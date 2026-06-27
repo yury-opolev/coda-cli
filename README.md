@@ -1,0 +1,567 @@
+# Coda
+
+**Coda is a native C# / .NET 10 agentic coding assistant for the terminal.** You
+talk to it in plain language; it reads and edits your code, runs commands, searches
+the web, and drives multi-step work to completion through an **agentic tool-use
+loop** — with you in control of what it's allowed to do. It connects to Claude
+(via Claude.ai subscription OAuth or an Anthropic API key) and to GitHub Copilot,
+talking to the Anthropic Messages API natively.
+
+Coda ships two front-ends over one engine: an **interactive TUI** for humans, and a
+**programmatic `coda serve` API** so an orchestrator can drive Coda as a coding
+subagent. The same engine is also embeddable in-process as a .NET library
+(`Coda.Sdk`).
+
+> **API reference:** the programmatic interface — the `coda serve` JSON-RPC
+> protocol, its transports/authentication, and the embeddable `Coda.Sdk` — is
+> documented in **[`docs/API.md`](docs/API.md)** (wire-level protocol details in
+> [`docs/serve-protocol.md`](docs/serve-protocol.md)).
+
+## Quick start
+
+> **Prerequisites:** Windows (the TUI uses DPAPI for credential storage) and the
+> [.NET 10 SDK](https://dotnet.microsoft.com/download).
+
+```powershell
+# 1. Clone and install as a global tool named `coda`:
+git clone https://github.com/yury-opolev/coda-cli.git
+cd coda-cli
+./publish.ps1 -Flavor tool
+dotnet tool install --global --add-source ./publish/tool Coda.Cli
+
+# 2. Run it (first launch walks you through provider sign-in):
+coda
+```
+
+`coda` is now on your PATH (via `%USERPROFILE%\.dotnet\tools`). On first launch the
+**setup wizard** has you pick a provider (Claude.ai subscription, an Anthropic API
+key, or GitHub Copilot), signs you in, and verifies the connection. Then just type.
+
+To upgrade later, bump + repack + update:
+
+```powershell
+./build.ps1                  # bump the build number
+./publish.ps1 -Flavor tool
+dotnet tool update --global --add-source ./publish/tool Coda.Cli
+```
+
+**Prefer a standalone exe** (no .NET runtime needed)? Build a self-contained binary
+and put it on your PATH instead:
+
+```powershell
+./publish.ps1 -Flavor self-contained   # -> publish/self-contained/coda.exe (~36 MB)
+```
+
+Check the version of any install with `coda --version`. Coda keeps all its own
+state under **`~/.coda/`** (settings, sessions, credentials, …), separate from the
+Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
+`.mcp.json` if present. See [Configuration & storage](#configuration--storage).
+
+## What Coda can do
+
+- **Agentic tool loop** — the model plans and acts using built-in tools:
+  - read-only, auto-run: `read_file`, `list_dir`, `glob`, `grep`
+  - permission-gated: `edit_file`, `write_file`, `run_command` (all file tools are
+    sandboxed to the working directory, symlink-aware)
+  - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
+    `todo_write` (a live checklist), plan mode, cron-style `schedule`, and
+    `background_task` (long-running jobs).
+- **Subagents & teams** — delegate a self-contained subtask with `task`, or spin up
+  a **multi-agent team** of named teammates that message each other and share a task
+  board.
+- **Code intelligence (LSP)** — when language servers are configured, an `lsp` tool
+  provides definitions/references/hover/symbols/diagnostics.
+- **MCP** — drop a `.mcp.json` in the working dir and Coda connects the servers,
+  exposing their tools (`mcp__<server>__<tool>`), resources, and prompts to the agent.
+- **Providers** — Claude.ai subscriber OAuth, Anthropic API key, and GitHub Copilot
+  (device flow), with automatic token refresh.
+- **You stay in control** — permission modes (`default` / `acceptEdits` / `plan` /
+  `bypass`), allow/deny rules and lifecycle hooks from settings files, and an
+  interactive approve/deny prompt for risky actions.
+- **Autonomy helpers (opt-in)** — a background **session-memory** notes file, a
+  **safety classifier** that vets actions in bypass mode, and an autonomous **goal
+  loop** that keeps working until a judge says the goal is met. Plus automatic
+  history **compaction**, output-style personas, and a plugin/skills marketplace.
+- **Programmatic & embeddable** — `coda serve` exposes the agent over JSON-RPC
+  (bidirectional: it streams progress and can ask the caller permission/clarification
+  questions), over stdio or an **API-key-authenticated local socket**; or embed the
+  engine directly via `Coda.Sdk`.
+
+Coda is its own product, independent of any vendor's official CLI.
+
+> **Platform note:** the engine is cross-platform, but the TUI and `coda serve`
+> currently require **Windows** at runtime because the default credential store uses
+> DPAPI.
+
+## Coda — the interactive TUI
+
+The terminal front-end is built on **Spectre.Console** — welcome banner, slash
+commands, streaming replies, and a status line.
+
+```powershell
+# Build (bumps the version), then run the TUI:
+./build.ps1
+dotnet run --project src/Coda.Tui -c Release
+```
+
+Inside the REPL:
+
+```
+/login [claude|copilot]   sign in (Claude.ai browser / Copilot device code)
+/status                   sign-in state for every provider
+/provider [id]            show or switch the active provider
+/model [id]               show or set the chat model
+/effort [low|medium|high|max|auto]  show or set reasoning effort (Claude only)
+/context                  show context-window usage broken down by category
+/goal [<text> | off]      set/clear the autonomous goal (--timeout, --max-turns)
+/log [<level> | stderr on|off]  show or set telemetry logging level
+/headers                  the outgoing request headers (secrets redacted)
+/logout [provider]        sign out
+/help [command]           list commands, or show detailed help for one
+/version   /clear   /exit
+```
+
+> **Tip:** append `--help` (or `-h`) to any command for its usage and examples, e.g. `/model --help`.
+
+### Model, effort & context
+
+- **`/model [id]`** shows or sets the chat model. With no argument it lists the
+  models the **active provider actually grants** — fetched live from the provider
+  (Anthropic `GET /v1/models`, Copilot `GET /models`) and cached for the session —
+  falling back to a built-in list when the provider exposes no such endpoint or the
+  call fails (e.g. Claude.ai OAuth, or offline). Each model is annotated with its
+  display name and context window from the **model catalog** (see below).
+  `/model refresh` re-fetches the live list *and* refreshes the catalog.
+- **`/effort [low|medium|high|max|auto]`** sets the reasoning effort level. It is
+  sent to the Anthropic API as `output_config.effort` (with the
+  `effort-2025-11-24` beta) and is honored only by models that support it
+  (`opus-4-8`, `sonnet-4-6`); `max` is Opus-only and clamps to `high` elsewhere.
+  Effort is session-scoped; `auto` clears it (model default). GitHub Copilot has
+  no effort equivalent, so the setting is ignored there.
+- **`/context`** shows how the model's 200k context window is being used, broken
+  down into **System prompt / System tools / MCP tools / Messages / Autocompact
+  buffer / Free space** with a grid visualization and per-category token counts.
+  Counts
+  come from the Anthropic **count-tokens API** when available
+  (`POST /v1/messages/count_tokens`), falling back to a local estimate otherwise
+  (e.g. Copilot or offline). The window size per model and the `/cost` price table
+  come from the **model catalog** (below), falling back to 200k / built-in prices.
+
+### Default provider & model (persisted)
+
+By default the TUI starts on Claude.ai. **Your choice sticks automatically** across
+sessions — no extra flag needed:
+
+- **`/provider <id>`** persists the startup provider (and clears any persisted model
+  so the new provider's default is used).
+- **`/model <id>`** persists the startup model.
+
+Both write to `~/.coda/settings.json` (`defaultProvider` / `defaultModel`), which you
+can also edit by hand:
+
+```json
+{ "defaultProvider": "github-copilot", "defaultModel": "claude-sonnet-4" }
+```
+
+Startup precedence is **env → settings → built-in default**: `CODA_PROVIDER` /
+`CODA_MODEL` override the persisted values for one run. A project-level
+`<project>/.coda/settings.json` overrides the user file. (Note: a hand-edited
+`defaultModel` is applied as-is to the resolved provider — keep it consistent with
+`defaultProvider`. `CODA_SETTINGS_DIR` relocates only `settings.json`, not the rest
+of `~/.coda`.)
+
+### Model catalog (metadata)
+
+Display names, context-window sizes, and pricing come from a **models.dev**-shaped
+catalog. Source order: an explicit file (`CODA_MODELS_PATH`), the on-disk cache
+(`~/.coda/cache/models.json`), then a **bundled snapshot** committed in the repo —
+so it works fully offline with no third-party call by default.
+
+The catalog is refreshed automatically: on TUI startup a **background, staleness-gated
+refresh** (default: if the cache is older than 12h) fetches the latest from models.dev
+without blocking; `/model refresh` forces it. Override the host with `CODA_MODELS_URL`,
+or disable all fetching with `CODA_DISABLE_MODELS_FETCH=1`. The in-repo snapshot is
+regenerated with `./scripts/update-models-snapshot.ps1`.
+
+The headless equivalent of the `/model` listing is **`coda models`**:
+
+```powershell
+coda models                      # active provider's models (text)
+coda models --provider copilot --json --refresh
+```
+
+### Headless help (`coda help`)
+
+`coda help` prints command metadata without starting a session — no credentials
+required, no sign-in needed:
+
+```powershell
+coda help                        # list all commands (name + summary)
+coda help <command>              # usage, arguments, and examples for one command
+coda help <command> --json       # structured JSON — for an orchestrating agent
+coda help --json                 # full command list as JSON
+```
+
+> `--json` is intended for a main or orchestrating agent that needs to discover
+> the available commands and their argument schemas programmatically.  The output
+> shape is `{ "commands": [{ "name", "aliases", "summary" }] }` for the list, and
+> `{ "name", "aliases", "summary", "usage", "description", "options", "examples" }`
+> for a single command.
+
+All product-facing names live in `src/Coda.Tui/Branding.cs` (one place to rename).
+
+### Setup & chatting
+
+On first launch (no stored credentials) Coda runs a **setup wizard**: pick a
+provider → sign in → it verifies the connection with a tiny real completion.
+Re-run it any time with `/setup`.
+
+Once connected, just type a message. Coda streams the assistant reply and runs an
+**agentic tool-use loop**:
+- read-only (automatic): `read_file`, `list_dir`, `glob`, `grep`
+- permission-gated: `edit_file`, `write_file`, `run_command`
+- `task` — delegate a self-contained subtask to a **subagent** (a nested agent loop
+  with the file/command tools but not `task`; it streams its work and reports back)
+- any tools from configured **MCP servers** (below), as `mcp__<server>__<tool>`
+
+All file tools are sandboxed to the working directory (symlink-aware). `/model`
+shows or sets the model; `/clear` resets the conversation.
+
+### MCP servers
+
+Drop a `.mcp.json` in the working directory; Coda connects the stdio servers at
+startup and exposes their tools to the agent (and subagents):
+
+```json
+{ "mcpServers": { "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }
+```
+
+> The chat path uses the native **Anthropic Messages API** (Claude.ai OAuth +
+> Anthropic API key). GitHub Copilot chat uses a different, OpenAI-shaped API.
+
+## Auth specifics
+
+- **Claude.ai subscription** — OAuth 2.0 Authorization Code + PKCE (S256): a
+  cryptographically random verifier/challenge/state, a system-browser loopback
+  redirect, and automatic token refresh near expiry.
+- **Anthropic API key** — the simplest path; bring your own `ANTHROPIC_API_KEY`
+  (via `ApiKeyProvider`).
+- **GitHub Copilot** — the OAuth Device Authorization Grant (enter a code at
+  github.com); the short-lived Copilot token is refreshed from the stored GitHub token.
+
+Provider endpoints and request details are configurable via environment variables
+and the provider config classes (`ClaudeAiOAuthConfig`, `GitHubCopilotConfig`).
+
+## Projects
+
+| Project | TFM | Purpose |
+|---|---|---|
+| `src/LlmAuth` | `net10.0` | Core: abstractions, PKCE, OAuth engine, loopback listener, identity, `CredentialManager`. |
+| `src/LlmAuth.Providers.ClaudeAi` | `net10.0` | Claude.ai OAuth provider + config + API-key provider. |
+| `src/LlmAuth.Providers.GitHubCopilot` | `net10.0` | GitHub Copilot device-flow provider. |
+| `src/LlmAuth.Storage.Windows` | `net10.0` | DPAPI-encrypted token store (DPAPI is Windows-only at runtime). |
+| `src/LlmClient` | `net10.0` | Anthropic Messages streaming client + client fingerprint. |
+| `src/Coda.Agent` | `net10.0` | Agent loop + tools (read/list/glob/grep/edit/write/run + task/subagents). |
+| `src/Coda.Mcp` | `net10.0` | MCP stdio client (JSON-RPC) + tool bridge. |
+| `src/Coda.Tui` | `net10.0` | The **Coda** interactive TUI (Spectre.Console). Requires Windows at runtime (DPAPI). |
+| `samples/LlmAuth.Sample` | `net10.0-windows` | Console demo. |
+| `tests/LlmAuth.Tests` | `net10.0` | xUnit unit tests (auth). |
+| `tests/Coda.Tui.Tests` | `net10.0` | xUnit unit tests (TUI). |
+| `tests/Engine.Tests` | `net10.0` | xUnit unit tests (SSE parser, agent loop, tools). |
+
+## Usage
+
+High layer (batteries-included loopback login):
+
+```csharp
+using LlmAuth;
+using LlmAuth.Providers.ClaudeAi;
+using LlmAuth.Storage.Windows;
+
+using var claude = new ClaudeAiProvider();
+var manager = new CredentialManager(new DpapiTokenStore(), [claude, new ApiKeyProvider()]);
+
+// Opens the system browser + a localhost loopback listener, captures the redirect:
+Credential cred = await manager.LoginAsync(ClaudeAiProvider.Id);
+
+// Everyday use — refreshes automatically when near expiry:
+AuthHeaders headers = await manager.GetAuthHeadersAsync(ClaudeAiProvider.Id);
+```
+
+Low layer (host-driven; headless / manual paste):
+
+```csharp
+ILoginFlow flow = claude.BeginLogin(new LoginOptions { RedirectMode = RedirectMode.Manual });
+Console.WriteLine(flow.AuthorizeUrl);            // host opens this however it likes
+// …host captures the redirect and reads ?code & ?state…
+Credential cred = await flow.CompleteAsync(code, state);
+```
+
+Custom browser hook (the "calls back to the host" model):
+
+```csharp
+await manager.LoginAsync(ClaudeAiProvider.Id, new LoginOptions
+{
+    OpenBrowser = (url, ct) => { /* show the URL / open an embedded view */ return Task.CompletedTask; }
+});
+```
+
+## GitHub Copilot (device flow)
+
+Copilot uses the OAuth **Device Authorization Grant** — the library calls back to
+your host with a code to enter at github.com:
+
+```csharp
+using var copilot = new GitHubCopilotProvider();
+var manager = new CredentialManager(new DpapiTokenStore(), [copilot]);
+
+Credential cred = await manager.LoginWithDeviceCodeAsync(
+    GitHubCopilotProvider.Id,
+    (prompt, ct) =>
+    {
+        Console.WriteLine($"Open {prompt.VerificationUri} and enter {prompt.UserCode}");
+        return Task.CompletedTask;
+    });
+
+// Bearer Copilot token + Editor-Version / Copilot-Integration-Id headers; the
+// short-lived Copilot token auto-refreshes from the stored GitHub token.
+AuthHeaders headers = await manager.GetAuthHeadersAsync(GitHubCopilotProvider.Id);
+```
+
+> Copilot endpoints/headers are configurable (`GitHubCopilotConfig` / `GH_COPILOT_*`
+> env vars). Using the Copilot API outside official editor integrations is subject to
+> GitHub's Terms of Service.
+
+## Versioning & build
+
+Semantic version lives in [`version.json`](version.json) (starts at **0.1**). The
+build entry point **bumps the build number on every run** and stamps the version
+into every assembly:
+
+```powershell
+./build.ps1                 # bump build number, Release build
+./build.ps1 -Test           # bump, build, run tests
+./build.ps1 -Configuration Debug
+./build.ps1 -NoBump         # build without bumping
+```
+
+Plain `dotnet build LlmAuth.slnx` / `dotnet test tests/LlmAuth.Tests` still work
+(they use the last-stamped version and do **not** bump).
+
+### Publishing
+
+`publish.ps1` publishes the **current** version (no bump) of the `coda` CLI into
+`./publish` in three flavors:
+
+```powershell
+./publish.ps1                          # all three flavors (win-x64, Release)
+./publish.ps1 -Flavor self-contained   # standalone coda.exe (bundles the runtime)
+./publish.ps1 -Flavor framework-dependent  # smaller coda.exe (needs .NET 10 runtime)
+./publish.ps1 -Flavor tool             # .NET global tool package (Coda.Cli)
+./publish.ps1 -Runtime win-arm64       # target Windows on ARM
+```
+
+| Flavor | Output | Needs .NET 10 installed? |
+|---|---|---|
+| `self-contained` | `publish/self-contained/coda.exe` (~36 MB) | No |
+| `framework-dependent` | `publish/framework-dependent/coda.exe` (~2 MB) | Yes |
+| `tool` | `publish/tool/Coda.Cli.<version>.nupkg` | Yes (SDK) |
+
+Install / upgrade the global tool (command: `coda`):
+
+```powershell
+dotnet tool install --global --add-source ./publish/tool Coda.Cli
+dotnet tool update  --global --add-source ./publish/tool Coda.Cli
+```
+
+Check the version of any flavor with `coda --version` (or `coda --help`).
+
+## Supervisor features (opt-in)
+
+Coda can run background supervisors alongside the agent. All are off by default
+and enabled via `SessionOptions`:
+
+| Option | Effect |
+|---|---|
+| `EnableSessionMemory = true` | After work-bearing turns, a background forked agent refreshes `.coda/SESSION_MEMORY.md` — a running, structured notes file about the session — without touching the main conversation. |
+| `EnableBypassClassifier = true` | In bypass ("yolo") mode, every mutating tool action is first classified by a separate model call; safe actions auto-run, risky ones (e.g. `rm -rf`, force-push) are escalated to you (or denied when headless). Fails closed. |
+| `Goal = "<objective>"` | The **autonomous goal loop**: a `GoalSupervisor` keeps the agent working until an isolated judge declares the goal met. When it tries to finish, the judge rules `DONE` / `CONTINUE`; on `CONTINUE` the agent is nudged with what remains. A transient judge error retries with backoff then **fails closed** (keeps working) — never silently ends an unfinished run. Bounded by a **time + turn budget** (default **24h / 60000 turns**, set via `GoalMaxDuration` / `GoalMaxContinuations` or the `goal` settings block). At the bound it **escalates one question** to the operator (via the `ask_user_question` channel / serve `request/question`); an answer grants **one bounded extension**, otherwise it stops. The outcome is reported as `RunResult.GoalStatus` (`Met` / `Unmet` + what remains). Long runs are kept within the context window by **in-loop compaction**. |
+
+These build on the agent's hook buses: post-sampling "observe" hooks (`IPostSamplingHook`)
+run after each turn, and stop hooks (`IStopHook`) can refuse to let the agent finish. The
+goal loop is a first-class `GoalSupervisor` consulted by the agent loop (it replaced the
+earlier `GoalStopHook`).
+
+Goal budget defaults are configurable in `~/.coda/settings.json` (project file overrides
+user), e.g.:
+
+```json
+{ "goal": { "maxDuration": "1.00:00:00", "maxContinuations": 60000, "autoCompact": true, "extensionFraction": 0.25 } }
+```
+
+Per-goal overrides (CLI `--goal-timeout` / `--max-continuations`, serve params, or TUI
+`/goal --timeout`/`--max-turns`) take precedence over settings, which take precedence over
+the built-in defaults.
+
+### Headless CLI flags
+
+All supervisor features are also reachable from `coda run`:
+
+| Flag | Effect |
+|---|---|
+| `--yolo` | Blanket-allow bypass — every mutating action runs without a prompt. |
+| `--yolo-safe` | Bypass + classifier — risky actions are escalated instead of blindly allowed. Prefer over `--yolo` when running unattended. |
+| `--goal "<objective>"` | Enable the autonomous goal loop; the agent works until the judge decides the goal is met (or the budget is exhausted). The goal status prints to stderr (and to the `--json` result as `goalStatus`); an unmet goal yields a non-zero exit code. |
+| `--goal-timeout <duration>` | Wall-clock budget for the goal run: `30m`, `2h`, `1d`, or `hh:mm:ss` (requires `--goal`; default 24h). A bare integer is rejected — use a unit. |
+| `--session-memory` | Enable the background SessionMemory watcher. |
+| `--max-continuations <n>` | Turn backstop. For a goal run it sets the goal turn budget (default 60000); otherwise it bounds non-goal stop-hook continuations (default 10). |
+| `--effort <level>` | Reasoning effort (`low`/`medium`/`high`/`max`/`auto`). Claude-only; `max` is Opus-only. |
+
+Example:
+
+```powershell
+coda run -p "refactor all tests to use xUnit v3 assertions" --yolo-safe --goal "all tests pass" --goal-timeout 2h --session-memory
+```
+
+Driven over `coda serve`, the goal is set on session create or dynamically with
+`session/setGoal` (persist-until-cleared), and `session/prompt` results carry `goalStatus`;
+the at-bound escalation reaches the orchestrator via `request/question`. See
+[`docs/serve-protocol.md`](docs/serve-protocol.md).
+
+## Configuration & storage
+
+Coda keeps **all of its own state under `~/.coda/`**, kept deliberately separate
+from the Claude CLI's `~/.claude/`. It will, however, *read* a couple of shared
+project files if they exist (it never writes to them).
+
+| What | Location | Notes |
+|---|---|---|
+| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers |
+| Project settings | `<project>/.coda/settings.json` | overrides user settings |
+| Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
+| Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |
+| Scheduled tasks | `<project>/.coda/scheduled_tasks.json` | |
+| Teams | `~/.coda/teams/` | |
+| Plugins | `~/.coda/`, `<project>/.coda/plugins/` | |
+| Skills | `~/.coda/skills/`, `<project>/.coda/skills/` (+ read-only `~/.claude/skills/`) | `SKILL.md` per skill |
+| Session memory | `<project>/.coda/SESSION_MEMORY.md` | when enabled |
+| Telemetry logs | `~/.coda/logs/coda-<timestamp>-<pid>.log` | JSON-lines; opt-in; secrets redacted |
+
+**Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
+(including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and
+`~/.claude/skills/` (lowest precedence — your `~/.coda/skills` and project skills
+override by name). Override the skill source dirs with `CODA_CLAUDE_SKILLS_DIR` /
+`CODA_USER_SKILLS_DIR` (point at a missing path to opt out).
+
+> **Credential migration:** credentials previously lived under `%APPDATA%\LlmAuth`
+> (Windows) / `~/.config/LlmAuth` (other OS). On first run after upgrading, Coda
+> moves them to `~/.coda/credentials/` automatically and removes the old folder.
+> DPAPI is keyed to the user (not the file path), so migrated tokens still decrypt.
+
+### Telemetry & logging
+
+Structured logging is **off by default**. When enabled, Coda writes one JSON-lines
+file per session to `~/.coda/logs/`.
+
+#### Enabling
+
+**Settings block** (`~/.coda/settings.json`; a project `.coda/settings.json` block
+replaces the user block wholesale, rather than merging field by field):
+
+```json
+{
+  "telemetry": {
+    "enabled": true,
+    "level": "debug",
+    "stderr": false,
+    "retainedFiles": 7,
+    "maxFileSizeMb": 20,
+    "maxRunParts": 10
+  }
+}
+```
+
+| Key | Type | Default | Description |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch |
+| `level` | `trace`\|`debug`\|`info`\|`warn`\|`error` | `info` | Minimum level written |
+| `stderr` | bool | `false` | Echo every log line to stderr as well |
+| `retainedFiles` | int | `7` | How many past runs to keep on startup (0 = keep all) |
+| `maxFileSizeMb` | int | `20` | Roll to a new part file when the current part exceeds this (0 = no cap) |
+| `maxRunParts` | int | `10` | Max part files per run; oldest parts are dropped (ring buffer). 0 = unbounded |
+| `directory` | string | `~/.coda/logs` | Override the logs directory |
+
+**TUI command** — `/log` shows current state and the log directory; `/log <level>` sets
+the level and enables logging (persists to user settings); `/log off` disables it;
+`/log stderr on|off` toggles stderr echo. Changes apply to the next session.
+
+**Headless flag** — `coda run --log-level <trace|debug|info|warn|error|off>` overrides
+settings for that run.
+
+**Environment overrides** (highest precedence; apply for one run only):
+
+| Variable | Values | Effect |
+|---|---|---|
+| `CODA_LOG_LEVEL` | `trace`…`error` or `off` | Set level (or disable) |
+| `CODA_LOG_STDERR` | `1`, `true`, `yes`, `on` | Echo to stderr |
+| `CODA_LOG_FILE` | directory path | Override the logs directory |
+
+#### Log files
+
+Each session writes to `~/.coda/logs/coda-<yyyyMMdd-HHmmss>-<pid>.log`. When a part
+exceeds `maxFileSizeMb` it rolls to `coda-….<n>.log`. At startup, runs beyond
+`retainedFiles` (newest-first) are deleted. A single long run is bounded by
+`maxRunParts`: once the limit is reached the oldest part is dropped (ring buffer).
+
+Each line is a JSON object:
+
+```json
+{"ts":"2026-06-04T12:00:00.0000000+00:00","level":"Information","category":"LlmClient","message":"..."}
+```
+
+Fields: `ts` (round-trip UTC), `level`, `category`, `message`. When an exception is
+logged, `exceptionType` and `exception` are added; the `stack` field is included only
+at `debug` or `trace`.
+
+#### Verbosity ladder
+
+| Level | What is logged |
+|---|---|
+| `error` / `warn` | Failures — including the real API error message on a failed model request |
+| `info` | Lifecycle events: session start, each model request start and completion |
+| `debug` | As above, plus metadata (token counts, model id, elapsed time) |
+| `trace` | As above, plus full request and response bodies |
+
+#### Redaction
+
+Secrets (auth tokens, API keys) are **always redacted** at every level. Auth headers
+are never logged. Full request/response bodies appear only at `trace`.
+
+> Even with telemetry **off**, a failed model request now surfaces the API's real
+> reason (e.g. `Model request failed: … (HTTP 400): The requested model is not
+> supported.`) instead of a bare HTTP status code.
+
+## Try the sample
+
+```bash
+# Claude.ai
+dotnet run --project samples/LlmAuth.Sample -- authurl   # print the exact authorize URL (no network)
+dotnet run --project samples/LlmAuth.Sample -- login     # interactive Claude.ai sign-in (opens browser)
+dotnet run --project samples/LlmAuth.Sample -- headers    # show the auth + identity headers
+dotnet run --project samples/LlmAuth.Sample -- logout
+
+# GitHub Copilot (device flow)
+dotnet run --project samples/LlmAuth.Sample -- copilot-login    # prints a code to enter at github.com/login/device
+dotnet run --project samples/LlmAuth.Sample -- copilot-headers   # show the Copilot bearer + editor headers
+dotnet run --project samples/LlmAuth.Sample -- copilot-logout
+```
+
+## Notes & caveats
+
+- **Windows-first.** The OAuth flow is cross-platform; only `DpapiTokenStore` is
+  Windows-only. Other OSes implement `ITokenStore` (Keychain / libsecret) — stubbed
+  for later.
+- **Authorization:** the Claude.ai subscription sign-in is subject to Anthropic's
+  Terms of Service. Using your own `ANTHROPIC_API_KEY` (via `ApiKeyProvider`) is the
+  most straightforward option and is unaffected.
+- GitHub Copilot and OpenAI providers are planned as additional `ICredentialProvider`s.

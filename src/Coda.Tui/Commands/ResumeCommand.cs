@@ -1,0 +1,114 @@
+using Coda.Sdk;
+using Coda.Tui.Repl;
+using Spectre.Console;
+
+namespace Coda.Tui.Commands;
+
+/// <summary>
+/// Lists recent sessions or resumes a specific one.
+/// <list type="bullet">
+///   <item><c>/resume</c> — list recent sessions.</item>
+///   <item><c>/resume &lt;id&gt;</c> — load the named session into the current conversation.</item>
+/// </list>
+/// </summary>
+public sealed class ResumeCommand : ISlashCommand
+{
+    public string Name => "resume";
+
+    public IReadOnlyList<string> Aliases => [];
+
+    public string Summary => "List or resume a past session";
+
+    public CommandHelp Help => new(
+        "/resume [<id>]",
+        Description: "Without an argument, lists recent sessions (newest first) showing ID, message count, age, and a preview. With an ID, loads that session's history into the current conversation, replacing any existing messages.",
+        Options:
+        [
+            ("(no args)", "list recent sessions with ID, message count, age, and preview"),
+            ("<id>", "load the named session into the current conversation"),
+        ],
+        Examples: ["/resume", "/resume abc123"]);
+
+    public async Task<CommandResult> ExecuteAsync(
+        CommandContext context,
+        IReadOnlyList<string> args,
+        CancellationToken cancellationToken = default)
+    {
+        var store = new SessionTranscriptStore(context.Session.WorkingDirectory);
+
+        if (args.Count == 0)
+        {
+            return await this.ListSessionsAsync(context, store, cancellationToken).ConfigureAwait(false);
+        }
+
+        return await this.ResumeSessionAsync(context, store, args[0], cancellationToken).ConfigureAwait(false);
+    }
+
+    private async Task<CommandResult> ListSessionsAsync(
+        CommandContext context,
+        SessionTranscriptStore store,
+        CancellationToken cancellationToken)
+    {
+        var summaries = await store.ListAsync(cancellationToken).ConfigureAwait(false);
+        if (summaries.Count == 0)
+        {
+            context.Console.MarkupLine("[grey50]No sessions found. Start a conversation to create one.[/]");
+            return CommandResult.Continue;
+        }
+
+        context.Console.MarkupLine("[grey50]Recent sessions (newest first):[/]");
+        for (var i = 0; i < summaries.Count; i++)
+        {
+            var s = summaries[i];
+            var age = FormatAge(s.CreatedUtc);
+            var preview = Markup.Escape(s.Preview.Length > 60 ? s.Preview[..60] + "…" : s.Preview);
+            var id = Markup.Escape(s.Id);
+            context.Console.MarkupLine(
+                $"  [bold]{i + 1}[/]  [yellow]{id}[/]  [grey50]{s.MessageCount} msgs · {age}[/]  {preview}");
+        }
+
+        return CommandResult.Continue;
+    }
+
+    private async Task<CommandResult> ResumeSessionAsync(
+        CommandContext context,
+        SessionTranscriptStore store,
+        string sessionId,
+        CancellationToken cancellationToken)
+    {
+        var messages = await store.LoadAsync(sessionId, cancellationToken).ConfigureAwait(false);
+        if (messages is null)
+        {
+            context.Console.MarkupLine($"[red]Session '{Markup.Escape(sessionId)}' not found.[/]");
+            return CommandResult.Continue;
+        }
+
+        context.Session.History.Clear();
+        context.Session.History.AddRange(messages);
+
+        var escapedId = Markup.Escape(sessionId);
+        context.Console.MarkupLine($"[grey50]Resumed session {escapedId} ({messages.Count} messages).[/]");
+        return CommandResult.Continue;
+    }
+
+    private static string FormatAge(DateTime createdUtc)
+    {
+        var age = DateTime.UtcNow - createdUtc;
+        if (age.TotalSeconds < 60)
+        {
+            return "just now";
+        }
+
+        if (age.TotalMinutes < 60)
+        {
+            return $"{(int)age.TotalMinutes}m ago";
+        }
+
+        if (age.TotalHours < 24)
+        {
+            return $"{(int)age.TotalHours}h ago";
+        }
+
+        return $"{(int)age.TotalDays}d ago";
+    }
+}

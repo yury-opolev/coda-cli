@@ -1,0 +1,136 @@
+using Coda.Tui;
+using Coda.Tui.Repl;
+
+namespace Coda.Tui.Tests;
+
+public sealed class CommandDispatchTests
+{
+    [Fact]
+    public async Task Version_command_prints_product_and_version()
+    {
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("version", Array.Empty<string>()), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Contains("Coda", console.Output);
+        Assert.Contains(Branding.Version, console.Output);
+    }
+
+    [Theory]
+    [InlineData("/help")]
+    [InlineData("/login")]
+    [InlineData("/logout")]
+    [InlineData("/status")]
+    [InlineData("/provider")]
+    [InlineData("/model")]
+    [InlineData("/headers")]
+    [InlineData("/clear")]
+    [InlineData("/version")]
+    [InlineData("/exit")]
+    public async Task Help_command_lists_every_command(string expectedCommand)
+    {
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        await app.DispatchAsync(ParsedInput.Slash("help", Array.Empty<string>()), CancellationToken.None);
+
+        Assert.Contains(expectedCommand, console.Output);
+    }
+
+    [Fact]
+    public async Task Unknown_command_reports_error()
+    {
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("nope", Array.Empty<string>()), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Contains("Unknown command", console.Output);
+    }
+
+    [Fact]
+    public async Task Free_text_prompt_without_credentials_prompts_to_sign_in()
+    {
+        // Default active provider is claude-ai with an empty store, so the agent
+        // run fails fast with "not signed in" (no network).
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Prompt("hello"), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Contains("signed in", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Exit_command_requests_exit()
+    {
+        var (app, _, _, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("exit", Array.Empty<string>()), CancellationToken.None);
+
+        Assert.True(result.ShouldExit);
+    }
+}
+
+public sealed class ProviderCommandTests
+{
+    [Fact]
+    public async Task Provider_without_args_shows_active_and_lists_others()
+    {
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        await app.DispatchAsync(ParsedInput.Slash("provider", Array.Empty<string>()), CancellationToken.None);
+
+        Assert.Contains("Active provider", console.Output);
+        Assert.Contains("Claude.ai", console.Output);
+        Assert.Contains("github-copilot", console.Output);
+    }
+
+    [Fact]
+    public async Task Provider_switches_active_by_token()
+    {
+        var (app, context, console, _) = TestAppBuilder.BuildApp();
+
+        await app.DispatchAsync(ParsedInput.Slash("provider", new[] { "copilot" }), CancellationToken.None);
+
+        Assert.Equal("github-copilot", context.Session.ActiveProviderId);
+        Assert.Contains("GitHub Copilot", console.Output);
+    }
+
+    [Fact]
+    public async Task Provider_with_bogus_token_reports_unknown()
+    {
+        var (app, context, console, _) = TestAppBuilder.BuildApp();
+
+        await app.DispatchAsync(ParsedInput.Slash("provider", new[] { "bogus" }), CancellationToken.None);
+
+        Assert.Equal("claude-ai", context.Session.ActiveProviderId);
+        Assert.Contains("Unknown provider", console.Output);
+    }
+}
+
+public sealed class LoginCommandTests
+{
+    [Fact]
+    public async Task Login_with_api_key_provider_is_offline()
+    {
+        var (app, context, console, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("login", new[] { "api" }), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Contains("ANTHROPIC_API_KEY", console.Output);
+        Assert.Equal("anthropic-api-key", context.Session.ActiveProviderId);
+    }
+
+    [Fact]
+    public async Task Login_with_bogus_provider_reports_unknown()
+    {
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("login", new[] { "bogus" }), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Contains("Unknown provider", console.Output);
+    }
+}

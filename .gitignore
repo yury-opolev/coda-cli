@@ -1,0 +1,29 @@
+# .NET build output
+[Bb]in/
+[Oo]bj/
+*.user
+.vs/
+
+# Node
+**/node_modules/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Generated version props (source of truth is version.json)
+version.props
+
+# Published artifacts
+/publish/
+
+# Build/coverage/spike artifacts (binaries, coverage reports)
+artifacts/
+*.cobertura.xml
+
+# Test run artifacts (hang dumps, sequence files)
+TestResults/
+**/TestResults/
+
+# Coda runtime/user data — never commit
+.coda/

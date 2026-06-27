@@ -1,0 +1,738 @@
+using System.Text;
+using System.Text.Json;
+using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Compaction;
+using Coda.Agent.Goals;
+using Coda.Agent.Hooks;
+using Coda.Agent.Lsp;
+using Coda.Agent.Scheduling;
+using Coda.Agent.Teams;
+using Coda.Agent.ToolSearch;
+using Coda.Agent.Tools;
+using LlmClient;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+
+namespace Coda.Agent;
+
+/// <summary>
+/// The agentic tool-use cycle: stream an assistant turn, run any requested tools
+/// (permission-gated), feed the results back, and repeat until the model stops
+/// requesting tools or the iteration bound is hit. Optional <see cref="AgentHooks"/>
+/// add the post-sampling observe-bus and the stop-hook step-in lever.
+/// </summary>
+public sealed partial class AgentLoop : IAgentLoop
+{
+    private readonly ILlmClient client;
+    private readonly ToolRegistry tools;
+    private readonly IPermissionPrompt permissions;
+    private readonly AgentOptions options;
+    private readonly ISubagentHost? subagents;
+    private readonly AgentHooks? hooks;
+    private readonly TodoStore? todos;
+    private readonly ScheduledTaskStore? schedules;
+    private readonly IUserQuestionPrompt? userQuestion;
+    private readonly UserHookRunner? userHooks;
+    private readonly IPlanApprover? planApprover;
+    private readonly BackgroundTaskRunner? backgroundTasks;
+    private readonly LspServerManager? lsp;
+    private readonly LspDiagnosticRegistry? lspDiagnostics;
+    private readonly TeamManager? teams;
+    private readonly ToolSearchCoordinator? toolSearch;
+    private readonly GoalSupervisor? goal;
+    private readonly Func<List<ChatMessage>, CancellationToken, Task>? compactAsync;
+    private readonly SteeringInbox? steering;
+    private readonly ILogger logger;
+
+    public GoalStatus? LastGoalStatus { get; private set; }
+
+    // Option labels for the at-bound goal escalation question. Kept as constants so the
+    // labels presented and the answer comparison can never drift apart.
+    private const string GoalContinueOption = "Provide guidance and continue";
+    private const string GoalStopOption = "Stop — goal not met";
+
+    public AgentLoop(
+        ILlmClient client,
+        ToolRegistry tools,
+        IPermissionPrompt permissions,
+        AgentOptions options,
+        ISubagentHost? subagents = null,
+        AgentHooks? hooks = null,
+        TodoStore? todos = null,
+        ScheduledTaskStore? schedules = null,
+        IUserQuestionPrompt? userQuestion = null,
+        UserHookRunner? userHooks = null,
+        IPlanApprover? planApprover = null,
+        BackgroundTaskRunner? backgroundTasks = null,
+        LspServerManager? lsp = null,
+        LspDiagnosticRegistry? lspDiagnostics = null,
+        TeamManager? teams = null,
+        ToolSearchCoordinator? toolSearch = null,
+        GoalSupervisor? goal = null,
+        Func<List<ChatMessage>, CancellationToken, Task>? compactAsync = null,
+        SteeringInbox? steering = null,
+        ILogger? logger = null)
+    {
+        this.client = client ?? throw new ArgumentNullException(nameof(client));
+        this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
+        this.permissions = permissions ?? throw new ArgumentNullException(nameof(permissions));
+        this.options = options ?? throw new ArgumentNullException(nameof(options));
+        this.subagents = subagents;
+        this.hooks = hooks;
+        this.todos = todos;
+        this.schedules = schedules;
+        this.userQuestion = userQuestion;
+        this.userHooks = userHooks;
+        this.planApprover = planApprover;
+        this.backgroundTasks = backgroundTasks;
+        this.lsp = lsp;
+        this.lspDiagnostics = lspDiagnostics;
+        this.teams = teams;
+        this.toolSearch = toolSearch;
+        this.goal = goal;
+        this.compactAsync = compactAsync;
+        this.steering = steering;
+        this.logger = logger ?? NullLogger.Instance;
+    }
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "turn start: iteration={iteration}, model={model}, historyMessages={messageCount}, tools={toolCount}")]
+    private partial void LogTurnStart(int iteration, string model, int messageCount, int toolCount);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "turn end: iteration={iteration}, stop={stopReason}, toolCalls={toolCount}, textChars={textLength}")]
+    private partial void LogTurnEnd(int iteration, string stopReason, int toolCount, int textLength);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "in-loop compaction failed (best-effort); continuing the run: iteration={iteration}")]
+    private partial void LogCompactionFailed(int iteration, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "context overflow on iteration={iteration}; compacting history and retrying the turn")]
+    private partial void LogContextOverflowCompaction(int iteration, Exception ex);
+
+    /// <summary>
+    /// Whether an exception from the LLM call signals the request was too long for the model's
+    /// context window — the request fails identically on retry unless the history is shrunk.
+    /// </summary>
+    private static bool IsContextOverflowError(Exception ex)
+    {
+        var message = ex.Message;
+        return message.Contains("context window exceeded", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("context_length", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("maximum context", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("prompt is too long", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("too many tokens", StringComparison.OrdinalIgnoreCase)
+            || message.Contains("input length and `max_tokens` exceed", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "Stop user hooks failed (best-effort); completing the turn")]
+    private partial void LogStopHooksFailed(Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "draining post-sampling hook tasks faulted (best-effort); turn already complete")]
+    private partial void LogPostSamplingDrainFailed(Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "PostToolUse user hooks failed (best-effort); continuing: tool={toolName}")]
+    private partial void LogPostToolUseHooksFailed(string toolName, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "LSP edit-seam notify failed (best-effort); tool result and turn unaffected")]
+    private partial void LogLspNotifyFailed(Exception ex);
+
+    public async Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(history);
+        ArgumentNullException.ThrowIfNull(sink);
+
+        var pendingHookTasks = new List<Task>();
+        var stopContinuations = 0;
+        var stopHookActive = false;
+        string? lastInjectedReminder = null;
+
+        try
+        {
+            for (var iteration = 0; ; iteration++)
+            {
+                // When no goal is active, honour the MaxIterations bound exactly as before.
+                if (this.goal is null && iteration >= this.options.MaxIterations)
+                {
+                    break;
+                }
+
+                // Goal runs: the budget governs termination, not MaxIterations.
+                // In-loop compaction keeps long runs within the context window.
+                if (this.goal is not null
+                    && this.compactAsync is not null
+                    && this.options.AutoCompact
+                    && this.options.AutoCompactTokenThreshold > 0
+                    && TokenEstimator.Estimate(history) > this.options.AutoCompactTokenThreshold)
+                {
+                    try
+                    {
+                        await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Compaction is best-effort; never aborts the run.
+                        this.LogCompactionFailed(iteration, ex);
+                    }
+                }
+
+                // DIAGNOSTICS SURFACING SEAM: after at least one tool cycle, check for
+                // fresh LSP diagnostics and inject them as a synthetic user message so
+                // the model sees compiler results on its edits. This runs before each
+                // model call except the very first (iteration == 0 means no tool cycle yet).
+                // Give async notifications a brief chance to arrive (up to ~300 ms polling).
+                if (iteration > 0 && this.lspDiagnostics is not null)
+                {
+                    await WaitForDiagnosticsAsync(this.lspDiagnostics, cancellationToken).ConfigureAwait(false);
+                    var diags = this.lspDiagnostics.CheckForDiagnostics();
+                    if (diags.Count > 0)
+                    {
+                        var formatted = FormatDiagnostics(diags, this.options.WorkingDirectory);
+                        history.Add(new ChatMessage(ChatRole.User, [new TextBlock(formatted)]));
+                    }
+                }
+
+                // LEADER INBOX SEAM: after at least one iteration, drain any messages
+                // that teammates have posted to the team-lead inbox and inject them as a
+                // synthetic user message so the leader model sees them before the next turn.
+                // Mirrors the LSP diagnostics seam above. Swallows non-cancellation errors.
+                if (iteration > 0 && this.teams is not null && this.teams.TeamName is not null)
+                {
+                    IReadOnlyList<string> inboxBlocks;
+                    try
+                    {
+                        inboxBlocks = await this.teams.DrainLeaderInboxAsync(cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch
+                    {
+                        inboxBlocks = [];
+                    }
+
+                    if (inboxBlocks.Count > 0)
+                    {
+                        var inboxText = string.Join("\n\n", inboxBlocks);
+                        history.Add(new ChatMessage(ChatRole.User, [new TextBlock(inboxText)]));
+                    }
+                }
+
+                // STEERING INBOX SEAM: drain operator steering comments posted mid-turn (via the
+                // serve `session/steer` request) and inject them as a synthetic user message before
+                // the next model call, so a running turn can be redirected. Mirrors the leader-inbox
+                // seam; runs every iteration so a steer is honored at the next iteration boundary.
+                if (this.steering is not null)
+                {
+                    var steers = this.steering.DrainAll();
+                    if (steers.Count > 0)
+                    {
+                        var steerText = string.Join("\n\n", steers);
+                        history.Add(new ChatMessage(ChatRole.User, [new TextBlock(steerText)]));
+                    }
+                }
+
+                // DEFERRED-TOOLS REMINDER SEAM: when tool search is active, inject a
+                // <deferred-tools> reminder block before each model request so the model
+                // knows which tools exist but whose schemas are not yet loaded. We only
+                // append when the reminder text changes (or is first injected) to avoid
+                // re-injecting an identical block every turn. Mirrors the LSP/teams seams.
+                if (this.toolSearch is not null && this.toolSearch.IsActive)
+                {
+                    var reminder = this.toolSearch.BuildDeferredToolsReminder(this.tools);
+                    if (reminder is not null && !string.Equals(reminder, lastInjectedReminder, StringComparison.Ordinal))
+                    {
+                        history.Add(new ChatMessage(ChatRole.User, [new TextBlock(reminder)]));
+                        lastInjectedReminder = reminder;
+                    }
+                }
+
+                // Per-request wire tool definitions: when tool search is active, the
+                // discovered set may grow during the turn, so we recompute each call.
+                // When inactive (or no coordinator), use the registry definitions unchanged.
+                var toolDefinitions = this.toolSearch is not null && this.toolSearch.IsActive
+                    ? this.toolSearch.BuildWireDefinitions(this.tools)
+                    : this.tools.Definitions;
+
+                var request = new ChatRequest
+                {
+                    Model = this.options.Model,
+                    MaxTokens = this.options.MaxTokens,
+                    System = this.options.SystemPrompt,
+                    Messages = history,
+                    Tools = toolDefinitions,
+                    Effort = this.options.Effort,
+                };
+
+                var text = new StringBuilder();
+                var toolUses = new List<ToolUseBlock>();
+                string? stopReason = null;
+
+                this.LogTurnStart(iteration, this.options.Model, history.Count, toolDefinitions.Count);
+
+                // Reactive overflow compaction: if the provider rejects the request because the
+                // context is too long, summarize the history once and retry the turn — rather than
+                // failing the run. (Proactive window-relative compaction usually prevents this; this
+                // is the safety net for a single oversized turn.)
+                var overflowRetried = false;
+                while (true)
+                {
+                    try
+                    {
+                        await foreach (var streamEvent in this.client.StreamAsync(request, cancellationToken).ConfigureAwait(false))
+                        {
+                            switch (streamEvent.Kind)
+                            {
+                                case AssistantEventKind.TextDelta:
+                                    text.Append(streamEvent.Text);
+                                    sink.OnAssistantText(streamEvent.Text!);
+                                    break;
+
+                                case AssistantEventKind.ToolUse:
+                                    toolUses.Add(streamEvent.ToolUse!);
+                                    break;
+
+                                case AssistantEventKind.Done:
+                                    stopReason = streamEvent.StopReason;
+                                    if (streamEvent.Usage is { } turnUsage)
+                                    {
+                                        sink.OnUsage(turnUsage);
+                                    }
+
+                                    break;
+                            }
+                        }
+
+                        break;
+                    }
+                    catch (Exception ex) when (!overflowRetried
+                        && this.compactAsync is not null
+                        && ex is not OperationCanceledException
+                        && IsContextOverflowError(ex))
+                    {
+                        overflowRetried = true;
+                        this.LogContextOverflowCompaction(iteration, ex);
+
+                        // Discard the partial turn and summarize the history in place, then retry.
+                        text.Clear();
+                        toolUses.Clear();
+                        stopReason = null;
+                        await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
+                        request = request with { Messages = history };
+                    }
+                }
+
+                sink.OnAssistantTextComplete();
+
+                this.LogTurnEnd(iteration, stopReason ?? "(none)", toolUses.Count, text.Length);
+
+                var assistantContent = new List<ContentBlock>();
+                if (text.Length > 0)
+                {
+                    assistantContent.Add(new TextBlock(text.ToString()));
+                }
+
+                assistantContent.AddRange(toolUses);
+                history.Add(new ChatMessage(ChatRole.Assistant, assistantContent));
+
+                // Observe-bus: fire post-sampling hooks after each assistant turn
+                // (non-blocking; drained in the finally below).
+                if (this.hooks is not null)
+                {
+                    pendingHookTasks.AddRange(this.hooks.FirePostSampling(this.BuildHookContext(history), cancellationToken));
+                }
+
+                // The API sets stop_reason="tool_use" whenever tool_use blocks are
+                // present, so drive off the presence of tool calls.
+                if (toolUses.Count == 0)
+                {
+                    if (this.goal is not null)
+                    {
+                        // Goal path: consult the supervisor before generic stop hooks.
+                        // The goal path and the generic stop-hook path are mutually exclusive.
+                        var verdict = await this.goal
+                            .EvaluateAsync(this.BuildHookContext(history), cancellationToken)
+                            .ConfigureAwait(false);
+
+                        switch (verdict)
+                        {
+                            case GoalVerdict.Continue c:
+                                history.Add(new ChatMessage(ChatRole.User, [new TextBlock(c.Nudge)]));
+                                continue;
+
+                            case GoalVerdict.Escalate e:
+                                var answer = this.userQuestion is null
+                                    ? null
+                                    : await this.userQuestion
+                                        .AskAsync(
+                                            e.Question,
+                                            [GoalContinueOption, GoalStopOption],
+                                            false,
+                                            cancellationToken)
+                                        .ConfigureAwait(false);
+
+                                // Any non-empty answer that is not an explicit stop is treated as
+                                // "continue with this guidance". A null answer means no interactive
+                                // user (headless) — stop with the goal unmet.
+                                var wantsContinue = !string.IsNullOrWhiteSpace(answer)
+                                    && !string.Equals(answer, GoalStopOption, StringComparison.OrdinalIgnoreCase);
+
+                                if (wantsContinue)
+                                {
+                                    if (this.goal.TryGrantExtension())
+                                    {
+                                        history.Add(new ChatMessage(ChatRole.User,
+                                            [new TextBlock($"Operator guidance: {answer}\nContinue toward the goal.")]));
+                                        continue;
+                                    }
+
+                                    // The single bounded extension was already spent — surface why we stop.
+                                    sink.OnError("The budget extension was already used; stopping with the goal unmet.");
+                                }
+
+                                this.goal.MarkStoppedUnmet();
+                                break;
+
+                            case GoalVerdict.Stop:
+                                break;
+                        }
+
+                        this.LastGoalStatus = this.goal.Status;
+                        // Fall through to the normal stop completion below.
+                    }
+                    else if (this.hooks is { } activeHooks
+                        && activeHooks.HasStopHooks
+                        && stopContinuations < this.options.MaxStopContinuations)
+                    {
+                        // Generic stop-hook path (only when no goal is active).
+                        var outcome = await activeHooks
+                            .RunStopHooksAsync(this.BuildHookContext(history), stopHookActive, cancellationToken)
+                            .ConfigureAwait(false);
+
+                        if (outcome.ShouldContinue)
+                        {
+                            history.Add(new ChatMessage(ChatRole.User, [new TextBlock(outcome.InjectedMessage)]));
+                            stopHookActive = true;
+                            stopContinuations++;
+                            continue;
+                        }
+                    }
+
+                    // Fire user Stop hooks (observation only — ignore exit code and errors).
+                    if (this.userHooks is not null)
+                    {
+                        try
+                        {
+                            await this.userHooks.RunStopAsync(cancellationToken).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            // User hook errors must not interrupt normal turn completion.
+                            this.LogStopHooksFailed(ex);
+                        }
+                    }
+
+                    sink.OnStopReason(stopReason);
+                    if (stopReason == "max_tokens")
+                    {
+                        sink.OnLimitReached("max_tokens", "The response was truncated (max_tokens reached).");
+                    }
+
+                    return; // turn complete
+                }
+
+                // A tool cycle intervened, so any subsequent stop is a fresh one — not a
+                // direct result of a prior stop-hook continuation. Reset so stop hooks
+                // treat the next natural stop correctly.
+                stopHookActive = false;
+                var resultBlocks = await this.RunToolsAsync(toolUses, sink, cancellationToken).ConfigureAwait(false);
+                history.Add(new ChatMessage(ChatRole.User, resultBlocks));
+            }
+
+            // Only the non-goal path breaks out of the loop via the MaxIterations bound.
+            // Keep history valid (ending on an assistant turn) even when we bail out.
+            history.Add(new ChatMessage(ChatRole.Assistant, [new TextBlock("(stopped: reached the maximum tool iterations)")]));
+            sink.OnLimitReached("max_tool_iterations", $"Reached the maximum of {this.options.MaxIterations} tool iterations.");
+        }
+        finally
+        {
+            // Drain background watchers so their work completes deterministically.
+            if (pendingHookTasks.Count > 0)
+            {
+                try
+                {
+                    await Task.WhenAll(pendingHookTasks).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // Individual hook failures are already swallowed in FirePostSampling.
+                    this.LogPostSamplingDrainFailed(ex);
+                }
+            }
+        }
+    }
+
+    private ReplHookContext BuildHookContext(List<ChatMessage> history) => new()
+    {
+        Messages = history.ToArray(),
+        SystemPrompt = this.options.SystemPrompt,
+        WorkingDirectory = this.options.WorkingDirectory,
+    };
+
+    private async Task<List<ContentBlock>> RunToolsAsync(
+        IReadOnlyList<ToolUseBlock> toolUses,
+        IAgentSink sink,
+        CancellationToken cancellationToken)
+    {
+        var results = new List<ContentBlock>();
+        var context = new ToolContext(this.options.WorkingDirectory)
+        {
+            Sink = sink,
+            Subagents = this.subagents,
+            Todos = this.todos,
+            Schedules = this.schedules,
+            UserQuestion = this.userQuestion,
+            PlanApprover = this.planApprover,
+            BackgroundTasks = this.backgroundTasks,
+            Lsp = this.lsp,
+            Teams = this.teams,
+            TeamTasks = this.teams?.Board,
+            TeamMailbox = this.teams?.Mailbox,
+            TeamStore = this.teams?.Store,
+            TeamName = this.teams?.TeamName,
+            AgentName = this.teams is not null ? TeamConstants.TeamLeadName : null,
+            AllTools = this.tools.All,
+            OnToolsDiscovered = names => this.toolSearch?.AddDiscovered(names),
+            Logger = this.logger,
+        };
+
+        foreach (var toolUse in toolUses)
+        {
+            sink.OnToolCall(toolUse.Name, toolUse.InputJson);
+
+            var tool = this.tools.Resolve(toolUse.Name);
+            if (tool is null)
+            {
+                var unknown = new ToolResult($"Unknown tool '{toolUse.Name}'.", IsError: true);
+                sink.OnToolResult(toolUse.Name, unknown);
+                results.Add(new ToolResultBlock(toolUse.Id, unknown.Content, unknown.IsError));
+                continue;
+            }
+
+            // Check user PreToolUse hooks BEFORE the permission prompt so a hook can
+            // block a call even when permissions would otherwise allow it.
+            if (this.userHooks is not null && this.userHooks.HasPreToolUse)
+            {
+                var hookResult = await this.userHooks
+                    .RunPreToolUseAsync(toolUse.Name, toolUse.InputJson, cancellationToken)
+                    .ConfigureAwait(false);
+
+                if (hookResult.Block)
+                {
+                    var blocked = new ToolResult(
+                        $"Blocked by hook: {hookResult.Message}",
+                        IsError: true);
+                    sink.OnToolResult(toolUse.Name, blocked);
+                    results.Add(new ToolResultBlock(toolUse.Id, blocked.Content, blocked.IsError));
+                    continue;
+                }
+            }
+
+            if (!tool.IsReadOnly)
+            {
+                var allowed = await this.permissions.RequestAsync(tool, toolUse.InputJson, cancellationToken).ConfigureAwait(false);
+                if (!allowed)
+                {
+                    var denied = new ToolResult("Permission denied by the user.", IsError: true);
+                    sink.OnToolResult(toolUse.Name, denied);
+                    results.Add(new ToolResultBlock(toolUse.Id, denied.Content, denied.IsError));
+                    continue;
+                }
+            }
+
+            ToolResult result;
+            try
+            {
+                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(toolUse.InputJson) ? "{}" : toolUse.InputJson);
+                result = await tool.ExecuteAsync(doc.RootElement, context, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                result = new ToolResult($"Tool error: {ex.Message}", IsError: true);
+            }
+
+            // Fire PostToolUse hooks (observation only — ignore exit code and errors).
+            if (this.userHooks is not null)
+            {
+                try
+                {
+                    await this.userHooks
+                        .RunPostToolUseAsync(toolUse.Name, toolUse.InputJson, result.Content, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    // User hook errors must not interrupt normal turn completion.
+                    this.LogPostToolUseHooksFailed(toolUse.Name, ex);
+                }
+            }
+
+            sink.OnToolResult(toolUse.Name, result);
+            results.Add(new ToolResultBlock(toolUse.Id, result.Content, result.IsError));
+
+            // EDIT SEAM: when a mutating file tool succeeds, notify the LSP server
+            // about the new file content (change + save) so it can publish diagnostics.
+            // Failures are swallowed — LSP must never break a tool result.
+            if (!result.IsError && this.lsp is not null && IsMutatingFileTool(toolUse.Name))
+            {
+                await this.NotifyLspFileEditedAsync(toolUse.InputJson, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
+        return results;
+    }
+
+    // -----------------------------------------------------------------------
+    // LSP helpers
+    // -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Polls the registry for up to ~300ms, yielding control between checks, so that
+    /// async LSP notifications in-flight have a chance to arrive before the seam runs.
+    /// Returns as soon as there is at least one pending diagnostic or the budget expires.
+    /// This keeps the turn latency impact negligible and avoids blocking the loop.
+    /// </summary>
+    private static async Task WaitForDiagnosticsAsync(LspDiagnosticRegistry registry, CancellationToken ct)
+    {
+        const int MaxPollMs = 300;
+        const int PollIntervalMs = 50;
+        const int MaxAttempts = MaxPollMs / PollIntervalMs;
+
+        for (var attempt = 0; attempt < MaxAttempts && !ct.IsCancellationRequested; attempt++)
+        {
+            if (registry.PendingCount > 0)
+            {
+                return;
+            }
+
+            await Task.Delay(PollIntervalMs, ct).ConfigureAwait(false);
+        }
+    }
+
+    private static bool IsMutatingFileTool(string toolName)
+    {
+        return toolName == EditTool.ToolName
+            || toolName == WriteFileTool.ToolName
+            || toolName == NotebookEditTool.ToolName;
+    }
+
+    private async Task NotifyLspFileEditedAsync(string? inputJson, CancellationToken ct)
+    {
+        try
+        {
+            // Extract the file path from the tool input JSON.
+            // EditTool / WriteFileTool use "path"; NotebookEditTool uses "notebook_path".
+            string? path = null;
+            using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(inputJson) ? "{}" : inputJson);
+            var root = doc.RootElement;
+            if (root.TryGetProperty("path", out var pathProp) && pathProp.ValueKind == JsonValueKind.String)
+            {
+                path = pathProp.GetString();
+            }
+            else if (root.TryGetProperty("notebook_path", out var nbProp) && nbProp.ValueKind == JsonValueKind.String)
+            {
+                path = nbProp.GetString();
+            }
+
+            if (string.IsNullOrEmpty(path))
+            {
+                return;
+            }
+
+            var fullPath = Path.IsPathRooted(path) ? path : Path.GetFullPath(Path.Combine(this.options.WorkingDirectory, path));
+
+            // Read the current on-disk content (the tool just wrote it).
+            string content;
+            try
+            {
+                content = await File.ReadAllTextAsync(fullPath, ct).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // File might not exist (e.g. delete edit). Skip gracefully.
+                return;
+            }
+
+            // Send didChange (opens if needed) then didSave so the server publishes diagnostics.
+            await this.lsp!.ChangeFileAsync(fullPath, content, ct).ConfigureAwait(false);
+            await this.lsp!.SaveFileAsync(fullPath, ct).ConfigureAwait(false);
+
+            // Clear stale delivered diagnostics for this file so fresh ones surface.
+            // The registry canonicalises file URIs and paths to the same key, so passing
+            // the local path here matches the server's publishDiagnostics URI.
+            this.lspDiagnostics?.ClearDeliveredForFile(fullPath);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // LSP failures must never break a tool result or the turn.
+            this.LogLspNotifyFailed(ex);
+        }
+    }
+
+    private static string FormatDiagnostics(IReadOnlyList<DiagnosticFile> files, string workingDirectory)
+    {
+        var sb = new StringBuilder();
+        sb.AppendLine("<diagnostics>");
+
+        foreach (var file in files)
+        {
+            // Convert URI or path to a relative display path.
+            var displayPath = file.Uri;
+            try
+            {
+                var localPath = Uri.TryCreate(file.Uri, UriKind.Absolute, out var u) && u.IsFile
+                    ? u.LocalPath
+                    : file.Uri;
+                displayPath = Path.GetRelativePath(workingDirectory, localPath);
+            }
+            catch
+            {
+                // Fall back to the raw URI/path.
+            }
+
+            foreach (var diag in file.Diagnostics)
+            {
+                // Wire positions are 0-based; display as 1-based.
+                var line = diag.Range.Start.Line + 1;
+                var character = diag.Range.Start.Character + 1;
+                var severity = diag.Severity.ToString();
+                var sourceCode = (diag.Source, diag.Code) switch
+                {
+                    (not null, not null) => $" ({diag.Source}/{diag.Code})",
+                    (not null, null) => $" ({diag.Source})",
+                    (null, not null) => $" ({diag.Code})",
+                    _ => string.Empty,
+                };
+
+                sb.AppendLine($"{displayPath}:{line}:{character} [{severity}] {diag.Message}{sourceCode}");
+            }
+        }
+
+        sb.Append("</diagnostics>");
+        return sb.ToString();
+    }
+}

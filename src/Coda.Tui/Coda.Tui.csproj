@@ -1,0 +1,35 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\LlmAuth\LlmAuth.csproj" />
+    <ProjectReference Include="..\LlmAuth.Providers.ClaudeAi\LlmAuth.Providers.ClaudeAi.csproj" />
+    <ProjectReference Include="..\LlmAuth.Providers.GitHubCopilot\LlmAuth.Providers.GitHubCopilot.csproj" />
+    <ProjectReference Include="..\LlmAuth.Storage.Windows\LlmAuth.Storage.Windows.csproj" />
+    <ProjectReference Include="..\LlmClient\LlmClient.csproj" />
+    <ProjectReference Include="..\Coda.Agent\Coda.Agent.csproj" />
+    <ProjectReference Include="..\Coda.Mcp\Coda.Mcp.csproj" />
+    <ProjectReference Include="..\Coda.Sdk\Coda.Sdk.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Spectre.Console" Version="0.55.2" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- .NET global tool packaging (only consumed by `dotnet pack`; harmless to normal build/test). -->
+  <PropertyGroup>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>coda</ToolCommandName>
+    <PackageId>Coda.Cli</PackageId>
+    <Authors>Coda</Authors>
+    <Description>Coda — an agentic coding assistant CLI.</Description>
+    <PackageTags>cli;agent;coding-assistant;llm</PackageTags>
+  </PropertyGroup>
+
+</Project>

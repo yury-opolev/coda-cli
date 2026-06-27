@@ -1,0 +1,31 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="coverlet.collector" Version="6.0.4" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="xunit" Version="2.9.3" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="3.1.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Using Include="Xunit" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Coda.Common\Coda.Common.csproj" />
+    <ProjectReference Include="..\..\src\Coda.JsonRpc\Coda.JsonRpc.csproj" />
+    <ProjectReference Include="..\..\src\LlmClient\LlmClient.csproj" />
+    <ProjectReference Include="..\..\src\Coda.Agent\Coda.Agent.csproj" />
+    <ProjectReference Include="..\..\src\LlmAuth\LlmAuth.csproj" />
+    <ProjectReference Include="..\..\src\Coda.Mcp\Coda.Mcp.csproj" />
+    <ProjectReference Include="..\..\src\Coda.Sdk\Coda.Sdk.csproj" />
+  </ItemGroup>
+
+</Project>

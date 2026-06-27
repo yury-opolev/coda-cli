@@ -1,0 +1,590 @@
+using System.Security.Cryptography;
+using System.Text;
+using System.Text.Json.Nodes;
+using Coda.Agent;
+using Coda.Agent.Goals;
+using Coda.JsonRpc;
+using Coda.Sdk.Serve.Messages;
+using LlmClient;
+
+namespace Coda.Sdk.Serve;
+
+
+/// <summary>
+/// Hosts a CodaSession behind a JSON-RPC serve protocol.
+/// Reads requests from <paramref name="input"/> and writes responses/notifications to
+/// <paramref name="output"/> using the serve protocol defined in ServeMethods.
+/// </summary>
+public sealed class ServeHost : IAsyncDisposable
+{
+    private readonly Stream input;
+    private readonly Stream output;
+    private readonly Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory;
+    private readonly string? expectedApiKey;
+    private volatile bool authenticated;
+    private readonly TaskCompletionSource shutdownTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    // Built in RunAsync before handlers are registered.
+    private JsonRpcConnection? connection;
+    private CodaSession? session;
+
+    // Turn-running guard: 0 = idle, 1 = running.
+    private int turnRunning;
+    private CancellationTokenSource? turnCts;
+
+    // Guards the {turnCts publish/clear} vs {interrupt} critical sections so an
+    // interrupt that races in before the turn publishes its CTS is never lost.
+    private readonly object turnLock = new();
+    private bool interruptPending;
+
+    private static readonly HashSet<string> SupportedImageMediaTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        "image/png",
+        "image/jpeg",
+        "image/gif",
+        "image/webp",
+    };
+
+    public ServeHost(
+        Stream input,
+        Stream output,
+        Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
+        string? expectedApiKey = null)
+    {
+        this.input = input ?? throw new ArgumentNullException(nameof(input));
+        this.output = output ?? throw new ArgumentNullException(nameof(output));
+        this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
+        this.expectedApiKey = expectedApiKey;
+        this.authenticated = expectedApiKey is null; // stdio: no auth required.
+    }
+
+    public async Task RunAsync(CancellationToken cancellationToken)
+    {
+        // Build the connection WITHOUT starting its read loop. Building the session below is
+        // slow (tools/teams/telemetry — ~seconds in production), and the orchestrator sends
+        // `initialize` the instant it connects. If the read loop were live during that window,
+        // the request would land before RegisterHandlers ran and be answered with -32601
+        // (Method not found), so initialize would never succeed. Deferring the loop until
+        // every handler is registered closes that race.
+        this.connection = new JsonRpcConnection(this.input, this.output, startListening: false);
+
+        var perm = new WirePermissionPrompt(this.connection);
+        var question = new WireUserQuestionPrompt(this.connection);
+        var plan = new WirePlanApprover(this.connection);
+
+        this.session = this.sessionFactory(perm, question, plan);
+
+        // Push LLM stream-progress to the orchestrator as event/streamProgress — the
+        // liveness pulse the Bridge watchdog consumes and its status surface shows, so a
+        // mid-LLM-call turn reads as "working", not "hung".
+        this.session.StreamProgressSink = new WireStreamProgressSink(this.connection);
+
+        this.RegisterHandlers(cancellationToken);
+
+        // All handlers exist now — safe to start reading inbound requests.
+        this.connection.Start();
+
+        // Wait until shutdown is requested, the CT fires, or the connection closes.
+        using var reg = cancellationToken.Register(() => this.shutdownTcs.TrySetResult());
+
+        try
+        {
+            await this.shutdownTcs.Task.ConfigureAwait(false);
+        }
+        finally
+        {
+            // Cancel-first teardown. Cancel any running turn so its token reaches the
+            // in-flight HttpClient.SendAsync and the turn unwinds, THEN await the session's
+            // async disposal (no sync-over-async — that previously self-deadlocked/leaked a
+            // turn-running session across the host's lifetime). Dispose the connection last.
+            this.CancelTurn();
+
+            if (this.session is not null)
+            {
+                try
+                {
+                    await this.session.DisposeAsync()
+                        .AsTask()
+                        .WaitAsync(TimeSpan.FromSeconds(5))
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort.
+                }
+            }
+
+            if (this.connection is not null)
+            {
+                try
+                {
+                    await this.connection.DisposeAsync().ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort.
+                }
+            }
+        }
+    }
+
+    public async ValueTask DisposeAsync()
+    {
+        // Same cancel-first order as RunAsync's finally: cancel the turn, await the
+        // session's async disposal, then dispose the connection.
+        this.CancelTurn();
+
+        if (this.session is not null)
+        {
+            try
+            {
+                await this.session.DisposeAsync()
+                    .AsTask()
+                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort.
+            }
+        }
+
+        if (this.connection is not null)
+        {
+            try
+            {
+                await this.connection.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort.
+            }
+        }
+    }
+
+    private void RegisterHandlers(CancellationToken hostCt)
+    {
+        var conn = this.connection!;
+        var sess = this.session!;
+
+        // initialize → validate api key (when required), optionally resume a persisted
+        // session, then return protocol version + session id.
+        conn.OnRequestAsync(ServeMethods.Initialize, async (p, ct) =>
+        {
+            var ip = ServeJson.FromNode<InitializeParams>(p);
+
+            if (this.expectedApiKey is not null && !this.authenticated)
+            {
+                if (!IsKeyValid(ip?.ApiKey, this.expectedApiKey))
+                {
+                    throw new JsonRpcRequestException(-32001, "unauthorized");
+                }
+
+                this.authenticated = true;
+            }
+
+            if (ip?.SessionId is { Length: > 0 } resumeId)
+            {
+                var transcripts = new SessionTranscriptStore(sess.Options.WorkingDirectory);
+                var messages = await transcripts.LoadAsync(resumeId, ct).ConfigureAwait(false);
+                if (messages is null)
+                {
+                    throw new JsonRpcRequestException(-32002, "session not found");
+                }
+
+                sess.Resume(resumeId, messages);
+            }
+
+            // Report the telemetry log file so the orchestrator can surface/tail it.
+            // Null when telemetry is off (no file is opened); omitted from the wire then.
+            return ServeJson.ToNode(new InitializeResult(
+                ServeMethods.ProtocolVersion,
+                sess.SessionId,
+                "coda",
+                sess.LogFilePath));
+        });
+
+        // session/prompt → async (long-running turn).
+        conn.OnRequestAsync(ServeMethods.Prompt, async (paramsNode, ct) =>
+        {
+            this.EnsureAuthenticated();
+
+            // Parse and validate BEFORE acquiring the turn guard so a bad image
+            // doesn't leave the guard stuck.
+            var promptParams = ServeJson.FromNode<PromptParams>(paramsNode);
+            var text = promptParams?.Text ?? string.Empty;
+
+            List<ContentBlock>? multimodalContent = null;
+            if (promptParams?.Images is { Count: > 0 } images)
+            {
+                foreach (var img in images)
+                {
+                    if (!SupportedImageMediaTypes.Contains(img.MediaType))
+                    {
+                        throw new InvalidOperationException($"unsupported image media type: {img.MediaType}");
+                    }
+
+                    if (!TryDecodeBase64(img.Base64, out _))
+                    {
+                        throw new InvalidOperationException("image base64 is empty or invalid");
+                    }
+
+                    var decoded = Convert.FromBase64String(img.Base64);
+                    if (decoded.Length > 5 * 1024 * 1024)
+                    {
+                        throw new InvalidOperationException("image exceeds the 5 MB limit");
+                    }
+                }
+
+                multimodalContent = new List<ContentBlock>();
+                foreach (var img in images)
+                {
+                    multimodalContent.Add(new ImageBlock(img.MediaType, img.Base64));
+                }
+
+                multimodalContent.Add(new TextBlock(text));
+            }
+
+            // One turn at a time.
+            if (Interlocked.CompareExchange(ref this.turnRunning, 1, 0) != 0)
+            {
+                throw new InvalidOperationException("busy: a turn is already running");
+            }
+
+            // Publish the turn CTS under the lock and honor any interrupt that arrived
+            // in the window between winning the guard and publishing the CTS.
+            CancellationTokenSource cts;
+            lock (this.turnLock)
+            {
+                cts = CancellationTokenSource.CreateLinkedTokenSource(ct, hostCt);
+                this.turnCts = cts;
+                if (this.interruptPending)
+                {
+                    this.interruptPending = false;
+                    cts.Cancel();
+                }
+            }
+
+            // A hung LLM call is bounded inside the LLM client by its HTTP response-headers /
+            // stream-idle timeouts (see LlmHttpTimeoutConfig) — surfacing as a normal failed
+            // turn with a clear error below. There is intentionally NO turn-level inactivity
+            // watchdog here: timeouts live at the layer of the operation they guard, and the
+            // orchestrator owns the outer session-level bound.
+            var sink = new WireAgentSink(conn);
+
+            try
+            {
+                // The run honors only the user/host interrupt (and host shutdown).
+                var result = multimodalContent is not null
+                    ? await sess.RunAsync(multimodalContent, sink, cts.Token).ConfigureAwait(false)
+                    : await sess.RunAsync(text, sink, cts.Token).ConfigureAwait(false);
+
+                // CodaSession swallows OCE and returns a failure result; an interrupt is the
+                // only cancellation source now.
+                var wasInterrupted = cts.IsCancellationRequested;
+
+                if (wasInterrupted)
+                {
+                    _ = conn.SendNotificationAsync(
+                        ServeMethods.EventTurnComplete,
+                        ServeJson.ToNode(new TurnCompleteEvent(null, true)),
+                        CancellationToken.None);
+
+                    return ServeJson.ToNode(new PromptResult(false, null, true));
+                }
+
+                // A failed turn (e.g. a provider error like an HTTP 400 model_not_supported) must
+                // surface its reason — both as an event/error and in the result — and to stderr.
+                // Otherwise the orchestrator sees a bare ok:false with no idea why.
+                if (!result.Success && !string.IsNullOrEmpty(result.Error))
+                {
+                    _ = conn.SendNotificationAsync(
+                        ServeMethods.EventError,
+                        ServeJson.ToNode(new Messages.ErrorEvent(result.Error!)),
+                        CancellationToken.None);
+                    Console.Error.WriteLine($"coda serve: turn failed: {result.Error}");
+                }
+
+                // Send turnComplete notification (fire-and-forget from handler).
+                _ = conn.SendNotificationAsync(
+                    ServeMethods.EventTurnComplete,
+                    ServeJson.ToNode(new TurnCompleteEvent(result.StopReason, false)),
+                    CancellationToken.None);
+
+                var promptResult = new PromptResult(result.Success, result.StopReason, false)
+                {
+                    GoalStatus = BuildWireGoalStatus(result.Goal),
+                    Error = result.Success ? null : result.Error,
+                };
+                return ServeJson.ToNode(promptResult);
+            }
+            catch (OperationCanceledException)
+            {
+                // The only cancellation source is a user/host interrupt (or host shutdown).
+                _ = conn.SendNotificationAsync(
+                    ServeMethods.EventTurnComplete,
+                    ServeJson.ToNode(new TurnCompleteEvent(null, true)),
+                    CancellationToken.None);
+
+                return ServeJson.ToNode(new PromptResult(false, null, true));
+            }
+            finally
+            {
+                lock (this.turnLock)
+                {
+                    Interlocked.Exchange(ref this.turnRunning, 0);
+                    var tcs = this.turnCts;
+                    this.turnCts = null;
+                    this.interruptPending = false;
+                    tcs?.Dispose();
+
+                    // Discard any steering comment that raced with turn end so it can never leak into
+                    // the next, unrelated turn. Done under the turn lock so it cannot interleave with
+                    // an in-flight session/steer (which only enqueues while turnRunning == 1).
+                    sess.ClearSteering();
+                }
+            }
+        });
+
+        // session/interrupt → cancel the running turn.
+        conn.OnRequest(ServeMethods.Interrupt, _ =>
+        {
+            this.EnsureAuthenticated();
+            this.CancelTurn();
+            return ServeJson.ToNode(new InterruptResult(true));
+        });
+
+        // session/steer → post a steering comment to the RUNNING turn so the orchestrator can redirect
+        // a working session "on the go". Accepted (and enqueued) ONLY while a turn is actually in flight,
+        // under the turn lock — so a steer can never leak into a later, unrelated turn (the inbox is also
+        // cleared at turn end under the same lock). Returns ok=false when no turn is running, so the
+        // orchestrator can fall back to delivering the message as a normal prompt.
+        conn.OnRequest(ServeMethods.Steer, p =>
+        {
+            this.EnsureAuthenticated();
+            var sp = ServeJson.FromNode<SteerParams>(p);
+            var accepted = false;
+            if (!string.IsNullOrWhiteSpace(sp?.Text))
+            {
+                lock (this.turnLock)
+                {
+                    if (this.turnRunning == 1)
+                    {
+                        sess.Steer(sp!.Text);
+                        accepted = true;
+                    }
+                }
+            }
+
+            return ServeJson.ToNode(new SteerResult(accepted));
+        });
+
+        // session/history → all messages.
+        conn.OnRequest(ServeMethods.History, _ =>
+        {
+            this.EnsureAuthenticated();
+            return ServeJson.ToNode(new HistoryResult(this.MapHistory(sess, 0)));
+        });
+
+        // session/messages → messages since index.
+        conn.OnRequest(ServeMethods.Messages, p =>
+        {
+            this.EnsureAuthenticated();
+            var mp = ServeJson.FromNode<MessagesParams>(p);
+            var msgs = this.MapHistory(sess, mp?.SinceIndex ?? 0);
+            return ServeJson.ToNode(new MessagesResult(msgs, sess.History.Count));
+        });
+
+        // session/models → resolve the provider's model list (live → catalog → built-in).
+        conn.OnRequestAsync(ServeMethods.Models, async (p, ct) =>
+        {
+            this.EnsureAuthenticated();
+            var mp = ServeJson.FromNode<ModelsParams>(p);
+            var result = await sess.ListModelsAsync(mp?.Refresh ?? false, ct).ConfigureAwait(false);
+            var models = result.Models
+                .Select(m => new WireModel(m.Id, m.DisplayName, m.ContextLimit))
+                .ToList();
+            return ServeJson.ToNode(new ModelsResult(result.Source.ToString().ToLowerInvariant(), models));
+        });
+
+        // session/setGoal → mutate the session's goal options (persist-until-cleared).
+        conn.OnRequest(ServeMethods.SetGoal, p =>
+        {
+            this.EnsureAuthenticated();
+            var sp = ServeJson.FromNode<SetGoalParams>(p);
+
+            // Parse the optional maxDuration; an explicitly-supplied but invalid value is an error.
+            TimeSpan? parsedDuration = null;
+            if (sp?.MaxDuration is { Length: > 0 } durStr)
+            {
+                if (!DurationParser.TryParse(durStr, out var dur))
+                {
+                    throw new JsonRpcRequestException(-32602, $"invalid maxDuration: '{durStr}'. Use a suffix form (e.g. '30m', '2h', '1d') or hh:mm:ss.");
+                }
+
+                parsedDuration = dur;
+            }
+
+            var goal = string.IsNullOrWhiteSpace(sp?.Goal) ? null : sp!.Goal;
+            sess.Options = sess.Options with
+            {
+                Goal = goal,
+                GoalMaxDuration = parsedDuration,
+                GoalMaxContinuations = sp?.MaxContinuations,
+            };
+
+            var resultDuration = sess.Options.GoalMaxDuration.HasValue
+                ? FormatDuration(sess.Options.GoalMaxDuration.Value)
+                : null;
+
+            return ServeJson.ToNode(new SetGoalResult(
+                Ok: true,
+                Goal: sess.Options.Goal,
+                MaxDuration: resultDuration,
+                MaxContinuations: sess.Options.GoalMaxContinuations));
+        });
+
+        // shutdown → signal the run loop to exit.
+        conn.OnRequest(ServeMethods.Shutdown, _ =>
+        {
+            this.EnsureAuthenticated();
+            this.shutdownTcs.TrySetResult();
+            return ServeJson.ToNode(new InterruptResult(true));
+        });
+    }
+
+    private IReadOnlyList<WireMessage> MapHistory(CodaSession sess, int sinceIndex)
+    {
+        var history = sess.History;
+        var result = new List<WireMessage>();
+
+        for (var i = sinceIndex; i < history.Count; i++)
+        {
+            var msg = history[i];
+            var role = msg.Role.ToString().ToLowerInvariant();
+            var sb = new System.Text.StringBuilder();
+
+            foreach (var block in msg.Content)
+            {
+                if (block is TextBlock tb)
+                {
+                    sb.Append(tb.Text);
+                }
+            }
+
+            result.Add(new WireMessage(role, sb.ToString()));
+        }
+
+        return result;
+    }
+
+    private static WireGoalStatus? BuildWireGoalStatus(GoalStatus? goal)
+    {
+        if (goal is null || goal.Outcome == GoalOutcome.None)
+        {
+            return null;
+        }
+
+        return new WireGoalStatus(
+            goal.Outcome.ToString(),
+            goal.Remaining,
+            goal.Continuations,
+            goal.Elapsed.TotalSeconds,
+            goal.Escalated,
+            goal.ExtensionUsed);
+    }
+
+    private static string FormatDuration(TimeSpan duration)
+    {
+        // Emit a human-readable form: prefer suffix shorthand for whole units, else hh:mm:ss.
+        if (duration.TotalDays >= 1 && duration == TimeSpan.FromDays(Math.Floor(duration.TotalDays)))
+        {
+            return $"{(int)duration.TotalDays}d";
+        }
+
+        if (duration.TotalHours >= 1 && duration == TimeSpan.FromHours(Math.Floor(duration.TotalHours)))
+        {
+            return $"{(int)duration.TotalHours}h";
+        }
+
+        if (duration.TotalMinutes >= 1 && duration == TimeSpan.FromMinutes(Math.Floor(duration.TotalMinutes)))
+        {
+            return $"{(int)duration.TotalMinutes}m";
+        }
+
+        return duration.ToString(@"hh\:mm\:ss");
+    }
+
+    private static bool TryDecodeBase64(string? value, out byte[] bytes)
+    {
+        bytes = [];
+        if (string.IsNullOrEmpty(value))
+        {
+            return false;
+        }
+
+        try
+        {
+            bytes = Convert.FromBase64String(value);
+            return true;
+        }
+        catch (FormatException)
+        {
+            return false;
+        }
+    }
+
+    private void EnsureAuthenticated()
+    {
+        if (!this.authenticated)
+        {
+            throw new JsonRpcRequestException(-32001, "unauthorized");
+        }
+    }
+
+    private static bool IsKeyValid(string? provided, string expected)
+    {
+        if (provided is null)
+        {
+            return false;
+        }
+
+        // Hash both sides to a fixed-length digest so the comparison is constant-time
+        // regardless of the provided key's length (no length side-channel).
+        var a = SHA256.HashData(Encoding.UTF8.GetBytes(provided));
+        var b = SHA256.HashData(Encoding.UTF8.GetBytes(expected));
+        return CryptographicOperations.FixedTimeEquals(a, b);
+    }
+
+    private void CancelTurn()
+    {
+        CancellationTokenSource? tcs;
+        lock (this.turnLock)
+        {
+            tcs = this.turnCts;
+            if (tcs is null)
+            {
+                // No live turn CTS yet. The turn may have won the guard but not published its
+                // CTS, OR its handler may be dispatched but not yet running (the Task.Run
+                // scheduling gap, where turnRunning is still 0). In both cases defer the
+                // interrupt so the next turn cancels itself the moment it publishes its CTS —
+                // otherwise an interrupt fired immediately after a prompt is lost and the turn
+                // hangs. A stray interrupt while truly idle is consumed by the next prompt.
+                this.interruptPending = true;
+                return;
+            }
+        }
+
+        // Cancel only — the running turn's finally owns disposal (disposing here could
+        // race a turn still using the token, and would double-dispose).
+        try
+        {
+            tcs.Cancel();
+        }
+        catch
+        {
+            // Best-effort (already disposed/cancelled).
+        }
+    }
+
+}

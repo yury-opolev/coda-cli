@@ -1,0 +1,23 @@
+<Solution>
+  <Folder Name="/samples/">
+    <Project Path="samples/LlmAuth.Sample/LlmAuth.Sample.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/Coda.Common/Coda.Common.csproj" />
+    <Project Path="src/Coda.JsonRpc/Coda.JsonRpc.csproj" />
+    <Project Path="src/Coda.Agent/Coda.Agent.csproj" />
+    <Project Path="src/Coda.Mcp/Coda.Mcp.csproj" />
+    <Project Path="src/Coda.Sdk/Coda.Sdk.csproj" />
+    <Project Path="src/Coda.Tui/Coda.Tui.csproj" />
+    <Project Path="src/LlmAuth.Providers.ClaudeAi/LlmAuth.Providers.ClaudeAi.csproj" />
+    <Project Path="src/LlmAuth.Providers.GitHubCopilot/LlmAuth.Providers.GitHubCopilot.csproj" />
+    <Project Path="src/LlmAuth.Storage.Windows/LlmAuth.Storage.Windows.csproj" />
+    <Project Path="src/LlmAuth/LlmAuth.csproj" />
+    <Project Path="src/LlmClient/LlmClient.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Coda.Tui.Tests/Coda.Tui.Tests.csproj" />
+    <Project Path="tests/Engine.Tests/Engine.Tests.csproj" />
+    <Project Path="tests/LlmAuth.Tests/LlmAuth.Tests.csproj" />
+  </Folder>
+</Solution>

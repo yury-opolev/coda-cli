@@ -1,0 +1,19 @@
+<Project>
+  <PropertyGroup>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <!-- Versioning. Source of truth is version.json (semantic version, starts 0.1).
+       build.ps1 bumps the build number and regenerates version.props (imported
+       below) so every assembly is stamped with the same current version.
+       Raw `dotnet build` (no script) falls back to the default below. -->
+  <PropertyGroup Label="VersionDefaults">
+    <Version Condition="'$(Version)' == ''">0.1.0</Version>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)version.props"
+          Condition="Exists('$(MSBuildThisFileDirectory)version.props')" />
+</Project>
