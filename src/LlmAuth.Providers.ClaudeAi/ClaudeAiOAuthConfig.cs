@@ -48,10 +48,14 @@ public sealed record ClaudeAiOAuthConfig
     /// </summary>
     public IReadOnlyList<string> AllScopes { get; init; } = BuildAllScopes();
 
-    /// <summary>Production OAuth configuration (PROD_OAUTH_CONFIG).</summary>
+    /// <summary>
+    /// Production OAuth endpoints. No OAuth client id is bundled: supply your own via the
+    /// <c>CLAUDE_CODE_OAUTH_CLIENT_ID</c> environment variable to use subscription OAuth login.
+    /// Otherwise authenticate with an Anthropic API key (<c>ApiKeyProvider</c>) or GitHub Copilot.
+    /// </summary>
     public static ClaudeAiOAuthConfig Prod { get; } = new()
     {
-        ClientId = "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
+        ClientId = string.Empty,
         BaseApiUrl = "https://api.anthropic.com",
         ConsoleAuthorizeUrl = "https://platform.claude.com/oauth/authorize",
         ClaudeAiAuthorizeUrl = "https://claude.com/cai/oauth/authorize",
@@ -61,10 +65,10 @@ public sealed record ClaudeAiOAuthConfig
         ManualRedirectUrl = "https://platform.claude.com/oauth/code/callback",
     };
 
-    /// <summary>Staging OAuth configuration (STAGING_OAUTH_CONFIG; ant builds).</summary>
+    /// <summary>Staging OAuth endpoints. No client id is bundled (see <see cref="Prod"/>).</summary>
     public static ClaudeAiOAuthConfig Staging { get; } = new()
     {
-        ClientId = "22422756-60c9-4084-8eb7-27705fd5cf9a",
+        ClientId = string.Empty,
         BaseApiUrl = "https://api-staging.anthropic.com",
         ConsoleAuthorizeUrl = "https://platform.staging.ant.dev/oauth/authorize",
         ClaudeAiAuthorizeUrl = "https://claude-ai.staging.ant.dev/oauth/authorize",

@@ -32,7 +32,7 @@ public class TokenExchangeTests
         Assert.Equal("authorization_code", root.GetProperty("grant_type").GetString());
         Assert.Equal("AUTHCODE", root.GetProperty("code").GetString());
         Assert.Equal("https://platform.claude.com/oauth/code/callback", root.GetProperty("redirect_uri").GetString());
-        Assert.Equal("9d1c250a-e61b-44d9-88ed-5944d1962f5e", root.GetProperty("client_id").GetString());
+        Assert.Equal(string.Empty, root.GetProperty("client_id").GetString());
         Assert.False(string.IsNullOrEmpty(root.GetProperty("code_verifier").GetString()));
         Assert.Equal(flow.State, root.GetProperty("state").GetString());
 
@@ -75,7 +75,7 @@ public class TokenExchangeTests
         var root = doc.RootElement;
         Assert.Equal("refresh_token", root.GetProperty("grant_type").GetString());
         Assert.Equal("OLDRT", root.GetProperty("refresh_token").GetString());
-        Assert.Equal("9d1c250a-e61b-44d9-88ed-5944d1962f5e", root.GetProperty("client_id").GetString());
+        Assert.Equal(string.Empty, root.GetProperty("client_id").GetString());
         Assert.Equal(
             "user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload",
             root.GetProperty("scope").GetString());

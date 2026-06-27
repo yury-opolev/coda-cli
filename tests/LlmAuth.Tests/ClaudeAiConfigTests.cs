@@ -9,7 +9,7 @@ public class ClaudeAiConfigTests
     {
         var c = ClaudeAiOAuthConfig.Prod;
 
-        Assert.Equal("9d1c250a-e61b-44d9-88ed-5944d1962f5e", c.ClientId);
+        Assert.Equal(string.Empty, c.ClientId);
         Assert.Equal("https://platform.claude.com/v1/oauth/token", c.TokenUrl);
         Assert.Equal("https://claude.com/cai/oauth/authorize", c.ClaudeAiAuthorizeUrl);
         Assert.Equal("https://platform.claude.com/oauth/authorize", c.ConsoleAuthorizeUrl);

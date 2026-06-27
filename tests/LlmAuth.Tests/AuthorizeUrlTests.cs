@@ -33,7 +33,7 @@ public class AuthorizeUrlTests
         // Decoded values.
         NameValueCollection q = HttpUtility.ParseQueryString(flow.AuthorizeUrl.Query);
         Assert.Equal("true", q["code"]);
-        Assert.Equal("9d1c250a-e61b-44d9-88ed-5944d1962f5e", q["client_id"]);
+        Assert.Equal(string.Empty, q["client_id"]); // no official client id bundled; supply via CLAUDE_CODE_OAUTH_CLIENT_ID
         Assert.Equal("code", q["response_type"]);
         Assert.Equal("https://platform.claude.com/oauth/code/callback", q["redirect_uri"]);
         Assert.Equal("S256", q["code_challenge_method"]);

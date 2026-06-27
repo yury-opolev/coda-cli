@@ -1,19 +1,14 @@
 namespace LlmAuth;
 
 /// <summary>
-/// Reproduces the identifying request headers the real Claude Code client sends
-/// to first-party Anthropic endpoints, so the .NET client presents identically:
-/// the <c>claude-cli/{version} (...)</c> User-Agent, <c>x-app: cli</c>,
-/// <c>anthropic-version</c>, and the per-session id. Cross-checked against
-/// the Claude Code v2.1.156 client.
-///
-/// NOTE: the SDK-injected <c>X-Stainless-*</c> headers and per-request
-/// <c>anthropic-beta</c> feature list belong to the model-client sub-project; see
-/// <see cref="StainlessHeaders"/> for the captured constants.
+/// The identifying request headers this client attaches to Anthropic Messages API
+/// requests: a <c>coda/{version}</c> User-Agent, <c>anthropic-version</c>, and a
+/// per-session id. The API-key path (<c>x-api-key</c>) is unaffected by these values;
+/// they are informational client identity, not authentication.
 /// </summary>
 public sealed class AnthropicClientIdentity
 {
-    public const string DefaultVersion = "2.1.156";
+    public const string DefaultVersion = "1.0";
     public const string AnthropicApiVersion = "2023-06-01";
 
     /// <summary>CLI version reported in the User-Agent (MACRO.VERSION).</summary>
@@ -31,22 +26,11 @@ public sealed class AnthropicClientIdentity
     public string SessionId { get; init; } = Guid.NewGuid().ToString();
 
     /// <summary>
-    /// Builds the User-Agent exactly as <c>getUserAgent()</c> does:
-    /// <c>claude-cli/{VERSION} ({USER_TYPE}, {ENTRYPOINT}{, agent-sdk/x}{, client-app/x}{, workload/x})</c>.
-    /// The <c>claude-cli/</c> prefix is load-bearing (server-side log filtering).
+    /// Builds the User-Agent: <c>coda/{VERSION} ({USER_TYPE}, {ENTRYPOINT})</c>.
     /// </summary>
     public string GetUserAgent()
     {
-        var agentSdk = Environment.GetEnvironmentVariable("CLAUDE_AGENT_SDK_VERSION");
-        var clientApp = Environment.GetEnvironmentVariable("CLAUDE_AGENT_SDK_CLIENT_APP");
-        var workload = Environment.GetEnvironmentVariable("CLAUDE_CODE_WORKLOAD");
-
-        var extra = string.Empty;
-        if (!string.IsNullOrEmpty(agentSdk)) { extra += $", agent-sdk/{agentSdk}"; }
-        if (!string.IsNullOrEmpty(clientApp)) { extra += $", client-app/{clientApp}"; }
-        if (!string.IsNullOrEmpty(workload)) { extra += $", workload/{workload}"; }
-
-        return $"claude-cli/{this.Version} ({this.UserType}, {this.Entrypoint}{extra})";
+        return $"coda/{this.Version} ({this.UserType}, {this.Entrypoint})";
     }
 
     /// <summary>
