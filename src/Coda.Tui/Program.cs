@@ -81,9 +81,14 @@ if (await FirstRunDetector.IsFirstRunAsync(context, cts.Token))
     await new SetupWizard().RunAsync(context, cts.Token);
 }
 
-// Connect configured MCP servers (.mcp.json in the working directory) and expose
-// their tools to the agent.
-await using var mcp = new Coda.Mcp.McpClientManager();
+// Connect configured MCP servers (user ~/.coda/.mcp.json + project .mcp.json) and
+// expose their tools to the agent. HTTP servers are built by the factory, which owns
+// the shared HttpClient and runs the OAuth flow interactively when challenged.
+using var mcpHttp = new HttpClient();
+var mcpHttpFactory = new Coda.Mcp.DefaultMcpHttpClientFactory(
+    mcpHttp, store, interactive: true,
+    msg => console.MarkupLine($"[grey50]{Spectre.Console.Markup.Escape(msg)}[/]"));
+await using var mcp = new Coda.Mcp.McpClientManager(mcpHttpFactory);
 var mcpServers = Coda.Mcp.McpConfig.Load(session.WorkingDirectory);
 if (mcpServers.Count > 0)
 {

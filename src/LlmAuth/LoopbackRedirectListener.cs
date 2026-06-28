@@ -4,7 +4,8 @@ using System.Net.Sockets;
 namespace LlmAuth;
 
 /// <summary>The query values captured from the OAuth redirect.</summary>
-public sealed record RedirectResult(string? Code, string? State, string? Error);
+/// <remarks><paramref name="Iss"/> carries the RFC 9207 issuer identifier when present.</remarks>
+public sealed record RedirectResult(string? Code, string? State, string? Error, string? Iss = null);
 
 /// <summary>
 /// High-layer browser-capture: binds a localhost <c>HttpListener</c>, waits for
@@ -68,7 +69,8 @@ public sealed class LoopbackRedirectListener : IDisposable
             query.TryGetValue("code", out var code);
             query.TryGetValue("state", out var state);
             query.TryGetValue("error", out var error);
-            var result = new RedirectResult(code, state, error);
+            query.TryGetValue("iss", out var iss);
+            var result = new RedirectResult(code, state, error, iss);
 
             await WriteSuccessPageAsync(context.Response, result.Error).ConfigureAwait(false);
             return result;

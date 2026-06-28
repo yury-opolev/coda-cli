@@ -45,22 +45,67 @@ public sealed class McpRpcConnectionTests
 public sealed class McpConfigTests
 {
     [Fact]
-    public void Parses_stdio_servers_and_skips_non_stdio()
+    public void Parses_stdio_servers()
     {
         const string json = """
             {"mcpServers":{
-              "fs":{"command":"npx","args":["-y","server-filesystem"],"env":{"ROOT":"/tmp"}},
-              "remote":{"type":"http","url":"https://example.com"}
+              "fs":{"command":"npx","args":["-y","server-filesystem"],"env":{"ROOT":"/tmp"}}
             }}
             """;
 
         var config = McpConfig.Parse(json);
 
-        Assert.True(config.ContainsKey("fs"));
-        Assert.Equal("npx", config["fs"].Command);
-        Assert.Equal(["-y", "server-filesystem"], config["fs"].Args);
-        Assert.Equal("/tmp", config["fs"].Env["ROOT"]);
-        Assert.False(config.ContainsKey("remote"));
+        var fs = Assert.IsType<McpStdioServerConfig>(config["fs"]);
+        Assert.Equal("npx", fs.Command);
+        Assert.Equal(["-y", "server-filesystem"], fs.Args);
+        Assert.Equal("/tmp", fs.Env["ROOT"]);
+    }
+
+    [Fact]
+    public void Parses_http_server_with_default_oauth_and_headers()
+    {
+        const string json = """
+            {"mcpServers":{
+              "remote":{"type":"http","url":"https://mcp.example.com/mcp","headers":{"X-Tenant":"acme"}}
+            }}
+            """;
+
+        var http = Assert.IsType<McpHttpServerConfig>(McpConfig.Parse(json)["remote"]);
+        Assert.Equal("https://mcp.example.com/mcp", http.Url.ToString());
+        Assert.Equal("acme", http.Headers["X-Tenant"]);
+        Assert.Equal(McpAuthMode.OAuth, http.Auth.Mode);
+    }
+
+    [Fact]
+    public void Parses_http_auth_block()
+    {
+        const string json = """
+            {"mcpServers":{
+              "remote":{"type":"streamable-http","url":"https://mcp.example.com",
+                "auth":{"mode":"bearer","token":"secret","clientId":"cid","scopes":["files:read"]}}
+            }}
+            """;
+
+        var http = Assert.IsType<McpHttpServerConfig>(McpConfig.Parse(json)["remote"]);
+        Assert.Equal(McpAuthMode.Bearer, http.Auth.Mode);
+        Assert.Equal("secret", http.Auth.BearerToken);
+        Assert.Equal("cid", http.Auth.ClientId);
+        Assert.Equal(["files:read"], http.Auth.Scopes);
+    }
+
+    [Fact]
+    public void Skips_unknown_transport_and_invalid_http_url()
+    {
+        const string json = """
+            {"mcpServers":{
+              "legacy":{"type":"sse","url":"https://example.com"},
+              "bad":{"type":"http"}
+            }}
+            """;
+
+        var config = McpConfig.Parse(json);
+        Assert.False(config.ContainsKey("legacy"));
+        Assert.False(config.ContainsKey("bad"));
     }
 
     [Fact]
@@ -68,6 +113,42 @@ public sealed class McpConfigTests
     {
         Assert.Empty(McpConfig.Parse("not json"));
         Assert.Empty(McpConfig.Parse("{}"));
+    }
+
+    [Fact]
+    public void Load_merges_user_then_project_overriding_by_name()
+    {
+        var userDir = Path.Combine(Path.GetTempPath(), "coda-mcp-user-" + Guid.NewGuid().ToString("N"));
+        var projectDir = Path.Combine(Path.GetTempPath(), "coda-mcp-proj-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(userDir);
+        Directory.CreateDirectory(projectDir);
+        try
+        {
+            File.WriteAllText(Path.Combine(userDir, ".mcp.json"), """
+                {"mcpServers":{
+                  "shared":{"command":"user-cmd"},
+                  "user-only":{"command":"u"}
+                }}
+                """);
+            File.WriteAllText(Path.Combine(projectDir, ".mcp.json"), """
+                {"mcpServers":{
+                  "shared":{"command":"project-cmd"},
+                  "project-only":{"command":"p"}
+                }}
+                """);
+
+            var config = McpConfig.Load(projectDir, userDir);
+
+            Assert.Equal(3, config.Count);
+            Assert.Equal("project-cmd", Assert.IsType<McpStdioServerConfig>(config["shared"]).Command);
+            Assert.True(config.ContainsKey("user-only"));
+            Assert.True(config.ContainsKey("project-only"));
+        }
+        finally
+        {
+            Directory.Delete(userDir, recursive: true);
+            Directory.Delete(projectDir, recursive: true);
+        }
     }
 }
 

@@ -1,7 +1,9 @@
 # Proposal: User-level MCP config, HTTP transport, and automatic OAuth for MCP servers
 
 - **Date:** 2026-06-28
-- **Status:** Draft / for review
+- **Status:** Implemented (M1–M5) on branch `feature/mcp-http-transport-auth`. Token-store
+  key uses the canonical resource URI (open decision #1). M6 (Client ID Metadata Documents,
+  full step-up escalation, `~/.claude.json` import) remains future work.
 - **Author:** design exploration (Coda)
 - **Scope:** `Coda.Mcp`, `LlmAuth*`, `Coda.Tui` wiring
 

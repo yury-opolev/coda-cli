@@ -3,29 +3,35 @@ using Coda.Agent;
 namespace Coda.Mcp;
 
 /// <summary>
-/// Connects all configured stdio MCP servers, aggregates their tools (as
-/// <see cref="ITool"/>s), and owns the server processes. A failing or slow server
-/// is skipped (logged) rather than blocking startup.
+/// Connects all configured MCP servers (stdio processes and HTTP endpoints), aggregates
+/// their tools (as <see cref="ITool"/>s), and owns the stdio server processes. A failing or
+/// slow server is skipped (logged) rather than blocking startup.
 /// </summary>
 public sealed class McpClientManager : IAsyncDisposable
 {
     private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(20);
 
-    private readonly List<McpStdioClient> clients = [];
+    private readonly List<IMcpClient> clients = [];
     private readonly List<ITool> tools = [];
     private readonly bool ownsClients;
+    private readonly IMcpHttpClientFactory? httpFactory;
 
-    /// <summary>Standard constructor: starts with no clients (use <see cref="ConnectAllAsync"/> to populate).</summary>
-    public McpClientManager()
+    /// <summary>
+    /// Standard constructor: starts with no clients (use <see cref="ConnectAllAsync"/> to
+    /// populate). <paramref name="httpFactory"/> builds clients for HTTP servers; when null,
+    /// HTTP servers are skipped (logged).
+    /// </summary>
+    public McpClientManager(IMcpHttpClientFactory? httpFactory = null)
     {
         this.ownsClients = true;
+        this.httpFactory = httpFactory;
     }
 
     /// <summary>
     /// Test-only constructor: accepts pre-built clients so tests can inject
     /// scripted connections without launching real processes.
     /// </summary>
-    internal McpClientManager(IEnumerable<McpStdioClient> prebuiltClients)
+    internal McpClientManager(IEnumerable<IMcpClient> prebuiltClients)
     {
         this.ownsClients = false;
         this.clients.AddRange(prebuiltClients);
@@ -34,7 +40,7 @@ public sealed class McpClientManager : IAsyncDisposable
     public IReadOnlyList<ITool> Tools => this.tools;
 
     /// <summary>Exposes the connected clients for resource/prompt fan-out operations.</summary>
-    public IReadOnlyList<McpStdioClient> Clients => this.clients;
+    public IReadOnlyList<IMcpClient> Clients => this.clients;
 
     /// <summary>Connect every server in <paramref name="servers"/>; <paramref name="log"/> receives status/errors.</summary>
     public async Task ConnectAllAsync(
@@ -44,13 +50,19 @@ public sealed class McpClientManager : IAsyncDisposable
     {
         foreach (var (name, config) in servers)
         {
-            McpStdioClient? client = null;
+            IMcpClient? client = null;
             try
             {
+                client = this.CreateClient(name, config);
+                if (client is null)
+                {
+                    log?.Invoke($"MCP server '{name}': HTTP transport is not available; skipped.");
+                    continue;
+                }
+
                 using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                 timeoutCts.CancelAfter(ConnectTimeout);
 
-                client = new McpStdioClient(name, config);
                 var serverTools = await client.InitializeAndListToolsAsync(timeoutCts.Token).ConfigureAwait(false);
 
                 this.clients.Add(client);
@@ -70,6 +82,17 @@ public sealed class McpClientManager : IAsyncDisposable
                 }
             }
         }
+    }
+
+    /// <summary>Construct the transport-appropriate client, or null when an HTTP server has no factory.</summary>
+    private IMcpClient? CreateClient(string name, McpServerConfig config)
+    {
+        return config switch
+        {
+            McpStdioServerConfig stdio => new McpStdioClient(name, stdio),
+            McpHttpServerConfig http => this.httpFactory?.Create(name, http),
+            _ => null,
+        };
     }
 
     /// <summary>
@@ -130,7 +153,7 @@ public sealed class McpClientManager : IAsyncDisposable
         return await client.GetPromptAsync(promptName, null, cancellationToken).ConfigureAwait(false);
     }
 
-    private async Task<IReadOnlyList<McpPromptInfo>> TryListPromptsAsync(McpStdioClient client, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<McpPromptInfo>> TryListPromptsAsync(IMcpClient client, CancellationToken cancellationToken)
     {
         try
         {
@@ -142,7 +165,7 @@ public sealed class McpClientManager : IAsyncDisposable
         }
     }
 
-    private async Task<IReadOnlyList<McpResourceInfo>> TryListResourcesAsync(McpStdioClient client, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<McpResourceInfo>> TryListResourcesAsync(IMcpClient client, CancellationToken cancellationToken)
     {
         try
         {

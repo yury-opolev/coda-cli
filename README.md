@@ -229,12 +229,41 @@ shows or sets the model; `/clear` resets the conversation.
 
 ### MCP servers
 
-Drop a `.mcp.json` in the working directory; Coda connects the stdio servers at
-startup and exposes their tools to the agent (and subagents):
+Coda connects MCP servers declared in `.mcp.json` and exposes their tools to the agent
+(and subagents). Two layers are merged, like skills and settings: a **user** file at
+`~/.coda/.mcp.json` and a **project** file at `<workdir>/.mcp.json` (project entries override
+user entries by name).
+
+**Stdio** (a locally launched process):
 
 ```json
 { "mcpServers": { "filesystem": { "command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "."] } } }
 ```
+
+**HTTP** (a remote Streamable-HTTP server). Add `"type": "http"` and a `url`; optional
+static `headers` are sent on every request:
+
+```json
+{ "mcpServers": { "remote": { "type": "http", "url": "https://mcp.example.com/mcp" } } }
+```
+
+HTTP servers authenticate automatically via the **MCP OAuth flow**: on a 401 challenge Coda
+performs RFC 9728 → RFC 8414/OIDC discovery, registers a client (configured id or RFC 7591
+dynamic registration), runs an OAuth 2.1 + PKCE login in your browser (with the RFC 8707
+`resource` parameter and RFC 9207 `iss` validation), then stores and refreshes the token
+(encrypted, under `~/.coda/credentials`, keyed by the server's canonical URI). Control it
+with an `auth` block:
+
+```json
+{ "mcpServers": { "remote": {
+  "type": "http", "url": "https://mcp.example.com/mcp",
+  "auth": { "mode": "oauth", "clientId": "optional-preregistered-id", "scopes": ["files:read"] }
+} } }
+```
+
+`mode` is `oauth` (default), `bearer` (static `"token"`), or `none`. Headless runs
+(`coda run`) reuse stored tokens but never open a browser; a server needing fresh sign-in is
+skipped with a note.
 
 > The chat path uses the native **Anthropic Messages API** (Claude.ai OAuth +
 > Anthropic API key). GitHub Copilot chat uses a different, OpenAI-shaped API.
@@ -444,6 +473,7 @@ project files if they exist (it never writes to them).
 | Teams | `~/.coda/teams/` | |
 | Plugins | `~/.coda/`, `<project>/.coda/plugins/` | |
 | Skills | `~/.coda/skills/`, `<project>/.coda/skills/` (+ read-only `~/.claude/skills/`) | `SKILL.md` per skill |
+| MCP servers | `~/.coda/.mcp.json`, `<project>/.mcp.json` | stdio + HTTP; project overrides user |
 | Session memory | `<project>/.coda/SESSION_MEMORY.md` | when enabled |
 | Telemetry logs | `~/.coda/logs/coda-<timestamp>-<pid>.log` | JSON-lines; opt-in; secrets redacted |
 
