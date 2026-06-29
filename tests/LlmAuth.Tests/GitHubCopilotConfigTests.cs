@@ -57,6 +57,20 @@ public sealed class GitHubCopilotConfigTests
         Assert.Throws<ArgumentException>(() => GitHubCopilotConfig.ForEnterprise("   "));
     }
 
+    [Theory]
+    [InlineData("copilot-api.microsoft.ghe.com")]
+    [InlineData("https://copilot-api.microsoft.ghe.com")]
+    public void ForEnterprise_CopilotHostPastedByMistake_RecoversGheHost(string domain)
+    {
+        // If the user pastes the Copilot host instead of the GHE host, recover the GHE host so
+        // every derived URL is consistent and we never double the "copilot-api." prefix.
+        var config = GitHubCopilotConfig.ForEnterprise(domain);
+
+        Assert.Equal("https://microsoft.ghe.com/login/device/code", config.DeviceCodeUrl);
+        Assert.Equal("https://microsoft.ghe.com/login/oauth/access_token", config.TokenUrl);
+        Assert.Equal("https://copilot-api.microsoft.ghe.com", config.ApiBaseUrl);
+    }
+
     // ── Default invariant ───────────────────────────────────────────────────────
 
     [Fact]

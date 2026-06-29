@@ -81,6 +81,15 @@ public sealed record GitHubCopilotConfig
             .Replace("https://", string.Empty, StringComparison.OrdinalIgnoreCase)
             .Replace("http://", string.Empty, StringComparison.OrdinalIgnoreCase)
             .TrimEnd('/');
+
+        // Recover the GHE host if the caller pasted the Copilot host (copilot-api.<ghe>) by
+        // mistake, so the device/token AND inference URLs are all derived consistently and we
+        // never produce a doubled "copilot-api." prefix.
+        if (d.StartsWith("copilot-api.", StringComparison.OrdinalIgnoreCase))
+        {
+            d = d["copilot-api.".Length..];
+        }
+
         return Default with
         {
             DeviceCodeUrl = $"https://{d}/login/device/code",
