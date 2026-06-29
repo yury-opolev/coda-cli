@@ -68,7 +68,9 @@ public sealed class GitHubCopilotProvider : IDeviceCodeLoginProvider, IDisposabl
         await onPrompt(prompt, cancellationToken).ConfigureAwait(false);
 
         var gitHubToken = await this.PollForGitHubTokenAsync(device, cancellationToken).ConfigureAwait(false);
-        return await this.ExchangeForCredentialAsync(gitHubToken, cancellationToken).ConfigureAwait(false);
+        return this.config.UseExchange
+            ? await this.ExchangeForCredentialAsync(gitHubToken, cancellationToken).ConfigureAwait(false)
+            : BuildDirectCredential(gitHubToken);
     }
 
     public bool NeedsRefresh(Credential credential)
@@ -87,7 +89,9 @@ public sealed class GitHubCopilotProvider : IDeviceCodeLoginProvider, IDisposabl
             throw new TokenRefreshException("No GitHub token available to refresh the Copilot token.");
         }
 
-        return await this.ExchangeForCredentialAsync(credential.RefreshToken, cancellationToken).ConfigureAwait(false);
+        return this.config.UseExchange
+            ? await this.ExchangeForCredentialAsync(credential.RefreshToken, cancellationToken).ConfigureAwait(false)
+            : BuildDirectCredential(credential.RefreshToken);
     }
 
     public AuthHeaders GetAuthHeaders(Credential credential)
@@ -109,6 +113,8 @@ public sealed class GitHubCopilotProvider : IDeviceCodeLoginProvider, IDisposabl
             // direct user turn (vs "agent" for tool follow-ups). Without it some
             // accounts return 400.
             ["X-Initiator"] = "user",
+            // Required by GHE data-residency tenants; accepted (no-op) by the public API.
+            ["X-GitHub-Api-Version"] = "2026-06-01",
         });
     }
 
@@ -233,6 +239,24 @@ public sealed class GitHubCopilotProvider : IDeviceCodeLoginProvider, IDisposabl
                 : null,
         };
     }
+
+    /// <summary>
+    /// Build a credential where the raw GitHub device-flow OAuth token IS the bearer
+    /// (no exchange). Used for GHE data-residency tenants where <c>copilot-api.{host}</c>
+    /// accepts the token directly. <see cref="Credential.ExpiresAt"/> is left null so
+    /// <see cref="NeedsRefresh"/> never triggers an unnecessary re-poll, and
+    /// <see cref="Credential.RefreshToken"/> is set to the same token so
+    /// <see cref="RefreshAsync"/> can still be driven explicitly if needed.
+    /// </summary>
+    private static Credential BuildDirectCredential(string gitHubToken) =>
+        new()
+        {
+            ProviderId = Id,
+            Kind = CredentialKind.OAuth,
+            AccessToken = gitHubToken,
+            RefreshToken = gitHubToken,
+            ExpiresAt = null,
+        };
 
     public void Dispose()
     {

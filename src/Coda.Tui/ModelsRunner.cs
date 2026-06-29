@@ -61,7 +61,8 @@ public static class ModelsRunner
         }
 
         using var claude = new ClaudeAiProvider();
-        using var copilot = new GitHubCopilotProvider();
+        var copilotConfig = GitHubCopilotConfig.FromEnvironment();
+        using var copilot = new GitHubCopilotProvider(copilotConfig);
         var apiKey = new ApiKeyProvider();
         var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
 

@@ -41,7 +41,8 @@ if (ImmediateCli.TryHandle(args, Console.Out) is int immediateExit)
 var console = AnsiConsole.Console;
 
 using var claude = new ClaudeAiProvider();
-using var copilot = new GitHubCopilotProvider();
+var copilotConfig = GitHubCopilotConfig.FromEnvironment();
+using var copilot = new GitHubCopilotProvider(copilotConfig);
 var apiKey = new ApiKeyProvider();
 var store = CredentialStoreFactory.Create();
 var credentials = new CredentialManager(store, [claude, copilot, apiKey]);

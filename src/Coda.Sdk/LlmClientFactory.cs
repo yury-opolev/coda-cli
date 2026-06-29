@@ -44,7 +44,8 @@ public static class LlmClientFactory
 
         if (providerId == GitHubCopilotProvider.Id)
         {
-            return new CopilotChatClient(credentials, providerId, httpClient, logger: factory.CreateLogger("LlmClient.Copilot"), timeoutConfig: timeouts, progressSink: streamProgress);
+            var copilotConfig = GitHubCopilotConfig.FromEnvironment();
+            return new CopilotChatClient(credentials, providerId, httpClient, baseUrl: copilotConfig.ApiBaseUrl, logger: factory.CreateLogger("LlmClient.Copilot"), timeoutConfig: timeouts, progressSink: streamProgress);
         }
 
         return null;
