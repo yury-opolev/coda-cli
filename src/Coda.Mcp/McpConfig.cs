@@ -3,15 +3,55 @@ using System.Text.Json;
 namespace Coda.Mcp;
 
 /// <summary>
-/// Loads stdio MCP server definitions from <c>.mcp.json</c> in the working
-/// directory: <c>{ "mcpServers": { name: { command, args[], env{}, type? } } }</c>.
-/// Only stdio servers (no <c>type</c>, or <c>type:"stdio"</c>) are returned.
+/// Loads MCP server definitions from <c>.mcp.json</c> files:
+/// <c>{ "mcpServers": { name: { command, args[], env{}, type? } | { type:"http", url, headers{}, auth{} } } }</c>.
+/// <para>
+/// Two layers are merged, mirroring how skills and <c>settings.json</c> resolve:
+/// a user file at <c>~/.coda/.mcp.json</c> (lowest precedence) and a project file at
+/// <c>&lt;workingDirectory&gt;/.mcp.json</c> (highest). Project entries override user
+/// entries by name.
+/// </para>
 /// </summary>
 public static class McpConfig
 {
-    public static IReadOnlyDictionary<string, McpServerConfig> Load(string workingDirectory)
+    private const string FileName = ".mcp.json";
+
+    /// <summary>
+    /// Load and merge the user (<c>~/.coda/.mcp.json</c>) and project
+    /// (<c>&lt;workingDirectory&gt;/.mcp.json</c>) server definitions. Project entries
+    /// override user entries by name.
+    /// </summary>
+    /// <param name="workingDirectory">The project directory holding <c>.mcp.json</c>.</param>
+    /// <param name="userMcpDir">
+    /// The directory holding the user-level <c>.mcp.json</c>. Defaults to
+    /// <c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c> when null.
+    /// </param>
+    public static IReadOnlyDictionary<string, McpServerConfig> Load(string workingDirectory, string? userMcpDir = null)
     {
-        var path = Path.Combine(workingDirectory, ".mcp.json");
+        var userBase = userMcpDir
+            ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
+
+        var userServers = LoadFile(Path.Combine(userBase, FileName));
+        var projectServers = LoadFile(Path.Combine(workingDirectory, FileName));
+
+        if (userServers.Count == 0)
+        {
+            return projectServers;
+        }
+
+        // Merge: user first, then project overlays by name (project wins).
+        var merged = new Dictionary<string, McpServerConfig>(userServers, StringComparer.Ordinal);
+        foreach (var (name, config) in projectServers)
+        {
+            merged[name] = config;
+        }
+
+        return merged;
+    }
+
+    private static IReadOnlyDictionary<string, McpServerConfig> LoadFile(string path)
+    {
         return File.Exists(path) ? Parse(File.ReadAllText(path)) : new Dictionary<string, McpServerConfig>();
     }
 
@@ -37,47 +77,110 @@ public static class McpConfig
 
             foreach (var server in servers.EnumerateObject())
             {
-                var config = server.Value;
-                var type = config.TryGetProperty("type", out var t) ? t.GetString() : null;
-                if (type is not null and not "stdio")
+                var config = ParseServer(server.Value);
+                if (config is not null)
                 {
-                    continue; // only stdio servers are supported here
+                    result[server.Name] = config;
                 }
-
-                var command = config.TryGetProperty("command", out var c) ? c.GetString() : null;
-                if (string.IsNullOrEmpty(command))
-                {
-                    continue;
-                }
-
-                var args = new List<string>();
-                if (config.TryGetProperty("args", out var a) && a.ValueKind == JsonValueKind.Array)
-                {
-                    foreach (var arg in a.EnumerateArray())
-                    {
-                        if (arg.ValueKind == JsonValueKind.String)
-                        {
-                            args.Add(arg.GetString()!);
-                        }
-                    }
-                }
-
-                var env = new Dictionary<string, string>(StringComparer.Ordinal);
-                if (config.TryGetProperty("env", out var e) && e.ValueKind == JsonValueKind.Object)
-                {
-                    foreach (var pair in e.EnumerateObject())
-                    {
-                        if (pair.Value.ValueKind == JsonValueKind.String)
-                        {
-                            env[pair.Name] = pair.Value.GetString()!;
-                        }
-                    }
-                }
-
-                result[server.Name] = new McpServerConfig(command, args, env);
             }
         }
 
         return result;
+    }
+
+    private static McpServerConfig? ParseServer(JsonElement config)
+    {
+        var type = config.TryGetProperty("type", out var t) ? t.GetString() : null;
+        return type switch
+        {
+            "http" or "streamable-http" => ParseHttp(config),
+            null or "stdio" => ParseStdio(config),
+            _ => null, // unknown transport (e.g. legacy "sse") is skipped
+        };
+    }
+
+    private static McpStdioServerConfig? ParseStdio(JsonElement config)
+    {
+        var command = config.TryGetProperty("command", out var c) ? c.GetString() : null;
+        if (string.IsNullOrEmpty(command))
+        {
+            return null;
+        }
+
+        var args = new List<string>();
+        if (config.TryGetProperty("args", out var a) && a.ValueKind == JsonValueKind.Array)
+        {
+            foreach (var arg in a.EnumerateArray())
+            {
+                if (arg.ValueKind == JsonValueKind.String)
+                {
+                    args.Add(arg.GetString()!);
+                }
+            }
+        }
+
+        return new McpStdioServerConfig(command, args, ParseStringMap(config, "env"));
+    }
+
+    private static McpHttpServerConfig? ParseHttp(JsonElement config)
+    {
+        var url = config.TryGetProperty("url", out var u) ? u.GetString() : null;
+        if (string.IsNullOrEmpty(url) || !Uri.TryCreate(url, UriKind.Absolute, out var uri))
+        {
+            return null;
+        }
+
+        return new McpHttpServerConfig(uri, ParseStringMap(config, "headers"), ParseAuth(config));
+    }
+
+    private static McpAuthConfig ParseAuth(JsonElement config)
+    {
+        if (!config.TryGetProperty("auth", out var auth) || auth.ValueKind != JsonValueKind.Object)
+        {
+            return McpAuthConfig.Default;
+        }
+
+        var mode = auth.TryGetProperty("mode", out var m) ? m.GetString() : null;
+        var parsedMode = mode?.ToLowerInvariant() switch
+        {
+            "none" => McpAuthMode.None,
+            "bearer" => McpAuthMode.Bearer,
+            _ => McpAuthMode.OAuth,
+        };
+
+        var clientId = auth.TryGetProperty("clientId", out var ci) ? ci.GetString() : null;
+        var token = auth.TryGetProperty("token", out var tok) ? tok.GetString() : null;
+
+        List<string>? scopes = null;
+        if (auth.TryGetProperty("scopes", out var sc) && sc.ValueKind == JsonValueKind.Array)
+        {
+            scopes = [];
+            foreach (var scope in sc.EnumerateArray())
+            {
+                if (scope.ValueKind == JsonValueKind.String)
+                {
+                    scopes.Add(scope.GetString()!);
+                }
+            }
+        }
+
+        return new McpAuthConfig(parsedMode, clientId, scopes, token);
+    }
+
+    private static IReadOnlyDictionary<string, string> ParseStringMap(JsonElement config, string property)
+    {
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (config.TryGetProperty(property, out var obj) && obj.ValueKind == JsonValueKind.Object)
+        {
+            foreach (var pair in obj.EnumerateObject())
+            {
+                if (pair.Value.ValueKind == JsonValueKind.String)
+                {
+                    map[pair.Name] = pair.Value.GetString()!;
+                }
+            }
+        }
+
+        return map;
     }
 }

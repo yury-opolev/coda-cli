@@ -76,7 +76,12 @@ public static class HeadlessRunner
         var apiKey = new ApiKeyProvider();
         var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
 
-        await using var mcp = new McpClientManager();
+        // HTTP MCP servers run non-interactively here: stored tokens still work, but a
+        // server that needs a fresh browser sign-in is skipped (logged), never blocking.
+        using var mcpHttp = new HttpClient();
+        var mcpHttpFactory = new DefaultMcpHttpClientFactory(
+            mcpHttp, CredentialStoreFactory.Create(), interactive: false, msg => Console.Error.WriteLine(msg));
+        await using var mcp = new McpClientManager(mcpHttpFactory);
         var mcpServers = McpConfig.Load(workingDirectory);
         if (mcpServers.Count > 0)
         {

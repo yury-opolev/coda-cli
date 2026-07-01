@@ -10,7 +10,7 @@ namespace Coda.Mcp;
 /// <c>initialize</c> handshake, lists tools, and forwards <c>tools/call</c>.
 /// JSON-RPC framing is delegated to <see cref="McpRpcConnection"/>.
 /// </summary>
-public class McpStdioClient : IAsyncDisposable
+public class McpStdioClient : IMcpClient
 {
     private const string ProtocolVersion = "2025-06-18";
 
@@ -19,7 +19,7 @@ public class McpStdioClient : IAsyncDisposable
     private readonly CancellationTokenSource readLoopCts = new();
     private readonly Task readLoop;
 
-    public McpStdioClient(string serverName, McpServerConfig config)
+    public McpStdioClient(string serverName, McpStdioServerConfig config)
     {
         ArgumentException.ThrowIfNullOrEmpty(serverName);
         ArgumentNullException.ThrowIfNull(config);
@@ -108,7 +108,7 @@ public class McpStdioClient : IAsyncDisposable
         try
         {
             var result = await this.rpc.SendRequestAsync("resources/list", null, cancellationToken).ConfigureAwait(false);
-            return this.ParseResourceList(result);
+            return McpResultParsers.ParseResourceList(result, this.ServerName);
         }
         catch (McpException)
         {
@@ -124,7 +124,7 @@ public class McpStdioClient : IAsyncDisposable
     {
         var parameters = new JsonObject { ["uri"] = uri };
         var result = await this.rpc.SendRequestAsync("resources/read", parameters, cancellationToken).ConfigureAwait(false);
-        return this.ParseResourceContents(result);
+        return McpResultParsers.ParseResourceContents(result);
     }
 
     /// <summary>
@@ -136,7 +136,7 @@ public class McpStdioClient : IAsyncDisposable
         try
         {
             var result = await this.rpc.SendRequestAsync("prompts/list", null, cancellationToken).ConfigureAwait(false);
-            return this.ParsePromptList(result);
+            return McpResultParsers.ParsePromptList(result, this.ServerName);
         }
         catch (McpException)
         {
@@ -159,106 +159,7 @@ public class McpStdioClient : IAsyncDisposable
         };
 
         var result = await this.rpc.SendRequestAsync("prompts/get", parameters, cancellationToken).ConfigureAwait(false);
-        return this.ParsePromptMessages(result);
-    }
-
-    private IReadOnlyList<McpPromptInfo> ParsePromptList(JsonElement result)
-    {
-        var prompts = new List<McpPromptInfo>();
-        if (!result.TryGetProperty("prompts", out var array) || array.ValueKind != JsonValueKind.Array)
-        {
-            return prompts;
-        }
-
-        foreach (var item in array.EnumerateArray())
-        {
-            var name = item.TryGetProperty("name", out var n) ? n.GetString() : null;
-            if (string.IsNullOrEmpty(name))
-            {
-                continue;
-            }
-
-            var description = item.TryGetProperty("description", out var d) ? d.GetString() : null;
-            prompts.Add(new McpPromptInfo(this.ServerName, name!, description));
-        }
-
-        return prompts;
-    }
-
-    private string ParsePromptMessages(JsonElement result)
-    {
-        if (!result.TryGetProperty("messages", out var array) || array.ValueKind != JsonValueKind.Array)
-        {
-            return string.Empty;
-        }
-
-        var lines = new List<string>();
-        foreach (var item in array.EnumerateArray())
-        {
-            var role = item.TryGetProperty("role", out var r) ? r.GetString() : null;
-            string? text = null;
-            if (item.TryGetProperty("content", out var content))
-            {
-                if (content.TryGetProperty("text", out var t))
-                {
-                    text = t.GetString();
-                }
-            }
-
-            if (role is not null && text is not null)
-            {
-                lines.Add($"{role}: {text}");
-            }
-        }
-
-        return string.Join('\n', lines);
-    }
-
-    private IReadOnlyList<McpResourceInfo> ParseResourceList(JsonElement result)
-    {
-        var resources = new List<McpResourceInfo>();
-        if (!result.TryGetProperty("resources", out var array) || array.ValueKind != JsonValueKind.Array)
-        {
-            return resources;
-        }
-
-        foreach (var item in array.EnumerateArray())
-        {
-            var uri = item.TryGetProperty("uri", out var u) ? u.GetString() : null;
-            var name = item.TryGetProperty("name", out var n) ? n.GetString() : null;
-            if (string.IsNullOrEmpty(uri) || string.IsNullOrEmpty(name))
-            {
-                continue;
-            }
-
-            var mimeType = item.TryGetProperty("mimeType", out var m) ? m.GetString() : null;
-            resources.Add(new McpResourceInfo(this.ServerName, uri!, name!, mimeType));
-        }
-
-        return resources;
-    }
-
-    private string ParseResourceContents(JsonElement result)
-    {
-        if (!result.TryGetProperty("contents", out var array) || array.ValueKind != JsonValueKind.Array)
-        {
-            return string.Empty;
-        }
-
-        var builder = new StringBuilder();
-        foreach (var item in array.EnumerateArray())
-        {
-            if (item.TryGetProperty("text", out var text))
-            {
-                builder.Append(text.GetString());
-            }
-            else if (item.TryGetProperty("blob", out _))
-            {
-                builder.Append("[binary content]");
-            }
-        }
-
-        return builder.ToString();
+        return McpResultParsers.ParsePromptMessages(result);
     }
 
     public async ValueTask DisposeAsync()

@@ -7,14 +7,14 @@ namespace Coda.Mcp;
 /// <summary>
 /// Bridges an MCP server tool to the agent's <see cref="ITool"/> abstraction. The
 /// advertised name is <c>mcp__{server}__{tool}</c> (matching the reference client);
-/// calls are forwarded to the server via <see cref="McpStdioClient"/>.
+/// calls are forwarded to the server via an <see cref="IMcpClient"/>.
 /// </summary>
 public sealed class McpTool : ITool
 {
-    private readonly McpStdioClient client;
+    private readonly IMcpClient client;
     private readonly McpToolInfo info;
 
-    public McpTool(McpStdioClient client, string serverName, McpToolInfo info)
+    public McpTool(IMcpClient client, string serverName, McpToolInfo info)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.info = info ?? throw new ArgumentNullException(nameof(info));
