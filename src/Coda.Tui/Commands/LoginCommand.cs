@@ -33,7 +33,7 @@ public sealed class LoginCommand : ISlashCommand
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        var provider = args.Count > 0 ? context.ResolveProvider(args[0]) : context.ActiveProvider;
+        var provider = args.Count > 0 ? context.ResolveProvider(args[0]) : ChooseProvider(context);
         if (provider is null)
         {
             context.Console.MarkupLine(Theme.ErrorMarkup($"Unknown provider '{args[0]}'."));
@@ -45,6 +45,7 @@ public sealed class LoginCommand : ISlashCommand
         {
             context.Console.MarkupLine(Theme.DimMarkup($"{provider.DisplayName} uses {ApiKeyProvider.EnvVarName} — no interactive login needed."));
             context.SetActiveProvider(provider);
+            PersistDefaultProvider(provider);
             return CommandResult.Continue;
         }
 
@@ -60,6 +61,7 @@ public sealed class LoginCommand : ISlashCommand
             if (credential is not null)
             {
                 context.SetActiveProvider(provider);
+                PersistDefaultProvider(provider);
                 context.Console.MarkupLine(Theme.SuccessMarkup($"Signed in to {provider.DisplayName}."));
                 if (!string.IsNullOrEmpty(credential.Account?.EmailAddress))
                 {
@@ -82,6 +84,44 @@ public sealed class LoginCommand : ISlashCommand
         }
 
         return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// Pick the provider to sign in to when <c>/login</c> is called with no argument:
+    /// an interactive picker when a terminal is attached and more than one provider
+    /// exists (so the user isn't silently sent to whatever happens to be active),
+    /// otherwise the active provider.
+    /// </summary>
+    private static ProviderDescriptor ChooseProvider(CommandContext context)
+    {
+        if (!context.Console.Profile.Capabilities.Interactive || context.Providers.Count <= 1)
+        {
+            return context.ActiveProvider;
+        }
+
+        return context.Console.Prompt(
+            new SelectionPrompt<ProviderDescriptor>()
+                .Title(Theme.DimMarkup("Sign in to which provider?"))
+                .UseConverter(p => p.DisplayName)
+                .AddChoices(context.Providers));
+    }
+
+    /// <summary>
+    /// Persist the signed-in provider as the startup default so it survives restarts.
+    /// The default model is cleared so the new provider's own default is used rather than
+    /// a stale cross-provider model id. Best-effort — a settings write failure must not
+    /// fail the sign-in.
+    /// </summary>
+    private static void PersistDefaultProvider(ProviderDescriptor provider)
+    {
+        try
+        {
+            SettingsWriter.SetUserDefaults(defaultProvider: provider.Id, defaultModel: string.Empty);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Leave the default unchanged; the session still uses the just-selected provider.
+        }
     }
 
     private static async Task<Credential> LoginLoopbackAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
