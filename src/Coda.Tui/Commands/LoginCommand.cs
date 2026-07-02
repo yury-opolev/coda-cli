@@ -1,7 +1,9 @@
+using Coda.Agent.Settings;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
+using LlmAuth.Providers.GitHubCopilot;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -98,21 +100,95 @@ public sealed class LoginCommand : ISlashCommand
 
     private static async Task<Credential> LoginDeviceAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
     {
+        // GitHub Copilot is deployment-aware: ask whether to sign in to public github.com
+        // or a GitHub Enterprise Cloud data-residency tenant, persist the choice, and run
+        // the device flow against that instance — so enterprise users authenticate against
+        // their own host and are not re-prompted on later sessions.
+        if (provider.Id == GitHubCopilotProvider.Id)
+        {
+            return await LoginCopilotDeviceAsync(context, provider, cancellationToken).ConfigureAwait(false);
+        }
+
         return await context.Credentials.LoginWithDeviceCodeAsync(
             provider.Id,
             (prompt, ct) =>
             {
-                var panel = new Panel(new Markup(
-                    $"{Theme.DimMarkup("1. Open")} {Theme.AccentMarkup(prompt.VerificationUri.ToString())}\n" +
-                    $"{Theme.DimMarkup("2. Enter code")} {Theme.BoldMarkup(prompt.UserCode)}"))
-                {
-                    Header = new PanelHeader($" Sign in to {provider.DisplayName} ", Justify.Left),
-                    Border = BoxBorder.Rounded,
-                };
-                context.Console.Write(panel);
-                context.Console.MarkupLine(Theme.DimMarkup("Waiting for you to authorize…"));
+                ShowDevicePrompt(context, provider, prompt);
                 return Task.CompletedTask;
             },
             cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    private static async Task<Credential> LoginCopilotDeviceAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
+    {
+        var enterpriseDomain = SettingsLoader.Load(context.Session.WorkingDirectory).GitHubEnterpriseDomain;
+
+        if (context.Console.Profile.Capabilities.Interactive)
+        {
+            const string publicChoice = "Public github.com";
+            const string enterpriseChoice = "GitHub Enterprise (data residency, *.ghe.com)";
+            var deployment = context.Console.Prompt(
+                new SelectionPrompt<string>()
+                    .Title(Theme.DimMarkup("Which GitHub Copilot deployment?"))
+                    .AddChoices(publicChoice, enterpriseChoice));
+
+            if (deployment == enterpriseChoice)
+            {
+                var entered = context.Console.Prompt(
+                    new TextPrompt<string>(Theme.DimMarkup("GitHub Enterprise domain (e.g. octocorp.ghe.com):"))
+                        .DefaultValue(string.IsNullOrWhiteSpace(enterpriseDomain) ? string.Empty : enterpriseDomain)
+                        .Validate(v => string.IsNullOrWhiteSpace(v)
+                            ? ValidationResult.Error("Enter your GitHub Enterprise domain")
+                            : ValidationResult.Success()));
+                enterpriseDomain = entered.Trim();
+            }
+            else
+            {
+                enterpriseDomain = null;
+            }
+
+            // Persist for future sessions (empty string clears back to public github.com).
+            SettingsWriter.SetGitHubEnterpriseDomain(enterpriseDomain ?? string.Empty);
+        }
+
+        // Make this process agree immediately: the auth provider below AND the connection
+        // test (which builds a chat client via FromEnvironment) resolve the same host.
+        Environment.SetEnvironmentVariable(
+            "GH_COPILOT_ENTERPRISE_DOMAIN",
+            string.IsNullOrWhiteSpace(enterpriseDomain) ? null : enterpriseDomain);
+
+        var config = GitHubCopilotConfig.FromEnvironment();
+        using var hostProvider = new GitHubCopilotProvider(config);
+        var credential = await hostProvider.LoginWithDeviceCodeAsync(
+            new LoginOptions(),
+            (prompt, ct) =>
+            {
+                ShowDevicePrompt(context, provider, prompt);
+                return Task.CompletedTask;
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        await context.Credentials.StoreAsync(provider.Id, credential, cancellationToken).ConfigureAwait(false);
+
+        if (!string.IsNullOrWhiteSpace(enterpriseDomain))
+        {
+            context.Console.MarkupLine(Theme.DimMarkup(
+                $"Using GitHub Enterprise {Markup.Escape(enterpriseDomain)}. Saved for future sessions."));
+        }
+
+        return credential;
+    }
+
+    private static void ShowDevicePrompt(CommandContext context, ProviderDescriptor provider, DeviceCodePrompt prompt)
+    {
+        var panel = new Panel(new Markup(
+            $"{Theme.DimMarkup("1. Open")} {Theme.AccentMarkup(prompt.VerificationUri.ToString())}\n" +
+            $"{Theme.DimMarkup("2. Enter code")} {Theme.BoldMarkup(prompt.UserCode)}"))
+        {
+            Header = new PanelHeader($" Sign in to {provider.DisplayName} ", Justify.Left),
+            Border = BoxBorder.Rounded,
+        };
+        context.Console.Write(panel);
+        context.Console.MarkupLine(Theme.DimMarkup("Waiting for you to authorize…"));
     }
 }

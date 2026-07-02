@@ -489,6 +489,7 @@ public sealed partial class AgentLoop : IAgentLoop
         var results = new List<ContentBlock>();
         var context = new ToolContext(this.options.WorkingDirectory)
         {
+            AllowOutsideWorkingDirectory = this.options.PermissionMode == PermissionMode.BypassPermissions,
             Sink = sink,
             Subagents = this.subagents,
             Todos = this.todos,

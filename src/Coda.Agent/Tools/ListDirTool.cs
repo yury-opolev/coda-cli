@@ -26,7 +26,7 @@ public sealed class ListDirTool : ITool
         {
             dir = context.WorkingDirectory;
         }
-        else if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, path, out dir!, out var pathError))
+        else if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, path, out dir!, out var pathError, context.AllowOutsideWorkingDirectory))
         {
             return Task.FromResult(new ToolResult(pathError!, IsError: true));
         }

@@ -33,7 +33,7 @@ public sealed class EditTool : ITool
 
         var replaceAll = input.TryGetProperty("replace_all", out var ra) && ra.ValueKind == JsonValueKind.True;
 
-        if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, path, out var full, out var pathError))
+        if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, path, out var full, out var pathError, context.AllowOutsideWorkingDirectory))
         {
             return new ToolResult(pathError!, IsError: true);
         }

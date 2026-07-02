@@ -67,6 +67,7 @@ public static class SettingsLoader
         // Defaults: project overrides user when set.
         var defaultProvider = projectSettings.DefaultProvider ?? userSettings.DefaultProvider;
         var defaultModel = projectSettings.DefaultModel ?? userSettings.DefaultModel;
+        var githubEnterpriseDomain = projectSettings.GitHubEnterpriseDomain ?? userSettings.GitHubEnterpriseDomain;
 
         // Merge goal block per field: project overrides user, field by field.
         var goalMerged = MergeGoalSettings(userSettings.Goal, projectSettings.Goal);
@@ -81,6 +82,7 @@ public static class SettingsLoader
             && projectSettings.Hooks.Count == 0
             && projectSettings.LspServers.Count == 0
             && defaultProvider is null && defaultModel is null
+            && githubEnterpriseDomain is null
             && goalMerged is null
             && telemetry is null)
         {
@@ -103,6 +105,7 @@ public static class SettingsLoader
             LspServers = mergedLsp,
             DefaultProvider = defaultProvider,
             DefaultModel = defaultModel,
+            GitHubEnterpriseDomain = githubEnterpriseDomain,
             Goal = goalMerged,
             Telemetry = telemetry,
         };
@@ -132,6 +135,7 @@ public static class SettingsLoader
                 LspServers = lspServers,
                 DefaultProvider = NullIfBlank(doc?.DefaultProvider),
                 DefaultModel = NullIfBlank(doc?.DefaultModel),
+                GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
                 Telemetry = ParseTelemetry(doc?.Telemetry),
             };
@@ -245,6 +249,7 @@ public static class SettingsLoader
         public HooksSection? Hooks { get; set; }
         public string? DefaultProvider { get; set; }
         public string? DefaultModel { get; set; }
+        public string? GithubEnterpriseDomain { get; set; }
         public GoalSection? Goal { get; set; }
         public TelemetrySection? Telemetry { get; set; }
     }

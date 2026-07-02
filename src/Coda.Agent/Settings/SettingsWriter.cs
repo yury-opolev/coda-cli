@@ -12,6 +12,39 @@ namespace Coda.Agent.Settings;
 public static class SettingsWriter
 {
     /// <summary>
+    /// Persist the GitHub Enterprise Cloud data-residency domain used by the GitHub
+    /// Copilot provider (e.g. <c>octocorp.ghe.com</c>). <see langword="null"/> leaves it
+    /// unchanged; an empty string removes it (reset to public github.com). Atomic (temp
+    /// file + move), preserving all other keys.
+    /// </summary>
+    public static void SetGitHubEnterpriseDomain(string? domain, string? userSettingsDir = null)
+    {
+        var homeDir = userSettingsDir
+            ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var dir = Path.Combine(homeDir, ".coda");
+        var file = Path.Combine(dir, "settings.json");
+
+        JsonObject root;
+        try
+        {
+            root = (File.Exists(file) ? JsonNode.Parse(File.ReadAllText(file)) as JsonObject : null) ?? new JsonObject();
+        }
+        catch (JsonException)
+        {
+            root = new JsonObject();
+        }
+
+        ApplyKey(root, "githubEnterpriseDomain", domain);
+
+        Directory.CreateDirectory(dir);
+        var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, file, overwrite: true);
+    }
+
+    /// <summary>
     /// Set the persisted default provider and/or model. A <see langword="null"/> value
     /// leaves that key unchanged; an empty string removes it (reset to default).
     /// </summary>

@@ -54,7 +54,7 @@ public sealed class NotebookEditTool : ITool
         }
 
         // --- path resolution / containment check ---------------------------
-        if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, notebookPath, out var fullPath, out var pathError))
+        if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, notebookPath, out var fullPath, out var pathError, context.AllowOutsideWorkingDirectory))
         {
             return new ToolResult(pathError!, IsError: true);
         }

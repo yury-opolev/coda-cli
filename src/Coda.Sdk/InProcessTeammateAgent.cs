@@ -79,6 +79,9 @@ internal sealed class InProcessTeammateAgent : ITeammateAgent
             Model = options.Model,
             SystemPrompt = systemPrompt,
             WorkingDirectory = options.WorkingDirectory,
+            // Teammates run in bypass mode (see the ModePermissionPrompt below); keep the
+            // options in sync so their filesystem tools match that (unrestricted) posture.
+            PermissionMode = PermissionMode.BypassPermissions,
             MaxIterations = Math.Min(options.MaxIterations, 500),
             MaxTokens = ModelLimits.ResolveMaxOutputTokens(ModelCatalog.Default, options.ProviderId, options.Model, options.MaxTokens),
             AutoCompactTokenThreshold = ModelLimits.ResolveAutoCompactThreshold(ModelCatalog.Default, options.ProviderId, options.Model, options.AutoCompactTokenThreshold),

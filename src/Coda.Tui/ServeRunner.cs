@@ -146,6 +146,7 @@ public static class ServeRunner
             }
 
             using var claude = new ClaudeAiProvider();
+            CopilotEnvironment.ApplyEnterpriseDomain(settings.GitHubEnterpriseDomain);
             var copilotConfig = GitHubCopilotConfig.FromEnvironment();
             using var copilot = new GitHubCopilotProvider(copilotConfig);
             var apiKey = new ApiKeyProvider();

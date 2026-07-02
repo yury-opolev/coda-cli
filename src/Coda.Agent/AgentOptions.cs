@@ -12,6 +12,12 @@ public sealed record AgentOptions
     public required string WorkingDirectory { get; init; }
 
     /// <summary>
+    /// The permission mode for this run. In <see cref="PermissionMode.BypassPermissions"/>
+    /// ("yolo") the filesystem tools may operate outside the working directory.
+    /// </summary>
+    public PermissionMode PermissionMode { get; init; } = PermissionMode.Default;
+
+    /// <summary>
     /// High backstop on tool-use iterations per user turn — a runaway-loop guard, not a work budget.
     /// Hitting it is a recoverable soft stop (the turn ends and the session returns to idle), not a crash.
     /// </summary>
