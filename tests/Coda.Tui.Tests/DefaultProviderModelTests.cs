@@ -1,5 +1,6 @@
 using Coda.Agent.Settings;
 using Coda.Tui.Commands;
+using LlmAuth.Providers.ClaudeAi;
 
 namespace Coda.Tui.Tests;
 
@@ -38,6 +39,22 @@ public sealed class DefaultProviderModelTests : IDisposable
 
         var settings = SettingsLoader.Load(this.home, this.home);
         Assert.Equal("github-copilot", settings.DefaultProvider);
+        Assert.Null(settings.DefaultModel); // reset so startup uses the provider default
+    }
+
+    [Fact]
+    public async Task Signing_in_persists_the_provider_as_default_and_resets_model()
+    {
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        // A stale model from a different provider that should be cleared on sign-in.
+        SettingsWriter.SetUserDefaults(defaultModel: "claude-opus-4-8", userSettingsDir: this.home);
+
+        // The Anthropic API-key provider has no interactive step, so /login completes
+        // synchronously (no browser/device flow) — exercising the persistence path.
+        await new LoginCommand().ExecuteAsync(context, [ApiKeyProvider.Id], CancellationToken.None);
+
+        var settings = SettingsLoader.Load(this.home, this.home);
+        Assert.Equal(ApiKeyProvider.Id, settings.DefaultProvider);
         Assert.Null(settings.DefaultModel); // reset so startup uses the provider default
     }
 
