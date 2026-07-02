@@ -63,12 +63,18 @@ internal static class ToolInput
     /// Resolve a path and confirm it stays within the working directory. Blocks the
     /// model from reading/writing arbitrary files (e.g. credential stores) outside cwd.
     /// </summary>
-    public static bool TryResolveWithinRoot(string root, string path, out string fullPath, out string? error)
+    /// <param name="allowOutsideRoot">
+    /// When true (bypass/"yolo" mode), the containment check is skipped so the model
+    /// may read/write anywhere the process can — the path is still resolved to a full
+    /// path. Defaults to false so every non-bypass caller keeps the cwd sandbox.
+    /// </param>
+    public static bool TryResolveWithinRoot(string root, string path, out string fullPath, out string? error, bool allowOutsideRoot = false)
     {
         fullPath = ResolvePath(root, path);
-        if (!IsWithinRoot(root, fullPath))
+        if (!allowOutsideRoot && !IsWithinRoot(root, fullPath))
         {
-            error = $"Path '{path}' is outside the working directory and is not allowed.";
+            error = $"Path '{path}' is outside the working directory and is not allowed. "
+                + "Switch to bypass permissions (/yolo) to allow paths outside the working directory.";
             return false;
         }
 

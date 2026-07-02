@@ -361,6 +361,24 @@ AuthHeaders headers = await manager.GetAuthHeadersAsync(GitHubCopilotProvider.Id
 > env vars). Using the Copilot API outside official editor integrations is subject to
 > GitHub's Terms of Service.
 
+### GitHub Enterprise (data residency)
+
+`/login copilot` (and first-run setup) asks whether you're on **public github.com** or
+a **GitHub Enterprise Cloud** data-residency tenant (a `*.ghe.com` subdomain, e.g.
+`octocorp.ghe.com`). Enterprise sign-in runs the device flow against your host and uses
+the raw device-flow token directly at `copilot-api.<domain>` (no dotcom token exchange),
+so the credential is durable — **you sign in once and are not re-prompted** on later
+sessions. Public github.com keeps the standard token exchange.
+
+Your choice is persisted to `~/.coda/settings.json` as `githubEnterpriseDomain`:
+
+```json
+{ "defaultProvider": "github-copilot", "githubEnterpriseDomain": "octocorp.ghe.com" }
+```
+
+On startup this hydrates `GH_COPILOT_ENTERPRISE_DOMAIN` (which an explicit env var still
+overrides) so both the auth provider and the chat client target the same host.
+
 ## Versioning & build
 
 Semantic version lives in [`version.json`](version.json) (starts at **0.1**). The

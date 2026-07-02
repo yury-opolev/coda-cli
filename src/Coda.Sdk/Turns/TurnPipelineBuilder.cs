@@ -155,6 +155,7 @@ public sealed class TurnPipelineBuilder
                 ProjectContext.Load(options.WorkingDirectory),
                 outputStyle.SystemPromptSuffix),
             WorkingDirectory = options.WorkingDirectory,
+            PermissionMode = options.PermissionMode,
             MaxIterations = options.MaxIterations,
             // Resolve max_tokens from the model's REAL published output ceiling (catalog), clamping any
             // explicit override to it — a flat default would 400 a smaller-cap model (e.g. Copilot's

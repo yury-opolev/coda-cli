@@ -40,6 +40,14 @@ if (ImmediateCli.TryHandle(args, Console.Out) is int immediateExit)
 // Composition root for the interactive Coda TUI.
 var console = AnsiConsole.Console;
 
+// Load persisted user/project settings up front so provider construction can honor the
+// configured GitHub Copilot enterprise domain (public github.com or a *.ghe.com tenant).
+var startupSettings = Coda.Agent.Settings.SettingsLoader.Load(Directory.GetCurrentDirectory());
+
+// Hydrate GH_COPILOT_ENTERPRISE_DOMAIN from the persisted setting so both the auth
+// provider and the chat-client factory resolve the same GitHub Copilot host.
+CopilotEnvironment.ApplyEnterpriseDomain(startupSettings.GitHubEnterpriseDomain);
+
 using var claude = new ClaudeAiProvider();
 var copilotConfig = GitHubCopilotConfig.FromEnvironment();
 using var copilot = new GitHubCopilotProvider(copilotConfig);
@@ -56,7 +64,6 @@ var providers = new List<ProviderDescriptor>
 
 // Resolve the startup provider + model from (in precedence): env overrides →
 // persisted user/project defaults (~/.coda/settings.json) → Claude.ai / provider default.
-var startupSettings = Coda.Agent.Settings.SettingsLoader.Load(Directory.GetCurrentDirectory());
 var startupProviderToken = Environment.GetEnvironmentVariable("CODA_PROVIDER") ?? startupSettings.DefaultProvider;
 var startupProviderId = Coda.Sdk.Providers.ProviderAliases.Resolve(startupProviderToken);
 var startupProvider = providers.FirstOrDefault(p => p.Id == startupProviderId) ?? providers[0];

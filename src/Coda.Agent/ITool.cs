@@ -11,6 +11,12 @@ namespace Coda.Agent;
 /// <summary>Context passed to a tool execution (working dir + optional services).</summary>
 public sealed record ToolContext(string WorkingDirectory)
 {
+    /// <summary>
+    /// When true, filesystem tools may operate on paths outside <see cref="WorkingDirectory"/>.
+    /// Set only in bypass-permissions ("yolo") mode; the default keeps the cwd sandbox.
+    /// </summary>
+    public bool AllowOutsideWorkingDirectory { get; init; }
+
     /// <summary>Telemetry logger for tool execution; null when telemetry is not wired (e.g. some tests).</summary>
     public ILogger? Logger { get; init; }
 

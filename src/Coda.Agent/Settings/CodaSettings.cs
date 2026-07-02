@@ -25,6 +25,14 @@ public sealed record CodaSettings(
     /// <summary>Persisted default model id used on startup; null = use the provider's default.</summary>
     public string? DefaultModel { get; init; }
 
+    /// <summary>
+    /// Persisted GitHub Enterprise Cloud data-residency domain for GitHub Copilot (e.g.
+    /// <c>octocorp.ghe.com</c>); null/blank = public github.com. Drives
+    /// <see cref="Coda.Agent.Settings"/>-based provider construction so an enterprise user
+    /// signs in once and is not re-prompted.
+    /// </summary>
+    public string? GitHubEnterpriseDomain { get; init; }
+
     /// <summary>Optional goal-loop defaults loaded from the "goal" block in settings.json. Null = no goal block present.</summary>
     public GoalSettings? Goal { get; init; }
 

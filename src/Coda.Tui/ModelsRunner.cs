@@ -61,6 +61,8 @@ public static class ModelsRunner
         }
 
         using var claude = new ClaudeAiProvider();
+        CopilotEnvironment.ApplyEnterpriseDomain(
+            Coda.Agent.Settings.SettingsLoader.Load(workingDirectory).GitHubEnterpriseDomain);
         var copilotConfig = GitHubCopilotConfig.FromEnvironment();
         using var copilot = new GitHubCopilotProvider(copilotConfig);
         var apiKey = new ApiKeyProvider();
