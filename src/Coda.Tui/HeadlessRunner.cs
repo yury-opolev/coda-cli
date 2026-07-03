@@ -81,12 +81,15 @@ public static class HeadlessRunner
         // HTTP MCP servers run non-interactively here: stored tokens still work, but a
         // server that needs a fresh browser sign-in is skipped (logged), never blocking.
         using var mcpHttp = new HttpClient();
+        var mcpCredentialStore = CredentialStoreFactory.Create();
         var mcpHttpFactory = new DefaultMcpHttpClientFactory(
-            mcpHttp, CredentialStoreFactory.Create(), interactive: false, msg => Console.Error.WriteLine(msg));
+            mcpHttp, mcpCredentialStore, interactive: false, msg => Console.Error.WriteLine(msg));
         await using var mcp = new McpClientManager(mcpHttpFactory);
         var mcpServers = McpConfig.Load(workingDirectory);
         if (mcpServers.Count > 0)
         {
+            // Resolve coda-secret:/${VAR} references before connecting (never plaintext in config).
+            mcpServers = await McpSecretResolver.ResolveAsync(mcpServers, mcpCredentialStore, cancellationToken).ConfigureAwait(false);
             await mcp.ConnectAllAsync(mcpServers, msg => Console.Error.WriteLine(msg), cancellationToken).ConfigureAwait(false);
         }
 

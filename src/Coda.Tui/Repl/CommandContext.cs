@@ -47,6 +47,12 @@ public sealed class CommandContext
     /// </summary>
     public Coda.Mcp.McpClientManager? Mcp { get; set; }
 
+    /// <summary>
+    /// The encrypted credential store, so <c>/mcp add</c> can store secret values encrypted and
+    /// write only a <c>coda-secret:</c> reference into <c>.mcp.json</c>. Null when unavailable.
+    /// </summary>
+    public LlmAuth.ITokenStore? CredentialStore { get; set; }
+
     public ProviderDescriptor? FindProvider(string id) =>
         this.Providers.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
 

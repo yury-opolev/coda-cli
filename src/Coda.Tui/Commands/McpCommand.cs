@@ -51,10 +51,10 @@ public sealed class McpCommand : ISlashCommand
                 RenderInfo(context, tail);
                 break;
             case "add":
-                HandleAddOrEdit(context, scope, tail, isEdit: false);
+                await HandleAddOrEdit(context, scope, tail, isEdit: false).ConfigureAwait(false);
                 break;
             case "edit":
-                HandleAddOrEdit(context, scope, tail, isEdit: true);
+                await HandleAddOrEdit(context, scope, tail, isEdit: true).ConfigureAwait(false);
                 break;
             case "remove" or "rm" or "delete":
                 HandleRemove(context, scope, tail);
@@ -195,7 +195,7 @@ public sealed class McpCommand : ISlashCommand
 
     // ── add / edit ────────────────────────────────────────────────────────
 
-    private void HandleAddOrEdit(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool isEdit)
+    private static async Task HandleAddOrEdit(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool isEdit)
     {
         var verb = isEdit ? "edit" : "add";
         if (tail.Count == 0)
@@ -233,7 +233,7 @@ public sealed class McpCommand : ISlashCommand
         }
         else if (context.Console.Profile.Capabilities.Interactive)
         {
-            config = RunWizard(context, name);
+            config = await RunWizard(context, name).ConfigureAwait(false);
             if (config is null)
             {
                 return; // wizard reported the problem / was cancelled
@@ -304,7 +304,7 @@ public sealed class McpCommand : ISlashCommand
 
     // ── interactive wizard ────────────────────────────────────────────────
 
-    private static McpServerConfig? RunWizard(CommandContext context, string name)
+    private static async Task<McpServerConfig?> RunWizard(CommandContext context, string name)
     {
         var transport = context.Console.Prompt(
             new SelectionPrompt<string>().Title($"Transport for '{Markup.Escape(name)}'?").AddChoices("stdio", "http"));
@@ -314,7 +314,8 @@ public sealed class McpCommand : ISlashCommand
             var command = context.Console.Ask<string>("Command:");
             var argsLine = context.Console.Prompt(new TextPrompt<string>("Args (space-separated):").AllowEmpty());
             var args = argsLine.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            return new McpStdioServerConfig(command, args, PromptPairs(context, "Env (KEY=VALUE, blank to finish):"));
+            var env = await PromptPairs(context, name, "env", "Env (KEY=VALUE, blank to finish):").ConfigureAwait(false);
+            return new McpStdioServerConfig(command, args, env);
         }
 
         var url = context.Console.Ask<string>("URL:");
@@ -324,20 +325,25 @@ public sealed class McpCommand : ISlashCommand
             return null;
         }
 
-        var headers = PromptPairs(context, "Headers (NAME=VALUE, blank to finish):");
+        var headers = await PromptPairs(context, name, "header", "Headers (NAME=VALUE, blank to finish):").ConfigureAwait(false);
         var authMode = context.Console.Prompt(
             new SelectionPrompt<string>().Title("Auth?").AddChoices("oauth", "bearer", "none"));
-        McpAuthConfig auth = authMode switch
+        McpAuthConfig auth;
+        if (authMode == "bearer")
         {
-            "bearer" => new McpAuthConfig(McpAuthMode.Bearer,
-                BearerToken: context.Console.Prompt(new TextPrompt<string>("Bearer token:").Secret())),
-            "none" => new McpAuthConfig(McpAuthMode.None),
-            _ => McpAuthConfig.Default,
-        };
+            var token = context.Console.Prompt(new TextPrompt<string>("Bearer token:").Secret());
+            token = await MaybeEncrypt(context, name, "auth/token", token).ConfigureAwait(false);
+            auth = new McpAuthConfig(McpAuthMode.Bearer, BearerToken: token);
+        }
+        else
+        {
+            auth = authMode == "none" ? new McpAuthConfig(McpAuthMode.None) : McpAuthConfig.Default;
+        }
+
         return new McpHttpServerConfig(uri, headers, auth);
     }
 
-    private static Dictionary<string, string> PromptPairs(CommandContext context, string title)
+    private static async Task<Dictionary<string, string>> PromptPairs(CommandContext context, string server, string fieldPrefix, string title)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         context.Console.MarkupLine(Markup.Escape(title));
@@ -356,10 +362,27 @@ public sealed class McpCommand : ISlashCommand
                 continue;
             }
 
-            map[line[..index]] = line[(index + 1)..];
+            var key = line[..index];
+            map[key] = await MaybeEncrypt(context, server, $"{fieldPrefix}/{key}", line[(index + 1)..]).ConfigureAwait(false);
         }
 
         return map;
+    }
+
+    /// <summary>
+    /// Offer to store <paramref name="value"/> encrypted (when a store is available) and return a
+    /// <c>coda-secret:</c> reference instead of the plaintext; otherwise return the literal value.
+    /// </summary>
+    private static async Task<string> MaybeEncrypt(CommandContext context, string server, string field, string value)
+    {
+        if (context.CredentialStore is { } store
+            && !string.IsNullOrEmpty(value)
+            && context.Console.Confirm("  Store this value encrypted (recommended)?"))
+        {
+            return await McpSecretStore.StoreAsync(store, server, field, value).ConfigureAwait(false);
+        }
+
+        return value;
     }
 
     // ── shared helpers ────────────────────────────────────────────────────

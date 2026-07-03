@@ -100,6 +100,8 @@ await using var mcp = new Coda.Mcp.McpClientManager(mcpHttpFactory);
 var mcpServers = Coda.Mcp.McpConfig.Load(session.WorkingDirectory);
 if (mcpServers.Count > 0)
 {
+    // Resolve coda-secret:/${VAR} references to real values before connecting (never plaintext in config).
+    mcpServers = await Coda.Mcp.McpSecretResolver.ResolveAsync(mcpServers, store, cts.Token);
     await mcp.ConnectAllAsync(mcpServers, msg => console.MarkupLine($"[grey50]{Spectre.Console.Markup.Escape(msg)}[/]"), cts.Token);
 }
 
@@ -114,9 +116,11 @@ Coda.Agent.ITool[] mcpHelperTools =
 Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
     mcp.Clients.Count > 0 ? [.. mcp.Tools, .. mcpHelperTools] : [];
 
-// Expose the live tool source (for /context accounting) and the manager (for /mcp) to commands.
+// Expose the live tool source (for /context accounting), the manager (for /mcp), and the
+// credential store (so /mcp add can store secrets encrypted) to commands.
 context.ExtraToolsProvider = agentToolsProvider;
 context.Mcp = mcp;
+context.CredentialStore = store;
 
 // Kick off a background, staleness-gated refresh of the models.dev catalog
 // (opencode-style): keeps model metadata current without blocking startup or
