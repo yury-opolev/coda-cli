@@ -24,6 +24,24 @@ public sealed class McpSecretStoreTests
         Assert.Equal("ghp_x", ((McpStdioServerConfig)resolved["github"]).Env["TOKEN"]);
     }
 
+    [Fact]
+    public async Task DeleteSecretsAsync_removes_only_referenced_keys()
+    {
+        var store = new FakeStore();
+        await store.SetAsync("mcp:github/env/TOKEN", "x");
+        await store.SetAsync("mcp:other/env/K", "y"); // unrelated server
+        var config = new McpStdioServerConfig("npx", [], new Dictionary<string, string>
+        {
+            ["TOKEN"] = "coda-secret:mcp:github/env/TOKEN",
+            ["PLAIN"] = "literal", // not a ref → not touched
+        });
+
+        await McpSecretStore.DeleteSecretsAsync(store, config);
+
+        Assert.Null(await store.GetAsync("mcp:github/env/TOKEN")); // deleted
+        Assert.Equal("y", await store.GetAsync("mcp:other/env/K")); // untouched
+    }
+
     private sealed class FakeStore : ITokenStore
     {
         private readonly Dictionary<string, string> map = new(StringComparer.Ordinal);

@@ -57,7 +57,7 @@ public sealed class McpCommand : ISlashCommand
                 await HandleAddOrEdit(context, scope, tail, isEdit: true).ConfigureAwait(false);
                 break;
             case "remove" or "rm" or "delete":
-                HandleRemove(context, scope, tail);
+                await HandleRemove(context, scope, tail).ConfigureAwait(false);
                 break;
             case "enable":
                 HandleToggle(context, scope, tail, disabled: false);
@@ -286,7 +286,7 @@ public sealed class McpCommand : ISlashCommand
 
     // ── remove ────────────────────────────────────────────────────────────
 
-    private static void HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail)
+    private static async Task HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail)
     {
         if (tail.Count == 0)
         {
@@ -295,7 +295,8 @@ public sealed class McpCommand : ISlashCommand
         }
 
         var name = tail[0];
-        if (!ExistsInScope(scope, name, context))
+        var config = GetConfigInScope(scope, name, context);
+        if (config is null)
         {
             context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file."));
             return;
@@ -306,6 +307,12 @@ public sealed class McpCommand : ISlashCommand
         {
             context.Console.MarkupLine("Cancelled.");
             return;
+        }
+
+        // Delete the server's encrypted secrets (derived from its coda-secret: refs) so they aren't orphaned.
+        if (context.CredentialStore is { } store)
+        {
+            await McpSecretStore.DeleteSecretsAsync(store, config).ConfigureAwait(false);
         }
 
         McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
@@ -454,10 +461,16 @@ public sealed class McpCommand : ISlashCommand
         && !value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal)
         && !(value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}'));
 
-    private static bool ExistsInScope(McpConfigScope scope, string name, CommandContext context)
+    private static bool ExistsInScope(McpConfigScope scope, string name, CommandContext context) =>
+        GetConfigInScope(scope, name, context) is not null;
+
+    /// <summary>The raw (unresolved) config for <paramref name="name"/> in the given scope's file, or null.</summary>
+    private static McpServerConfig? GetConfigInScope(McpConfigScope scope, string name, CommandContext context)
     {
         var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
-        return File.Exists(path) && McpConfig.Parse(File.ReadAllText(path)).ContainsKey(name);
+        return File.Exists(path) && McpConfig.Parse(File.ReadAllText(path)).TryGetValue(name, out var config)
+            ? config
+            : null;
     }
 
     /// <summary>Gather the display snapshot from the configured entries + the live MCP manager.</summary>
