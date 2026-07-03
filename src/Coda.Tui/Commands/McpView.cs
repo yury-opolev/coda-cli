@@ -39,6 +39,7 @@ public static class McpView
         builder.AppendLine($"  description: {Description(server.Info)}");
         builder.AppendLine($"  transport:   {TransportDetail(server.Entry.Config)}");
         builder.AppendLine($"  status:      {StatusLabel(server)}");
+        AppendConfigSecrets(builder, server.Entry.Config);
 
         if (server.Connected)
         {
@@ -62,6 +63,58 @@ public static class McpView
         }
 
         return builder.ToString().TrimEnd();
+    }
+
+    /// <summary>Show env / headers / auth so a secret is visibly <b>configured</b> — always with the value masked.</summary>
+    private static void AppendConfigSecrets(StringBuilder builder, McpServerConfig config)
+    {
+        switch (config)
+        {
+            case McpStdioServerConfig stdio:
+                AppendMaskedMap(builder, "env", stdio.Env);
+                break;
+
+            case McpHttpServerConfig http:
+                AppendMaskedMap(builder, "headers", http.Headers);
+                builder.AppendLine($"  auth:        {http.Auth.Mode.ToString().ToLowerInvariant()}");
+                if (http.Auth.BearerToken is { } token)
+                {
+                    builder.AppendLine($"    token = {MaskValue(token)}");
+                }
+
+                break;
+        }
+    }
+
+    private static void AppendMaskedMap(StringBuilder builder, string label, IReadOnlyDictionary<string, string> map)
+    {
+        if (map.Count == 0)
+        {
+            return;
+        }
+
+        builder.AppendLine($"  {label}:");
+        foreach (var (key, value) in map)
+        {
+            builder.AppendLine($"    {key} = {MaskValue(value)}");
+        }
+    }
+
+    /// <summary>Never reveal a raw value: encrypted refs and literals mask to <c>*****</c>; a <c>${VAR}</c>
+    /// reference is shown (the variable name is not itself a secret) so its source is discoverable.</summary>
+    private static string MaskValue(string value)
+    {
+        if (value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal))
+        {
+            return "***** (encrypted)";
+        }
+
+        if (value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}'))
+        {
+            return $"***** (from {value})";
+        }
+
+        return "*****";
     }
 
     private static string ScopeLabel(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
