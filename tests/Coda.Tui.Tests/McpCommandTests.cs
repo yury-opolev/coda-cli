@@ -2,6 +2,9 @@ using Coda.Tui.Commands;
 
 namespace Coda.Tui.Tests;
 
+// Mutates the process-wide CODA_USER_MCP_DIR env var, so it must not run in parallel with any other
+// test that resolves MCP config from the environment (mirrors the SettingsDirEnv / SkillSourceEnv pattern).
+[Collection("McpDirEnv")]
 public sealed class McpCommandTests
 {
     [Fact]
@@ -107,4 +110,10 @@ public sealed class McpCommandTests
             }
         }
     }
+}
+
+/// <summary>Serializes tests that mutate the process-wide CODA_USER_MCP_DIR env var.</summary>
+[CollectionDefinition("McpDirEnv", DisableParallelization = true)]
+public sealed class McpDirEnvCollection
+{
 }
