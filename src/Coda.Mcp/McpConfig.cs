@@ -28,12 +28,7 @@ public static class McpConfig
     /// </param>
     public static IReadOnlyDictionary<string, McpServerConfig> Load(string workingDirectory, string? userMcpDir = null)
     {
-        var userBase = userMcpDir
-            ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
-
-        var userServers = LoadFile(Path.Combine(userBase, FileName));
-        var projectServers = LoadFile(Path.Combine(workingDirectory, FileName));
+        var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
 
         if (userServers.Count == 0)
         {
@@ -48,6 +43,44 @@ public static class McpConfig
         }
 
         return merged;
+    }
+
+    /// <summary>
+    /// Like <see cref="Load"/> but tags each server with the <see cref="McpConfigScope"/> it was
+    /// resolved from (project overrides user). For display and scope-aware editing.
+    /// </summary>
+    public static IReadOnlyList<McpServerEntry> LoadEntries(string workingDirectory, string? userMcpDir = null)
+    {
+        var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
+        var entries = new List<McpServerEntry>();
+
+        foreach (var (name, config) in userServers)
+        {
+            if (!projectServers.ContainsKey(name))
+            {
+                entries.Add(new McpServerEntry(name, config, McpConfigScope.User));
+            }
+        }
+
+        foreach (var (name, config) in projectServers)
+        {
+            entries.Add(new McpServerEntry(name, config, McpConfigScope.Project));
+        }
+
+        return entries;
+    }
+
+    /// <summary>Resolve and parse the user and project layers separately (shared by Load/LoadEntries).</summary>
+    private static (IReadOnlyDictionary<string, McpServerConfig> User, IReadOnlyDictionary<string, McpServerConfig> Project) LoadLayers(
+        string workingDirectory, string? userMcpDir)
+    {
+        var userBase = userMcpDir
+            ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
+            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
+
+        return (
+            LoadFile(Path.Combine(userBase, FileName)),
+            LoadFile(Path.Combine(workingDirectory, FileName)));
     }
 
     private static IReadOnlyDictionary<string, McpServerConfig> LoadFile(string path)

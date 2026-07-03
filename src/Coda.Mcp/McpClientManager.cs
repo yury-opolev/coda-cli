@@ -42,6 +42,17 @@ public sealed class McpClientManager : IAsyncDisposable
     /// <summary>Exposes the connected clients for resource/prompt fan-out operations.</summary>
     public IReadOnlyList<IMcpClient> Clients => this.clients;
 
+    /// <summary>True when a client for <paramref name="serverName"/> is currently connected.</summary>
+    public bool IsServerConnected(string serverName) =>
+        this.clients.Any(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal));
+
+    /// <summary>The identity a connected server reported at initialize, or null when not connected / none.</summary>
+    public McpServerInfo? ServerInfoFor(string serverName) =>
+        this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal))?.ServerInfo;
+
+    /// <summary>The connected tools that belong to <paramref name="serverName"/> (empty when not connected).</summary>
+    public IReadOnlyList<McpTool> ServerTools(string serverName) => McpServerTools.ForServer(this.tools, serverName);
+
     /// <summary>Connect every server in <paramref name="servers"/>; <paramref name="log"/> receives status/errors.</summary>
     public async Task ConnectAllAsync(
         IReadOnlyDictionary<string, McpServerConfig> servers,

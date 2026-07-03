@@ -18,8 +18,12 @@ public sealed class McpTool : ITool
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.info = info ?? throw new ArgumentNullException(nameof(info));
+        this.ServerName = serverName;
         this.Name = $"mcp__{Sanitize(serverName)}__{Sanitize(info.Name)}";
     }
+
+    /// <summary>The configured MCP server this tool belongs to (unsanitized).</summary>
+    public string ServerName { get; }
 
     public string Name { get; }
 
