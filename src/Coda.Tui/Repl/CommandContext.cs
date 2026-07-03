@@ -38,6 +38,12 @@ public sealed class CommandContext
     /// </summary>
     public IReadOnlyList<ITool> ExtraTools { get; set; } = [];
 
+    /// <summary>
+    /// The live MCP client manager, so <c>/mcp</c> can report connection status and tools.
+    /// Null in non-interactive contexts (e.g. headless <c>coda help</c>) where no manager exists.
+    /// </summary>
+    public Coda.Mcp.McpClientManager? Mcp { get; set; }
+
     public ProviderDescriptor? FindProvider(string id) =>
         this.Providers.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
 

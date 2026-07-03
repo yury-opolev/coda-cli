@@ -36,6 +36,7 @@ public static class SlashCommandCatalog
         new MarketplaceCommand(),
         new InitCommand(),
         new MemoryCommand(),
+        new McpCommand(),
         new CompactCommand(),
         new ContextCommand(),
         new CostCommand(),

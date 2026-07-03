@@ -113,6 +113,9 @@ IReadOnlyList<Coda.Agent.ITool> agentTools = mcpServers.Count > 0
 // Expose the agent's extra tools to slash commands (e.g. /context token accounting).
 context.ExtraTools = agentTools;
 
+// Expose the live MCP manager to slash commands (e.g. /mcp list/info).
+context.Mcp = mcp;
+
 // Kick off a background, staleness-gated refresh of the models.dev catalog
 // (opencode-style): keeps model metadata current without blocking startup or
 // adding a network request on every launch. Best-effort; honors
