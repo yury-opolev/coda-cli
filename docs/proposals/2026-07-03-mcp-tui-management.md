@@ -1,7 +1,10 @@
 # Proposal: Interactive `/mcp` management in the coda TUI
 
 - **Date:** 2026-07-03
-- **Status:** Draft / design exploration (spec for review)
+- **Status:** Implemented (P1–P4) on branch `feature/mcp-tui-management`. `/mcp` list/info/add/edit/
+  remove/enable/disable/start/stop/restart; encrypted secrets (`coda-secret:` refs + `${VAR}`).
+  Deferred: redacted display of secret env/header values in `info`; deleting stored secrets on
+  `remove` (the `ITokenStore` has no enumerate API).
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** `Coda.Tui` (new `/mcp` slash command + REPL wiring), `Coda.Mcp` (config writer, live
   per-server connect/disconnect, server info capture, secret-reference resolution), `Coda.Common`
