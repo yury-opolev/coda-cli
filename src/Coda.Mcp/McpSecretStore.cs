@@ -27,7 +27,9 @@ public static class McpSecretStore
     /// Delete every credential-store secret referenced by <paramref name="config"/> (its
     /// <c>coda-secret:&lt;key&gt;</c> env / header / token values) — called when a server is removed so
     /// its encrypted secrets are not orphaned. The store's lossy key sanitization prevents
-    /// enumeration, so we derive the exact keys from the config's own references.
+    /// enumeration, so we derive the exact keys from the config's own references. Keys are assumed
+    /// server-private (the <c>mcp:&lt;server&gt;/…</c> convention); a hand-shared ref could delete a
+    /// key another server still uses.
     /// </summary>
     public static async Task DeleteSecretsAsync(ITokenStore store, McpServerConfig config, CancellationToken cancellationToken = default)
     {

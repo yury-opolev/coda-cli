@@ -57,7 +57,7 @@ public sealed class McpCommand : ISlashCommand
                 await HandleAddOrEdit(context, scope, tail, isEdit: true).ConfigureAwait(false);
                 break;
             case "remove" or "rm" or "delete":
-                await HandleRemove(context, scope, tail).ConfigureAwait(false);
+                await HandleRemove(context, scope, tail, cancellationToken).ConfigureAwait(false);
                 break;
             case "enable":
                 HandleToggle(context, scope, tail, disabled: false);
@@ -286,7 +286,7 @@ public sealed class McpCommand : ISlashCommand
 
     // ── remove ────────────────────────────────────────────────────────────
 
-    private static async Task HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail)
+    private static async Task HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, CancellationToken ct)
     {
         if (tail.Count == 0)
         {
@@ -309,13 +309,15 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        // Delete the server's encrypted secrets (derived from its coda-secret: refs) so they aren't orphaned.
+        McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
+
+        // Delete the server's encrypted secrets (derived from its coda-secret: refs) AFTER the entry
+        // is gone, so a failed write never orphans the config against already-deleted secrets.
         if (context.CredentialStore is { } store)
         {
-            await McpSecretStore.DeleteSecretsAsync(store, config).ConfigureAwait(false);
+            await McpSecretStore.DeleteSecretsAsync(store, config, ct).ConfigureAwait(false);
         }
 
-        McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
         context.Console.MarkupLine(Markup.Escape($"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."));
     }
 
