@@ -90,6 +90,40 @@ public static class ServeRunner
     }
 
     /// <summary>
+    /// Loads and connects the merged MCP config for a serve session, returning the agent's MCP
+    /// tool list and the owning <see cref="McpClientManager"/> (which the caller MUST dispose).
+    /// Returns <c>(empty, null)</c> when MCP is disabled or no servers are configured — in that
+    /// case nothing is left to dispose. HTTP servers are connected non-interactively via
+    /// <paramref name="httpFactory"/>; all diagnostics go through <paramref name="log"/> (stderr).
+    /// </summary>
+    /// <param name="userMcpDir">Test/override seam for the user-level <c>.mcp.json</c> directory;
+    /// null uses the default resolution (<c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c>).</param>
+    public static async Task<(IReadOnlyList<ITool> Tools, McpClientManager? Manager)> LoadMcpToolsAsync(
+        bool enableMcp,
+        string workingDirectory,
+        IMcpHttpClientFactory httpFactory,
+        Action<string> log,
+        CancellationToken cancellationToken,
+        string? userMcpDir = null)
+    {
+        if (!enableMcp)
+        {
+            return ([], null);
+        }
+
+        var manager = new McpClientManager(httpFactory);
+        var servers = McpConfig.Load(workingDirectory, userMcpDir);
+        if (servers.Count == 0)
+        {
+            await manager.DisposeAsync().ConfigureAwait(false);
+            return ([], null);
+        }
+
+        await manager.ConnectAllAsync(servers, log, cancellationToken).ConfigureAwait(false);
+        return (BuildMcpExtraTools(manager), manager);
+    }
+
+    /// <summary>
     /// Enforces the security invariant before binding: a socket may never run unauthenticated.
     /// Returns (false, reason) when the configuration is invalid. stdio (no api key) is valid.
     /// </summary>

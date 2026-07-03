@@ -312,6 +312,42 @@ public sealed class ServeRunnerTests
         Assert.Single(tools.OfType<GetMcpPromptTool>());
     }
 
+    // ── LoadMcpToolsAsync ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task LoadMcpToolsAsync_disabled_returns_empty_and_no_manager()
+    {
+        var (tools, manager) = await ServeRunner.LoadMcpToolsAsync(
+            enableMcp: false,
+            workingDirectory: Directory.GetCurrentDirectory(),
+            httpFactory: new ThrowingHttpFactory(),
+            log: _ => { },
+            cancellationToken: default);
+
+        Assert.Empty(tools);
+        Assert.Null(manager);
+    }
+
+    [Fact]
+    public async Task LoadMcpToolsAsync_enabled_but_no_servers_returns_empty_and_no_manager()
+    {
+        // Hermetic: both the working dir and the user MCP dir are empty temp dirs, so
+        // McpConfig.Load finds zero servers regardless of the machine's real ~/.coda.
+        using var work = new TempDir();
+        using var user = new TempDir();
+
+        var (tools, manager) = await ServeRunner.LoadMcpToolsAsync(
+            enableMcp: true,
+            workingDirectory: work.Path,
+            httpFactory: new ThrowingHttpFactory(),
+            log: _ => { },
+            cancellationToken: default,
+            userMcpDir: user.Path);
+
+        Assert.Empty(tools);
+        Assert.Null(manager);
+    }
+
     // ── BuildSessionOptions ───────────────────────────────────────────────
 
     [Fact]
@@ -598,6 +634,39 @@ public sealed class ServeRunnerTests
         // Nothing configured by flag or settings → no invented provider/model.
         Assert.Null(options.ProviderId);
         Assert.Null(options.Model);
+    }
+
+    /// <summary>
+    /// An <see cref="IMcpHttpClientFactory"/> that fails if used. The no-server tests configure
+    /// no HTTP MCP server, so <see cref="Create"/> must never be called — this proves it.
+    /// </summary>
+    private sealed class ThrowingHttpFactory : IMcpHttpClientFactory
+    {
+        public IMcpClient Create(string serverName, McpHttpServerConfig config)
+            => throw new InvalidOperationException("HTTP factory must not be used when no HTTP server is configured.");
+    }
+
+    /// <summary>A throwaway directory, deleted on dispose — for hermetic MCP-config tests.</summary>
+    private sealed class TempDir : IDisposable
+    {
+        public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "coda-mcp-test-" + Guid.NewGuid().ToString("N"));
+
+        public TempDir() => Directory.CreateDirectory(this.Path);
+
+        public void Dispose()
+        {
+            try
+            {
+                if (Directory.Exists(this.Path))
+                {
+                    Directory.Delete(this.Path, recursive: true);
+                }
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup.
+            }
+        }
     }
 
     /// <summary>
