@@ -66,8 +66,15 @@ public static class McpView
 
     private static string ScopeLabel(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
 
-    private static string StatusLabel(McpServerStatus s) =>
-        s.Connected ? $"connected ({s.Tools.Count} tools)" : "not connected";
+    private static string StatusLabel(McpServerStatus s)
+    {
+        if (s.Entry.Config.Disabled)
+        {
+            return s.Connected ? $"disabled (running, {s.Tools.Count} tools)" : "disabled";
+        }
+
+        return s.Connected ? $"connected ({s.Tools.Count} tools)" : "not connected";
+    }
 
     private static string Description(McpServerInfo? info)
     {

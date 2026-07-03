@@ -30,11 +30,6 @@ public static class McpConfig
     {
         var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
 
-        if (userServers.Count == 0)
-        {
-            return projectServers;
-        }
-
         // Merge: user first, then project overlays by name (project wins).
         var merged = new Dictionary<string, McpServerConfig>(userServers, StringComparer.Ordinal);
         foreach (var (name, config) in projectServers)
@@ -42,7 +37,18 @@ public static class McpConfig
             merged[name] = config;
         }
 
-        return merged;
+        // Disabled servers are excluded so they never auto-connect; they remain visible via
+        // LoadEntries so /mcp can list and re-enable them.
+        var connectable = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
+        foreach (var (name, config) in merged)
+        {
+            if (!config.Disabled)
+            {
+                connectable[name] = config;
+            }
+        }
+
+        return connectable;
     }
 
     /// <summary>
@@ -137,12 +143,20 @@ public static class McpConfig
     private static McpServerConfig? ParseServer(JsonElement config)
     {
         var type = config.TryGetProperty("type", out var t) ? t.GetString() : null;
-        return type switch
+        var parsed = type switch
         {
             "http" or "streamable-http" => ParseHttp(config),
             null or "stdio" => ParseStdio(config),
-            _ => null, // unknown transport (e.g. legacy "sse") is skipped
+            _ => (McpServerConfig?)null, // unknown transport (e.g. legacy "sse") is skipped
         };
+
+        if (parsed is null)
+        {
+            return null;
+        }
+
+        var disabled = config.TryGetProperty("disabled", out var d) && d.ValueKind == JsonValueKind.True;
+        return disabled ? parsed with { Disabled = true } : parsed;
     }
 
     private static McpStdioServerConfig? ParseStdio(JsonElement config)

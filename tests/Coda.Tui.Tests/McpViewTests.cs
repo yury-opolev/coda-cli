@@ -51,6 +51,20 @@ public sealed class McpViewTests
     }
 
     [Fact]
+    public void FormatList_shows_disabled_status()
+    {
+        var entry = new McpServerEntry(
+            "off",
+            new McpStdioServerConfig("cmd", [], new Dictionary<string, string>()) { Disabled = true },
+            McpConfigScope.Project);
+        var rows = new List<McpServerStatus> { new(entry, Connected: false, Info: null, Tools: []) };
+
+        var text = McpView.FormatList(rows);
+
+        Assert.Contains("disabled", text);
+    }
+
+    [Fact]
     public void FormatInfo_not_connected_prompts_to_start()
     {
         var status = new McpServerStatus(Stdio("fs", McpConfigScope.Project), Connected: false, Info: null, Tools: []);
