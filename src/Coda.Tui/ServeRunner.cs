@@ -213,8 +213,6 @@ public static class ServeRunner
             var apiKey = new ApiKeyProvider();
             var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
 
-            var sessionOptions = BuildSessionOptions(options, settings.Telemetry);
-
             // Resolve API key: flag wins, else env var. Its presence selects the socket transport.
             var resolvedKey = options.ApiKey ?? Environment.GetEnvironmentVariable("CODA_SERVE_API_KEY");
             options = options with { ApiKey = string.IsNullOrEmpty(resolvedKey) ? null : resolvedKey };
@@ -288,6 +286,21 @@ public static class ServeRunner
                         // on a transient network/cache failure the next access silently retries.
                     }
                 }, cts.Token);
+
+                // Connect MCP servers (parity with the TUI / `coda run`): default-on unless
+                // --no-mcp or CODA_SERVE_DISABLE_MCP. Non-interactive (never opens a browser);
+                // ALL MCP diagnostics go to stderr because stdout is the JSON-RPC protocol channel.
+                var enableMcp = ResolveMcpEnabled(
+                    options.EnableMcp, Environment.GetEnvironmentVariable("CODA_SERVE_DISABLE_MCP"));
+                using var mcpHttp = new HttpClient();
+                var mcpHttpFactory = new DefaultMcpHttpClientFactory(
+                    mcpHttp, CredentialStoreFactory.Create(), interactive: false,
+                    msg => Console.Error.WriteLine(msg));
+                var (mcpTools, mcpManager) = await LoadMcpToolsAsync(
+                    enableMcp, options.WorkingDirectory!, mcpHttpFactory,
+                    msg => Console.Error.WriteLine(msg), cts.Token).ConfigureAwait(false);
+                await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
+                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools);
 
                 var streams = await transport.AcceptAsync(cts.Token).ConfigureAwait(false);
                 await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey);
