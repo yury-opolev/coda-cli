@@ -70,17 +70,30 @@ public static class McpConfig
         return entries;
     }
 
+    /// <summary>
+    /// The <c>.mcp.json</c> path for a given scope: the working directory for
+    /// <see cref="McpConfigScope.Project"/>, or the user base
+    /// (<paramref name="userMcpDir"/> ?? <c>CODA_USER_MCP_DIR</c> ?? <c>~/.coda</c>) for
+    /// <see cref="McpConfigScope.User"/>. Shared by the loader and the writer.
+    /// </summary>
+    public static string FilePath(McpConfigScope scope, string workingDirectory, string? userMcpDir = null)
+    {
+        var directory = scope == McpConfigScope.User
+            ? userMcpDir
+                ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda")
+            : workingDirectory;
+
+        return Path.Combine(directory, FileName);
+    }
+
     /// <summary>Resolve and parse the user and project layers separately (shared by Load/LoadEntries).</summary>
     private static (IReadOnlyDictionary<string, McpServerConfig> User, IReadOnlyDictionary<string, McpServerConfig> Project) LoadLayers(
         string workingDirectory, string? userMcpDir)
     {
-        var userBase = userMcpDir
-            ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
-
         return (
-            LoadFile(Path.Combine(userBase, FileName)),
-            LoadFile(Path.Combine(workingDirectory, FileName)));
+            LoadFile(FilePath(McpConfigScope.User, workingDirectory, userMcpDir)),
+            LoadFile(FilePath(McpConfigScope.Project, workingDirectory, userMcpDir)));
     }
 
     private static IReadOnlyDictionary<string, McpServerConfig> LoadFile(string path)
