@@ -45,6 +45,11 @@ public sealed record ServeOptions
     /// servers. Defaults to true for parity with the TUI and <c>coda run</c>.</summary>
     public bool EnableMcp { get; init; } = true;
 
+    /// <summary>When false (<c>--no-project-mcp</c> or <c>CODA_DISABLE_PROJECT_MCP</c>), ignore the
+    /// project-level <c>&lt;cwd&gt;/.mcp.json</c> and load only the user layer. Defaults to true
+    /// (full host visibility); an orchestrator sets it for a curated, repo-isolated MCP set.</summary>
+    public bool EnableProjectMcp { get; init; } = true;
+
     /// <summary>
     /// Parse <c>serve</c> arguments (everything after the <c>serve</c> token):
     /// <c>[--provider id] [--model id] [--cwd path] [--permission-mode m] [--yolo] [--api-key key] [--endpoint name]</c>.
@@ -66,6 +71,7 @@ public sealed record ServeOptions
         var forceTelemetry = false;
         string? telemetryLevel = null;
         var enableMcp = true;
+        var enableProjectMcp = true;
 
         for (var i = 0; i < args.Count; i++)
         {
@@ -159,6 +165,10 @@ public sealed record ServeOptions
                     enableMcp = true;
                     break;
 
+                case "--no-project-mcp":
+                    enableProjectMcp = false;
+                    break;
+
                 case "--max-continuations":
                     // Matches `coda run`: bounds non-goal stop-hooks AND sets the goal turn backstop.
                     if (++i < args.Count && int.TryParse(args[i], out var parsedMax) && parsedMax > 0)
@@ -234,6 +244,7 @@ public sealed record ServeOptions
             ForceTelemetry = forceTelemetry,
             TelemetryLevel = telemetryLevel,
             EnableMcp = enableMcp,
+            EnableProjectMcp = enableProjectMcp,
         };
     }
 

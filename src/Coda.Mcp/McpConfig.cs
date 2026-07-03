@@ -26,15 +26,21 @@ public static class McpConfig
     /// The directory holding the user-level <c>.mcp.json</c>. Defaults to
     /// <c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c> when null.
     /// </param>
-    public static IReadOnlyDictionary<string, McpServerConfig> Load(string workingDirectory, string? userMcpDir = null)
+    /// <param name="includeProject">When false, the project layer (<c>&lt;cwd&gt;/.mcp.json</c>) is
+    /// ignored entirely — used by <c>coda serve --no-project-mcp</c> so an orchestrator-curated user
+    /// set can't be overridden by a repo-local file.</param>
+    public static IReadOnlyDictionary<string, McpServerConfig> Load(string workingDirectory, string? userMcpDir = null, bool includeProject = true)
     {
         var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
 
-        // Merge: user first, then project overlays by name (project wins).
+        // Merge: user first, then project overlays by name (project wins) unless suppressed.
         var merged = new Dictionary<string, McpServerConfig>(userServers, StringComparer.Ordinal);
-        foreach (var (name, config) in projectServers)
+        if (includeProject)
         {
-            merged[name] = config;
+            foreach (var (name, config) in projectServers)
+            {
+                merged[name] = config;
+            }
         }
 
         // Disabled servers are excluded so they never auto-connect; they remain visible via
