@@ -1,3 +1,4 @@
+using Coda.Mcp;
 using Coda.Tui.Commands;
 
 namespace Coda.Tui.Tests;
@@ -57,6 +58,126 @@ public sealed class McpCommandTests
 
         Assert.Contains("npx", console.Output);
         Assert.Contains("stdio", console.Output);
+    }
+
+    [Fact]
+    public async Task Add_with_flags_writes_config()
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx", "--args", "-y srv"], CancellationToken.None);
+
+        Assert.Contains("Added", console.Output);
+        Assert.True(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("github"));
+    }
+
+    [Fact]
+    public async Task Add_existing_is_rejected()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "github": { "command": "x" } } }""");
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx"], CancellationToken.None);
+
+        Assert.Contains("already exists", console.Output);
+    }
+
+    [Fact]
+    public async Task Add_no_flags_non_interactive_prompts_for_flags()
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["add", "github"], CancellationToken.None);
+
+        Assert.Contains("Provide flags", console.Output);
+    }
+
+    [Fact]
+    public async Task Add_user_scope_writes_user_file_not_project()
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["add", "github", "--user", "--command", "npx"], CancellationToken.None);
+
+        Assert.True(File.Exists(Path.Combine(dirs.User, ".mcp.json")));
+        Assert.False(File.Exists(Path.Combine(dirs.Project, ".mcp.json")));
+    }
+
+    [Fact]
+    public async Task Edit_nonexistent_is_rejected()
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["edit", "nope", "--command", "x"], CancellationToken.None);
+
+        Assert.Contains("not configured", console.Output);
+    }
+
+    [Fact]
+    public async Task Edit_updates_existing()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "s": { "command": "old" } } }""");
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["edit", "s", "--command", "new"], CancellationToken.None);
+
+        Assert.Contains("Updated", console.Output);
+        Assert.Equal("new", ((McpStdioServerConfig)McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json")))["s"]).Command);
+    }
+
+    [Fact]
+    public async Task Remove_deletes_entry()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "s": { "command": "x" } } }""");
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["remove", "s"], CancellationToken.None);
+
+        Assert.Contains("Removed", console.Output);
+        Assert.False(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("s"));
+    }
+
+    [Fact]
+    public async Task Disable_then_enable_toggles_persisted_flag()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "s": { "command": "x" } } }""");
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        var cmd = new McpCommand();
+        var path = Path.Combine(dirs.Project, ".mcp.json");
+
+        await cmd.ExecuteAsync(context, ["disable", "s"], CancellationToken.None);
+        Assert.True(McpConfig.Parse(File.ReadAllText(path))["s"].Disabled);
+
+        await cmd.ExecuteAsync(context, ["enable", "s"], CancellationToken.None);
+        Assert.False(McpConfig.Parse(File.ReadAllText(path))["s"].Disabled);
+    }
+
+    [Fact]
+    public async Task Disable_unknown_reports_not_configured()
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, ["disable", "nope"], CancellationToken.None);
+
+        Assert.Contains("not configured", console.Output);
     }
 
     /// <summary>
