@@ -294,6 +294,24 @@ public sealed class ServeRunnerTests
         Assert.Equal(expected, ServeRunner.ResolveMcpEnabled(parsed, env));
     }
 
+    // ── BuildMcpExtraTools composition ────────────────────────────────────
+
+    [Fact]
+    public void BuildMcpExtraTools_appends_the_four_resource_prompt_helpers()
+    {
+        // An empty manager (no connected servers) → manager.Tools is empty, so the result is
+        // exactly the four helper tools the TUI also adds.
+        var manager = new McpClientManager();
+
+        var tools = ServeRunner.BuildMcpExtraTools(manager);
+
+        Assert.Equal(4, tools.Count);
+        Assert.Single(tools.OfType<ListMcpResourcesTool>());
+        Assert.Single(tools.OfType<ReadMcpResourceTool>());
+        Assert.Single(tools.OfType<ListMcpPromptsTool>());
+        Assert.Single(tools.OfType<GetMcpPromptTool>());
+    }
+
     // ── BuildSessionOptions ───────────────────────────────────────────────
 
     [Fact]

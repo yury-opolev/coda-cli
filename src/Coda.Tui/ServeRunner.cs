@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Agent.Settings;
+using Coda.Mcp;
 using Coda.Sdk;
 using Coda.Sdk.Serve;
 using Coda.Sdk.Serve.Transport;
@@ -69,6 +70,24 @@ public static class ServeRunner
     /// </summary>
     public static bool ResolveMcpEnabled(bool parsedEnableMcp, string? disableEnvValue)
         => disableEnvValue is "1" or "true" ? false : parsedEnableMcp;
+
+    /// <summary>
+    /// Composes the agent's MCP tool list: the servers' own tools followed by the four
+    /// resource/prompt helper tools (matching the interactive TUI). Split out so the
+    /// composition is unit-testable with an empty <see cref="McpClientManager"/>.
+    /// </summary>
+    public static IReadOnlyList<ITool> BuildMcpExtraTools(McpClientManager manager)
+    {
+        ArgumentNullException.ThrowIfNull(manager);
+        return
+        [
+            .. manager.Tools,
+            new ListMcpResourcesTool(manager),
+            new ReadMcpResourceTool(manager),
+            new ListMcpPromptsTool(manager),
+            new GetMcpPromptTool(manager),
+        ];
+    }
 
     /// <summary>
     /// Enforces the security invariant before binding: a socket may never run unauthenticated.
