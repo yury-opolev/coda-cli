@@ -53,6 +53,12 @@ public sealed class McpClientManager : IAsyncDisposable
     /// <summary>The connected tools that belong to <paramref name="serverName"/> (empty when not connected).</summary>
     public IReadOnlyList<McpTool> ServerTools(string serverName) => McpServerTools.ForServer(this.tools, serverName);
 
+    /// <summary>
+    /// Bumped on every connect/disconnect. A live tool source can compare it to detect changes
+    /// (the TUI re-reads <see cref="Tools"/> per turn, so it picks up changes without polling).
+    /// </summary>
+    public int Version { get; private set; }
+
     /// <summary>Connect every server in <paramref name="servers"/>; <paramref name="log"/> receives status/errors.</summary>
     public async Task ConnectAllAsync(
         IReadOnlyDictionary<string, McpServerConfig> servers,
@@ -61,38 +67,73 @@ public sealed class McpClientManager : IAsyncDisposable
     {
         foreach (var (name, config) in servers)
         {
-            IMcpClient? client = null;
-            try
-            {
-                client = this.CreateClient(name, config);
-                if (client is null)
-                {
-                    log?.Invoke($"MCP server '{name}': HTTP transport is not available; skipped.");
-                    continue;
-                }
-
-                using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-                timeoutCts.CancelAfter(ConnectTimeout);
-
-                var serverTools = await client.InitializeAndListToolsAsync(timeoutCts.Token).ConfigureAwait(false);
-
-                this.clients.Add(client);
-                foreach (var toolInfo in serverTools)
-                {
-                    this.tools.Add(new McpTool(client, name, toolInfo));
-                }
-
-                log?.Invoke($"MCP server '{name}': {serverTools.Count} tool(s).");
-            }
-            catch (Exception ex)
-            {
-                log?.Invoke($"MCP server '{name}' failed to connect: {ex.Message}");
-                if (client is not null)
-                {
-                    await client.DisposeAsync().ConfigureAwait(false);
-                }
-            }
+            var result = await this.ConnectServerAsync(name, config, cancellationToken).ConfigureAwait(false);
+            log?.Invoke(result.Connected
+                ? $"MCP server '{name}': {result.ToolCount} tool(s)."
+                : $"MCP server '{name}' failed to connect: {result.Error}");
         }
+    }
+
+    /// <summary>
+    /// Connect a single server (add its tools). Returns a failure result — never throws — when the
+    /// server is already connected, its transport is unavailable, or initialize fails.
+    /// </summary>
+    public async Task<McpConnectResult> ConnectServerAsync(string name, McpServerConfig config, CancellationToken cancellationToken = default)
+    {
+        if (this.IsServerConnected(name))
+        {
+            return McpConnectResult.Failure($"'{name}' is already connected.");
+        }
+
+        var client = this.CreateClient(name, config);
+        return client is null
+            ? McpConnectResult.Failure("HTTP transport is not available.")
+            : await this.ConnectClientAsync(client, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Initialize a pre-built client and adopt its tools (a test seam + the shared connect core).</summary>
+    internal async Task<McpConnectResult> ConnectClientAsync(IMcpClient client, CancellationToken cancellationToken)
+    {
+        try
+        {
+            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            timeoutCts.CancelAfter(ConnectTimeout);
+
+            var serverTools = await client.InitializeAndListToolsAsync(timeoutCts.Token).ConfigureAwait(false);
+
+            this.clients.Add(client);
+            foreach (var toolInfo in serverTools)
+            {
+                this.tools.Add(new McpTool(client, client.ServerName, toolInfo));
+            }
+
+            this.Version++;
+            return McpConnectResult.Success(serverTools.Count);
+        }
+        catch (Exception ex)
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+            return McpConnectResult.Failure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Disconnect a single server: dispose its client and drop its tools. Returns false when no
+    /// server with that name is connected.
+    /// </summary>
+    public async Task<bool> DisconnectServerAsync(string name)
+    {
+        var client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, name, StringComparison.Ordinal));
+        if (client is null)
+        {
+            return false;
+        }
+
+        this.clients.Remove(client);
+        this.tools.RemoveAll(t => t is McpTool mcpTool && string.Equals(mcpTool.ServerName, name, StringComparison.Ordinal));
+        await client.DisposeAsync().ConfigureAwait(false);
+        this.Version++;
+        return true;
     }
 
     /// <summary>Construct the transport-appropriate client, or null when an HTTP server has no factory.</summary>
