@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Agent.Settings;
+using Coda.Mcp;
 using Coda.Sdk;
 using Coda.Sdk.Serve;
 using LlmAuth;
@@ -294,6 +295,29 @@ public sealed class ServeRunnerTests
     }
 
     // ── BuildSessionOptions ───────────────────────────────────────────────
+
+    [Fact]
+    public void BuildSessionOptions_defaults_extra_tools_to_empty()
+    {
+        var options = ServeRunner.Parse(["--cwd", "C:\\x"]);
+
+        var so = ServeRunner.BuildSessionOptions(options);
+
+        Assert.Empty(so.ExtraTools);
+    }
+
+    [Fact]
+    public void BuildSessionOptions_threads_extra_tools_through()
+    {
+        var options = ServeRunner.Parse(["--cwd", "C:\\x"]);
+        // A real MCP helper tool instance is a convenient ITool sample (no hand-written double).
+        ITool sample = new ListMcpPromptsTool(new McpClientManager());
+
+        var so = ServeRunner.BuildSessionOptions(options, baseTelemetry: null, extraTools: [sample]);
+
+        Assert.Single(so.ExtraTools);
+        Assert.Same(sample, so.ExtraTools[0]);
+    }
 
     [Fact]
     public void BuildSessionOptions_maps_yolo_safe_to_bypass_with_classifier()

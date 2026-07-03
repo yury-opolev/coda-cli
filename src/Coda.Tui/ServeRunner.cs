@@ -258,7 +258,10 @@ public static class ServeRunner
     /// <see cref="TelemetrySettings.Disabled"/> when none) with <c>Enabled = true</c> and the
     /// parsed level applied. The on-disk settings file is never mutated.
     /// </summary>
-    public static SessionOptions BuildSessionOptions(ServeOptions options, TelemetrySettings? baseTelemetry = null) =>
+    public static SessionOptions BuildSessionOptions(
+        ServeOptions options,
+        TelemetrySettings? baseTelemetry = null,
+        IReadOnlyList<ITool>? extraTools = null) =>
         new()
         {
             ProviderId = options.ProviderId!,
@@ -272,6 +275,8 @@ public static class ServeRunner
             MaxStopContinuations = options.MaxStopContinuations,
             GoalMaxDuration = options.GoalMaxDuration,
             GoalMaxContinuations = options.GoalMaxContinuations,
+            // MCP (and any future host-supplied) tools. Empty unless serve connected MCP servers.
+            ExtraTools = extraTools ?? [],
             // Telemetry layering (force-on, level, "off" special case) lives entirely in
             // TelemetryResolver — the single authority. Serve only passes its inputs through.
             TelemetryOverride = TelemetryResolver.ResolveServeOverride(
