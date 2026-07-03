@@ -232,7 +232,8 @@ shows or sets the model; `/clear` resets the conversation.
 Coda connects MCP servers declared in `.mcp.json` and exposes their tools to the agent
 (and subagents). Two layers are merged, like skills and settings: a **user** file at
 `~/.coda/.mcp.json` and a **project** file at `<workdir>/.mcp.json` (project entries override
-user entries by name).
+user entries by name). All three entry points — the interactive TUI, `coda run`, and
+`coda serve` — load the same merged config.
 
 **Stdio** (a locally launched process):
 
@@ -262,8 +263,16 @@ with an `auth` block:
 ```
 
 `mode` is `oauth` (default), `bearer` (static `"token"`), or `none`. Headless runs
-(`coda run`) reuse stored tokens but never open a browser; a server needing fresh sign-in is
-skipped with a note.
+(`coda run` and `coda serve`) reuse stored tokens but never open a browser; a server needing
+fresh sign-in is skipped with a note to stderr. Pre-authorize such servers once via the TUI or
+`coda run`; the encrypted token is then reused by every process automatically.
+
+**`coda serve` MCP controls.** MCP loads by default under serve (parity with the TUI and
+`coda run`). Disable it per session with `--no-mcp` (or `CODA_SERVE_DISABLE_MCP=1`). Point serve
+at an orchestrator-curated config with `CODA_USER_MCP_DIR` — the cleanest way to give a
+programmatic session a deliberate MCP set instead of the operator's personal `~/.coda/.mcp.json`.
+Serve never writes MCP diagnostics to stdout (that is the JSON-RPC protocol channel); they go to
+stderr.
 
 > The chat path uses the native **Anthropic Messages API** (Claude.ai OAuth +
 > Anthropic API key). GitHub Copilot chat uses a different, OpenAI-shaped API.

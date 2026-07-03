@@ -233,6 +233,16 @@ public sealed class ServeRunnerTests
         Assert.Contains("serve", output);
     }
 
+    [Fact]
+    public void Help_output_documents_no_mcp_flag()
+    {
+        var writer = new StringWriter();
+        ImmediateCli.TryHandle(["--help"], writer);
+        var output = writer.ToString();
+
+        Assert.Contains("--no-mcp", output);
+    }
+
     // ── API key / endpoint flag parsing ───────────────────────────────────
 
     [Fact]

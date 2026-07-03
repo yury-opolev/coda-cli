@@ -42,6 +42,7 @@ public static class ImmediateCli
         writer.WriteLine();
         writer.WriteLine($"Usage: {Branding.CliName} [options]");
         writer.WriteLine($"       {Branding.CliName} run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode <mode>] [--provider <id>] [--model <id>] [--effort <level>] [--log-level <level>] [--cwd <path>] [--goal \"<objective>\"] [--session-memory] [--max-continuations <n>]");
+        writer.WriteLine($"       {Branding.CliName} serve [--provider <id>] [--model <id>] [--cwd <path>] [--permission-mode <mode>] [--goal \"<objective>\"] [--session-memory] [--telemetry] [--no-mcp] [--api-key <key>] [--endpoint <name>]");
         writer.WriteLine();
         writer.WriteLine("With no arguments, starts the interactive assistant (runs first-time setup if needed).");
         writer.WriteLine();
