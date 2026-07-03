@@ -32,11 +32,26 @@ public sealed class CommandContext
     public SlashCommandRegistry Commands { get; }
 
     /// <summary>
-    /// Extra tools beyond the built-ins (MCP tools + MCP resource/prompt tools)
-    /// that the agent loads. Set after MCP servers connect; used by /context to
-    /// report tool token usage accurately. Empty when no MCP servers are configured.
+    /// Live source of the agent's extra tools (MCP tools + MCP resource/prompt tools). A provider
+    /// (not a snapshot) so <c>/mcp start|stop</c> is reflected immediately — e.g. by <c>/context</c>
+    /// token accounting. Null in non-interactive contexts.
     /// </summary>
-    public IReadOnlyList<ITool> ExtraTools { get; set; } = [];
+    public Func<IReadOnlyList<ITool>>? ExtraToolsProvider { get; set; }
+
+    /// <summary>The agent's current extra tools (from <see cref="ExtraToolsProvider"/>; empty when unset).</summary>
+    public IReadOnlyList<ITool> ExtraTools => this.ExtraToolsProvider?.Invoke() ?? [];
+
+    /// <summary>
+    /// The live MCP client manager, so <c>/mcp</c> can report connection status and tools.
+    /// Null in non-interactive contexts (e.g. headless <c>coda help</c>) where no manager exists.
+    /// </summary>
+    public Coda.Mcp.McpClientManager? Mcp { get; set; }
+
+    /// <summary>
+    /// The encrypted credential store, so <c>/mcp add</c> can store secret values encrypted and
+    /// write only a <c>coda-secret:</c> reference into <c>.mcp.json</c>. Null when unavailable.
+    /// </summary>
+    public LlmAuth.ITokenStore? CredentialStore { get; set; }
 
     public ProviderDescriptor? FindProvider(string id) =>
         this.Providers.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));

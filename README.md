@@ -235,6 +235,21 @@ Coda connects MCP servers declared in `.mcp.json` and exposes their tools to the
 user entries by name). All three entry points — the interactive TUI, `coda run`, and
 `coda serve` — load the same merged config.
 
+**Manage servers from the TUI with `/mcp`** — no hand-editing or restart required:
+
+| Command | Action |
+|---|---|
+| `/mcp` · `/mcp info <name>` | list servers (scope, transport, status) · inspect one (description + tools) |
+| `/mcp add <name> [flags]` · `/mcp edit <name>` | add/change a server via a wizard, or inline flags (`--command`, `--args`, `--env`, `--url`, `--header`, `--auth`) |
+| `/mcp remove <name>` | delete a server from its config file |
+| `/mcp start\|stop\|restart <name>` | connect/disconnect **live** — tools appear/disappear from the next turn |
+| `/mcp enable\|disable <name>` | persistently toggle a server (`"disabled": true`, survives restart) |
+
+Writes default to the project file; add `--user` to target `~/.coda/.mcp.json`. Secret values
+(tokens, keys) the wizard collects can be **stored encrypted** in coda's credential store — only a
+`coda-secret:<key>` reference is written to `.mcp.json`. Values are resolved at load: `coda-secret:…`
+decrypts from the store, `${ENV_VAR}` expands from the environment, anything else is literal.
+
 **Stdio** (a locally launched process):
 
 ```json

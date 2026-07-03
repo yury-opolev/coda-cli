@@ -68,6 +68,8 @@ public class McpStdioClient : IMcpClient
 
     public string ServerName { get; }
 
+    public McpServerInfo? ServerInfo { get; private set; }
+
     /// <summary>Run the initialize handshake and return the server's tools.</summary>
     public async Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken cancellationToken = default)
     {
@@ -77,7 +79,8 @@ public class McpStdioClient : IMcpClient
             ["capabilities"] = new JsonObject(),
             ["clientInfo"] = new JsonObject { ["name"] = "coda", ["version"] = "0.1" },
         };
-        await this.rpc.SendRequestAsync("initialize", initParams, cancellationToken).ConfigureAwait(false);
+        var initResult = await this.rpc.SendRequestAsync("initialize", initParams, cancellationToken).ConfigureAwait(false);
+        this.ServerInfo = McpServerInfo.Parse(initResult);
         await this.rpc.SendNotificationAsync("notifications/initialized").ConfigureAwait(false);
 
         var toolsResult = await this.rpc.SendRequestAsync("tools/list", null, cancellationToken).ConfigureAwait(false);

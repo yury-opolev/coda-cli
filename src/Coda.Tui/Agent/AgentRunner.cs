@@ -16,12 +16,12 @@ namespace Coda.Tui.Agent;
 /// </summary>
 public sealed class AgentRunner : IDisposable
 {
-    private readonly IReadOnlyList<ITool> extraTools;
+    private readonly Func<IReadOnlyList<ITool>>? extraToolsProvider;
     private CodaSession? session;
 
-    public AgentRunner(IReadOnlyList<ITool>? extraTools = null)
+    public AgentRunner(Func<IReadOnlyList<ITool>>? extraToolsProvider = null)
     {
-        this.extraTools = extraTools ?? [];
+        this.extraToolsProvider = extraToolsProvider;
     }
 
     public async Task RunAsync(CommandContext context, string prompt, CancellationToken cancellationToken = default)
@@ -81,7 +81,8 @@ public sealed class AgentRunner : IDisposable
         Model = context.Session.Model,
         WorkingDirectory = context.Session.WorkingDirectory,
         PermissionMode = context.Session.PermissionMode,
-        ExtraTools = this.extraTools,
+        // Re-read each turn so /mcp start|stop changes take effect from the next turn.
+        ExtraTools = this.extraToolsProvider?.Invoke() ?? [],
         InteractivePrompt = new TuiPermissionPrompt(context.Console),
         UserQuestionPrompt = context.Console.Profile.Capabilities.Interactive
             ? new TuiUserQuestionPrompt(context.Console)

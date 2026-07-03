@@ -108,7 +108,8 @@ public static class ServeRunner
         IMcpHttpClientFactory httpFactory,
         Action<string> log,
         CancellationToken cancellationToken,
-        string? userMcpDir = null)
+        string? userMcpDir = null,
+        ITokenStore? secretStore = null)
     {
         if (!enableMcp)
         {
@@ -121,6 +122,12 @@ public static class ServeRunner
         if (servers.Count == 0)
         {
             return ([], null);
+        }
+
+        // Resolve coda-secret:/${VAR} references before connecting (never plaintext in config).
+        if (secretStore is not null)
+        {
+            servers = await McpSecretResolver.ResolveAsync(servers, secretStore, cancellationToken).ConfigureAwait(false);
         }
 
         var manager = new McpClientManager(httpFactory);
@@ -298,12 +305,13 @@ public static class ServeRunner
                 var enableMcp = ResolveMcpEnabled(
                     options.EnableMcp, Environment.GetEnvironmentVariable("CODA_SERVE_DISABLE_MCP"));
                 using var mcpHttp = new HttpClient();
+                var mcpCredentialStore = CredentialStoreFactory.Create();
                 var mcpHttpFactory = new DefaultMcpHttpClientFactory(
-                    mcpHttp, CredentialStoreFactory.Create(), interactive: false,
+                    mcpHttp, mcpCredentialStore, interactive: false,
                     msg => Console.Error.WriteLine(msg));
                 var (mcpTools, mcpManager) = await LoadMcpToolsAsync(
                     enableMcp, options.WorkingDirectory!, mcpHttpFactory,
-                    msg => Console.Error.WriteLine(msg), cts.Token).ConfigureAwait(false);
+                    msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null, secretStore: mcpCredentialStore).ConfigureAwait(false);
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
                 var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools);
 

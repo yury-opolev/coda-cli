@@ -100,18 +100,27 @@ await using var mcp = new Coda.Mcp.McpClientManager(mcpHttpFactory);
 var mcpServers = Coda.Mcp.McpConfig.Load(session.WorkingDirectory);
 if (mcpServers.Count > 0)
 {
+    // Resolve coda-secret:/${VAR} references to real values before connecting (never plaintext in config).
+    mcpServers = await Coda.Mcp.McpSecretResolver.ResolveAsync(mcpServers, store, cts.Token);
     await mcp.ConnectAllAsync(mcpServers, msg => console.MarkupLine($"[grey50]{Spectre.Console.Markup.Escape(msg)}[/]"), cts.Token);
 }
 
-// When MCP servers are configured, expose resource list/read tools alongside
-// the server-advertised tools. Elicitation (server-initiated requests) is
-// intentionally out of scope and not exposed here.
-IReadOnlyList<Coda.Agent.ITool> agentTools = mcpServers.Count > 0
-    ? [.. mcp.Tools, new Coda.Mcp.ListMcpResourcesTool(mcp), new Coda.Mcp.ReadMcpResourceTool(mcp), new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp)]
-    : mcp.Tools;
+// Live tool source: recomputed each turn so /mcp start|stop changes take effect from the next
+// turn. When any server is connected, expose its tools plus the resource/prompt helper tools;
+// otherwise no MCP tools. Helper tools are built once (they only reference the manager).
+Coda.Agent.ITool[] mcpHelperTools =
+[
+    new Coda.Mcp.ListMcpResourcesTool(mcp), new Coda.Mcp.ReadMcpResourceTool(mcp),
+    new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp),
+];
+Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
+    mcp.Clients.Count > 0 ? [.. mcp.Tools, .. mcpHelperTools] : [];
 
-// Expose the agent's extra tools to slash commands (e.g. /context token accounting).
-context.ExtraTools = agentTools;
+// Expose the live tool source (for /context accounting), the manager (for /mcp), and the
+// credential store (so /mcp add can store secrets encrypted) to commands.
+context.ExtraToolsProvider = agentToolsProvider;
+context.Mcp = mcp;
+context.CredentialStore = store;
 
 // Kick off a background, staleness-gated refresh of the models.dev catalog
 // (opencode-style): keeps model metadata current without blocking startup or
@@ -132,6 +141,6 @@ _ = Task.Run(async () =>
     }
 }, cts.Token);
 
-using var app = new TuiApp(context, agentTools);
+using var app = new TuiApp(context, agentToolsProvider);
 await app.RunAsync(cts.Token);
 return 0;

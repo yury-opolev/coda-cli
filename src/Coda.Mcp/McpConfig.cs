@@ -28,17 +28,7 @@ public static class McpConfig
     /// </param>
     public static IReadOnlyDictionary<string, McpServerConfig> Load(string workingDirectory, string? userMcpDir = null)
     {
-        var userBase = userMcpDir
-            ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
-
-        var userServers = LoadFile(Path.Combine(userBase, FileName));
-        var projectServers = LoadFile(Path.Combine(workingDirectory, FileName));
-
-        if (userServers.Count == 0)
-        {
-            return projectServers;
-        }
+        var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
 
         // Merge: user first, then project overlays by name (project wins).
         var merged = new Dictionary<string, McpServerConfig>(userServers, StringComparer.Ordinal);
@@ -47,7 +37,69 @@ public static class McpConfig
             merged[name] = config;
         }
 
-        return merged;
+        // Disabled servers are excluded so they never auto-connect; they remain visible via
+        // LoadEntries so /mcp can list and re-enable them.
+        var connectable = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
+        foreach (var (name, config) in merged)
+        {
+            if (!config.Disabled)
+            {
+                connectable[name] = config;
+            }
+        }
+
+        return connectable;
+    }
+
+    /// <summary>
+    /// Like <see cref="Load"/> but tags each server with the <see cref="McpConfigScope"/> it was
+    /// resolved from (project overrides user). For display and scope-aware editing.
+    /// </summary>
+    public static IReadOnlyList<McpServerEntry> LoadEntries(string workingDirectory, string? userMcpDir = null)
+    {
+        var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
+        var entries = new List<McpServerEntry>();
+
+        foreach (var (name, config) in userServers)
+        {
+            if (!projectServers.ContainsKey(name))
+            {
+                entries.Add(new McpServerEntry(name, config, McpConfigScope.User));
+            }
+        }
+
+        foreach (var (name, config) in projectServers)
+        {
+            entries.Add(new McpServerEntry(name, config, McpConfigScope.Project));
+        }
+
+        return entries;
+    }
+
+    /// <summary>
+    /// The <c>.mcp.json</c> path for a given scope: the working directory for
+    /// <see cref="McpConfigScope.Project"/>, or the user base
+    /// (<paramref name="userMcpDir"/> ?? <c>CODA_USER_MCP_DIR</c> ?? <c>~/.coda</c>) for
+    /// <see cref="McpConfigScope.User"/>. Shared by the loader and the writer.
+    /// </summary>
+    public static string FilePath(McpConfigScope scope, string workingDirectory, string? userMcpDir = null)
+    {
+        var directory = scope == McpConfigScope.User
+            ? userMcpDir
+                ?? Environment.GetEnvironmentVariable("CODA_USER_MCP_DIR")
+                ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda")
+            : workingDirectory;
+
+        return Path.Combine(directory, FileName);
+    }
+
+    /// <summary>Resolve and parse the user and project layers separately (shared by Load/LoadEntries).</summary>
+    private static (IReadOnlyDictionary<string, McpServerConfig> User, IReadOnlyDictionary<string, McpServerConfig> Project) LoadLayers(
+        string workingDirectory, string? userMcpDir)
+    {
+        return (
+            LoadFile(FilePath(McpConfigScope.User, workingDirectory, userMcpDir)),
+            LoadFile(FilePath(McpConfigScope.Project, workingDirectory, userMcpDir)));
     }
 
     private static IReadOnlyDictionary<string, McpServerConfig> LoadFile(string path)
@@ -91,12 +143,20 @@ public static class McpConfig
     private static McpServerConfig? ParseServer(JsonElement config)
     {
         var type = config.TryGetProperty("type", out var t) ? t.GetString() : null;
-        return type switch
+        var parsed = type switch
         {
             "http" or "streamable-http" => ParseHttp(config),
             null or "stdio" => ParseStdio(config),
-            _ => null, // unknown transport (e.g. legacy "sse") is skipped
+            _ => (McpServerConfig?)null, // unknown transport (e.g. legacy "sse") is skipped
         };
+
+        if (parsed is null)
+        {
+            return null;
+        }
+
+        var disabled = config.TryGetProperty("disabled", out var d) && d.ValueKind == JsonValueKind.True;
+        return disabled ? parsed with { Disabled = true } : parsed;
     }
 
     private static McpStdioServerConfig? ParseStdio(JsonElement config)
