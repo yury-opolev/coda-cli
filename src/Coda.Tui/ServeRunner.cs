@@ -65,16 +65,20 @@ public static class ServeRunner
 
     /// <summary>
     /// Resolves whether MCP should be connected for this serve run: the parsed flag default
-    /// (<c>--no-mcp</c> / <c>--mcp</c>), overridden off by <c>CODA_SERVE_DISABLE_MCP</c> in
-    /// (<c>"1"</c>, <c>"true"</c>). Split out so the env precedence is unit-testable.
+    /// (<c>--no-mcp</c> / <c>--mcp</c>), overridden off by a truthy <c>CODA_SERVE_DISABLE_MCP</c>
+    /// (<c>"1"</c> / <c>"true"</c>, case-insensitive — see <see cref="EnvFlags.IsTruthy"/>). Split
+    /// out so the env precedence is unit-testable.
     /// </summary>
     public static bool ResolveMcpEnabled(bool parsedEnableMcp, string? disableEnvValue)
-        => disableEnvValue is "1" or "true" ? false : parsedEnableMcp;
+        => EnvFlags.IsTruthy(disableEnvValue) ? false : parsedEnableMcp;
 
     /// <summary>
     /// Composes the agent's MCP tool list: the servers' own tools followed by the four
-    /// resource/prompt helper tools (matching the interactive TUI). Split out so the
-    /// composition is unit-testable with an empty <see cref="McpClientManager"/>.
+    /// resource/prompt helper tools. Deliberately mirrors the interactive TUI (<c>Program.cs</c>)
+    /// rather than <c>HeadlessRunner</c> (which omits the helpers): a serve session is long-lived
+    /// and richer like the TUI, and the helper tools are inert unless a server exposes
+    /// resources/prompts. Split out so the composition is unit-testable with an empty
+    /// <see cref="McpClientManager"/>.
     /// </summary>
     public static IReadOnlyList<ITool> BuildMcpExtraTools(McpClientManager manager)
     {
@@ -111,14 +115,15 @@ public static class ServeRunner
             return ([], null);
         }
 
-        var manager = new McpClientManager(httpFactory);
+        // Load config BEFORE constructing the manager: nothing to dispose when MCP is off or no
+        // server is configured, and a failing config read can't leak a manager.
         var servers = McpConfig.Load(workingDirectory, userMcpDir);
         if (servers.Count == 0)
         {
-            await manager.DisposeAsync().ConfigureAwait(false);
             return ([], null);
         }
 
+        var manager = new McpClientManager(httpFactory);
         await manager.ConnectAllAsync(servers, log, cancellationToken).ConfigureAwait(false);
         return (BuildMcpExtraTools(manager), manager);
     }

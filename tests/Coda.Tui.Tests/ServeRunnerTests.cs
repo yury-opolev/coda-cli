@@ -3,6 +3,8 @@ using Coda.Agent.Settings;
 using Coda.Mcp;
 using Coda.Sdk;
 using Coda.Sdk.Serve;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -297,6 +299,8 @@ public sealed class ServeRunnerTests
     [InlineData(true, "0", true)]
     [InlineData(true, "1", false)]
     [InlineData(true, "true", false)]
+    [InlineData(true, "True", false)]   // case-insensitive, matching CODA_DISABLE_MODELS_FETCH
+    [InlineData(true, "TRUE", false)]
     [InlineData(false, null, false)]   // --no-mcp already off; env absent keeps it off
     [InlineData(false, "1", false)]
     public void ResolveMcpEnabled_applies_env_override(bool parsed, string? env, bool expected)
@@ -356,6 +360,40 @@ public sealed class ServeRunnerTests
 
         Assert.Empty(tools);
         Assert.Null(manager);
+    }
+
+    [Fact]
+    public async Task LoadMcpToolsAsync_with_configured_server_returns_server_tools_plus_helpers()
+    {
+        // A project .mcp.json with one HTTP server; the stub factory returns a fake client
+        // exposing a single tool — no process or network is touched. Covers the connect branch
+        // (ConnectAllAsync → BuildMcpExtraTools) and the caller's manager-disposal contract.
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(
+            Path.Combine(work.Path, ".mcp.json"),
+            """{ "mcpServers": { "fake": { "type": "http", "url": "https://example.test/mcp" } } }""");
+
+        var (tools, manager) = await ServeRunner.LoadMcpToolsAsync(
+            enableMcp: true,
+            workingDirectory: work.Path,
+            httpFactory: new StubHttpFactory(),
+            log: _ => { },
+            cancellationToken: default,
+            userMcpDir: user.Path);
+
+        Assert.NotNull(manager);
+        await using (manager)
+        {
+            // The one server tool (mcp__fake__echo) followed by the four resource/prompt helpers.
+            Assert.Equal(5, tools.Count);
+            var serverTool = Assert.Single(tools.OfType<McpTool>());
+            Assert.Equal("mcp__fake__echo", serverTool.Name);
+            Assert.Single(tools.OfType<ListMcpResourcesTool>());
+            Assert.Single(tools.OfType<ReadMcpResourceTool>());
+            Assert.Single(tools.OfType<ListMcpPromptsTool>());
+            Assert.Single(tools.OfType<GetMcpPromptTool>());
+        }
     }
 
     // ── BuildSessionOptions ───────────────────────────────────────────────
@@ -654,6 +692,40 @@ public sealed class ServeRunnerTests
     {
         public IMcpClient Create(string serverName, McpHttpServerConfig config)
             => throw new InvalidOperationException("HTTP factory must not be used when no HTTP server is configured.");
+    }
+
+    /// <summary>Returns a <see cref="StubMcpClient"/> for any HTTP server — no real transport.</summary>
+    private sealed class StubHttpFactory : IMcpHttpClientFactory
+    {
+        public IMcpClient Create(string serverName, McpHttpServerConfig config) => new StubMcpClient(serverName);
+    }
+
+    /// <summary>A fake MCP client exposing one tool (<c>echo</c>); everything else is inert.</summary>
+    private sealed class StubMcpClient : IMcpClient
+    {
+        public StubMcpClient(string serverName) => this.ServerName = serverName;
+
+        public string ServerName { get; }
+
+        public Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<McpToolInfo>>([new McpToolInfo("echo", "Echoes input.", """{"type":"object"}""", true)]);
+
+        public Task<(string Text, bool IsError)> CallToolAsync(string toolName, JsonElement arguments, CancellationToken cancellationToken = default)
+            => Task.FromResult(("ok", false));
+
+        public Task<IReadOnlyList<McpResourceInfo>> ListResourcesAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<McpResourceInfo>>([]);
+
+        public Task<string> ReadResourceAsync(string uri, CancellationToken cancellationToken = default)
+            => Task.FromResult(string.Empty);
+
+        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
+
+        public Task<string> GetPromptAsync(string name, JsonNode? arguments, CancellationToken cancellationToken = default)
+            => Task.FromResult(string.Empty);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     /// <summary>A throwaway directory, deleted on dispose — for hermetic MCP-config tests.</summary>

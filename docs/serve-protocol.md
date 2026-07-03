@@ -50,6 +50,10 @@ interactive TUI and `coda run`, exposing each server's tools to the session as
   servers once via the TUI or `coda run`.
 - **stdout stays pure.** All MCP connect/skip diagnostics go to **stderr**; no MCP output is ever
   written to stdout (the JSON-RPC protocol channel).
+- **Startup timing.** Servers connect sequentially before the JSON-RPC connection is accepted, each
+  with a 20s connect cap. Many slow/hanging servers can therefore delay the handshake (bounded by
+  server count × 20s, and by shutdown/cancellation). Keep the curated set small, or use `--no-mcp`
+  when a session needs no external tools.
 
 ## Orchestrator → Coda (requests)
 | Method | Params | Result |

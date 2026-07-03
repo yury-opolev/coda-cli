@@ -212,8 +212,7 @@ public sealed class ModelCatalog
         }
     }
 
-    private static bool IsTruthy(string? value) =>
-        value is not null && (value == "1" || value.Equals("true", StringComparison.OrdinalIgnoreCase));
+    private static bool IsTruthy(string? value) => EnvFlags.IsTruthy(value);
 
     private static IReadOnlyDictionary<string, IReadOnlyDictionary<string, CatalogModel>>? TryParseFile(string path)
     {
