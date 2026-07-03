@@ -37,6 +37,8 @@ public sealed class McpHttpClient : IMcpClient
 
     public string ServerName { get; }
 
+    public McpServerInfo? ServerInfo { get; private set; }
+
     public async Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken cancellationToken = default)
     {
         var initParams = new JsonObject
@@ -46,7 +48,8 @@ public sealed class McpHttpClient : IMcpClient
             ["clientInfo"] = new JsonObject { ["name"] = "coda", ["version"] = "0.1" },
         };
 
-        await this.SendRequestAsync("initialize", initParams, cancellationToken).ConfigureAwait(false);
+        var initResult = await this.SendRequestAsync("initialize", initParams, cancellationToken).ConfigureAwait(false);
+        this.ServerInfo = McpServerInfo.Parse(initResult);
         await this.SendNotificationAsync("notifications/initialized", cancellationToken).ConfigureAwait(false);
 
         var toolsResult = await this.SendRequestAsync("tools/list", null, cancellationToken).ConfigureAwait(false);

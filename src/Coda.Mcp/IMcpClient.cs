@@ -14,6 +14,12 @@ public interface IMcpClient : IAsyncDisposable
     /// <summary>The configured server name (used to build <c>mcp__{server}__{tool}</c> names).</summary>
     string ServerName { get; }
 
+    /// <summary>
+    /// Identity the server reported at <c>initialize</c> (name/version/instructions), or null before
+    /// initialize or when the server reported none. Default null so simple implementers need not set it.
+    /// </summary>
+    McpServerInfo? ServerInfo => null;
+
     /// <summary>Run the initialize handshake and return the server's tools.</summary>
     Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken cancellationToken = default);
 
