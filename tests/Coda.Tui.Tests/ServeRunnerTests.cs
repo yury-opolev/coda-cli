@@ -109,6 +109,36 @@ public sealed class ServeRunnerTests
         Assert.Equal("/tmp", options.WorkingDirectory);
     }
 
+    // ── MCP enable/disable parsing ────────────────────────────────────────
+
+    [Fact]
+    public void Parse_enable_mcp_defaults_to_true()
+    {
+        var options = ServeOptions.Parse([]);
+        Assert.True(options.EnableMcp);
+    }
+
+    [Fact]
+    public void Parse_no_mcp_flag_disables_mcp()
+    {
+        var options = ServeOptions.Parse(["--no-mcp"]);
+        Assert.False(options.EnableMcp);
+    }
+
+    [Fact]
+    public void Parse_mcp_flag_keeps_mcp_enabled()
+    {
+        var options = ServeOptions.Parse(["--mcp"]);
+        Assert.True(options.EnableMcp);
+    }
+
+    [Fact]
+    public void Parse_no_mcp_wins_regardless_of_position()
+    {
+        var options = ServeOptions.Parse(["--mcp", "--no-mcp"]);
+        Assert.False(options.EnableMcp);
+    }
+
     // ── BuildHost seam ───────────────────────────────────────────────────
 
     [Fact]
