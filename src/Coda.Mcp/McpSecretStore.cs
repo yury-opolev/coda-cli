@@ -10,7 +10,8 @@ namespace Coda.Mcp;
 /// </summary>
 public static class McpSecretStore
 {
-    /// <summary>The store key for a server's secret field, e.g. <c>mcp:github/env/TOKEN</c>.</summary>
+    /// <summary>The store key for a server's secret field, e.g. <c>mcp:github/env/TOKEN</c>.
+    /// Assumes server names contain no <c>/</c> (they are JSON object keys in practice).</summary>
     public static string KeyFor(string server, string field) => $"mcp:{server}/{field}";
 
     /// <summary>Encrypt <paramref name="value"/> under <c>mcp:&lt;server&gt;/&lt;field&gt;</c>; returns the reference to store in config.</summary>

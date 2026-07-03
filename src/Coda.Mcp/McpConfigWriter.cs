@@ -82,22 +82,25 @@ public static class McpConfigWriter
 
     private static JsonObject ReadRoot(string path)
     {
-        if (File.Exists(path))
+        if (!File.Exists(path))
         {
-            try
-            {
-                if (JsonNode.Parse(File.ReadAllText(path)) is JsonObject obj)
-                {
-                    return obj;
-                }
-            }
-            catch (JsonException)
-            {
-                // Corrupt/unreadable file → start fresh; the write repairs it rather than throwing.
-            }
+            return new JsonObject(); // brand-new config file
         }
 
-        return new JsonObject();
+        // NEVER start fresh on an existing-but-unparseable file: a mutating write would then discard
+        // every other server and unrelated key. Refuse instead, so the file is preserved.
+        JsonNode? root;
+        try
+        {
+            root = JsonNode.Parse(File.ReadAllText(path));
+        }
+        catch (JsonException ex)
+        {
+            throw new McpException($"'{path}' is not valid JSON ({ex.Message}); fix or remove it before editing MCP servers.");
+        }
+
+        return root as JsonObject
+            ?? throw new McpException($"'{path}' does not contain a JSON object; fix or remove it before editing MCP servers.");
     }
 
     private static JsonObject GetOrCreateServers(JsonObject root)
@@ -120,7 +123,10 @@ public static class McpConfigWriter
             Directory.CreateDirectory(directory);
         }
 
-        File.WriteAllText(path, root.ToJsonString(writeOptions));
+        // Write to a temp file then move over the target, so a crash mid-write can't truncate the config.
+        var temp = path + ".tmp";
+        File.WriteAllText(temp, root.ToJsonString(writeOptions));
+        File.Move(temp, path, overwrite: true);
     }
 
     private static JsonObject ToJson(McpServerConfig config, bool disabled)

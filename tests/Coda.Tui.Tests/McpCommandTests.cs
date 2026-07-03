@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Mcp;
 using Coda.Tui.Commands;
+using LlmAuth;
 
 namespace Coda.Tui.Tests;
 
@@ -224,9 +225,54 @@ public sealed class McpCommandTests
         Assert.False(context.Mcp.IsServerConnected("remote"));
     }
 
+    [Fact]
+    public async Task Start_resolves_coda_secret_reference_before_connecting()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "remote": { "type": "http", "url": "https://x/mcp", "headers": { "X-Key": "coda-secret:mcp:remote/header/X-Key" } } } }""");
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync("mcp:remote/header/X-Key", "decrypted-value");
+        context.CredentialStore = store;
+        var factory = new StubHttpFactory();
+        context.Mcp = new McpClientManager(factory);
+
+        await new McpCommand().ExecuteAsync(context, ["start", "remote"], CancellationToken.None);
+
+        Assert.NotNull(factory.LastConfig);
+        Assert.Equal("decrypted-value", factory.LastConfig!.Headers["X-Key"]); // resolved, not the literal ref
+    }
+
     private sealed class StubHttpFactory : IMcpHttpClientFactory
     {
-        public IMcpClient Create(string serverName, McpHttpServerConfig config) => new StubMcpClient(serverName);
+        public McpHttpServerConfig? LastConfig { get; private set; }
+
+        public IMcpClient Create(string serverName, McpHttpServerConfig config)
+        {
+            this.LastConfig = config;
+            return new StubMcpClient(serverName);
+        }
+    }
+
+    private sealed class InMemoryStore : ITokenStore
+    {
+        private readonly Dictionary<string, string> map = new(StringComparer.Ordinal);
+
+        public Task<string?> GetAsync(string key, CancellationToken ct = default)
+            => Task.FromResult(this.map.TryGetValue(key, out var v) ? v : null);
+
+        public Task SetAsync(string key, string value, CancellationToken ct = default)
+        {
+            this.map[key] = value;
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(string key, CancellationToken ct = default)
+        {
+            this.map.Remove(key);
+            return Task.CompletedTask;
+        }
     }
 
     private sealed class StubMcpClient : IMcpClient

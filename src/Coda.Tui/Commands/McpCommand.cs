@@ -113,7 +113,8 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        var result = await context.Mcp.ConnectServerAsync(name, entry.Config, ct).ConfigureAwait(false);
+        var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
+        var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
         context.Console.MarkupLine(Markup.Escape(result.Connected
             ? $"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."
             : $"Failed to start '{name}': {result.Error}"));
@@ -160,7 +161,8 @@ public sealed class McpCommand : ISlashCommand
                 return;
             }
 
-            var result = await context.Mcp.ConnectServerAsync(name, entry.Config, ct).ConfigureAwait(false);
+            var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
+            var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
             context.Console.MarkupLine(Markup.Escape(result.Connected
                 ? $"Restarted '{name}' — {result.ToolCount} tool(s)."
                 : $"Failed to restart '{name}': {result.Error}"));
@@ -173,9 +175,21 @@ public sealed class McpCommand : ISlashCommand
             await context.Mcp.DisconnectServerAsync(serverName).ConfigureAwait(false);
         }
 
-        await context.Mcp.ConnectAllAsync(McpConfig.Load(context.Session.WorkingDirectory), cancellationToken: ct).ConfigureAwait(false);
+        var servers = McpConfig.Load(context.Session.WorkingDirectory);
+        if (context.CredentialStore is { } store)
+        {
+            servers = await McpSecretResolver.ResolveAsync(servers, store, ct).ConfigureAwait(false);
+        }
+
+        await context.Mcp.ConnectAllAsync(servers, cancellationToken: ct).ConfigureAwait(false);
         context.Console.MarkupLine(Markup.Escape($"Reconnected MCP servers ({context.Mcp.Clients.Count} connected)."));
     }
+
+    /// <summary>Resolve <c>coda-secret:</c> / <c>${VAR}</c> references before a live connect (parity with startup).</summary>
+    private static async Task<McpServerConfig> ResolveSecrets(CommandContext context, McpServerConfig config, CancellationToken ct)
+        => context.CredentialStore is { } store
+            ? await McpSecretResolver.ResolveAsync(config, store, ct).ConfigureAwait(false)
+            : config;
 
     // ── Inspect ───────────────────────────────────────────────────────────
 
@@ -245,10 +259,27 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        McpConfigWriter.Upsert(scope, name, config!, disabled: false, context.Session.WorkingDirectory);
+        try
+        {
+            McpConfigWriter.Upsert(scope, name, config!, disabled: false, context.Session.WorkingDirectory);
+        }
+        catch (McpException ex)
+        {
+            context.Console.MarkupLine(Markup.Escape(ex.Message));
+            return;
+        }
+
         var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
         context.Console.MarkupLine(Markup.Escape(
             $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Run /mcp start {name} to connect it, or it loads on next launch."));
+
+        // The flag path writes values verbatim (unlike the wizard, which offers encryption). Warn if
+        // a literal secret-looking value was persisted so the user can move it out of the file.
+        if (flags.Count > 0 && HasLiteralSecret(config!))
+        {
+            context.Console.MarkupLine(Markup.Escape(
+                "Note: values were stored as plaintext. Use the wizard (/mcp add with no flags) or a ${ENV_VAR} reference to keep secrets out of .mcp.json."));
+        }
     }
 
     // ── remove ────────────────────────────────────────────────────────────
@@ -407,6 +438,19 @@ public sealed class McpCommand : ISlashCommand
     }
 
     private static string ScopeName(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
+
+    /// <summary>True when the config carries a literal (non-reference) value in a secret-bearing field.</summary>
+    private static bool HasLiteralSecret(McpServerConfig config) => config switch
+    {
+        McpStdioServerConfig stdio => stdio.Env.Values.Any(IsLiteralSecret),
+        McpHttpServerConfig http => (http.Auth.BearerToken is { } t && IsLiteralSecret(t)) || http.Headers.Values.Any(IsLiteralSecret),
+        _ => false,
+    };
+
+    private static bool IsLiteralSecret(string value) =>
+        !string.IsNullOrEmpty(value)
+        && !value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal)
+        && !(value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}'));
 
     private static bool ExistsInScope(McpConfigScope scope, string name, CommandContext context)
     {

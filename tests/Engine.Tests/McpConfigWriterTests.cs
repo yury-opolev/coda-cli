@@ -41,6 +41,39 @@ public sealed class McpConfigWriterTests
     }
 
     [Fact]
+    public void Upsert_roundtrips_http_oauth_with_clientid_and_scopes()
+    {
+        using var dir = new TempDir();
+
+        McpConfigWriter.Upsert(
+            McpConfigScope.Project, "remote",
+            new McpHttpServerConfig(new Uri("https://x/mcp"), new Dictionary<string, string>(),
+                new McpAuthConfig(McpAuthMode.OAuth, ClientId: "cid", Scopes: ["files:read", "files:write"])),
+            disabled: false, dir.Path);
+
+        var http = Assert.IsType<McpHttpServerConfig>(
+            McpConfig.Parse(File.ReadAllText(Path.Combine(dir.Path, ".mcp.json")))["remote"]);
+        Assert.Equal(McpAuthMode.OAuth, http.Auth.Mode);
+        Assert.Equal("cid", http.Auth.ClientId);
+        Assert.Equal(["files:read", "files:write"], http.Auth.Scopes);
+    }
+
+    [Fact]
+    public void Upsert_on_corrupt_file_throws_and_preserves_it()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, ".mcp.json");
+        const string corrupt = "{ this is not valid json";
+        File.WriteAllText(path, corrupt);
+
+        Assert.Throws<McpException>(() => McpConfigWriter.Upsert(
+            McpConfigScope.Project, "x",
+            new McpStdioServerConfig("c", [], new Dictionary<string, string>()), disabled: false, dir.Path));
+
+        Assert.Equal(corrupt, File.ReadAllText(path)); // never wiped
+    }
+
+    [Fact]
     public void Upsert_preserves_other_servers_and_unrelated_keys()
     {
         using var dir = new TempDir();

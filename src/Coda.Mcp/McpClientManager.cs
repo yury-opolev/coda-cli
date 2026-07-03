@@ -6,6 +6,12 @@ namespace Coda.Mcp;
 /// Connects all configured MCP servers (stdio processes and HTTP endpoints), aggregates
 /// their tools (as <see cref="ITool"/>s), and owns the stdio server processes. A failing or
 /// slow server is skipped (logged) rather than blocking startup.
+/// <para>
+/// Thread-safety by convention: the client/tool lists are mutated only from the REPL thread
+/// between agent turns (via <c>/mcp start|stop</c>) and read by a turn that has already started
+/// (which copies <see cref="Tools"/> into a fresh array). There is no background reconnect, so no
+/// lock is used. A future background mutator would need synchronization here.
+/// </para>
 /// </summary>
 public sealed class McpClientManager : IAsyncDisposable
 {

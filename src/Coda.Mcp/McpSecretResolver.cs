@@ -34,6 +34,14 @@ public static class McpSecretResolver
         return result;
     }
 
+    /// <summary>Resolve secret references in a single server config (used by the live <c>/mcp start</c> path).</summary>
+    public static Task<McpServerConfig> ResolveAsync(McpServerConfig config, ITokenStore store, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(config);
+        ArgumentNullException.ThrowIfNull(store);
+        return ResolveConfigAsync(config, store, cancellationToken);
+    }
+
     private static async Task<McpServerConfig> ResolveConfigAsync(McpServerConfig config, ITokenStore store, CancellationToken ct)
     {
         switch (config)
