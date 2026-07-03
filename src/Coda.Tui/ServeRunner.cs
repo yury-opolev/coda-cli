@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Agent.Settings;
+using Coda.Mcp;
 using Coda.Sdk;
 using Coda.Sdk.Serve;
 using Coda.Sdk.Serve.Transport;
@@ -60,6 +61,71 @@ public static class ServeRunner
             WorkingDirectory = workingDirectory,
             Model = model,
         };
+    }
+
+    /// <summary>
+    /// Resolves whether MCP should be connected for this serve run: the parsed flag default
+    /// (<c>--no-mcp</c> / <c>--mcp</c>), overridden off by a truthy <c>CODA_SERVE_DISABLE_MCP</c>
+    /// (<c>"1"</c> / <c>"true"</c>, case-insensitive — see <see cref="EnvFlags.IsTruthy"/>). Split
+    /// out so the env precedence is unit-testable.
+    /// </summary>
+    public static bool ResolveMcpEnabled(bool parsedEnableMcp, string? disableEnvValue)
+        => EnvFlags.IsTruthy(disableEnvValue) ? false : parsedEnableMcp;
+
+    /// <summary>
+    /// Composes the agent's MCP tool list: the servers' own tools followed by the four
+    /// resource/prompt helper tools. Deliberately mirrors the interactive TUI (<c>Program.cs</c>)
+    /// rather than <c>HeadlessRunner</c> (which omits the helpers): a serve session is long-lived
+    /// and richer like the TUI, and the helper tools are inert unless a server exposes
+    /// resources/prompts. Split out so the composition is unit-testable with an empty
+    /// <see cref="McpClientManager"/>.
+    /// </summary>
+    public static IReadOnlyList<ITool> BuildMcpExtraTools(McpClientManager manager)
+    {
+        ArgumentNullException.ThrowIfNull(manager);
+        return
+        [
+            .. manager.Tools,
+            new ListMcpResourcesTool(manager),
+            new ReadMcpResourceTool(manager),
+            new ListMcpPromptsTool(manager),
+            new GetMcpPromptTool(manager),
+        ];
+    }
+
+    /// <summary>
+    /// Loads and connects the merged MCP config for a serve session, returning the agent's MCP
+    /// tool list and the owning <see cref="McpClientManager"/> (which the caller MUST dispose).
+    /// Returns <c>(empty, null)</c> when MCP is disabled or no servers are configured — in that
+    /// case nothing is left to dispose. HTTP servers are connected non-interactively via
+    /// <paramref name="httpFactory"/>; all diagnostics go through <paramref name="log"/> (stderr).
+    /// </summary>
+    /// <param name="userMcpDir">Test/override seam for the user-level <c>.mcp.json</c> directory;
+    /// null uses the default resolution (<c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c>).</param>
+    public static async Task<(IReadOnlyList<ITool> Tools, McpClientManager? Manager)> LoadMcpToolsAsync(
+        bool enableMcp,
+        string workingDirectory,
+        IMcpHttpClientFactory httpFactory,
+        Action<string> log,
+        CancellationToken cancellationToken,
+        string? userMcpDir = null)
+    {
+        if (!enableMcp)
+        {
+            return ([], null);
+        }
+
+        // Load config BEFORE constructing the manager: nothing to dispose when MCP is off or no
+        // server is configured, and a failing config read can't leak a manager.
+        var servers = McpConfig.Load(workingDirectory, userMcpDir);
+        if (servers.Count == 0)
+        {
+            return ([], null);
+        }
+
+        var manager = new McpClientManager(httpFactory);
+        await manager.ConnectAllAsync(servers, log, cancellationToken).ConfigureAwait(false);
+        return (BuildMcpExtraTools(manager), manager);
     }
 
     /// <summary>
@@ -152,8 +218,6 @@ public static class ServeRunner
             var apiKey = new ApiKeyProvider();
             var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
 
-            var sessionOptions = BuildSessionOptions(options, settings.Telemetry);
-
             // Resolve API key: flag wins, else env var. Its presence selects the socket transport.
             var resolvedKey = options.ApiKey ?? Environment.GetEnvironmentVariable("CODA_SERVE_API_KEY");
             options = options with { ApiKey = string.IsNullOrEmpty(resolvedKey) ? null : resolvedKey };
@@ -228,6 +292,21 @@ public static class ServeRunner
                     }
                 }, cts.Token);
 
+                // Connect MCP servers (parity with the TUI / `coda run`): default-on unless
+                // --no-mcp or CODA_SERVE_DISABLE_MCP. Non-interactive (never opens a browser);
+                // ALL MCP diagnostics go to stderr because stdout is the JSON-RPC protocol channel.
+                var enableMcp = ResolveMcpEnabled(
+                    options.EnableMcp, Environment.GetEnvironmentVariable("CODA_SERVE_DISABLE_MCP"));
+                using var mcpHttp = new HttpClient();
+                var mcpHttpFactory = new DefaultMcpHttpClientFactory(
+                    mcpHttp, CredentialStoreFactory.Create(), interactive: false,
+                    msg => Console.Error.WriteLine(msg));
+                var (mcpTools, mcpManager) = await LoadMcpToolsAsync(
+                    enableMcp, options.WorkingDirectory!, mcpHttpFactory,
+                    msg => Console.Error.WriteLine(msg), cts.Token).ConfigureAwait(false);
+                await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
+                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools);
+
                 var streams = await transport.AcceptAsync(cts.Token).ConfigureAwait(false);
                 await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey);
                 await host.RunAsync(cts.Token).ConfigureAwait(false);
@@ -250,7 +329,10 @@ public static class ServeRunner
     /// <see cref="TelemetrySettings.Disabled"/> when none) with <c>Enabled = true</c> and the
     /// parsed level applied. The on-disk settings file is never mutated.
     /// </summary>
-    public static SessionOptions BuildSessionOptions(ServeOptions options, TelemetrySettings? baseTelemetry = null) =>
+    public static SessionOptions BuildSessionOptions(
+        ServeOptions options,
+        TelemetrySettings? baseTelemetry = null,
+        IReadOnlyList<ITool>? extraTools = null) =>
         new()
         {
             ProviderId = options.ProviderId!,
@@ -264,6 +346,8 @@ public static class ServeRunner
             MaxStopContinuations = options.MaxStopContinuations,
             GoalMaxDuration = options.GoalMaxDuration,
             GoalMaxContinuations = options.GoalMaxContinuations,
+            // MCP (and any future host-supplied) tools. Empty unless serve connected MCP servers.
+            ExtraTools = extraTools ?? [],
             // Telemetry layering (force-on, level, "off" special case) lives entirely in
             // TelemetryResolver — the single authority. Serve only passes its inputs through.
             TelemetryOverride = TelemetryResolver.ResolveServeOverride(

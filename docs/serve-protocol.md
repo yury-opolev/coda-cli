@@ -32,6 +32,29 @@ orchestrator ──spawn──► coda serve
    when the turn completes (or is interrupted).
 4. Repeat. `session/interrupt` cancels the in-flight turn. `shutdown` (or closing stdin) stops the server.
 
+## MCP servers
+
+`coda serve` connects the same merged MCP config (`~/.coda/.mcp.json` + `<cwd>/.mcp.json`) as the
+interactive TUI and `coda run`, exposing each server's tools to the session as
+`mcp__<server>__<tool>` (plus the resource/prompt helper tools). This is **on by default**.
+
+- **Disable per session:** pass `--no-mcp`, or set `CODA_SERVE_DISABLE_MCP=1` in the spawned
+  process's environment (env wins over the default; `--no-mcp` and the env var are equivalent).
+- **Curate the set:** set `CODA_USER_MCP_DIR` to a directory containing an orchestrator-owned
+  `.mcp.json`. This replaces the user layer (`~/.coda/.mcp.json`) with a vetted set — the
+  recommended way to give a programmatic session a deliberate, least-privilege tool surface
+  instead of the operator's personal servers.
+- **Auth is non-interactive.** stdio servers launch normally; HTTP servers with a valid stored
+  token are reused; an HTTP server needing a fresh OAuth sign-in is **skipped and logged to
+  stderr** — serve never opens a browser and never blocks the handshake. Pre-authorize such
+  servers once via the TUI or `coda run`.
+- **stdout stays pure.** All MCP connect/skip diagnostics go to **stderr**; no MCP output is ever
+  written to stdout (the JSON-RPC protocol channel).
+- **Startup timing.** Servers connect sequentially before the JSON-RPC connection is accepted, each
+  with a 20s connect cap. Many slow/hanging servers can therefore delay the handshake (bounded by
+  server count × 20s, and by shutdown/cancellation). Keep the curated set small, or use `--no-mcp`
+  when a session needs no external tools.
+
 ## Orchestrator → Coda (requests)
 | Method | Params | Result |
 |---|---|---|

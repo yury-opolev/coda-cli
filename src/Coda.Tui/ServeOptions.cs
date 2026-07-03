@@ -41,6 +41,10 @@ public sealed record ServeOptions
     /// to keep the loaded settings' level. Honored only when telemetry is forced on.</summary>
     public string? TelemetryLevel { get; init; }
 
+    /// <summary>When false (<c>--no-mcp</c> or <c>CODA_SERVE_DISABLE_MCP</c>), skip connecting MCP
+    /// servers. Defaults to true for parity with the TUI and <c>coda run</c>.</summary>
+    public bool EnableMcp { get; init; } = true;
+
     /// <summary>
     /// Parse <c>serve</c> arguments (everything after the <c>serve</c> token):
     /// <c>[--provider id] [--model id] [--cwd path] [--permission-mode m] [--yolo] [--api-key key] [--endpoint name]</c>.
@@ -61,6 +65,7 @@ public sealed record ServeOptions
         int? goalMaxContinuations = null;
         var forceTelemetry = false;
         string? telemetryLevel = null;
+        var enableMcp = true;
 
         for (var i = 0; i < args.Count; i++)
         {
@@ -146,6 +151,14 @@ public sealed record ServeOptions
                     enableSessionMemory = true;
                     break;
 
+                case "--no-mcp":
+                    enableMcp = false;
+                    break;
+
+                case "--mcp":
+                    enableMcp = true;
+                    break;
+
                 case "--max-continuations":
                     // Matches `coda run`: bounds non-goal stop-hooks AND sets the goal turn backstop.
                     if (++i < args.Count && int.TryParse(args[i], out var parsedMax) && parsedMax > 0)
@@ -220,6 +233,7 @@ public sealed record ServeOptions
             GoalMaxContinuations = goalMaxContinuations,
             ForceTelemetry = forceTelemetry,
             TelemetryLevel = telemetryLevel,
+            EnableMcp = enableMcp,
         };
     }
 

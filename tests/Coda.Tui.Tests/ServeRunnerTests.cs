@@ -1,7 +1,10 @@
 using Coda.Agent;
 using Coda.Agent.Settings;
+using Coda.Mcp;
 using Coda.Sdk;
 using Coda.Sdk.Serve;
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -109,6 +112,36 @@ public sealed class ServeRunnerTests
         Assert.Equal("/tmp", options.WorkingDirectory);
     }
 
+    // ── MCP enable/disable parsing ────────────────────────────────────────
+
+    [Fact]
+    public void Parse_enable_mcp_defaults_to_true()
+    {
+        var options = ServeOptions.Parse([]);
+        Assert.True(options.EnableMcp);
+    }
+
+    [Fact]
+    public void Parse_no_mcp_flag_disables_mcp()
+    {
+        var options = ServeOptions.Parse(["--no-mcp"]);
+        Assert.False(options.EnableMcp);
+    }
+
+    [Fact]
+    public void Parse_mcp_flag_keeps_mcp_enabled()
+    {
+        var options = ServeOptions.Parse(["--mcp"]);
+        Assert.True(options.EnableMcp);
+    }
+
+    [Fact]
+    public void Parse_no_mcp_wins_regardless_of_position()
+    {
+        var options = ServeOptions.Parse(["--mcp", "--no-mcp"]);
+        Assert.False(options.EnableMcp);
+    }
+
     // ── BuildHost seam ───────────────────────────────────────────────────
 
     [Fact]
@@ -202,6 +235,16 @@ public sealed class ServeRunnerTests
         Assert.Contains("serve", output);
     }
 
+    [Fact]
+    public void Help_output_documents_no_mcp_flag()
+    {
+        var writer = new StringWriter();
+        ImmediateCli.TryHandle(["--help"], writer);
+        var output = writer.ToString();
+
+        Assert.Contains("--no-mcp", output);
+    }
+
     // ── API key / endpoint flag parsing ───────────────────────────────────
 
     [Fact]
@@ -248,7 +291,135 @@ public sealed class ServeRunnerTests
         Assert.Null(opts.ApiKey);
     }
 
+    // ── ResolveMcpEnabled (CODA_SERVE_DISABLE_MCP override) ────────────────
+
+    [Theory]
+    [InlineData(true, null, true)]
+    [InlineData(true, "", true)]
+    [InlineData(true, "0", true)]
+    [InlineData(true, "1", false)]
+    [InlineData(true, "true", false)]
+    [InlineData(true, "True", false)]   // case-insensitive, matching CODA_DISABLE_MODELS_FETCH
+    [InlineData(true, "TRUE", false)]
+    [InlineData(false, null, false)]   // --no-mcp already off; env absent keeps it off
+    [InlineData(false, "1", false)]
+    public void ResolveMcpEnabled_applies_env_override(bool parsed, string? env, bool expected)
+    {
+        Assert.Equal(expected, ServeRunner.ResolveMcpEnabled(parsed, env));
+    }
+
+    // ── BuildMcpExtraTools composition ────────────────────────────────────
+
+    [Fact]
+    public void BuildMcpExtraTools_appends_the_four_resource_prompt_helpers()
+    {
+        // An empty manager (no connected servers) → manager.Tools is empty, so the result is
+        // exactly the four helper tools the TUI also adds.
+        var manager = new McpClientManager();
+
+        var tools = ServeRunner.BuildMcpExtraTools(manager);
+
+        Assert.Equal(4, tools.Count);
+        Assert.Single(tools.OfType<ListMcpResourcesTool>());
+        Assert.Single(tools.OfType<ReadMcpResourceTool>());
+        Assert.Single(tools.OfType<ListMcpPromptsTool>());
+        Assert.Single(tools.OfType<GetMcpPromptTool>());
+    }
+
+    // ── LoadMcpToolsAsync ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task LoadMcpToolsAsync_disabled_returns_empty_and_no_manager()
+    {
+        var (tools, manager) = await ServeRunner.LoadMcpToolsAsync(
+            enableMcp: false,
+            workingDirectory: Directory.GetCurrentDirectory(),
+            httpFactory: new ThrowingHttpFactory(),
+            log: _ => { },
+            cancellationToken: default);
+
+        Assert.Empty(tools);
+        Assert.Null(manager);
+    }
+
+    [Fact]
+    public async Task LoadMcpToolsAsync_enabled_but_no_servers_returns_empty_and_no_manager()
+    {
+        // Hermetic: both the working dir and the user MCP dir are empty temp dirs, so
+        // McpConfig.Load finds zero servers regardless of the machine's real ~/.coda.
+        using var work = new TempDir();
+        using var user = new TempDir();
+
+        var (tools, manager) = await ServeRunner.LoadMcpToolsAsync(
+            enableMcp: true,
+            workingDirectory: work.Path,
+            httpFactory: new ThrowingHttpFactory(),
+            log: _ => { },
+            cancellationToken: default,
+            userMcpDir: user.Path);
+
+        Assert.Empty(tools);
+        Assert.Null(manager);
+    }
+
+    [Fact]
+    public async Task LoadMcpToolsAsync_with_configured_server_returns_server_tools_plus_helpers()
+    {
+        // A project .mcp.json with one HTTP server; the stub factory returns a fake client
+        // exposing a single tool — no process or network is touched. Covers the connect branch
+        // (ConnectAllAsync → BuildMcpExtraTools) and the caller's manager-disposal contract.
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(
+            Path.Combine(work.Path, ".mcp.json"),
+            """{ "mcpServers": { "fake": { "type": "http", "url": "https://example.test/mcp" } } }""");
+
+        var (tools, manager) = await ServeRunner.LoadMcpToolsAsync(
+            enableMcp: true,
+            workingDirectory: work.Path,
+            httpFactory: new StubHttpFactory(),
+            log: _ => { },
+            cancellationToken: default,
+            userMcpDir: user.Path);
+
+        Assert.NotNull(manager);
+        await using (manager)
+        {
+            // The one server tool (mcp__fake__echo) followed by the four resource/prompt helpers.
+            Assert.Equal(5, tools.Count);
+            var serverTool = Assert.Single(tools.OfType<McpTool>());
+            Assert.Equal("mcp__fake__echo", serverTool.Name);
+            Assert.Single(tools.OfType<ListMcpResourcesTool>());
+            Assert.Single(tools.OfType<ReadMcpResourceTool>());
+            Assert.Single(tools.OfType<ListMcpPromptsTool>());
+            Assert.Single(tools.OfType<GetMcpPromptTool>());
+        }
+    }
+
     // ── BuildSessionOptions ───────────────────────────────────────────────
+
+    [Fact]
+    public void BuildSessionOptions_defaults_extra_tools_to_empty()
+    {
+        var options = ServeRunner.Parse(["--cwd", "C:\\x"]);
+
+        var so = ServeRunner.BuildSessionOptions(options);
+
+        Assert.Empty(so.ExtraTools);
+    }
+
+    [Fact]
+    public void BuildSessionOptions_threads_extra_tools_through()
+    {
+        var options = ServeRunner.Parse(["--cwd", "C:\\x"]);
+        // A real MCP helper tool instance is a convenient ITool sample (no hand-written double).
+        ITool sample = new ListMcpPromptsTool(new McpClientManager());
+
+        var so = ServeRunner.BuildSessionOptions(options, baseTelemetry: null, extraTools: [sample]);
+
+        Assert.Single(so.ExtraTools);
+        Assert.Same(sample, so.ExtraTools[0]);
+    }
 
     [Fact]
     public void BuildSessionOptions_maps_yolo_safe_to_bypass_with_classifier()
@@ -511,6 +682,73 @@ public sealed class ServeRunnerTests
         // Nothing configured by flag or settings → no invented provider/model.
         Assert.Null(options.ProviderId);
         Assert.Null(options.Model);
+    }
+
+    /// <summary>
+    /// An <see cref="IMcpHttpClientFactory"/> that fails if used. The no-server tests configure
+    /// no HTTP MCP server, so <see cref="Create"/> must never be called — this proves it.
+    /// </summary>
+    private sealed class ThrowingHttpFactory : IMcpHttpClientFactory
+    {
+        public IMcpClient Create(string serverName, McpHttpServerConfig config)
+            => throw new InvalidOperationException("HTTP factory must not be used when no HTTP server is configured.");
+    }
+
+    /// <summary>Returns a <see cref="StubMcpClient"/> for any HTTP server — no real transport.</summary>
+    private sealed class StubHttpFactory : IMcpHttpClientFactory
+    {
+        public IMcpClient Create(string serverName, McpHttpServerConfig config) => new StubMcpClient(serverName);
+    }
+
+    /// <summary>A fake MCP client exposing one tool (<c>echo</c>); everything else is inert.</summary>
+    private sealed class StubMcpClient : IMcpClient
+    {
+        public StubMcpClient(string serverName) => this.ServerName = serverName;
+
+        public string ServerName { get; }
+
+        public Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<McpToolInfo>>([new McpToolInfo("echo", "Echoes input.", """{"type":"object"}""", true)]);
+
+        public Task<(string Text, bool IsError)> CallToolAsync(string toolName, JsonElement arguments, CancellationToken cancellationToken = default)
+            => Task.FromResult(("ok", false));
+
+        public Task<IReadOnlyList<McpResourceInfo>> ListResourcesAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<McpResourceInfo>>([]);
+
+        public Task<string> ReadResourceAsync(string uri, CancellationToken cancellationToken = default)
+            => Task.FromResult(string.Empty);
+
+        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken cancellationToken = default)
+            => Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
+
+        public Task<string> GetPromptAsync(string name, JsonNode? arguments, CancellationToken cancellationToken = default)
+            => Task.FromResult(string.Empty);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
+
+    /// <summary>A throwaway directory, deleted on dispose — for hermetic MCP-config tests.</summary>
+    private sealed class TempDir : IDisposable
+    {
+        public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "coda-mcp-test-" + Guid.NewGuid().ToString("N"));
+
+        public TempDir() => Directory.CreateDirectory(this.Path);
+
+        public void Dispose()
+        {
+            try
+            {
+                if (Directory.Exists(this.Path))
+                {
+                    Directory.Delete(this.Path, recursive: true);
+                }
+            }
+            catch (IOException)
+            {
+                // Best-effort cleanup.
+            }
+        }
     }
 
     /// <summary>
