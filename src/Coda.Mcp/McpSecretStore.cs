@@ -22,4 +22,42 @@ public static class McpSecretStore
         await store.SetAsync(key, value, cancellationToken).ConfigureAwait(false);
         return McpSecretResolver.SecretRefPrefix + key;
     }
+
+    /// <summary>
+    /// Delete every credential-store secret referenced by <paramref name="config"/> (its
+    /// <c>coda-secret:&lt;key&gt;</c> env / header / token values) — called when a server is removed so
+    /// its encrypted secrets are not orphaned. The store's lossy key sanitization prevents
+    /// enumeration, so we derive the exact keys from the config's own references. Keys are assumed
+    /// server-private (the <c>mcp:&lt;server&gt;/…</c> convention); a hand-shared ref could delete a
+    /// key another server still uses.
+    /// </summary>
+    public static async Task DeleteSecretsAsync(ITokenStore store, McpServerConfig config, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(store);
+        ArgumentNullException.ThrowIfNull(config);
+        foreach (var key in SecretKeys(config))
+        {
+            await store.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private static IEnumerable<string> SecretKeys(McpServerConfig config)
+    {
+        IEnumerable<string> values = config switch
+        {
+            McpStdioServerConfig stdio => stdio.Env.Values,
+            McpHttpServerConfig http => http.Auth.BearerToken is { } token
+                ? http.Headers.Values.Append(token)
+                : http.Headers.Values,
+            _ => [],
+        };
+
+        foreach (var value in values)
+        {
+            if (value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal))
+            {
+                yield return value[McpSecretResolver.SecretRefPrefix.Length..];
+            }
+        }
+    }
 }

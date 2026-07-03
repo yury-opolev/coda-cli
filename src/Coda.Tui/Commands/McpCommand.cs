@@ -57,7 +57,7 @@ public sealed class McpCommand : ISlashCommand
                 await HandleAddOrEdit(context, scope, tail, isEdit: true).ConfigureAwait(false);
                 break;
             case "remove" or "rm" or "delete":
-                HandleRemove(context, scope, tail);
+                await HandleRemove(context, scope, tail, cancellationToken).ConfigureAwait(false);
                 break;
             case "enable":
                 HandleToggle(context, scope, tail, disabled: false);
@@ -178,7 +178,8 @@ public sealed class McpCommand : ISlashCommand
         var servers = McpConfig.Load(context.Session.WorkingDirectory);
         if (context.CredentialStore is { } store)
         {
-            servers = await McpSecretResolver.ResolveAsync(servers, store, ct).ConfigureAwait(false);
+            servers = await McpSecretResolver.ResolveAsync(servers, store, ct,
+                msg => context.Console.MarkupLine(Markup.Escape(msg))).ConfigureAwait(false);
         }
 
         await context.Mcp.ConnectAllAsync(servers, cancellationToken: ct).ConfigureAwait(false);
@@ -188,7 +189,8 @@ public sealed class McpCommand : ISlashCommand
     /// <summary>Resolve <c>coda-secret:</c> / <c>${VAR}</c> references before a live connect (parity with startup).</summary>
     private static async Task<McpServerConfig> ResolveSecrets(CommandContext context, McpServerConfig config, CancellationToken ct)
         => context.CredentialStore is { } store
-            ? await McpSecretResolver.ResolveAsync(config, store, ct).ConfigureAwait(false)
+            ? await McpSecretResolver.ResolveAsync(config, store, ct,
+                msg => context.Console.MarkupLine(Markup.Escape(msg))).ConfigureAwait(false)
             : config;
 
     // ── Inspect ───────────────────────────────────────────────────────────
@@ -284,7 +286,7 @@ public sealed class McpCommand : ISlashCommand
 
     // ── remove ────────────────────────────────────────────────────────────
 
-    private static void HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail)
+    private static async Task HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, CancellationToken ct)
     {
         if (tail.Count == 0)
         {
@@ -293,7 +295,8 @@ public sealed class McpCommand : ISlashCommand
         }
 
         var name = tail[0];
-        if (!ExistsInScope(scope, name, context))
+        var config = GetConfigInScope(scope, name, context);
+        if (config is null)
         {
             context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file."));
             return;
@@ -307,6 +310,14 @@ public sealed class McpCommand : ISlashCommand
         }
 
         McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
+
+        // Delete the server's encrypted secrets (derived from its coda-secret: refs) AFTER the entry
+        // is gone, so a failed write never orphans the config against already-deleted secrets.
+        if (context.CredentialStore is { } store)
+        {
+            await McpSecretStore.DeleteSecretsAsync(store, config, ct).ConfigureAwait(false);
+        }
+
         context.Console.MarkupLine(Markup.Escape($"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."));
     }
 
@@ -452,10 +463,16 @@ public sealed class McpCommand : ISlashCommand
         && !value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal)
         && !(value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}'));
 
-    private static bool ExistsInScope(McpConfigScope scope, string name, CommandContext context)
+    private static bool ExistsInScope(McpConfigScope scope, string name, CommandContext context) =>
+        GetConfigInScope(scope, name, context) is not null;
+
+    /// <summary>The raw (unresolved) config for <paramref name="name"/> in the given scope's file, or null.</summary>
+    private static McpServerConfig? GetConfigInScope(McpConfigScope scope, string name, CommandContext context)
     {
         var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
-        return File.Exists(path) && McpConfig.Parse(File.ReadAllText(path)).ContainsKey(name);
+        return File.Exists(path) && McpConfig.Parse(File.ReadAllText(path)).TryGetValue(name, out var config)
+            ? config
+            : null;
     }
 
     /// <summary>Gather the display snapshot from the configured entries + the live MCP manager.</summary>

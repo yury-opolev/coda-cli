@@ -155,6 +155,23 @@ public sealed class McpCommandTests
     }
 
     [Fact]
+    public async Task Remove_deletes_stored_secrets()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "github": { "command": "npx", "env": { "TOKEN": "coda-secret:mcp:github/env/TOKEN" } } } }""");
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync("mcp:github/env/TOKEN", "ghp_x");
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["remove", "github"], CancellationToken.None);
+
+        Assert.Null(await store.GetAsync("mcp:github/env/TOKEN")); // secret deleted, not orphaned
+        Assert.False(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("github"));
+    }
+
+    [Fact]
     public async Task Disable_then_enable_toggles_persisted_flag()
     {
         using var dirs = new McpTestDirs();

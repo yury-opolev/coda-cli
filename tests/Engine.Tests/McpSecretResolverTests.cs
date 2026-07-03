@@ -77,6 +77,56 @@ public sealed class McpSecretResolverTests
     }
 
     [Fact]
+    public async Task Resolves_embedded_env_var_in_a_larger_string()
+    {
+        Environment.SetEnvironmentVariable("CODA_TEST_EMB", "xyz");
+        try
+        {
+            var servers = new Dictionary<string, McpServerConfig>
+            {
+                ["remote"] = new McpHttpServerConfig(new Uri("https://x/mcp"),
+                    new Dictionary<string, string> { ["Authorization"] = "Bearer ${CODA_TEST_EMB}" }, McpAuthConfig.Default),
+            };
+
+            var http = (McpHttpServerConfig)(await McpSecretResolver.ResolveAsync(servers, new FakeStore()))["remote"];
+
+            Assert.Equal("Bearer xyz", http.Headers["Authorization"]);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODA_TEST_EMB", null);
+        }
+    }
+
+    [Fact]
+    public async Task Warns_when_secret_ref_resolves_empty()
+    {
+        var warnings = new List<string>();
+        var servers = new Dictionary<string, McpServerConfig>
+        {
+            ["s"] = new McpStdioServerConfig("x", [], new Dictionary<string, string> { ["K"] = "coda-secret:mcp:s/absent" }),
+        };
+
+        await McpSecretResolver.ResolveAsync(servers, new FakeStore(), default, warnings.Add);
+
+        Assert.Contains(warnings, w => w.Contains("mcp:s/absent", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Warns_when_env_var_missing()
+    {
+        var warnings = new List<string>();
+        var servers = new Dictionary<string, McpServerConfig>
+        {
+            ["s"] = new McpStdioServerConfig("x", [], new Dictionary<string, string> { ["K"] = "${CODA_TEST_DEFINITELY_UNSET}" }),
+        };
+
+        await McpSecretResolver.ResolveAsync(servers, new FakeStore(), default, warnings.Add);
+
+        Assert.Contains(warnings, w => w.Contains("CODA_TEST_DEFINITELY_UNSET", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task Missing_secret_resolves_to_empty()
     {
         var servers = new Dictionary<string, McpServerConfig>

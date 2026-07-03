@@ -142,6 +142,28 @@ public sealed class ServeRunnerTests
         Assert.False(options.EnableMcp);
     }
 
+    [Fact]
+    public void Parse_enable_project_mcp_defaults_to_true()
+    {
+        Assert.True(ServeOptions.Parse([]).EnableProjectMcp);
+    }
+
+    [Fact]
+    public void Parse_no_project_mcp_disables_project_layer()
+    {
+        Assert.False(ServeOptions.Parse(["--no-project-mcp"]).EnableProjectMcp);
+    }
+
+    [Theory]
+    [InlineData(true, null, true)]
+    [InlineData(true, "1", false)]
+    [InlineData(true, "true", false)]
+    [InlineData(false, null, false)]
+    public void ResolveProjectMcpEnabled_applies_env_override(bool parsed, string? env, bool expected)
+    {
+        Assert.Equal(expected, ServeRunner.ResolveProjectMcpEnabled(parsed, env));
+    }
+
     // ── BuildHost seam ───────────────────────────────────────────────────
 
     [Fact]

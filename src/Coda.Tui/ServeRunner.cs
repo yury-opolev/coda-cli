@@ -73,6 +73,14 @@ public static class ServeRunner
         => EnvFlags.IsTruthy(disableEnvValue) ? false : parsedEnableMcp;
 
     /// <summary>
+    /// Resolves whether the project-level <c>&lt;cwd&gt;/.mcp.json</c> is loaded: the parsed flag
+    /// (<c>--no-project-mcp</c>) overridden off by a truthy <c>CODA_DISABLE_PROJECT_MCP</c>. Default
+    /// true (full host visibility); off gives a curated user-only set no repo file can override.
+    /// </summary>
+    public static bool ResolveProjectMcpEnabled(bool parsedEnableProjectMcp, string? disableEnvValue)
+        => EnvFlags.IsTruthy(disableEnvValue) ? false : parsedEnableProjectMcp;
+
+    /// <summary>
     /// Composes the agent's MCP tool list: the servers' own tools followed by the four
     /// resource/prompt helper tools. Deliberately mirrors the interactive TUI (<c>Program.cs</c>)
     /// rather than <c>HeadlessRunner</c> (which omits the helpers): a serve session is long-lived
@@ -109,7 +117,8 @@ public static class ServeRunner
         Action<string> log,
         CancellationToken cancellationToken,
         string? userMcpDir = null,
-        ITokenStore? secretStore = null)
+        ITokenStore? secretStore = null,
+        bool includeProjectMcp = true)
     {
         if (!enableMcp)
         {
@@ -118,7 +127,7 @@ public static class ServeRunner
 
         // Load config BEFORE constructing the manager: nothing to dispose when MCP is off or no
         // server is configured, and a failing config read can't leak a manager.
-        var servers = McpConfig.Load(workingDirectory, userMcpDir);
+        var servers = McpConfig.Load(workingDirectory, userMcpDir, includeProjectMcp);
         if (servers.Count == 0)
         {
             return ([], null);
@@ -127,7 +136,7 @@ public static class ServeRunner
         // Resolve coda-secret:/${VAR} references before connecting (never plaintext in config).
         if (secretStore is not null)
         {
-            servers = await McpSecretResolver.ResolveAsync(servers, secretStore, cancellationToken).ConfigureAwait(false);
+            servers = await McpSecretResolver.ResolveAsync(servers, secretStore, cancellationToken, log).ConfigureAwait(false);
         }
 
         var manager = new McpClientManager(httpFactory);
@@ -304,6 +313,8 @@ public static class ServeRunner
                 // ALL MCP diagnostics go to stderr because stdout is the JSON-RPC protocol channel.
                 var enableMcp = ResolveMcpEnabled(
                     options.EnableMcp, Environment.GetEnvironmentVariable("CODA_SERVE_DISABLE_MCP"));
+                var includeProjectMcp = ResolveProjectMcpEnabled(
+                    options.EnableProjectMcp, Environment.GetEnvironmentVariable("CODA_DISABLE_PROJECT_MCP"));
                 using var mcpHttp = new HttpClient();
                 var mcpCredentialStore = CredentialStoreFactory.Create();
                 var mcpHttpFactory = new DefaultMcpHttpClientFactory(
@@ -311,7 +322,8 @@ public static class ServeRunner
                     msg => Console.Error.WriteLine(msg));
                 var (mcpTools, mcpManager) = await LoadMcpToolsAsync(
                     enableMcp, options.WorkingDirectory!, mcpHttpFactory,
-                    msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null, secretStore: mcpCredentialStore).ConfigureAwait(false);
+                    msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null,
+                    secretStore: mcpCredentialStore, includeProjectMcp: includeProjectMcp).ConfigureAwait(false);
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
                 var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools);
 

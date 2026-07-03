@@ -65,6 +65,46 @@ public sealed class McpViewTests
     }
 
     [Fact]
+    public void FormatInfo_masks_env_values_and_shows_var_references()
+    {
+        var entry = new McpServerEntry(
+            "github",
+            new McpStdioServerConfig("npx", [], new Dictionary<string, string>
+            {
+                ["SECRET"] = "coda-secret:mcp:github/env/SECRET",
+                ["FROM_ENV"] = "${GH_TOKEN}",
+                ["LITERAL"] = "ghp_plaintext_should_not_show",
+            }),
+            McpConfigScope.Project);
+        var status = new McpServerStatus(entry, Connected: false, Info: null, Tools: []);
+
+        var text = McpView.FormatInfo(status);
+
+        Assert.DoesNotContain("ghp_plaintext_should_not_show", text); // literal never revealed
+        Assert.Contains("SECRET = ***** (encrypted)", text);
+        Assert.Contains("FROM_ENV = ***** (from ${GH_TOKEN})", text);
+        Assert.Contains("LITERAL = *****", text);
+    }
+
+    [Fact]
+    public void FormatInfo_http_masks_token_and_shows_auth_mode()
+    {
+        var entry = new McpServerEntry(
+            "remote",
+            new McpHttpServerConfig(new Uri("https://x/mcp"), new Dictionary<string, string>(),
+                new McpAuthConfig(McpAuthMode.Bearer, BearerToken: "secret-token")),
+            McpConfigScope.User);
+        var status = new McpServerStatus(entry, Connected: false, Info: null, Tools: []);
+
+        var text = McpView.FormatInfo(status);
+
+        Assert.DoesNotContain("secret-token", text);
+        Assert.Contains("auth:", text);
+        Assert.Contains("bearer", text);
+        Assert.Contains("token = *****", text);
+    }
+
+    [Fact]
     public void FormatInfo_not_connected_prompts_to_start()
     {
         var status = new McpServerStatus(Stdio("fs", McpConfigScope.Project), Connected: false, Info: null, Tools: []);

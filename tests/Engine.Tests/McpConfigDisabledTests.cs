@@ -48,6 +48,22 @@ public sealed class McpConfigDisabledTests
         Assert.True(entries["off"].Config.Disabled); // still visible, tagged disabled
     }
 
+    [Fact]
+    public void Load_with_includeProject_false_ignores_the_project_layer()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(Path.Combine(user.Path, ".mcp.json"), """{ "mcpServers": { "u": { "command": "a" } } }""");
+        File.WriteAllText(Path.Combine(work.Path, ".mcp.json"), """{ "mcpServers": { "p": { "command": "b" } } }""");
+
+        var withProject = McpConfig.Load(work.Path, user.Path);
+        var userOnly = McpConfig.Load(work.Path, user.Path, includeProject: false);
+
+        Assert.True(withProject.ContainsKey("p")); // default: project layer loaded
+        Assert.False(userOnly.ContainsKey("p"));   // suppressed
+        Assert.True(userOnly.ContainsKey("u"));    // user layer kept
+    }
+
     private sealed class TempDir : IDisposable
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "coda-mcp-dis-" + Guid.NewGuid().ToString("N"));

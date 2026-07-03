@@ -44,6 +44,10 @@ interactive TUI and `coda run`, exposing each server's tools to the session as
   `.mcp.json`. This replaces the user layer (`~/.coda/.mcp.json`) with a vetted set — the
   recommended way to give a programmatic session a deliberate, least-privilege tool surface
   instead of the operator's personal servers.
+- **Full isolation:** add `--no-project-mcp` (or `CODA_DISABLE_PROJECT_MCP=1`) to also ignore the
+  project-level `<cwd>/.mcp.json`, so a repo-local file can't override the curated user set. Combine
+  with `CODA_USER_MCP_DIR` for a session that sees *only* the vetted servers. (Default: the project
+  layer is loaded — full host visibility.)
 - **Auth is non-interactive.** stdio servers launch normally; HTTP servers with a valid stored
   token are reused; an HTTP server needing a fresh OAuth sign-in is **skipped and logged to
   stderr** — serve never opens a browser and never blocks the handshake. Pre-authorize such
