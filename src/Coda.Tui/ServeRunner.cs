@@ -127,7 +127,7 @@ public static class ServeRunner
         // Resolve coda-secret:/${VAR} references before connecting (never plaintext in config).
         if (secretStore is not null)
         {
-            servers = await McpSecretResolver.ResolveAsync(servers, secretStore, cancellationToken).ConfigureAwait(false);
+            servers = await McpSecretResolver.ResolveAsync(servers, secretStore, cancellationToken, log).ConfigureAwait(false);
         }
 
         var manager = new McpClientManager(httpFactory);

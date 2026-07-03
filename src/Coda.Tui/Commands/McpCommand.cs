@@ -178,7 +178,8 @@ public sealed class McpCommand : ISlashCommand
         var servers = McpConfig.Load(context.Session.WorkingDirectory);
         if (context.CredentialStore is { } store)
         {
-            servers = await McpSecretResolver.ResolveAsync(servers, store, ct).ConfigureAwait(false);
+            servers = await McpSecretResolver.ResolveAsync(servers, store, ct,
+                msg => context.Console.MarkupLine(Markup.Escape(msg))).ConfigureAwait(false);
         }
 
         await context.Mcp.ConnectAllAsync(servers, cancellationToken: ct).ConfigureAwait(false);
@@ -188,7 +189,8 @@ public sealed class McpCommand : ISlashCommand
     /// <summary>Resolve <c>coda-secret:</c> / <c>${VAR}</c> references before a live connect (parity with startup).</summary>
     private static async Task<McpServerConfig> ResolveSecrets(CommandContext context, McpServerConfig config, CancellationToken ct)
         => context.CredentialStore is { } store
-            ? await McpSecretResolver.ResolveAsync(config, store, ct).ConfigureAwait(false)
+            ? await McpSecretResolver.ResolveAsync(config, store, ct,
+                msg => context.Console.MarkupLine(Markup.Escape(msg))).ConfigureAwait(false)
             : config;
 
     // ── Inspect ───────────────────────────────────────────────────────────

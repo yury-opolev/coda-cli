@@ -101,7 +101,8 @@ var mcpServers = Coda.Mcp.McpConfig.Load(session.WorkingDirectory);
 if (mcpServers.Count > 0)
 {
     // Resolve coda-secret:/${VAR} references to real values before connecting (never plaintext in config).
-    mcpServers = await Coda.Mcp.McpSecretResolver.ResolveAsync(mcpServers, store, cts.Token);
+    mcpServers = await Coda.Mcp.McpSecretResolver.ResolveAsync(mcpServers, store, cts.Token,
+        msg => console.MarkupLine($"[grey50]{Spectre.Console.Markup.Escape(msg)}[/]"));
     await mcp.ConnectAllAsync(mcpServers, msg => console.MarkupLine($"[grey50]{Spectre.Console.Markup.Escape(msg)}[/]"), cts.Token);
 }
 

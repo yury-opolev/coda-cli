@@ -89,7 +89,8 @@ public static class HeadlessRunner
         if (mcpServers.Count > 0)
         {
             // Resolve coda-secret:/${VAR} references before connecting (never plaintext in config).
-            mcpServers = await McpSecretResolver.ResolveAsync(mcpServers, mcpCredentialStore, cancellationToken).ConfigureAwait(false);
+            mcpServers = await McpSecretResolver.ResolveAsync(mcpServers, mcpCredentialStore, cancellationToken,
+                msg => Console.Error.WriteLine(msg)).ConfigureAwait(false);
             await mcp.ConnectAllAsync(mcpServers, msg => Console.Error.WriteLine(msg), cancellationToken).ConfigureAwait(false);
         }
 
