@@ -14,10 +14,10 @@ public sealed class TuiApp : IDisposable
     private readonly AgentRunner agentRunner;
     private readonly IShellExecutor shellExecutor;
 
-    public TuiApp(CommandContext context, IReadOnlyList<Coda.Agent.ITool>? mcpTools = null, IShellExecutor? shellExecutor = null)
+    public TuiApp(CommandContext context, Func<IReadOnlyList<Coda.Agent.ITool>>? mcpToolsProvider = null, IShellExecutor? shellExecutor = null)
     {
         this.context = context ?? throw new ArgumentNullException(nameof(context));
-        this.agentRunner = new AgentRunner(mcpTools);
+        this.agentRunner = new AgentRunner(mcpToolsProvider);
         this.shellExecutor = shellExecutor ?? new ProcessShellExecutor();
     }
 

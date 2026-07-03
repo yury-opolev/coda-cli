@@ -84,7 +84,7 @@ public sealed class BashModeDispatchTests
         });
 
         var context = new CommandContext(console, credentials, session, providers, registry);
-        var app = new TuiApp(context, mcpTools: null, shellExecutor: shellExecutor);
+        var app = new TuiApp(context, mcpToolsProvider: null, shellExecutor: shellExecutor);
         return (app, context, console);
     }
 

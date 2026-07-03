@@ -32,11 +32,14 @@ public sealed class CommandContext
     public SlashCommandRegistry Commands { get; }
 
     /// <summary>
-    /// Extra tools beyond the built-ins (MCP tools + MCP resource/prompt tools)
-    /// that the agent loads. Set after MCP servers connect; used by /context to
-    /// report tool token usage accurately. Empty when no MCP servers are configured.
+    /// Live source of the agent's extra tools (MCP tools + MCP resource/prompt tools). A provider
+    /// (not a snapshot) so <c>/mcp start|stop</c> is reflected immediately — e.g. by <c>/context</c>
+    /// token accounting. Null in non-interactive contexts.
     /// </summary>
-    public IReadOnlyList<ITool> ExtraTools { get; set; } = [];
+    public Func<IReadOnlyList<ITool>>? ExtraToolsProvider { get; set; }
+
+    /// <summary>The agent's current extra tools (from <see cref="ExtraToolsProvider"/>; empty when unset).</summary>
+    public IReadOnlyList<ITool> ExtraTools => this.ExtraToolsProvider?.Invoke() ?? [];
 
     /// <summary>
     /// The live MCP client manager, so <c>/mcp</c> can report connection status and tools.
