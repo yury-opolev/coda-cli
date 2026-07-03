@@ -63,6 +63,14 @@ public static class ServeRunner
     }
 
     /// <summary>
+    /// Resolves whether MCP should be connected for this serve run: the parsed flag default
+    /// (<c>--no-mcp</c> / <c>--mcp</c>), overridden off by <c>CODA_SERVE_DISABLE_MCP</c> in
+    /// (<c>"1"</c>, <c>"true"</c>). Split out so the env precedence is unit-testable.
+    /// </summary>
+    public static bool ResolveMcpEnabled(bool parsedEnableMcp, string? disableEnvValue)
+        => disableEnvValue is "1" or "true" ? false : parsedEnableMcp;
+
+    /// <summary>
     /// Enforces the security invariant before binding: a socket may never run unauthenticated.
     /// Returns (false, reason) when the configuration is invalid. stdio (no api key) is valid.
     /// </summary>

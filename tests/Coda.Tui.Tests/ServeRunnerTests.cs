@@ -278,6 +278,21 @@ public sealed class ServeRunnerTests
         Assert.Null(opts.ApiKey);
     }
 
+    // ── ResolveMcpEnabled (CODA_SERVE_DISABLE_MCP override) ────────────────
+
+    [Theory]
+    [InlineData(true, null, true)]
+    [InlineData(true, "", true)]
+    [InlineData(true, "0", true)]
+    [InlineData(true, "1", false)]
+    [InlineData(true, "true", false)]
+    [InlineData(false, null, false)]   // --no-mcp already off; env absent keeps it off
+    [InlineData(false, "1", false)]
+    public void ResolveMcpEnabled_applies_env_override(bool parsed, string? env, bool expected)
+    {
+        Assert.Equal(expected, ServeRunner.ResolveMcpEnabled(parsed, env));
+    }
+
     // ── BuildSessionOptions ───────────────────────────────────────────────
 
     [Fact]
