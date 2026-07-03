@@ -74,9 +74,11 @@ agent's tools on the next turn — with no agent-loop surgery. Slash commands ru
 | `/mcp add [<name>] [flags]` | Interactive wizard (pick transport → command/url → args → env/headers → auth), or one-line via flags. Writes `.mcp.json` (project default, `--user` for user). Offers to start it immediately. |
 | `/mcp edit <name>` | Re-opens the wizard pre-filled with the server's current config; writes back to the file it came from. |
 | `/mcp remove <name>` | Deletes the entry (with confirmation), stops it if running, and removes any stored secrets for it. |
-| `/mcp start <name>` | Connects the server; its tools become available next turn. |
-| `/mcp stop <name>` | Disconnects the server (disposes the process/HTTP client); its tools disappear next turn. |
+| `/mcp start <name>` | **Transient**: connects the server; its tools become available next turn. |
+| `/mcp stop <name>` | **Transient**: disconnects the server (disposes the process/HTTP client); its tools disappear next turn. Config unchanged — a restart reconnects it. |
 | `/mcp restart [<name>]` | Stop+start one server, or reconnect all when no name is given (also picks up external `.mcp.json` edits). |
+| `/mcp disable <name>` | **Persisted**: writes `"disabled": true` to the entry (and stops it) — the loader skips it on every startup until re-enabled. |
+| `/mcp enable <name>` | **Persisted**: clears `disabled` (and starts it). |
 
 Inline flags for scripting (mirroring `claude mcp add`): `--command`, `--args`, `--env KEY=VAL`
 (repeatable), `--url`, `--header NAME=VAL`, `--transport stdio|http`, `--auth oauth|bearer|none`.
@@ -135,16 +137,19 @@ path to capture them:
 
 ### 5.5 Secrets — encrypted at rest + redacted
 
-- **Store:** reuse `CredentialStoreFactory.Create()` (DPAPI / AES-GCM under `~/.coda/credentials`).
-  When the wizard collects a secret-looking value (stdio `env` value, HTTP bearer token, or an auth
-  header), write the plaintext to the store under a stable key `mcp/<server>/<field>` and put the
-  reference string `"coda-secret:mcp/<server>/<field>"` in `.mcp.json`.
-- **Resolve at load:** `McpConfig.Load` (and a new resolution step) dereferences three string forms
-  per secret field — `"coda-secret:<key>"` → decrypt from the store; `"${ENV_VAR}"` → environment
-  expansion; anything else → literal (today's behavior, back-compatible). Because resolution lives
-  in the loader, **`coda serve` inherits encrypted secrets for free** (it already builds the store).
-  This requires passing the store into `McpConfig.Load` at its three call sites (TUI, `coda run`,
-  serve) — a small signature/overload change.
+- **Store:** reuse `CredentialStoreFactory.Create()` (DPAPI / AES-GCM under `~/.coda/credentials`) —
+  the same store as provider tokens, namespaced by key. When the wizard collects a secret-looking
+  value (stdio `env` value, HTTP bearer token, or an auth header), write the plaintext under a
+  stable key **`mcp:<server>/<field>`** (mirroring the existing `llmauth:<provider>` convention;
+  the distinct prefix avoids collision) and put the reference `"coda-secret:mcp:<server>/<field>"`
+  in `.mcp.json`.
+- **Resolve via a separate step (not inside `Load`):** `McpConfig.Load` stays **pure** (config
+  parsing, no credential dependency). A new **`McpSecretResolver.Resolve(config, store)`**
+  dereferences three string forms per secret field — `"coda-secret:<key>"` → decrypt from the
+  store; `"${ENV_VAR}"` → environment expansion; anything else → literal (today's behavior,
+  back-compatible). The three entry points (TUI, `coda run`, serve) call `Resolve` right after
+  `Load`, so **`coda serve` inherits encrypted secrets for free** (it already builds the store) and
+  `Coda.Mcp`'s parser never takes a credential dependency.
 - **Redact:** `/mcp list` and `/mcp info` mask any `coda-secret:`/`${VAR}`/secret-looking value via
   `SecretRedactor` — e.g. `GITHUB_TOKEN = ***** (encrypted)` / `***** (from $VAR)`.
 - **Remove:** `/mcp remove` also deletes the server's stored secrets.
@@ -196,15 +201,21 @@ Each milestone is independently shippable and testable; P1 delivers value on its
 - **Redaction is defense-in-depth** — even literal (non-encrypted) secret-looking values are masked
   in `list`/`info`, so a shoulder-surfed terminal never shows a token.
 
-## 9. Open questions
+## 9. Resolved decisions (2026-07-03)
 
-1. **Enable/disable vs start/stop.** Do we also want a persisted `disabled: true` in `.mcp.json`
-   (survives restart) distinct from an in-session `stop`? Proposed: yes in P2 (a `disabled` flag the
-   loader honors), with `stop`/`start` as the in-session verbs. Confirm.
-2. **Secret-key scheme.** `mcp/<server>/<field>` under the shared credential store — acceptable, or
-   prefer a dedicated namespace/file to keep MCP secrets separate from provider tokens?
-3. **`McpConfig.Load` signature.** Adding the credential store for secret resolution touches three
-   call sites. Prefer an optional overload (store-less = literal/`${VAR}` only) so non-secret paths
-   and tests stay simple?
-4. **Scope default.** Project-default with `--user` opt-in (as decided) — confirm this is right for
-   the common case, vs user-default.
+1. **Enable/disable + start/stop — both.** In-session `start`/`stop` are transient; persisted
+   `disable`/`enable` write a `"disabled": true` field the loader skips at startup (P1 loader honors
+   it; P2 writer sets it; P3 wires the verbs). `list` shows a `disabled` state.
+2. **Shared credential store, key `mcp:<server>/<field>`** — reuse the DPAPI/AES-GCM store; distinct
+   prefix from `llmauth:` avoids collision. No dedicated store.
+3. **Separate `McpSecretResolver.Resolve(config, store)` step** — `McpConfig.Load` stays pure; the
+   three entry points call the resolver after `Load`. No credential dependency in the config parser.
+4. **Project-default write scope + `--user`** — `add`/`edit`/`remove` write `./.mcp.json` by default;
+   `--user` targets `~/.coda/.mcp.json`. The wizard always shows the exact file it will write.
+
+## 10. Follow-up (not in this proposal)
+
+- **Project-layer suppression for curated serve.** M4's `Curated` Bridge policy redirects only the
+  user layer; `<cwd>/.mcp.json` still overrides it. A coda-side control (e.g. serve
+  `--no-project-mcp` / `CODA_DISABLE_PROJECT_MCP`) would let the Bridge fully isolate the coding
+  engine's MCP set. Tracked separately from `/mcp` TUI management.
