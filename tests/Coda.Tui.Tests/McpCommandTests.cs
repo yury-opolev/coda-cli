@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using Coda.Mcp;
 using Coda.Tui.Commands;
 
@@ -178,6 +180,78 @@ public sealed class McpCommandTests
         await new McpCommand().ExecuteAsync(context, ["disable", "nope"], CancellationToken.None);
 
         Assert.Contains("not configured", console.Output);
+    }
+
+    [Fact]
+    public async Task Start_unknown_reports_not_configured()
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager();
+
+        await new McpCommand().ExecuteAsync(context, ["start", "nope"], CancellationToken.None);
+
+        Assert.Contains("not configured", console.Output);
+    }
+
+    [Fact]
+    public async Task Stop_not_running_reports_not_running()
+    {
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Mcp = new McpClientManager();
+
+        await new McpCommand().ExecuteAsync(context, ["stop", "x"], CancellationToken.None);
+
+        Assert.Contains("not running", console.Output);
+    }
+
+    [Fact]
+    public async Task Start_connects_configured_server_then_stop_disconnects()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "remote": { "type": "http", "url": "https://x/mcp" } } }""");
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager(new StubHttpFactory());
+        var cmd = new McpCommand();
+
+        await cmd.ExecuteAsync(context, ["start", "remote"], CancellationToken.None);
+        Assert.Contains("Started", console.Output);
+        Assert.True(context.Mcp.IsServerConnected("remote"));
+
+        await cmd.ExecuteAsync(context, ["stop", "remote"], CancellationToken.None);
+        Assert.False(context.Mcp.IsServerConnected("remote"));
+    }
+
+    private sealed class StubHttpFactory : IMcpHttpClientFactory
+    {
+        public IMcpClient Create(string serverName, McpHttpServerConfig config) => new StubMcpClient(serverName);
+    }
+
+    private sealed class StubMcpClient : IMcpClient
+    {
+        public StubMcpClient(string serverName) => this.ServerName = serverName;
+
+        public string ServerName { get; }
+
+        public Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<McpToolInfo>>([new McpToolInfo("echo", "Echo.", "{}", true)]);
+
+        public Task<(string Text, bool IsError)> CallToolAsync(string toolName, JsonElement arguments, CancellationToken ct = default)
+            => Task.FromResult((string.Empty, false));
+
+        public Task<IReadOnlyList<McpResourceInfo>> ListResourcesAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<McpResourceInfo>>([]);
+
+        public Task<string> ReadResourceAsync(string uri, CancellationToken ct = default) => Task.FromResult(string.Empty);
+
+        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken ct = default)
+            => Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
+
+        public Task<string> GetPromptAsync(string name, JsonNode? arguments, CancellationToken ct = default) => Task.FromResult(string.Empty);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 
     /// <summary>

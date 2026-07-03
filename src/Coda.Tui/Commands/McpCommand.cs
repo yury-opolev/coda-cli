@@ -33,7 +33,7 @@ public sealed class McpCommand : ISlashCommand
         ],
         Examples: ["/mcp", "/mcp info github", "/mcp add github --command npx --args \"-y @modelcontextprotocol/server-github\"", "/mcp disable github"]);
 
-    public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
+    public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(args);
@@ -65,12 +65,116 @@ public sealed class McpCommand : ISlashCommand
             case "disable":
                 HandleToggle(context, scope, tail, disabled: true);
                 break;
+            case "start":
+                await HandleStart(context, tail, cancellationToken).ConfigureAwait(false);
+                break;
+            case "stop":
+                await HandleStop(context, tail).ConfigureAwait(false);
+                break;
+            case "restart":
+                await HandleRestart(context, tail, cancellationToken).ConfigureAwait(false);
+                break;
             default:
-                context.Console.MarkupLine(Markup.Escape($"Unknown /mcp subcommand '{sub}'. Try /mcp, /mcp info <name>, /mcp add <name>, or /mcp remove <name>."));
+                context.Console.MarkupLine(Markup.Escape($"Unknown /mcp subcommand '{sub}'. Try /mcp, /mcp info <name>, /mcp add <name>, /mcp start <name>, or /mcp remove <name>."));
                 break;
         }
 
-        return Task.FromResult(CommandResult.Continue);
+        return CommandResult.Continue;
+    }
+
+    // ── live lifecycle: start / stop / restart ────────────────────────────
+
+    private static async Task HandleStart(CommandContext context, IReadOnlyList<string> tail, CancellationToken ct)
+    {
+        if (tail.Count == 0)
+        {
+            context.Console.MarkupLine("Usage: /mcp start <name>");
+            return;
+        }
+
+        if (context.Mcp is null)
+        {
+            context.Console.MarkupLine("MCP is not available in this session.");
+            return;
+        }
+
+        var name = tail[0];
+        if (context.Mcp.IsServerConnected(name))
+        {
+            context.Console.MarkupLine(Markup.Escape($"'{name}' is already running."));
+            return;
+        }
+
+        var entry = McpConfig.LoadEntries(context.Session.WorkingDirectory)
+            .FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.Ordinal));
+        if (entry is null)
+        {
+            context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured. Add it with /mcp add {name} …"));
+            return;
+        }
+
+        var result = await context.Mcp.ConnectServerAsync(name, entry.Config, ct).ConfigureAwait(false);
+        context.Console.MarkupLine(Markup.Escape(result.Connected
+            ? $"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."
+            : $"Failed to start '{name}': {result.Error}"));
+    }
+
+    private static async Task HandleStop(CommandContext context, IReadOnlyList<string> tail)
+    {
+        if (tail.Count == 0)
+        {
+            context.Console.MarkupLine("Usage: /mcp stop <name>");
+            return;
+        }
+
+        if (context.Mcp is null)
+        {
+            context.Console.MarkupLine("MCP is not available in this session.");
+            return;
+        }
+
+        var name = tail[0];
+        var stopped = await context.Mcp.DisconnectServerAsync(name).ConfigureAwait(false);
+        context.Console.MarkupLine(Markup.Escape(stopped
+            ? $"Stopped '{name}' — its tools are removed from the next turn."
+            : $"'{name}' is not running."));
+    }
+
+    private static async Task HandleRestart(CommandContext context, IReadOnlyList<string> tail, CancellationToken ct)
+    {
+        if (context.Mcp is null)
+        {
+            context.Console.MarkupLine("MCP is not available in this session.");
+            return;
+        }
+
+        if (tail.Count > 0)
+        {
+            var name = tail[0];
+            await context.Mcp.DisconnectServerAsync(name).ConfigureAwait(false);
+            var entry = McpConfig.LoadEntries(context.Session.WorkingDirectory)
+                .FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.Ordinal));
+            if (entry is null)
+            {
+                context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured."));
+                return;
+            }
+
+            var result = await context.Mcp.ConnectServerAsync(name, entry.Config, ct).ConfigureAwait(false);
+            context.Console.MarkupLine(Markup.Escape(result.Connected
+                ? $"Restarted '{name}' — {result.ToolCount} tool(s)."
+                : $"Failed to restart '{name}': {result.Error}"));
+            return;
+        }
+
+        // No name → reconnect everything, picking up external .mcp.json edits.
+        foreach (var serverName in context.Mcp.Clients.Select(c => c.ServerName).ToList())
+        {
+            await context.Mcp.DisconnectServerAsync(serverName).ConfigureAwait(false);
+        }
+
+        await context.Mcp.ConnectAllAsync(McpConfig.Load(context.Session.WorkingDirectory), cancellationToken: ct).ConfigureAwait(false);
+        context.Console.MarkupLine(Markup.Escape($"Reconnected MCP servers ({context.Mcp.Clients.Count} connected)."));
     }
 
     // ── Inspect ───────────────────────────────────────────────────────────
