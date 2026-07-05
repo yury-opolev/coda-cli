@@ -45,10 +45,11 @@ public static class SettingsWriter
     }
 
     /// <summary>
-    /// Set the persisted default provider and/or model. A <see langword="null"/> value
-    /// leaves that key unchanged; an empty string removes it (reset to default).
+    /// Set the persisted default provider. A <see langword="null"/> value leaves it unchanged;
+    /// an empty string removes it. (There is no global default model — a model is only ever
+    /// configured per provider via <see cref="SetUserModelForProvider"/>.)
     /// </summary>
-    public static void SetUserDefaults(string? defaultProvider = null, string? defaultModel = null, string? userSettingsDir = null)
+    public static void SetUserDefaultProvider(string? defaultProvider, string? userSettingsDir = null)
     {
         var homeDir = userSettingsDir
             ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
@@ -67,7 +68,6 @@ public static class SettingsWriter
         }
 
         ApplyKey(root, "defaultProvider", defaultProvider);
-        ApplyKey(root, "defaultModel", defaultModel);
 
         Directory.CreateDirectory(dir);
 
@@ -81,12 +81,12 @@ public static class SettingsWriter
     }
 
     /// <summary>
-    /// Persist the default model <b>for a specific provider</b> under the
-    /// <c>defaultModelByProvider</c> object (e.g. <c>github-copilot -&gt; claude-opus-4.8</c>),
-    /// preserving all other providers' entries and all other settings keys. This is what the
-    /// <c>/model</c> command writes so a model belongs to its provider. Atomic (temp file + move).
+    /// Persist the model <b>for a specific provider</b> under the <c>modelByProvider</c> object
+    /// (e.g. <c>github-copilot -&gt; claude-opus-4.8</c>), preserving all other providers' entries
+    /// and all other settings keys. This is what the <c>/model</c> command writes so a model belongs
+    /// to its provider — there is no provider-agnostic default model. Atomic (temp file + move).
     /// </summary>
-    public static void SetUserDefaultModelForProvider(string providerId, string model, string? userSettingsDir = null)
+    public static void SetUserModelForProvider(string providerId, string model, string? userSettingsDir = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(providerId);
         ArgumentException.ThrowIfNullOrWhiteSpace(model);
@@ -107,9 +107,9 @@ public static class SettingsWriter
             root = new JsonObject();
         }
 
-        var byProvider = root["defaultModelByProvider"] as JsonObject ?? new JsonObject();
+        var byProvider = root["modelByProvider"] as JsonObject ?? new JsonObject();
         byProvider[providerId] = model;
-        root["defaultModelByProvider"] = byProvider;
+        root["modelByProvider"] = byProvider;
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });

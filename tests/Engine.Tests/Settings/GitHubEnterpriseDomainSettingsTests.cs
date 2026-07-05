@@ -71,13 +71,13 @@ public sealed class GitHubEnterpriseDomainSettingsTests : IDisposable
     [Fact]
     public void SetGitHubEnterpriseDomain_round_trips_and_preserves_other_keys()
     {
-        this.WriteUser("""{ "defaultModel": "keepme", "permissions": { "allow": ["read_file"] } }""");
+        this.WriteUser("""{ "defaultProvider": "keepme", "permissions": { "allow": ["read_file"] } }""");
 
         SettingsWriter.SetGitHubEnterpriseDomain("octocorp.ghe.com", this.userHome);
 
         var reloaded = SettingsLoader.Load(this.projectDir, this.userHome);
         Assert.Equal("octocorp.ghe.com", reloaded.GitHubEnterpriseDomain);
-        Assert.Equal("keepme", reloaded.DefaultModel);
+        Assert.Equal("keepme", reloaded.DefaultProvider);
         Assert.Contains("read_file", reloaded.Allow);
     }
 

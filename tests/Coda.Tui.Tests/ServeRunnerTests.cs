@@ -640,27 +640,30 @@ public sealed class ServeRunnerTests
         Assert.True(so.TelemetryOverride!.Enabled);
     }
 
-    // ── settings.json defaultModel fallback (provider: flag → connected credential) ──
-    // When --model is absent, Parse falls back to the user's persisted ~/.coda/settings.json
-    // default BEFORE the built-in provider default. CLI flags win. settings.DefaultProvider is
-    // NOT a provider selector — Parse/ApplyDefaults never has a connected credential to consult,
-    // so provider resolves from the flag alone (RunAsync applies the connected-credential
-    // fallback afterward; see ServeProviderFallbackTests).
+    // ── Parse resolves from flags only; effective provider/model resolved later in RunAsync ──
+    // CLI flags win. Parse/ApplyDefaults runs BEFORE the connected credential is known, so with no
+    // --provider it resolves the provider to null, and (the model belonging to the provider) the
+    // model to null too — there is no provider-agnostic default. The effective (provider, model) is
+    // resolved in RunAsync via ResolveEffective once the credential is known (see the tests there
+    // and ServeProviderFallbackTests). settings.DefaultProvider is NOT a provider selector.
 
     [Fact]
-    public void Parse_no_provider_or_model_flag_falls_back_to_settings_model_only()
+    public void Parse_no_flags_leaves_provider_and_model_null_for_later_resolution()
     {
+        // Parse runs BEFORE the connected credential is known, so with no flags it resolves nothing:
+        // the effective provider/model are resolved in RunAsync (ResolveEffective). Settings never
+        // supply a provider-agnostic model.
         using var home = new TempSettingsHome("""
         {
             "defaultProvider": "github-copilot",
-            "defaultModel": "some-model"
+            "modelByProvider": { "github-copilot": "some-model" }
         }
         """);
 
         var options = ServeRunner.Parse(["--cwd", "X:/wf"], home.Root);
 
         Assert.Null(options.ProviderId);
-        Assert.Equal("some-model", options.Model);
+        Assert.Null(options.Model);
     }
 
     [Fact]
@@ -668,8 +671,7 @@ public sealed class ServeRunnerTests
     {
         using var home = new TempSettingsHome("""
         {
-            "defaultProvider": "github-copilot",
-            "defaultModel": "some-model"
+            "modelByProvider": { "claude-ai": "settings-model" }
         }
         """);
 
@@ -687,8 +689,7 @@ public sealed class ServeRunnerTests
         // no longer supplies it (only a connected credential does, resolved later in RunAsync).
         using var home = new TempSettingsHome("""
         {
-            "defaultProvider": "github-copilot",
-            "defaultModel": "settings-model"
+            "defaultProvider": "github-copilot"
         }
         """);
 
