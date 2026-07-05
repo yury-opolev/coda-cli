@@ -640,12 +640,15 @@ public sealed class ServeRunnerTests
         Assert.True(so.TelemetryOverride!.Enabled);
     }
 
-    // ── settings.json defaultProvider/defaultModel fallback ────────────────
-    // When --provider/--model are absent, Parse falls back to the user's persisted
-    // ~/.coda/settings.json defaults BEFORE the built-in provider default. CLI flags win.
+    // ── settings.json defaultModel fallback (provider: flag → connected credential) ──
+    // When --model is absent, Parse falls back to the user's persisted ~/.coda/settings.json
+    // default BEFORE the built-in provider default. CLI flags win. settings.DefaultProvider is
+    // NOT a provider selector — Parse/ApplyDefaults never has a connected credential to consult,
+    // so provider resolves from the flag alone (RunAsync applies the connected-credential
+    // fallback afterward; see ServeProviderFallbackTests).
 
     [Fact]
-    public void Parse_no_provider_or_model_flag_falls_back_to_settings_defaults()
+    public void Parse_no_provider_or_model_flag_falls_back_to_settings_model_only()
     {
         using var home = new TempSettingsHome("""
         {
@@ -656,7 +659,7 @@ public sealed class ServeRunnerTests
 
         var options = ServeRunner.Parse(["--cwd", "X:/wf"], home.Root);
 
-        Assert.Equal(GitHubCopilotProvider.Id, options.ProviderId);
+        Assert.Null(options.ProviderId);
         Assert.Equal("some-model", options.Model);
     }
 
@@ -678,9 +681,10 @@ public sealed class ServeRunnerTests
     }
 
     [Fact]
-    public void Parse_explicit_model_flag_wins_while_provider_falls_back_to_settings()
+    public void Parse_explicit_model_flag_wins_while_provider_stays_unset_without_settings_fallback()
     {
-        // Mixed: --model is explicit (wins), --provider is absent (settings default applies).
+        // Mixed: --model is explicit (wins). --provider is absent, and settings.DefaultProvider
+        // no longer supplies it (only a connected credential does, resolved later in RunAsync).
         using var home = new TempSettingsHome("""
         {
             "defaultProvider": "github-copilot",
@@ -690,7 +694,7 @@ public sealed class ServeRunnerTests
 
         var options = ServeRunner.Parse(["--model", "flag-model"], home.Root);
 
-        Assert.Equal(GitHubCopilotProvider.Id, options.ProviderId);
+        Assert.Null(options.ProviderId);
         Assert.Equal("flag-model", options.Model);
     }
 

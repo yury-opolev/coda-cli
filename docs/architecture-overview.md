@@ -728,3 +728,34 @@ startup race) is a genuine *improvement* in layering, not a regression.
   the real bounds are the per-call header + per-chunk idle guards (§4.8).
 - **The removed turn-level watchdog** is an *improvement* — the timeout now sits at the layer
   it guards. It is listed here only as the canonical example of getting layering right.
+
+## Provider model & credential storage
+
+coda uses a **single-provider model**: at most one provider is connected at a time, and that
+connection *is* the active provider. There is no separate "default provider" setting that can
+diverge from what you are logged in to.
+
+- **One credential.** `coda auth login <provider>` (and `/provider <id>`, which is the same
+  "connect" action) persists the provider's credential and deletes any other provider's
+  credential, so `~/.coda/credentials/` holds at most one `*.cred`. `CredentialManager` enforces
+  this on every login/store, and `GetConnectedProviderIdAsync()` returns the single connected
+  provider.
+- **Provider is derived from the credential.** `ProviderModelResolver` resolves the provider as
+  `--provider` flag → the connected provider. `settings.json` `defaultProvider` is **retired as
+  a selector** (no longer read or written to choose the provider); `defaultModel` is unchanged.
+- **`coda serve` tolerance.** When launched with a `--provider` that has no credential (e.g. a
+  stale value passed by a host integration), serve falls back to the single connected provider
+  and logs a warning, so the session still runs. An API-key provider (`anthropic-api-key`) counts
+  as authenticated when its env var (`ANTHROPIC_API_KEY`) is set.
+- **Startup banner** shows the connected provider + model (or a "not signed in — run /login"
+  hint when there is no credential).
+
+### Credential-at-rest (Windows)
+
+`FileTokenStore` encrypts each credential with AES-256-GCM using a per-installation key. On
+**Windows** the AES key (`key.bin`) is additionally **DPAPI-wrapped** (`ProtectedData`,
+`CurrentUser`) and the credentials directory + files are **ACL-restricted to the current user**,
+so a copied `key.bin` is useless to another user or on another machine. Non-Windows keeps the raw
+key with `0600`/`0700` permissions. A `key.bin` that cannot be unwrapped (foreign/corrupt/legacy)
+is regenerated — existing credentials then require a fresh `coda auth login` (this is the expected
+one-time migration when upgrading from a pre-DPAPI build).

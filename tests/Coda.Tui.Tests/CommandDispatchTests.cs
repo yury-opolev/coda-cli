@@ -1,5 +1,6 @@
 using Coda.Tui;
 using Coda.Tui.Repl;
+using LlmAuth.Providers.ClaudeAi;
 
 namespace Coda.Tui.Tests;
 
@@ -87,14 +88,17 @@ public sealed class ProviderCommandTests
     }
 
     [Fact]
-    public async Task Provider_switches_active_by_token()
+    public async Task Provider_connects_by_token()
     {
+        // Use the API-key provider: it connects synchronously (no interactive
+        // OAuth/device-code flow), unlike copilot/claude which would launch a
+        // real browser/device-code login and block/hang under test.
         var (app, context, console, _) = TestAppBuilder.BuildApp();
 
-        await app.DispatchAsync(ParsedInput.Slash("provider", new[] { "copilot" }), CancellationToken.None);
+        await app.DispatchAsync(ParsedInput.Slash("provider", new[] { ApiKeyProvider.Id }), CancellationToken.None);
 
-        Assert.Equal("github-copilot", context.Session.ActiveProviderId);
-        Assert.Contains("GitHub Copilot", console.Output);
+        Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId);
+        Assert.Contains("Anthropic API key", console.Output);
     }
 
     [Fact]
@@ -132,5 +136,25 @@ public sealed class LoginCommandTests
 
         Assert.False(result.ShouldExit);
         Assert.Contains("Unknown provider", console.Output);
+    }
+
+    /// <summary>
+    /// Connecting to the API-key provider stores no credential of its own — but it must
+    /// still enforce the single-credential invariant by purging any OTHER stored credential.
+    /// Otherwise a prior GitHub Copilot connection would leave its .cred behind and
+    /// GetConnectedProviderIdAsync would keep reporting copilot as connected.
+    /// </summary>
+    [Fact]
+    public async Task Login_with_api_key_provider_purges_other_stored_credentials()
+    {
+        var (app, context, _, credentials) = TestAppBuilder.BuildApp();
+        await credentials.StoreAsync("github-copilot", TestAppBuilder.OAuthCredential("github-copilot"), CancellationToken.None);
+        Assert.Equal("github-copilot", await credentials.GetConnectedProviderIdAsync(CancellationToken.None));
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("login", new[] { "api" }), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Null(await credentials.GetConnectedProviderIdAsync(CancellationToken.None));
+        Assert.Equal("anthropic-api-key", context.Session.ActiveProviderId);
     }
 }

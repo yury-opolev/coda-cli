@@ -40,13 +40,30 @@ public sealed class LoginCommand : ISlashCommand
             return CommandResult.Continue;
         }
 
-        // API-key auth has no interactive step — handle it up front.
+        await ConnectAsync(context, provider, cancellationToken).ConfigureAwait(false);
+        return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// Connect to (sign in to) <paramref name="provider"/> and make it the active
+    /// provider. Shared by <c>/login</c> and <c>/provider &lt;id&gt;</c> — both are the
+    /// same "connect to this provider" action. The credential store enforces a single
+    /// credential (Task 2), so this replaces any existing connection; provider identity
+    /// is now derived from the connected credential rather than a persisted settings
+    /// pointer, so no <c>defaultProvider</c> is written here.
+    /// </summary>
+    internal static async Task ConnectAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
+    {
+        // API-key auth has no interactive step — handle it up front. It also stores no
+        // credential of its own, so connecting to it must still purge any OTHER provider's
+        // stored credential (single-credential invariant) — otherwise GetConnectedProviderIdAsync
+        // would keep reporting the previously-connected OAuth provider as active.
         if (provider.LoginKind == LoginKind.ApiKey)
         {
             context.Console.MarkupLine(Theme.DimMarkup($"{provider.DisplayName} uses {ApiKeyProvider.EnvVarName} — no interactive login needed."));
+            await context.Credentials.RemoveAllStoredCredentialsExceptAsync(keepProviderId: null, cancellationToken).ConfigureAwait(false);
             context.SetActiveProvider(provider);
-            PersistDefaultProvider(provider);
-            return CommandResult.Continue;
+            return;
         }
 
         try
@@ -61,7 +78,6 @@ public sealed class LoginCommand : ISlashCommand
             if (credential is not null)
             {
                 context.SetActiveProvider(provider);
-                PersistDefaultProvider(provider);
                 context.Console.MarkupLine(Theme.SuccessMarkup($"Signed in to {provider.DisplayName}."));
                 if (!string.IsNullOrEmpty(credential.Account?.EmailAddress))
                 {
@@ -82,8 +98,6 @@ public sealed class LoginCommand : ISlashCommand
         {
             context.Console.MarkupLine(Theme.ErrorMarkup($"Sign-in failed: {ex.Message}"));
         }
-
-        return CommandResult.Continue;
     }
 
     /// <summary>
@@ -104,24 +118,6 @@ public sealed class LoginCommand : ISlashCommand
                 .Title(Theme.DimMarkup("Sign in to which provider?"))
                 .UseConverter(p => p.DisplayName)
                 .AddChoices(context.Providers));
-    }
-
-    /// <summary>
-    /// Persist the signed-in provider as the startup default so it survives restarts.
-    /// The default model is cleared so the new provider's own default is used rather than
-    /// a stale cross-provider model id. Best-effort — a settings write failure must not
-    /// fail the sign-in.
-    /// </summary>
-    private static void PersistDefaultProvider(ProviderDescriptor provider)
-    {
-        try
-        {
-            SettingsWriter.SetUserDefaults(defaultProvider: provider.Id, defaultModel: string.Empty);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            // Leave the default unchanged; the session still uses the just-selected provider.
-        }
     }
 
     private static async Task<Credential> LoginLoopbackAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)

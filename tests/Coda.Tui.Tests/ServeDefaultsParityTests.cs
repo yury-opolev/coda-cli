@@ -1,6 +1,5 @@
 using Coda.Agent.Settings;
 using Coda.Sdk.Providers;
-using LlmAuth.Providers.GitHubCopilot;
 
 namespace Coda.Tui.Tests;
 
@@ -8,9 +7,12 @@ namespace Coda.Tui.Tests;
 /// Parity tests proving <c>coda serve</c> and the TUI/<see cref="SettingsLoader"/>
 /// read from a SINGLE source of settings defaults. For the same settings dir, the
 /// (provider, model) serve resolves must equal what the loader resolves with the
-/// same precedence chain (explicit flag → settings default → provider default).
-/// Also locks the intended alignment: serve now honors PROJECT settings.json
-/// defaults (previously it read USER-only).
+/// same precedence chain: explicit flag → connected credential (provider; NOT
+/// settings.DefaultProvider — <c>Parse</c>/<c>ApplyDefaults</c> never has a
+/// connected credential to consult, so provider resolves from the flag alone),
+/// explicit flag → settings default (model). Also locks the intended alignment:
+/// serve now honors PROJECT settings.json defaults for the model (previously it
+/// read USER-only).
 /// </summary>
 public sealed class ServeDefaultsParityTests
 {
@@ -25,8 +27,7 @@ public sealed class ServeDefaultsParityTests
         string userSettingsDir)
     {
         var settings = SettingsLoader.Load(workingDir, userSettingsDir);
-        var providerToken = providerFlag ?? settings.DefaultProvider;
-        var providerId = string.IsNullOrWhiteSpace(providerToken) ? null : ProviderAliases.Resolve(providerToken);
+        var providerId = string.IsNullOrWhiteSpace(providerFlag) ? null : ProviderAliases.Resolve(providerFlag);
         var model = modelFlag ?? settings.DefaultModel;
         return (providerId, model);
     }
@@ -44,6 +45,10 @@ public sealed class ServeDefaultsParityTests
         var serve = ServeRunner.Parse(["--cwd", env.WorkingDir], env.UserHome);
         var expected = ResolveFromLoader(null, null, env.WorkingDir, env.UserHome);
 
+        // settings.DefaultProvider is no longer a provider selector: with no flag and no
+        // connected credential in scope, provider resolves to null (Require fails fast later).
+        Assert.Null(serve.ProviderId);
+        Assert.Equal("user-model", serve.Model);
         Assert.Equal(expected.ProviderId, serve.ProviderId);
         Assert.Equal(expected.Model, serve.Model);
     }
@@ -51,7 +56,8 @@ public sealed class ServeDefaultsParityTests
     [Fact]
     public void Serve_honors_project_settings_defaults_matching_loader()
     {
-        // INTENDED ALIGNMENT: project settings.json now influences serve (it used to be USER-only).
+        // INTENDED ALIGNMENT: project settings.json now influences serve's MODEL default (it
+        // used to be USER-only). Provider is untouched by either settings file (see above).
         using var env = new TempEnv(
             userJson: """
             {
@@ -68,8 +74,8 @@ public sealed class ServeDefaultsParityTests
         var serve = ServeRunner.Parse(["--cwd", env.WorkingDir], env.UserHome);
         var expected = ResolveFromLoader(null, null, env.WorkingDir, env.UserHome);
 
-        // Project model wins; provider falls through to user. Serve == loader.
-        Assert.Equal(GitHubCopilotProvider.Id, serve.ProviderId);
+        // Project model wins; provider stays null (no flag, no connected credential). Serve == loader.
+        Assert.Null(serve.ProviderId);
         Assert.Equal("project-model", serve.Model);
         Assert.Equal(expected.ProviderId, serve.ProviderId);
         Assert.Equal(expected.Model, serve.Model);

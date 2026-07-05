@@ -6,30 +6,37 @@ namespace Coda.Tui.Tests;
 /// Parity tests proving <c>coda run</c> (<see cref="HeadlessRunner"/>) and
 /// <c>coda models</c> (<see cref="ModelsRunner"/>) resolve their effective
 /// (provider, model) from the SAME precedence chain as <c>coda serve</c> and the
-/// TUI: explicit flag → settings default, with NO built-in fallback. Regression
-/// guard for the bug where these two entry points silently fell through to the
-/// Anthropic/Claude.ai default, ignoring the user's configured provider.
+/// TUI: explicit flag → connected credential (provider) / settings default
+/// (model), with NO built-in fallback. <c>settings.DefaultProvider</c> is no
+/// longer a provider selector — asserted below by setting it to something OTHER
+/// than the connected provider and expecting the connected provider to win.
+/// Regression guard for the bug where these two entry points silently fell
+/// through to the Anthropic/Claude.ai default, ignoring the user's configured
+/// provider.
 /// </summary>
 public sealed class RunnerDefaultsParityTests
 {
     [Fact]
-    public void Run_honors_settings_default_provider_and_model()
+    public void Run_honors_connected_provider_and_settings_model()
     {
         using var env = new TempEnv("""
         {
-            "defaultProvider": "github-copilot",
+            "defaultProvider": "anthropic-api-key",
             "defaultModel": "claude-opus-4-8"
         }
         """);
 
-        var (providerId, model) = HeadlessRunner.ResolveDefaults(providerFlag: null, modelFlag: null, env.WorkingDir, env.UserHome);
+        var (providerId, model) = HeadlessRunner.ResolveDefaults(
+            providerFlag: null, modelFlag: null, env.WorkingDir, env.UserHome,
+            connectedProviderId: GitHubCopilotProvider.Id);
 
+        // Connected provider wins over settings.DefaultProvider; model still comes from settings.
         Assert.Equal(GitHubCopilotProvider.Id, providerId);
         Assert.Equal("claude-opus-4-8", model);
     }
 
     [Fact]
-    public void Run_no_settings_resolves_to_null_without_inventing_a_default()
+    public void Run_no_settings_or_connected_provider_resolves_to_null_without_inventing_a_default()
     {
         using var env = new TempEnv(userJson: null);
 
@@ -40,22 +47,23 @@ public sealed class RunnerDefaultsParityTests
     }
 
     [Fact]
-    public void Models_honors_settings_default_provider()
+    public void Models_honors_connected_provider()
     {
         using var env = new TempEnv("""
         {
-            "defaultProvider": "github-copilot",
+            "defaultProvider": "anthropic-api-key",
             "defaultModel": "claude-opus-4-8"
         }
         """);
 
-        var (providerId, _) = ModelsRunner.ResolveDefaults(providerFlag: null, env.WorkingDir, env.UserHome);
+        var (providerId, _) = ModelsRunner.ResolveDefaults(
+            providerFlag: null, env.WorkingDir, env.UserHome, connectedProviderId: GitHubCopilotProvider.Id);
 
         Assert.Equal(GitHubCopilotProvider.Id, providerId);
     }
 
     [Fact]
-    public void Models_no_settings_resolves_to_null()
+    public void Models_no_settings_or_connected_provider_resolves_to_null()
     {
         using var env = new TempEnv(userJson: null);
 

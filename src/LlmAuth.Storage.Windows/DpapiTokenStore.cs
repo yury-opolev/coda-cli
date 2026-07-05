@@ -1,6 +1,7 @@
 using System.Runtime.Versioning;
 using System.Security.Cryptography;
 using System.Text;
+using LlmAuth;
 
 namespace LlmAuth.Storage.Windows;
 
@@ -30,6 +31,7 @@ public sealed class DpapiTokenStore : ITokenStore
         // credentials from the legacy location on first run.
         this.directory = directory ?? CredentialStoreLocation.ResolveDefault();
         Directory.CreateDirectory(this.directory);
+        WindowsCredentialProtection.RestrictToCurrentUser(this.directory);
     }
 
     public Task<string?> GetAsync(string key, CancellationToken cancellationToken = default)
@@ -49,7 +51,9 @@ public sealed class DpapiTokenStore : ITokenStore
     {
         var plainBytes = Encoding.UTF8.GetBytes(value);
         var protectedBytes = ProtectedData.Protect(plainBytes, noEntropy, DataProtectionScope.CurrentUser);
-        File.WriteAllBytes(this.PathFor(key), protectedBytes);
+        var path = this.PathFor(key);
+        File.WriteAllBytes(path, protectedBytes);
+        WindowsCredentialProtection.RestrictToCurrentUser(path);
         return Task.CompletedTask;
     }
 

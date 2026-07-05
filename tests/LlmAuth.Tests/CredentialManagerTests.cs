@@ -6,13 +6,18 @@ public class CredentialManagerTests
 
     private sealed class FakeProvider : ICredentialProvider
     {
+        public FakeProvider(string id = FakeId)
+        {
+            this.ProviderId = id;
+        }
+
         public bool ForceNeedsRefresh { get; set; }
 
         public Credential? RefreshResult { get; set; }
 
         public int RefreshCallCount { get; private set; }
 
-        public string ProviderId => FakeId;
+        public string ProviderId { get; }
 
         public ILoginFlow BeginLogin(LoginOptions options) => throw new NotSupportedException();
 
@@ -28,9 +33,9 @@ public class CredentialManagerTests
             new(new Dictionary<string, string> { ["Authorization"] = $"Bearer {credential.AccessToken}" });
     }
 
-    private static Credential SampleCredential() => new()
+    private static Credential SampleCredential(string providerId = FakeId) => new()
     {
-        ProviderId = FakeId,
+        ProviderId = providerId,
         Kind = CredentialKind.OAuth,
         AccessToken = "AT",
         RefreshToken = "RT",
@@ -110,5 +115,26 @@ public class CredentialManagerTests
     {
         var manager = new CredentialManager(new InMemoryTokenStore(), [new FakeProvider()]);
         Assert.Contains(FakeId, manager.ProviderIds);
+    }
+
+    [Fact]
+    public async Task Store_SecondProvider_RemovesFirst_SingleCredentialInvariant()
+    {
+        var store = new InMemoryTokenStore();
+        var mgr = new CredentialManager(store, [new FakeProvider("a"), new FakeProvider("b")]);
+
+        await mgr.StoreAsync("a", SampleCredential("a"), default);
+        await mgr.StoreAsync("b", SampleCredential("b"), default);
+
+        Assert.Null(await mgr.GetStoredCredentialAsync("a"));
+        Assert.NotNull(await mgr.GetStoredCredentialAsync("b"));
+        Assert.Equal("b", await mgr.GetConnectedProviderIdAsync());
+    }
+
+    [Fact]
+    public async Task GetConnectedProviderId_NoCredential_ReturnsNull()
+    {
+        var mgr = new CredentialManager(new InMemoryTokenStore(), [new FakeProvider("a")]);
+        Assert.Null(await mgr.GetConnectedProviderIdAsync());
     }
 }

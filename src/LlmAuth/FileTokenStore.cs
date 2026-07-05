@@ -20,6 +20,7 @@ public sealed class FileTokenStore : ITokenStore
         // credentials from the legacy location on first run.
         this.directory = directory ?? CredentialStoreLocation.ResolveDefault();
         Directory.CreateDirectory(this.directory);
+        WindowsCredentialProtection.RestrictToCurrentUser(this.directory);
 
         if (!OperatingSystem.IsWindows())
         {
@@ -104,15 +105,22 @@ public sealed class FileTokenStore : ITokenStore
         var keyPath = Path.Combine(this.directory, "key.bin");
         if (File.Exists(keyPath))
         {
-            var existing = File.ReadAllBytes(keyPath);
-            if (existing.Length == 32)
+            try
             {
-                return existing;
+                var unwrapped = WindowsCredentialProtection.UnprotectKey(File.ReadAllBytes(keyPath));
+                if (unwrapped.Length == 32)
+                {
+                    return unwrapped;
+                }
+            }
+            catch (CryptographicException)
+            {
+                // Unreadable/foreign key (e.g. different user, corrupt) — regenerate below.
             }
         }
 
         var newKey = RandomNumberGenerator.GetBytes(32);
-        File.WriteAllBytes(keyPath, newKey);
+        File.WriteAllBytes(keyPath, WindowsCredentialProtection.ProtectKey(newKey));
         SetOwnerOnly(keyPath);
         return newKey;
     }
@@ -126,9 +134,12 @@ public sealed class FileTokenStore : ITokenStore
 
     private static void SetOwnerOnly(string path)
     {
-        if (!OperatingSystem.IsWindows())
+        if (OperatingSystem.IsWindows())
         {
-            File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
+            WindowsCredentialProtection.RestrictToCurrentUser(path);
+            return;
         }
+
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
     }
 }
