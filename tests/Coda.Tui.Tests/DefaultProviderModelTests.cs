@@ -28,34 +28,40 @@ public sealed class DefaultProviderModelTests : IDisposable
     }
 
     [Fact]
-    public async Task Choosing_a_provider_persists_it_and_resets_model()
+    public async Task Provider_command_with_id_connects_but_does_not_persist_default_provider()
     {
         var (_, context, _, _) = TestAppBuilder.BuildApp();
-        // Pre-existing persisted model that should be cleared when the provider changes.
+        // Pre-existing persisted model — connecting must leave it untouched: provider
+        // identity is now derived from the connected credential, not a settings pointer,
+        // so there's no cross-provider stale-model concern to guard against anymore.
         SettingsWriter.SetUserDefaults(defaultModel: "claude-opus-4-8", userSettingsDir: this.home);
 
-        // No flag — choosing persists automatically.
-        await new ProviderCommand().ExecuteAsync(context, ["copilot"], CancellationToken.None);
+        // Use the API-key provider so the connect flow completes synchronously in-test —
+        // OAuth loopback/device-code flows require real browser/network interaction.
+        await new ProviderCommand().ExecuteAsync(context, [ApiKeyProvider.Id], CancellationToken.None);
 
+        Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId); // connected in-session
         var settings = SettingsLoader.Load(this.home, this.home);
-        Assert.Equal("github-copilot", settings.DefaultProvider);
-        Assert.Null(settings.DefaultModel); // reset so startup uses the provider default
+        Assert.Null(settings.DefaultProvider); // no settings pointer written
+        Assert.Equal("claude-opus-4-8", settings.DefaultModel); // left untouched
     }
 
     [Fact]
-    public async Task Signing_in_persists_the_provider_as_default_and_resets_model()
+    public async Task Signing_in_connects_the_provider_without_persisting_a_default()
     {
         var (_, context, _, _) = TestAppBuilder.BuildApp();
-        // A stale model from a different provider that should be cleared on sign-in.
+        // A pre-existing persisted model that login must leave alone (no clearing —
+        // login no longer touches settings.json at all).
         SettingsWriter.SetUserDefaults(defaultModel: "claude-opus-4-8", userSettingsDir: this.home);
 
         // The Anthropic API-key provider has no interactive step, so /login completes
-        // synchronously (no browser/device flow) — exercising the persistence path.
+        // synchronously (no browser/device flow) — exercising the connect path.
         await new LoginCommand().ExecuteAsync(context, [ApiKeyProvider.Id], CancellationToken.None);
 
+        Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId); // connected in-session
         var settings = SettingsLoader.Load(this.home, this.home);
-        Assert.Equal(ApiKeyProvider.Id, settings.DefaultProvider);
-        Assert.Null(settings.DefaultModel); // reset so startup uses the provider default
+        Assert.Null(settings.DefaultProvider); // retired selector — never written
+        Assert.Equal("claude-opus-4-8", settings.DefaultModel); // untouched
     }
 
     [Fact]
@@ -71,14 +77,15 @@ public sealed class DefaultProviderModelTests : IDisposable
     }
 
     [Fact]
-    public async Task Legacy_default_flag_is_still_accepted()
+    public async Task Legacy_default_flag_is_accepted_but_no_longer_persists_anything()
     {
         var (_, context, _, _) = TestAppBuilder.BuildApp();
 
-        await new ProviderCommand().ExecuteAsync(context, ["copilot", "--default"], CancellationToken.None);
+        await new ProviderCommand().ExecuteAsync(context, [ApiKeyProvider.Id, "--default"], CancellationToken.None);
 
+        Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId);
         var settings = SettingsLoader.Load(this.home, this.home);
-        Assert.Equal("github-copilot", settings.DefaultProvider);
+        Assert.Null(settings.DefaultProvider);
     }
 
     [Fact]
