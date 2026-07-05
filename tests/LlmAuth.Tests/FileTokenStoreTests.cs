@@ -165,6 +165,36 @@ public sealed class FileTokenStoreTests : IDisposable
         Assert.Equal(expected, credMode);
         Assert.Equal(expected, keyMode);
     }
+
+    [Fact]
+    public async Task SetThenGet_RoundTripsAcrossInstances()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ftok-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            await new FileTokenStore(dir).SetAsync("llmauth:copilot", "secret-value");
+            var got = await new FileTokenStore(dir).GetAsync("llmauth:copilot");
+            Assert.Equal("secret-value", got);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
+
+    [Fact]
+    public void KeyFile_OnWindows_IsDpapiWrapped_NotRawKey()
+    {
+        if (!OperatingSystem.IsWindows()) { return; } // Windows-only behaviour
+        var dir = Path.Combine(Path.GetTempPath(), "ftok-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            _ = new FileTokenStore(dir); // creates key.bin
+            var raw = File.ReadAllBytes(Path.Combine(dir, "key.bin"));
+            // A DPAPI blob is NOT 32 bytes (a raw AES-256 key would be exactly 32).
+            Assert.NotEqual(32, raw.Length);
+            // And it round-trips back to a 32-byte key.
+            Assert.Equal(32, WindowsCredentialProtection.UnprotectKey(raw).Length);
+        }
+        finally { Directory.Delete(dir, true); }
+    }
 }
 
 internal static class ByteArrayExtensions
