@@ -48,7 +48,7 @@ public sealed class RewindCommand : ISlashCommand
         {
             if (!int.TryParse(args[0], out n) || n < 1)
             {
-                context.Console.MarkupLine("[red]Usage: /rewind [n] where n is a positive integer.[/]");
+                context.Console.MarkupLine("[red]Usage: /rewind [[n]] where n is a positive integer.[/]");
                 return Task.FromResult(CommandResult.Continue);
             }
         }

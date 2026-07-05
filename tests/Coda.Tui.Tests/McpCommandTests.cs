@@ -101,6 +101,26 @@ public sealed class McpCommandTests
         Assert.Contains("Provide flags", console.Output);
     }
 
+    // The no-name usage strings for add/edit/remove/enable/disable embed literal "[--command …]" /
+    // "[--user]" flag hints. Spectre parses "[...]" as markup, so an unescaped usage line makes
+    // MarkupLine throw "Could not find color or style '--command'/'--user'". Each must Markup.Escape.
+    [Theory]
+    [InlineData("add")]
+    [InlineData("edit")]
+    [InlineData("remove")]
+    [InlineData("enable")]
+    [InlineData("disable")]
+    public async Task Subcommand_without_name_prints_usage_without_markup_error(string sub)
+    {
+        using var dirs = new McpTestDirs();
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+
+        await new McpCommand().ExecuteAsync(context, [sub], CancellationToken.None);
+
+        Assert.Contains("Usage:", console.Output);
+    }
+
     [Fact]
     public async Task Add_user_scope_writes_user_file_not_project()
     {
