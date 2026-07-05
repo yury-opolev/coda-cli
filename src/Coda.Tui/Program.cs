@@ -78,8 +78,18 @@ var startupProvider = StartupProviderResolver.Resolve(
     Environment.GetEnvironmentVariable("CODA_PROVIDER"), connectedProviderId, providers);
 
 var session = new SessionState(startupProvider.Id);
-var startupModel = Environment.GetEnvironmentVariable("CODA_MODEL") ?? startupSettings.DefaultModel;
-session.Model = string.IsNullOrWhiteSpace(startupModel) ? startupProvider.DefaultModel : startupModel;
+
+// Resolve the startup model through the SHARED resolver so the interactive TUI honors the same
+// precedence as serve/run/models: CODA_MODEL -> per-provider default (defaultModelByProvider) ->
+// global defaultModel (back-compat) -> the provider's built-in default. Previously this read only
+// the global defaultModel, so once a model was pinned per-provider the TUI ignored it and fell back
+// to the provider's built-in (e.g. Copilot -> gpt-4o instead of the configured claude-opus-4.8).
+var (_, resolvedStartupModel) = Coda.Sdk.Providers.ProviderModelResolver.Resolve(
+    startupProvider.Id,
+    Environment.GetEnvironmentVariable("CODA_MODEL"),
+    startupSettings,
+    connectedProviderId);
+session.Model = string.IsNullOrWhiteSpace(resolvedStartupModel) ? startupProvider.DefaultModel : resolvedStartupModel;
 
 var registry = new SlashCommandRegistry(SlashCommandCatalog.CreateAll());
 
