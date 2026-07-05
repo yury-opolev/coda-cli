@@ -1,5 +1,6 @@
 using Coda.Tui;
 using Coda.Tui.Repl;
+using LlmAuth.Providers.ClaudeAi;
 
 namespace Coda.Tui.Tests;
 
@@ -87,14 +88,17 @@ public sealed class ProviderCommandTests
     }
 
     [Fact]
-    public async Task Provider_switches_active_by_token()
+    public async Task Provider_connects_by_token()
     {
+        // Use the API-key provider: it connects synchronously (no interactive
+        // OAuth/device-code flow), unlike copilot/claude which would launch a
+        // real browser/device-code login and block/hang under test.
         var (app, context, console, _) = TestAppBuilder.BuildApp();
 
-        await app.DispatchAsync(ParsedInput.Slash("provider", new[] { "copilot" }), CancellationToken.None);
+        await app.DispatchAsync(ParsedInput.Slash("provider", new[] { ApiKeyProvider.Id }), CancellationToken.None);
 
-        Assert.Equal("github-copilot", context.Session.ActiveProviderId);
-        Assert.Contains("GitHub Copilot", console.Output);
+        Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId);
+        Assert.Contains("Anthropic API key", console.Output);
     }
 
     [Fact]
