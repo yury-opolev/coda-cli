@@ -86,6 +86,7 @@ public sealed class CredentialManager
             .ConfigureAwait(false);
 
         await this.PersistAsync(providerId, credential, cancellationToken).ConfigureAwait(false);
+        await this.RemoveOtherCredentialsAsync(providerId, cancellationToken).ConfigureAwait(false);
         return credential;
     }
 
@@ -115,6 +116,7 @@ public sealed class CredentialManager
             .ConfigureAwait(false);
 
         await this.PersistAsync(providerId, credential, cancellationToken).ConfigureAwait(false);
+        await this.RemoveOtherCredentialsAsync(providerId, cancellationToken).ConfigureAwait(false);
         return credential;
     }
 
@@ -166,10 +168,11 @@ public sealed class CredentialManager
     }
 
     /// <summary>Persist a credential the host obtained itself (e.g. via the low-layer flow).</summary>
-    public Task StoreAsync(string providerId, Credential credential, CancellationToken cancellationToken = default)
+    public async Task StoreAsync(string providerId, Credential credential, CancellationToken cancellationToken = default)
     {
         _ = this.GetProvider(providerId);
-        return this.PersistAsync(providerId, credential, cancellationToken);
+        await this.PersistAsync(providerId, credential, cancellationToken).ConfigureAwait(false);
+        await this.RemoveOtherCredentialsAsync(providerId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Delete the stored credential for a provider.</summary>
@@ -186,6 +189,21 @@ public sealed class CredentialManager
     {
         _ = this.GetProvider(providerId);
         return this.LoadAsync(providerId, cancellationToken);
+    }
+
+    /// <summary>The single provider id that currently has a stored credential, or null.</summary>
+    public async Task<string?> GetConnectedProviderIdAsync(CancellationToken cancellationToken = default)
+    {
+        foreach (var id in this.providers.Keys)
+        {
+            var raw = await this.store.GetAsync(StoreKey(id), cancellationToken).ConfigureAwait(false);
+            if (raw is not null)
+            {
+                return id;
+            }
+        }
+
+        return null;
     }
 
     private async Task<Credential?> LoadAsync(string providerId, CancellationToken cancellationToken)
@@ -205,6 +223,18 @@ public sealed class CredentialManager
         return this.providers.TryGetValue(providerId, out var provider)
             ? provider
             : throw new ProviderNotRegisteredException(providerId);
+    }
+
+    /// <summary>Delete every stored credential except the given provider's (single-credential invariant).</summary>
+    private async Task RemoveOtherCredentialsAsync(string keepProviderId, CancellationToken cancellationToken)
+    {
+        foreach (var id in this.providers.Keys)
+        {
+            if (!string.Equals(id, keepProviderId, StringComparison.Ordinal))
+            {
+                await this.store.DeleteAsync(StoreKey(id), cancellationToken).ConfigureAwait(false);
+            }
+        }
     }
 
     private static string StoreKey(string providerId) => $"llmauth:{providerId}";
