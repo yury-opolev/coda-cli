@@ -1,3 +1,5 @@
+using LlmAuth.Providers.ClaudeAi;
+
 namespace Coda.Tui.Tests;
 
 /// <summary>
@@ -20,5 +22,22 @@ public sealed class ServeProviderFallbackTests
     public void ResolveServeProvider_Cases(string? flag, bool flagHasCred, string? connected, string? expected)
     {
         Assert.Equal(expected, ServeRunner.ResolveServeProvider(flag, flagHasCred, connected));
+    }
+
+    /// <summary>
+    /// <see cref="ServeRunner.FlagProviderIsAuthenticated"/>: the API-key provider
+    /// (<see cref="ApiKeyProvider.Id"/>) never stores a credential — it is authenticated by the
+    /// presence of its env var, not by matching the connected (OAuth) provider. Every other
+    /// provider is authenticated only when it matches the single connected provider.
+    /// </summary>
+    [Theory]
+    [InlineData("anthropic-api-key", null, true, true)]    // api-key + env set -> authenticated
+    [InlineData("anthropic-api-key", "github-copilot", false, false)] // api-key, no env -> not
+    [InlineData("github-copilot", "github-copilot", false, true)]     // oauth matches connected
+    [InlineData("claude", "github-copilot", false, false)]            // oauth, not connected
+    [InlineData(null, "github-copilot", true, false)]                 // no flag
+    public void FlagProviderIsAuthenticated_Cases(string? providerId, string? connected, bool apiKeyEnv, bool expected)
+    {
+        Assert.Equal(expected, ServeRunner.FlagProviderIsAuthenticated(providerId, connected, apiKeyEnv));
     }
 }

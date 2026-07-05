@@ -83,6 +83,25 @@ public static class ServeRunner
     }
 
     /// <summary>
+    /// True when the explicitly-requested provider is usable: an API-key provider with its
+    /// env var present, or an OAuth provider whose credential is the single stored (connected) one.
+    /// </summary>
+    internal static bool FlagProviderIsAuthenticated(string? providerId, string? connectedProviderId, bool apiKeyEnvPresent)
+    {
+        if (string.IsNullOrWhiteSpace(providerId))
+        {
+            return false;
+        }
+
+        if (string.Equals(providerId, ApiKeyProvider.Id, StringComparison.Ordinal))
+        {
+            return apiKeyEnvPresent;
+        }
+
+        return string.Equals(providerId, connectedProviderId, StringComparison.Ordinal);
+    }
+
+    /// <summary>
     /// Resolves whether MCP should be connected for this serve run: the parsed flag default
     /// (<c>--no-mcp</c> / <c>--mcp</c>), overridden off by a truthy <c>CODA_SERVE_DISABLE_MCP</c>
     /// (<c>"1"</c> / <c>"true"</c>, case-insensitive — see <see cref="EnvFlags.IsTruthy"/>). Split
@@ -247,8 +266,9 @@ public static class ServeRunner
             // fast on a provider that merely lacks a credential, substitute the connected one and
             // say so loudly — silent substitution would be surprising.
             var connectedProviderId = await credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
-            var flagHasCredential = options.ProviderId is not null
-                && string.Equals(options.ProviderId, connectedProviderId, StringComparison.Ordinal);
+            var apiKeyEnvPresent = !string.IsNullOrEmpty(
+                Environment.GetEnvironmentVariable(ApiKeyProvider.EnvVarName));
+            var flagHasCredential = FlagProviderIsAuthenticated(options.ProviderId, connectedProviderId, apiKeyEnvPresent);
             var resolvedProviderId = ResolveServeProvider(options.ProviderId, flagHasCredential, connectedProviderId);
             if (!string.IsNullOrWhiteSpace(options.ProviderId)
                 && !string.Equals(resolvedProviderId, options.ProviderId, StringComparison.Ordinal))
