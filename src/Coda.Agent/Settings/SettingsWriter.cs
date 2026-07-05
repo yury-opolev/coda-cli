@@ -81,6 +81,44 @@ public static class SettingsWriter
     }
 
     /// <summary>
+    /// Persist the default model <b>for a specific provider</b> under the
+    /// <c>defaultModelByProvider</c> object (e.g. <c>github-copilot -&gt; claude-opus-4.8</c>),
+    /// preserving all other providers' entries and all other settings keys. This is what the
+    /// <c>/model</c> command writes so a model belongs to its provider. Atomic (temp file + move).
+    /// </summary>
+    public static void SetUserDefaultModelForProvider(string providerId, string model, string? userSettingsDir = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(providerId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+
+        var homeDir = userSettingsDir
+            ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var dir = Path.Combine(homeDir, ".coda");
+        var file = Path.Combine(dir, "settings.json");
+
+        JsonObject root;
+        try
+        {
+            root = (File.Exists(file) ? JsonNode.Parse(File.ReadAllText(file)) as JsonObject : null) ?? new JsonObject();
+        }
+        catch (JsonException)
+        {
+            root = new JsonObject();
+        }
+
+        var byProvider = root["defaultModelByProvider"] as JsonObject ?? new JsonObject();
+        byProvider[providerId] = model;
+        root["defaultModelByProvider"] = byProvider;
+
+        Directory.CreateDirectory(dir);
+        var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, file, overwrite: true);
+    }
+
+    /// <summary>
     /// Persists the telemetry block to user settings, preserving all other keys
     /// (including telemetry sub-keys this method does not manage). Writes the level
     /// as a lowercase word (e.g. "debug"). Atomic (temp file + move).

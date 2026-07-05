@@ -112,4 +112,61 @@ public sealed class ProviderModelResolverTests
         var (provider, _) = ProviderModelResolver.Resolve(null, null, CodaSettings.Empty, connectedProviderId: null);
         Assert.Null(provider);
     }
+
+    // ── the model belongs to the provider (defaultModelByProvider + built-in fallback) ──
+
+    [Fact]
+    public void PerProviderModel_WinsOverGlobalDefault()
+    {
+        var settings = CodaSettings.Empty with
+        {
+            DefaultModel = "global-model",
+            DefaultModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "per-provider-model" },
+        };
+
+        var (provider, model) = ProviderModelResolver.Resolve(null, null, settings, connectedProviderId: GitHubCopilotProvider.Id);
+
+        Assert.Equal(GitHubCopilotProvider.Id, provider);
+        Assert.Equal("per-provider-model", model);
+    }
+
+    [Fact]
+    public void PerProviderModel_DoesNotLeakToAnotherProvider()
+    {
+        // A model set for Copilot must NOT be used when the connected provider is Claude.ai —
+        // it falls back to Claude's own built-in default instead.
+        var settings = CodaSettings.Empty with
+        {
+            DefaultModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "copilot-only-model" },
+        };
+
+        var (provider, model) = ProviderModelResolver.Resolve(null, null, settings, connectedProviderId: ClaudeAiProvider.Id);
+
+        Assert.Equal(ClaudeAiProvider.Id, provider);
+        Assert.NotEqual("copilot-only-model", model);
+        Assert.Equal(ProviderDefaults.ModelFor(ClaudeAiProvider.Id), model);
+    }
+
+    [Fact]
+    public void ResolvedProvider_NoModelConfigured_FallsBackToProviderBuiltInDefault()
+    {
+        var (provider, model) = ProviderModelResolver.Resolve(null, null, CodaSettings.Empty, connectedProviderId: GitHubCopilotProvider.Id);
+
+        Assert.Equal(GitHubCopilotProvider.Id, provider);
+        Assert.False(string.IsNullOrWhiteSpace(model));
+        Assert.Equal(ProviderDefaults.ModelFor(GitHubCopilotProvider.Id), model);
+    }
+
+    [Fact]
+    public void Flag_WinsOverPerProviderModel()
+    {
+        var settings = CodaSettings.Empty with
+        {
+            DefaultModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "per-provider-model" },
+        };
+
+        var (_, model) = ProviderModelResolver.Resolve(null, modelFlag: "flag-model", settings, connectedProviderId: GitHubCopilotProvider.Id);
+
+        Assert.Equal("flag-model", model);
+    }
 }

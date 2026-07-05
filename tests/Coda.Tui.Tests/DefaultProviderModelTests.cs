@@ -65,15 +65,19 @@ public sealed class DefaultProviderModelTests : IDisposable
     }
 
     [Fact]
-    public async Task Choosing_a_model_persists_it()
+    public async Task Choosing_a_model_persists_it_for_the_active_provider()
     {
         var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var providerId = context.ActiveProvider.Id;
 
         await new ModelCommand().ExecuteAsync(context, ["claude-opus-4-8"], CancellationToken.None);
 
+        // The model belongs to the provider: persisted under defaultModelByProvider[activeProvider],
+        // NOT the global defaultModel (which would leak to other providers).
         var settings = SettingsLoader.Load(this.home, this.home);
-        Assert.Equal("claude-opus-4-8", settings.DefaultModel);
+        Assert.Equal("claude-opus-4-8", settings.DefaultModelByProvider[providerId]);
         Assert.Equal("claude-opus-4-8", context.Session.Model);
+        Assert.Null(settings.DefaultModel);
     }
 
     [Fact]

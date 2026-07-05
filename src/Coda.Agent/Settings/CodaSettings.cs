@@ -26,6 +26,15 @@ public sealed record CodaSettings(
     public string? DefaultModel { get; init; }
 
     /// <summary>
+    /// Per-provider default model ids, keyed by provider id (e.g. <c>"github-copilot" -&gt;
+    /// "claude-opus-4.8"</c>). A model set here belongs to that provider and wins over the global
+    /// <see cref="DefaultModel"/>, so switching providers never reuses a model meant for another
+    /// (which would otherwise fail — e.g. an Anthropic model id against Copilot). Empty = none.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> DefaultModelByProvider { get; init; } =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>
     /// Persisted GitHub Enterprise Cloud data-residency domain for GitHub Copilot (e.g.
     /// <c>octocorp.ghe.com</c>); null/blank = public github.com. Drives
     /// <see cref="Coda.Agent.Settings"/>-based provider construction so an enterprise user
