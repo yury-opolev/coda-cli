@@ -195,6 +195,23 @@ public sealed class FileTokenStoreTests : IDisposable
         }
         finally { Directory.Delete(dir, true); }
     }
+
+    [Fact]
+    public async Task CorruptKeyFile_IsRegenerated_StoreStillWorks()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "ftok-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            Directory.CreateDirectory(dir);
+            // A key.bin that is neither a valid raw 32-byte key nor a valid DPAPI blob.
+            File.WriteAllBytes(Path.Combine(dir, "key.bin"), new byte[] { 1, 2, 3, 4, 5 });
+
+            var store = new FileTokenStore(dir); // must NOT throw — regenerates the key
+            await store.SetAsync("llmauth:copilot", "secret-value");
+            Assert.Equal("secret-value", await new FileTokenStore(dir).GetAsync("llmauth:copilot"));
+        }
+        finally { Directory.Delete(dir, true); }
+    }
 }
 
 internal static class ByteArrayExtensions

@@ -63,12 +63,10 @@ internal static class WindowsCredentialProtection
         }
 
         var isDir = Directory.Exists(path);
-        var inherit = isDir
-            ? InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit
-            : InheritanceFlags.None;
 
         if (isDir)
         {
+            var inherit = InheritanceFlags.ContainerInherit | InheritanceFlags.ObjectInherit;
             var sec = new DirectorySecurity();
             sec.SetAccessRuleProtection(isProtected: true, preserveInheritance: false);
             sec.AddAccessRule(new FileSystemAccessRule(user, FileSystemRights.FullControl, inherit, PropagationFlags.None, AccessControlType.Allow));
