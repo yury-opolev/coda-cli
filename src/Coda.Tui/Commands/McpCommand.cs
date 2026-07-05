@@ -216,7 +216,7 @@ public sealed class McpCommand : ISlashCommand
         var verb = isEdit ? "edit" : "add";
         if (tail.Count == 0)
         {
-            context.Console.MarkupLine($"Usage: /mcp {verb} <name> [--command <cmd> --args \"…\" | --url <url>] [--user]");
+            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {verb} <name> [--command <cmd> --args \"…\" | --url <url>] [--user]"));
             return;
         }
 
@@ -290,7 +290,7 @@ public sealed class McpCommand : ISlashCommand
     {
         if (tail.Count == 0)
         {
-            context.Console.MarkupLine("Usage: /mcp remove <name> [--user]");
+            context.Console.MarkupLine(Markup.Escape("Usage: /mcp remove <name> [--user]"));
             return;
         }
 
@@ -328,7 +328,7 @@ public sealed class McpCommand : ISlashCommand
         var verb = disabled ? "disable" : "enable";
         if (tail.Count == 0)
         {
-            context.Console.MarkupLine($"Usage: /mcp {verb} <name> [--user]");
+            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {verb} <name> [--user]"));
             return;
         }
 

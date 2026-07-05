@@ -69,6 +69,19 @@ public sealed class ResumeRewindCommandTests : IDisposable
         Assert.Contains("Nothing to rewind", console.Output);
     }
 
+    // The invalid-argument usage hint embeds a literal "[n]". Spectre parses "[...]" as markup, so an
+    // unescaped hint makes MarkupLine throw "Could not find color or style 'n'". It must be escaped.
+    [Fact]
+    public async Task Rewind_invalid_arg_prints_usage_without_markup_error()
+    {
+        var (console, context) = this.BuildContext();
+        context.Session.History.Add(new ChatMessage(ChatRole.User, [new TextBlock("hi")]));
+
+        await new RewindCommand().ExecuteAsync(context, new[] { "notanumber" });
+
+        Assert.Contains("Usage:", console.Output);
+    }
+
     [Fact]
     public async Task Rewind_reports_remaining_message_count()
     {
