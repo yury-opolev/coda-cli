@@ -102,6 +102,29 @@ public static class ServeRunner
     }
 
     /// <summary>
+    /// Resolve the effective (provider, model) for a serve run once the connected credential is
+    /// known. Provider: the requested provider when authenticated, else the single connected
+    /// provider (credential-aware fallback). Model: resolved AGAINST THE EFFECTIVE PROVIDER
+    /// (<c>--model</c> → the provider's configured <c>modelByProvider</c> → its built-in default),
+    /// so the model always belongs to the provider actually used — there is no provider-agnostic
+    /// default model. Pure and testable: no credential or process I/O (the caller supplies the
+    /// connected provider id and api-key-env presence).
+    /// </summary>
+    internal static (string? ProviderId, string? Model) ResolveEffective(
+        string? requestedProviderId,
+        string? modelFlag,
+        Coda.Agent.Settings.CodaSettings settings,
+        string? connectedProviderId,
+        bool apiKeyEnvPresent)
+    {
+        var flagHasCredential = FlagProviderIsAuthenticated(requestedProviderId, connectedProviderId, apiKeyEnvPresent);
+        var providerId = ResolveServeProvider(requestedProviderId, flagHasCredential, connectedProviderId);
+        var (_, model) = Coda.Sdk.Providers.ProviderModelResolver.Resolve(
+            providerId, modelFlag, settings, connectedProviderId: null);
+        return (providerId, model);
+    }
+
+    /// <summary>
     /// Resolves whether MCP should be connected for this serve run: the parsed flag default
     /// (<c>--no-mcp</c> / <c>--mcp</c>), overridden off by a truthy <c>CODA_SERVE_DISABLE_MCP</c>
     /// (<c>"1"</c> / <c>"true"</c>, case-insensitive — see <see cref="EnvFlags.IsTruthy"/>). Split
@@ -251,6 +274,10 @@ public static class ServeRunner
             var raw = ServeOptions.Parse(args);
             var workingDirectory = raw.WorkingDirectory ?? Directory.GetCurrentDirectory();
             var settings = SettingsLoader.Load(workingDirectory);
+            // ApplyDefaults resolves the provider/model from flags+settings ALONE (no credential I/O),
+            // so with no --provider the model is not yet known; it is re-resolved for the effective
+            // provider below via ResolveEffective, once the connected credential is known. Do not
+            // "simplify" by trusting options.Model here — that reintroduces the "No model configured" bug.
             var options = ApplyDefaults(raw, workingDirectory, settings);
 
             using var claude = new ClaudeAiProvider();
@@ -268,8 +295,10 @@ public static class ServeRunner
             var connectedProviderId = await credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
             var apiKeyEnvPresent = !string.IsNullOrEmpty(
                 Environment.GetEnvironmentVariable(ApiKeyProvider.EnvVarName));
-            var flagHasCredential = FlagProviderIsAuthenticated(options.ProviderId, connectedProviderId, apiKeyEnvPresent);
-            var resolvedProviderId = ResolveServeProvider(options.ProviderId, flagHasCredential, connectedProviderId);
+
+            // Resolve the effective (provider, model) now that the connected credential is known.
+            var (resolvedProviderId, resolvedModel) = ResolveEffective(
+                options.ProviderId, raw.Model, settings, connectedProviderId, apiKeyEnvPresent);
             if (!string.IsNullOrWhiteSpace(options.ProviderId)
                 && !string.Equals(resolvedProviderId, options.ProviderId, StringComparison.Ordinal))
             {
@@ -277,10 +306,11 @@ public static class ServeRunner
                     $"coda serve: warning: requested provider '{options.ProviderId}' has no credential; using connected provider '{resolvedProviderId}'.");
             }
 
-            options = options with { ProviderId = resolvedProviderId };
+            options = options with { ProviderId = resolvedProviderId, Model = resolvedModel };
 
-            // Fail fast (do NOT spawn) when neither a flag/settings nor a connected credential
-            // configured the provider/model — there is no built-in default to silently fall back to.
+            // Fail fast (do NOT spawn) only when NO provider is configured (no flag, no connected
+            // credential). A known provider always yields a built-in model, so the model never fails
+            // once the provider is resolved.
             try
             {
                 Coda.Sdk.Providers.ProviderModelResolver.Require(options.ProviderId, options.Model);

@@ -147,28 +147,24 @@ Inside the REPL:
   (e.g. Copilot or offline). The window size per model and the `/cost` price table
   come from the **model catalog** (below), falling back to 200k / built-in prices.
 
-### Default provider & model (persisted)
+### Model per provider (persisted)
 
-By default the TUI starts on Claude.ai. **Your choice sticks automatically** across
-sessions — no extra flag needed:
+The provider is resolved automatically from the credential you're signed in to
+(`coda auth login <id>`) — there is no persisted "default provider". A **model always belongs to
+a provider** (there is no provider-agnostic default model), and **your model choice sticks per
+provider**:
 
-- **`/provider <id>`** persists the startup provider (and clears any persisted model
-  so the new provider's default is used).
-- **`/model <id>`** persists the startup model.
+- **`/model <id>`** persists the model **for the active provider**.
 
-Both write to `~/.coda/settings.json` (`defaultProvider` / `defaultModel`), which you
-can also edit by hand:
+Persisted under `~/.coda/settings.json` as `modelByProvider`, which you can also edit by hand:
 
 ```json
-{ "defaultProvider": "github-copilot", "defaultModel": "claude-sonnet-4" }
+{ "modelByProvider": { "github-copilot": "claude-opus-4.8" } }
 ```
 
-Startup precedence is **env → settings → built-in default**: `CODA_PROVIDER` /
-`CODA_MODEL` override the persisted values for one run. A project-level
-`<project>/.coda/settings.json` overrides the user file. (Note: a hand-edited
-`defaultModel` is applied as-is to the resolved provider — keep it consistent with
-`defaultProvider`. `CODA_SETTINGS_DIR` relocates only `settings.json`, not the rest
-of `~/.coda`.)
+Model precedence is **`CODA_MODEL` env → the provider's `modelByProvider` entry → the provider's
+built-in default**. A project-level `<project>/.coda/settings.json` overrides the user file per
+provider. (`CODA_SETTINGS_DIR` relocates only `settings.json`, not the rest of `~/.coda`.)
 
 ### Model catalog (metadata)
 

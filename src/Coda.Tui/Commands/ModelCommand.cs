@@ -110,37 +110,20 @@ public sealed class ModelCommand : ISlashCommand
     }
 
     /// <summary>
-    /// Persist startup defaults, returning a status note. Never throws: a failed write
+    /// Persist the chosen model FOR THE ACTIVE PROVIDER (under <c>modelByProvider</c>), so it belongs
+    /// to that provider — there is no provider-agnostic default model. Never throws: a failed write
     /// (e.g. read-only home) is reported but doesn't break the in-session change.
-    /// </summary>
-    internal static string TryPersistDefaults(string? defaultProvider = null, string? defaultModel = null)
-    {
-        try
-        {
-            SettingsWriter.SetUserDefaults(defaultProvider, defaultModel);
-            return "— saved as the default.";
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            return $"(couldn't save default: {ex.Message})";
-        }
-    }
-
-    /// <summary>
-    /// Persist the chosen model as the default FOR THE ACTIVE PROVIDER (under
-    /// <c>defaultModelByProvider</c>), so it belongs to that provider rather than being a global
-    /// value that could mismatch a different provider later. Never throws.
     /// </summary>
     internal static string TryPersistModelForProvider(string providerId, string model)
     {
         try
         {
-            SettingsWriter.SetUserDefaultModelForProvider(providerId, model);
-            return "— saved as this provider's default.";
+            SettingsWriter.SetUserModelForProvider(providerId, model);
+            return "— saved as this provider's model.";
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return $"(couldn't save default: {ex.Message})";
+            return $"(couldn't save model: {ex.Message})";
         }
     }
 

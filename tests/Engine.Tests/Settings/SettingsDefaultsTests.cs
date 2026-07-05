@@ -3,11 +3,11 @@ using Coda.Agent.Settings;
 namespace Engine.Tests.Settings;
 
 /// <summary>
-/// Tests that <see cref="SettingsLoader"/> is the single source of resolved
-/// <c>defaultProvider</c>/<c>defaultModel</c>: merging user + project files
-/// (project overrides user, per field), honoring <c>CODA_SETTINGS_DIR</c>, and
-/// normalizing blank values to <see langword="null"/>. These are the values
-/// both the TUI startup and <c>coda serve</c> now consume.
+/// Tests that <see cref="SettingsLoader"/> is the single source of the resolved
+/// <c>defaultProvider</c> and the per-provider <c>modelByProvider</c> map: merging user + project
+/// files (project overrides user, per field / per provider), honoring <c>CODA_SETTINGS_DIR</c>, and
+/// normalizing blank values away. These are the values both the TUI startup and <c>coda serve</c>
+/// consume. There is intentionally no provider-agnostic default model.
 /// </summary>
 [Collection("env")]
 public sealed class SettingsDefaultsTests : IDisposable
@@ -57,36 +57,36 @@ public sealed class SettingsDefaultsTests : IDisposable
         this.WriteUser("""
         {
             "defaultProvider": "github-copilot",
-            "defaultModel": "claude-opus-4"
+            "modelByProvider": { "github-copilot": "claude-opus-4" }
         }
         """);
 
         var settings = SettingsLoader.Load(this.projectDir, this.userHome);
 
         Assert.Equal("github-copilot", settings.DefaultProvider);
-        Assert.Equal("claude-opus-4", settings.DefaultModel);
+        Assert.Equal("claude-opus-4", settings.ModelByProvider["github-copilot"]);
     }
 
     [Fact]
-    public void Project_defaults_override_user_defaults_per_field()
+    public void Project_models_override_user_models_per_provider()
     {
         this.WriteUser("""
         {
             "defaultProvider": "github-copilot",
-            "defaultModel": "user-model"
+            "modelByProvider": { "github-copilot": "user-model", "anthropic-api-key": "user-anthropic" }
         }
         """);
         this.WriteProject("""
         {
-            "defaultModel": "project-model"
+            "modelByProvider": { "github-copilot": "project-model" }
         }
         """);
 
         var settings = SettingsLoader.Load(this.projectDir, this.userHome);
 
-        // Provider falls through to user (not set in project); model is overridden by project.
-        Assert.Equal("github-copilot", settings.DefaultProvider);
-        Assert.Equal("project-model", settings.DefaultModel);
+        Assert.Equal("github-copilot", settings.DefaultProvider); // provider falls through to user
+        Assert.Equal("project-model", settings.ModelByProvider["github-copilot"]); // project overrides
+        Assert.Equal("user-anthropic", settings.ModelByProvider["anthropic-api-key"]); // user entry survives
     }
 
     [Fact]
@@ -95,7 +95,7 @@ public sealed class SettingsDefaultsTests : IDisposable
         this.WriteUser("""
         {
             "defaultProvider": "github-copilot",
-            "defaultModel": "env-model"
+            "modelByProvider": { "github-copilot": "env-model" }
         }
         """);
 
@@ -105,31 +105,31 @@ public sealed class SettingsDefaultsTests : IDisposable
         var settings = SettingsLoader.Load(this.projectDir);
 
         Assert.Equal("github-copilot", settings.DefaultProvider);
-        Assert.Equal("env-model", settings.DefaultModel);
+        Assert.Equal("env-model", settings.ModelByProvider["github-copilot"]);
     }
 
     [Fact]
-    public void Blank_defaults_normalize_to_null()
+    public void Blank_values_normalize_away()
     {
         this.WriteUser("""
         {
             "defaultProvider": "   ",
-            "defaultModel": ""
+            "modelByProvider": { "github-copilot": "  " }
         }
         """);
 
         var settings = SettingsLoader.Load(this.projectDir, this.userHome);
 
         Assert.Null(settings.DefaultProvider);
-        Assert.Null(settings.DefaultModel);
+        Assert.Empty(settings.ModelByProvider); // blank per-provider model values are dropped
     }
 
     [Fact]
-    public void No_files_yields_null_defaults()
+    public void No_files_yields_empty_defaults()
     {
         var settings = SettingsLoader.Load(this.projectDir, this.userHome);
 
         Assert.Null(settings.DefaultProvider);
-        Assert.Null(settings.DefaultModel);
+        Assert.Empty(settings.ModelByProvider);
     }
 }

@@ -34,7 +34,7 @@ public sealed class DefaultProviderModelTests : IDisposable
         // Pre-existing persisted model — connecting must leave it untouched: provider
         // identity is now derived from the connected credential, not a settings pointer,
         // so there's no cross-provider stale-model concern to guard against anymore.
-        SettingsWriter.SetUserDefaults(defaultModel: "claude-opus-4-8", userSettingsDir: this.home);
+        SettingsWriter.SetUserModelForProvider(ApiKeyProvider.Id, "claude-opus-4-8", this.home);
 
         // Use the API-key provider so the connect flow completes synchronously in-test —
         // OAuth loopback/device-code flows require real browser/network interaction.
@@ -43,7 +43,7 @@ public sealed class DefaultProviderModelTests : IDisposable
         Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId); // connected in-session
         var settings = SettingsLoader.Load(this.home, this.home);
         Assert.Null(settings.DefaultProvider); // no settings pointer written
-        Assert.Equal("claude-opus-4-8", settings.DefaultModel); // left untouched
+        Assert.Equal("claude-opus-4-8", settings.ModelByProvider[ApiKeyProvider.Id]); // left untouched
     }
 
     [Fact]
@@ -52,7 +52,7 @@ public sealed class DefaultProviderModelTests : IDisposable
         var (_, context, _, _) = TestAppBuilder.BuildApp();
         // A pre-existing persisted model that login must leave alone (no clearing —
         // login no longer touches settings.json at all).
-        SettingsWriter.SetUserDefaults(defaultModel: "claude-opus-4-8", userSettingsDir: this.home);
+        SettingsWriter.SetUserModelForProvider(ApiKeyProvider.Id, "claude-opus-4-8", this.home);
 
         // The Anthropic API-key provider has no interactive step, so /login completes
         // synchronously (no browser/device flow) — exercising the connect path.
@@ -61,7 +61,7 @@ public sealed class DefaultProviderModelTests : IDisposable
         Assert.Equal(ApiKeyProvider.Id, context.Session.ActiveProviderId); // connected in-session
         var settings = SettingsLoader.Load(this.home, this.home);
         Assert.Null(settings.DefaultProvider); // retired selector — never written
-        Assert.Equal("claude-opus-4-8", settings.DefaultModel); // untouched
+        Assert.Equal("claude-opus-4-8", settings.ModelByProvider[ApiKeyProvider.Id]); // untouched
     }
 
     [Fact]
@@ -72,12 +72,11 @@ public sealed class DefaultProviderModelTests : IDisposable
 
         await new ModelCommand().ExecuteAsync(context, ["claude-opus-4-8"], CancellationToken.None);
 
-        // The model belongs to the provider: persisted under defaultModelByProvider[activeProvider],
-        // NOT the global defaultModel (which would leak to other providers).
+        // The model belongs to the provider: persisted under modelByProvider[activeProvider].
+        // There is no provider-agnostic default model.
         var settings = SettingsLoader.Load(this.home, this.home);
-        Assert.Equal("claude-opus-4-8", settings.DefaultModelByProvider[providerId]);
+        Assert.Equal("claude-opus-4-8", settings.ModelByProvider[providerId]);
         Assert.Equal("claude-opus-4-8", context.Session.Model);
-        Assert.Null(settings.DefaultModel);
     }
 
     [Fact]
@@ -102,7 +101,7 @@ public sealed class DefaultProviderModelTests : IDisposable
 
         var settings = SettingsLoader.Load(this.home, this.home);
         Assert.Null(settings.DefaultProvider);
-        Assert.Null(settings.DefaultModel);
+        Assert.Empty(settings.ModelByProvider);
     }
 }
 

@@ -41,7 +41,7 @@ public sealed class TelemetrySettingsLoaderTests : IDisposable
     [Fact]
     public void No_telemetry_block_yields_null()
     {
-        var home = this.WriteUserSettings("""{ "defaultModel": "x" }""");
+        var home = this.WriteUserSettings("""{ "defaultProvider": "x" }""");
 
         var settings = SettingsLoader.Load(Path.Combine(this.root, "proj"), home);
 

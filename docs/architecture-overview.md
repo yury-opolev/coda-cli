@@ -316,13 +316,16 @@ re-reading inside the lock to avoid duplicate refreshes), and produces auth head
 The home root is `CODA_SETTINGS_DIR` when set, else the user profile — this is what lets the
 serve path (and tests) redirect settings hermetically. Merge rules: list fields (allow / deny
 / hooks) concatenate user-then-project; LSP servers overlay by name; `defaultProvider` /
-`defaultModel` / telemetry are project-overrides-user; goal settings merge field-by-field.
+`modelByProvider` / telemetry are project-overrides-user (per provider for the model);
+goal settings merge field-by-field.
 Missing or corrupt files are silently treated as empty (`CodaSettings.Empty`).
 
 `CodaSettings` carries permissions, hooks, LSP servers, provider/model defaults, the goal
 block, and the telemetry block. **Serve defaults** (provider/model when no `--provider`/
-`--model` flag) come from the SAME `SettingsLoader.Load(...).DefaultProvider`/`.DefaultModel`
-the TUI uses (merged user + project, project-over-user, honoring `CODA_SETTINGS_DIR`), falling
+`--model` flag) come from the SAME source the TUI uses: the provider from the connected credential,
+the model from that provider's `SettingsLoader.Load(...).ModelByProvider` entry (or its built-in
+default), resolved by the shared `ProviderModelResolver` (merged user + project, project-over-user,
+honoring `CODA_SETTINGS_DIR`), falling
 back to the built-in provider default. Runtime mutation of the goal happens via `session/setGoal`,
 which rewrites `CodaSession.Options` (a `volatile` record snapshotted per turn).
 
@@ -610,7 +613,7 @@ startup race) is a genuine *improvement* in layering, not a regression.
 - **What.** The `provider token → providerId` switch (`"claude"/"copilot"/"apikey"/…`)
   is copy-pasted in **four** front-end runners: `Program.cs` (`ResolveStartupProviderId`),
   `ServeRunner.cs` (`ResolveProviderId`), `HeadlessRunner.cs`, and `ModelsRunner.cs`.
-  `DefaultModelFor` (provider → default model) is likewise duplicated. The nominal
+  `ProviderDefaults.ModelFor` (provider → built-in model) is likewise duplicated. The nominal
   **200,000-token context window** is hardcoded in three places (`CodaSession.cs:148`,
   `CodaSession.cs:429`, `ToolSearchCoordinator` default).
 - **Why it's a problem.** Adding a provider or changing an alias means editing four files
@@ -685,9 +688,10 @@ startup race) is a genuine *improvement* in layering, not a regression.
   merged user + project). It's the classic "config read in more than one place" trap.
 - **Direction.** Make `SettingsLoader` the single parse authority and fold serve's telemetry
   layering back into `TelemetryResolver`.
-- **Resolution — resolved.** `ServeRunner.Parse` now consumes `SettingsLoader.Load(...).DefaultProvider`/
-  `.DefaultModel` — the same merged source the TUI uses (serve now also honors PROJECT
-  `settings.json` defaults, not just user). `ServeUserDefaults` was **deleted**. The serve
+- **Resolution — resolved.** `ServeRunner` now consumes `SettingsLoader.Load(...).DefaultProvider`/
+  `.ModelByProvider` — the same merged source the TUI uses (serve now also honors PROJECT
+  `settings.json` defaults, not just user), with the model resolved for the effective provider in
+  `ResolveEffective` after the connected credential is known. `ServeUserDefaults` was **deleted**. The serve
   force-on telemetry layering (incl. the `--telemetry-level off` special case) folded into the
   single authority `TelemetryResolver.ResolveServeOverride`; serve passes its `--telemetry`/
   `--telemetry-level` inputs through it rather than re-implementing layering. There is now one
@@ -742,7 +746,9 @@ diverge from what you are logged in to.
   provider.
 - **Provider is derived from the credential.** `ProviderModelResolver` resolves the provider as
   `--provider` flag → the connected provider. `settings.json` `defaultProvider` is **retired as
-  a selector** (no longer read or written to choose the provider); `defaultModel` is unchanged.
+  a selector** (no longer read or written to choose the provider); the global `defaultModel` is
+  **removed** — a model is configured per provider via `modelByProvider` (it only ever makes sense
+  for a specific provider), resolved against the effective provider.
 - **`coda serve` tolerance.** When launched with a `--provider` that has no credential (e.g. a
   stale value passed by a host integration), serve falls back to the single connected provider
   and logs a warning, so the session still runs. An API-key provider (`anthropic-api-key`) counts

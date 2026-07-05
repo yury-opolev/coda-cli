@@ -12,11 +12,11 @@ namespace Coda.Sdk.Providers;
 /// is no longer a provider selector.
 /// <para>
 /// The <b>model belongs to the resolved provider</b>: it resolves explicit flag →
-/// the provider's persisted per-provider default (<c>defaultModelByProvider</c>) →
-/// the global <c>defaultModel</c> (back-compat) → the provider's built-in default
-/// (<see cref="ProviderDefaults"/>). Because a signed-in provider always has a
-/// built-in default, a model is never left unconfigured once a provider is known —
-/// and a stale global model can no longer mismatch a different provider.
+/// the provider's configured model (<c>modelByProvider</c>) → the provider's built-in
+/// default (<see cref="ProviderDefaults"/>). There is intentionally NO provider-agnostic
+/// default model, so a model configured for one provider can never mismatch another; and
+/// because a signed-in provider always has a built-in default, a model is never left
+/// unconfigured once a provider is known.
 /// </para>
 /// <para>
 /// Used by <c>coda serve</c>, <c>coda run</c>, and <c>coda models</c> so every
@@ -32,7 +32,7 @@ public static class ProviderModelResolver
     /// </summary>
     /// <param name="providerFlag">The explicit <c>--provider</c> token, or null when absent.</param>
     /// <param name="modelFlag">The explicit <c>--model</c> token, or null when absent.</param>
-    /// <param name="settings">Merged settings supplying <c>DefaultModel</c>.</param>
+    /// <param name="settings">Merged settings supplying <c>ModelByProvider</c>.</param>
     /// <param name="connectedProviderId">The connected credential's provider id, or null when none is connected.</param>
     public static (string? ProviderId, string? Model) Resolve(
         string? providerFlag, string? modelFlag, CodaSettings settings, string? connectedProviderId)
@@ -42,20 +42,20 @@ public static class ProviderModelResolver
         var providerToken = Blank(providerFlag) ?? Blank(connectedProviderId);
         var providerId = providerToken is null ? null : ProviderAliases.Resolve(providerToken);
 
-        // Model belongs to the provider: flag → per-provider default → global default (back-compat)
-        // → the provider's built-in default. The built-in fallback means a known provider always
-        // has a usable model, and a per-provider entry never lets a stale global model leak across.
+        // The model belongs to the provider: flag → the provider's configured model
+        // (modelByProvider) → the provider's built-in default. There is NO provider-agnostic
+        // default model, so a model configured for one provider can never leak to another, and a
+        // known provider always has a usable model.
         var model = Blank(modelFlag)
-            ?? PerProviderModel(settings, providerId)
-            ?? Blank(settings.DefaultModel)
+            ?? ProviderModel(settings, providerId)
             ?? (providerId is null ? null : ProviderDefaults.ModelFor(providerId));
 
         return (providerId, model);
     }
 
-    private static string? PerProviderModel(CodaSettings settings, string? providerId)
+    private static string? ProviderModel(CodaSettings settings, string? providerId)
         => providerId is not null
-            && settings.DefaultModelByProvider.TryGetValue(providerId, out var model)
+            && settings.ModelByProvider.TryGetValue(providerId, out var model)
             ? Blank(model)
             : null;
 
@@ -77,7 +77,7 @@ public static class ProviderModelResolver
         if (string.IsNullOrWhiteSpace(model))
         {
             throw new ProviderModelNotConfiguredException(
-                "No model configured. Pass --model <id>, or set \"defaultModel\" in ~/.coda/settings.json.");
+                "No model configured for the provider. Pass --model <id>.");
         }
 
         return (providerId, model);

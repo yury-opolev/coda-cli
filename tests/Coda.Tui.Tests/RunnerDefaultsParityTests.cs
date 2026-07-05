@@ -17,12 +17,11 @@ namespace Coda.Tui.Tests;
 public sealed class RunnerDefaultsParityTests
 {
     [Fact]
-    public void Run_honors_connected_provider_and_settings_model()
+    public void Run_honors_connected_provider_and_its_configured_model()
     {
         using var env = new TempEnv("""
         {
-            "defaultProvider": "anthropic-api-key",
-            "defaultModel": "claude-opus-4-8"
+            "modelByProvider": { "github-copilot": "copilot-model" }
         }
         """);
 
@@ -30,9 +29,9 @@ public sealed class RunnerDefaultsParityTests
             providerFlag: null, modelFlag: null, env.WorkingDir, env.UserHome,
             connectedProviderId: GitHubCopilotProvider.Id);
 
-        // Connected provider wins over settings.DefaultProvider; model still comes from settings.
+        // The connected credential selects the provider; the model is that provider's configured one.
         Assert.Equal(GitHubCopilotProvider.Id, providerId);
-        Assert.Equal("claude-opus-4-8", model);
+        Assert.Equal("copilot-model", model);
     }
 
     [Fact]
@@ -51,8 +50,7 @@ public sealed class RunnerDefaultsParityTests
     {
         using var env = new TempEnv("""
         {
-            "defaultProvider": "anthropic-api-key",
-            "defaultModel": "claude-opus-4-8"
+            "defaultProvider": "anthropic-api-key"
         }
         """);
 

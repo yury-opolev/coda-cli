@@ -7,31 +7,16 @@ namespace Engine.Tests.Providers;
 
 /// <summary>
 /// The single source of truth for resolving a runner's effective (provider, model).
-/// Provider resolves from an explicit flag → connected credential. Model resolves
-/// from an explicit flag → the persisted settings default. There is NO built-in
-/// fallback: when neither configures a value it resolves to null and
-/// <see cref="ProviderModelResolver.Require"/> fails fast, instead of silently
-/// defaulting to the Anthropic/Claude.ai provider as the old code did.
-/// <c>settings.DefaultProvider</c> is no longer a provider selector. (The
-/// transitional 3-arg overload — connected credential always null — was removed
-/// once every caller migrated to the 4-arg overload; these cases now exercise it
-/// with <c>connectedProviderId: null</c> directly.)
+/// Provider resolves from an explicit flag → the connected credential; there is NO built-in
+/// provider fallback, and <c>settings.DefaultProvider</c> is not a selector. The MODEL belongs to
+/// the resolved provider: flag → the provider's configured model (<c>modelByProvider</c>) → the
+/// provider's built-in default. There is intentionally NO provider-agnostic default model, so a
+/// model configured for one provider can never leak to another.
 /// </summary>
 public sealed class ProviderModelResolverTests
 {
     [Fact]
-    public void NoConnectedProvider_does_not_select_provider_from_settings_default()
-    {
-        var settings = CodaSettings.Empty with { DefaultProvider = "github-copilot", DefaultModel = "claude-opus-4-8" };
-
-        var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: null, modelFlag: null, settings, connectedProviderId: null);
-
-        Assert.Null(providerId);
-        Assert.Equal("claude-opus-4-8", model);
-    }
-
-    [Fact]
-    public void No_flag_and_no_settings_resolves_to_null_without_inventing_a_default()
+    public void No_flag_and_no_connected_resolves_to_null()
     {
         var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: null, modelFlag: null, CodaSettings.Empty, connectedProviderId: null);
 
@@ -40,22 +25,28 @@ public sealed class ProviderModelResolverTests
     }
 
     [Fact]
-    public void Blank_settings_values_resolve_to_null()
+    public void Blank_flags_resolve_to_null()
     {
-        var settings = CodaSettings.Empty with { DefaultProvider = "   ", DefaultModel = "" };
-
-        var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: null, modelFlag: null, settings, connectedProviderId: null);
+        var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: "   ", modelFlag: "", CodaSettings.Empty, connectedProviderId: null);
 
         Assert.Null(providerId);
         Assert.Null(model);
     }
 
     [Fact]
-    public void Explicit_flags_win_over_settings()
+    public void Settings_DefaultProvider_is_not_a_selector()
     {
-        var settings = CodaSettings.Empty with { DefaultProvider = "github-copilot", DefaultModel = "settings-model" };
+        var settings = CodaSettings.Empty with { DefaultProvider = "github-copilot" };
 
-        var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: "claude", modelFlag: "flag-model", settings, connectedProviderId: null);
+        var (providerId, _) = ProviderModelResolver.Resolve(providerFlag: null, modelFlag: null, settings, connectedProviderId: null);
+
+        Assert.Null(providerId); // only a flag or a connected credential selects a provider
+    }
+
+    [Fact]
+    public void Explicit_flags_win()
+    {
+        var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: "claude", modelFlag: "flag-model", CodaSettings.Empty, connectedProviderId: null);
 
         Assert.Equal(ClaudeAiProvider.Id, providerId);
         Assert.Equal("flag-model", model);
@@ -82,62 +73,54 @@ public sealed class ProviderModelResolverTests
     [Fact]
     public void Require_returns_the_pair_when_both_configured()
     {
-        var (providerId, model) = ProviderModelResolver.Require(GitHubCopilotProvider.Id, "claude-opus-4-8");
+        var (providerId, model) = ProviderModelResolver.Require(GitHubCopilotProvider.Id, "claude-opus-4.8");
 
         Assert.Equal(GitHubCopilotProvider.Id, providerId);
-        Assert.Equal("claude-opus-4-8", model);
+        Assert.Equal("claude-opus-4.8", model);
     }
 
+    // ── provider: flag → connected credential ──────────────────────────────────
+
     [Fact]
-    public void Resolve_NoFlag_UsesConnectedProvider_NotSettingsDefault()
+    public void No_flag_uses_connected_provider()
     {
-        var settings = CodaSettings.Empty with { DefaultProvider = "anthropic-api-key", DefaultModel = "m1" };
-        var (provider, model) = ProviderModelResolver.Resolve(
-            providerFlag: null, modelFlag: null, settings, connectedProviderId: "github-copilot");
-        Assert.Equal(ProviderAliases.Resolve("github-copilot"), provider);
-        Assert.Equal("m1", model);
+        var (provider, _) = ProviderModelResolver.Resolve(null, null, CodaSettings.Empty, connectedProviderId: GitHubCopilotProvider.Id);
+
+        Assert.Equal(GitHubCopilotProvider.Id, provider);
     }
 
     [Fact]
-    public void Resolve_Flag_OverridesConnected()
+    public void Flag_overrides_connected_provider()
     {
-        var settings = CodaSettings.Empty;
-        var (provider, _) = ProviderModelResolver.Resolve("claude", null, settings, connectedProviderId: "github-copilot");
-        Assert.Equal(ProviderAliases.Resolve("claude"), provider);
+        var (provider, _) = ProviderModelResolver.Resolve("claude", null, CodaSettings.Empty, connectedProviderId: GitHubCopilotProvider.Id);
+
+        Assert.Equal(ClaudeAiProvider.Id, provider);
     }
 
-    [Fact]
-    public void Resolve_NoFlagNoConnected_ProviderIsNull()
-    {
-        var (provider, _) = ProviderModelResolver.Resolve(null, null, CodaSettings.Empty, connectedProviderId: null);
-        Assert.Null(provider);
-    }
-
-    // ── the model belongs to the provider (defaultModelByProvider + built-in fallback) ──
+    // ── model belongs to the provider (modelByProvider + built-in; NO global default) ──
 
     [Fact]
-    public void PerProviderModel_WinsOverGlobalDefault()
+    public void ModelByProvider_used_for_the_resolved_provider()
     {
         var settings = CodaSettings.Empty with
         {
-            DefaultModel = "global-model",
-            DefaultModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "per-provider-model" },
+            ModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "configured-model" },
         };
 
         var (provider, model) = ProviderModelResolver.Resolve(null, null, settings, connectedProviderId: GitHubCopilotProvider.Id);
 
         Assert.Equal(GitHubCopilotProvider.Id, provider);
-        Assert.Equal("per-provider-model", model);
+        Assert.Equal("configured-model", model);
     }
 
     [Fact]
-    public void PerProviderModel_DoesNotLeakToAnotherProvider()
+    public void ModelByProvider_does_not_leak_to_another_provider()
     {
         // A model set for Copilot must NOT be used when the connected provider is Claude.ai —
         // it falls back to Claude's own built-in default instead.
         var settings = CodaSettings.Empty with
         {
-            DefaultModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "copilot-only-model" },
+            ModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "copilot-only-model" },
         };
 
         var (provider, model) = ProviderModelResolver.Resolve(null, null, settings, connectedProviderId: ClaudeAiProvider.Id);
@@ -148,7 +131,7 @@ public sealed class ProviderModelResolverTests
     }
 
     [Fact]
-    public void ResolvedProvider_NoModelConfigured_FallsBackToProviderBuiltInDefault()
+    public void ResolvedProvider_with_no_configured_model_falls_back_to_provider_built_in()
     {
         var (provider, model) = ProviderModelResolver.Resolve(null, null, CodaSettings.Empty, connectedProviderId: GitHubCopilotProvider.Id);
 
@@ -158,15 +141,31 @@ public sealed class ProviderModelResolverTests
     }
 
     [Fact]
-    public void Flag_WinsOverPerProviderModel()
+    public void Model_flag_wins_over_modelByProvider()
     {
         var settings = CodaSettings.Empty with
         {
-            DefaultModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "per-provider-model" },
+            ModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "configured-model" },
         };
 
         var (_, model) = ProviderModelResolver.Resolve(null, modelFlag: "flag-model", settings, connectedProviderId: GitHubCopilotProvider.Id);
 
         Assert.Equal("flag-model", model);
+    }
+
+    [Fact]
+    public void ModelByProvider_used_when_provider_comes_from_flag()
+    {
+        // Mirrors the interactive TUI startup call: Resolve(startupProvider.Id, CODA_MODEL, settings, connected).
+        var settings = CodaSettings.Empty with
+        {
+            ModelByProvider = new Dictionary<string, string> { [GitHubCopilotProvider.Id] = "configured-model" },
+        };
+
+        var (provider, model) = ProviderModelResolver.Resolve(
+            providerFlag: GitHubCopilotProvider.Id, modelFlag: null, settings, connectedProviderId: GitHubCopilotProvider.Id);
+
+        Assert.Equal(GitHubCopilotProvider.Id, provider);
+        Assert.Equal("configured-model", model);
     }
 }

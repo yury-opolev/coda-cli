@@ -29,14 +29,14 @@ public sealed class SettingsDefaultsTests : IDisposable
     }
 
     [Fact]
-    public void Load_reads_default_provider_and_model()
+    public void Load_reads_default_provider_and_model_by_provider()
     {
-        var home = WriteUserSettings("""{ "defaultProvider": "github-copilot", "defaultModel": "claude-sonnet-4" }""");
+        var home = WriteUserSettings("""{ "defaultProvider": "github-copilot", "modelByProvider": { "github-copilot": "claude-sonnet-4" } }""");
 
         var settings = SettingsLoader.Load(Path.Combine(this.root, "project"), home);
 
         Assert.Equal("github-copilot", settings.DefaultProvider);
-        Assert.Equal("claude-sonnet-4", settings.DefaultModel);
+        Assert.Equal("claude-sonnet-4", settings.ModelByProvider["github-copilot"]);
     }
 
     [Fact]
@@ -53,11 +53,11 @@ public sealed class SettingsDefaultsTests : IDisposable
     }
 
     [Fact]
-    public void Writer_sets_default_preserving_other_keys()
+    public void Writer_sets_default_provider_preserving_other_keys()
     {
         var home = WriteUserSettings("""{ "permissions": { "allow": ["read_file"] } }""");
 
-        SettingsWriter.SetUserDefaults(defaultProvider: "github-copilot", userSettingsDir: home);
+        SettingsWriter.SetUserDefaultProvider("github-copilot", home);
 
         var settings = SettingsLoader.Load(Path.Combine(this.root, "project"), home);
         Assert.Equal("github-copilot", settings.DefaultProvider);
@@ -65,24 +65,35 @@ public sealed class SettingsDefaultsTests : IDisposable
     }
 
     [Fact]
-    public void Writer_empty_value_clears_the_key()
+    public void Writer_empty_value_clears_the_provider_key()
     {
-        var home = WriteUserSettings("""{ "defaultModel": "claude-opus-4-8" }""");
+        var home = WriteUserSettings("""{ "defaultProvider": "github-copilot" }""");
 
-        SettingsWriter.SetUserDefaults(defaultModel: string.Empty, userSettingsDir: home);
+        SettingsWriter.SetUserDefaultProvider(string.Empty, home);
 
         var settings = SettingsLoader.Load(Path.Combine(this.root, "project"), home);
-        Assert.Null(settings.DefaultModel);
+        Assert.Null(settings.DefaultProvider);
     }
 
     [Fact]
     public void Writer_creates_file_when_missing()
     {
-        SettingsWriter.SetUserDefaults(defaultProvider: "anthropic-api-key", defaultModel: "claude-opus-4-8", userSettingsDir: this.root);
+        SettingsWriter.SetUserDefaultProvider("anthropic-api-key", this.root);
 
         var settings = SettingsLoader.Load(Path.Combine(this.root, "project"), this.root);
         Assert.Equal("anthropic-api-key", settings.DefaultProvider);
-        Assert.Equal("claude-opus-4-8", settings.DefaultModel);
+    }
+
+    [Fact]
+    public void Writer_sets_model_for_provider_preserving_other_providers()
+    {
+        var home = WriteUserSettings("""{ "modelByProvider": { "anthropic-api-key": "claude-opus-4-8" } }""");
+
+        SettingsWriter.SetUserModelForProvider("github-copilot", "claude-opus-4.8", home);
+
+        var settings = SettingsLoader.Load(Path.Combine(this.root, "project"), home);
+        Assert.Equal("claude-opus-4.8", settings.ModelByProvider["github-copilot"]);
+        Assert.Equal("claude-opus-4-8", settings.ModelByProvider["anthropic-api-key"]); // other provider preserved
     }
 
     [Fact]

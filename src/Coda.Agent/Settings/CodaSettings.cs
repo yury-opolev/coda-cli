@@ -22,16 +22,13 @@ public sealed record CodaSettings(
     /// <summary>Persisted default provider id used on startup (e.g. "github-copilot"); null = none configured.</summary>
     public string? DefaultProvider { get; init; }
 
-    /// <summary>Persisted default model id used on startup; null = use the provider's default.</summary>
-    public string? DefaultModel { get; init; }
-
     /// <summary>
-    /// Per-provider default model ids, keyed by provider id (e.g. <c>"github-copilot" -&gt;
-    /// "claude-opus-4.8"</c>). A model set here belongs to that provider and wins over the global
-    /// <see cref="DefaultModel"/>, so switching providers never reuses a model meant for another
-    /// (which would otherwise fail — e.g. an Anthropic model id against Copilot). Empty = none.
+    /// The model to use for each provider, keyed by provider id (e.g. <c>"github-copilot" -&gt;
+    /// "claude-opus-4.8"</c>). A model only ever makes sense in the context of a provider, so there
+    /// is intentionally NO provider-agnostic default model: when a provider has no entry here the
+    /// provider's own built-in default is used. Empty = none configured.
     /// </summary>
-    public IReadOnlyDictionary<string, string> DefaultModelByProvider { get; init; } =
+    public IReadOnlyDictionary<string, string> ModelByProvider { get; init; } =
         new Dictionary<string, string>(StringComparer.Ordinal);
 
     /// <summary>

@@ -17,7 +17,7 @@ public sealed class SettingsWriterTelemetryTests : IDisposable
     {
         var dir = Path.Combine(this.root, ".coda");
         Directory.CreateDirectory(dir);
-        File.WriteAllText(Path.Combine(dir, "settings.json"), """{ "defaultModel": "keepme", "permissions": { "allow": ["read_file"] } }""");
+        File.WriteAllText(Path.Combine(dir, "settings.json"), """{ "defaultProvider": "keepme", "permissions": { "allow": ["read_file"] } }""");
 
         SettingsWriter.SetTelemetry(enabled: true, level: LogLevel.Debug, stderr: false, userSettingsDir: this.root);
 
@@ -25,7 +25,7 @@ public sealed class SettingsWriterTelemetryTests : IDisposable
         Assert.NotNull(reloaded.Telemetry);
         Assert.True(reloaded.Telemetry!.Enabled);
         Assert.Equal(LogLevel.Debug, reloaded.Telemetry.MinLevel);
-        Assert.Equal("keepme", reloaded.DefaultModel);
+        Assert.Equal("keepme", reloaded.DefaultProvider);
         Assert.Contains("read_file", reloaded.Allow);
     }
 
