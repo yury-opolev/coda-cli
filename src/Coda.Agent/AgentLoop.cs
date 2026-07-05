@@ -1,5 +1,7 @@
+using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using Coda.Common;
 using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
@@ -43,6 +45,38 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly Func<List<ChatMessage>, CancellationToken, Task>? compactAsync;
     private readonly SteeringInbox? steering;
     private readonly ILogger logger;
+    private readonly TimeSpan toolProgressInterval;
+    private readonly TimeSpan toolMaxDuration;
+    private readonly Func<CancellationToken, Task>? persistTurn;
+
+    /// <summary>
+    /// How often <see cref="IAgentSink.OnToolProgress"/> pulses while a tool executes. Kept
+    /// well below any orchestrator idle watchdog (the Bridge's is 300s) so a legitimately
+    /// long tool never reads as hung, yet cheap enough to run for every tool call.
+    /// </summary>
+    internal static readonly TimeSpan DefaultToolProgressInterval = TimeSpan.FromSeconds(15);
+
+    /// <summary>
+    /// Last-resort wall-clock ceiling on a single tool call. Tools with their own timeout
+    /// (run_command, MCP) fire that first; this bounds any tool that would otherwise block
+    /// forever — the universal backstop the orchestrator watchdog can no longer provide now that
+    /// the tool-progress heartbeat keeps it alive during tool execution. Generous so it never
+    /// interferes with a legitimately long command; overridable via <see cref="ToolMaxSecondsEnv"/>.
+    /// </summary>
+    internal static readonly TimeSpan DefaultToolMaxDuration = TimeSpan.FromMinutes(30);
+
+    /// <summary>Environment variable overriding the per-tool wall-clock ceiling (whole seconds; &lt;= 0 disables).</summary>
+    internal const string ToolMaxSecondsEnv = "CODA_TOOL_MAX_SECONDS";
+
+    internal static TimeSpan ResolveToolMaxDuration(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw, out var seconds))
+        {
+            return DefaultToolMaxDuration;
+        }
+
+        return seconds <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(seconds);
+    }
 
     public GoalStatus? LastGoalStatus { get; private set; }
 
@@ -71,7 +105,10 @@ public sealed partial class AgentLoop : IAgentLoop
         GoalSupervisor? goal = null,
         Func<List<ChatMessage>, CancellationToken, Task>? compactAsync = null,
         SteeringInbox? steering = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        TimeSpan? toolProgressInterval = null,
+        Func<CancellationToken, Task>? persistTurnAsync = null,
+        TimeSpan? toolMaxDuration = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -93,6 +130,13 @@ public sealed partial class AgentLoop : IAgentLoop
         this.compactAsync = compactAsync;
         this.steering = steering;
         this.logger = logger ?? NullLogger.Instance;
+        this.toolProgressInterval = toolProgressInterval is { } interval && interval > TimeSpan.Zero
+            ? interval
+            : DefaultToolProgressInterval;
+        this.toolMaxDuration = toolMaxDuration is { } maxDuration && maxDuration > TimeSpan.Zero
+            ? maxDuration
+            : ResolveToolMaxDuration(Environment.GetEnvironmentVariable(ToolMaxSecondsEnv));
+        this.persistTurn = persistTurnAsync;
     }
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "turn start: iteration={iteration}, model={model}, historyMessages={messageCount}, tools={toolCount}")]
@@ -100,6 +144,18 @@ public sealed partial class AgentLoop : IAgentLoop
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "turn end: iteration={iteration}, stop={stopReason}, toolCalls={toolCount}, textChars={textLength}")]
     private partial void LogTurnEnd(int iteration, string stopReason, int toolCount, int textLength);
+
+    // Log the ACTUAL command each tool call carries (secrets redacted) at Information so the
+    // telemetry file shows what a session was doing — even one later killed mid-tool. Without
+    // this the log only records aggregate "toolCalls=N" and the command is unrecoverable.
+    [LoggerMessage(Level = LogLevel.Information, Message = "tool call: {toolName} {argsSummary}")]
+    private partial void LogToolCall(string toolName, string argsSummary);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "tool result: {toolName} isError={isError} chars={chars}")]
+    private partial void LogToolResult(string toolName, bool isError, int chars);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "incremental transcript persist failed (best-effort); continuing the turn")]
+    private partial void LogPersistTurnFailed(Exception ex);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "in-loop compaction failed (best-effort); continuing the run: iteration={iteration}")]
     private partial void LogCompactionFailed(int iteration, Exception ex);
@@ -337,6 +393,11 @@ public sealed partial class AgentLoop : IAgentLoop
                 assistantContent.AddRange(toolUses);
                 history.Add(new ChatMessage(ChatRole.Assistant, assistantContent));
 
+                // Record on the go: persist the transcript the moment the assistant turn (with
+                // its tool_use blocks — the requested commands) is committed to history, so a
+                // kill during the ensuing tool execution still leaves a record of what it asked.
+                await this.MaybePersistTurnAsync(cancellationToken).ConfigureAwait(false);
+
                 // Observe-bus: fire post-sampling hooks after each assistant turn
                 // (non-blocking; drained in the finally below).
                 if (this.hooks is not null)
@@ -449,6 +510,10 @@ public sealed partial class AgentLoop : IAgentLoop
                 stopHookActive = false;
                 var resultBlocks = await this.RunToolsAsync(toolUses, sink, cancellationToken).ConfigureAwait(false);
                 history.Add(new ChatMessage(ChatRole.User, resultBlocks));
+
+                // Persist again once tool results are in history, so a kill in the gap before
+                // the next sampling still captures the outputs, not just the requests.
+                await this.MaybePersistTurnAsync(cancellationToken).ConfigureAwait(false);
             }
 
             // Only the non-goal path breaks out of the loop via the MaxIterations bound.
@@ -512,6 +577,7 @@ public sealed partial class AgentLoop : IAgentLoop
         foreach (var toolUse in toolUses)
         {
             sink.OnToolCall(toolUse.Name, toolUse.InputJson);
+            this.LogToolCall(toolUse.Name, SummarizeToolInput(toolUse.InputJson));
 
             var tool = this.tools.Resolve(toolUse.Name);
             if (tool is null)
@@ -554,10 +620,36 @@ public sealed partial class AgentLoop : IAgentLoop
             }
 
             ToolResult result;
+            // Pulse a liveness heartbeat while the tool runs so the orchestrator's idle
+            // watchdog can tell "a long tool is working" from "the process is wedged". The
+            // pump is torn down in the finally — including on the OperationCanceledException
+            // rethrow path — so it can never outlive the tool call.
+            var toolStartedAt = Stopwatch.GetTimestamp();
+            using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            var heartbeat = PumpToolProgressAsync(sink, toolUse.Name, this.toolProgressInterval, toolStartedAt, heartbeatCts.Token);
+
+            // Last-resort wall-clock ceiling: the token handed to the tool is cancelled if it runs
+            // past toolMaxDuration, so no single tool can wedge the session forever (the backstop the
+            // watchdog no longer provides during tool execution). Tools with a shorter self-timeout
+            // fire that first; a caller/turn cancel is distinguished below and still unwinds the turn.
+            using var toolCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            if (this.toolMaxDuration != Timeout.InfiniteTimeSpan)
+            {
+                toolCts.CancelAfter(this.toolMaxDuration);
+            }
+
             try
             {
                 using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(toolUse.InputJson) ? "{}" : toolUse.InputJson);
-                result = await tool.ExecuteAsync(doc.RootElement, context, cancellationToken).ConfigureAwait(false);
+                result = await tool.ExecuteAsync(doc.RootElement, context, toolCts.Token).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException) when (toolCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+            {
+                // The ceiling fired (not a caller/turn cancel) — terminate just this tool and hand the
+                // model a clean error, so the session keeps running instead of wedging.
+                result = new ToolResult(
+                    $"Tool '{toolUse.Name}' exceeded the {this.toolMaxDuration.TotalSeconds:N0}s maximum run time and was terminated.",
+                    IsError: true);
             }
             catch (OperationCanceledException)
             {
@@ -566,6 +658,18 @@ public sealed partial class AgentLoop : IAgentLoop
             catch (Exception ex)
             {
                 result = new ToolResult($"Tool error: {ex.Message}", IsError: true);
+            }
+            finally
+            {
+                heartbeatCts.Cancel();
+                try
+                {
+                    await heartbeat.ConfigureAwait(false);
+                }
+                catch
+                {
+                    // Best-effort teardown; the pump swallows its own cancellation.
+                }
             }
 
             // Fire PostToolUse hooks (observation only — ignore exit code and errors).
@@ -585,6 +689,7 @@ public sealed partial class AgentLoop : IAgentLoop
             }
 
             sink.OnToolResult(toolUse.Name, result);
+            this.LogToolResult(toolUse.Name, result.IsError, result.Content.Length);
             results.Add(new ToolResultBlock(toolUse.Id, result.Content, result.IsError));
 
             // EDIT SEAM: when a mutating file tool succeeds, notify the LSP server
@@ -597,6 +702,68 @@ public sealed partial class AgentLoop : IAgentLoop
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Best-effort incremental transcript persist ("record on the go"). Invoked after each
+    /// assistant turn and tool cycle so a session killed mid-run still leaves a record of
+    /// everything up to the kill; a persistence failure must never break the turn.
+    /// </summary>
+    private async Task MaybePersistTurnAsync(CancellationToken cancellationToken)
+    {
+        if (this.persistTurn is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await this.persistTurn(cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            this.LogPersistTurnFailed(ex);
+        }
+    }
+
+    /// <summary>A redacted, length-bounded preview of a tool call's JSON arguments for telemetry.</summary>
+    internal static string SummarizeToolInput(string? inputJson)
+    {
+        if (string.IsNullOrWhiteSpace(inputJson))
+        {
+            return "{}";
+        }
+
+        var redacted = SecretRedactor.RedactJson(inputJson);
+        return redacted.Length > 500 ? redacted[..500] + "…" : redacted;
+    }
+
+    /// <summary>
+    /// Emits <see cref="IAgentSink.OnToolProgress"/> every <paramref name="interval"/> while a
+    /// tool runs, giving the orchestrator a liveness signal during the tool-execution phase
+    /// (the counterpart to the LLM stream-progress pulse). Returns when <paramref name="ct"/>
+    /// is cancelled — which the caller does the instant the tool completes.
+    /// </summary>
+    internal static async Task PumpToolProgressAsync(
+        IAgentSink sink,
+        string toolName,
+        TimeSpan interval,
+        long startTimestamp,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var timer = new PeriodicTimer(interval);
+            while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
+            {
+                var elapsedMs = (long)Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
+                sink.OnToolProgress(toolName, elapsedMs);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            // Expected: the tool finished and the heartbeat was cancelled.
+        }
     }
 
     // -----------------------------------------------------------------------

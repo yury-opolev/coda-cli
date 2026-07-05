@@ -43,6 +43,12 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventToolResult, node);
     }
 
+    public void OnToolProgress(string toolName, long elapsedMs)
+    {
+        var node = ServeJson.ToNode(new ToolProgressEvent(toolName, elapsedMs));
+        _ = this.SendAsync(ServeMethods.EventToolProgress, node);
+    }
+
     public void OnError(string message)
     {
         var node = ServeJson.ToNode(new ErrorEvent(message));

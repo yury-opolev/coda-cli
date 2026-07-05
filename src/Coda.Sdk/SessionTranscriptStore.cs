@@ -16,6 +16,12 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         WriteIndented = false,
     };
 
+    // Caches the resolved createdUtc per session so repeated "record on the go" saves don't
+    // re-read the whole file each time just to preserve it (the incremental persist runs
+    // multiple times per turn).
+    private readonly System.Collections.Concurrent.ConcurrentDictionary<string, DateTime> createdUtcBySession =
+        new(StringComparer.Ordinal);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "skipping corrupt session transcript (best-effort); it is omitted from the session list: file={file}")]
     private static partial void LogCorruptTranscriptSkipped(ILogger logger, string file, Exception ex);
 
@@ -50,25 +56,20 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
 
         Directory.CreateDirectory(this.SessionsDir);
 
-        // Preserve the original createdUtc if the file already exists; only
-        // use DateTime.UtcNow when creating the session for the first time.
         var filePath = this.FilePath(sessionId);
-        var createdUtc = DateTime.UtcNow;
-        if (File.Exists(filePath))
+
+        // Preserve the original createdUtc across incremental saves. Resolve it once (reading the
+        // existing file only if we have not seen this session yet), then cache it so repeated
+        // "record on the go" saves never re-read the file.
+        DateTime createdUtc;
+        if (this.createdUtcBySession.TryGetValue(sessionId, out var cached))
         {
-            try
-            {
-                var existing = JsonNode.Parse(await File.ReadAllTextAsync(filePath, ct).ConfigureAwait(false));
-                var raw = existing?["createdUtc"]?.GetValue<string>();
-                if (raw is not null)
-                {
-                    createdUtc = DateTime.Parse(raw, null, System.Globalization.DateTimeStyles.RoundtripKind);
-                }
-            }
-            catch
-            {
-                // Corrupt existing file — fall back to DateTime.UtcNow already set above.
-            }
+            createdUtc = cached;
+        }
+        else
+        {
+            createdUtc = await ResolveCreatedUtcAsync(filePath, ct).ConfigureAwait(false);
+            this.createdUtcBySession[sessionId] = createdUtc;
         }
 
         var root = new JsonObject
@@ -78,8 +79,38 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
             ["messages"] = SerializeMessages(messages),
         };
 
-        await File.WriteAllTextAsync(filePath, root.ToJsonString(JsonOptions), ct)
-            .ConfigureAwait(false);
+        // Atomic write: serialize to a temp file, then rename over the target. A hard kill mid-write
+        // (exactly what the Bridge watchdog does) then leaves the previous transcript intact instead
+        // of a truncated, unparseable file — the failure mode "record on the go" exists to avoid.
+        var tempPath = filePath + ".tmp";
+        await File.WriteAllTextAsync(tempPath, root.ToJsonString(JsonOptions), ct).ConfigureAwait(false);
+        File.Move(tempPath, filePath, overwrite: true);
+    }
+
+    /// <summary>
+    /// Resolve the session's createdUtc: the value already on disk (so it survives across saves)
+    /// or now for a brand-new session. Never throws — a corrupt existing file falls back to now.
+    /// </summary>
+    private static async Task<DateTime> ResolveCreatedUtcAsync(string filePath, CancellationToken ct)
+    {
+        if (File.Exists(filePath))
+        {
+            try
+            {
+                var existing = JsonNode.Parse(await File.ReadAllTextAsync(filePath, ct).ConfigureAwait(false));
+                var raw = existing?["createdUtc"]?.GetValue<string>();
+                if (raw is not null)
+                {
+                    return DateTime.Parse(raw, null, System.Globalization.DateTimeStyles.RoundtripKind);
+                }
+            }
+            catch
+            {
+                // Corrupt existing file — fall through to now.
+            }
+        }
+
+        return DateTime.UtcNow;
     }
 
     /// <summary>

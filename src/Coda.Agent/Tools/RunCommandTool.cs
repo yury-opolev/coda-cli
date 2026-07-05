@@ -22,7 +22,7 @@ public sealed class RunCommandTool : ITool
     public string Description => "Run a shell command (PowerShell) in the working directory and return combined stdout/stderr.";
 
     public string InputSchemaJson => """
-        {"type":"object","properties":{"command":{"type":"string","description":"The command line to run"}},"required":["command"]}
+        {"type":"object","properties":{"command":{"type":"string","description":"The command line to run"},"timeoutSeconds":{"type":"integer","description":"Optional maximum seconds to allow this command to run before it is terminated (default 600). Raise it for a known-long command (a build, a large test suite); only this command is terminated on timeout, the session keeps running."}},"required":["command"]}
         """;
 
     public bool IsReadOnly => false;
@@ -35,7 +35,7 @@ public sealed class RunCommandTool : ITool
             return new ToolResult("Missing required 'command'.", IsError: true);
         }
 
-        var timeout = ResolveTimeout(Environment.GetEnvironmentVariable(TimeoutEnv));
+        var timeout = ResolveTimeout(TryGetTimeoutSeconds(input), Environment.GetEnvironmentVariable(TimeoutEnv));
         var executor = new ProcessShellExecutor(context.Logger, this.Name);
         var shellResult = await executor.RunAsync(command, context.WorkingDirectory, timeout, cancellationToken).ConfigureAwait(false);
 
@@ -56,6 +56,21 @@ public sealed class RunCommandTool : ITool
     }
 
     /// <summary>
+    /// Resolve the effective timeout. A positive per-call value (the model's choice for this
+    /// specific command) wins; otherwise fall back to the <see cref="TimeoutEnv"/> override,
+    /// then <see cref="DefaultTimeout"/>.
+    /// </summary>
+    public static TimeSpan ResolveTimeout(int? perCallSeconds, string? rawEnv)
+    {
+        if (perCallSeconds is > 0)
+        {
+            return TimeSpan.FromSeconds(perCallSeconds.Value);
+        }
+
+        return ResolveTimeout(rawEnv);
+    }
+
+    /// <summary>
     /// Resolve the command timeout from the raw <see cref="TimeoutEnv"/> value: whole
     /// seconds when parseable, <see cref="DefaultTimeout"/> when unset/unparseable, and
     /// <see cref="Timeout.InfiniteTimeSpan"/> (no timeout) when &lt;= 0.
@@ -68,5 +83,19 @@ public sealed class RunCommandTool : ITool
         }
 
         return seconds <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(seconds);
+    }
+
+    /// <summary>Reads the optional per-call <c>timeoutSeconds</c> argument, if the model supplied one.</summary>
+    private static int? TryGetTimeoutSeconds(JsonElement input)
+    {
+        if (input.ValueKind == JsonValueKind.Object
+            && input.TryGetProperty("timeoutSeconds", out var value)
+            && value.ValueKind == JsonValueKind.Number
+            && value.TryGetInt32(out var seconds))
+        {
+            return seconds;
+        }
+
+        return null;
     }
 }
