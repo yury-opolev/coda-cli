@@ -82,4 +82,29 @@ public sealed class ProviderModelResolverTests
         Assert.Equal(GitHubCopilotProvider.Id, providerId);
         Assert.Equal("claude-opus-4-8", model);
     }
+
+    [Fact]
+    public void Resolve_NoFlag_UsesConnectedProvider_NotSettingsDefault()
+    {
+        var settings = CodaSettings.Empty with { DefaultProvider = "anthropic-api-key", DefaultModel = "m1" };
+        var (provider, model) = ProviderModelResolver.Resolve(
+            providerFlag: null, modelFlag: null, settings, connectedProviderId: "github-copilot");
+        Assert.Equal(ProviderAliases.Resolve("github-copilot"), provider);
+        Assert.Equal("m1", model);
+    }
+
+    [Fact]
+    public void Resolve_Flag_OverridesConnected()
+    {
+        var settings = CodaSettings.Empty;
+        var (provider, _) = ProviderModelResolver.Resolve("claude", null, settings, connectedProviderId: "github-copilot");
+        Assert.Equal(ProviderAliases.Resolve("claude"), provider);
+    }
+
+    [Fact]
+    public void Resolve_NoFlagNoConnected_ProviderIsNull()
+    {
+        var (provider, _) = ProviderModelResolver.Resolve(null, null, CodaSettings.Empty, connectedProviderId: null);
+        Assert.Null(provider);
+    }
 }

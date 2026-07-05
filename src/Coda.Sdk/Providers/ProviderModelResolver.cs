@@ -19,21 +19,35 @@ public static class ProviderModelResolver
 {
     /// <summary>
     /// Resolve the configured provider id and model, or <see langword="null"/> for
-    /// either when neither the flag nor the settings default supplies it. Applies
+    /// either when neither the flag nor the connected provider supplies it. Applies
     /// no built-in fallback.
+    /// </summary>
+    /// <param name="providerFlag">The explicit <c>--provider</c> token, or null when absent.</param>
+    /// <param name="modelFlag">The explicit <c>--model</c> token, or null when absent.</param>
+    /// <param name="settings">Merged settings supplying <c>DefaultModel</c>.</param>
+    /// <param name="connectedProviderId">The connected credential's provider id, or null when none is connected.</param>
+    public static (string? ProviderId, string? Model) Resolve(
+        string? providerFlag, string? modelFlag, CodaSettings settings, string? connectedProviderId)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+
+        var providerToken = Blank(providerFlag) ?? Blank(connectedProviderId);
+        var providerId = providerToken is null ? null : ProviderAliases.Resolve(providerToken);
+        var model = Blank(modelFlag) ?? Blank(settings.DefaultModel);
+        return (providerId, model);
+    }
+
+    /// <summary>
+    /// Resolve the configured provider id and model, or <see langword="null"/> for
+    /// either when neither the flag nor the settings default supplies it. Applies
+    /// no built-in fallback. Back-compat overload: delegates to the 4-arg version
+    /// with <c>settings.DefaultProvider</c> as the connected provider.
     /// </summary>
     /// <param name="providerFlag">The explicit <c>--provider</c> token, or null when absent.</param>
     /// <param name="modelFlag">The explicit <c>--model</c> token, or null when absent.</param>
     /// <param name="settings">Merged settings supplying <c>DefaultProvider</c>/<c>DefaultModel</c>.</param>
     public static (string? ProviderId, string? Model) Resolve(string? providerFlag, string? modelFlag, CodaSettings settings)
-    {
-        ArgumentNullException.ThrowIfNull(settings);
-
-        var providerToken = Blank(providerFlag) ?? Blank(settings.DefaultProvider);
-        var providerId = providerToken is null ? null : ProviderAliases.Resolve(providerToken);
-        var model = Blank(modelFlag) ?? Blank(settings.DefaultModel);
-        return (providerId, model);
-    }
+        => Resolve(providerFlag, modelFlag, settings, connectedProviderId: settings.DefaultProvider);
 
     /// <summary>
     /// Validate that both a provider and a model were configured, throwing
@@ -47,7 +61,7 @@ public static class ProviderModelResolver
         if (string.IsNullOrWhiteSpace(providerId))
         {
             throw new ProviderModelNotConfiguredException(
-                "No provider configured. Pass --provider <id>, or set \"defaultProvider\" in ~/.coda/settings.json.");
+                "Not signed in. Run \"coda auth login\" (or pass --provider <id>).");
         }
 
         if (string.IsNullOrWhiteSpace(model))
