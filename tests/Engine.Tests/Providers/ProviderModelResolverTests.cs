@@ -6,22 +6,26 @@ using LlmAuth.Providers.GitHubCopilot;
 namespace Engine.Tests.Providers;
 
 /// <summary>
-/// The single source of truth for resolving a runner's effective (provider, model)
-/// from an explicit flag then the persisted settings default — with NO built-in
-/// fallback. When neither configures a value it resolves to null and
-/// <see cref="ProviderModelResolver.Require"/> fails fast, instead of silently
-/// defaulting to the Anthropic/Claude.ai provider as the old code did.
+/// The single source of truth for resolving a runner's effective (provider, model).
+/// Provider resolves from an explicit flag → connected credential (the 3-arg
+/// overload is a transitional shim with no connected credential, so it resolves
+/// provider from the flag only). Model resolves from an explicit flag → the
+/// persisted settings default. There is NO built-in fallback: when neither
+/// configures a value it resolves to null and <see cref="ProviderModelResolver.Require"/>
+/// fails fast, instead of silently defaulting to the Anthropic/Claude.ai provider
+/// as the old code did. <c>settings.DefaultProvider</c> is no longer a provider
+/// selector.
 /// </summary>
 public sealed class ProviderModelResolverTests
 {
     [Fact]
-    public void Resolves_provider_and_model_from_settings_when_no_flags()
+    public void ThreeArg_overload_does_not_select_provider_from_settings_default()
     {
         var settings = CodaSettings.Empty with { DefaultProvider = "github-copilot", DefaultModel = "claude-opus-4-8" };
 
         var (providerId, model) = ProviderModelResolver.Resolve(providerFlag: null, modelFlag: null, settings);
 
-        Assert.Equal(GitHubCopilotProvider.Id, providerId);
+        Assert.Null(providerId);
         Assert.Equal("claude-opus-4-8", model);
     }
 
