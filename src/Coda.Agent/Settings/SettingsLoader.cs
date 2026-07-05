@@ -67,6 +67,7 @@ public static class SettingsLoader
         // Defaults: project overrides user when set.
         var defaultProvider = projectSettings.DefaultProvider ?? userSettings.DefaultProvider;
         var defaultModel = projectSettings.DefaultModel ?? userSettings.DefaultModel;
+        var defaultModelByProvider = MergeModelByProvider(userSettings.DefaultModelByProvider, projectSettings.DefaultModelByProvider);
         var githubEnterpriseDomain = projectSettings.GitHubEnterpriseDomain ?? userSettings.GitHubEnterpriseDomain;
 
         // Merge goal block per field: project overrides user, field by field.
@@ -82,6 +83,7 @@ public static class SettingsLoader
             && projectSettings.Hooks.Count == 0
             && projectSettings.LspServers.Count == 0
             && defaultProvider is null && defaultModel is null
+            && defaultModelByProvider.Count == 0
             && githubEnterpriseDomain is null
             && goalMerged is null
             && telemetry is null)
@@ -105,6 +107,7 @@ public static class SettingsLoader
             LspServers = mergedLsp,
             DefaultProvider = defaultProvider,
             DefaultModel = defaultModel,
+            DefaultModelByProvider = defaultModelByProvider,
             GitHubEnterpriseDomain = githubEnterpriseDomain,
             Goal = goalMerged,
             Telemetry = telemetry,
@@ -135,6 +138,7 @@ public static class SettingsLoader
                 LspServers = lspServers,
                 DefaultProvider = NullIfBlank(doc?.DefaultProvider),
                 DefaultModel = NullIfBlank(doc?.DefaultModel),
+                DefaultModelByProvider = ParseModelByProvider(doc?.DefaultModelByProvider),
                 GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
                 Telemetry = ParseTelemetry(doc?.Telemetry),
@@ -243,12 +247,56 @@ public static class SettingsLoader
     private static string? NullIfBlank(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
 
+    private static readonly IReadOnlyDictionary<string, string> emptyModelByProvider =
+        new Dictionary<string, string>(StringComparer.Ordinal);
+
+    /// <summary>Parse the <c>defaultModelByProvider</c> object, dropping blank keys/values.</summary>
+    private static IReadOnlyDictionary<string, string> ParseModelByProvider(Dictionary<string, string>? raw)
+    {
+        if (raw is not { Count: > 0 })
+        {
+            return emptyModelByProvider;
+        }
+
+        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var (provider, model) in raw)
+        {
+            var trimmedProvider = provider?.Trim();
+            var trimmedModel = model?.Trim();
+            if (!string.IsNullOrEmpty(trimmedProvider) && !string.IsNullOrEmpty(trimmedModel))
+            {
+                map[trimmedProvider] = trimmedModel;
+            }
+        }
+
+        return map;
+    }
+
+    /// <summary>Merge per-provider model defaults: project entries overlay user entries by provider id.</summary>
+    private static IReadOnlyDictionary<string, string> MergeModelByProvider(
+        IReadOnlyDictionary<string, string> user, IReadOnlyDictionary<string, string> project)
+    {
+        if (user.Count == 0 && project.Count == 0)
+        {
+            return emptyModelByProvider;
+        }
+
+        var merged = new Dictionary<string, string>(user, StringComparer.Ordinal);
+        foreach (var (provider, model) in project)
+        {
+            merged[provider] = model;
+        }
+
+        return merged;
+    }
+
     private sealed class SettingsDocument
     {
         public PermissionsSection? Permissions { get; set; }
         public HooksSection? Hooks { get; set; }
         public string? DefaultProvider { get; set; }
         public string? DefaultModel { get; set; }
+        public Dictionary<string, string>? DefaultModelByProvider { get; set; }
         public string? GithubEnterpriseDomain { get; set; }
         public GoalSection? Goal { get; set; }
         public TelemetrySection? Telemetry { get; set; }

@@ -35,9 +35,10 @@ public sealed class ModelCommand : ISlashCommand
     {
         if (args.Count > 0 && !string.Equals(args[0], "refresh", StringComparison.OrdinalIgnoreCase))
         {
-            // Choosing a model persists it as the startup default (last choice sticks).
+            // Choosing a model persists it as the default FOR THE ACTIVE PROVIDER (last choice sticks),
+            // so the model belongs to its provider and never leaks to another.
             context.Session.Model = args[0];
-            var note = TryPersistDefaults(defaultModel: args[0]);
+            var note = TryPersistModelForProvider(context.ActiveProvider.Id, args[0]);
             context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(args[0])} {Theme.DimMarkup(note)}");
             return CommandResult.Continue;
         }
@@ -118,6 +119,24 @@ public sealed class ModelCommand : ISlashCommand
         {
             SettingsWriter.SetUserDefaults(defaultProvider, defaultModel);
             return "— saved as the default.";
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            return $"(couldn't save default: {ex.Message})";
+        }
+    }
+
+    /// <summary>
+    /// Persist the chosen model as the default FOR THE ACTIVE PROVIDER (under
+    /// <c>defaultModelByProvider</c>), so it belongs to that provider rather than being a global
+    /// value that could mismatch a different provider later. Never throws.
+    /// </summary>
+    internal static string TryPersistModelForProvider(string providerId, string model)
+    {
+        try
+        {
+            SettingsWriter.SetUserDefaultModelForProvider(providerId, model);
+            return "— saved as this provider's default.";
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
