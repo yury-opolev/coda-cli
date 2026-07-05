@@ -25,13 +25,22 @@ public sealed class McpCommand : ISlashCommand
         [
             ("(no args) / list", "list configured servers (name, scope, transport, status)"),
             ("info <name>", "show a server's description, transport, status, and tools"),
-            ("add <name> [flags]", "add a server (wizard when no flags); e.g. --command npx --args \"-y pkg\" or --url https://…"),
+            ("add <name> [flags]", "add a server (wizard when no flags); see stdio/http flags below"),
             ("edit <name> [flags]", "change an existing server (wizard when no flags)"),
             ("remove <name>", "delete a server from its config file"),
             ("enable/disable <name>", "persistently enable/disable a server (survives restart)"),
+            ("stdio flags", "--command <exe>  --args \"a b c\"  --env KEY=VALUE (repeat for each var)"),
+            ("http flags", "--url <url>  --header NAME=VALUE (repeatable)  --auth none|bearer|oauth  --token <t>"),
             ("--user", "target the user file (~/.coda/.mcp.json) instead of the project file"),
         ],
-        Examples: ["/mcp", "/mcp info github", "/mcp add github --command npx --args \"-y @modelcontextprotocol/server-github\"", "/mcp disable github"]);
+        Examples:
+        [
+            "/mcp",
+            "/mcp info github",
+            "/mcp add github --command npx --args \"-y @modelcontextprotocol/server-github\"",
+            "/mcp add memory --command C:\\path\\to\\server.exe --env DATA_DIR=C:\\data",
+            "/mcp disable github",
+        ]);
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
@@ -216,7 +225,7 @@ public sealed class McpCommand : ISlashCommand
         var verb = isEdit ? "edit" : "add";
         if (tail.Count == 0)
         {
-            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {verb} <name> [--command <cmd> --args \"…\" | --url <url>] [--user]"));
+            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {verb} <name> [--command <cmd> --args \"…\" --env KEY=VALUE | --url <url> --header NAME=VALUE] [--user]"));
             return;
         }
 
@@ -257,7 +266,7 @@ public sealed class McpCommand : ISlashCommand
         }
         else
         {
-            context.Console.MarkupLine(Markup.Escape($"Provide flags (e.g. --command <cmd> or --url <url>), or run /mcp {verb} {name} interactively."));
+            context.Console.MarkupLine(Markup.Escape($"Provide flags (e.g. --command <cmd> [--env KEY=VALUE] or --url <url>), or run /mcp {verb} {name} interactively."));
             return;
         }
 
