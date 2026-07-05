@@ -62,11 +62,20 @@ var providers = new List<ProviderDescriptor>
     new(ApiKeyProvider.Id, "Anthropic API key", LoginKind.ApiKey, AnthropicModels.DefaultModel),
 };
 
-// Resolve the startup provider + model from (in precedence): env overrides →
-// persisted user/project defaults (~/.coda/settings.json) → Claude.ai / provider default.
-var startupProviderToken = Environment.GetEnvironmentVariable("CODA_PROVIDER") ?? startupSettings.DefaultProvider;
-var startupProviderId = Coda.Sdk.Providers.ProviderAliases.Resolve(startupProviderToken);
-var startupProvider = providers.FirstOrDefault(p => p.Id == startupProviderId) ?? providers[0];
+using var cts = new CancellationTokenSource();
+System.Console.CancelKeyPress += (_, e) =>
+{
+    e.Cancel = true;
+    cts.Cancel();
+};
+
+// Resolve the startup provider + model from (in precedence): CODA_PROVIDER env →
+// the connected credential's provider → the first provider descriptor. This mirrors
+// ServeRunner/HeadlessRunner/ModelsRunner: the session's active provider comes from
+// the connected credential, never from the retired settings.DefaultProvider.
+var connectedProviderId = await credentials.GetConnectedProviderIdAsync(cts.Token).ConfigureAwait(false);
+var startupProvider = StartupProviderResolver.Resolve(
+    Environment.GetEnvironmentVariable("CODA_PROVIDER"), connectedProviderId, providers);
 
 var session = new SessionState(startupProvider.Id);
 var startupModel = Environment.GetEnvironmentVariable("CODA_MODEL") ?? startupSettings.DefaultModel;
@@ -75,13 +84,6 @@ session.Model = string.IsNullOrWhiteSpace(startupModel) ? startupProvider.Defaul
 var registry = new SlashCommandRegistry(SlashCommandCatalog.CreateAll());
 
 var context = new CommandContext(console, credentials, session, providers, registry);
-
-using var cts = new CancellationTokenSource();
-System.Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    cts.Cancel();
-};
 
 // First run with no credentials → guide the user through connecting.
 if (await FirstRunDetector.IsFirstRunAsync(context, cts.Token))

@@ -225,8 +225,20 @@ public sealed class CredentialManager
             : throw new ProviderNotRegisteredException(providerId);
     }
 
+    /// <summary>
+    /// Delete every stored credential except <paramref name="keepProviderId"/> (pass
+    /// <see langword="null"/> to delete ALL stored credentials). Public entry point for
+    /// connect paths that don't go through <see cref="StoreAsync"/> or <see cref="LoginAsync"/>
+    /// — e.g. the API-key provider has no credential of its own to persist, but "connecting"
+    /// to it must still evict any other provider's stored credential to preserve the
+    /// single-credential invariant (<c>GetConnectedProviderIdAsync</c> must then return null,
+    /// not a stale prior connection).
+    /// </summary>
+    public Task RemoveAllStoredCredentialsExceptAsync(string? keepProviderId, CancellationToken cancellationToken = default) =>
+        this.RemoveOtherCredentialsAsync(keepProviderId, cancellationToken);
+
     /// <summary>Delete every stored credential except the given provider's (single-credential invariant).</summary>
-    private async Task RemoveOtherCredentialsAsync(string keepProviderId, CancellationToken cancellationToken)
+    private async Task RemoveOtherCredentialsAsync(string? keepProviderId, CancellationToken cancellationToken)
     {
         foreach (var id in this.providers.Keys)
         {

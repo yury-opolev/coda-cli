@@ -1,3 +1,4 @@
+using System.Security.AccessControl;
 using LlmAuth.Storage.Windows;
 
 namespace LlmAuth.Tests;
@@ -67,6 +68,61 @@ public class DpapiStoreTests
             await store.SetAsync("llmauth:claude-ai", "x", default);
             await store.DeleteAsync("llmauth:claude-ai", default);
             Assert.Null(await store.GetAsync("llmauth:claude-ai", default));
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) { Directory.Delete(dir, recursive: true); }
+        }
+    }
+
+    /// <summary>
+    /// The credentials directory (the store Windows actually uses, unlike
+    /// <see cref="FileTokenStore"/>) must be ACL-locked to the current user as soon as
+    /// it is created — not left with inherited/default permissions.
+    /// </summary>
+    [Fact]
+    public void Ctor_OnWindows_RestrictsDirectoryToCurrentUser()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var dir = NewTempDir();
+        try
+        {
+            _ = new DpapiTokenStore(dir);
+
+            var security = new DirectoryInfo(dir).GetAccessControl();
+            Assert.True(security.AreAccessRulesProtected);
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) { Directory.Delete(dir, recursive: true); }
+        }
+    }
+
+    /// <summary>
+    /// Each written <c>.cred</c> file must be ACL-locked to the current user right after
+    /// <see cref="DpapiTokenStore.SetAsync"/> writes it.
+    /// </summary>
+    [Fact]
+    public async Task SetAsync_OnWindows_RestrictsCredFileToCurrentUser()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var dir = NewTempDir();
+        try
+        {
+            var store = new DpapiTokenStore(dir);
+            await store.SetAsync("llmauth:claude-ai", "secret-value", default);
+
+            var credFile = Directory.GetFiles(dir, "*.cred").Single();
+            var security = new FileInfo(credFile).GetAccessControl();
+            Assert.True(security.AreAccessRulesProtected);
         }
         finally
         {

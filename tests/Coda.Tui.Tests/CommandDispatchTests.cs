@@ -137,4 +137,24 @@ public sealed class LoginCommandTests
         Assert.False(result.ShouldExit);
         Assert.Contains("Unknown provider", console.Output);
     }
+
+    /// <summary>
+    /// Connecting to the API-key provider stores no credential of its own — but it must
+    /// still enforce the single-credential invariant by purging any OTHER stored credential.
+    /// Otherwise a prior GitHub Copilot connection would leave its .cred behind and
+    /// GetConnectedProviderIdAsync would keep reporting copilot as connected.
+    /// </summary>
+    [Fact]
+    public async Task Login_with_api_key_provider_purges_other_stored_credentials()
+    {
+        var (app, context, _, credentials) = TestAppBuilder.BuildApp();
+        await credentials.StoreAsync("github-copilot", TestAppBuilder.OAuthCredential("github-copilot"), CancellationToken.None);
+        Assert.Equal("github-copilot", await credentials.GetConnectedProviderIdAsync(CancellationToken.None));
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("login", new[] { "api" }), CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Null(await credentials.GetConnectedProviderIdAsync(CancellationToken.None));
+        Assert.Equal("anthropic-api-key", context.Session.ActiveProviderId);
+    }
 }

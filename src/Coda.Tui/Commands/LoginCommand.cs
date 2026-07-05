@@ -54,10 +54,14 @@ public sealed class LoginCommand : ISlashCommand
     /// </summary>
     internal static async Task ConnectAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
     {
-        // API-key auth has no interactive step — handle it up front.
+        // API-key auth has no interactive step — handle it up front. It also stores no
+        // credential of its own, so connecting to it must still purge any OTHER provider's
+        // stored credential (single-credential invariant) — otherwise GetConnectedProviderIdAsync
+        // would keep reporting the previously-connected OAuth provider as active.
         if (provider.LoginKind == LoginKind.ApiKey)
         {
             context.Console.MarkupLine(Theme.DimMarkup($"{provider.DisplayName} uses {ApiKeyProvider.EnvVarName} — no interactive login needed."));
+            await context.Credentials.RemoveAllStoredCredentialsExceptAsync(keepProviderId: null, cancellationToken).ConfigureAwait(false);
             context.SetActiveProvider(provider);
             return;
         }
