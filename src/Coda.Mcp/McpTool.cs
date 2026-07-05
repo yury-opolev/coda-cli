@@ -11,6 +11,18 @@ namespace Coda.Mcp;
 /// </summary>
 public sealed class McpTool : ITool
 {
+    /// <summary>
+    /// Default MCP tool-call timeout: 10 minutes. An MCP call is otherwise unbounded (the
+    /// server could hang), so once the orchestrator stops killing coda during tool execution
+    /// (it now sees the tool-progress heartbeat) a hung call would hang the session forever.
+    /// This bounds it at the operation layer: only the call fails, the session keeps running.
+    /// Overridable via <see cref="TimeoutEnv"/>.
+    /// </summary>
+    public static readonly TimeSpan DefaultTimeout = TimeSpan.FromMinutes(10);
+
+    /// <summary>Environment variable overriding the MCP call timeout (whole seconds; &lt;= 0 disables).</summary>
+    public const string TimeoutEnv = "CODA_MCP_TOOL_TIMEOUT";
+
     private readonly IMcpClient client;
     private readonly McpToolInfo info;
 
@@ -37,15 +49,44 @@ public sealed class McpTool : ITool
 
     public async Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
     {
+        var timeout = ResolveTimeout(Environment.GetEnvironmentVariable(TimeoutEnv));
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (timeout != Timeout.InfiniteTimeSpan)
+        {
+            timeoutCts.CancelAfter(timeout);
+        }
+
         try
         {
-            var (text, isError) = await this.client.CallToolAsync(this.info.Name, input, cancellationToken).ConfigureAwait(false);
+            var (text, isError) = await this.client.CallToolAsync(this.info.Name, input, timeoutCts.Token).ConfigureAwait(false);
             return new ToolResult(text, isError);
         }
         catch (McpException ex)
         {
             return new ToolResult($"MCP tool error: {ex.Message}", IsError: true);
         }
+        catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            // The tool's own timeout fired (not a caller/turn cancel) — return a clean error to
+            // the model instead of aborting the whole turn. The caller-cancel path is left to
+            // propagate so an interrupt still unwinds the turn.
+            return new ToolResult($"MCP tool '{this.info.Name}' timed out after {timeout.TotalSeconds:N0}s.", IsError: true);
+        }
+    }
+
+    /// <summary>
+    /// Resolve the MCP call timeout from the raw <see cref="TimeoutEnv"/> value: whole seconds
+    /// when parseable, <see cref="DefaultTimeout"/> when unset/unparseable, and
+    /// <see cref="Timeout.InfiniteTimeSpan"/> (no timeout) when &lt;= 0.
+    /// </summary>
+    public static TimeSpan ResolveTimeout(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw, out var seconds))
+        {
+            return DefaultTimeout;
+        }
+
+        return seconds <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(seconds);
     }
 
     /// <summary>Tool names must match the model API charset (^[a-zA-Z0-9_-]+$).</summary>

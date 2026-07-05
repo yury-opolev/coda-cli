@@ -34,6 +34,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             goal: spec.Goal,
             compactAsync: spec.CompactAsync,
             steering: spec.Steering,
-            logger: spec.Logger);
+            logger: spec.Logger,
+            persistTurnAsync: spec.PersistTurnAsync);
     }
 }

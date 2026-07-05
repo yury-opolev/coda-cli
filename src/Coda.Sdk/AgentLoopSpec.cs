@@ -37,6 +37,10 @@ namespace Coda.Sdk;
 /// <param name="Goal">Optional goal supervisor governing long, goal-driven runs.</param>
 /// <param name="CompactAsync">Optional in-loop compaction callback for goal runs.</param>
 /// <param name="Logger">Logger for the loop's tool/turn diagnostics.</param>
+/// <param name="Steering">Optional steering inbox for mid-turn redirection.</param>
+/// <param name="PersistTurnAsync">Optional callback invoked after each assistant turn and
+/// tool cycle so the transcript is recorded incrementally ("on the go") — a session killed
+/// mid-run then still leaves a record of everything up to the kill.</param>
 public sealed record AgentLoopSpec(
     ILlmClient Client,
     ToolRegistry Tools,
@@ -57,4 +61,5 @@ public sealed record AgentLoopSpec(
     GoalSupervisor? Goal,
     Func<List<ChatMessage>, CancellationToken, Task>? CompactAsync,
     ILogger Logger,
-    SteeringInbox? Steering = null);
+    SteeringInbox? Steering = null,
+    Func<CancellationToken, Task>? PersistTurnAsync = null);

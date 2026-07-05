@@ -50,6 +50,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private bool lspInitialized;
     private TokenUsage sessionUsage = TokenUsage.Zero;
 
+    // Reused across the incremental "record on the go" saves so the store's createdUtc cache
+    // survives between turns (a fresh store per call would re-read the file every save).
+    private SessionTranscriptStore? transcriptStore;
+
     /// <summary>
     /// Optional stream-progress sink injected by the serve layer (the Bridge liveness
     /// pulse). Null in standalone/TUI runs — the client falls back to telemetry-log
@@ -327,7 +331,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // the per-turn assembly (agent options, permission stack, goal supervisor, tools, subagent
         // host, and the loop spec) to the pipeline builder.
         var settings = SettingsLoader.Load(options.WorkingDirectory);
-        var loopSpec = this.turnPipelineBuilder.BuildSpec(options, client, settings) with { Steering = this.steeringInbox };
+        var loopSpec = this.turnPipelineBuilder.BuildSpec(options, client, settings) with
+        {
+            Steering = this.steeringInbox,
+            // Record on the go: the loop persists the transcript after every turn/tool cycle, so a
+            // session killed mid-run still leaves a record (not just the once-at-the-end save below).
+            PersistTurnAsync = this.PersistTranscriptAsync,
+        };
         var loop = this.agentLoopFactory.Create(loopSpec);
 
         if (options.AutoCompactTokenThreshold > 0
@@ -627,10 +637,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     {
         try
         {
-            var transcriptStore = new SessionTranscriptStore(
+            this.transcriptStore ??= new SessionTranscriptStore(
                 this.Options.WorkingDirectory,
                 this.loggerFactory.CreateLogger<SessionTranscriptStore>());
-            await transcriptStore.SaveAsync(this.SessionId, this.history, cancellationToken).ConfigureAwait(false);
+            await this.transcriptStore.SaveAsync(this.SessionId, this.history, cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

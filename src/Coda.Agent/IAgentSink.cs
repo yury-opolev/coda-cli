@@ -17,6 +17,14 @@ public interface IAgentSink
     /// <summary>A tool finished.</summary>
     void OnToolResult(string toolName, ToolResult result);
 
+    /// <summary>
+    /// A liveness pulse emitted periodically while a tool is still executing, so an
+    /// orchestrator can tell "a long-running tool is working" from "the process is wedged"
+    /// (mirrors the LLM stream-progress pulse for the tool-execution phase). <paramref
+    /// name="elapsedMs"/> is how long the tool has been running so far. Optional.
+    /// </summary>
+    void OnToolProgress(string toolName, long elapsedMs) { }
+
     /// <summary>A non-fatal error occurred during the turn.</summary>
     void OnError(string message);
 

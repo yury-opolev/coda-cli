@@ -37,4 +37,32 @@ public sealed class RunCommandTimeoutTests
         Assert.Equal(Timeout.InfiniteTimeSpan, RunCommandTool.ResolveTimeout("0"));
         Assert.Equal(Timeout.InfiniteTimeSpan, RunCommandTool.ResolveTimeout("-5"));
     }
+
+    [Fact]
+    public void Resolve_per_call_value_wins_over_env_and_default()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(120), RunCommandTool.ResolveTimeout(120, null));
+        Assert.Equal(TimeSpan.FromSeconds(120), RunCommandTool.ResolveTimeout(120, "300")); // per-call beats env
+    }
+
+    [Fact]
+    public void Resolve_falls_back_to_env_then_default_when_no_per_call()
+    {
+        Assert.Equal(TimeSpan.FromSeconds(300), RunCommandTool.ResolveTimeout(null, "300"));
+        Assert.Equal(RunCommandTool.DefaultTimeout, RunCommandTool.ResolveTimeout(null, null));
+    }
+
+    [Fact]
+    public void Resolve_ignores_non_positive_per_call_and_uses_env_or_default()
+    {
+        // A model passing 0/negative does NOT disable the timeout — it falls through to env/default.
+        Assert.Equal(TimeSpan.FromSeconds(300), RunCommandTool.ResolveTimeout(0, "300"));
+        Assert.Equal(RunCommandTool.DefaultTimeout, RunCommandTool.ResolveTimeout(-1, null));
+    }
+
+    [Fact]
+    public void Schema_advertises_the_optional_per_call_timeout()
+    {
+        Assert.Contains("timeoutSeconds", new RunCommandTool().InputSchemaJson);
+    }
 }

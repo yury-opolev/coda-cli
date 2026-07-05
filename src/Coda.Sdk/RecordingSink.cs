@@ -66,6 +66,11 @@ internal sealed class RecordingSink : IAgentSink
         this.inner?.OnToolResult(toolName, result);
     }
 
+    // Must forward — this is the production decorator wrapping the serve WireAgentSink. If the
+    // tool-execution heartbeat is not forwarded here it never reaches the wire and the Bridge
+    // watchdog stays blind during tool execution (the whole bug this pulse exists to fix).
+    public void OnToolProgress(string toolName, long elapsedMs) => this.inner?.OnToolProgress(toolName, elapsedMs);
+
     public void OnError(string message) => this.inner?.OnError(message);
 
     public void OnLimitReached(string kind, string message) => this.inner?.OnLimitReached(kind, message);
