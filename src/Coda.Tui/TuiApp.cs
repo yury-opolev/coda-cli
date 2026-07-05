@@ -23,7 +23,8 @@ public sealed class TuiApp : IDisposable
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
-        Banner.Render(this.context.Console, this.context.Session);
+        var connectedProvider = await this.context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
+        Banner.Render(this.context.Console, this.context.Session, connectedProvider, this.context.Session.Model);
 
         var interactive = this.context.Console.Profile.Capabilities.Interactive;
 

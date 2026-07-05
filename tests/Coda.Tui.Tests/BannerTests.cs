@@ -36,4 +36,27 @@ public sealed class BannerTests
 
         Assert.DoesNotContain("Claude Code", console.Output, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void Render_SignedIn_ShowsProviderAndModel()
+    {
+        var console = NewConsole();
+        var session = new SessionState("claude-ai", "/tmp") { Model = "claude-opus-4.8" };
+
+        Banner.Render(console, session, connectedProvider: "github-copilot", model: "claude-opus-4.8");
+
+        Assert.Contains("github-copilot", console.Output, StringComparison.Ordinal);
+        Assert.Contains("claude-opus-4.8", console.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Render_NotSignedIn_ShowsLoginHint()
+    {
+        var console = NewConsole();
+        var session = new SessionState("claude-ai", "/tmp");
+
+        Banner.Render(console, session, connectedProvider: null, model: null);
+
+        Assert.Contains("not signed in", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
 }

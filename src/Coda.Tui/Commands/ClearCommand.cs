@@ -18,12 +18,13 @@ public sealed class ClearCommand : ISlashCommand
         "/clear",
         Description: "Reset the conversation history and token usage, then redraw the banner.");
 
-    public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
+    public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
         context.Session.History.Clear();
         context.Session.SessionUsage = TokenUsage.Zero;
         context.Console.Clear();
-        Banner.Render(context.Console, context.Session);
-        return Task.FromResult(CommandResult.Continue);
+        var connectedProvider = await context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
+        Banner.Render(context.Console, context.Session, connectedProvider, context.Session.Model);
+        return CommandResult.Continue;
     }
 }

@@ -6,7 +6,7 @@ namespace Coda.Tui.Rendering;
 /// <summary>Renders the rebranded welcome banner (wordmark + version + cwd + hints).</summary>
 public static class Banner
 {
-    public static void Render(IAnsiConsole console, SessionState session)
+    public static void Render(IAnsiConsole console, SessionState session, string? connectedProvider = null, string? model = null)
     {
         ArgumentNullException.ThrowIfNull(console);
 
@@ -14,8 +14,13 @@ public static class Banner
             $"{Theme.AccentMarkup($"Welcome to {Branding.ProductName}")} {Theme.DimMarkup($"v{Branding.Version}")}\n" +
             $"{Theme.DimMarkup(Branding.Tagline)}");
 
+        var providerLine = connectedProvider is null
+            ? Theme.DimMarkup("not signed in — run ") + Theme.AccentMarkup("/login")
+            : $"{Theme.DimMarkup("provider:")} {Markup.Escape(connectedProvider)}   {Theme.DimMarkup("model:")} {Markup.Escape(model ?? "—")}";
+
         var body = new Markup(
             $"{Theme.DimMarkup("cwd:")} {Markup.Escape(session.WorkingDirectory)}\n" +
+            $"{providerLine}\n" +
             $"{Theme.DimMarkup("Type")} {Theme.AccentMarkup("/help")} {Theme.DimMarkup("for commands, or")} " +
             $"{Theme.AccentMarkup("/login")} {Theme.DimMarkup("to sign in.")} {Theme.DimMarkup("/exit to quit.")}");
 
