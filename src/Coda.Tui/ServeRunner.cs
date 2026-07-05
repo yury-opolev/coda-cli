@@ -50,10 +50,14 @@ public static class ServeRunner
     /// Applies the merged-settings provider/model defaults to already-parsed options.
     /// Split out so <see cref="RunAsync"/> can load <see cref="CodaSettings"/> ONCE and reuse it
     /// for both the defaults here and the telemetry block, instead of loading the files twice.
+    /// Deliberately pure (settings only, no credential I/O) so its existing unit tests stay
+    /// hermetic — the connected-credential-aware fallback is applied separately in
+    /// <see cref="RunAsync"/> via <see cref="ResolveServeProvider"/>, AFTER this returns.
     /// </summary>
     internal static ServeOptions ApplyDefaults(ServeOptions raw, string workingDirectory, CodaSettings settings)
     {
-        var (providerId, model) = Coda.Sdk.Providers.ProviderModelResolver.Resolve(raw.ProviderId, raw.Model, settings);
+        var (providerId, model) = Coda.Sdk.Providers.ProviderModelResolver.Resolve(
+            raw.ProviderId, raw.Model, settings, connectedProviderId: null);
 
         return raw with
         {
@@ -61,6 +65,21 @@ public static class ServeRunner
             WorkingDirectory = workingDirectory,
             Model = model,
         };
+    }
+
+    /// <summary>
+    /// Serve provider resolution with credential-aware fallback: use the requested provider when
+    /// it is authenticated; otherwise fall back to the single connected provider; otherwise keep
+    /// the requested one so Require throws the clean not-signed-in error.
+    /// </summary>
+    internal static string? ResolveServeProvider(string? flagProvider, bool flagHasCredential, string? connectedProviderId)
+    {
+        if (!string.IsNullOrWhiteSpace(flagProvider) && flagHasCredential)
+        {
+            return flagProvider;
+        }
+
+        return connectedProviderId ?? flagProvider;
     }
 
     /// <summary>
@@ -215,8 +234,33 @@ public static class ServeRunner
             var settings = SettingsLoader.Load(workingDirectory);
             var options = ApplyDefaults(raw, workingDirectory, settings);
 
-            // Fail fast (do NOT spawn) when neither a flag nor settings configured the
-            // provider/model — there is no built-in default to silently fall back to.
+            using var claude = new ClaudeAiProvider();
+            CopilotEnvironment.ApplyEnterpriseDomain(settings.GitHubEnterpriseDomain);
+            var copilotConfig = GitHubCopilotConfig.FromEnvironment();
+            using var copilot = new GitHubCopilotProvider(copilotConfig);
+            var apiKey = new ApiKeyProvider();
+            var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
+
+            // Credential-aware fallback: the requested provider (flag or settings default) may
+            // have no stored credential while a different provider is connected (e.g. after
+            // switching machines/providers but before updating settings). Rather than failing
+            // fast on a provider that merely lacks a credential, substitute the connected one and
+            // say so loudly — silent substitution would be surprising.
+            var connectedProviderId = await credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
+            var flagHasCredential = options.ProviderId is not null
+                && string.Equals(options.ProviderId, connectedProviderId, StringComparison.Ordinal);
+            var resolvedProviderId = ResolveServeProvider(options.ProviderId, flagHasCredential, connectedProviderId);
+            if (!string.IsNullOrWhiteSpace(options.ProviderId)
+                && !string.Equals(resolvedProviderId, options.ProviderId, StringComparison.Ordinal))
+            {
+                Console.Error.WriteLine(
+                    $"coda serve: warning: requested provider '{options.ProviderId}' has no credential; using connected provider '{resolvedProviderId}'.");
+            }
+
+            options = options with { ProviderId = resolvedProviderId };
+
+            // Fail fast (do NOT spawn) when neither a flag/settings nor a connected credential
+            // configured the provider/model — there is no built-in default to silently fall back to.
             try
             {
                 Coda.Sdk.Providers.ProviderModelResolver.Require(options.ProviderId, options.Model);
@@ -226,13 +270,6 @@ public static class ServeRunner
                 Console.Error.WriteLine($"coda serve: {ex.Message}");
                 return 1;
             }
-
-            using var claude = new ClaudeAiProvider();
-            CopilotEnvironment.ApplyEnterpriseDomain(settings.GitHubEnterpriseDomain);
-            var copilotConfig = GitHubCopilotConfig.FromEnvironment();
-            using var copilot = new GitHubCopilotProvider(copilotConfig);
-            var apiKey = new ApiKeyProvider();
-            var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
 
             // Resolve API key: flag wins, else env var. Its presence selects the socket transport.
             var resolvedKey = options.ApiKey ?? Environment.GetEnvironmentVariable("CODA_SERVE_API_KEY");

@@ -18,19 +18,21 @@ public static class HeadlessRunner
 {
     /// <summary>
     /// Resolve the configured (provider, model) from the precedence chain
-    /// explicit flag → persisted settings default — the SAME resolution
-    /// <c>coda serve</c> and <c>coda models</c> apply. Returns <see langword="null"/>
-    /// for either when neither the flag nor settings supplies it (no built-in
-    /// fallback); <see cref="RunAsync"/> then fails fast. Exposed for parity testing.
+    /// explicit flag → connected credential's provider — the SAME resolution
+    /// <c>coda serve</c> and <c>coda models</c> apply. Model resolves from an
+    /// explicit flag → persisted settings default. Returns <see langword="null"/>
+    /// for either when nothing supplies it (no built-in fallback); <see cref="RunAsync"/>
+    /// then fails fast. Exposed for parity testing.
     /// </summary>
     public static (string? ProviderId, string? Model) ResolveDefaults(
         string? providerFlag,
         string? modelFlag,
         string workingDirectory,
-        string? userSettingsDir = null)
+        string? userSettingsDir = null,
+        string? connectedProviderId = null)
     {
         var settings = Coda.Agent.Settings.SettingsLoader.Load(workingDirectory, userSettingsDir);
-        return Coda.Sdk.Providers.ProviderModelResolver.Resolve(providerFlag, modelFlag, settings);
+        return Coda.Sdk.Providers.ProviderModelResolver.Resolve(providerFlag, modelFlag, settings, connectedProviderId);
     }
 
     public static async Task<int> RunAsync(string[] runArgs, CancellationToken cancellationToken = default)
@@ -57,18 +59,6 @@ public static class HeadlessRunner
         }
 
         var workingDirectory = options.WorkingDirectory ?? Directory.GetCurrentDirectory();
-        string providerId;
-        string model;
-        try
-        {
-            var (resolvedProvider, resolvedModel) = ResolveDefaults(options.ProviderId, options.Model, workingDirectory);
-            (providerId, model) = Coda.Sdk.Providers.ProviderModelResolver.Require(resolvedProvider, resolvedModel);
-        }
-        catch (Coda.Sdk.Providers.ProviderModelNotConfiguredException ex)
-        {
-            Console.Error.WriteLine(ex.Message);
-            return 1;
-        }
 
         using var claude = new ClaudeAiProvider();
         CopilotEnvironment.ApplyEnterpriseDomain(
@@ -77,6 +67,21 @@ public static class HeadlessRunner
         using var copilot = new GitHubCopilotProvider(copilotConfig);
         var apiKey = new ApiKeyProvider();
         var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
+
+        string providerId;
+        string model;
+        try
+        {
+            var connectedProviderId = await credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
+            var (resolvedProvider, resolvedModel) = ResolveDefaults(
+                options.ProviderId, options.Model, workingDirectory, connectedProviderId: connectedProviderId);
+            (providerId, model) = Coda.Sdk.Providers.ProviderModelResolver.Require(resolvedProvider, resolvedModel);
+        }
+        catch (Coda.Sdk.Providers.ProviderModelNotConfiguredException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
 
         // HTTP MCP servers run non-interactively here: stored tokens still work, but a
         // server that needs a fresh browser sign-in is skipped (logged), never blocking.

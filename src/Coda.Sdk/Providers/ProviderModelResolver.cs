@@ -41,20 +41,6 @@ public static class ProviderModelResolver
     }
 
     /// <summary>
-    /// Resolve the configured provider id and model, or <see langword="null"/> for
-    /// either when neither the flag nor the settings default supplies it. Applies
-    /// no built-in fallback. Transitional shim: delegates to the 4-arg version with
-    /// no connected provider, so the provider resolves from <paramref name="providerFlag"/>
-    /// alone (<c>settings.DefaultProvider</c> no longer selects a provider). Callers
-    /// that have a connected credential should call the 4-arg overload directly.
-    /// </summary>
-    /// <param name="providerFlag">The explicit <c>--provider</c> token, or null when absent.</param>
-    /// <param name="modelFlag">The explicit <c>--model</c> token, or null when absent.</param>
-    /// <param name="settings">Merged settings supplying <c>DefaultModel</c>.</param>
-    public static (string? ProviderId, string? Model) Resolve(string? providerFlag, string? modelFlag, CodaSettings settings)
-        => Resolve(providerFlag, modelFlag, settings, connectedProviderId: null);
-
-    /// <summary>
     /// Validate that both a provider and a model were configured, throwing
     /// <see cref="ProviderModelNotConfiguredException"/> with an actionable message
     /// otherwise. Returns the non-null pair on success. Call this at the point a

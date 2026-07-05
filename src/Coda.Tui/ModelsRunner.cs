@@ -17,18 +17,20 @@ public static class ModelsRunner
 {
     /// <summary>
     /// Resolve the configured (provider, model) from the precedence chain
-    /// explicit flag → persisted settings default — the SAME resolution
-    /// <c>coda serve</c> and <c>coda run</c> apply. Returns <see langword="null"/>
-    /// for either when neither the flag nor settings supplies it (no built-in
-    /// fallback); <see cref="RunAsync"/> then fails fast. Exposed for parity testing.
+    /// explicit flag → connected credential's provider — the SAME resolution
+    /// <c>coda serve</c> and <c>coda run</c> apply. Model resolves from an
+    /// explicit flag → persisted settings default. Returns <see langword="null"/>
+    /// for either when nothing supplies it (no built-in fallback); <see cref="RunAsync"/>
+    /// then fails fast. Exposed for parity testing.
     /// </summary>
     public static (string? ProviderId, string? Model) ResolveDefaults(
         string? providerFlag,
         string workingDirectory,
-        string? userSettingsDir = null)
+        string? userSettingsDir = null,
+        string? connectedProviderId = null)
     {
         var settings = Coda.Agent.Settings.SettingsLoader.Load(workingDirectory, userSettingsDir);
-        return Coda.Sdk.Providers.ProviderModelResolver.Resolve(providerFlag, modelFlag: null, settings);
+        return Coda.Sdk.Providers.ProviderModelResolver.Resolve(providerFlag, modelFlag: null, settings, connectedProviderId);
     }
 
     public static async Task<int> RunAsync(string[] args, CancellationToken cancellationToken = default)
@@ -47,18 +49,6 @@ public static class ModelsRunner
         }
 
         var workingDirectory = cwd ?? Directory.GetCurrentDirectory();
-        string providerId;
-        string model;
-        try
-        {
-            var (resolvedProvider, resolvedModel) = ResolveDefaults(providerToken, workingDirectory);
-            (providerId, model) = Coda.Sdk.Providers.ProviderModelResolver.Require(resolvedProvider, resolvedModel);
-        }
-        catch (Coda.Sdk.Providers.ProviderModelNotConfiguredException ex)
-        {
-            Console.Error.WriteLine(ex.Message);
-            return 1;
-        }
 
         using var claude = new ClaudeAiProvider();
         CopilotEnvironment.ApplyEnterpriseDomain(
@@ -67,6 +57,21 @@ public static class ModelsRunner
         using var copilot = new GitHubCopilotProvider(copilotConfig);
         var apiKey = new ApiKeyProvider();
         var credentials = new CredentialManager(new DpapiTokenStore(), [claude, copilot, apiKey]);
+
+        string providerId;
+        string model;
+        try
+        {
+            var connectedProviderId = await credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
+            var (resolvedProvider, resolvedModel) = ResolveDefaults(
+                providerToken, workingDirectory, connectedProviderId: connectedProviderId);
+            (providerId, model) = Coda.Sdk.Providers.ProviderModelResolver.Require(resolvedProvider, resolvedModel);
+        }
+        catch (Coda.Sdk.Providers.ProviderModelNotConfiguredException ex)
+        {
+            Console.Error.WriteLine(ex.Message);
+            return 1;
+        }
 
         var options = new SessionOptions
         {
