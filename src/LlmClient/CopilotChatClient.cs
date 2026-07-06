@@ -108,9 +108,13 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
         // Retry the headers phase only (send + status check) so a transient 5xx self-heals
         // without ever re-emitting a partial stream. A fresh request is built per attempt
         // (an HttpRequestMessage cannot be sent twice). A permanent 4xx fails fast.
+        var headersStopwatch = System.Diagnostics.Stopwatch.StartNew();
         using var response = await this.retryPolicy.ExecuteAsync(
             async (attempt, ct) =>
             {
+                // Restart per attempt so the logged latency reflects only the final (successful)
+                // round-trip, not the failed attempts and their retry backoff.
+                headersStopwatch.Restart();
                 var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{this.baseUrl}/chat/completions");
                 foreach (var (name, value) in auth.Headers)
                 {
@@ -134,6 +138,11 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
                 return resp;
             },
             callToken).ConfigureAwait(false);
+
+        // Split the two latency phases so a "slow call" can be attributed: the HTTP round-trip to
+        // response headers (network + provider accept) is logged here; the wait from headers to the
+        // first token (model-generation latency) is the "first token after Nms" line below.
+        this.LogHeadersReceived(request.Model, headersStopwatch.ElapsedMilliseconds);
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var accumulator = new LlmResponseAccumulator();
@@ -307,6 +316,9 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Copilot request: model {model}")]
     private partial void LogRequestStart(string model);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "Copilot response headers after {latencyMs}ms for model {model} (HTTP round-trip; model-generation latency is the next 'first token after' line)")]
+    private partial void LogHeadersReceived(string model, long latencyMs);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "Normalized Copilot model id '{original}' -> '{normalized}'")]
     private partial void LogModelNormalized(string original, string normalized);

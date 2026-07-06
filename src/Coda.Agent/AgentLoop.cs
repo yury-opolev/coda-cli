@@ -47,6 +47,7 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly ILogger logger;
     private readonly TimeSpan toolProgressInterval;
     private readonly TimeSpan toolMaxDuration;
+    private readonly TimeSpan? transportRetryDelay;
     private readonly Func<CancellationToken, Task>? persistTurn;
 
     /// <summary>
@@ -108,7 +109,8 @@ public sealed partial class AgentLoop : IAgentLoop
         ILogger? logger = null,
         TimeSpan? toolProgressInterval = null,
         Func<CancellationToken, Task>? persistTurnAsync = null,
-        TimeSpan? toolMaxDuration = null)
+        TimeSpan? toolMaxDuration = null,
+        TimeSpan? transportRetryDelay = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -136,6 +138,9 @@ public sealed partial class AgentLoop : IAgentLoop
         this.toolMaxDuration = toolMaxDuration is { } maxDuration && maxDuration > TimeSpan.Zero
             ? maxDuration
             : ResolveToolMaxDuration(Environment.GetEnvironmentVariable(ToolMaxSecondsEnv));
+        // A test seam only: when set (incl. Zero), overrides the transport-retry backoff so tests
+        // don't sleep the real 0.5s/2s ladder. Production leaves it null → the real backoff.
+        this.transportRetryDelay = transportRetryDelay;
         this.persistTurn = persistTurnAsync;
     }
 
@@ -163,6 +168,9 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Information, Message = "context overflow on iteration={iteration}; compacting history and retrying the turn")]
     private partial void LogContextOverflowCompaction(int iteration, Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "transient transport error before first content (iteration={iteration}); retrying turn (attempt {attempt})")]
+    private partial void LogTransportRetry(int iteration, int attempt, Exception ex);
+
     /// <summary>
     /// Whether an exception from the LLM call signals the request was too long for the model's
     /// context window — the request fails identically on retry unless the history is shrunk.
@@ -177,6 +185,33 @@ public sealed partial class AgentLoop : IAgentLoop
             || message.Contains("too many tokens", StringComparison.OrdinalIgnoreCase)
             || message.Contains("input length and `max_tokens` exceed", StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Whether an exception is a transient transport-layer failure (a dropped/reset stream),
+    /// safe to retry ONLY when no content has been emitted yet (checked at the call site).
+    /// <para>
+    /// <see cref="System.Net.Http.HttpRequestException"/> is intentionally NOT matched at the top
+    /// level: a send-phase HttpRequestException is already retried by the headers-phase policy
+    /// (see <c>LlmErrorClassifier</c>), so matching it here would re-retry permanent failures
+    /// (connection refused / DNS / auth-token refresh) the policy already owns. The one-level
+    /// InnerException unwrap still catches a mid-stream reset wrapped in an HttpRequestException.
+    /// </para>
+    /// Excludes provider status errors (LlmClientException) and timeouts (LlmHttpTimeoutException —
+    /// already clean, resumable failures), and context overflow (handled separately).
+    /// </summary>
+    private static bool IsTransientTransportError(Exception ex)
+    {
+        return ex is System.IO.IOException
+            or System.Net.Sockets.SocketException
+            || ex.InnerException is System.IO.IOException or System.Net.Sockets.SocketException;
+    }
+
+    // Bounded pre-content retry of a turn on a transient transport failure (e.g. the provider
+    // forcibly closed the connection before the first token): 2 retries, 0.5s then 2s backoff.
+    private const int MaxTransportRetries = 2;
+
+    private TimeSpan TransportRetryBackoff(int attempt) =>
+        this.transportRetryDelay ?? TimeSpan.FromMilliseconds(attempt <= 1 ? 500 : 2000);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "Stop user hooks failed (best-effort); completing the turn")]
     private partial void LogStopHooksFailed(Exception ex);
@@ -333,6 +368,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 // failing the run. (Proactive window-relative compaction usually prevents this; this
                 // is the safety net for a single oversized turn.)
                 var overflowRetried = false;
+                var transportRetries = 0;
                 while (true)
                 {
                     try
@@ -377,6 +413,23 @@ public sealed partial class AgentLoop : IAgentLoop
                         stopReason = null;
                         await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
                         request = request with { Messages = history };
+                    }
+                    catch (Exception ex) when (transportRetries < MaxTransportRetries
+                        && !cancellationToken.IsCancellationRequested
+                        && ex is not OperationCanceledException
+                        && text.Length == 0 && toolUses.Count == 0 && stopReason is null
+                        && IsTransientTransportError(ex))
+                    {
+                        // A transport-level failure (e.g. the provider forcibly closed the connection)
+                        // BEFORE anything reached the sink. The guard is airtight: no text/tool-use was
+                        // yielded, and stopReason is null so no terminal Done event fired (which would
+                        // have emitted usage) — so re-running the turn is clean: no duplicate output, no
+                        // double tool execution, no double-counted usage. Once any of those is set, a
+                        // mid-stream failure surfaces rather than replaying. A caller cancel is excluded
+                        // too, so a cancellation that surfaces as IOException isn't spuriously retried.
+                        transportRetries++;
+                        this.LogTransportRetry(iteration, transportRetries, ex);
+                        await Task.Delay(this.TransportRetryBackoff(transportRetries), cancellationToken).ConfigureAwait(false);
                     }
                 }
 
