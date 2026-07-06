@@ -100,9 +100,13 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         // Retry the headers phase only (send + status check) so a transient 5xx self-heals
         // without ever re-emitting a partial stream. A fresh request is built per attempt
         // (an HttpRequestMessage cannot be sent twice). A permanent 4xx fails fast.
+        var headersStopwatch = System.Diagnostics.Stopwatch.StartNew();
         using var response = await this.retryPolicy.ExecuteAsync(
             async (attempt, ct) =>
             {
+                // Restart per attempt so the logged latency reflects only the final (successful)
+                // round-trip, not the failed attempts and their retry backoff.
+                headersStopwatch.Restart();
                 var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{this.baseUrl}/v1/messages");
                 foreach (var (name, value) in this.fingerprint.BuildHeaders())
                 {
@@ -138,6 +142,11 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
                 return resp;
             },
             callToken).ConfigureAwait(false);
+
+        // Split the two latency phases so a "slow call" can be attributed: the HTTP round-trip to
+        // response headers (network + provider accept) is logged here; the wait from headers to the
+        // first token (model-generation latency) is the "first token after Nms" line below.
+        this.LogHeadersReceived(request.Model, headersStopwatch.ElapsedMilliseconds);
 
         var stopwatch = System.Diagnostics.Stopwatch.StartNew();
         var accumulator = new LlmResponseAccumulator();
@@ -499,6 +508,9 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Anthropic request: model {model}, effort {effort}")]
     private partial void LogRequestStart(string model, string? effort);
+
+    [LoggerMessage(Level = LogLevel.Information, Message = "Anthropic response headers after {latencyMs}ms for model {model} (HTTP round-trip; model-generation latency is the next 'first token after' line)")]
+    private partial void LogHeadersReceived(string model, long latencyMs);
 
     [LoggerMessage(Level = LogLevel.Trace, Message = "Anthropic [req {requestId}] request: model {model}, messages={messageCount}, tools={toolCount} [{toolNames}], system='{systemPreview}', lastUser='{userPreview}'")]
     private partial void LogRequestTrace(string requestId, string model, int messageCount, string systemPreview, string userPreview, int toolCount, string toolNames);
