@@ -39,6 +39,24 @@ public sealed class ModelCatalog
     /// <summary>Drop the cached <see cref="Default"/> so the next access reloads (e.g. after a refresh).</summary>
     public static void ResetDefault() => defaultLazy = NewLazy();
 
+    private static readonly Lazy<ModelCatalog> bundledLazy =
+        new(LoadBundled, LazyThreadSafetyMode.ExecutionAndPublication);
+
+    /// <summary>
+    /// The catalog from the BUNDLED snapshot only — ignores <c>CODA_MODELS_PATH</c> and the on-disk
+    /// cache. Deterministic (unlike <see cref="Default"/>, which prefers a live/cached catalog), so
+    /// callers that need the shipped defaults regardless of machine state (notably tests) can rely on it.
+    /// </summary>
+    public static ModelCatalog Bundled => bundledLazy.Value;
+
+    /// <summary>
+    /// When set to <c>1</c>, <see cref="Load"/> skips the on-disk cache and falls straight through to
+    /// the bundled snapshot (an explicit <c>CODA_MODELS_PATH</c> is still honored). The test assembly
+    /// sets this so <see cref="Default"/> is deterministic — surviving a <see cref="ResetDefault"/>
+    /// (e.g. from <see cref="RefreshAsync(HttpClient, CancellationToken)"/>) that a plain pin would not.
+    /// </summary>
+    internal const string SkipCacheEnv = "CODA_MODELS_SKIP_CACHE";
+
     /// <summary>Map a Coda provider id to its models.dev provider key, or null if unmapped.</summary>
     public static string? ProviderKeyFor(string providerId) => providerId switch
     {
@@ -109,7 +127,9 @@ public sealed class ModelCatalog
     public static ModelCatalog Load()
     {
         var explicitPath = Environment.GetEnvironmentVariable("CODA_MODELS_PATH");
-        foreach (var source in new[] { explicitPath, CachePath })
+        var skipCache = string.Equals(Environment.GetEnvironmentVariable(SkipCacheEnv), "1", StringComparison.Ordinal);
+        var sources = skipCache ? new[] { explicitPath } : new[] { explicitPath, CachePath };
+        foreach (var source in sources)
         {
             if (!string.IsNullOrEmpty(source) && File.Exists(source))
             {
@@ -121,17 +141,18 @@ public sealed class ModelCatalog
             }
         }
 
-        var snapshot = ReadEmbeddedSnapshot();
-        if (snapshot is not null)
-        {
-            var parsed = TryParse(snapshot);
-            if (parsed is not null)
-            {
-                return new ModelCatalog(parsed);
-            }
-        }
+        return LoadBundled();
+    }
 
-        return new ModelCatalog(new Dictionary<string, IReadOnlyDictionary<string, CatalogModel>>());
+    /// <summary>
+    /// Load the catalog from the BUNDLED embedded snapshot only (no <c>CODA_MODELS_PATH</c>, no
+    /// on-disk cache). Never throws — returns an empty catalog if the snapshot is missing/unparseable.
+    /// </summary>
+    public static ModelCatalog LoadBundled()
+    {
+        var snapshot = ReadEmbeddedSnapshot();
+        var parsed = snapshot is not null ? TryParse(snapshot) : null;
+        return new ModelCatalog(parsed ?? new Dictionary<string, IReadOnlyDictionary<string, CatalogModel>>());
     }
 
     /// <summary>
