@@ -78,8 +78,10 @@ public sealed class ModelLimitsTests
     public void Bundled_catalog_carries_real_output_limits()
     {
         // Guards the snapshot regeneration + parser: the offline default must carry real output limits,
-        // otherwise we'd silently fall back to a flat value (the bug this whole change fixes).
-        Assert.Equal(64000, ModelLimits.ResolveMaxOutputTokens(ModelCatalog.Default, ClaudeAiProvider.Id, "claude-sonnet-4-6", cap: null));
-        Assert.Equal(128000, ModelLimits.ResolveMaxOutputTokens(ModelCatalog.Default, ClaudeAiProvider.Id, "claude-opus-4-8", cap: null));
+        // otherwise we'd silently fall back to a flat value (the bug this whole change fixes). Uses the
+        // BUNDLED catalog explicitly — asserting against Default would read the machine's ~/.coda cache
+        // and drift when a model's real limit changes upstream.
+        Assert.Equal(64000, ModelLimits.ResolveMaxOutputTokens(ModelCatalog.Bundled, ClaudeAiProvider.Id, "claude-sonnet-4-6", cap: null));
+        Assert.Equal(128000, ModelLimits.ResolveMaxOutputTokens(ModelCatalog.Bundled, ClaudeAiProvider.Id, "claude-opus-4-8", cap: null));
     }
 }
