@@ -179,6 +179,35 @@ public sealed class ResumeRewindCommandTests : IDisposable
         Assert.Contains("No sessions found", console.Output);
     }
 
+    [Fact]
+    public async Task Resume_known_session_adopts_the_session_id()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        await store.SaveAsync("sid-abc", [new ChatMessage(ChatRole.User, [new TextBlock("hi")])]);
+
+        var (_, context) = this.BuildContext();
+        await new ResumeCommand().ExecuteAsync(context, new[] { "sid-abc" });
+
+        // The fix: the current session id is adopted so the next turn appends to sid-abc's transcript.
+        Assert.Equal("sid-abc", context.Session.SessionId);
+    }
+
+    [Fact]
+    public async Task Resume_by_index_selects_the_newest_and_adopts_its_id()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        await store.SaveAsync("older", [new ChatMessage(ChatRole.User, [new TextBlock("old")])]);
+        await Task.Delay(50); // exceed Windows DateTime.UtcNow resolution so createdUtc differs
+        await store.SaveAsync("newer", [new ChatMessage(ChatRole.User, [new TextBlock("new")])]);
+
+        var (_, context) = this.BuildContext();
+        await new ResumeCommand().ExecuteAsync(context, new[] { "1" }); // 1 = newest
+
+        Assert.Equal("newer", context.Session.SessionId);
+        Assert.Single(context.Session.History);
+        Assert.Equal("new", ((TextBlock)context.Session.History[0].Content[0]).Text);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
     private (TestConsole Console, CommandContext Context) BuildContext()

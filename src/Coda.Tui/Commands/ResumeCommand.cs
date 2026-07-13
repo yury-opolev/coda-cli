@@ -41,7 +41,24 @@ public sealed class ResumeCommand : ISlashCommand
             return await this.ListSessionsAsync(context, store, cancellationToken).ConfigureAwait(false);
         }
 
-        return await this.ResumeSessionAsync(context, store, args[0], cancellationToken).ConfigureAwait(false);
+        var targetId = await ResolveTargetIdAsync(store, args[0], cancellationToken).ConfigureAwait(false);
+        return await this.ResumeSessionAsync(context, store, targetId, cancellationToken).ConfigureAwait(false);
+    }
+
+    // A bare positive integer within the listing selects the Nth-newest session (1-based);
+    // anything else is treated as a literal session id.
+    private static async Task<string> ResolveTargetIdAsync(SessionTranscriptStore store, string arg, CancellationToken cancellationToken)
+    {
+        if (int.TryParse(arg, out var index) && index >= 1)
+        {
+            var summaries = await store.ListAsync(cancellationToken).ConfigureAwait(false);
+            if (index <= summaries.Count)
+            {
+                return summaries[index - 1].Id;
+            }
+        }
+
+        return arg;
     }
 
     private async Task<CommandResult> ListSessionsAsync(
@@ -85,6 +102,7 @@ public sealed class ResumeCommand : ISlashCommand
 
         context.Session.History.Clear();
         context.Session.History.AddRange(messages);
+        context.Session.SessionId = sessionId;   // adopt: subsequent turns append to this transcript (true continue)
 
         var escapedId = Markup.Escape(sessionId);
         context.Console.MarkupLine($"[grey50]Resumed session {escapedId} ({messages.Count} messages).[/]");
