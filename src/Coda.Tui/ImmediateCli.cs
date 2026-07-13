@@ -40,7 +40,7 @@ public static class ImmediateCli
     {
         writer.WriteLine($"{Branding.ProductName} v{Branding.Version} — {Branding.Tagline}");
         writer.WriteLine();
-        writer.WriteLine($"Usage: {Branding.CliName} [options]");
+        writer.WriteLine($"Usage: {Branding.CliName} [options] [--continue] [--resume <id>]");
         writer.WriteLine($"       {Branding.CliName} run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode <mode>] [--provider <id>] [--model <id>] [--effort <level>] [--log-level <level>] [--cwd <path>] [--goal \"<objective>\"] [--session-memory] [--max-continuations <n>]");
         writer.WriteLine($"       {Branding.CliName} serve [--provider <id>] [--model <id>] [--cwd <path>] [--permission-mode <mode>] [--goal \"<objective>\"] [--session-memory] [--telemetry] [--no-mcp] [--no-project-mcp] [--api-key <key>] [--endpoint <name>]");
         writer.WriteLine();
@@ -55,5 +55,9 @@ public static class ImmediateCli
         writer.WriteLine("  serve           Run as a JSON-RPC agent server over stdio (for an orchestrator).");
         writer.WriteLine("  models          List the active provider's models (text, or --json)");
         writer.WriteLine("  help            Print command help (text, or --json for agents)");
+        writer.WriteLine("  continue        Resume the most recent session in this directory (also: -c)");
+        writer.WriteLine("  resume [<id>]   Resume a session by id, or the most recent (also: -r)");
+        writer.WriteLine("  export <id>     Export a session to a portable *.coda-session.json bundle");
+        writer.WriteLine("  import <file>   Import a *.coda-session.json bundle into this directory");
     }
 }

@@ -31,6 +31,18 @@ if (args.Length > 0 && args[0] == "help")
     return await Coda.Tui.HelpRunner.RunAsync(args[1..]);
 }
 
+// `coda export <id> [--out <path>] [--pretty]`: write a portable session bundle (headless, credential-free).
+if (args.Length > 0 && args[0] == "export")
+{
+    return await Coda.Tui.SessionCommands.RunExportAsync(args[1..], Directory.GetCurrentDirectory());
+}
+
+// `coda import <file>`: import a session bundle into this directory (headless, credential-free).
+if (args.Length > 0 && args[0] == "import")
+{
+    return await Coda.Tui.SessionCommands.RunImportAsync(args[1..], Directory.GetCurrentDirectory());
+}
+
 // Immediate, no-side-effect commands (`--version`, `--help`) before the TUI starts.
 if (ImmediateCli.TryHandle(args, Console.Out) is int immediateExit)
 {
