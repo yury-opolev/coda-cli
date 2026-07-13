@@ -3,21 +3,14 @@ using LlmClient;
 namespace Coda.Sdk;
 
 /// <summary>
-/// One turn within a <see cref="SessionBundle"/>: the lean transcript's role/blocks, optionally
-/// enriched with the matching audit turn's usage/stop-reason/timestamp when the sidecar was
-/// available at export time.
+/// One transcript message within a <see cref="SessionBundle"/>: a role plus its content blocks.
+/// Audit metadata (usage, stop reason, timestamps, system prompt, tool defs) lives separately in
+/// <see cref="SessionBundle.AuditTurns"/> — one entry per user turn — because the agent loop
+/// appends multiple assistant messages per audit turn, so message-to-turn alignment is not 1:1.
 /// </summary>
 public sealed record SessionBundleTurn
 {
     public required string Role { get; init; }                 // "user" | "assistant"
-
-    public DateTime? TsUtc { get; init; }
-
-    public int? InputTokens { get; init; }
-
-    public int? OutputTokens { get; init; }
-
-    public string? StopReason { get; init; }
 
     public required IReadOnlyList<ContentBlock> Blocks { get; init; }
 }
@@ -50,4 +43,11 @@ public sealed record SessionBundle
     public IReadOnlyList<ToolDefinition> ToolDefs { get; init; } = [];
 
     public required IReadOnlyList<SessionBundleTurn> Turns { get; init; }
+
+    /// <summary>
+    /// The audit sidecar's turns, carried verbatim (one per user turn, with effective per-turn
+    /// system prompt / tool defs). Empty when no sidecar was available at export time. Replayed
+    /// on import to reconstruct the sidecar exactly.
+    /// </summary>
+    public IReadOnlyList<SessionAuditTurn> AuditTurns { get; init; } = [];
 }

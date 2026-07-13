@@ -19,10 +19,12 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
     private static readonly JsonSerializerOptions PrettyJsonOptions = new() { WriteIndented = true };
 
     /// <summary>
-    /// Builds a portable bundle for <paramref name="sessionId"/>: the lean transcript's turns,
-    /// enriched with the audit sidecar's per-turn usage/stop-reason/timestamp when a sidecar
-    /// exists (aligning the k-th assistant message to audit turn k). Returns <c>null</c> if no
-    /// transcript is persisted for <paramref name="sessionId"/>. Never throws.
+    /// Builds a portable bundle for <paramref name="sessionId"/>: the lean transcript's messages
+    /// (role + blocks, in order) plus, when a sidecar exists, the audit turns carried VERBATIM as a
+    /// separate top-level array. The transcript and the sidecar are not 1:1 (the agent loop appends
+    /// several assistant messages per audit turn), so they are kept as independent lists rather than
+    /// interleaved. Returns <c>null</c> if no transcript is persisted for <paramref name="sessionId"/>.
+    /// Never throws.
     /// </summary>
     public async Task<SessionBundle?> ExportAsync(string sessionId, DateTime exportedUtc, CancellationToken ct = default)
     {
@@ -51,32 +53,14 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             : (IReadOnlyList<SessionAuditTurn>)[];
 
         var turns = new List<SessionBundleTurn>(messages.Count);
-        var assistantIndex = 0;
         foreach (var message in messages)
         {
             var role = message.Role == ChatRole.User ? "user" : "assistant";
-            if (message.Role != ChatRole.Assistant)
-            {
-                turns.Add(new SessionBundleTurn { Role = role, Blocks = message.Content });
-                continue;
-            }
-
-            // Both the transcript and the audit sidecar record one entry per user/assistant turn,
-            // so the k-th assistant message aligns to audit turn k. An older or edited session can
-            // have the two counts disagree — enrich what aligns and leave the rest block-only.
-            var auditTurn = assistantIndex < auditTurns.Count ? auditTurns[assistantIndex] : null;
-            turns.Add(new SessionBundleTurn
-            {
-                Role = role,
-                TsUtc = auditTurn?.TsUtc,
-                InputTokens = auditTurn?.InputTokens,
-                OutputTokens = auditTurn?.OutputTokens,
-                StopReason = auditTurn?.StopReason,
-                Blocks = message.Content,
-            });
-            assistantIndex++;
+            turns.Add(new SessionBundleTurn { Role = role, Blocks = message.Content });
         }
 
+        // Effective final system prompt / tool defs / provider / model come from the last audit
+        // turn (LoadAsync carries them forward, so the last turn holds the effective values).
         string? systemPrompt = null;
         IReadOnlyList<ToolDefinition> toolDefs = [];
         string? provider = null;
@@ -102,6 +86,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             SystemPrompt = systemPrompt,
             ToolDefs = toolDefs,
             Turns = turns,
+            AuditTurns = auditTurns,
         };
     }
 
@@ -163,40 +148,16 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
 
         await transcriptStore.SaveAsync(targetId, messages, ct).ConfigureAwait(false);
 
-        if (bundle.AuditAvailable)
+        // Replay the audit turns verbatim. Each turn already carries its effective per-turn system
+        // prompt / tool defs, so AppendTurnAsync's change-only emission re-derives the exact on-disk
+        // compaction — mid-session prompt/tool changes round-trip losslessly, and there is one audit
+        // line per user turn (not per assistant message).
+        if (bundle.AuditTurns.Count > 0)
         {
             var auditStore = new SessionAuditStore(workingDirectory);
-            var assistantIndex = 0;
-            foreach (var turn in bundle.Turns)
+            foreach (var auditTurn in bundle.AuditTurns)
             {
-                if (!string.Equals(turn.Role, "assistant", StringComparison.OrdinalIgnoreCase))
-                {
-                    continue;
-                }
-
-                // Per-turn system-prompt/tool-defs change history is not preserved across
-                // export/import (known v1 limitation) — the effective final values are stored
-                // top-level. Attach them to EVERY reconstructed turn: change-only emission then
-                // writes them once on turn 0 and OMITS them on unchanged later turns, and
-                // carry-forward on load restores the effective value for every turn. Passing an
-                // empty ToolDefs (or null SystemPrompt) on later turns would NOT be a no-op — it
-                // differs from the last-emitted non-empty value, so the store would emit the empty
-                // array and clobber the carried-forward tool-def history on reload.
-                var auditTurn = new SessionAuditTurn
-                {
-                    TurnIndex = assistantIndex,
-                    TsUtc = turn.TsUtc ?? bundle.ExportedUtc,
-                    Provider = bundle.Provider ?? string.Empty,
-                    Model = bundle.Model ?? string.Empty,
-                    InputTokens = turn.InputTokens ?? 0,
-                    OutputTokens = turn.OutputTokens ?? 0,
-                    StopReason = turn.StopReason,
-                    SystemPrompt = bundle.SystemPrompt,
-                    ToolDefs = bundle.ToolDefs,
-                };
-
                 await auditStore.AppendTurnAsync(targetId, auditTurn, ct).ConfigureAwait(false);
-                assistantIndex++;
             }
         }
 
@@ -237,6 +198,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
         ["systemPrompt"] = bundle.SystemPrompt,
         ["toolDefs"] = SerializeToolDefs(bundle.ToolDefs),
         ["turns"] = SerializeTurns(bundle.Turns),
+        ["auditTurns"] = SerializeAuditTurns(bundle.AuditTurns),
     };
 
     private static JsonArray SerializeTurns(IReadOnlyList<SessionBundleTurn> turns)
@@ -247,11 +209,54 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             array.Add(new JsonObject
             {
                 ["role"] = turn.Role,
-                ["tsUtc"] = turn.TsUtc?.ToString("O"),
-                ["inputTokens"] = turn.InputTokens,
-                ["outputTokens"] = turn.OutputTokens,
-                ["stopReason"] = turn.StopReason,
                 ["blocks"] = ChatMessageJson.SerializeBlocks(turn.Blocks),
+            });
+        }
+
+        return array;
+    }
+
+    // Audit turns are serialized in the same field shape SessionAuditStore writes to the sidecar
+    // (turnIndex, tsUtc "O", provider, model, usage:{in,out}, stopReason, toolCalls, systemPrompt,
+    // toolDefs) so a bundle round-trips the sidecar exactly. Each turn here carries its effective
+    // (carried-forward) systemPrompt/toolDefs, so every entry emits them in full.
+    private static JsonArray SerializeAuditTurns(IReadOnlyList<SessionAuditTurn> auditTurns)
+    {
+        var array = new JsonArray();
+        foreach (var turn in auditTurns)
+        {
+            array.Add(new JsonObject
+            {
+                ["turnIndex"] = turn.TurnIndex,
+                ["tsUtc"] = turn.TsUtc.ToString("O"),
+                ["provider"] = turn.Provider,
+                ["model"] = turn.Model,
+                ["usage"] = new JsonObject
+                {
+                    ["in"] = turn.InputTokens,
+                    ["out"] = turn.OutputTokens,
+                },
+                ["stopReason"] = turn.StopReason,
+                ["toolCalls"] = SerializeToolCalls(turn.ToolCalls),
+                ["systemPrompt"] = turn.SystemPrompt,
+                ["toolDefs"] = SerializeToolDefs(turn.ToolDefs),
+            });
+        }
+
+        return array;
+    }
+
+    private static JsonArray SerializeToolCalls(IReadOnlyList<ToolCallRecord> toolCalls)
+    {
+        var array = new JsonArray();
+        foreach (var call in toolCalls)
+        {
+            array.Add(new JsonObject
+            {
+                ["name"] = call.Name,
+                ["input"] = call.Input,
+                ["result"] = call.Result,
+                ["isError"] = call.IsError,
             });
         }
 
@@ -289,6 +294,8 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
         var toolDefs = toolDefsArray is not null ? DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
         var turnsArray = root["turns"]?.AsArray() ?? new JsonArray();
         var turns = DeserializeTurns(turnsArray);
+        var auditTurnsArray = root["auditTurns"]?.AsArray();
+        var auditTurns = auditTurnsArray is not null ? DeserializeAuditTurns(auditTurnsArray) : (IReadOnlyList<SessionAuditTurn>)[];
 
         return new SessionBundle
         {
@@ -303,6 +310,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             SystemPrompt = systemPrompt,
             ToolDefs = toolDefs,
             Turns = turns,
+            AuditTurns = auditTurns,
         };
     }
 
@@ -322,15 +330,68 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             turns.Add(new SessionBundleTurn
             {
                 Role = obj["role"]?.GetValue<string>() ?? "user",
-                TsUtc = ParseDateTime(obj["tsUtc"]),
-                InputTokens = obj["inputTokens"] is JsonValue inputTokensValue ? inputTokensValue.GetValue<int>() : null,
-                OutputTokens = obj["outputTokens"] is JsonValue outputTokensValue ? outputTokensValue.GetValue<int>() : null,
-                StopReason = obj["stopReason"]?.GetValue<string>(),
                 Blocks = blocks,
             });
         }
 
         return turns;
+    }
+
+    private static IReadOnlyList<SessionAuditTurn> DeserializeAuditTurns(JsonArray array)
+    {
+        var turns = new List<SessionAuditTurn>(array.Count);
+        foreach (var item in array)
+        {
+            if (item is not JsonObject obj)
+            {
+                continue;
+            }
+
+            var usage = obj["usage"]?.AsObject();
+            var inputTokens = usage?["in"] is JsonValue inValue ? inValue.GetValue<int>() : 0;
+            var outputTokens = usage?["out"] is JsonValue outValue ? outValue.GetValue<int>() : 0;
+
+            var toolCallsArray = obj["toolCalls"]?.AsArray();
+            var toolCalls = toolCallsArray is not null ? DeserializeToolCalls(toolCallsArray) : (IReadOnlyList<ToolCallRecord>)[];
+            var toolDefsArray = obj["toolDefs"]?.AsArray();
+            var toolDefs = toolDefsArray is not null ? DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
+
+            turns.Add(new SessionAuditTurn
+            {
+                TurnIndex = obj["turnIndex"] is JsonValue turnIndexValue ? turnIndexValue.GetValue<int>() : 0,
+                TsUtc = ParseDateTime(obj["tsUtc"]) ?? DateTime.UnixEpoch,
+                Provider = obj["provider"]?.GetValue<string>() ?? string.Empty,
+                Model = obj["model"]?.GetValue<string>() ?? string.Empty,
+                InputTokens = inputTokens,
+                OutputTokens = outputTokens,
+                StopReason = obj["stopReason"]?.GetValue<string>(),
+                ToolCalls = toolCalls,
+                SystemPrompt = obj["systemPrompt"]?.GetValue<string>(),
+                ToolDefs = toolDefs,
+            });
+        }
+
+        return turns;
+    }
+
+    private static IReadOnlyList<ToolCallRecord> DeserializeToolCalls(JsonArray array)
+    {
+        var list = new List<ToolCallRecord>(array.Count);
+        foreach (var item in array)
+        {
+            if (item is not JsonObject obj)
+            {
+                continue;
+            }
+
+            list.Add(new ToolCallRecord(
+                obj["name"]?.GetValue<string>() ?? string.Empty,
+                obj["input"]?.GetValue<string>() ?? string.Empty,
+                obj["result"]?.GetValue<string>(),
+                obj["isError"]?.GetValue<bool>() ?? false));
+        }
+
+        return list;
     }
 
     private static IReadOnlyList<ToolDefinition> DeserializeToolDefs(JsonArray array)
@@ -359,7 +420,17 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             return null;
         }
 
-        var raw = value.GetValue<string>();
-        return DateTime.Parse(raw, null, System.Globalization.DateTimeStyles.RoundtripKind);
+        try
+        {
+            var raw = value.GetValue<string>();
+            return DateTime.Parse(raw, null, System.Globalization.DateTimeStyles.RoundtripKind);
+        }
+        catch
+        {
+            // A malformed but schema-valid date must not abort the import (the import command's
+            // catch filter does not include FormatException) — recover the conversation with a
+            // sentinel timestamp instead of throwing an ugly stack trace out of ImportAsync.
+            return DateTime.UnixEpoch;
+        }
     }
 }
