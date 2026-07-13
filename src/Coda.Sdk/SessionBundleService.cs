@@ -134,7 +134,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
 
         var transcriptStore = new SessionTranscriptStore(workingDirectory);
         var targetId = await transcriptStore.LoadAsync(bundle.Id, ct).ConfigureAwait(false) is not null
-            ? Guid.NewGuid().ToString("N")[..12]
+            ? SessionIds.NewId()
             : bundle.Id;
 
         var messages = new List<ChatMessage>(bundle.Turns.Count);
