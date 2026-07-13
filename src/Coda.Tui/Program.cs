@@ -153,6 +153,24 @@ _ = Task.Run(async () =>
     }
 }, cts.Token);
 
+// Continue/resume a prior session when launched with -c/--continue/continue or -r/--resume/resume.
+var startupIntent = SessionCli.ParseStartupIntent(args);
+if (startupIntent.HasIntent)
+{
+    var target = await SessionCli.ResolveAsync(
+        session.WorkingDirectory, startupIntent.ContinueLatest, startupIntent.ResumeId, cts.Token).ConfigureAwait(false);
+    if (target is not null)
+    {
+        session.SessionId = target.Id;
+        session.History.AddRange(target.Messages);
+        console.MarkupLine($"[grey50]Resumed session {Spectre.Console.Markup.Escape(target.Id)} ({target.Messages.Count} messages).[/]");
+    }
+    else
+    {
+        console.MarkupLine("[grey50]No session to continue.[/]");
+    }
+}
+
 using var app = new TuiApp(context, agentToolsProvider);
 await app.RunAsync(cts.Token);
 return 0;

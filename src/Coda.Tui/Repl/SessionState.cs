@@ -16,6 +16,12 @@ public sealed class SessionState
 
     public string WorkingDirectory { get; set; }
 
+    /// <summary>
+    /// The persisted session id this conversation writes to. Null until the first turn assigns one
+    /// (captured back from the CodaSession) or a resume/continue seeds it. Settable by /resume.
+    /// </summary>
+    public string? SessionId { get; set; }
+
     /// <summary>The model id used for chat (settable via /model).</summary>
     public string Model { get; set; } = AnthropicModels.DefaultModel;
 
