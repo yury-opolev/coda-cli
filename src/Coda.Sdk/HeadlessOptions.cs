@@ -45,6 +45,12 @@ public sealed record HeadlessOptions
     /// </summary>
     public int? GoalMaxContinuationsOverride { get; init; }
 
+    /// <summary>When true (set by <c>--continue</c>), append to the newest session in the working directory instead of starting fresh.</summary>
+    public bool Continue { get; init; }
+
+    /// <summary>When set (by <c>--resume &lt;id&gt;</c>), append to the named session instead of starting fresh.</summary>
+    public string? ResumeSessionId { get; init; }
+
     /// <summary>
     /// Parse <c>run</c> arguments (everything after the <c>run</c> token):
     /// <c>-p/--prompt &lt;text&gt; [--json] [--yolo] [--yolo-safe] [--permission-mode m]
@@ -70,6 +76,8 @@ public sealed record HeadlessOptions
         var enableSessionMemory = false;
         var maxContinuations = 10;
         int? goalMaxContinuationsOverride = null;
+        var continueSession = false;
+        string? resumeSessionId = null;
 
         for (var i = 0; i < args.Count; i++)
         {
@@ -164,6 +172,13 @@ public sealed record HeadlessOptions
                     if (!int.TryParse(args[i], out maxContinuations) || maxContinuations <= 0) { error = $"Invalid value for --max-continuations: '{args[i]}' must be a positive integer."; return false; }
                     goalMaxContinuationsOverride = maxContinuations;
                     break;
+                case "--continue":
+                    continueSession = true;
+                    break;
+                case "--resume":
+                    if (++i >= args.Count) { error = "Missing value for --resume."; return false; }
+                    resumeSessionId = args[i];
+                    break;
                 default:
                     error = $"Unknown argument '{arg}'.";
                     return false;
@@ -179,6 +194,12 @@ public sealed record HeadlessOptions
         if (goalMaxDuration.HasValue && string.IsNullOrWhiteSpace(goal))
         {
             error = "--goal-timeout requires --goal to be set.";
+            return false;
+        }
+
+        if (continueSession && resumeSessionId is not null)
+        {
+            error = "Use either --continue or --resume <id>, not both.";
             return false;
         }
 
@@ -198,6 +219,8 @@ public sealed record HeadlessOptions
             EnableSessionMemory = enableSessionMemory,
             MaxStopContinuations = maxContinuations,
             GoalMaxContinuationsOverride = goalMaxContinuationsOverride,
+            Continue = continueSession,
+            ResumeSessionId = resumeSessionId,
         };
         return true;
     }

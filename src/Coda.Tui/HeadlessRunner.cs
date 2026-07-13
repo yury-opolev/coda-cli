@@ -40,7 +40,7 @@ public static class HeadlessRunner
         if (!HeadlessOptions.TryParse(runArgs, out var options, out var parseError))
         {
             Console.Error.WriteLine(parseError);
-            Console.Error.WriteLine("Usage: coda run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode default|acceptEdits|plan|bypass] [--provider id] [--model id] [--effort low|medium|high|max|auto] [--log-level trace|debug|info|warn|error|off] [--cwd path] [--goal \"<objective>\"] [--goal-timeout <duration>] [--session-memory] [--max-continuations <n>]");
+            Console.Error.WriteLine("Usage: coda run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode default|acceptEdits|plan|bypass] [--provider id] [--model id] [--effort low|medium|high|max|auto] [--log-level trace|debug|info|warn|error|off] [--cwd path] [--goal \"<objective>\"] [--goal-timeout <duration>] [--session-memory] [--max-continuations <n>] [--continue] [--resume <id>]");
             return 1;
         }
 
@@ -116,7 +116,25 @@ public static class HeadlessRunner
             MaxStopContinuations = options.MaxStopContinuations,
         };
 
-        using var session = new CodaSession(credentials, sessionOptions);
+        List<ChatMessage>? seedHistory = null;
+        string? seedSessionId = null;
+        if (options.Continue || options.ResumeSessionId is not null)
+        {
+            var target = await SessionCli.ResolveAsync(
+                workingDirectory, options.Continue, options.ResumeSessionId, cancellationToken).ConfigureAwait(false);
+            if (target is null)
+            {
+                Console.Error.WriteLine(options.Continue
+                    ? "No session to continue in this directory."
+                    : $"Session '{options.ResumeSessionId}' not found.");
+                return 1;
+            }
+
+            seedHistory = [.. target.Messages];
+            seedSessionId = target.Id;
+        }
+
+        using var session = new CodaSession(credentials, sessionOptions, history: seedHistory, sessionId: seedSessionId);
 
         // Start configured LSP servers + diagnostics handlers (no-op when none configured).
         await session.InitializeAsync(cancellationToken).ConfigureAwait(false);
