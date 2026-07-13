@@ -76,7 +76,7 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         {
             ["id"] = sessionId,
             ["createdUtc"] = createdUtc.ToString("O"),
-            ["messages"] = SerializeMessages(messages),
+            ["messages"] = ChatMessageJson.SerializeMessages(messages),
         };
 
         // Atomic write: serialize to a temp file, then rename over the target. A hard kill mid-write
@@ -147,7 +147,7 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
                 return null;
             }
 
-            return DeserializeMessages(messagesArray);
+            return ChatMessageJson.DeserializeMessages(messagesArray);
         }
         catch
         {
@@ -204,113 +204,8 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
     }
 
     // ── Serialization ──────────────────────────────────────────────────────────
-
-    private static JsonArray SerializeMessages(IReadOnlyList<ChatMessage> messages)
-    {
-        var array = new JsonArray();
-        foreach (var message in messages)
-        {
-            var msgObj = new JsonObject
-            {
-                ["role"] = message.Role == ChatRole.User ? "user" : "assistant",
-                ["blocks"] = SerializeBlocks(message.Content),
-            };
-            array.Add(msgObj);
-        }
-
-        return array;
-    }
-
-    private static JsonArray SerializeBlocks(IReadOnlyList<ContentBlock> blocks)
-    {
-        var array = new JsonArray();
-        foreach (var block in blocks)
-        {
-            JsonObject obj = block switch
-            {
-                TextBlock tb => new JsonObject
-                {
-                    ["type"] = "text",
-                    ["text"] = tb.Text,
-                },
-                ToolUseBlock tub => new JsonObject
-                {
-                    ["type"] = "tool_use",
-                    ["id"] = tub.Id,
-                    ["name"] = tub.Name,
-                    ["input"] = tub.InputJson,
-                },
-                ToolResultBlock trb => new JsonObject
-                {
-                    ["type"] = "tool_result",
-                    ["toolUseId"] = trb.ToolUseId,
-                    ["content"] = trb.Content,
-                    ["isError"] = trb.IsError,
-                },
-                _ => new JsonObject { ["type"] = "unknown" },
-            };
-            array.Add(obj);
-        }
-
-        return array;
-    }
-
-    private static IReadOnlyList<ChatMessage> DeserializeMessages(JsonArray array)
-    {
-        var messages = new List<ChatMessage>(array.Count);
-        foreach (var item in array)
-        {
-            if (item is not JsonObject msgObj)
-            {
-                continue;
-            }
-
-            var roleStr = msgObj["role"]?.GetValue<string>();
-            var role = string.Equals(roleStr, "assistant", StringComparison.OrdinalIgnoreCase)
-                ? ChatRole.Assistant
-                : ChatRole.User;
-
-            var blocksArray = msgObj["blocks"]?.AsArray();
-            var blocks = blocksArray is not null ? DeserializeBlocks(blocksArray) : (IReadOnlyList<ContentBlock>)[];
-            messages.Add(new ChatMessage(role, blocks));
-        }
-
-        return messages;
-    }
-
-    private static IReadOnlyList<ContentBlock> DeserializeBlocks(JsonArray array)
-    {
-        var blocks = new List<ContentBlock>(array.Count);
-        foreach (var item in array)
-        {
-            if (item is not JsonObject obj)
-            {
-                continue;
-            }
-
-            var type = obj["type"]?.GetValue<string>();
-            ContentBlock? block = type switch
-            {
-                "text" => new TextBlock(obj["text"]?.GetValue<string>() ?? string.Empty),
-                "tool_use" => new ToolUseBlock(
-                    obj["id"]?.GetValue<string>() ?? string.Empty,
-                    obj["name"]?.GetValue<string>() ?? string.Empty,
-                    obj["input"]?.GetValue<string>() ?? string.Empty),
-                "tool_result" => new ToolResultBlock(
-                    obj["toolUseId"]?.GetValue<string>() ?? string.Empty,
-                    obj["content"]?.GetValue<string>() ?? string.Empty,
-                    obj["isError"]?.GetValue<bool>() ?? false),
-                _ => null,
-            };
-
-            if (block is not null)
-            {
-                blocks.Add(block);
-            }
-        }
-
-        return blocks;
-    }
+    // Message/block (de)serialization lives in ChatMessageJson, shared with SessionBundleService
+    // so the transcript file and portable bundle stay wire-compatible.
 
     private static string ExtractPreview(JsonArray? messagesArray)
     {

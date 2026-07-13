@@ -31,6 +31,18 @@ if (args.Length > 0 && args[0] == "help")
     return await Coda.Tui.HelpRunner.RunAsync(args[1..]);
 }
 
+// `coda export <id> [--out <path>] [--pretty]`: write a portable session bundle (headless, credential-free).
+if (args.Length > 0 && args[0] == "export")
+{
+    return await Coda.Tui.SessionCommands.RunExportAsync(args[1..], Directory.GetCurrentDirectory());
+}
+
+// `coda import <file>`: import a session bundle into this directory (headless, credential-free).
+if (args.Length > 0 && args[0] == "import")
+{
+    return await Coda.Tui.SessionCommands.RunImportAsync(args[1..], Directory.GetCurrentDirectory());
+}
+
 // Immediate, no-side-effect commands (`--version`, `--help`) before the TUI starts.
 if (ImmediateCli.TryHandle(args, Console.Out) is int immediateExit)
 {
@@ -152,6 +164,24 @@ _ = Task.Run(async () =>
         // network/cache failure that the next access silently retries) — nothing to surface.
     }
 }, cts.Token);
+
+// Continue/resume a prior session when launched with -c/--continue/continue or -r/--resume/resume.
+var startupIntent = SessionCli.ParseStartupIntent(args);
+if (startupIntent.HasIntent)
+{
+    var target = await SessionCli.ResolveAsync(
+        session.WorkingDirectory, startupIntent.ContinueLatest, startupIntent.ResumeId, cts.Token).ConfigureAwait(false);
+    if (target is not null)
+    {
+        session.SessionId = target.Id;
+        session.History.AddRange(target.Messages);
+        console.MarkupLine($"[grey50]Resumed session {Spectre.Console.Markup.Escape(target.Id)} ({target.Messages.Count} messages).[/]");
+    }
+    else
+    {
+        console.MarkupLine("[grey50]No session to continue.[/]");
+    }
+}
 
 using var app = new TuiApp(context, agentToolsProvider);
 await app.RunAsync(cts.Token);

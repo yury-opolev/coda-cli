@@ -33,11 +33,21 @@ public sealed class AgentRunner : IDisposable
             this.session = new CodaSession(
                 context.Credentials,
                 this.BuildOptions(context),
-                history: context.Session.History);
+                history: context.Session.History,
+                sessionId: context.Session.SessionId);
+
+            // If the session generated its own id (no resume seeded one), capture it back so /export,
+            // /resume, and later turns all reference the same id.
+            context.Session.SessionId ??= this.session.SessionId;
 
             // Start configured LSP servers + diagnostics handlers (no-op when none
             // are configured). Done once, when the session is first created.
             await this.session.InitializeAsync(cancellationToken).ConfigureAwait(false);
+        }
+        else if (context.Session.SessionId is { } id && this.session.SessionId != id)
+        {
+            // /resume changed the target id mid-session; adopt it so this turn appends to that transcript.
+            this.session.AdoptSessionId(id);
         }
 
         this.session.Options = this.BuildOptions(context);

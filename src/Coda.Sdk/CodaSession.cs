@@ -54,6 +54,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     // survives between turns (a fresh store per call would re-read the file every save).
     private SessionTranscriptStore? transcriptStore;
 
+    private SessionAuditStore? auditStore;
+    private int auditTurnIndex;
+    private string? auditCounterForId;
+
     /// <summary>
     /// Optional stream-progress sink injected by the serve layer (the Bridge liveness
     /// pulse). Null in standalone/TUI runs — the client falls back to telemetry-log
@@ -201,6 +205,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     [LoggerMessage(Level = LogLevel.Debug, Message = "transcript persistence failed (best-effort); the turn is unaffected: session={sessionId}")]
     private partial void LogTranscriptPersistFailed(string sessionId, Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "audit persistence failed for session {sessionId} (best-effort; the turn is unaffected)")]
+    private partial void LogAuditPersistFailed(string sessionId, Exception ex);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "team manager dispose failed (best-effort) during session teardown: session={sessionId}")]
     private partial void LogTeamManagerDisposeFailed(string sessionId, Exception ex);
 
@@ -286,6 +293,17 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Adopt an existing session id so subsequent transcript/audit saves target its files, WITHOUT
+    /// replacing history. Used by the TUI, whose history list is shared by reference (so
+    /// <see cref="Resume"/>, which swaps history, is not appropriate there).
+    /// </summary>
+    public void AdoptSessionId(string sessionId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sessionId);
+        this.SessionId = sessionId;
+    }
+
+    /// <summary>
     /// Run one user turn: stream the assistant reply (with tool use), keep the
     /// conversation, and return a structured result. On failure the turn is rolled
     /// back so history never corrupts.
@@ -355,6 +373,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
+            await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
             return new RunResult(true, recording.FinalText, recording.ToolCalls, recording.StopReason, null)
             {
@@ -646,6 +665,42 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             // Transcript persistence must never break a turn.
             this.LogTranscriptPersistFailed(this.SessionId, ex);
+        }
+    }
+
+    private async Task PersistAuditTurnAsync(SessionOptions options, RecordingSink recording, string systemPrompt, IReadOnlyList<ToolDefinition> toolDefs, CancellationToken cancellationToken)
+    {
+        try
+        {
+            this.auditStore ??= new SessionAuditStore(options.WorkingDirectory);
+
+            // Seed / re-seed the per-session turn counter from the sidecar so indices stay monotonic
+            // across resume (a fresh process) and across an in-life id adoption (TUI /resume).
+            if (this.auditCounterForId != this.SessionId)
+            {
+                this.auditTurnIndex = (await this.auditStore.LoadAsync(this.SessionId, cancellationToken).ConfigureAwait(false)).Count;
+                this.auditCounterForId = this.SessionId;
+            }
+
+            var turn = new SessionAuditTurn
+            {
+                TurnIndex = this.auditTurnIndex++,
+                TsUtc = DateTime.UtcNow,
+                Provider = options.ProviderId,
+                Model = options.Model,
+                InputTokens = recording.Usage.InputTokens,
+                OutputTokens = recording.Usage.OutputTokens,
+                StopReason = recording.StopReason,
+                ToolCalls = recording.ToolCalls,
+                SystemPrompt = systemPrompt,
+                ToolDefs = toolDefs,
+            };
+            await this.auditStore.AppendTurnAsync(this.SessionId, turn, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            // Audit persistence is best-effort and must never break a turn (same policy as the transcript).
+            this.LogAuditPersistFailed(this.SessionId, ex);
         }
     }
 

@@ -42,6 +42,7 @@ public static class SlashCommandCatalog
         new CostCommand(),
         new ImageCommand(),
         new ExportCommand(),
+        new ImportCommand(),
         new DiffCommand(),
         new DoctorCommand(),
         new VersionCommand(),
