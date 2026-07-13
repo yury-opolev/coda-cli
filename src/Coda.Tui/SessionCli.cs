@@ -53,15 +53,18 @@ public static class SessionCli
             case "-r" or "--resume" or "resume":
                 var hasId = args.Count > 1 && !args[1].StartsWith('-');
                 return hasId ? new StartupIntent(false, args[1]) : new StartupIntent(true, null);
+            case "-f" or "--fork" or "fork":
+                var forkHasId = args.Count > 1 && !args[1].StartsWith('-');
+                return forkHasId ? new StartupIntent(false, args[1], Fork: true) : new StartupIntent(true, null, Fork: true);
             default:
                 return new StartupIntent(false, null);
         }
     }
 }
 
-/// <summary>A parsed TUI startup continue/resume intent.</summary>
-public sealed record StartupIntent(bool ContinueLatest, string? ResumeId)
+/// <summary>A parsed TUI startup continue/resume/fork intent.</summary>
+public sealed record StartupIntent(bool ContinueLatest, string? ResumeId, bool Fork = false)
 {
-    /// <summary>True when the user asked to continue or resume a session at launch.</summary>
+    /// <summary>True when the user asked to continue, resume, or fork a session at launch.</summary>
     public bool HasIntent => this.ContinueLatest || this.ResumeId is not null;
 }
