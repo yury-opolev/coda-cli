@@ -42,9 +42,16 @@ public sealed class SendMessageToolShutdownSelfStopTests : IDisposable
 
     public void Dispose()
     {
-        if (Directory.Exists(this.tempDir))
+        try
         {
-            Directory.Delete(this.tempDir, recursive: true);
+            if (Directory.Exists(this.tempDir))
+            {
+                Directory.Delete(this.tempDir, recursive: true);
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Best-effort teardown: a background poll loop may still be releasing a file handle.
         }
     }
 
@@ -186,9 +193,16 @@ public sealed class SendMessageToolShutdownSelfStopTests : IDisposable
         }
         finally
         {
-            if (Directory.Exists(tempDir2))
+            try
             {
-                Directory.Delete(tempDir2, recursive: true);
+                if (Directory.Exists(tempDir2))
+                {
+                    Directory.Delete(tempDir2, recursive: true);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Best-effort teardown: a background poll loop may still be releasing a file handle.
             }
         }
     }

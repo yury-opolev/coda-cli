@@ -196,4 +196,29 @@ public sealed class MailboxTests : IDisposable
             Assert.Contains($"msg{i}", texts);
         }
     }
+
+    [Fact]
+    public async Task Concurrent_writes_from_separate_instances_do_not_race_or_lose_messages()
+    {
+        // Two Mailbox instances over the SAME base dir — exactly what happens when a teammate
+        // runner and a tool ToolContext each construct their own Mailbox. Per-instance locking
+        // does not serialize their read-modify-writes to the same inbox file, so they collide
+        // (IOException "file used by another process") or clobber each other (lost messages).
+        // The lock must be process-wide (keyed by path), not per instance.
+        var box1 = new Mailbox(this.teamsBaseDir);
+        var box2 = new Mailbox(this.teamsBaseDir);
+
+        var tasks = new List<Task>();
+        for (var i = 0; i < 25; i++)
+        {
+            tasks.Add(box1.WriteAsync("bob", "my-team", MakeMessage("a", $"a{i}")));
+            tasks.Add(box2.WriteAsync("bob", "my-team", MakeMessage("b", $"b{i}")));
+        }
+
+        // Must neither throw nor lose a write.
+        await Task.WhenAll(tasks).WaitAsync(TimeSpan.FromSeconds(15));
+
+        var messages = await this.mailbox.ReadAsync("bob", "my-team").WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(50, messages.Count);
+    }
 }
