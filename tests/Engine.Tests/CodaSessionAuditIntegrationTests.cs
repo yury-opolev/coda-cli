@@ -75,4 +75,37 @@ public sealed class CodaSessionAuditIntegrationTests : IDisposable
         Assert.Equal(3, audit.Count);
         Assert.Equal(2, audit[^1].TurnIndex);
     }
+
+    [Fact]
+    public async Task AdoptSessionId_continues_the_audit_turn_index_from_the_adopted_sidecar()
+    {
+        // Pre-seed a sidecar for id "resumed2" with two turns (indices 0, 1).
+        var store = new SessionAuditStore(this.tempDir);
+        for (var i = 0; i < 2; i++)
+        {
+            await store.AppendTurnAsync("resumed2", new SessionAuditTurn
+            {
+                TurnIndex = i,
+                TsUtc = new DateTime(2026, 7, 13, 9, 0, i, DateTimeKind.Utc),
+                Provider = "github-copilot",
+                Model = "claude-opus-4.8",
+                InputTokens = 1,
+                OutputTokens = 1,
+                SystemPrompt = "SEED",
+                ToolDefs = [new ToolDefinition("read_file", "reads", "{}")],
+            });
+        }
+
+        // A fresh session (generated id) runs one turn, then adopts "resumed2" in-life and runs again.
+        using var session = FakeSession.New(this.tempDir);
+        await session.RunAsync("first");
+        session.AdoptSessionId("resumed2");
+        await session.RunAsync("second");
+
+        // The counter must reseed on the id change (continuing the adopted sidecar's count of 2),
+        // NOT continue the generated id's count.
+        var audit = await new SessionAuditStore(this.tempDir).LoadAsync("resumed2");
+        Assert.Equal(3, audit.Count);
+        Assert.Equal(2, audit[^1].TurnIndex);
+    }
 }

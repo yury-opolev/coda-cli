@@ -373,7 +373,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
-            await this.PersistAuditTurnAsync(options, recording, cancellationToken).ConfigureAwait(false);
+            await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
             return new RunResult(true, recording.FinalText, recording.ToolCalls, recording.StopReason, null)
             {
@@ -668,7 +668,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         }
     }
 
-    private async Task PersistAuditTurnAsync(SessionOptions options, RecordingSink recording, CancellationToken cancellationToken)
+    private async Task PersistAuditTurnAsync(SessionOptions options, RecordingSink recording, string systemPrompt, IReadOnlyList<ToolDefinition> toolDefs, CancellationToken cancellationToken)
     {
         try
         {
@@ -681,15 +681,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 this.auditTurnIndex = (await this.auditStore.LoadAsync(this.SessionId, cancellationToken).ConfigureAwait(false)).Count;
                 this.auditCounterForId = this.SessionId;
             }
-
-            var includeAnthropicSystemPrefix = options.ProviderId != GitHubCopilotProvider.Id;
-            var outputStyle = BuiltInOutputStyles.Resolve(options.OutputStyle);
-            var systemPrompt = AgentSystemPrompt.Build(
-                options.WorkingDirectory,
-                includeAnthropicSystemPrefix,
-                ProjectContext.Load(options.WorkingDirectory),
-                outputStyle.SystemPromptSuffix);
-            var toolDefs = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]).Definitions;
 
             var turn = new SessionAuditTurn
             {
