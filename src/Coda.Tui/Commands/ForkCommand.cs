@@ -21,15 +21,16 @@ public sealed class ForkCommand : ISlashCommand
         "/fork",
         Description: "Keep the current conversation history but start writing to a new session id. The original session is frozen at its saved state and stays resumable.");
 
-    public Task<CommandResult> ExecuteAsync(
+    public async Task<CommandResult> ExecuteAsync(
         CommandContext context,
         IReadOnlyList<string> args,
         CancellationToken cancellationToken = default)
     {
-        context.Session.SessionId = SessionIds.NewId();
+        context.Session.SessionId = await SessionForking.ForkAsync(
+            context.Session.WorkingDirectory, context.Session.SessionId, context.Session.History, cancellationToken).ConfigureAwait(false);
 
         var escapedId = Markup.Escape(context.Session.SessionId);
         context.Console.MarkupLine($"[grey50]Forked into a new session {escapedId} (original frozen).[/]");
-        return Task.FromResult(CommandResult.Continue);
+        return CommandResult.Continue;
     }
 }
