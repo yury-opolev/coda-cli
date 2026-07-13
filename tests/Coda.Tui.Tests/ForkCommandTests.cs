@@ -38,7 +38,40 @@ public sealed class ForkCommandTests : IDisposable
         Assert.Contains("Forked", console.Output);
     }
 
+    [Fact]
+    public async Task Fork_carries_the_source_audit_into_the_new_session()
+    {
+        var (_, context) = this.BuildContext();
+        var dir = context.Session.WorkingDirectory;
+        await new SessionTranscriptStore(dir).SaveAsync("source-aaaa",
+            [new ChatMessage(ChatRole.User, [new TextBlock("q")])]);
+        await new SessionAuditStore(dir).AppendTurnAsync("source-aaaa", MakeTurn());
+        context.Session.SessionId = "source-aaaa";
+        context.Session.History.Add(new ChatMessage(ChatRole.User, [new TextBlock("q")]));
+
+        await new ForkCommand().ExecuteAsync(context, Array.Empty<string>());
+
+        var newId = context.Session.SessionId!;
+        Assert.NotEqual("source-aaaa", newId);
+        Assert.NotNull(await new SessionTranscriptStore(dir).LoadAsync(newId));
+        Assert.Single(await new SessionAuditStore(dir).LoadAsync(newId));      // audit carried
+        Assert.Single(await new SessionAuditStore(dir).LoadAsync("source-aaaa")); // source untouched
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────────
+
+    private static SessionAuditTurn MakeTurn() => new()
+    {
+        TurnIndex = 0,
+        TsUtc = new DateTime(2026, 7, 13, 9, 0, 0, DateTimeKind.Utc),
+        Provider = "p",
+        Model = "m",
+        InputTokens = 10,
+        OutputTokens = 5,
+        SystemPrompt = "sys-0",
+        ToolCalls = [],
+        ToolDefs = [],
+    };
 
     private (TestConsole Console, CommandContext Context) BuildContext()
     {
