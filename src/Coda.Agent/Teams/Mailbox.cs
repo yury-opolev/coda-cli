@@ -11,8 +11,12 @@ public sealed class Mailbox
         PropertyNameCaseInsensitive = true,
     };
 
+    // Per-inbox-path lock. STATIC so it serializes read-modify-write across ALL Mailbox instances
+    // in the process (a teammate runner and a tool ToolContext each construct their own Mailbox over
+    // the same teams dir); a per-instance lock let their writes to the same file race.
+    private static readonly ConcurrentDictionary<string, SemaphoreSlim> locks = new();
+
     private readonly string teamsBaseDir;
-    private readonly ConcurrentDictionary<string, SemaphoreSlim> locks = new();
 
     public Mailbox(string teamsBaseDir)
     {
@@ -26,15 +30,15 @@ public sealed class Mailbox
             "inboxes",
             AgentId.SanitizeName(agent) + ".json");
 
-    private SemaphoreSlim GetLock(string path) =>
-        this.locks.GetOrAdd(path, _ => new SemaphoreSlim(1, 1));
+    private static SemaphoreSlim GetLock(string path) =>
+        locks.GetOrAdd(path, _ => new SemaphoreSlim(1, 1));
 
     public async Task WriteAsync(string recipient, string team, TeammateMessage message, CancellationToken ct = default)
     {
         var path = this.GetInboxPath(recipient, team);
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
-        var sem = this.GetLock(path);
+        var sem = GetLock(path);
         await sem.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -51,7 +55,7 @@ public sealed class Mailbox
     public async Task<IReadOnlyList<TeammateMessage>> ReadAsync(string agent, string team, CancellationToken ct = default)
     {
         var path = this.GetInboxPath(agent, team);
-        var sem = this.GetLock(path);
+        var sem = GetLock(path);
         await sem.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -72,7 +76,7 @@ public sealed class Mailbox
     public async Task MarkReadByIndexAsync(string agent, string team, int index, CancellationToken ct = default)
     {
         var path = this.GetInboxPath(agent, team);
-        var sem = this.GetLock(path);
+        var sem = GetLock(path);
         await sem.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -99,7 +103,7 @@ public sealed class Mailbox
     public async Task MarkAllReadAsync(string agent, string team, CancellationToken ct = default)
     {
         var path = this.GetInboxPath(agent, team);
-        var sem = this.GetLock(path);
+        var sem = GetLock(path);
         await sem.WaitAsync(ct).ConfigureAwait(false);
         try
         {
@@ -130,7 +134,7 @@ public sealed class Mailbox
             return;
         }
 
-        var sem = this.GetLock(path);
+        var sem = GetLock(path);
         await sem.WaitAsync(ct).ConfigureAwait(false);
         try
         {
