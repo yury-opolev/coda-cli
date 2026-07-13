@@ -196,7 +196,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
         ["model"] = bundle.Model,
         ["auditAvailable"] = bundle.AuditAvailable,
         ["systemPrompt"] = bundle.SystemPrompt,
-        ["toolDefs"] = SerializeToolDefs(bundle.ToolDefs),
+        ["toolDefs"] = AuditJson.SerializeToolDefs(bundle.ToolDefs),
         ["turns"] = SerializeTurns(bundle.Turns),
         ["auditTurns"] = SerializeAuditTurns(bundle.AuditTurns),
     };
@@ -237,42 +237,9 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
                     ["out"] = turn.OutputTokens,
                 },
                 ["stopReason"] = turn.StopReason,
-                ["toolCalls"] = SerializeToolCalls(turn.ToolCalls),
+                ["toolCalls"] = AuditJson.SerializeToolCalls(turn.ToolCalls),
                 ["systemPrompt"] = turn.SystemPrompt,
-                ["toolDefs"] = SerializeToolDefs(turn.ToolDefs),
-            });
-        }
-
-        return array;
-    }
-
-    private static JsonArray SerializeToolCalls(IReadOnlyList<ToolCallRecord> toolCalls)
-    {
-        var array = new JsonArray();
-        foreach (var call in toolCalls)
-        {
-            array.Add(new JsonObject
-            {
-                ["name"] = call.Name,
-                ["input"] = call.Input,
-                ["result"] = call.Result,
-                ["isError"] = call.IsError,
-            });
-        }
-
-        return array;
-    }
-
-    private static JsonArray SerializeToolDefs(IReadOnlyList<ToolDefinition> toolDefs)
-    {
-        var array = new JsonArray();
-        foreach (var def in toolDefs)
-        {
-            array.Add(new JsonObject
-            {
-                ["name"] = def.Name,
-                ["description"] = def.Description,
-                ["inputSchema"] = def.InputSchemaJson,
+                ["toolDefs"] = AuditJson.SerializeToolDefs(turn.ToolDefs),
             });
         }
 
@@ -291,7 +258,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
         var auditAvailable = root["auditAvailable"]?.GetValue<bool>() ?? false;
         var systemPrompt = root["systemPrompt"]?.GetValue<string>();
         var toolDefsArray = root["toolDefs"]?.AsArray();
-        var toolDefs = toolDefsArray is not null ? DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
+        var toolDefs = toolDefsArray is not null ? AuditJson.DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
         var turnsArray = root["turns"]?.AsArray() ?? new JsonArray();
         var turns = DeserializeTurns(turnsArray);
         var auditTurnsArray = root["auditTurns"]?.AsArray();
@@ -352,9 +319,9 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             var outputTokens = usage?["out"] is JsonValue outValue ? outValue.GetValue<int>() : 0;
 
             var toolCallsArray = obj["toolCalls"]?.AsArray();
-            var toolCalls = toolCallsArray is not null ? DeserializeToolCalls(toolCallsArray) : (IReadOnlyList<ToolCallRecord>)[];
+            var toolCalls = toolCallsArray is not null ? AuditJson.DeserializeToolCalls(toolCallsArray) : (IReadOnlyList<ToolCallRecord>)[];
             var toolDefsArray = obj["toolDefs"]?.AsArray();
-            var toolDefs = toolDefsArray is not null ? DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
+            var toolDefs = toolDefsArray is not null ? AuditJson.DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
 
             turns.Add(new SessionAuditTurn
             {
@@ -372,45 +339,6 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
         }
 
         return turns;
-    }
-
-    private static IReadOnlyList<ToolCallRecord> DeserializeToolCalls(JsonArray array)
-    {
-        var list = new List<ToolCallRecord>(array.Count);
-        foreach (var item in array)
-        {
-            if (item is not JsonObject obj)
-            {
-                continue;
-            }
-
-            list.Add(new ToolCallRecord(
-                obj["name"]?.GetValue<string>() ?? string.Empty,
-                obj["input"]?.GetValue<string>() ?? string.Empty,
-                obj["result"]?.GetValue<string>(),
-                obj["isError"]?.GetValue<bool>() ?? false));
-        }
-
-        return list;
-    }
-
-    private static IReadOnlyList<ToolDefinition> DeserializeToolDefs(JsonArray array)
-    {
-        var list = new List<ToolDefinition>(array.Count);
-        foreach (var item in array)
-        {
-            if (item is not JsonObject obj)
-            {
-                continue;
-            }
-
-            list.Add(new ToolDefinition(
-                obj["name"]?.GetValue<string>() ?? string.Empty,
-                obj["description"]?.GetValue<string>() ?? string.Empty,
-                obj["inputSchema"]?.GetValue<string>() ?? string.Empty));
-        }
-
-        return list;
     }
 
     private static DateTime? ParseDateTime(JsonNode? node)

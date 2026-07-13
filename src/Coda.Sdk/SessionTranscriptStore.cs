@@ -30,16 +30,6 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
     private string FilePath(string sessionId) => Path.Combine(this.SessionsDir, $"{sessionId}.json");
 
     /// <summary>
-    /// Returns <c>true</c> when <paramref name="sessionId"/> is safe to use as a
-    /// file name: non-empty, contains no invalid file-name characters, and contains
-    /// no path separator components (guards against traversal like "../../secret").
-    /// </summary>
-    private static bool IsValidId(string sessionId)
-        => !string.IsNullOrEmpty(sessionId)
-           && sessionId.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
-           && Path.GetFileName(sessionId) == sessionId;
-
-    /// <summary>
     /// Persists <paramref name="messages"/> to disk. Creates the sessions directory
     /// if it does not exist. If <paramref name="messages"/> is empty, or
     /// <paramref name="sessionId"/> is invalid, skips writing.
@@ -49,7 +39,7 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         IReadOnlyList<ChatMessage> messages,
         CancellationToken ct = default)
     {
-        if (messages.Count == 0 || !IsValidId(sessionId))
+        if (messages.Count == 0 || !SessionIds.IsValid(sessionId))
         {
             return;
         }
@@ -121,7 +111,7 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         string sessionId,
         CancellationToken ct = default)
     {
-        if (!IsValidId(sessionId))
+        if (!SessionIds.IsValid(sessionId))
         {
             return null;
         }
