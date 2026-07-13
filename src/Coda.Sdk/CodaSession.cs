@@ -286,6 +286,17 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
+    /// Adopt an existing session id so subsequent transcript/audit saves target its files, WITHOUT
+    /// replacing history. Used by the TUI, whose history list is shared by reference (so
+    /// <see cref="Resume"/>, which swaps history, is not appropriate there).
+    /// </summary>
+    public void AdoptSessionId(string sessionId)
+    {
+        ArgumentException.ThrowIfNullOrEmpty(sessionId);
+        this.SessionId = sessionId;
+    }
+
+    /// <summary>
     /// Run one user turn: stream the assistant reply (with tool use), keep the
     /// conversation, and return a structured result. On failure the turn is rolled
     /// back so history never corrupts.
