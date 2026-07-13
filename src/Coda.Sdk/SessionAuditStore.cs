@@ -102,6 +102,39 @@ public sealed class SessionAuditStore(string workingDirectory)
     }
 
     /// <summary>
+    /// Copies the audit sidecar from <paramref name="sourceId"/> to <paramref name="targetId"/>,
+    /// so a forked session carries the source's full turn-by-turn audit trail. No-op when either
+    /// id is invalid or the source has no sidecar file; swallows any I/O failure (never throws) —
+    /// this is called from a swallowed seam. Does not touch the change-only emission cache.
+    /// </summary>
+    public Task CopyAsync(string sourceId, string targetId, CancellationToken ct = default)
+    {
+        if (!SessionIds.IsValid(sourceId) || !SessionIds.IsValid(targetId))
+        {
+            return Task.CompletedTask;
+        }
+
+        try
+        {
+            var sourcePath = this.FilePath(sourceId);
+            if (!File.Exists(sourcePath))
+            {
+                return Task.CompletedTask;
+            }
+
+            var targetPath = this.FilePath(targetId);
+            Directory.CreateDirectory(this.SessionsDir);
+            File.Copy(sourcePath, targetPath, overwrite: true);
+        }
+        catch
+        {
+            // Never throw out of persistence — this is called from a swallowed seam.
+        }
+
+        return Task.CompletedTask;
+    }
+
+    /// <summary>
     /// Loads all turns for <paramref name="sessionId"/>, reconstructing the effective
     /// <see cref="SessionAuditTurn.SystemPrompt"/>/<see cref="SessionAuditTurn.ToolDefs"/> for each
     /// turn by carrying forward the most recent emitted value. Tolerates a torn/corrupt line
