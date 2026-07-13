@@ -126,7 +126,7 @@ public static class HeadlessRunner
             if (target is null)
             {
                 Console.Error.WriteLine(options.Fork
-                    ? "No session to fork in this directory."
+                    ? (options.ForkSessionId is not null ? $"Session '{options.ForkSessionId}' not found." : "No session to fork in this directory.")
                     : options.Continue ? "No session to continue in this directory." : $"Session '{options.ResumeSessionId}' not found.");
                 return 1;
             }

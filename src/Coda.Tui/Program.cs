@@ -165,7 +165,8 @@ _ = Task.Run(async () =>
     }
 }, cts.Token);
 
-// Continue/resume a prior session when launched with -c/--continue/continue or -r/--resume/resume.
+// Continue/resume a prior session when launched with -c/--continue/continue or -r/--resume/resume,
+// or fork one into a new session id when launched with -f/--fork/fork.
 var startupIntent = SessionCli.ParseStartupIntent(args);
 if (startupIntent.HasIntent)
 {

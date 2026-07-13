@@ -36,8 +36,9 @@ public static class SessionCli
     }
 
     /// <summary>
-    /// Parse a continue/resume launch intent from argv: `-c`/`--continue`/`continue` → newest; `-r`/
-    /// `--resume`/`resume` with an id → that id, or without one → newest. Anything else → no intent.
+    /// Parse a continue/resume/fork launch intent from argv: `-c`/`--continue`/`continue` → newest; `-r`/
+    /// `--resume`/`resume` with an id → that id, or without one → newest; `-f`/`--fork`/`fork` with an id →
+    /// fork that id, or without one → fork the newest, each into a new session id. Anything else → no intent.
     /// </summary>
     public static StartupIntent ParseStartupIntent(IReadOnlyList<string> args)
     {

@@ -1,3 +1,4 @@
+using Coda.Sdk;
 using Coda.Tui.Repl;
 using Spectre.Console;
 
@@ -25,7 +26,7 @@ public sealed class ForkCommand : ISlashCommand
         IReadOnlyList<string> args,
         CancellationToken cancellationToken = default)
     {
-        context.Session.SessionId = Coda.Sdk.SessionIds.NewId();
+        context.Session.SessionId = SessionIds.NewId();
 
         var escapedId = Markup.Escape(context.Session.SessionId);
         context.Console.MarkupLine($"[grey50]Forked into a new session {escapedId} (original frozen).[/]");

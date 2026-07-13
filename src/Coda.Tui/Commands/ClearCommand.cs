@@ -1,3 +1,4 @@
+using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using LlmClient;
@@ -22,7 +23,7 @@ public sealed class ClearCommand : ISlashCommand
     {
         context.Session.History.Clear();
         context.Session.SessionUsage = TokenUsage.Zero;
-        context.Session.SessionId = Coda.Sdk.SessionIds.NewId();
+        context.Session.SessionId = SessionIds.NewId();
         context.Console.Clear();
         var connectedProvider = await context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
         Banner.Render(context.Console, context.Session, connectedProvider, context.Session.Model);
