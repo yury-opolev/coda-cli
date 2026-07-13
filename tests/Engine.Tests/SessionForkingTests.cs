@@ -79,4 +79,17 @@ public sealed class SessionForkingTests : IDisposable
         Assert.NotNull(await new SessionTranscriptStore(this.dir).LoadAsync(newId));
         Assert.Empty(await new SessionAuditStore(this.dir).LoadAsync(newId));
     }
+
+    [Fact]
+    public async Task ForkAsync_swallows_a_transcript_write_failure_and_still_returns_an_id()
+    {
+        // Point workingDirectory at an existing FILE so the sessions dir cannot be created → SaveAsync throws.
+        var asFile = Path.Combine(this.dir, "not-a-dir");
+        await File.WriteAllTextAsync(asFile, "x");
+
+        var newId = await SessionForking.ForkAsync(asFile, null,
+            [new ChatMessage(ChatRole.User, [new TextBlock("hi")])]);
+
+        Assert.Matches("^[0-9a-f]{12}$", newId);
+    }
 }

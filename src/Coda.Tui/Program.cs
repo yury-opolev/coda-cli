@@ -179,7 +179,7 @@ if (startupIntent.HasIntent)
         {
             // Fork: seed history and eagerly persist the new session (transcript + carried
             // audit sidecar) so it shows up in /resume immediately.
-            session.SessionId = await Coda.Sdk.SessionForking.ForkAsync(session.WorkingDirectory, target.Id, target.Messages, cts.Token);
+            session.SessionId = await Coda.Sdk.SessionForking.ForkAsync(session.WorkingDirectory, target.Id, target.Messages, cts.Token).ConfigureAwait(false);
             console.MarkupLine($"[grey50]Forked from {Spectre.Console.Markup.Escape(target.Id)} into a new session ({target.Messages.Count} messages).[/]");
         }
         else
