@@ -165,7 +165,8 @@ _ = Task.Run(async () =>
     }
 }, cts.Token);
 
-// Continue/resume a prior session when launched with -c/--continue/continue or -r/--resume/resume.
+// Continue/resume a prior session when launched with -c/--continue/continue or -r/--resume/resume,
+// or fork one into a new session id when launched with -f/--fork/fork.
 var startupIntent = SessionCli.ParseStartupIntent(args);
 if (startupIntent.HasIntent)
 {
@@ -173,13 +174,21 @@ if (startupIntent.HasIntent)
         session.WorkingDirectory, startupIntent.ContinueLatest, startupIntent.ResumeId, cts.Token).ConfigureAwait(false);
     if (target is not null)
     {
-        session.SessionId = target.Id;
         session.History.AddRange(target.Messages);
-        console.MarkupLine($"[grey50]Resumed session {Spectre.Console.Markup.Escape(target.Id)} ({target.Messages.Count} messages).[/]");
+        if (startupIntent.Fork)
+        {
+            // Fork: seed history but leave SessionId null so a fresh id is minted on the first turn.
+            console.MarkupLine($"[grey50]Forked from {Spectre.Console.Markup.Escape(target.Id)} into a new session ({target.Messages.Count} messages).[/]");
+        }
+        else
+        {
+            session.SessionId = target.Id;
+            console.MarkupLine($"[grey50]Resumed session {Spectre.Console.Markup.Escape(target.Id)} ({target.Messages.Count} messages).[/]");
+        }
     }
     else
     {
-        console.MarkupLine("[grey50]No session to continue.[/]");
+        console.MarkupLine(startupIntent.Fork ? "[grey50]No session to fork.[/]" : "[grey50]No session to continue.[/]");
     }
 }
 

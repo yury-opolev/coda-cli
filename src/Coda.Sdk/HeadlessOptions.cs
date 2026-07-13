@@ -52,10 +52,23 @@ public sealed record HeadlessOptions
     public string? ResumeSessionId { get; init; }
 
     /// <summary>
+    /// When true (set by <c>--fork [id]</c>), seed history from a prior session but mint a
+    /// fresh session id — the source session is never written to.
+    /// </summary>
+    public bool Fork { get; init; }
+
+    /// <summary>
+    /// Optional session id to fork from (set by <c>--fork &lt;id&gt;</c>). Null forks the newest
+    /// session in the working directory.
+    /// </summary>
+    public string? ForkSessionId { get; init; }
+
+    /// <summary>
     /// Parse <c>run</c> arguments (everything after the <c>run</c> token):
     /// <c>-p/--prompt &lt;text&gt; [--json] [--yolo] [--yolo-safe] [--permission-mode m]
     /// [--provider id] [--model id] [--effort level] [--cwd path] [--goal &lt;text&gt;]
-    /// [--goal-timeout &lt;duration&gt;] [--session-memory] [--max-continuations &lt;n&gt;]</c>.
+    /// [--goal-timeout &lt;duration&gt;] [--session-memory] [--max-continuations &lt;n&gt;]
+    /// [--continue] [--resume &lt;id&gt;] [--fork [id]]</c>.
     /// </summary>
     public static bool TryParse(IReadOnlyList<string> args, out HeadlessOptions options, out string? error)
     {
@@ -78,6 +91,8 @@ public sealed record HeadlessOptions
         int? goalMaxContinuationsOverride = null;
         var continueSession = false;
         string? resumeSessionId = null;
+        var fork = false;
+        string? forkSessionId = null;
 
         for (var i = 0; i < args.Count; i++)
         {
@@ -179,6 +194,10 @@ public sealed record HeadlessOptions
                     if (++i >= args.Count) { error = "Missing value for --resume."; return false; }
                     resumeSessionId = args[i];
                     break;
+                case "--fork":
+                    fork = true;
+                    if (i + 1 < args.Count && !args[i + 1].StartsWith('-')) { forkSessionId = args[++i]; }
+                    break;
                 default:
                     error = $"Unknown argument '{arg}'.";
                     return false;
@@ -197,9 +216,10 @@ public sealed record HeadlessOptions
             return false;
         }
 
-        if (continueSession && resumeSessionId is not null)
+        var exclusiveResumeFlagCount = (continueSession ? 1 : 0) + (resumeSessionId is not null ? 1 : 0) + (fork ? 1 : 0);
+        if (exclusiveResumeFlagCount > 1)
         {
-            error = "Use either --continue or --resume <id>, not both.";
+            error = "Use only one of --continue, --resume <id>, or --fork [id].";
             return false;
         }
 
@@ -221,6 +241,8 @@ public sealed record HeadlessOptions
             GoalMaxContinuationsOverride = goalMaxContinuationsOverride,
             Continue = continueSession,
             ResumeSessionId = resumeSessionId,
+            Fork = fork,
+            ForkSessionId = forkSessionId,
         };
         return true;
     }

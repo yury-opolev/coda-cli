@@ -40,7 +40,7 @@ public static class HeadlessRunner
         if (!HeadlessOptions.TryParse(runArgs, out var options, out var parseError))
         {
             Console.Error.WriteLine(parseError);
-            Console.Error.WriteLine("Usage: coda run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode default|acceptEdits|plan|bypass] [--provider id] [--model id] [--effort low|medium|high|max|auto] [--log-level trace|debug|info|warn|error|off] [--cwd path] [--goal \"<objective>\"] [--goal-timeout <duration>] [--session-memory] [--max-continuations <n>] [--continue] [--resume <id>]");
+            Console.Error.WriteLine("Usage: coda run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode default|acceptEdits|plan|bypass] [--provider id] [--model id] [--effort low|medium|high|max|auto] [--log-level trace|debug|info|warn|error|off] [--cwd path] [--goal \"<objective>\"] [--goal-timeout <duration>] [--session-memory] [--max-continuations <n>] [--continue] [--resume <id>] [--fork [id]]");
             return 1;
         }
 
@@ -118,20 +118,23 @@ public static class HeadlessRunner
 
         List<ChatMessage>? seedHistory = null;
         string? seedSessionId = null;
-        if (options.Continue || options.ResumeSessionId is not null)
+        if (options.Continue || options.ResumeSessionId is not null || options.Fork)
         {
-            var target = await SessionCli.ResolveAsync(
-                workingDirectory, options.Continue, options.ResumeSessionId, cancellationToken).ConfigureAwait(false);
+            var continueLatest = options.Continue || (options.Fork && options.ForkSessionId is null);
+            var lookupId = options.Fork ? options.ForkSessionId : options.ResumeSessionId;
+            var target = await SessionCli.ResolveAsync(workingDirectory, continueLatest, lookupId, cancellationToken).ConfigureAwait(false);
             if (target is null)
             {
-                Console.Error.WriteLine(options.Continue
-                    ? "No session to continue in this directory."
-                    : $"Session '{options.ResumeSessionId}' not found.");
+                Console.Error.WriteLine(options.Fork
+                    ? (options.ForkSessionId is not null ? $"Session '{options.ForkSessionId}' not found." : "No session to fork in this directory.")
+                    : options.Continue ? "No session to continue in this directory." : $"Session '{options.ResumeSessionId}' not found.");
                 return 1;
             }
 
             seedHistory = [.. target.Messages];
-            seedSessionId = target.Id;
+            // Fork seeds history but NOT the id: leave seedSessionId null so a fresh id is minted.
+            seedSessionId = options.Fork ? null : target.Id;
+            if (options.Fork) { Console.Error.WriteLine($"[fork] from {target.Id} -> new session ({target.Messages.Count} messages)"); }
         }
 
         using var session = new CodaSession(credentials, sessionOptions, history: seedHistory, sessionId: seedSessionId);

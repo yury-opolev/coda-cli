@@ -49,4 +49,31 @@ public sealed class SessionCliTests : IDisposable
     {
         Assert.Null(await SessionCli.ResolveAsync(this.tempDir, true, null));
     }
+
+    [Fact]
+    public void ParseStartupIntent_fork_no_id_forks_latest()
+    {
+        var intent = SessionCli.ParseStartupIntent(["--fork"]);
+        Assert.True(intent.Fork);
+        Assert.True(intent.ContinueLatest);
+        Assert.Null(intent.ResumeId);
+        Assert.True(intent.HasIntent);
+    }
+
+    [Fact]
+    public void ParseStartupIntent_fork_with_id()
+    {
+        var intent = SessionCli.ParseStartupIntent(["fork", "pick-me"]);
+        Assert.True(intent.Fork);
+        Assert.False(intent.ContinueLatest);
+        Assert.Equal("pick-me", intent.ResumeId);
+    }
+
+    [Fact]
+    public void ParseStartupIntent_resume_is_not_fork()
+    {
+        var intent = SessionCli.ParseStartupIntent(["--resume", "abc"]);
+        Assert.False(intent.Fork);
+        Assert.Equal("abc", intent.ResumeId);
+    }
 }

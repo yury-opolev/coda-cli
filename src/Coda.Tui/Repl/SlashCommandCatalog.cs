@@ -28,6 +28,7 @@ public static class SlashCommandCatalog
         new HeadersCommand(),
         new ClearCommand(),
         new ResumeCommand(),
+        new ForkCommand(),
         new RewindCommand(),
         new SkillsCommand(),
         new SkillCommand(),

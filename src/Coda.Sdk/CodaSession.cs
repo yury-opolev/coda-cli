@@ -81,7 +81,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.llmClientFactory = llmClientFactory ?? new DefaultLlmClientFactory();
         this.agentLoopFactory = agentLoopFactory ?? new DefaultAgentLoopFactory();
         this.history = history ?? [];
-        this.SessionId = sessionId ?? Guid.NewGuid().ToString("N")[..12];
+        this.SessionId = sessionId ?? SessionIds.NewId();
         if (httpClient is null)
         {
             // No HttpClient.Timeout: it would cap the TOTAL stream duration and kill a

@@ -362,4 +362,49 @@ public sealed class SessionTranscriptTests : IDisposable
 
         Assert.Equal(firstCreated, secondCreated);
     }
+
+    // ── Freeze invariant: minting/adopting a fresh id never touches the original transcript ─────
+
+    [Fact]
+    public async Task SaveAsync_under_a_new_id_never_overwrites_a_prior_sessions_transcript()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var originalId = "aaaaaaaaaaaa";
+        var forkedId = "bbbbbbbbbbbb";
+
+        var originalMessages = new List<ChatMessage>
+        {
+            new(ChatRole.User, [new TextBlock("original question")]),
+            new(ChatRole.Assistant, [new TextBlock("original answer")]),
+        };
+        await store.SaveAsync(originalId, originalMessages);
+
+        var sessionsDir = Path.Combine(this.tempDir, ".coda", "sessions");
+        var originalPath = Path.Combine(sessionsDir, $"{originalId}.json");
+        var originalBytesBefore = await File.ReadAllBytesAsync(originalPath);
+        var originalWriteTimeBefore = File.GetLastWriteTimeUtc(originalPath);
+
+        // Simulate /clear or /fork: a brand-new id is minted/adopted and a different
+        // conversation is saved under it. This must never touch the original file.
+        await Task.Delay(50);
+        var forkedMessages = new List<ChatMessage>
+        {
+            new(ChatRole.User, [new TextBlock("forked question")]),
+        };
+        await store.SaveAsync(forkedId, forkedMessages);
+
+        // The original transcript is frozen: byte-identical content and mtime.
+        var originalBytesAfter = await File.ReadAllBytesAsync(originalPath);
+        Assert.Equal(originalBytesBefore, originalBytesAfter);
+        Assert.Equal(originalWriteTimeBefore, File.GetLastWriteTimeUtc(originalPath));
+
+        // The new id's transcript exists with its own messages.
+        var forkedPath = Path.Combine(sessionsDir, $"{forkedId}.json");
+        Assert.True(File.Exists(forkedPath));
+        var forkedLoaded = await store.LoadAsync(forkedId);
+        Assert.NotNull(forkedLoaded);
+        Assert.Single(forkedLoaded);
+        var forkedText = Assert.IsType<TextBlock>(forkedLoaded[0].Content[0]);
+        Assert.Equal("forked question", forkedText.Text);
+    }
 }

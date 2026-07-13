@@ -1,3 +1,4 @@
+using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using LlmClient;
@@ -12,16 +13,17 @@ public sealed class ClearCommand : ISlashCommand
 
     public IReadOnlyList<string> Aliases => ["cls"];
 
-    public string Summary => "Clear the screen";
+    public string Summary => "Clear the screen and start a fresh session";
 
     public CommandHelp Help => new(
         "/clear",
-        Description: "Reset the conversation history and token usage, then redraw the banner.");
+        Description: "Reset the conversation history and token usage and start a fresh session (the pre-clear session is preserved and stays resumable), then redraw the banner.");
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
         context.Session.History.Clear();
         context.Session.SessionUsage = TokenUsage.Zero;
+        context.Session.SessionId = SessionIds.NewId();
         context.Console.Clear();
         var connectedProvider = await context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
         Banner.Render(context.Console, context.Session, connectedProvider, context.Session.Model);

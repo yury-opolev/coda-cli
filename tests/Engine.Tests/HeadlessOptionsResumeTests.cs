@@ -33,4 +33,34 @@ public sealed class HeadlessOptionsResumeTests
         Assert.False(HeadlessOptions.TryParse(["-p", "go", "--continue", "--resume", "x"], out _, out var err));
         Assert.NotNull(err);
     }
+
+    [Fact]
+    public void Parses_fork_flag_without_id()
+    {
+        Assert.True(HeadlessOptions.TryParse(["-p", "go", "--fork"], out var o, out _));
+        Assert.True(o.Fork);
+        Assert.Null(o.ForkSessionId);
+    }
+
+    [Fact]
+    public void Parses_fork_with_id()
+    {
+        Assert.True(HeadlessOptions.TryParse(["-p", "go", "--fork", "abc123"], out var o, out _));
+        Assert.True(o.Fork);
+        Assert.Equal("abc123", o.ForkSessionId);
+    }
+
+    [Fact]
+    public void Fork_with_continue_is_an_error()
+    {
+        Assert.False(HeadlessOptions.TryParse(["-p", "go", "--fork", "--continue"], out _, out var err));
+        Assert.NotNull(err);
+    }
+
+    [Fact]
+    public void Fork_with_resume_is_an_error()
+    {
+        Assert.False(HeadlessOptions.TryParse(["-p", "go", "--fork", "x", "--resume", "y"], out _, out var err));
+        Assert.NotNull(err);
+    }
 }
