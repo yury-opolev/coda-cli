@@ -30,18 +30,8 @@ public sealed class SessionAuditStore(string workingDirectory)
 
     private string FilePath(string sessionId) => Path.Combine(this.SessionsDir, $"{sessionId}.audit.jsonl");
 
-    /// <summary>
-    /// Returns <c>true</c> when <paramref name="sessionId"/> is safe to use as a
-    /// file name: non-empty, contains no invalid file-name characters, and contains
-    /// no path separator components (guards against traversal like "../../secret").
-    /// </summary>
-    private static bool IsValidId(string sessionId)
-        => !string.IsNullOrEmpty(sessionId)
-           && sessionId.IndexOfAny(Path.GetInvalidFileNameChars()) < 0
-           && Path.GetFileName(sessionId) == sessionId;
-
     /// <summary>Returns <c>true</c> when an audit sidecar file exists for <paramref name="sessionId"/>.</summary>
-    public bool Exists(string sessionId) => IsValidId(sessionId) && File.Exists(this.FilePath(sessionId));
+    public bool Exists(string sessionId) => SessionIds.IsValid(sessionId) && File.Exists(this.FilePath(sessionId));
 
     /// <summary>
     /// Appends one turn to the audit sidecar. <see cref="SessionAuditTurn.SystemPrompt"/> and
@@ -51,7 +41,7 @@ public sealed class SessionAuditStore(string workingDirectory)
     /// </summary>
     public async Task AppendTurnAsync(string sessionId, SessionAuditTurn turn, CancellationToken ct = default)
     {
-        if (!IsValidId(sessionId))
+        if (!SessionIds.IsValid(sessionId))
         {
             return;
         }
@@ -65,7 +55,7 @@ public sealed class SessionAuditStore(string workingDirectory)
                 state = this.emittedStateBySession.GetOrAdd(sessionId, RecoverState(filePath));
             }
 
-            var toolDefsArray = BuildToolDefsArray(turn.ToolDefs);
+            var toolDefsArray = AuditJson.SerializeToolDefs(turn.ToolDefs);
             var toolDefsJson = toolDefsArray.ToJsonString(JsonOptions);
 
             var emitSystemPrompt = !state.HasSystemPrompt
@@ -85,7 +75,7 @@ public sealed class SessionAuditStore(string workingDirectory)
                     ["out"] = turn.OutputTokens,
                 },
                 ["stopReason"] = turn.StopReason,
-                ["toolCalls"] = SerializeToolCalls(turn.ToolCalls),
+                ["toolCalls"] = AuditJson.SerializeToolCalls(turn.ToolCalls),
             };
 
             if (emitSystemPrompt)
@@ -119,7 +109,7 @@ public sealed class SessionAuditStore(string workingDirectory)
     /// </summary>
     public async Task<IReadOnlyList<SessionAuditTurn>> LoadAsync(string sessionId, CancellationToken ct = default)
     {
-        if (!IsValidId(sessionId))
+        if (!SessionIds.IsValid(sessionId))
         {
             return [];
         }
@@ -163,78 +153,8 @@ public sealed class SessionAuditStore(string workingDirectory)
     }
 
     // ── Serialization ──────────────────────────────────────────────────────────
-
-    private static JsonArray SerializeToolCalls(IReadOnlyList<ToolCallRecord> toolCalls)
-    {
-        var array = new JsonArray();
-        foreach (var call in toolCalls)
-        {
-            array.Add(new JsonObject
-            {
-                ["name"] = call.Name,
-                ["input"] = call.Input,
-                ["result"] = call.Result,
-                ["isError"] = call.IsError,
-            });
-        }
-
-        return array;
-    }
-
-    private static IReadOnlyList<ToolCallRecord> DeserializeToolCalls(JsonArray array)
-    {
-        var list = new List<ToolCallRecord>(array.Count);
-        foreach (var item in array)
-        {
-            if (item is not JsonObject obj)
-            {
-                continue;
-            }
-
-            list.Add(new ToolCallRecord(
-                obj["name"]?.GetValue<string>() ?? string.Empty,
-                obj["input"]?.GetValue<string>() ?? string.Empty,
-                obj["result"]?.GetValue<string>(),
-                obj["isError"]?.GetValue<bool>() ?? false));
-        }
-
-        return list;
-    }
-
-    private static JsonArray BuildToolDefsArray(IReadOnlyList<ToolDefinition> toolDefs)
-    {
-        var array = new JsonArray();
-        foreach (var def in toolDefs)
-        {
-            array.Add(new JsonObject
-            {
-                ["name"] = def.Name,
-                ["description"] = def.Description,
-                ["inputSchema"] = def.InputSchemaJson,
-            });
-        }
-
-        return array;
-    }
-
-    private static IReadOnlyList<ToolDefinition> DeserializeToolDefs(JsonArray array)
-    {
-        var list = new List<ToolDefinition>(array.Count);
-        foreach (var item in array)
-        {
-            if (item is not JsonObject obj)
-            {
-                continue;
-            }
-
-            list.Add(new ToolDefinition(
-                obj["name"]?.GetValue<string>() ?? string.Empty,
-                obj["description"]?.GetValue<string>() ?? string.Empty,
-                obj["inputSchema"]?.GetValue<string>() ?? string.Empty));
-        }
-
-        return list;
-    }
+    // Tool-call / tool-def JSON shape is shared with SessionBundleService via AuditJson so the
+    // bundle round-trips the sidecar exactly.
 
     private static SessionAuditTurn ParseLine(string line, ref string? currentSystemPrompt, ref IReadOnlyList<ToolDefinition> currentToolDefs)
     {
@@ -250,7 +170,7 @@ public sealed class SessionAuditStore(string workingDirectory)
         var stopReason = obj["stopReason"]?.GetValue<string>();
 
         var toolCallsArray = obj["toolCalls"]?.AsArray();
-        var toolCalls = toolCallsArray is not null ? DeserializeToolCalls(toolCallsArray) : (IReadOnlyList<ToolCallRecord>)[];
+        var toolCalls = toolCallsArray is not null ? AuditJson.DeserializeToolCalls(toolCallsArray) : (IReadOnlyList<ToolCallRecord>)[];
 
         if (obj["systemPrompt"] is JsonValue systemPromptValue)
         {
@@ -259,7 +179,7 @@ public sealed class SessionAuditStore(string workingDirectory)
 
         if (obj["toolDefs"] is JsonArray toolDefsArray)
         {
-            currentToolDefs = DeserializeToolDefs(toolDefsArray);
+            currentToolDefs = AuditJson.DeserializeToolDefs(toolDefsArray);
         }
 
         return new SessionAuditTurn
