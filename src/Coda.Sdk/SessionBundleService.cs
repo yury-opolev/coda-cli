@@ -176,8 +176,12 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
 
                 // Per-turn system-prompt/tool-defs change history is not preserved across
                 // export/import (known v1 limitation) — the effective final values are stored
-                // top-level and reattached to the first turn; change-only emission on append then
-                // carries them forward for the rest.
+                // top-level. Attach them to EVERY reconstructed turn: change-only emission then
+                // writes them once on turn 0 and OMITS them on unchanged later turns, and
+                // carry-forward on load restores the effective value for every turn. Passing an
+                // empty ToolDefs (or null SystemPrompt) on later turns would NOT be a no-op — it
+                // differs from the last-emitted non-empty value, so the store would emit the empty
+                // array and clobber the carried-forward tool-def history on reload.
                 var auditTurn = new SessionAuditTurn
                 {
                     TurnIndex = assistantIndex,
@@ -187,8 +191,8 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
                     InputTokens = turn.InputTokens ?? 0,
                     OutputTokens = turn.OutputTokens ?? 0,
                     StopReason = turn.StopReason,
-                    SystemPrompt = assistantIndex == 0 ? bundle.SystemPrompt : null,
-                    ToolDefs = assistantIndex == 0 ? bundle.ToolDefs : [],
+                    SystemPrompt = bundle.SystemPrompt,
+                    ToolDefs = bundle.ToolDefs,
                 };
 
                 await auditStore.AppendTurnAsync(targetId, auditTurn, ct).ConfigureAwait(false);

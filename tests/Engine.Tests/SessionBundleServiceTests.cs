@@ -130,4 +130,57 @@ public sealed class SessionBundleServiceTests : IDisposable
 
         await Assert.ThrowsAsync<InvalidOperationException>(() => svc.ImportAsync(bad));
     }
+
+    [Fact]
+    public async Task ImportAsync_carries_tool_defs_and_system_prompt_forward_to_later_turns()
+    {
+        var transcript = new SessionTranscriptStore(this.tempDir);
+        await transcript.SaveAsync("m1",
+        [
+            new(ChatRole.User, [new TextBlock("q1")]),
+            new(ChatRole.Assistant, [new TextBlock("a1")]),
+            new(ChatRole.User, [new TextBlock("q2")]),
+            new(ChatRole.Assistant, [new TextBlock("a2")]),
+        ]);
+        var audit = new SessionAuditStore(this.tempDir);
+        for (var i = 0; i < 2; i++)
+        {
+            await audit.AppendTurnAsync("m1", new SessionAuditTurn
+            {
+                TurnIndex = i,
+                TsUtc = new DateTime(2026, 7, 13, 9, 0, i, DateTimeKind.Utc),
+                Provider = "github-copilot",
+                Model = "claude-opus-4.8",
+                InputTokens = 100 + i,
+                OutputTokens = 10 + i,
+                StopReason = "end_turn",
+                SystemPrompt = "SYSTEM-PROMPT-TEXT",
+                ToolDefs = [new ToolDefinition("read_file", "reads", "{}")],
+            });
+        }
+
+        var svc = new SessionBundleService(this.tempDir, "0.1.63");
+        var bundle = await svc.ExportAsync("m1", FixedExport);
+        var outPath = Path.Combine(this.tempDir, "m1.coda-session.json");
+        await svc.WriteAsync(bundle!, outPath, pretty: false);
+
+        var otherDir = Directory.CreateTempSubdirectory("coda_bundle_dst_").FullName;
+        try
+        {
+            var svc2 = new SessionBundleService(otherDir, "0.1.63");
+            var importedId = await svc2.ImportAsync(outPath);
+
+            var turns = await new SessionAuditStore(otherDir).LoadAsync(importedId);
+            Assert.Equal(2, turns.Count);
+            foreach (var turn in turns)
+            {
+                Assert.Equal("SYSTEM-PROMPT-TEXT", turn.SystemPrompt);
+                Assert.Equal("read_file", Assert.Single(turn.ToolDefs).Name);
+            }
+        }
+        finally
+        {
+            try { Directory.Delete(otherDir, recursive: true); } catch { /* ignore */ }
+        }
+    }
 }
