@@ -97,6 +97,20 @@ public sealed class ModelListingTests
         Assert.Null(models.Single(m => m.Id == "nolimits").ContextLimit);
     }
 
+    [Fact]
+    public void Copilot_ParseModels_reads_supported_endpoints()
+    {
+        const string json = """
+            {"data":[
+              {"id":"gpt-5.6-sol","name":"GPT-5.6 Sol","supported_endpoints":["/v1/messages","/v1/responses"],"capabilities":{"type":"chat"}}
+            ]}
+            """;
+
+        var model = Assert.Single(CopilotChatClient.ParseModels(json));
+
+        Assert.Equal(["/v1/messages", "/v1/responses"], model.SupportedEndpoints);
+    }
+
     // ── Network paths ────────────────────────────────────────────────────────
 
     private sealed class JsonHandler(HttpStatusCode status, string body) : HttpMessageHandler

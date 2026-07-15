@@ -179,6 +179,11 @@ without blocking; `/model refresh` forces it. Override the host with `CODA_MODEL
 or disable all fetching with `CODA_DISABLE_MODELS_FETCH=1`. The in-repo snapshot is
 regenerated with `./scripts/update-models-snapshot.ps1`.
 
+For GitHub Copilot request routing, the authenticated `GET /models` response is
+authoritative: Coda reads each model's `supported_endpoints` and uses `/responses`,
+`/v1/messages`, or `/chat/completions` as advertised. This lets newly released models
+work without a hard-coded model-name list.
+
 The headless equivalent of the `/model` listing is **`coda models`**:
 
 ```powershell

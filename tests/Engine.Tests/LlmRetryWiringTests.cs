@@ -32,6 +32,14 @@ public sealed class LlmRetryWiringTests
 
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            if (request.Method == HttpMethod.Get && request.RequestUri?.AbsolutePath == "/models")
+            {
+                return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent("""{"data":[]}""", Encoding.UTF8, "application/json"),
+                });
+            }
+
             var n = Interlocked.Increment(ref this.calls);
             if (n <= this.failures)
             {
