@@ -24,4 +24,11 @@ public interface ILlmClient
     /// </summary>
     Task<IReadOnlyList<ModelInfo>> ListModelsAsync(CancellationToken cancellationToken = default) =>
         Task.FromResult<IReadOnlyList<ModelInfo>>([]);
+
+    /// <summary>
+    /// Force-refresh the provider's model metadata when supported. The default
+    /// delegates to <see cref="ListModelsAsync"/>.
+    /// </summary>
+    Task<IReadOnlyList<ModelInfo>> RefreshModelsAsync(CancellationToken cancellationToken = default) =>
+        this.ListModelsAsync(cancellationToken);
 }

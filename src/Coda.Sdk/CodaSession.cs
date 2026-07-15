@@ -595,7 +595,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             try
             {
-                live = await client.ListModelsAsync(cancellationToken).ConfigureAwait(false);
+                live = refresh
+                    ? await client.RefreshModelsAsync(cancellationToken).ConfigureAwait(false)
+                    : await client.ListModelsAsync(cancellationToken).ConfigureAwait(false);
             }
             finally
             {

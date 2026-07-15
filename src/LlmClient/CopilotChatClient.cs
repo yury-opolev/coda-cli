@@ -27,6 +27,7 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
     private readonly LlmHttpTimeoutConfig timeoutConfig;
     private readonly IStreamProgressSink progressSink;
     private readonly ILlmRetryPolicy retryPolicy;
+    private IReadOnlyList<ModelInfo>? modelMetadata;
 
     public CopilotChatClient(
         CredentialManager credentials,
@@ -41,6 +42,11 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.ProviderId = providerId;
         this.baseUrl = (baseUrl ?? DefaultBaseUrl).TrimEnd('/');
+        if (CopilotModelMetadataCache.TryGet(this.baseUrl, out var cachedModels))
+        {
+            this.modelMetadata = cachedModels;
+        }
+
         this.logger = logger ?? NullLogger.Instance;
         this.timeoutConfig = timeoutConfig ?? LlmHttpTimeoutConfig.FromEnvironment();
         this.progressSink = progressSink ?? NullStreamProgressSink.Instance;
@@ -86,9 +92,10 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
         }
 
         var callToken = callCts.Token;
-
         var auth = await this.credentials.GetAuthHeadersAsync(this.ProviderId, callToken).ConfigureAwait(false);
-        var bodyJson = OpenAiRequest.Build(request).ToJsonString();
+        await this.ListModelsAsync(callToken).ConfigureAwait(false);
+        var endpoint = this.ResolveEndpoint(request.Model);
+        var bodyJson = BuildRequestBody(request, endpoint);
 
         var requestId = LlmRequestLog.NewId();
         this.LogRequestStart(request.Model);
@@ -105,112 +112,201 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
             this.LogRequestBody(requestId, TelemetryText.Truncate(SecretRedactor.RedactJson(bodyJson)));
         }
 
+        HttpResponseMessage response;
+        try
+        {
+            response = await this.SendAsync(
+                auth,
+                request.Model,
+                bodyJson,
+                endpoint,
+                callToken).ConfigureAwait(false);
+        }
+        catch (LlmClientException ex) when (endpoint == CopilotEndpoint.ChatCompletions && IsChatEndpointMismatch(ex))
+        {
+            await this.ListModelsAsync(callToken).ConfigureAwait(false);
+            endpoint = this.ResolveEndpoint(request.Model);
+            if (endpoint == CopilotEndpoint.ChatCompletions)
+            {
+                throw;
+            }
+
+            bodyJson = BuildRequestBody(request, endpoint);
+            response = await this.SendAsync(
+                auth,
+                request.Model,
+                bodyJson,
+                endpoint,
+                callToken).ConfigureAwait(false);
+        }
+
+        using (response)
+        {
+            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var accumulator = new LlmResponseAccumulator();
+            var stream = await response.Content.ReadAsStreamAsync(callToken).ConfigureAwait(false);
+            await using (stream.ConfigureAwait(false))
+            {
+                var providerEvents = endpoint switch
+                {
+                    CopilotEndpoint.Messages => AnthropicSseReader.ReadAsync(stream, callToken),
+                    CopilotEndpoint.Responses => OpenAiResponsesSseReader.ReadAsync(stream, callToken),
+                    _ => OpenAiSseReader.ReadAsync(stream, callToken),
+                };
+                var events = LlmHttpTimeoutGuards.WithStreamIdleTimeout(
+                    providerEvents,
+                    this.timeoutConfig,
+                    elapsed => this.progressSink.OnChunk(0, 0, (long)elapsed.TotalMilliseconds),
+                    callToken);
+
+                // Manual enumeration so an overall-deadline trip (callCts fired, but NOT the
+                // caller's token) maps to a clear LlmHttpTimeoutException instead of a bare
+                // OperationCanceledException. (A `yield return` cannot live inside try/catch.)
+                await using var enumerator = events.GetAsyncEnumerator(callToken);
+                var progressChunks = 0;
+                var progressChars = 0;
+                var firstTokenSeen = false;
+                while (true)
+                {
+                    bool moved;
+                    try
+                    {
+                        moved = await enumerator.MoveNextAsync().ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && callCts.IsCancellationRequested)
+                    {
+                        throw LlmHttpTimeoutException.Overall(this.timeoutConfig.OverallCallTimeout);
+                    }
+
+                    if (!moved)
+                    {
+                        break;
+                    }
+
+                    var streamEvent = enumerator.Current;
+                    accumulator.Observe(streamEvent);
+                    if (streamEvent.Kind is AssistantEventKind.TextDelta or AssistantEventKind.ToolUse)
+                    {
+                        if (!firstTokenSeen)
+                        {
+                            firstTokenSeen = true;
+                            this.progressSink.OnFirstToken(stopwatch.ElapsedMilliseconds);
+                        }
+
+                        progressChunks++;
+                        progressChars += streamEvent.Text?.Length ?? 0;
+                        this.progressSink.OnChunk(progressChunks, progressChars, stopwatch.ElapsedMilliseconds);
+                    }
+
+                    yield return streamEvent;
+                }
+
+                this.progressSink.OnCompleted(progressChunks, progressChars, stopwatch.ElapsedMilliseconds, accumulator.StopReason);
+            }
+
+            if (this.logger.IsEnabled(LogLevel.Trace))
+            {
+                this.LogResponseTrace(
+                    requestId,
+                    request.Model,
+                    TelemetryText.Truncate(SecretRedactor.Redact(accumulator.Content)),
+                    accumulator.StopReason ?? "(none)",
+                    accumulator.Usage?.InputTokens ?? 0,
+                    accumulator.Usage?.OutputTokens ?? 0,
+                    stopwatch.ElapsedMilliseconds);
+            }
+        }
+    }
+
+    private async Task<HttpResponseMessage> SendAsync(
+        AuthHeaders auth,
+        string model,
+        string bodyJson,
+        CopilotEndpoint endpoint,
+        CancellationToken cancellationToken)
+    {
         // Retry the headers phase only (send + status check) so a transient 5xx self-heals
         // without ever re-emitting a partial stream. A fresh request is built per attempt
         // (an HttpRequestMessage cannot be sent twice). A permanent 4xx fails fast.
         var headersStopwatch = System.Diagnostics.Stopwatch.StartNew();
-        using var response = await this.retryPolicy.ExecuteAsync(
+        var response = await this.retryPolicy.ExecuteAsync(
             async (attempt, ct) =>
             {
                 // Restart per attempt so the logged latency reflects only the final (successful)
                 // round-trip, not the failed attempts and their retry backoff.
                 headersStopwatch.Restart();
-                var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{this.baseUrl}/chat/completions");
+                var path = endpoint switch
+                {
+                    CopilotEndpoint.Messages => "/v1/messages",
+                    CopilotEndpoint.Responses => "/responses",
+                    _ => "/chat/completions",
+                };
+                var httpRequest = new HttpRequestMessage(HttpMethod.Post, $"{this.baseUrl}{path}");
                 foreach (var (name, value) in auth.Headers)
                 {
                     httpRequest.Headers.TryAddWithoutValidation(name, value);
                 }
 
+                if (endpoint == CopilotEndpoint.Messages)
+                {
+                    httpRequest.Headers.TryAddWithoutValidation("anthropic-version", "2023-06-01");
+                }
+
                 httpRequest.Content = new StringContent(bodyJson, Encoding.UTF8, "application/json");
 
-                var resp = await LlmHttpTimeoutGuards
+                var response = await LlmHttpTimeoutGuards
                     .SendWithHeadersTimeoutAsync(this.http, httpRequest, this.timeoutConfig, ct)
                     .ConfigureAwait(false);
-                if (!resp.IsSuccessStatusCode)
+                if (!response.IsSuccessStatusCode)
                 {
-                    var status = (int)resp.StatusCode;
-                    var body = await resp.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
-                    resp.Dispose();
-                    this.LogRequestFailed(status, request.Model, SecretRedactor.RedactJson(body));
+                    var status = (int)response.StatusCode;
+                    var body = await response.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                    response.Dispose();
+                    this.LogRequestFailed(status, model, SecretRedactor.RedactJson(body));
                     throw new LlmClientException(status, body);
                 }
 
-                return resp;
+                return response;
             },
-            callToken).ConfigureAwait(false);
+            cancellationToken).ConfigureAwait(false);
 
-        // Split the two latency phases so a "slow call" can be attributed: the HTTP round-trip to
-        // response headers (network + provider accept) is logged here; the wait from headers to the
-        // first token (model-generation latency) is the "first token after Nms" line below.
-        this.LogHeadersReceived(request.Model, headersStopwatch.ElapsedMilliseconds);
+        this.LogHeadersReceived(model, headersStopwatch.ElapsedMilliseconds);
+        return response;
+    }
 
-        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
-        var accumulator = new LlmResponseAccumulator();
-        var stream = await response.Content.ReadAsStreamAsync(callToken).ConfigureAwait(false);
-        await using (stream.ConfigureAwait(false))
+    private static string BuildRequestBody(ChatRequest request, CopilotEndpoint endpoint) =>
+        endpoint switch
         {
-            var events = LlmHttpTimeoutGuards.WithStreamIdleTimeout(
-                OpenAiSseReader.ReadAsync(stream, callToken),
-                this.timeoutConfig,
-                elapsed => this.progressSink.OnChunk(0, 0, (long)elapsed.TotalMilliseconds),
-                callToken);
+            CopilotEndpoint.Messages => AnthropicMessagesClient.BuildBody(request).ToJsonString(),
+            CopilotEndpoint.Responses => OpenAiResponsesRequest.Build(request).ToJsonString(),
+            _ => OpenAiRequest.Build(request).ToJsonString(),
+        };
 
-            // Manual enumeration so an overall-deadline trip (callCts fired, but NOT the
-            // caller's token) maps to a clear LlmHttpTimeoutException instead of a bare
-            // OperationCanceledException. (A `yield return` cannot live inside try/catch.)
-            await using var enumerator = events.GetAsyncEnumerator(callToken);
-            var progressChunks = 0;
-            var progressChars = 0;
-            var firstTokenSeen = false;
-            while (true)
-            {
-                bool moved;
-                try
-                {
-                    moved = await enumerator.MoveNextAsync().ConfigureAwait(false);
-                }
-                catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested && callCts.IsCancellationRequested)
-                {
-                    throw LlmHttpTimeoutException.Overall(this.timeoutConfig.OverallCallTimeout);
-                }
+    private static bool IsChatEndpointMismatch(LlmClientException exception) =>
+        exception.StatusCode == 400
+        && exception.ResponseBody.Contains("/chat/completions", StringComparison.OrdinalIgnoreCase)
+        && (exception.ResponseBody.Contains("not accessible", StringComparison.OrdinalIgnoreCase)
+            || exception.ResponseBody.Contains("not supported", StringComparison.OrdinalIgnoreCase));
 
-                if (!moved)
-                {
-                    break;
-                }
-
-                var streamEvent = enumerator.Current;
-                accumulator.Observe(streamEvent);
-                if (streamEvent.Kind is AssistantEventKind.TextDelta or AssistantEventKind.ToolUse)
-                {
-                    if (!firstTokenSeen)
-                    {
-                        firstTokenSeen = true;
-                        this.progressSink.OnFirstToken(stopwatch.ElapsedMilliseconds);
-                    }
-
-                    progressChunks++;
-                    progressChars += streamEvent.Text?.Length ?? 0;
-                    this.progressSink.OnChunk(progressChunks, progressChars, stopwatch.ElapsedMilliseconds);
-                }
-
-                yield return streamEvent;
-            }
-
-            this.progressSink.OnCompleted(progressChunks, progressChars, stopwatch.ElapsedMilliseconds, accumulator.StopReason);
+    private CopilotEndpoint ResolveEndpoint(string model)
+    {
+        var metadata = this.modelMetadata?.FirstOrDefault(candidate =>
+            string.Equals(candidate.Id, model, StringComparison.OrdinalIgnoreCase));
+        var endpoints = metadata?.SupportedEndpoints ?? [];
+        if (endpoints.Any(endpoint =>
+            string.Equals(endpoint, "/responses", StringComparison.OrdinalIgnoreCase)
+            || string.Equals(endpoint, "/v1/responses", StringComparison.OrdinalIgnoreCase)))
+        {
+            return CopilotEndpoint.Responses;
         }
 
-        if (this.logger.IsEnabled(LogLevel.Trace))
+        if (endpoints.Any(endpoint =>
+            string.Equals(endpoint, "/v1/messages", StringComparison.OrdinalIgnoreCase)))
         {
-            this.LogResponseTrace(
-                requestId,
-                request.Model,
-                TelemetryText.Truncate(SecretRedactor.Redact(accumulator.Content)),
-                accumulator.StopReason ?? "(none)",
-                accumulator.Usage?.InputTokens ?? 0,
-                accumulator.Usage?.OutputTokens ?? 0,
-                stopwatch.ElapsedMilliseconds);
+            return CopilotEndpoint.Messages;
         }
+
+        return CopilotEndpoint.ChatCompletions;
     }
 
     /// <summary>
@@ -220,30 +316,59 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
     /// </summary>
     public async Task<IReadOnlyList<ModelInfo>> ListModelsAsync(CancellationToken cancellationToken = default)
     {
-        using var httpRequest = new HttpRequestMessage(HttpMethod.Get, $"{this.baseUrl}/models");
+        if (this.modelMetadata is not null)
+        {
+            return this.modelMetadata;
+        }
+
         try
         {
             var auth = await this.credentials.GetAuthHeadersAsync(this.ProviderId, cancellationToken).ConfigureAwait(false);
-            foreach (var (name, value) in auth.Headers)
-            {
-                httpRequest.Headers.TryAddWithoutValidation(name, value);
-            }
+            using var response = await this.retryPolicy.ExecuteAsync(
+                async (attempt, ct) =>
+                {
+                    using var request = new HttpRequestMessage(HttpMethod.Get, $"{this.baseUrl}/models");
+                    foreach (var (name, value) in auth.Headers)
+                    {
+                        request.Headers.TryAddWithoutValidation(name, value);
+                    }
 
-            using var response = await LlmHttpTimeoutGuards
-                .SendNonStreamingAsync(this.http, httpRequest, this.timeoutConfig, cancellationToken)
-                .ConfigureAwait(false);
-            if (!response.IsSuccessStatusCode)
-            {
-                return [];
-            }
+                    var result = await LlmHttpTimeoutGuards
+                        .SendNonStreamingAsync(this.http, request, this.timeoutConfig, ct)
+                        .ConfigureAwait(false);
+                    if (!result.IsSuccessStatusCode)
+                    {
+                        var status = (int)result.StatusCode;
+                        var body = await result.Content.ReadAsStringAsync(ct).ConfigureAwait(false);
+                        result.Dispose();
+                        throw new LlmClientException(status, body);
+                    }
+
+                    return result;
+                },
+                cancellationToken).ConfigureAwait(false);
 
             var json = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            return ParseModels(json);
+            var models = ParseModels(json);
+            if (models.Count > 0)
+            {
+                this.modelMetadata = models;
+                CopilotModelMetadataCache.Set(this.baseUrl, models);
+            }
+
+            return models;
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or LlmHttpTimeoutException or System.Text.Json.JsonException or LlmAuth.LlmAuthException)
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or LlmHttpTimeoutException or LlmClientException or System.Text.Json.JsonException or LlmAuth.LlmAuthException)
         {
             return [];
         }
+    }
+
+    public Task<IReadOnlyList<ModelInfo>> RefreshModelsAsync(CancellationToken cancellationToken = default)
+    {
+        this.modelMetadata = null;
+        CopilotModelMetadataCache.Remove(this.baseUrl);
+        return this.ListModelsAsync(cancellationToken);
     }
 
     /// <summary>
@@ -291,7 +416,11 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
 
             if (seen.Add(id))
             {
-                models.Add(new ModelInfo(id, (string?)item["name"], ReadContextLimit(item)));
+                models.Add(new ModelInfo(
+                    id,
+                    (string?)item["name"],
+                    ReadContextLimit(item),
+                    ReadSupportedEndpoints(item)));
             }
         }
 
@@ -312,6 +441,22 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
         }
 
         return (int?)limits["max_context_window_tokens"] ?? (int?)limits["max_prompt_tokens"];
+    }
+
+    private static IReadOnlyList<string> ReadSupportedEndpoints(JsonNode item)
+    {
+        if (item["supported_endpoints"] is not JsonArray endpoints)
+        {
+            return [];
+        }
+
+        return
+        [
+            .. endpoints
+                .Select(endpoint => (string?)endpoint)
+                .Where(endpoint => !string.IsNullOrWhiteSpace(endpoint))
+                .Select(endpoint => endpoint!),
+        ];
     }
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Copilot request: model {model}")]
