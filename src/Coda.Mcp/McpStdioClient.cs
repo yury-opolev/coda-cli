@@ -14,10 +14,27 @@ public class McpStdioClient : IMcpClient
 {
     private const string ProtocolVersion = "2025-06-18";
 
+    /// <summary>
+    /// Race-closing window used only when a transport failure and the child's exit may be
+    /// reported out of order: it is not a retry or startup delay. When stdout EOF surfaces just
+    /// before the OS marks the process exited, we wait this long for the exit (and then for the
+    /// stderr drain) so the failure can be attributed precisely.
+    /// </summary>
+    private static readonly TimeSpan ExitGracePeriod = TimeSpan.FromMilliseconds(250);
+
+    /// <summary>
+    /// A single UTF-8 encoding without a byte-order mark, reused for every child's stdin so the
+    /// first bytes we write are never <c>EF BB BF</c> (which servers may mis-parse as content).
+    /// </summary>
+    private static readonly UTF8Encoding StdinEncoding = new(encoderShouldEmitUTF8Identifier: false);
+
     private readonly Process? process;
     private readonly McpRpcConnection rpc;
     private readonly CancellationTokenSource readLoopCts = new();
     private readonly Task readLoop;
+    private readonly CancellationTokenSource? stderrCts;
+    private readonly Task stderrDrain;
+    private readonly McpProcessDiagnostics? diagnostics;
 
     public McpStdioClient(string serverName, McpStdioServerConfig config)
     {
@@ -34,7 +51,8 @@ public class McpStdioClient : IMcpClient
             UseShellExecute = false,
             CreateNoWindow = true,
             StandardOutputEncoding = Encoding.UTF8,
-            StandardInputEncoding = Encoding.UTF8,
+            StandardErrorEncoding = Encoding.UTF8,
+            StandardInputEncoding = StdinEncoding,
         };
         foreach (var arg in config.Args)
         {
@@ -50,6 +68,12 @@ public class McpStdioClient : IMcpClient
         this.process.StandardInput.NewLine = "\n";
         this.rpc = new McpRpcConnection(this.process.StandardInput);
         this.readLoop = this.rpc.RunReadLoopAsync(this.process.StandardOutput, this.readLoopCts.Token);
+
+        // Drain stderr for the whole process lifetime, starting immediately: diagnostics must not
+        // depend on (or wait for) a startup failure to be captured.
+        this.diagnostics = new McpProcessDiagnostics();
+        this.stderrCts = new CancellationTokenSource();
+        this.stderrDrain = this.diagnostics.DrainAsync(this.process.StandardError, this.stderrCts.Token);
     }
 
     /// <summary>
@@ -64,6 +88,9 @@ public class McpStdioClient : IMcpClient
         this.process = null;
         this.rpc = rpc;
         this.readLoop = Task.CompletedTask;
+        this.stderrCts = null;
+        this.stderrDrain = Task.CompletedTask;
+        this.diagnostics = null;
     }
 
     public string ServerName { get; }
@@ -79,12 +106,81 @@ public class McpStdioClient : IMcpClient
             ["capabilities"] = new JsonObject(),
             ["clientInfo"] = new JsonObject { ["name"] = "coda", ["version"] = "0.1" },
         };
-        var initResult = await this.rpc.SendRequestAsync("initialize", initParams, cancellationToken).ConfigureAwait(false);
+        var initResult = await this.SendStartupRequestAsync("initialize", initParams, cancellationToken).ConfigureAwait(false);
         this.ServerInfo = McpServerInfo.Parse(initResult);
         await this.rpc.SendNotificationAsync("notifications/initialized").ConfigureAwait(false);
 
-        var toolsResult = await this.rpc.SendRequestAsync("tools/list", null, cancellationToken).ConfigureAwait(false);
+        var toolsResult = await this.SendStartupRequestAsync("tools/list", null, cancellationToken).ConfigureAwait(false);
         return McpToolInfo.ParseList(toolsResult);
+    }
+
+    /// <summary>
+    /// Send a startup-phase request (<c>initialize</c> / <c>tools/list</c>) and translate failures
+    /// into precise <see cref="McpConnectionException"/>s. Caller cancellation becomes
+    /// <see cref="McpConnectionException.Canceled"/>. A transport <see cref="McpException"/> is
+    /// attributed to an owned child that exited (<see cref="McpConnectionException.ProcessExited"/>)
+    /// only after a short grace window closes the ordering race; otherwise the original exception is
+    /// rethrown unchanged. A process-less (test-only) client always preserves the original.
+    /// </summary>
+    private async Task<JsonElement> SendStartupRequestAsync(string phase, JsonNode? parameters, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await this.rpc.SendRequestAsync(phase, parameters, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException ex) when (cancellationToken.IsCancellationRequested)
+        {
+            throw McpConnectionException.Canceled(this.ServerName, phase, ex);
+        }
+        catch (McpException ex)
+        {
+            if (this.process is null)
+            {
+                throw;
+            }
+
+            if (!this.process.HasExited)
+            {
+                // The transport loss may have raced ahead of the OS reporting the exit: give the
+                // exit a bounded moment to surface before deciding.
+                await WaitForExitWithinGraceAsync(this.process).ConfigureAwait(false);
+            }
+
+            if (!this.process.HasExited)
+            {
+                throw;
+            }
+
+            await this.WaitForDrainWithinGraceAsync().ConfigureAwait(false);
+            var stderr = this.diagnostics?.SnapshotTail();
+            throw McpConnectionException.ProcessExited(this.ServerName, phase, this.process.ExitCode, stderr);
+        }
+    }
+
+    private static async Task WaitForExitWithinGraceAsync(Process process)
+    {
+        using var graceCts = new CancellationTokenSource(ExitGracePeriod);
+        try
+        {
+            await process.WaitForExitAsync(graceCts.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Grace elapsed and the process is still running; the caller re-checks HasExited.
+        }
+    }
+
+    private async Task WaitForDrainWithinGraceAsync()
+    {
+        try
+        {
+            await this.stderrDrain.WaitAsync(ExitGracePeriod).ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            // Best-effort: a timed-out or faulted drain must not replace the ProcessExited failure;
+            // we snapshot whatever sanitized stderr was captured so far.
+        }
     }
 
     /// <summary>Invoke a tool and return its formatted result.</summary>
@@ -168,6 +264,11 @@ public class McpStdioClient : IMcpClient
     public async ValueTask DisposeAsync()
     {
         await this.readLoopCts.CancelAsync().ConfigureAwait(false);
+        if (this.stderrCts is not null)
+        {
+            await this.stderrCts.CancelAsync().ConfigureAwait(false);
+        }
+
         try
         {
             if (this.process is not null && !this.process.HasExited)
@@ -192,7 +293,18 @@ public class McpStdioClient : IMcpClient
             // dispose is the normal consequence of the kill above and carries nothing actionable.
         }
 
+        try
+        {
+            await this.stderrDrain.ConfigureAwait(false);
+        }
+        catch
+        {
+            // best-effort: the stderr drain faults on the cancellation/kill above; nothing here is
+            // actionable and teardown errors must never mask an earlier connection failure.
+        }
+
         this.readLoopCts.Dispose();
+        this.stderrCts?.Dispose();
         this.process?.Dispose();
     }
 }

@@ -6,6 +6,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\Coda.Agent\Coda.Agent.csproj" />
+    <ProjectReference Include="..\Coda.Common\Coda.Common.csproj" />
     <ProjectReference Include="..\LlmAuth\LlmAuth.csproj" />
   </ItemGroup>
 
