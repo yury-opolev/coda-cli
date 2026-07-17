@@ -124,6 +124,37 @@ public sealed class UiPromptServiceTests
     }
 
     [Fact]
+    public async Task Actor_cancellation_racing_publish_orders_request_before_cancellation_response()
+    {
+        using var cts = new CancellationTokenSource();
+
+        // The publisher cancels the token the instant it receives the request event, exposing any
+        // interleaving between publishing the request and registering the cancellation callback.
+        var publisher = new CancelOnRequestPublisher(cts);
+        var service = new ActorUiPromptService(publisher);
+
+        var task = service.RequestAsync(UiPromptRequest.Confirm("A?", defaultValue: false), cts.Token);
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+
+        // The request must be recorded (and thus reduced) before its cancellation response;
+        // otherwise the reducer is left with a stale PendingPrompt.
+        Assert.Equal(2, publisher.Events.Count);
+        var requested = Assert.IsType<UiPromptRequestedEvent>(publisher.Events[0]);
+        var response = Assert.IsType<UiPromptResponseSubmittedEvent>(publisher.Events[1]);
+        Assert.Equal(requested.Request.Id, response.RequestId);
+        Assert.True(response.Response.Cancelled);
+
+        var state = UiSessionSnapshot.Empty;
+        foreach (var uiEvent in publisher.Events)
+        {
+            state = UiReducer.Reduce(state, uiEvent);
+        }
+
+        Assert.Null(state.PendingPrompt);
+    }
+
+    [Fact]
     public void Spectre_fallback_factory_is_interactive_for_interactive_console()
     {
         using var console = new TestConsole();
@@ -280,6 +311,28 @@ public sealed class UiPromptServiceTests
         public List<UiEvent> Events { get; } = [];
 
         public void Publish(UiEvent uiEvent) => this.Events.Add(uiEvent);
+    }
+
+    private sealed class CancelOnRequestPublisher : IUiEventPublisher
+    {
+        private readonly CancellationTokenSource _cts;
+
+        public CancelOnRequestPublisher(CancellationTokenSource cts) => this._cts = cts;
+
+        public List<UiEvent> Events { get; } = [];
+
+        public void Publish(UiEvent uiEvent)
+        {
+            // Cancel before recording the request. If the cancellation callback is registered
+            // before the request is published (the bug), Cancel() runs it synchronously here and
+            // records the cancellation response ahead of this request, inverting the order.
+            if (uiEvent is UiPromptRequestedEvent)
+            {
+                this._cts.Cancel();
+            }
+
+            this.Events.Add(uiEvent);
+        }
     }
 
     private sealed class FakeTool : ITool

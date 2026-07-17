@@ -42,12 +42,36 @@ public sealed class ActorUiPromptService : IUiPromptService
             _pending[request.Id] = tcs;
         }
 
-        // Registering before publishing avoids losing an already-cancelled token; removing on
-        // cancellation touches only this request's entry so other pending prompts survive.
-        CancellationTokenRegistration registration = default;
+        // Publish the request BEFORE registering the cancellation callback. A cancellation that
+        // races in during Publish must never emit its response ahead of the request, which would
+        // leave the reducer with a stale PendingPrompt. Publishing first, then registering, means
+        // that if the token is (or becomes) cancelled by now, CancellationToken.Register invokes
+        // the callback synchronously below — after the request is already published — guaranteeing
+        // request -> cancellation-response order.
+        try
+        {
+            _publisher.Publish(new UiPromptRequestedEvent(request));
+        }
+        catch
+        {
+            lock (_lock)
+            {
+                if (_pending.TryGetValue(request.Id, out var existing) && ReferenceEquals(existing, tcs))
+                {
+                    _pending.Remove(request.Id);
+                }
+            }
+
+            throw;
+        }
+
+        // Register after publishing; removing on cancellation touches only this request's entry so
+        // other pending prompts survive. If the token was already cancelled during Publish, Register
+        // runs the callback synchronously right here, emitting the cancellation response after the
+        // request that is now live in the reducer.
         if (cancellationToken.CanBeCanceled)
         {
-            registration = cancellationToken.Register(static state =>
+            CancellationTokenRegistration registration = cancellationToken.Register(static state =>
             {
                 var (service, id, source, token) = ((ActorUiPromptService, Guid, TaskCompletionSource<UiPromptResponse>, CancellationToken))state!;
 
@@ -86,30 +110,14 @@ public sealed class ActorUiPromptService : IUiPromptService
             }, (this, request.Id, tcs, cancellationToken));
 
             // Dispose the registration once the prompt resolves so long-lived tokens don't leak it.
+            // Safe even if the callback already ran synchronously during Register above: the task is
+            // then already completed and this continuation runs synchronously to dispose.
             tcs.Task.ContinueWith(
                 static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
                 registration,
                 CancellationToken.None,
                 TaskContinuationOptions.ExecuteSynchronously,
                 TaskScheduler.Default);
-        }
-
-        try
-        {
-            _publisher.Publish(new UiPromptRequestedEvent(request));
-        }
-        catch
-        {
-            lock (_lock)
-            {
-                if (_pending.TryGetValue(request.Id, out var existing) && ReferenceEquals(existing, tcs))
-                {
-                    _pending.Remove(request.Id);
-                }
-            }
-
-            registration.Dispose();
-            throw;
         }
 
         return tcs.Task;
