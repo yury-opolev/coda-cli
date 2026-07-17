@@ -8,7 +8,9 @@ namespace Coda.Tui.Ui.Prompts;
 /// <see cref="TaskCompletionSource{TResult}"/> keyed by request id and publishes a
 /// <see cref="UiPromptRequestedEvent"/>; the actor later feeds the matching
 /// <see cref="UiPromptResponseSubmittedEvent"/> back through <see cref="Complete"/> to resolve it.
-/// Cancellation removes and cancels only the caller's own pending prompt.
+/// Cancellation removes and cancels only the caller's own pending prompt, and publishes a matching
+/// cancellation <see cref="UiPromptResponseSubmittedEvent"/> so the reducer clears its stale
+/// <c>PendingPrompt</c>.
 /// </summary>
 public sealed class ActorUiPromptService : IUiPromptService
 {
@@ -30,6 +32,10 @@ public sealed class ActorUiPromptService : IUiPromptService
     {
         ArgumentNullException.ThrowIfNull(request);
 
+        // Deny an already-cancelled request before touching state or publishing anything, so a
+        // pre-cancelled token can never emit a request event that no one will ever answer.
+        cancellationToken.ThrowIfCancellationRequested();
+
         var tcs = new TaskCompletionSource<UiPromptResponse>(TaskCreationOptions.RunContinuationsAsynchronously);
         lock (_lock)
         {
@@ -44,15 +50,39 @@ public sealed class ActorUiPromptService : IUiPromptService
             registration = cancellationToken.Register(static state =>
             {
                 var (service, id, source, token) = ((ActorUiPromptService, Guid, TaskCompletionSource<UiPromptResponse>, CancellationToken))state!;
+
+                // Remove our own entry first so a subsequent UiActor.Complete (from the response we
+                // publish below) no-ops instead of racing to resolve an already-cancelled prompt.
+                bool owned;
                 lock (service._lock)
                 {
-                    if (service._pending.TryGetValue(id, out var existing) && ReferenceEquals(existing, source))
+                    owned = service._pending.TryGetValue(id, out var existing) && ReferenceEquals(existing, source);
+                    if (owned)
                     {
                         service._pending.Remove(id);
                     }
                 }
 
                 source.TrySetCanceled(token);
+
+                // The request event was already published, so its PendingPrompt is live in the
+                // reducer. Emit a matching cancellation response to clear it; only owned prompts
+                // ever published a request. Swallow only shutdown-specific failures from a
+                // cancelled/disposed mailbox — never a broader set.
+                if (owned)
+                {
+                    try
+                    {
+                        service._publisher.Publish(new UiPromptResponseSubmittedEvent(
+                            id, new UiPromptResponse(true, [], null)));
+                    }
+                    catch (OperationCanceledException)
+                    {
+                    }
+                    catch (ObjectDisposedException)
+                    {
+                    }
+                }
             }, (this, request.Id, tcs, cancellationToken));
 
             // Dispose the registration once the prompt resolves so long-lived tokens don't leak it.

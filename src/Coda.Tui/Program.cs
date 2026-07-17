@@ -1,6 +1,7 @@
 using Coda.Tui;
 using Coda.Tui.Repl;
 using Coda.Tui.Setup;
+using Coda.Tui.Ui.Prompts;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -100,7 +101,12 @@ session.Model = string.IsNullOrWhiteSpace(resolvedStartupModel) ? startupProvide
 
 var registry = new SlashCommandRegistry(SlashCommandCatalog.CreateAll());
 
-var context = new CommandContext(console, credentials, session, providers, registry);
+// Wire the interactive Spectre prompt surface as the production fallback so permission requests,
+// user questions, and plan approval stay interactive (events remain no-op until the actor-driven
+// semantic UI is wired). The Plain default is reserved for noninteractive/test callers.
+var context = new CommandContext(
+    console, credentials, session, providers, registry,
+    prompts: UiPromptServiceFactory.ForSpectreFallback(console));
 
 // First run with no credentials → guide the user through connecting.
 if (await FirstRunDetector.IsFirstRunAsync(context, cts.Token))

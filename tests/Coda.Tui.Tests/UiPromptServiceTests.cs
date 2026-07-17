@@ -81,6 +81,61 @@ public sealed class UiPromptServiceTests
     }
 
     [Fact]
+    public async Task Actor_pre_cancelled_request_throws_before_publishing_any_event()
+    {
+        using var mailbox = new UiEventMailbox(8);
+        var service = new ActorUiPromptService(mailbox);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => service.RequestAsync(UiPromptRequest.Confirm("A?", defaultValue: false), cts.Token));
+
+        Assert.Equal(0, mailbox.Count);
+    }
+
+    [Fact]
+    public async Task Actor_cancellation_publishes_response_that_clears_pending_prompt()
+    {
+        using var mailbox = new UiEventMailbox(8);
+        var service = new ActorUiPromptService(mailbox);
+        using var cts = new CancellationTokenSource();
+
+        var task = service.RequestAsync(UiPromptRequest.Confirm("A?", defaultValue: false), cts.Token);
+        var requested = Assert.IsType<UiPromptRequestedEvent>(await mailbox.ReadAsync());
+
+        // PendingPrompt is set once the request event is reduced.
+        var state = UiReducer.Reduce(UiSessionSnapshot.Empty, requested);
+        Assert.Same(requested.Request, state.PendingPrompt);
+
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => task);
+
+        // A matching cancellation response is published so the reducer can clear the stale prompt.
+        Assert.Equal(1, mailbox.Count);
+        var response = Assert.IsType<UiPromptResponseSubmittedEvent>(await mailbox.ReadAsync());
+        Assert.Equal(requested.Request.Id, response.RequestId);
+        Assert.True(response.Response.Cancelled);
+        Assert.Empty(response.Response.SelectedIds);
+        Assert.Null(response.Response.Text);
+
+        var cleared = UiReducer.Reduce(state, response);
+        Assert.Null(cleared.PendingPrompt);
+    }
+
+    [Fact]
+    public void Spectre_fallback_factory_is_interactive_for_interactive_console()
+    {
+        using var console = new TestConsole();
+        console.Profile.Capabilities.Interactive = true;
+
+        var service = UiPromptServiceFactory.ForSpectreFallback(console);
+
+        Assert.IsType<SpectreUiPromptService>(service);
+        Assert.True(service.IsInteractive);
+    }
+
+    [Fact]
     public async Task Actor_unknown_or_duplicate_response_does_not_complete_other_prompts()
     {
         using var mailbox = new UiEventMailbox(8);
