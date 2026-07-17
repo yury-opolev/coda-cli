@@ -478,6 +478,10 @@ git commit -m "feat(tui): add Terminal.Gui mode policy" -m "Co-authored-by: Copi
 ### Task 2: Define typed events, transcript blocks, immutable snapshots, and reducer
 
 **Files:**
+- Create: `src/Coda.Agent/BackgroundTasks/BackgroundTaskSnapshot.cs`
+- Create: `src/Coda.Agent/Lsp/LspServerSnapshot.cs`
+- Create: `src/Coda.Sdk/SessionRuntimeSnapshot.cs`
+- Create: `src/Coda.Mcp/McpRuntimeSnapshot.cs`
 - Create: `src/Coda.Tui/Ui/Events/UiEvent.cs`
 - Create: `src/Coda.Tui/Ui/Events/IUiEventPublisher.cs`
 - Create: `src/Coda.Tui/Ui/State/TranscriptBlock.cs`
@@ -576,6 +580,56 @@ dotnet test tests/Coda.Tui.Tests/Coda.Tui.Tests.csproj --filter "FullyQualifiedN
 Expected: build fails because the event, block, snapshot, and reducer types do not exist.
 
 - [ ] **Step 3: Add the exact event and state contracts**
+
+Create the immutable cross-project snapshot record contracts before the UI events that reference them:
+
+```csharp
+namespace Coda.Agent.BackgroundTasks;
+
+public sealed record BackgroundTaskSnapshot(string Id, BackgroundTaskStatus Status);
+```
+
+```csharp
+namespace Coda.Agent.Lsp;
+
+public sealed record LspServerSnapshot(
+    string Name,
+    LspServerState State,
+    IReadOnlyList<string> Extensions);
+```
+
+```csharp
+using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Goals;
+using Coda.Agent.Lsp;
+using Coda.Agent.Scheduling;
+using Coda.Agent.Todos;
+using LlmClient;
+
+namespace Coda.Sdk;
+
+public sealed record SessionRuntimeSnapshot(
+    string SessionId,
+    TokenUsage Usage,
+    GoalStatus? Goal,
+    IReadOnlyList<TodoItem> Todos,
+    IReadOnlyList<ScheduledTask> ScheduledTasks,
+    IReadOnlyList<BackgroundTaskSnapshot> BackgroundTasks,
+    IReadOnlyList<LspServerSnapshot> LspServers);
+```
+
+```csharp
+namespace Coda.Mcp;
+
+public sealed record McpServerRuntimeSnapshot(
+    string Name,
+    McpServerInfo? Info,
+    int ToolCount);
+
+public sealed record McpRuntimeSnapshot(
+    int Version,
+    IReadOnlyList<McpServerRuntimeSnapshot> Servers);
+```
 
 Use this event hierarchy in `UiEvent.cs`:
 
@@ -805,7 +859,7 @@ Expected: PASS, 0 failed.
 - [ ] **Step 6: Commit**
 
 ```powershell
-git add src/Coda.Tui/Ui/Events src/Coda.Tui/Ui/State/TranscriptBlock.cs src/Coda.Tui/Ui/State/UiSessionSnapshot.cs src/Coda.Tui/Ui/State/UiReducer.cs src/Coda.Tui/Ui/State/SessionHistoryProjector.cs tests/Coda.Tui.Tests/UiReducerTests.cs
+git add src/Coda.Agent/BackgroundTasks/BackgroundTaskSnapshot.cs src/Coda.Agent/Lsp/LspServerSnapshot.cs src/Coda.Sdk/SessionRuntimeSnapshot.cs src/Coda.Mcp/McpRuntimeSnapshot.cs src/Coda.Tui/Ui/Events src/Coda.Tui/Ui/State/TranscriptBlock.cs src/Coda.Tui/Ui/State/UiSessionSnapshot.cs src/Coda.Tui/Ui/State/UiReducer.cs src/Coda.Tui/Ui/State/SessionHistoryProjector.cs tests/Coda.Tui.Tests/UiReducerTests.cs
 git commit -m "feat(tui): add semantic UI state reducer" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
@@ -814,10 +868,6 @@ git commit -m "feat(tui): add semantic UI state reducer" -m "Co-authored-by: Cop
 ### Task 3: Add explicit runtime snapshots, context caching, and responsive status projection
 
 **Files:**
-- Create: `src/Coda.Agent/BackgroundTasks/BackgroundTaskSnapshot.cs`
-- Create: `src/Coda.Agent/Lsp/LspServerSnapshot.cs`
-- Create: `src/Coda.Sdk/SessionRuntimeSnapshot.cs`
-- Create: `src/Coda.Mcp/McpRuntimeSnapshot.cs`
 - Modify: `src/Coda.Agent/BackgroundTasks/BackgroundTaskRunner.cs`
 - Modify: `src/Coda.Agent/Lsp/LspServerManager.cs`
 - Modify: `src/Coda.Sdk/CodaSession.cs`
@@ -1011,60 +1061,9 @@ dotnet test tests/Coda.Tui.Tests/Coda.Tui.Tests.csproj --filter "FullyQualifiedN
 
 Expected: build fails because snapshot, cache, and projector APIs do not exist.
 
-- [ ] **Step 4: Add immutable snapshot APIs**
+- [ ] **Step 4: Add immutable snapshot accessors**
 
-Use these exact records:
-
-```csharp
-namespace Coda.Agent.BackgroundTasks;
-
-public sealed record BackgroundTaskSnapshot(string Id, BackgroundTaskStatus Status);
-```
-
-```csharp
-namespace Coda.Agent.Lsp;
-
-public sealed record LspServerSnapshot(
-    string Name,
-    LspServerState State,
-    IReadOnlyList<string> Extensions);
-```
-
-```csharp
-using Coda.Agent;
-using Coda.Agent.BackgroundTasks;
-using Coda.Agent.Goals;
-using Coda.Agent.Lsp;
-using Coda.Agent.Scheduling;
-using Coda.Agent.Todos;
-using LlmClient;
-
-namespace Coda.Sdk;
-
-public sealed record SessionRuntimeSnapshot(
-    string SessionId,
-    TokenUsage Usage,
-    GoalStatus? Goal,
-    IReadOnlyList<TodoItem> Todos,
-    IReadOnlyList<ScheduledTask> ScheduledTasks,
-    IReadOnlyList<BackgroundTaskSnapshot> BackgroundTasks,
-    IReadOnlyList<LspServerSnapshot> LspServers);
-```
-
-```csharp
-namespace Coda.Mcp;
-
-public sealed record McpServerRuntimeSnapshot(
-    string Name,
-    McpServerInfo? Info,
-    int ToolCount);
-
-public sealed record McpRuntimeSnapshot(
-    int Version,
-    IReadOnlyList<McpServerRuntimeSnapshot> Servers);
-```
-
-Implement copied accessors:
+The immutable record contracts were introduced in Task 2. Implement copied accessors:
 
 ```csharp
 public IReadOnlyList<BackgroundTaskSnapshot> GetSnapshot() =>
@@ -1164,7 +1163,7 @@ Expected: PASS, 0 failed.
 - [ ] **Step 7: Commit**
 
 ```powershell
-git add src/Coda.Agent/BackgroundTasks src/Coda.Agent/Lsp src/Coda.Sdk/SessionRuntimeSnapshot.cs src/Coda.Sdk/CodaSession.cs src/Coda.Mcp/McpRuntimeSnapshot.cs src/Coda.Mcp/McpClientManager.cs src/Coda.Tui/Ui/State/ContextSnapshotCache.cs src/Coda.Tui/Ui/State/GitStatusCache.cs src/Coda.Tui/Ui/State/StatusProjector.cs tests/Engine.Tests/RuntimeSnapshotTests.cs tests/Coda.Tui.Tests/ContextSnapshotCacheTests.cs tests/Coda.Tui.Tests/StatusProjectorTests.cs
+git add src/Coda.Agent/BackgroundTasks/BackgroundTaskRunner.cs src/Coda.Agent/Lsp/LspServerManager.cs src/Coda.Sdk/CodaSession.cs src/Coda.Mcp/McpClientManager.cs src/Coda.Tui/Ui/State/ContextSnapshotCache.cs src/Coda.Tui/Ui/State/GitStatusCache.cs src/Coda.Tui/Ui/State/StatusProjector.cs tests/Engine.Tests/RuntimeSnapshotTests.cs tests/Coda.Tui.Tests/ContextSnapshotCacheTests.cs tests/Coda.Tui.Tests/StatusProjectorTests.cs
 git commit -m "feat(tui): expose immutable runtime status" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
