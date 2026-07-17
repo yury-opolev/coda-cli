@@ -1,4 +1,5 @@
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.State;
 
@@ -16,7 +17,7 @@ namespace Coda.Tui.Ui.Shells;
 /// private to the shell layer and never enters <see cref="UiSessionSnapshot"/>, so no Terminal.Gui
 /// type leaks into the host-neutral state model.
 /// </remarks>
-internal abstract class TerminalGuiShellBase : Window, IUiFrameSink
+internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHandle
 {
     private const int DefaultStatusWidth = 80;
 
@@ -71,6 +72,13 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink
     /// <summary>The most recently applied snapshot.</summary>
     internal UiSessionSnapshot Snapshot { get; private set; }
 
+    /// <summary>
+    /// Why this shell stopped, set by the controller just before it requests the application loop to
+    /// stop. The mode runner reads it after the loop returns to decide between exit and mode switch.
+    /// Null while the shell is running normally.
+    /// </summary>
+    public TuiShellExit? RequestedExit { get; private set; }
+
     /// <summary>Number of times the status text actually changed; exposed for tests only.</summary>
     internal int StatusUpdateCount => this.statusUpdateCount;
 
@@ -79,6 +87,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink
 
     /// <summary>Exports the composer state so it survives a shell/mode switch.</summary>
     public ComposerState ExportComposerState() => this.controller.Export();
+
+    /// <summary>
+    /// Record why the shell is stopping and ask the owning application loop to stop. Called by the
+    /// controller on the UI thread in response to an exit or mode-switch action; the mode runner then
+    /// reads <see cref="RequestedExit"/> once the loop returns.
+    /// </summary>
+    public void RequestStop(TuiShellExit outcome)
+    {
+        ArgumentNullException.ThrowIfNull(outcome);
+        this.RequestedExit = outcome;
+        this.app.RequestStop();
+    }
 
     /// <summary>Restores composer state captured by <see cref="ExportComposerState"/>.</summary>
     public void RestoreComposerState(ComposerState state)
