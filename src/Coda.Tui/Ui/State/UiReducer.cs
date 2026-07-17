@@ -117,6 +117,11 @@ public static class UiReducer
             Notification = new UiNotification("Turn interrupted", UiNotificationLevel.Warning),
         },
 
+        UiPromptRequestedEvent e => state with { PendingPrompt = e.Request },
+        UiPromptResponseSubmittedEvent e => state.PendingPrompt?.Id == e.RequestId
+            ? state with { PendingPrompt = null }
+            : state,
+
         _ => state,
     };
 

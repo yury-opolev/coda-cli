@@ -1,38 +1,35 @@
+using System.Linq;
 using Coda.Agent;
-using Coda.Tui.Rendering;
-using Spectre.Console;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Prompts;
 
 namespace Coda.Tui.Agent;
 
-/// <summary>Asks the user to allow/deny a mutating tool call (host-callback model).</summary>
-public sealed class TuiPermissionPrompt : IPermissionPrompt
+/// <summary>
+/// Asks the user to allow/deny a mutating tool call through the host-neutral prompt surface. Publishes
+/// <see cref="PermissionRequestedEvent"/>/<see cref="PermissionResolvedEvent"/> so the UI can reflect
+/// the decision. Non-interactive prompt surfaces deny by default for safety.
+/// </summary>
+public sealed class TuiPermissionPrompt(IUiPromptService prompts, IUiEventPublisher events) : IPermissionPrompt
 {
-    private const string Allow = "Allow";
-    private const string Deny = "Deny";
-
-    private readonly IAnsiConsole console;
-
-    public TuiPermissionPrompt(IAnsiConsole console)
+    public async Task<bool> RequestAsync(ITool tool, string inputPreview, CancellationToken cancellationToken = default)
     {
-        this.console = console;
-    }
+        events.Publish(new PermissionRequestedEvent(tool.Name, inputPreview));
 
-    public Task<bool> RequestAsync(ITool tool, string inputPreview, CancellationToken cancellationToken = default)
-    {
-        this.console.MarkupLine(Theme.WarnMarkup($"Permission requested: {tool.Name}") + " " + Theme.DimMarkup(inputPreview));
-
-        if (!this.console.Profile.Capabilities.Interactive)
+        bool allowed;
+        if (!prompts.IsInteractive)
         {
-            // No way to ask — deny by default for safety.
-            this.console.MarkupLine(Theme.DimMarkup("(non-interactive: denied)"));
-            return Task.FromResult(false);
+            allowed = false;
+        }
+        else
+        {
+            var response = await prompts.RequestAsync(
+                UiPromptRequest.Confirm($"Allow {tool.Name} to run?", defaultValue: false),
+                cancellationToken).ConfigureAwait(false);
+            allowed = !response.Cancelled && response.SelectedIds.Contains("yes");
         }
 
-        var choice = this.console.Prompt(
-            new SelectionPrompt<string>()
-                .Title(Theme.DimMarkup($"Allow {tool.Name} to run?"))
-                .AddChoices(Allow, Deny));
-
-        return Task.FromResult(choice == Allow);
+        events.Publish(new PermissionResolvedEvent(tool.Name, allowed));
+        return allowed;
     }
 }

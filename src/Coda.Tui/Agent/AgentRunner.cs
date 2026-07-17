@@ -93,12 +93,12 @@ public sealed class AgentRunner : IDisposable
         PermissionMode = context.Session.PermissionMode,
         // Re-read each turn so /mcp start|stop changes take effect from the next turn.
         ExtraTools = this.extraToolsProvider?.Invoke() ?? [],
-        InteractivePrompt = new TuiPermissionPrompt(context.Console),
-        UserQuestionPrompt = context.Console.Profile.Capabilities.Interactive
-            ? new TuiUserQuestionPrompt(context.Console)
+        InteractivePrompt = new TuiPermissionPrompt(context.Prompts, context.Events),
+        UserQuestionPrompt = context.Prompts.IsInteractive
+            ? new TuiUserQuestionPrompt(context.Prompts, context.Events)
             : null,
-        PlanApprover = context.Console.Profile.Capabilities.Interactive
-            ? new TuiPlanApprover(context.Console, context.Session)
+        PlanApprover = context.Prompts.IsInteractive
+            ? new TuiPlanApprover(context.Prompts, context.Events, context.Session)
             : null,
         OutputStyle = context.Session.OutputStyle,
         Effort = context.Session.Effort,

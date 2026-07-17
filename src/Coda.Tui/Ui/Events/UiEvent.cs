@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using Coda.Agent;
 using Coda.Mcp;
 using Coda.Sdk;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.State;
 using LlmClient;
 
@@ -119,3 +120,9 @@ public sealed record TurnCompletedEvent(bool Success) : UiEvent;
 
 /// <summary>A turn was interrupted/cancelled.</summary>
 public sealed record TurnInterruptedEvent : UiEvent;
+
+/// <summary>A host-neutral prompt is being requested from the user.</summary>
+public sealed record UiPromptRequestedEvent(UiPromptRequest Request) : UiEvent;
+
+/// <summary>A pending host-neutral prompt was answered.</summary>
+public sealed record UiPromptResponseSubmittedEvent(Guid RequestId, UiPromptResponse Response) : UiEvent;

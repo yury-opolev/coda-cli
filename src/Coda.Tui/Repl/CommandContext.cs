@@ -1,4 +1,7 @@
 using Coda.Agent;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.State;
 using LlmAuth;
 using Spectre.Console;
 
@@ -12,13 +15,25 @@ public sealed class CommandContext
         CredentialManager credentials,
         SessionState session,
         IReadOnlyList<ProviderDescriptor> providers,
-        SlashCommandRegistry commands)
+        SlashCommandRegistry commands,
+        IUiPromptService? prompts = null,
+        IUiEventPublisher? events = null,
+        ContextSnapshotCache? contextSnapshots = null,
+        GitStatusCache? gitStatus = null,
+        Func<UiSessionSnapshot>? uiSnapshotProvider = null,
+        bool semanticUiEnabled = false)
     {
         this.Console = console;
         this.Credentials = credentials;
         this.Session = session;
         this.Providers = providers;
         this.Commands = commands;
+        this.Prompts = prompts ?? PlainUiPromptService.Instance;
+        this.Events = events ?? NullUiEventPublisher.Instance;
+        this.ContextSnapshots = contextSnapshots;
+        this.GitStatus = gitStatus;
+        this.UiSnapshotProvider = uiSnapshotProvider;
+        this.SemanticUiEnabled = semanticUiEnabled;
     }
 
     public IAnsiConsole Console { get; }
@@ -30,6 +45,24 @@ public sealed class CommandContext
     public IReadOnlyList<ProviderDescriptor> Providers { get; }
 
     public SlashCommandRegistry Commands { get; }
+
+    /// <summary>Host-neutral prompt surface; defaults to the non-interactive plain fallback.</summary>
+    public IUiPromptService Prompts { get; }
+
+    /// <summary>Semantic UI event publisher; defaults to a no-op publisher.</summary>
+    public IUiEventPublisher Events { get; }
+
+    /// <summary>Cache of context-window snapshots for the semantic UI; null when not wired.</summary>
+    public ContextSnapshotCache? ContextSnapshots { get; set; }
+
+    /// <summary>Cache of git working-tree status for the semantic UI; null when not wired.</summary>
+    public GitStatusCache? GitStatus { get; set; }
+
+    /// <summary>Provider of the current UI snapshot for the semantic UI; null when not wired.</summary>
+    public Func<UiSessionSnapshot>? UiSnapshotProvider { get; set; }
+
+    /// <summary>Whether the actor-driven semantic UI is active.</summary>
+    public bool SemanticUiEnabled { get; }
 
     /// <summary>
     /// Live source of the agent's extra tools (MCP tools + MCP resource/prompt tools). A provider

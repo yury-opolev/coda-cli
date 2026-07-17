@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Events;
@@ -48,6 +49,7 @@ public sealed class UiActor
     private readonly UiEventMailbox _mailbox;
     private readonly IUiFrameSink _frameSink;
     private readonly IUiEventObserver? _eventObserver;
+    private readonly ActorUiPromptService? _prompts;
     private UiSessionSnapshot _current;
     private long _lastFrameTicks = long.MinValue;
 
@@ -56,12 +58,14 @@ public sealed class UiActor
         UiEventMailbox mailbox,
         IUiFrameSink frameSink,
         UiSessionSnapshot initial,
-        IUiEventObserver? eventObserver = null)
+        IUiEventObserver? eventObserver = null,
+        ActorUiPromptService? prompts = null)
     {
         _mailbox = mailbox ?? throw new ArgumentNullException(nameof(mailbox));
         _frameSink = frameSink ?? throw new ArgumentNullException(nameof(frameSink));
         _current = initial ?? throw new ArgumentNullException(nameof(initial));
         _eventObserver = eventObserver;
+        _prompts = prompts;
     }
 
     /// <summary>The most recently applied snapshot.</summary>
@@ -94,6 +98,11 @@ public sealed class UiActor
                 var critical = false;
                 foreach (var uiEvent in batch)
                 {
+                    if (_prompts is not null && uiEvent is UiPromptResponseSubmittedEvent submitted)
+                    {
+                        _prompts.Complete(submitted);
+                    }
+
                     if (_eventObserver is not null)
                     {
                         await _eventObserver.ApplyEventAsync(uiEvent, cancellationToken).ConfigureAwait(false);
@@ -136,6 +145,8 @@ public sealed class UiActor
         UserQuestionResolvedEvent => true,
         PlanApprovalRequestedEvent => true,
         PlanApprovalResolvedEvent => true,
+        UiPromptRequestedEvent => true,
+        UiPromptResponseSubmittedEvent => true,
         TurnStartedEvent => true,
         TurnCompletedEvent => true,
         TurnInterruptedEvent => true,

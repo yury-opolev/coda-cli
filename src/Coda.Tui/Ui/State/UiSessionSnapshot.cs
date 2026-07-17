@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using Coda.Agent;
 using Coda.Mcp;
 using Coda.Sdk;
+using Coda.Tui.Ui.Prompts;
 using LlmClient;
 
 namespace Coda.Tui.Ui.State;
@@ -33,7 +34,8 @@ public sealed record UiSessionSnapshot(
     ImmutableArray<TranscriptBlock> Transcript,
     UiNotification? Notification,
     string? StopReason,
-    string Mode)
+    string Mode,
+    UiPromptRequest? PendingPrompt = null)
 {
     /// <summary>The initial, empty state before any event is applied.</summary>
     public static UiSessionSnapshot Empty { get; } = new(
@@ -58,5 +60,6 @@ public sealed record UiSessionSnapshot(
         Transcript: [],
         Notification: null,
         StopReason: null,
-        Mode: "plain");
+        Mode: "plain",
+        PendingPrompt: null);
 }
