@@ -305,4 +305,33 @@ public sealed class UiActionMapTests
         Assert.Equal(UiAction.None, UiActionMap.Map(Key.Backspace, Typing));
         Assert.Equal(UiAction.None, UiActionMap.Map(Key.Delete, Typing));
     }
+
+    [Fact]
+    public void Arrow_and_home_end_keys_map_to_controller_cursor_actions()
+    {
+        Assert.Equal(UiAction.CursorLeft, UiActionMap.Map(Key.CursorLeft, Typing));
+        Assert.Equal(UiAction.CursorRight, UiActionMap.Map(Key.CursorRight, Typing));
+        Assert.Equal(UiAction.LineStart, UiActionMap.Map(Key.Home, Typing));
+        Assert.Equal(UiAction.LineEnd, UiActionMap.Map(Key.End, Typing));
+    }
+
+    [Fact]
+    public void Ctrl_arrow_keys_map_to_word_movement()
+    {
+        Assert.Equal(UiAction.WordLeft, UiActionMap.Map(Key.CursorLeft.WithCtrl, Typing));
+        Assert.Equal(UiAction.WordRight, UiActionMap.Map(Key.CursorRight.WithCtrl, Typing));
+    }
+
+    [Fact]
+    public void Cursor_navigation_keys_do_not_shadow_completion_and_history_on_up_down()
+    {
+        // Left/Right/Home/End are cursor actions even while a completion popup is open,
+        // but Up/Down must still drive completion/history precedence.
+        Assert.Equal(UiAction.CursorLeft, UiActionMap.Map(Key.CursorLeft, Completing));
+        Assert.Equal(UiAction.CursorRight, UiActionMap.Map(Key.CursorRight, Completing));
+        Assert.Equal(UiAction.CompletionPrevious, UiActionMap.Map(Key.CursorUp, Completing));
+        Assert.Equal(UiAction.CompletionNext, UiActionMap.Map(Key.CursorDown, Completing));
+        Assert.Equal(UiAction.HistoryPrevious, UiActionMap.Map(Key.CursorUp, Typing));
+        Assert.Equal(UiAction.HistoryNext, UiActionMap.Map(Key.CursorDown, Typing));
+    }
 }

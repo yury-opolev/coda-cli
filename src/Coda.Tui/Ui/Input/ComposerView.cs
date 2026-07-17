@@ -83,6 +83,7 @@ internal sealed class ComposerView : TextView
 
         if (TryGetPrintableText(key, out var text))
         {
+            this.SyncCursorFromView();
             this.controller.InsertText(text);
             this.SyncTextView();
             return true;
@@ -97,6 +98,7 @@ internal sealed class ComposerView : TextView
 
     protected override bool OnPaste(string text)
     {
+        this.SyncCursorFromView();
         this.controller.BeginPaste();
         try
         {
@@ -151,6 +153,23 @@ internal sealed class ComposerView : TextView
 
     private void OnContentsChangedSync(object? sender, ContentsChangedEventArgs e) =>
         this.SyncControllerFromTextView();
+
+    /// <summary>
+    /// Defense in depth for caret paths the controller did not directly drive (for
+    /// example a future mouse click): reconcile the controller from the visible caret
+    /// before inserting. It is a no-op until the view is laid out, because an unlaid-out
+    /// <see cref="TextView"/> reports its insertion point as the origin regardless of the
+    /// controller's authoritative caret.
+    /// </summary>
+    private void SyncCursorFromView()
+    {
+        if (this.syncingText || !this.IsInitialized)
+        {
+            return;
+        }
+
+        this.SyncControllerFromTextView();
+    }
 
     private void SyncTextView()
     {

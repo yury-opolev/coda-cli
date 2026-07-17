@@ -11,6 +11,25 @@ public sealed class ComposerViewTests
     private static string Normalize(string value) =>
         value.Replace("\r\n", "\n").Replace("\r", "\n");
 
+    /// <summary>
+    /// Builds a composer with a real, nonzero viewport using Terminal.Gui's public
+    /// layout facilities, so the base <see cref="TextView"/> caret genuinely moves when
+    /// cursor keys are processed. This is what makes the caret-synchronization tests
+    /// exercise the real editing surface rather than an inert, unlaid-out view.
+    /// </summary>
+    private static ComposerView CreateLaidOutView(ComposerController controller)
+    {
+        var view = new ComposerView(controller)
+        {
+            Width = 40,
+            Height = 5,
+        };
+        view.BeginInit();
+        view.EndInit();
+        view.Layout(new System.Drawing.Size(40, 5));
+        return view;
+    }
+
     [Fact]
     public void Enter_submits_but_ctrl_j_inserts_newline()
     {
@@ -103,6 +122,96 @@ public sealed class ComposerViewTests
         view.SetDraft("/he\nx", 5);
 
         Assert.Equal(2, view.DraftLineCount);
+    }
+
+    [Fact]
+    public void Cursor_left_then_printable_inserts_at_moved_caret()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller);
+        view.SetDraft("abcd", 4);
+
+        view.NewKeyDownEvent(Key.CursorLeft);
+
+        // The caret must move in the controller (the source of truth) immediately, not
+        // lazily inside the base TextView after OnKeyDown returns.
+        Assert.Equal(3, controller.State.CursorIndex);
+        Assert.Equal(3, view.InsertionPoint.X);
+
+        view.NewKeyDownEvent(new Key('X'));
+
+        Assert.Equal("abcXd", view.GetDraft());
+        Assert.Equal("abcXd", Normalize(view.Text));
+        Assert.Equal(4, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void Home_then_printable_inserts_at_line_start()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller);
+        view.SetDraft("abcd", 4);
+
+        view.NewKeyDownEvent(Key.Home);
+        Assert.Equal(0, controller.State.CursorIndex);
+
+        view.NewKeyDownEvent(new Key('Z'));
+
+        Assert.Equal("Zabcd", view.GetDraft());
+        Assert.Equal("Zabcd", Normalize(view.Text));
+        Assert.Equal(1, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void End_then_printable_inserts_at_line_end()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller);
+        view.SetDraft("abcd", 0);
+
+        view.NewKeyDownEvent(Key.End);
+        Assert.Equal(4, controller.State.CursorIndex);
+
+        view.NewKeyDownEvent(new Key('!'));
+
+        Assert.Equal("abcd!", view.GetDraft());
+        Assert.Equal("abcd!", Normalize(view.Text));
+        Assert.Equal(5, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void Cursor_right_at_end_is_clamped_and_keeps_caret_synchronized()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller);
+        view.SetDraft("abcd", 4);
+
+        view.NewKeyDownEvent(Key.CursorRight);
+        Assert.Equal(4, controller.State.CursorIndex);
+
+        view.NewKeyDownEvent(new Key('Q'));
+
+        Assert.Equal("abcdQ", view.GetDraft());
+        Assert.Equal("abcdQ", Normalize(view.Text));
+        Assert.Equal(5, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void Paste_after_cursor_move_inserts_at_moved_caret()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller);
+        view.SetDraft("abcd", 4);
+
+        view.NewKeyDownEvent(Key.CursorLeft);
+        view.NewKeyDownEvent(Key.CursorLeft);
+        Assert.Equal(2, controller.State.CursorIndex);
+
+        view.NewPasteEvent("XY");
+
+        Assert.Equal("abXYcd", view.GetDraft());
+        Assert.Equal("abXYcd", Normalize(view.Text));
+        Assert.Equal(4, controller.State.CursorIndex);
     }
 
     private sealed class TestCommand(string name, string summary) : ISlashCommand

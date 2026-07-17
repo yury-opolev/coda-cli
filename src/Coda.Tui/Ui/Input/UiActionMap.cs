@@ -58,6 +58,39 @@ public static class UiActionMap
             return context.CompletionVisible ? UiAction.CompletionNext : UiAction.HistoryNext;
         }
 
+        // Ctrl+Arrow performs word movement; the plain arrows move by one grapheme. These
+        // are routed through the controller (the caret source of truth) so a subsequent
+        // insert/paste lands at the moved position instead of a stale one.
+        if (key == Key.CursorLeft.WithCtrl)
+        {
+            return UiAction.WordLeft;
+        }
+
+        if (key == Key.CursorRight.WithCtrl)
+        {
+            return UiAction.WordRight;
+        }
+
+        if (key == Key.CursorLeft)
+        {
+            return UiAction.CursorLeft;
+        }
+
+        if (key == Key.CursorRight)
+        {
+            return UiAction.CursorRight;
+        }
+
+        if (key == Key.Home)
+        {
+            return UiAction.LineStart;
+        }
+
+        if (key == Key.End)
+        {
+            return UiAction.LineEnd;
+        }
+
         if (key == Key.Tab)
         {
             return UiAction.CompleteSuggestion;
