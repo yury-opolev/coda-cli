@@ -184,4 +184,100 @@ public sealed class TranscriptBlockFormatterTests
 
         Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == "    return 1");
     }
+
+    [Fact]
+    public void Nested_unordered_list_retains_all_items_in_order()
+    {
+        var block = new AssistantTranscriptBlock(
+            Guid.NewGuid(), "- top one\n  - nested a\n  - nested b\n- top two", true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        var order = new[] { "top one", "nested a", "nested b", "top two" };
+        AssertContentInOrder(lines, order);
+    }
+
+    [Fact]
+    public void Ordered_list_item_with_nested_bullets_retains_numbering_and_details()
+    {
+        var block = new AssistantTranscriptBlock(
+            Guid.NewGuid(), "1. first step\n   - detail a\n   - detail b\n2. second step", true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        AssertContentInOrder(lines, new[] { "first step", "detail a", "detail b", "second step" });
+        Assert.Contains(lines, line => line.Text.Contains("1. first step", StringComparison.Ordinal));
+        Assert.Contains(lines, line => line.Text.Contains("2. second step", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Fenced_code_block_under_list_item_retains_code_text()
+    {
+        var block = new AssistantTranscriptBlock(
+            Guid.NewGuid(), "- run this\n\n  ```\n  echo hello\n  ```", true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.Contains(lines, line => line.Text.Contains("run this", StringComparison.Ordinal));
+        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text.Contains("echo hello", StringComparison.Ordinal));
+
+        var plain = TranscriptBlockFormatter.FormatPlainText(block, width: 80);
+        Assert.Contains("echo hello", plain, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Quote_continuation_under_list_item_retains_content()
+    {
+        var block = new AssistantTranscriptBlock(
+            Guid.NewGuid(), "- item head\n\n  > quoted note\n\n  trailing paragraph", true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        AssertContentInOrder(lines, new[] { "item head", "quoted note", "trailing paragraph" });
+    }
+
+    [Fact]
+    public void Deeply_nested_list_recurses_without_corrupting_indentation()
+    {
+        var block = new AssistantTranscriptBlock(
+            Guid.NewGuid(), "- a\n  - b\n    - c\n      - d", true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        AssertContentInOrder(lines, new[] { "a", "b", "c", "d" });
+
+        int IndentOf(string needle)
+        {
+            var text = lines.First(line => line.Text.Contains(needle, StringComparison.Ordinal)).Text;
+            return text.Length - text.TrimStart().Length;
+        }
+
+        // Each deeper level must be indented strictly more than its parent.
+        Assert.True(IndentOf("a") < IndentOf("b"));
+        Assert.True(IndentOf("b") < IndentOf("c"));
+        Assert.True(IndentOf("c") < IndentOf("d"));
+        Assert.DoesNotContain(lines, line => line.Text.Contains("\u001b[", StringComparison.Ordinal));
+    }
+
+    private static void AssertContentInOrder(
+        IReadOnlyList<TranscriptRenderLine> lines, IReadOnlyList<string> needles)
+    {
+        var lastIndex = -1;
+        foreach (var needle in needles)
+        {
+            var index = -1;
+            for (var i = 0; i < lines.Count; i++)
+            {
+                if (lines[i].Text.Contains(needle, StringComparison.Ordinal))
+                {
+                    index = i;
+                    break;
+                }
+            }
+
+            Assert.True(index >= 0, $"Expected content '{needle}' to be present.");
+            Assert.True(index > lastIndex, $"Expected content '{needle}' to appear after previous content.");
+            lastIndex = index;
+        }
+    }
 }

@@ -124,20 +124,20 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendBlock(List<TranscriptRenderLine> lines, Block node, int width)
+    private static void AppendBlock(List<TranscriptRenderLine> lines, Block node, int width, string indent = "")
     {
         switch (node)
         {
             case HeadingBlock heading:
-                AppendWrapped(lines, RenderInline(heading.Inline), width, TranscriptRole.Heading);
+                AppendWrapped(lines, RenderInline(heading.Inline), width, TranscriptRole.Heading, indent);
                 break;
 
             case ParagraphBlock paragraph:
-                AppendWrapped(lines, RenderInline(paragraph.Inline), width, TranscriptRole.Assistant);
+                AppendWrapped(lines, RenderInline(paragraph.Inline), width, TranscriptRole.Assistant, indent);
                 break;
 
             case Markdig.Syntax.CodeBlock code:
-                AppendCode(lines, code.Lines.ToString(), width);
+                AppendCode(lines, code.Lines.ToString(), width, indent);
                 break;
 
             case QuoteBlock quote:
@@ -146,26 +146,26 @@ public static class TranscriptBlockFormatter
                 {
                     if (!innerFirst)
                     {
-                        lines.Add(new TranscriptRenderLine(string.Empty, TranscriptRole.Assistant));
+                        lines.Add(new TranscriptRenderLine(indent, TranscriptRole.Assistant));
                     }
 
                     innerFirst = false;
-                    AppendBlock(lines, child, width);
+                    AppendBlock(lines, child, width, indent);
                 }
 
                 break;
 
             case ListBlock list:
-                AppendList(lines, list, width);
+                AppendList(lines, list, width, indent);
                 break;
 
             case LeafBlock leaf when leaf.Inline is not null:
-                AppendWrapped(lines, RenderInline(leaf.Inline), width, TranscriptRole.Assistant);
+                AppendWrapped(lines, RenderInline(leaf.Inline), width, TranscriptRole.Assistant, indent);
                 break;
         }
     }
 
-    private static void AppendList(List<TranscriptRenderLine> lines, ListBlock list, int width)
+    private static void AppendList(List<TranscriptRenderLine> lines, ListBlock list, int width, string indent)
     {
         var order = list.IsOrdered && int.TryParse(list.OrderedStart, out var start) ? start : 1;
         foreach (var item in list)
@@ -176,32 +176,36 @@ public static class TranscriptBlockFormatter
             }
 
             var marker = list.IsOrdered ? $"{order++}. " : "• ";
-            var buffer = new StringBuilder();
+            // Continuation lines (and nested blocks) align under the item text, not the marker.
+            var contentIndent = indent + new string(' ', marker.Length);
+            var itemStart = lines.Count;
+
             foreach (var child in listItem)
             {
-                if (child is LeafBlock { Inline: { } inline })
-                {
-                    if (buffer.Length > 0)
-                    {
-                        buffer.Append(' ');
-                    }
-
-                    buffer.Append(RenderInline(inline));
-                }
+                AppendBlock(lines, child, width, contentIndent);
             }
 
-            AppendWrapped(lines, marker + buffer, width, TranscriptRole.Assistant);
+            // Replace the padding at the front of the item's first line with the actual marker.
+            if (lines.Count > itemStart)
+            {
+                var firstLine = lines[itemStart];
+                var prefixLength = indent.Length + marker.Length;
+                var text = firstLine.Text;
+                var suffix = text.Length >= prefixLength ? text[prefixLength..] : string.Empty;
+                lines[itemStart] = firstLine with { Text = indent + marker + suffix };
+            }
         }
     }
 
-    private static void AppendCode(List<TranscriptRenderLine> lines, string code, int width)
+    private static void AppendCode(List<TranscriptRenderLine> lines, string code, int width, string indent = "")
     {
+        var contentWidth = EffectiveWidth(width, indent);
         foreach (var line in SplitLines(code))
         {
             // Code is preformatted: preserve whitespace, only hard-breaking lines wider than the viewport.
-            foreach (var wrapped in WrapPreformatted(line, width))
+            foreach (var wrapped in WrapPreformatted(line, contentWidth))
             {
-                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.Code));
+                lines.Add(new TranscriptRenderLine(indent + wrapped, TranscriptRole.Code));
             }
         }
     }
@@ -265,15 +269,23 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendWrapped(List<TranscriptRenderLine> lines, string text, int width, TranscriptRole role)
+    private static void AppendWrapped(List<TranscriptRenderLine> lines, string text, int width, TranscriptRole role, string indent = "")
     {
+        var contentWidth = EffectiveWidth(width, indent);
         foreach (var line in SplitLines(text))
         {
-            foreach (var wrapped in WrapLine(line, width))
+            foreach (var wrapped in WrapLine(line, contentWidth))
             {
-                lines.Add(new TranscriptRenderLine(wrapped, role));
+                lines.Add(new TranscriptRenderLine(indent + wrapped, role));
             }
         }
+    }
+
+    /// <summary>Width available for content once an indentation prefix is reserved (indent counts toward width).</summary>
+    private static int EffectiveWidth(int width, string indent)
+    {
+        var remaining = width - indent.Length;
+        return remaining > 0 ? remaining : 1;
     }
 
     private static string RenderInline(ContainerInline? container)
