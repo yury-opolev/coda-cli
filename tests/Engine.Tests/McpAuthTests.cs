@@ -285,6 +285,67 @@ public sealed class McpClientIdResolutionTests
     }
 
     [Fact]
+    public async Task Faulted_registration_send_returns_endpoint_specific_failure_without_leaking()
+    {
+        // The registration POST faults with a transport error (HttpRequestException). That
+        // exception must be converted into the actionable endpoint-specific failure rather
+        // than escaping the structured resolution.
+        var handler = new McpAuthRouteHandler();
+        handler.PostFaults(RegistrationEndpoint);
+        using var http = new HttpClient(handler);
+
+        var provider = Provider(http, new InMemoryTokenStore(), new McpAuthConfig(McpAuthMode.OAuth));
+        var result = await provider.ResolveClientIdAsync(AsMeta(RegistrationEndpoint), RedirectUri, default);
+
+        Assert.Null(result.ClientId);
+        Assert.Equal(
+            "Dynamic client registration failed at https://auth.example.com/register. "
+            + "Configure auth.clientId or use an authenticated stdio proxy.",
+            result.Error);
+        // No raw exception text leaks into the actionable message.
+        Assert.DoesNotContain("connection refused", result.Error);
+    }
+
+    [Fact]
+    public async Task Malformed_registration_success_body_returns_endpoint_specific_failure_without_leaking()
+    {
+        // A 200 response whose body is not valid JSON triggers a JsonException while parsing;
+        // it must surface as the endpoint-specific failure with no body text leaked.
+        const string sentinel = "sentinel-body-DO-NOT-LEAK";
+        var handler = new McpAuthRouteHandler();
+        handler.Post(RegistrationEndpoint, $$"""{ "client_secret": "{{sentinel}}", this-is-not-json """);
+        using var http = new HttpClient(handler);
+
+        var provider = Provider(http, new InMemoryTokenStore(), new McpAuthConfig(McpAuthMode.OAuth));
+        var result = await provider.ResolveClientIdAsync(AsMeta(RegistrationEndpoint), RedirectUri, default);
+
+        Assert.Null(result.ClientId);
+        Assert.Equal(
+            "Dynamic client registration failed at https://auth.example.com/register. "
+            + "Configure auth.clientId or use an authenticated stdio proxy.",
+            result.Error);
+        Assert.DoesNotContain(sentinel, result.Error);
+    }
+
+    [Fact]
+    public async Task Caller_requested_cancellation_is_not_reclassified_as_failure()
+    {
+        // A registration route is available, but the caller's own token is already canceled.
+        // Cooperative cancellation must propagate as OperationCanceledException, not be
+        // swallowed and turned into a registration-failure result.
+        var handler = new McpAuthRouteHandler();
+        handler.Post(RegistrationEndpoint, """{"client_id":"fresh-cid"}""");
+        using var http = new HttpClient(handler);
+
+        var provider = Provider(http, new InMemoryTokenStore(), new McpAuthConfig(McpAuthMode.OAuth));
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => provider.ResolveClientIdAsync(AsMeta(RegistrationEndpoint), RedirectUri, cts.Token));
+    }
+
+    [Fact]
     public async Task Successful_registration_is_persisted_and_reused()
     {
         var handler = new McpAuthRouteHandler();
@@ -341,6 +402,37 @@ public sealed class McpUnauthorizedResolutionFlowTests
             "Authorization server https://auth.example.com does not advertise dynamic client registration. "
             + "Configure auth.clientId or use an authenticated stdio proxy.");
     }
+
+    [Fact]
+    public async Task Faulted_registration_logs_actionable_failure_and_does_not_open_browser()
+    {
+        var handler = new McpAuthRouteHandler();
+        handler.Get("https://mcp.example.com/.well-known/oauth-protected-resource",
+            """{"resource":"https://mcp.example.com","authorization_servers":["https://auth.example.com"]}""");
+        handler.Get("https://auth.example.com/.well-known/oauth-authorization-server",
+            """{"issuer":"https://auth.example.com","authorization_endpoint":"https://auth.example.com/authorize","token_endpoint":"https://auth.example.com/token","registration_endpoint":"https://auth.example.com/register"}""");
+        // Dynamic registration is advertised but its send faults with a transport error.
+        handler.PostFaults("https://auth.example.com/register");
+
+        using var http = new HttpClient(handler);
+        var logs = new List<string>();
+        var browserOpened = false;
+
+        var provider = new McpOAuthProvider(
+            http, new InMemoryTokenStore(), "https://mcp.example.com/mcp",
+            new McpAuthConfig(McpAuthMode.OAuth), interactive: true,
+            openBrowser: (_, _) => { browserOpened = true; return Task.CompletedTask; },
+            log: logs.Add);
+
+        using var response = new HttpResponseMessage(HttpStatusCode.Unauthorized);
+        var handled = await provider.HandleUnauthorizedAsync(response);
+
+        Assert.False(handled);
+        Assert.False(browserOpened);
+        Assert.Contains(logs, m => m ==
+            "Dynamic client registration failed at https://auth.example.com/register. "
+            + "Configure auth.clientId or use an authenticated stdio proxy.");
+    }
 }
 
 /// <summary>A stub handler that routes by method+URL and records what it was asked for.</summary>
@@ -348,6 +440,7 @@ internal sealed class McpAuthRouteHandler : HttpMessageHandler
 {
     private readonly Dictionary<string, (HttpStatusCode Status, string Body)> gets = new(StringComparer.Ordinal);
     private readonly Dictionary<string, (HttpStatusCode Status, string Body)> posts = new(StringComparer.Ordinal);
+    private readonly HashSet<string> postFaults = new(StringComparer.Ordinal);
 
     public List<string> SeenUrls { get; } = [];
 
@@ -357,14 +450,24 @@ internal sealed class McpAuthRouteHandler : HttpMessageHandler
 
     public void Post(string url, string json, HttpStatusCode status = HttpStatusCode.OK) => this.posts[url] = (status, json);
 
+    /// <summary>Register a POST endpoint whose send faults with a transport error.</summary>
+    public void PostFaults(string url) => this.postFaults.Add(url);
+
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
+        cancellationToken.ThrowIfCancellationRequested();
+
         var url = request.RequestUri!.ToString();
         this.SeenUrls.Add(url);
 
         if (request.Method == HttpMethod.Post)
         {
             this.PostCount++;
+            if (this.postFaults.Contains(url))
+            {
+                throw new HttpRequestException("connection refused to registration endpoint");
+            }
+
             return Task.FromResult(this.posts.TryGetValue(url, out var p)
                 ? Response(p.Status, p.Body)
                 : new HttpResponseMessage(HttpStatusCode.NotFound));
