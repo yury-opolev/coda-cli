@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Terminal.Gui v2 compatibility spike. It references Coda.Tui so the exact same
+    Terminal.Gui 2.4.17 package (and driver stack) the product ships is exercised
+    transitively; the harness itself only uses public Terminal.Gui abstractions and
+    sample-local types, so it never depends on Coda.Tui internals or reflection probes.
+  -->
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Coda.Tui\Coda.Tui.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+</Project>
