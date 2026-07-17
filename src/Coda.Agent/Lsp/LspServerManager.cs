@@ -143,6 +143,26 @@ public sealed class LspServerManager : IAsyncDisposable
     }
 
     /// <summary>
+    /// A fresh, name-ordered, immutable snapshot of the configured servers for the UI status view:
+    /// each server's name, current lifecycle state and the (sorted) file extensions it handles.
+    /// Carries no <see cref="LspServerInstance"/> references, so the UI never touches engine state.
+    /// </summary>
+    public LspServerSnapshot[] GetSnapshot()
+    {
+        return this.servers
+            .OrderBy(kv => kv.Key, StringComparer.Ordinal)
+            .Select(kv => new LspServerSnapshot(
+                kv.Value.Name,
+                kv.Value.State,
+                this.extensionMap
+                    .Where(e => string.Equals(e.Value, kv.Key, StringComparison.Ordinal))
+                    .Select(e => e.Key)
+                    .OrderBy(ext => ext, StringComparer.Ordinal)
+                    .ToArray()))
+            .ToArray();
+    }
+
+    /// <summary>
     /// Sends <c>textDocument/didOpen</c> for the file. Deduplicates: if the file is already
     /// open on the same server, the notification is not sent again.
     /// </summary>

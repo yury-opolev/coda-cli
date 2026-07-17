@@ -95,6 +95,22 @@ public sealed class BackgroundTaskRunner : IDisposable
     }
 
     /// <summary>
+    /// A fresh, id-ordered, immutable snapshot of the tracked tasks for the UI status view.
+    /// A new array is allocated on every call (even when empty) so callers never alias engine state.
+    /// </summary>
+    public BackgroundTaskSnapshot[] GetSnapshot()
+    {
+        var ordered = this.tasks.Values
+            .OrderBy(t => t.Id, StringComparer.Ordinal)
+            .Select(t => new BackgroundTaskSnapshot(t.Id, t.Status))
+            .ToList();
+
+        var result = new BackgroundTaskSnapshot[ordered.Count];
+        ordered.CopyTo(result);
+        return result;
+    }
+
+    /// <summary>
     /// Remove a completed (or stopped/failed) task from the registry and dispose it.
     /// Returns <c>true</c> when the task was found and removed.
     /// </summary>
