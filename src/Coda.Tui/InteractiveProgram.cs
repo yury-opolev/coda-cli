@@ -188,7 +188,6 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         using var app = new TuiApp(context, agentToolsProvider, agentRunner: agentRunner);
 
         var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
-        context.UiSnapshotProvider = () => controller.CurrentSnapshot;
 
         // Ctrl-C: interrupt the active turn; a first/idle Ctrl-C never exits (the callback publishes the
         // idle notice). The explicit exit action is wired separately through the controller.
@@ -199,6 +198,11 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         var observer = new SwitchableUiEventObserver();
         var actor = new UiActor(mailbox, frameSink, UiSessionSnapshot.Empty, observer, actorPrompts);
         var actorTask = RunActorAsync(actor, error, hostToken);
+
+        // Semantic commands (e.g. /status) and metadata republishes read the live actor snapshot, so
+        // provider/model/effort/permission/connection stay correct in every mode — including
+        // Terminal.Gui, where nothing captures a controller snapshot mid-session.
+        LiveSnapshotBinding.Bind(context, actor);
 
         // Startup runs exactly once for the whole session; every mode attempt and every fallback awaits
         // the SAME completion (via the memoizing gate). A frame/actor fault in one mode therefore can
@@ -347,6 +351,12 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         {
             await host.RunAsync(mode, ComposerState.Empty, hostToken).ConfigureAwait(false);
 
+            // A clean exit can leave a controller dispatch (a background command/turn) still running —
+            // e.g. the Exit action stopped the shell mid-turn. Interrupt the active turn and observe the
+            // dispatch, bounded, BEFORE draining and disposing the actor/mailbox, so no late producer
+            // publishes into a disposed mailbox.
+            await DrainDispatchBeforeShutdownAsync(controller, agentRunner, cancellationToken).ConfigureAwait(false);
+
             // Clean exit (EOF/`/exit`/exhausted fallback): drain the actor so the just-published final
             // command output — which may still be queued or mid-observer — is emitted before the actor
             // is cancelled. Bounded so a stuck observer/frame can never hang shutdown.
@@ -359,6 +369,22 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Observe any in-flight controller dispatch on a clean exit before the actor/mailbox is torn down.
+    /// The active turn is interrupted first so a long-running dispatch unwinds promptly, then the
+    /// dispatch is awaited within a bounded budget (also released by host cancellation) so shutdown can
+    /// neither hang on a stuck turn nor let a late producer publish into the disposed mailbox.
+    /// </summary>
+    private static async Task DrainDispatchBeforeShutdownAsync(
+        TuiController controller, AgentRunner runner, CancellationToken cancellationToken)
+    {
+        runner.TryInterruptActiveTurn();
+
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
+        await controller.WaitForDispatchAsync(linked.Token).ConfigureAwait(false);
     }
 
     /// <summary>

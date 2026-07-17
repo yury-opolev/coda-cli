@@ -1,4 +1,6 @@
 using System.Collections.Immutable;
+using Coda.Tui.Repl;
+using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
@@ -223,6 +225,135 @@ public sealed class FullscreenTuiShellTests
         Assert.Equal(1, shell.Transcript.ReplaceAllCount);
         Assert.Equal(0, shell.Transcript.AppendCount);
         Assert.Equal(0, shell.Transcript.ReplaceLastCount);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Mixed_batch_replace_and_append_reformats_only_changed_blocks_not_the_whole_transcript()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+
+        var calls = 0;
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> counting = (block, width) =>
+        {
+            calls++;
+            return TranscriptBlockFormatter.Format(block, width);
+        };
+        using var shell = new FullscreenTuiShell(
+            app,
+            new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty,
+            transcriptFormatter: counting);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var blocks = Enumerable.Range(0, 10_000)
+            .Select(i => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {i}"))
+            .ToImmutableArray();
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = blocks }, CancellationToken.None);
+
+        // Reset the counter after the initial load, which necessarily formats every block once to learn
+        // its row count.
+        calls = 0;
+
+        // A single frame replaces two widely separated interior blocks AND appends a new tail block.
+        var changed100 = new CommandOutputTranscriptBlock(blocks[100].Id, "line 100 CHANGED");
+        var changed5000 = new CommandOutputTranscriptBlock(blocks[5000].Id, "line 5000 CHANGED");
+        var appended = new CommandOutputTranscriptBlock(Guid.NewGuid(), "brand new tail");
+        var mixed = blocks.SetItem(100, changed100).SetItem(5000, changed5000).Add(appended);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = mixed }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        // Only the two replaced blocks and the appended block are re-wrapped by the reconcile, plus the
+        // small visible window drawn by the viewport — bounded, never O(10k) as a ReplaceAll would be.
+        Assert.True(calls < 200, $"formatter called {calls} times; expected bounded, not O(n)");
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Same_length_multi_block_replacement_reformats_only_changed_blocks()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+
+        var calls = 0;
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> counting = (block, width) =>
+        {
+            calls++;
+            return TranscriptBlockFormatter.Format(block, width);
+        };
+        using var shell = new FullscreenTuiShell(
+            app,
+            new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty,
+            transcriptFormatter: counting);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var blocks = Enumerable.Range(0, 10_000)
+            .Select(i => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {i}"))
+            .ToImmutableArray();
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = blocks }, CancellationToken.None);
+        calls = 0;
+
+        // Same length; two separated blocks replaced in place (no append, no deletion).
+        var replaced = blocks
+            .SetItem(10, new CommandOutputTranscriptBlock(blocks[10].Id, "ten"))
+            .SetItem(9_000, new CommandOutputTranscriptBlock(blocks[9_000].Id, "nine thousand"));
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = replaced }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        Assert.True(calls < 200, $"formatter called {calls} times; expected bounded, not O(n)");
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Ctrl_end_clears_the_unseen_header_indicator_without_a_new_snapshot()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var seed = Lines(50);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-10);
+        Assert.False(shell.Transcript.AutoFollow);
+
+        var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new tail"));
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
+        Assert.Contains("Ctrl+End", shell.Header.Text);
+
+        // Ctrl+End jumps to newest; the header must clear the indicator immediately, with no new snapshot
+        // arriving to trigger UpdateHeader.
+        shell.Transcript.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.True(shell.Transcript.AutoFollow);
+        Assert.DoesNotContain("Ctrl+End", shell.Header.Text);
 
         if (token is not null)
         {

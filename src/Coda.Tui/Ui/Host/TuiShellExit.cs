@@ -42,4 +42,15 @@ public sealed record TuiShellExit(
     /// <summary>A failure that retains the composer <paramref name="state"/> so a fallback mode can resume the draft.</summary>
     public static TuiShellExit Failed(Exception error, ComposerState state) =>
         new(TuiShellExitKind.Failed, null, state ?? ComposerState.Empty, error);
+
+    /// <summary>
+    /// Attach a cleanup (teardown/disposal) <paramref name="error"/> to a clean Exit/SwitchMode outcome.
+    /// The requested outcome is preserved — the host must not fall back or relaunch for a teardown fault —
+    /// while the error rides along so the host can emit a single cleanup diagnostic.
+    /// </summary>
+    public TuiShellExit WithCleanupError(Exception error)
+    {
+        ArgumentNullException.ThrowIfNull(error);
+        return this with { Error = error };
+    }
 }

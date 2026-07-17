@@ -81,6 +81,31 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         return TuiShellExit.Failed(new AggregateException(inner), composer);
     }
 
+    /// <summary>
+    /// Combine the primary run outcome with any cleanup failures into a single <see cref="TuiShellExit"/>.
+    /// A real run failure (<paramref name="primary"/> non-null) still falls back, aggregating cleanup
+    /// after the primary. But a clean Exit/SwitchMode whose teardown threw keeps its requested outcome —
+    /// a disposal fault must never force an unnecessary fallback/relaunch — while carrying the cleanup
+    /// error so the host emits one diagnostic.
+    /// </summary>
+    internal static TuiShellExit Combine(
+        Exception? primary, TuiShellExit? outcome, IReadOnlyList<Exception> cleanup, ComposerState composer)
+    {
+        if (primary is not null)
+        {
+            return BuildFailure(primary, cleanup, composer);
+        }
+
+        var clean = outcome ?? TuiShellExit.Exited;
+        if (cleanup.Count == 0)
+        {
+            return clean;
+        }
+
+        var cleanupError = cleanup.Count == 1 ? cleanup[0] : new AggregateException(cleanup);
+        return clean.WithCleanupError(cleanupError);
+    }
+
     private async Task<TuiShellExit> RunTerminalGuiAsync(TuiRunMode mode, ComposerState composer, CancellationToken cancellationToken)
     {
         IApplication? app = null;
@@ -134,12 +159,10 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
             TryCleanup(() => app?.Dispose(), cleanup);
         }
 
-        if (primary is null && cleanup.Count == 0)
-        {
-            return outcome ?? TuiShellExit.Exited;
-        }
-
-        return BuildFailure(primary, cleanup, composer);
+        // Fold the run outcome and any cleanup faults into a single result: a clean Exit/SwitchMode is
+        // preserved (a teardown fault only rides along as a diagnostic), while a real run failure falls
+        // back with the primary exception first.
+        return Combine(primary, outcome, cleanup, composer);
     }
 
     private static void TryCleanup(Action action, List<Exception> cleanup)

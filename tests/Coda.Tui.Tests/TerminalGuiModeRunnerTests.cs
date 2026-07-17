@@ -150,4 +150,64 @@ public sealed class TerminalGuiModeRunnerTests
         var aggregate = Assert.IsType<AggregateException>(result.Error);
         Assert.Same(cleanup, Assert.Single(aggregate.InnerExceptions));
     }
+
+    [Fact]
+    public void Clean_exit_with_a_cleanup_exception_stays_an_exit_and_carries_the_cleanup_error()
+    {
+        // A cleanup (disposal) fault during a clean exit must NOT be turned into a Failed exit — that
+        // would trigger an unnecessary fallback/relaunch. The requested Exit is preserved and the
+        // cleanup fault rides along so the host can emit one diagnostic.
+        var cleanup = new InvalidOperationException("dispose blew up");
+
+        var result = TerminalGuiModeRunner.Combine(
+            primary: null,
+            outcome: TuiShellExit.Exited,
+            cleanup: [cleanup],
+            composer: ComposerState.Empty);
+
+        Assert.Equal(TuiShellExitKind.Exit, result.Kind);
+        Assert.Same(cleanup, result.Error);
+    }
+
+    [Fact]
+    public void Switch_with_a_cleanup_exception_still_switches_and_carries_the_cleanup_error()
+    {
+        var cleanup = new InvalidOperationException("dispose blew up");
+        var draft = new ComposerState("carry", 2, [], 0, false);
+        var outcome = TuiShellExit.SwitchTo(TuiRunMode.Fullscreen, draft);
+
+        var result = TerminalGuiModeRunner.Combine(
+            primary: null,
+            outcome: outcome,
+            cleanup: [cleanup],
+            composer: draft);
+
+        Assert.Equal(TuiShellExitKind.SwitchMode, result.Kind);
+        Assert.Equal(TuiRunMode.Fullscreen, result.NextMode);
+        Assert.Equal(draft, result.Composer);
+        Assert.Same(cleanup, result.Error);
+    }
+
+    [Fact]
+    public void Primary_run_failure_with_cleanup_still_fails_with_the_primary_first()
+    {
+        var primary = new InvalidOperationException("run failed");
+        var cleanup = new InvalidOperationException("dispose failed");
+
+        var result = TerminalGuiModeRunner.Combine(primary, outcome: null, [cleanup], ComposerState.Empty);
+
+        Assert.Equal(TuiShellExitKind.Failed, result.Kind);
+        var aggregate = Assert.IsType<AggregateException>(result.Error);
+        Assert.Same(primary, aggregate.InnerExceptions[0]);
+        Assert.Same(cleanup, aggregate.InnerExceptions[1]);
+    }
+
+    [Fact]
+    public void Clean_exit_without_cleanup_is_returned_unchanged()
+    {
+        var result = TerminalGuiModeRunner.Combine(null, TuiShellExit.Exited, [], ComposerState.Empty);
+
+        Assert.Equal(TuiShellExitKind.Exit, result.Kind);
+        Assert.Null(result.Error);
+    }
 }

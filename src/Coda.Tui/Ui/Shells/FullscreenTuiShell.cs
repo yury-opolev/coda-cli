@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Shells;
@@ -20,23 +21,20 @@ namespace Coda.Tui.Ui.Shells;
 /// auto-follow only when the viewport is already at the bottom; otherwise the header shows an
 /// <c>"{n} new — Ctrl+End"</c> indicator.
 /// </remarks>
-internal sealed class FullscreenTuiShell : TerminalGuiShellBase
+internal sealed class FullscreenTuiShell(
+    IApplication app,
+    ComposerController controller,
+    IUiEventPublisher publisher,
+    UiSessionSnapshot initialSnapshot,
+    Func<UiSessionSnapshot, int, string>? statusProjection = null,
+    Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null)
+    : TerminalGuiShellBase(app, controller, publisher, initialSnapshot, statusProjection)
 {
     /// <summary>The transcript is never rendered wider than this many columns.</summary>
     public const int MaximumTranscriptWidth = 120;
 
     private Label header = null!;
     private VirtualizedTranscriptView transcript = null!;
-
-    public FullscreenTuiShell(
-        IApplication app,
-        ComposerController controller,
-        IUiEventPublisher publisher,
-        UiSessionSnapshot initialSnapshot,
-        Func<UiSessionSnapshot, int, string>? statusProjection = null)
-        : base(app, controller, publisher, initialSnapshot, statusProjection)
-    {
-    }
 
     /// <summary>The one-row session header (session/model and the unseen-rows indicator).</summary>
     internal Label Header => this.header;
@@ -56,7 +54,8 @@ internal sealed class FullscreenTuiShell : TerminalGuiShellBase
         this.header.Width = Dim.Fill();
         this.header.Height = 1;
 
-        this.transcript = new VirtualizedTranscriptView(this.HostApp);
+        this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter);
+        this.transcript.TranscriptScrolled += this.RefreshHeaderForViewport;
         this.transcript.X = Pos.Center();
         this.transcript.Y = Pos.Bottom(this.header);
         this.transcript.Width = Dim.Func(TranscriptWidth, this);
@@ -92,52 +91,30 @@ internal sealed class FullscreenTuiShell : TerminalGuiShellBase
 
         if (before.IsEmpty || after.IsEmpty || after[0].Id != before[0].Id)
         {
+            // Initial load, clear/reseed, or a wholesale change of the first block: a full rebuild.
             this.transcript.ReplaceAll(after);
             this.UpdateHeader(next);
             return;
         }
 
-        // Unchanged blocks keep their object identity across snapshots (the reducer only ever appends a
-        // block or replaces one via ImmutableArray.SetItem), so a reference-equality prefix/suffix scan
-        // tells us the exact edit — a tail append, a single block update (interior or tail), or, for
-        // anything more complex, a full rebuild. Only the changed block(s) are ever re-wrapped.
-        var min = Math.Min(before.Length, after.Length);
-        var prefix = 0;
-        while (prefix < min && ReferenceEquals(before[prefix], after[prefix]))
+        // The reducer only ever appends a block at the tail or replaces one in place via SetItem — it
+        // never inserts or removes an interior block. So a single frame is one of:
+        //   • a same-length transcript with any number of in-place replacements,
+        //   • replacements at existing positions plus a tail append, or
+        //   • a shorter transcript (a deletion, only ever produced by a reseed/clear).
+        // The first two re-wrap ONLY the blocks that actually changed (reference inequality) plus any
+        // appended tail — bounded by the number of changes, never O(n) — while a deletion, which cannot
+        // be reconciled incrementally, falls back to a full rebuild.
+        if (after.Length == before.Length)
         {
-            prefix++;
+            this.ReplaceChangedPositions(before, after, count: after.Length);
         }
-
-        var suffix = 0;
-        while (suffix < min - prefix &&
-            ReferenceEquals(before[before.Length - 1 - suffix], after[after.Length - 1 - suffix]))
+        else if (after.Length > before.Length)
         {
-            suffix++;
-        }
-
-        var beforeMiddle = before.Length - prefix - suffix;
-        var afterMiddle = after.Length - prefix - suffix;
-
-        if (beforeMiddle == 0 && afterMiddle == 0)
-        {
-            // No transcript change (a metadata-only event).
-        }
-        else if (beforeMiddle == 0 && suffix == 0)
-        {
-            for (var i = prefix; i < after.Length; i++)
+            this.ReplaceChangedPositions(before, after, count: before.Length);
+            for (var i = before.Length; i < after.Length; i++)
             {
                 this.transcript.Append(after[i]);
-            }
-        }
-        else if (beforeMiddle == 1 && afterMiddle == 1)
-        {
-            if (prefix == after.Length - 1)
-            {
-                this.transcript.ReplaceLast(after[prefix]);
-            }
-            else
-            {
-                this.transcript.ReplaceAt(prefix, after[prefix]);
             }
         }
         else
@@ -146,6 +123,33 @@ internal sealed class FullscreenTuiShell : TerminalGuiShellBase
         }
 
         this.UpdateHeader(next);
+    }
+
+    /// <summary>
+    /// Re-wrap only the first <paramref name="count"/> positions whose block reference changed. A tail
+    /// replacement reuses the streaming <see cref="VirtualizedTranscriptView.ReplaceLast"/> path (which
+    /// preserves auto-follow); any interior replacement reformats just that one block via
+    /// <see cref="VirtualizedTranscriptView.ReplaceAt"/>.
+    /// </summary>
+    private void ReplaceChangedPositions(
+        ImmutableArray<TranscriptBlock> before, ImmutableArray<TranscriptBlock> after, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            if (ReferenceEquals(before[i], after[i]))
+            {
+                continue;
+            }
+
+            if (i == after.Length - 1)
+            {
+                this.transcript.ReplaceLast(after[i]);
+            }
+            else
+            {
+                this.transcript.ReplaceAt(i, after[i]);
+            }
+        }
     }
 
     private void UpdateHeader(UiSessionSnapshot snapshot)
@@ -157,6 +161,22 @@ internal sealed class FullscreenTuiShell : TerminalGuiShellBase
         this.header.Text = !this.transcript.AutoFollow && unseen > 0
             ? $"{left}    {unseen} new — Ctrl+End"
             : left;
+    }
+
+    /// <summary>
+    /// Refresh the header immediately after a user scroll/jump so the "{n} new — Ctrl+End" indicator
+    /// appears or clears without waiting for the next snapshot (e.g. Ctrl+End clears it at once).
+    /// </summary>
+    private void RefreshHeaderForViewport() => this.UpdateHeader(this.Snapshot);
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && this.transcript is not null)
+        {
+            this.transcript.TranscriptScrolled -= this.RefreshHeaderForViewport;
+        }
+
+        base.Dispose(disposing);
     }
 
     private static int TranscriptWidth(View? shell)

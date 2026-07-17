@@ -1,3 +1,4 @@
+using Coda.Tui.Repl;
 using Coda.Tui.Ui;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
@@ -245,6 +246,199 @@ public sealed class TuiControllerTests
 
         var clear = Assert.IsType<ActiveOperationChangedEvent>(events.Events[1]);
         Assert.Null(clear.Operation);
+    }
+
+    [Fact]
+    public async Task Dispatch_result_exit_stops_the_attached_shell_with_exit()
+    {
+        // The Terminal.Gui shells submit `/exit` through OnSubmitted, whose dispatch returns
+        // CommandResult.Exit; the controller must honor that result and stop the shell, exactly as the
+        // plain/Spectre loops already break on ShouldExit.
+        var shell = new FakeShellHandle(ComposerState.Empty);
+        var controller = new TuiController(
+            dispatch: (_, _) => Task.FromResult(CommandResult.Exit),
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+        controller.AttachShell(shell, TuiRunMode.Inline);
+
+        controller.OnSubmitted("/exit");
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.True(controller.ExitRequested);
+        Assert.Equal(TuiShellExitKind.Exit, shell.LastStop!.Kind);
+    }
+
+    [Fact]
+    public async Task Dispatch_result_continue_neither_exits_nor_stops_the_shell()
+    {
+        var shell = new FakeShellHandle(ComposerState.Empty);
+        var controller = new TuiController(
+            dispatch: (_, _) => Task.FromResult(CommandResult.Continue),
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+        controller.AttachShell(shell, TuiRunMode.Inline);
+
+        controller.OnSubmitted("just a prompt");
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.False(controller.ExitRequested);
+        Assert.Null(shell.LastStop);
+    }
+
+    [Fact]
+    public async Task WaitForDispatch_observes_a_delayed_dispatch_before_returning()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // While the dispatch is blocked, the wait must not complete — shutdown must observe it first.
+        var wait = controller.WaitForDispatchAsync(CancellationToken.None);
+        Assert.False(wait.IsCompleted);
+
+        release.SetResult();
+        await wait.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(wait.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task WaitForDispatch_returns_immediately_when_idle()
+    {
+        var controller = new TuiController(
+            dispatch: (_, _) => Task.CompletedTask,
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        await controller.WaitForDispatchAsync(CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task WaitForDispatch_from_within_the_dispatch_does_not_deadlock()
+    {
+        TuiController controller = null!;
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        controller = new TuiController(
+            dispatch: async (_, ct) =>
+            {
+                // Self-join guard: awaiting our own dispatch would deadlock, so it must return at once.
+                await controller.WaitForDispatchAsync(ct);
+                completed.TrySetResult();
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run");
+
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Fact]
+    public async Task Faulting_dispatch_during_shutdown_never_publishes_into_the_disposed_mailbox()
+    {
+        using var hostCts = new CancellationTokenSource();
+        var publisher = new LateThrowingPublisher();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+                throw new InvalidOperationException("boom after shutdown");
+            },
+            tryInterrupt: () => false,
+            publisher: publisher,
+            initialSnapshot: UiSessionSnapshot.Empty,
+            hostCancellationToken: hostCts.Token);
+
+        controller.OnSubmitted("run");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var dispatch = controller.CurrentDispatch;
+        Assert.NotNull(dispatch);
+
+        // Shutdown ordering: host cancelled and the mailbox disposed, THEN the dispatch faults.
+        hostCts.Cancel();
+        publisher.MarkDisposed();
+        release.SetResult();
+
+        await dispatch!.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The faulting dispatch swallowed the fault without publishing into the disposed mailbox.
+        Assert.Equal(TaskStatus.RanToCompletion, dispatch.Status);
+        Assert.DoesNotContain(publisher.Published, e => e is AgentErrorEvent);
+    }
+
+    [Fact]
+    public async Task Faulting_dispatch_swallows_object_disposed_from_a_late_publish()
+    {
+        var publisher = new LateThrowingPublisher();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        // No host cancellation: exercise the narrow ObjectDisposedException race where the mailbox is
+        // disposed while the host token has not yet been observed as cancelled.
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+                throw new InvalidOperationException("boom");
+            },
+            tryInterrupt: () => false,
+            publisher: publisher,
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var dispatch = controller.CurrentDispatch;
+        Assert.NotNull(dispatch);
+
+        publisher.MarkDisposed();
+        release.SetResult();
+
+        await dispatch!.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(TaskStatus.RanToCompletion, dispatch.Status);
+    }
+
+    private sealed class LateThrowingPublisher : IUiEventPublisher
+    {
+        private volatile bool disposed;
+
+        public List<UiEvent> Published { get; } = new();
+
+        public void MarkDisposed() => this.disposed = true;
+
+        public void Publish(UiEvent uiEvent)
+        {
+            if (this.disposed)
+            {
+                throw new ObjectDisposedException(nameof(LateThrowingPublisher));
+            }
+
+            this.Published.Add(uiEvent);
+        }
     }
 
     private sealed class FakeShellHandle(ComposerState composer) : ITuiShellHandle

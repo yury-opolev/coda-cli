@@ -40,12 +40,13 @@ public sealed class TuiController
     /// <summary>The label shown in the status bar while the interactive startup is running.</summary>
     internal const string StartingLabel = "Starting…";
 
-    private readonly Func<string, CancellationToken, Task> dispatch;
+    private readonly Func<string, CancellationToken, Task<CommandResult>> dispatch;
     private readonly Func<bool> tryInterrupt;
     private readonly Func<bool> hasActiveTurn;
     private readonly IUiEventPublisher publisher;
     private readonly CancellationToken hostToken;
     private readonly object gate = new();
+    private readonly AsyncLocal<bool> inDispatch = new();
 
     private ITuiShellHandle? shell;
     private TuiRunMode currentMode = TuiRunMode.Inline;
@@ -83,9 +84,12 @@ public sealed class TuiController
         this.Prompts = prompts ?? throw new ArgumentNullException(nameof(prompts));
     }
 
-    /// <summary>Test seam: inject dispatch and interrupt behavior directly, without the full engine.</summary>
+    /// <summary>
+    /// Test seam: inject dispatch that reports its <see cref="CommandResult"/> (so a <c>/exit</c> command
+    /// stops the shell) and interrupt behavior directly, without the full engine.
+    /// </summary>
     internal TuiController(
-        Func<string, CancellationToken, Task> dispatch,
+        Func<string, CancellationToken, Task<CommandResult>> dispatch,
         Func<bool> tryInterrupt,
         IUiEventPublisher publisher,
         UiSessionSnapshot initialSnapshot,
@@ -94,8 +98,22 @@ public sealed class TuiController
     {
     }
 
-    private TuiController(
+    /// <summary>
+    /// Test seam (adapter overload): a dispatch that returns a bare <see cref="Task"/> is treated as
+    /// always <see cref="CommandResult.Continue"/>. Retained so existing seams stay source-compatible.
+    /// </summary>
+    internal TuiController(
         Func<string, CancellationToken, Task> dispatch,
+        Func<bool> tryInterrupt,
+        IUiEventPublisher publisher,
+        UiSessionSnapshot initialSnapshot,
+        CancellationToken hostCancellationToken = default)
+        : this(AsContinuing(dispatch), tryInterrupt, publisher, initialSnapshot, hostCancellationToken)
+    {
+    }
+
+    private TuiController(
+        Func<string, CancellationToken, Task<CommandResult>> dispatch,
         Func<bool> tryInterrupt,
         Func<bool> hasActiveTurn,
         IUiEventPublisher publisher,
@@ -324,9 +342,19 @@ public sealed class TuiController
 
     private async Task RunDispatchAsync(string text, CancellationToken token)
     {
+        // Mark the async flow so a re-entrant WaitForDispatchAsync (called from within the dispatch)
+        // never self-joins and deadlocks.
+        this.inDispatch.Value = true;
         try
         {
-            await this.dispatch(text, token).ConfigureAwait(false);
+            var result = await this.dispatch(text, token).ConfigureAwait(false);
+
+            // A `/exit` command reports ShouldExit; honor it exactly as the plain/Spectre loops break on
+            // the same result, stopping the attached shell so Terminal.Gui leaves cleanly.
+            if (result.ShouldExit)
+            {
+                this.RequestExit();
+            }
         }
         catch (OperationCanceledException)
         {
@@ -334,7 +362,7 @@ public sealed class TuiController
         }
         catch (Exception ex)
         {
-            this.publisher.Publish(new AgentErrorEvent(ex.Message));
+            this.PublishDispatchError(ex);
         }
         finally
         {
@@ -346,6 +374,81 @@ public sealed class TuiController
                 this.dispatchTask = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Publish a dispatch fault as an error notice, but never let a late publish surface as an
+    /// unobserved fault: during shutdown the mailbox may already be (or is about to be) disposed, and
+    /// dropping a diagnostic then is safe. The shutdown-specific <see cref="ObjectDisposedException"/> is
+    /// handled narrowly so a genuine bug in the publisher is still not swallowed silently otherwise.
+    /// </summary>
+    private void PublishDispatchError(Exception ex)
+    {
+        if (this.hostToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        try
+        {
+            this.publisher.Publish(new AgentErrorEvent(ex.Message));
+        }
+        catch (ObjectDisposedException)
+        {
+            // The mailbox was disposed concurrently with shutdown; the diagnostic is safely dropped.
+        }
+    }
+
+    /// <summary>
+    /// Observe the in-flight dispatch (if any) so a host shutdown can await it before the actor is
+    /// flushed and the mailbox disposed — otherwise a late producer could publish into a disposed
+    /// mailbox. Bounded by <paramref name="cancellationToken"/> and safe against races: it returns at
+    /// once when idle, when the dispatch is already completing, or when invoked from within the dispatch
+    /// task itself (a self-join would otherwise deadlock). It never rethrows the dispatch's own faults,
+    /// which are handled inside <see cref="RunDispatchAsync"/>.
+    /// </summary>
+    public async Task WaitForDispatchAsync(CancellationToken cancellationToken = default)
+    {
+        if (this.inDispatch.Value)
+        {
+            return;
+        }
+
+        Task? current;
+        lock (this.gate)
+        {
+            current = this.dispatchTask;
+        }
+
+        if (current is null || current.IsCompleted)
+        {
+            return;
+        }
+
+        try
+        {
+            await current.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // Bounded: the shutdown budget elapsed or was cancelled; proceed with teardown regardless.
+        }
+        catch (Exception)
+        {
+            // RunDispatchAsync owns its faults; observing the task here must never rethrow into shutdown.
+        }
+    }
+
+    /// <summary>Adapt a result-less dispatch into one that always reports <see cref="CommandResult.Continue"/>.</summary>
+    private static Func<string, CancellationToken, Task<CommandResult>> AsContinuing(
+        Func<string, CancellationToken, Task> dispatch)
+    {
+        ArgumentNullException.ThrowIfNull(dispatch);
+        return async (text, token) =>
+        {
+            await dispatch(text, token).ConfigureAwait(false);
+            return CommandResult.Continue;
+        };
     }
 
     private TuiRunMode ToggleTarget()

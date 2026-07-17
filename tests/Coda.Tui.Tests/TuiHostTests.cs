@@ -194,6 +194,46 @@ public sealed class TuiHostTests
         Assert.False(exited);
     }
 
+    [Fact]
+    public async Task Clean_exit_with_a_cleanup_error_reports_a_diagnostic_without_falling_back()
+    {
+        var cleanup = new InvalidOperationException("teardown blew up");
+        var runner = new ScriptedRunner(
+            new Dictionary<TuiRunMode, Queue<TuiShellExit>>
+            {
+                [TuiRunMode.Inline] = new([TuiShellExit.Exited.WithCleanupError(cleanup)]),
+            });
+        var error = new StringWriter();
+        var host = new TuiHost(runner, error);
+
+        await host.RunAsync(TuiRunMode.Inline, ComposerState.Empty);
+
+        Assert.Equal([TuiRunMode.Inline], runner.Attempts);
+        Assert.Contains("teardown blew up", error.ToString());
+        Assert.DoesNotContain("failed", error.ToString());
+    }
+
+    [Fact]
+    public async Task Switch_with_a_cleanup_error_still_switches_and_reports_a_diagnostic()
+    {
+        var cleanup = new InvalidOperationException("teardown blew up");
+        var draft = new ComposerState("draft", 2, [], 0, false);
+        var runner = new ScriptedRunner(
+            new Dictionary<TuiRunMode, Queue<TuiShellExit>>
+            {
+                [TuiRunMode.Inline] = new([TuiShellExit.SwitchTo(TuiRunMode.Fullscreen, draft).WithCleanupError(cleanup)]),
+                [TuiRunMode.Fullscreen] = new([TuiShellExit.Exited]),
+            });
+        var error = new StringWriter();
+        var host = new TuiHost(runner, error);
+
+        await host.RunAsync(TuiRunMode.Inline, ComposerState.Empty);
+
+        Assert.Equal([TuiRunMode.Inline, TuiRunMode.Fullscreen], runner.Attempts);
+        Assert.Equal(draft, runner.States[1]);
+        Assert.Contains("teardown blew up", error.ToString());
+    }
+
     private sealed class ScriptedRunner(Dictionary<TuiRunMode, Queue<TuiShellExit>> scripts) : ITuiModeRunner
     {
         private readonly object identity = new();

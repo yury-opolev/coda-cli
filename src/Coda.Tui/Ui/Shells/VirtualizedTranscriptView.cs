@@ -46,6 +46,14 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>Whether the viewport is pinned to the newest output.</summary>
     public bool AutoFollow => this.viewport.AutoFollow;
 
+    /// <summary>
+    /// Raised after a user scroll/jump changes the virtual viewport (auto-follow, unseen-row count, or
+    /// top row), so a host can refresh chrome — e.g. the full-screen header's "{n} new — Ctrl+End"
+    /// indicator — immediately instead of waiting for the next snapshot. Distinct from the base
+    /// <see cref="View"/>'s own viewport event, which tracks Terminal.Gui layout, not this virtual scroll.
+    /// </summary>
+    internal event Action? TranscriptScrolled;
+
     /// <summary>Rows appended while scrolled away that have not been seen.</summary>
     public int UnseenRows => this.viewport.UnseenRows;
 
@@ -142,6 +150,7 @@ internal sealed class VirtualizedTranscriptView : View
     {
         this.viewport.ScrollBy(rows);
         this.SetNeedsDraw();
+        this.TranscriptScrolled?.Invoke();
     }
 
     /// <summary>Jumps to the newest row and resumes auto-following.</summary>
@@ -149,6 +158,7 @@ internal sealed class VirtualizedTranscriptView : View
     {
         this.viewport.JumpToNewest();
         this.SetNeedsDraw();
+        this.TranscriptScrolled?.Invoke();
     }
 
     /// <summary>Whether the block with <paramref name="id"/> is currently expanded.</summary>
@@ -261,6 +271,7 @@ internal sealed class VirtualizedTranscriptView : View
         {
             this.viewport.ScrollToTop();
             this.SetNeedsDraw();
+            this.TranscriptScrolled?.Invoke();
             return true;
         }
 

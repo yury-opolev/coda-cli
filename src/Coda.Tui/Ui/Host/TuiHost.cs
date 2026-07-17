@@ -53,9 +53,11 @@ public sealed class TuiHost
             switch (exit.Kind)
             {
                 case TuiShellExitKind.Exit:
+                    this.ReportCleanup(mode, exit);
                     return;
 
                 case TuiShellExitKind.SwitchMode:
+                    this.ReportCleanup(mode, exit);
                     if (++switches > MaxModeSwitches || exit.NextMode is not { } next)
                     {
                         return;
@@ -85,6 +87,18 @@ public sealed class TuiHost
                 default:
                     return;
             }
+        }
+    }
+
+    /// <summary>
+    /// Emit a single cleanup diagnostic when a clean Exit/SwitchMode outcome carried a teardown fault.
+    /// The outcome itself is still honored by the caller (no fallback for a disposal fault).
+    /// </summary>
+    private void ReportCleanup(TuiRunMode mode, TuiShellExit exit)
+    {
+        if (exit.Error is not null)
+        {
+            this.error.WriteLine($"{Label(mode)} cleanup warning: {Describe(exit.Error)}");
         }
     }
 

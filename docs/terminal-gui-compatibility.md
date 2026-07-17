@@ -35,7 +35,9 @@ automated smoke against an isolated ANSI screen buffer.
   the total block count.
 - **Restoration:** startup and every exit path (clean exit, Ctrl-C then explicit exit, and a managed
   renderer crash) restore the alternate screen, cursor, mouse mode, bracketed paste, and scroll region.
-- **Minimum sizes:** the layout remains usable at **60×12**, **59×12**, and **60×11**.
+- **Minimum sizes:** **60×12** is the minimum usable interactive layout. **59×12** (too narrow) and
+  **60×11** (too short) are below that minimum and instead verify the graceful fallback (auto) and
+  usage-error (explicit `--tui`) paths — they are not usable interactive layouts.
 
 ## Checklist items (columns)
 
@@ -58,7 +60,7 @@ the terminal supports full-screen:
 14. **Crash restore** — a managed renderer crash restores the terminal and exits non-zero.
 15. **Bounded 10k** — full-screen visible-row formatting stays bounded with 10,000 blocks.
 16. **Redirected** — redirected input and redirected output both use plain behavior.
-17. **Min size** — usable at 60×12, 59×12, and 60×11.
+17. **Min size** — **60×12** is the minimum usable interactive layout; **59×12** and **60×11** verify the fallback/error path (not usable interactive layouts).
 
 Legend: `☐` untested · `✅` pass · `❌` fail · `➖` not applicable / unsupported.
 
