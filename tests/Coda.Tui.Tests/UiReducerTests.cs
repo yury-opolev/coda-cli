@@ -254,6 +254,22 @@ public sealed class UiReducerTests
     }
 
     [Fact]
+    public void Active_operation_changed_sets_and_clears_the_operation()
+    {
+        var state = UiReducer.Reduce(
+            UiSessionSnapshot.Empty,
+            new ActiveOperationChangedEvent(new ActiveOperation("startup", "Starting…", null)));
+
+        Assert.NotNull(state.ActiveOperation);
+        Assert.Equal("startup", state.ActiveOperation!.Kind);
+        Assert.Equal("Starting…", state.ActiveOperation.Label);
+
+        state = UiReducer.Reduce(state, new ActiveOperationChangedEvent(null));
+
+        Assert.Null(state.ActiveOperation);
+    }
+
+    [Fact]
     public void Null_publisher_is_a_no_op_singleton()
     {
         Assert.Same(NullUiEventPublisher.Instance, NullUiEventPublisher.Instance);

@@ -226,6 +226,27 @@ public sealed class TuiControllerTests
         Assert.Same(prompt, controller.CurrentSnapshot.PendingPrompt);
     }
 
+    [Fact]
+    public void Begin_startup_publishes_starting_indicator_and_complete_clears_it()
+    {
+        var events = new RecordingUiEvents();
+        var controller = new TuiController(
+            dispatch: (_, _) => Task.CompletedTask,
+            tryInterrupt: () => false,
+            publisher: events,
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.BeginStartup();
+        controller.CompleteStartup();
+
+        var set = Assert.IsType<ActiveOperationChangedEvent>(events.Events[0]);
+        Assert.NotNull(set.Operation);
+        Assert.Equal("startup", set.Operation!.Kind);
+
+        var clear = Assert.IsType<ActiveOperationChangedEvent>(events.Events[1]);
+        Assert.Null(clear.Operation);
+    }
+
     private sealed class FakeShellHandle(ComposerState composer) : ITuiShellHandle
     {
         public TuiShellExit? LastStop { get; private set; }

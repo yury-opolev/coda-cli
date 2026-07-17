@@ -123,6 +123,8 @@ public static class UiReducer
             ? state with { PendingPrompt = null }
             : state,
 
+        ActiveOperationChangedEvent e => state with { ActiveOperation = e.Operation },
+
         _ => state,
     };
 

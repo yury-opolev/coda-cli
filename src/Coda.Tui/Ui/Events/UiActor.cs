@@ -50,8 +50,11 @@ public sealed class UiActor
     private readonly IUiFrameSink _frameSink;
     private readonly IUiEventObserver? _eventObserver;
     private readonly ActorUiPromptService? _prompts;
+    private readonly object _barrierGate = new();
+    private readonly HashSet<TaskCompletionSource> _pendingBarriers = new();
     private UiSessionSnapshot _current;
     private long _lastFrameTicks = long.MinValue;
+    private bool _stopped;
 
     /// <summary>Create an actor that reduces events from <paramref name="mailbox"/> into frames.</summary>
     public UiActor(
@@ -70,6 +73,52 @@ public sealed class UiActor
 
     /// <summary>The most recently applied snapshot.</summary>
     public UiSessionSnapshot Current => Volatile.Read(ref _current);
+
+    /// <summary>
+    /// Drain every event queued before this call through the observer, reducer, and frame sink, then
+    /// complete. It publishes an internal ordered barrier through the same mailbox the actor reads, so
+    /// the returned task completes only once the actor has fully applied all preceding events in FIFO
+    /// order — a mere empty mailbox is insufficient because an event may already be dequeued while its
+    /// observer is still running. The call fails deterministically instead of hanging: it throws
+    /// <see cref="OperationCanceledException"/> if <paramref name="cancellationToken"/> is (or becomes)
+    /// cancelled, faults if the observer/frame sink throws while draining, throws
+    /// <see cref="InvalidOperationException"/> if the actor has already stopped, and is cancelled if the
+    /// actor stops while the barrier is still pending.
+    /// </summary>
+    public Task FlushAsync(CancellationToken cancellationToken = default)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromCanceled(cancellationToken);
+        }
+
+        var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        lock (_barrierGate)
+        {
+            if (_stopped)
+            {
+                return Task.FromException(new InvalidOperationException("The UI actor is not running."));
+            }
+
+            _pendingBarriers.Add(completion);
+        }
+
+        try
+        {
+            _mailbox.Publish(new UiFlushBarrierEvent(completion));
+        }
+        catch (Exception ex)
+        {
+            lock (_barrierGate)
+            {
+                _pendingBarriers.Remove(completion);
+            }
+
+            return Task.FromException(ex);
+        }
+
+        return completion.Task.WaitAsync(cancellationToken);
+    }
 
     /// <summary>Run the reduce loop until <paramref name="cancellationToken"/> is cancelled.</summary>
     public async Task RunAsync(CancellationToken cancellationToken)
@@ -94,41 +143,125 @@ public sealed class UiActor
                     batch.Add(next!);
                 }
 
-                var snapshot = _current;
-                var critical = false;
-                foreach (var uiEvent in batch)
-                {
-                    if (_prompts is not null && uiEvent is UiPromptResponseSubmittedEvent submitted)
-                    {
-                        _prompts.Complete(submitted);
-                    }
-
-                    if (_eventObserver is not null)
-                    {
-                        await _eventObserver.ApplyEventAsync(uiEvent, cancellationToken).ConfigureAwait(false);
-                    }
-
-                    snapshot = UiReducer.Reduce(snapshot, uiEvent);
-                    critical |= IsCritical(uiEvent);
-                }
-
-                if (snapshot == _current)
-                {
-                    continue;
-                }
-
-                if (!critical)
-                {
-                    await ThrottleStreamingFrameAsync(cancellationToken).ConfigureAwait(false);
-                }
-
-                await _frameSink.ApplyAsync(snapshot, cancellationToken).ConfigureAwait(false);
-                _lastFrameTicks = Environment.TickCount64;
-                Volatile.Write(ref _current, snapshot);
+                await ApplyBatchAsync(batch, cancellationToken).ConfigureAwait(false);
             }
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
+        }
+        finally
+        {
+            StopAndCancelPendingBarriers();
+        }
+    }
+
+    private async Task ApplyBatchAsync(List<UiEvent> batch, CancellationToken cancellationToken)
+    {
+        var snapshot = _current;
+        var critical = false;
+        try
+        {
+            foreach (var uiEvent in batch)
+            {
+                if (uiEvent is UiFlushBarrierEvent barrier)
+                {
+                    // Apply the frame for every event queued before this barrier so it only completes
+                    // once BOTH the observer (above, in FIFO order) AND the frame sink have seen them.
+                    snapshot = await ApplyFrameIfChangedAsync(snapshot, critical: true, cancellationToken).ConfigureAwait(false);
+                    critical = false;
+                    CompleteBarrier(barrier.Completion);
+                    continue;
+                }
+
+                if (_prompts is not null && uiEvent is UiPromptResponseSubmittedEvent submitted)
+                {
+                    _prompts.Complete(submitted);
+                }
+
+                if (_eventObserver is not null)
+                {
+                    await _eventObserver.ApplyEventAsync(uiEvent, cancellationToken).ConfigureAwait(false);
+                }
+
+                snapshot = UiReducer.Reduce(snapshot, uiEvent);
+                critical |= IsCritical(uiEvent);
+            }
+
+            await ApplyFrameIfChangedAsync(snapshot, critical, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // Host shutdown: any barrier still pending in this batch is cancelled by the run loop's
+            // finally, so callers never hang.
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // An observer/frame fault resolves every not-yet-completed barrier in this batch with the
+            // same exception rather than leaving its caller waiting forever.
+            FaultBarriers(batch, ex);
+            throw;
+        }
+    }
+
+    private async ValueTask<UiSessionSnapshot> ApplyFrameIfChangedAsync(
+        UiSessionSnapshot snapshot, bool critical, CancellationToken cancellationToken)
+    {
+        if (snapshot == _current)
+        {
+            return snapshot;
+        }
+
+        if (!critical)
+        {
+            await ThrottleStreamingFrameAsync(cancellationToken).ConfigureAwait(false);
+        }
+
+        await _frameSink.ApplyAsync(snapshot, cancellationToken).ConfigureAwait(false);
+        _lastFrameTicks = Environment.TickCount64;
+        Volatile.Write(ref _current, snapshot);
+        return snapshot;
+    }
+
+    private void CompleteBarrier(TaskCompletionSource completion)
+    {
+        lock (_barrierGate)
+        {
+            _pendingBarriers.Remove(completion);
+        }
+
+        completion.TrySetResult();
+    }
+
+    private void FaultBarriers(List<UiEvent> batch, Exception ex)
+    {
+        foreach (var uiEvent in batch)
+        {
+            if (uiEvent is UiFlushBarrierEvent barrier)
+            {
+                lock (_barrierGate)
+                {
+                    _pendingBarriers.Remove(barrier.Completion);
+                }
+
+                barrier.Completion.TrySetException(ex);
+            }
+        }
+    }
+
+    private void StopAndCancelPendingBarriers()
+    {
+        TaskCompletionSource[] pending;
+        lock (_barrierGate)
+        {
+            _stopped = true;
+            pending = _pendingBarriers.ToArray();
+            _pendingBarriers.Clear();
+        }
+
+        foreach (var completion in pending)
+        {
+            completion.TrySetCanceled();
         }
     }
 
@@ -155,6 +288,7 @@ public sealed class UiActor
         TranscriptSeededEvent => true,
         TranscriptClearedEvent => true,
         ConsoleClearRequestedEvent => true,
+        ActiveOperationChangedEvent => true,
         _ => false,
     };
 

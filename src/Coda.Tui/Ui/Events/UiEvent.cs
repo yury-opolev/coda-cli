@@ -126,3 +126,16 @@ public sealed record UiPromptRequestedEvent(UiPromptRequest Request) : UiEvent;
 
 /// <summary>A pending host-neutral prompt was answered.</summary>
 public sealed record UiPromptResponseSubmittedEvent(Guid RequestId, UiPromptResponse Response) : UiEvent;
+
+/// <summary>Set or clear the active operation shown in the status bar (e.g. a startup spinner).</summary>
+public sealed record ActiveOperationChangedEvent(ActiveOperation? Operation) : UiEvent;
+
+/// <summary>
+/// An internal ordering barrier published through the mailbox by <see cref="UiActor.FlushAsync"/>. The
+/// actor completes <see cref="Completion"/> only after every event queued before it has passed the
+/// observer, reducer, and frame sink in FIFO order. <see cref="UiReducer"/> ignores it (the default
+/// case returns the snapshot unchanged) and no public renderer produces output for it, so it is
+/// invisible to the UI; it is never coalesced or evicted because it is not a coalescible streaming
+/// event.
+/// </summary>
+internal sealed record UiFlushBarrierEvent(TaskCompletionSource Completion) : UiEvent;

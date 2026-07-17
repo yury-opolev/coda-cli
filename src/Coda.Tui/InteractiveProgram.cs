@@ -346,6 +346,11 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         try
         {
             await host.RunAsync(mode, ComposerState.Empty, hostToken).ConfigureAwait(false);
+
+            // Clean exit (EOF/`/exit`/exhausted fallback): drain the actor so the just-published final
+            // command output — which may still be queued or mid-observer — is emitted before the actor
+            // is cancelled. Bounded so a stuck observer/frame can never hang shutdown.
+            await FlushUiSafelyAsync(actor, actorTask, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
@@ -354,6 +359,30 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Drain the actor's pending UI events on a clean exit before the host cancels it. Skips the flush
+    /// entirely when the host is already tearing down (cancellation requested) or the actor task has
+    /// stopped/faulted, and never rethrows: a flush timeout or fault must not delay or fail shutdown.
+    /// </summary>
+    private static async Task FlushUiSafelyAsync(UiActor actor, Task actorTask, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested || actorTask.IsCompleted)
+        {
+            return;
+        }
+
+        using var flushCts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+        try
+        {
+            await actor.FlushAsync(flushCts.Token).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Timeout, actor already stopped, or an observer/frame fault surfaced through the barrier:
+            // proceed with shutdown regardless.
+        }
     }
 
     /// <summary>Seed continue/resume/fork history and publish the projected transcript.</summary>

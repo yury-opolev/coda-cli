@@ -37,6 +37,9 @@ public sealed class TuiController
     /// <summary>The idle Ctrl-C notice; Ctrl-C never exits, so this points users at an explicit exit.</summary>
     internal const string IdleNotification = "Nothing is running; use /exit or Ctrl+D to exit.";
 
+    /// <summary>The label shown in the status bar while the interactive startup is running.</summary>
+    internal const string StartingLabel = "Starting…";
+
     private readonly Func<string, CancellationToken, Task> dispatch;
     private readonly Func<bool> tryInterrupt;
     private readonly Func<bool> hasActiveTurn;
@@ -195,6 +198,9 @@ public sealed class TuiController
         {
             this.startupPending = true;
         }
+
+        // Surface a generic "Starting…" active-operation indicator; the status projector renders it.
+        this.publisher.Publish(new ActiveOperationChangedEvent(new ActiveOperation("startup", StartingLabel, null)));
     }
 
     /// <summary>Re-enable submission once the interactive startup callback has finished.</summary>
@@ -204,6 +210,8 @@ public sealed class TuiController
         {
             this.startupPending = false;
         }
+
+        this.publisher.Publish(new ActiveOperationChangedEvent(null));
     }
 
     /// <summary>Whether startup is still running and submission is therefore blocked.</summary>
