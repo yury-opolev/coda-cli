@@ -14,6 +14,9 @@
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.55.2" />
     <PackageReference Include="Terminal.Gui" Version="2.4.17" />
+    <!-- Terminal.Gui 2.4.17 depends on Markdig 1.3.2; reference it explicitly so the shared
+         transcript formatter can parse assistant markdown through Markdig's stable AST. -->
+    <PackageReference Include="Markdig" Version="1.3.2" />
   </ItemGroup>
 
   <ItemGroup>

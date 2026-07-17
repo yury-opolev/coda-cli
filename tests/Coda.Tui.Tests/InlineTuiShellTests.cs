@@ -23,6 +23,13 @@ internal static class ShellTestFactory
             new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
             publisher ?? new RecordingUiEvents(),
             UiSessionSnapshot.Empty);
+
+    public static FullscreenTuiShell CreateFullscreen(IApplication app, IUiEventPublisher? publisher = null) =>
+        new(
+            app,
+            new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
+            publisher ?? new RecordingUiEvents(),
+            UiSessionSnapshot.Empty);
 }
 
 public sealed class InlineTuiShellTests

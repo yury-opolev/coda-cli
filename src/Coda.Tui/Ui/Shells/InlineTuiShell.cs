@@ -1,7 +1,7 @@
 using System.Collections.Immutable;
-using System.Text;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Shells;
@@ -120,7 +120,14 @@ internal sealed class InlineTuiShell : TerminalGuiShellBase
     private void CommitBlock(TranscriptBlock block)
     {
         this.BlockCommitted?.Invoke(this, block);
-        this.RenderCommittedBlock(TranscriptBlockText.Format(block));
+        this.RenderCommittedBlock(TranscriptBlockFormatter.FormatPlainText(block, this.CommitWidth()));
+    }
+
+    /// <summary>The wrap width used when committing a block to native scrollback.</summary>
+    private int CommitWidth()
+    {
+        var width = this.Frame.Width;
+        return width > 0 ? width : 80;
     }
 
     /// <summary>
@@ -176,7 +183,7 @@ internal sealed class InlineTuiShell : TerminalGuiShellBase
             return;
         }
 
-        var text = Bound(TranscriptBlockText.FormatActive(active));
+        var text = Bound(ActiveRowText(active));
         if (!string.Equals(text, this.ActiveRow.Text, StringComparison.Ordinal) || !this.ActiveRow.Visible)
         {
             this.ActiveRow.Text = text;
@@ -212,53 +219,16 @@ internal sealed class InlineTuiShell : TerminalGuiShellBase
         var singleLine = text.Replace("\r", " ").Replace("\n", " ");
         return singleLine.Length <= MaxActiveRowLength ? singleLine : singleLine[..MaxActiveRowLength];
     }
-}
 
-/// <summary>
-/// Minimal, host-neutral text projection for transcript blocks. It is intentionally lossless for the
-/// content the inline shell must never drop — command output, diffs, tool names/results, and
-/// assistant text — pending the richer formatter introduced with the full-screen transcript view.
-/// </summary>
-internal static class TranscriptBlockText
-{
-    public static string Format(TranscriptBlock block) => block switch
-    {
-        UserTranscriptBlock user => "> " + user.Text,
-        AssistantTranscriptBlock assistant => assistant.Text,
-        ToolTranscriptBlock tool => FormatTool(tool),
-        CommandOutputTranscriptBlock command => command.Text,
-        DiffTranscriptBlock diff => diff.Patch,
-        PermissionTranscriptBlock permission =>
-            $"[permission] {permission.ToolName} {permission.InputPreview}{FormatDecision(permission.Allowed)}",
-        UserQuestionTranscriptBlock question =>
-            question.Answer is { } answer ? $"[question] {question.Question} -> {answer}" : $"[question] {question.Question}",
-        NoticeTranscriptBlock notice => $"[{notice.Level.ToString().ToLowerInvariant()}] {notice.Text}",
-        SessionBoundaryTranscriptBlock boundary => $"--- session {boundary.SessionId} ---",
-        _ => string.Empty,
-    };
-
-    public static string FormatActive(TranscriptBlock block) => block switch
+    /// <summary>
+    /// The compact, single-row projection of the active (streaming) block shown above the composer.
+    /// Streaming assistant text is shown raw (its markdown is still incomplete); a running tool is shown
+    /// as a short status line. Anything else falls back to the shared formatter's plain-text projection.
+    /// </summary>
+    private static string ActiveRowText(TranscriptBlock block) => block switch
     {
         AssistantTranscriptBlock assistant => assistant.Text,
         ToolTranscriptBlock tool => $"[tool] {tool.ToolName} {(tool.ElapsedMs is { } ms ? ms + "ms" : "running")}",
-        _ => Format(block),
-    };
-
-    private static string FormatTool(ToolTranscriptBlock tool)
-    {
-        var builder = new StringBuilder($"[tool] {tool.ToolName} {tool.InputJson}");
-        if (tool.Result is { Length: > 0 } result)
-        {
-            builder.Append(Environment.NewLine).Append(result);
-        }
-
-        return builder.ToString();
-    }
-
-    private static string FormatDecision(bool? allowed) => allowed switch
-    {
-        true => " -> allowed",
-        false => " -> denied",
-        null => string.Empty,
+        _ => TranscriptBlockFormatter.FormatPlainText(block, MaxActiveRowLength),
     };
 }
