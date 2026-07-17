@@ -101,7 +101,6 @@ public sealed class ContextSnapshotCache
             lock (this.gate)
             {
                 this.current = report;
-                this.invalidated = false;
                 if (ReferenceEquals(this.inFlight, task))
                 {
                     this.inFlight = null;

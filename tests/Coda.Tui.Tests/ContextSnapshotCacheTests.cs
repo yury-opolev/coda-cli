@@ -88,6 +88,47 @@ public sealed class ContextSnapshotCacheTests
     }
 
     [Fact]
+    public async Task ContextSnapshotCache_invalidation_during_analysis_is_not_clobbered_by_completion()
+    {
+        var calls = 0;
+        var gate = new TaskCompletionSource<ContextReport>();
+        var cache = new ContextSnapshotCache(_ =>
+        {
+            Interlocked.Increment(ref calls);
+            return gate.Task;
+        });
+
+        var first = cache.GetAsync();
+
+        // Wait until the analyzer has actually started (call count observed).
+        var spin = new SpinWait();
+        while (Volatile.Read(ref calls) < 1)
+        {
+            spin.SpinOnce();
+        }
+
+        // Invalidate while the first analysis is still in flight.
+        cache.InvalidateAfterTurn();
+
+        // Complete the in-flight analysis and let ObserveAsync run.
+        gate.SetResult(Report());
+        await first;
+
+        // Ensure ObserveAsync's critical section has executed (it publishes Current in the
+        // same locked block that would clobber the invalidation).
+        while (cache.Current is null)
+        {
+            spin.SpinOnce();
+        }
+
+        // The invalidation that arrived mid-analysis must survive completion, so the
+        // next GetAsync re-analyzes instead of returning the stale cached report.
+        await cache.GetAsync();
+
+        Assert.Equal(2, calls);
+    }
+
+    [Fact]
     public async Task ContextSnapshotCache_caller_cancellation_does_not_corrupt_shared_state()
     {
         var gate = new TaskCompletionSource<ContextReport>();
