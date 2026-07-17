@@ -102,6 +102,42 @@ public sealed class TuiControllerTests
     }
 
     [Fact]
+    public async Task Submit_is_blocked_while_startup_pending_and_re_enabled_after_completion()
+    {
+        var dispatched = 0;
+        var controller = new TuiController(
+            dispatch: (_, _) =>
+            {
+                Interlocked.Increment(ref dispatched);
+                return Task.CompletedTask;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        // While startup is pending the composer/plain loop cannot submit a turn, so the bounded mailbox
+        // cannot fill before its actor is running and no turn races MCP/setup initialization.
+        controller.BeginStartup();
+        Assert.True(controller.StartupPending);
+
+        controller.OnSubmitted("blocked");
+        Assert.Null(controller.CurrentDispatch);
+        Assert.Equal(0, dispatched);
+
+        // Once startup completes, submission is re-enabled.
+        controller.CompleteStartup();
+        Assert.False(controller.StartupPending);
+
+        controller.OnSubmitted("allowed");
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.Equal(1, dispatched);
+    }
+
+    [Fact]
     public async Task Exit_action_sets_exit_request_and_stops_the_shell()
     {
         var shell = new FakeShellHandle(ComposerState.Empty);

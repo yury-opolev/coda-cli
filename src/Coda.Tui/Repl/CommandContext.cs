@@ -36,7 +36,7 @@ public sealed class CommandContext
         this.SemanticUiEnabled = semanticUiEnabled;
     }
 
-    public IAnsiConsole Console { get; }
+    public IAnsiConsole Console { get; internal set; }
 
     public CredentialManager Credentials { get; }
 
@@ -47,10 +47,10 @@ public sealed class CommandContext
     public SlashCommandRegistry Commands { get; }
 
     /// <summary>Host-neutral prompt surface; defaults to the non-interactive plain fallback.</summary>
-    public IUiPromptService Prompts { get; }
+    public IUiPromptService Prompts { get; internal set; }
 
     /// <summary>Semantic UI event publisher; defaults to a no-op publisher.</summary>
-    public IUiEventPublisher Events { get; }
+    public IUiEventPublisher Events { get; internal set; }
 
     /// <summary>Cache of context-window snapshots for the semantic UI; null when not wired.</summary>
     public ContextSnapshotCache? ContextSnapshots { get; set; }
@@ -62,7 +62,27 @@ public sealed class CommandContext
     public Func<UiSessionSnapshot>? UiSnapshotProvider { get; set; }
 
     /// <summary>Whether the actor-driven semantic UI is active.</summary>
-    public bool SemanticUiEnabled { get; }
+    public bool SemanticUiEnabled { get; internal set; }
+
+    /// <summary>
+    /// Swap the per-mode presentation environment (console, prompt surface, event publisher, and the
+    /// semantic-UI flag) in place, so the shared command graph — the same
+    /// <see cref="CommandContext"/>, <c>TuiApp</c>, <c>AgentRunner</c>, and <c>TuiController</c> — is
+    /// reused across a mode switch or fallback instead of being rebuilt. Callers must only invoke this
+    /// while no dispatch is in flight (the controller serializes dispatch), so a turn never observes a
+    /// half-swapped environment.
+    /// </summary>
+    internal void SetModeEnvironment(
+        IAnsiConsole console,
+        IUiPromptService prompts,
+        IUiEventPublisher events,
+        bool semanticUiEnabled)
+    {
+        this.Console = console ?? throw new ArgumentNullException(nameof(console));
+        this.Prompts = prompts ?? throw new ArgumentNullException(nameof(prompts));
+        this.Events = events ?? throw new ArgumentNullException(nameof(events));
+        this.SemanticUiEnabled = semanticUiEnabled;
+    }
 
     /// <summary>
     /// Live source of the agent's extra tools (MCP tools + MCP resource/prompt tools). A provider

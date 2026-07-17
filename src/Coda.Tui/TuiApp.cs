@@ -34,62 +34,109 @@ public sealed class TuiApp : IDisposable
     /// <summary>The agent runner this host dispatches turns through. Exposed for host wiring/tests.</summary>
     internal AgentRunner Runner => this.agentRunner;
 
-    public async Task RunAsync(CancellationToken cancellationToken = default)
+    /// <summary>
+    /// Backwards-compatible entry point that runs the Spectre REPL. Retained so callers built before
+    /// the host owned mode selection keep compiling; new code selects <see cref="RunSpectreAsync"/> or
+    /// <see cref="RunPlainAsync"/> explicitly.
+    /// </summary>
+    [Obsolete("Use RunSpectreAsync or RunPlainAsync; the interactive host now selects the loop.")]
+    public Task RunAsync(CancellationToken cancellationToken = default) => this.RunSpectreAsync(cancellationToken);
+
+    /// <summary>
+    /// The interactive Spectre REPL loop: render the banner, read a line through the
+    /// <see cref="InteractiveLineEditor"/>, and dispatch it. Used only for a real, interactive terminal
+    /// (the plain/redirected path uses <see cref="RunPlainAsync"/>). Honors cancellation and exit.
+    /// </summary>
+    public async Task RunSpectreAsync(CancellationToken cancellationToken = default)
     {
         var connectedProvider = await this.context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
         Banner.Render(this.context.Console, this.context.Session, connectedProvider, this.context.Session.Model);
 
-        var interactive = this.context.Console.Profile.Capabilities.Interactive;
-
         while (!cancellationToken.IsCancellationRequested)
         {
-            // Plain line read works both interactively and with piped/scripted input
-            // (a Spectre text widget throws in non-interactive mode). Only show the
-            // glyph when interactive so scripted/piped output stays clean.
-            if (interactive)
+            if (!string.IsNullOrEmpty(this.context.Session.Goal))
             {
-                if (!string.IsNullOrEmpty(this.context.Session.Goal))
-                {
-                    // Keep the indicator compact; the full goal text is shown by /goal.
-                    var goal = this.context.Session.Goal;
-                    var shown = goal.Length > 40 ? goal[..40] + "…" : goal;
-                    this.context.Console.Markup(Theme.DimMarkup($"[goal: {shown}] "));
-                }
-
-                this.context.Console.Markup($"{Theme.PromptGlyph} ");
+                // Keep the indicator compact; the full goal text is shown by /goal.
+                var goal = this.context.Session.Goal;
+                var shown = goal.Length > 40 ? goal[..40] + "…" : goal;
+                this.context.Console.Markup(Theme.DimMarkup($"[goal: {shown}] "));
             }
 
-            var input = interactive
-                ? await new InteractiveLineEditor(this.context.Console, this.context.Commands)
-                    .ReadLineAsync(cancellationToken).ConfigureAwait(false)
-                : Console.ReadLine();
+            this.context.Console.Markup($"{Theme.PromptGlyph} ");
+
+            var input = await new InteractiveLineEditor(this.context.Console, this.context.Commands)
+                .ReadLineAsync(cancellationToken).ConfigureAwait(false);
             if (input is null)
             {
                 break; // EOF
             }
 
-            CommandResult result;
-            try
-            {
-                result = await this.DispatchAsync(CommandParser.Parse(input), cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                this.context.Console.MarkupLine(Theme.DimMarkup("Canceled."));
-                break;
-            }
-            catch (Exception ex)
-            {
-                // A single command must never tear down the whole REPL.
-                this.context.Console.MarkupLine(Theme.ErrorMarkup($"Error: {ex.Message}"));
-                continue;
-            }
-
-            if (result.ShouldExit)
+            if (!await this.DispatchLineAsync(input, cancellationToken).ConfigureAwait(false))
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// The plain, line-based loop for redirected/non-interactive/CI runs and explicit <c>--plain</c>:
+    /// read a line from <paramref name="input"/> and dispatch it through the shared
+    /// <see cref="DispatchAsync"/> path. No banner, prompt glyph, or control sequences are emitted, and
+    /// all output flows through <see cref="CommandContext.Console"/>/<see cref="CommandContext.Events"/>
+    /// so a single owner serializes it. Honors EOF, cancellation, and <see cref="CommandResult.ShouldExit"/>.
+    /// </summary>
+    public async Task RunPlainAsync(TextReader input, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            string? line;
+            try
+            {
+                line = await input.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (line is null)
+            {
+                break; // EOF
+            }
+
+            if (!await this.DispatchLineAsync(line, cancellationToken).ConfigureAwait(false))
+            {
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parse and dispatch a single input line, translating cancellation/error into the loop's
+    /// continue/stop decision. Returns false when the loop should stop (cancelled or an exit command).
+    /// </summary>
+    private async Task<bool> DispatchLineAsync(string line, CancellationToken cancellationToken)
+    {
+        CommandResult result;
+        try
+        {
+            result = await this.DispatchAsync(CommandParser.Parse(line), cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            this.context.Console.MarkupLine(Theme.DimMarkup("Canceled."));
+            return false;
+        }
+        catch (Exception ex)
+        {
+            // A single command must never tear down the whole REPL.
+            this.context.Console.MarkupLine(Theme.ErrorMarkup($"Error: {ex.Message}"));
+            return true;
+        }
+
+        return !result.ShouldExit;
     }
 
     /// <summary>Dispatch a single parsed line. Exposed for testing.</summary>

@@ -50,6 +50,7 @@ public sealed class TuiController
     private CancellationTokenSource? dispatchCts;
     private Task? dispatchTask;
     private bool exitRequested;
+    private bool startupPending;
     private TuiRunMode? pendingModeSwitch;
 
     /// <summary>
@@ -183,6 +184,40 @@ public sealed class TuiController
         }
     }
 
+    /// <summary>
+    /// Block submission until startup completes: while pending, the composer/plain loop cannot submit a
+    /// turn, so a bounded mailbox cannot fill before its actor is running and no turn races MCP/setup
+    /// initialization. Paired with <see cref="CompleteStartup"/>.
+    /// </summary>
+    internal void BeginStartup()
+    {
+        lock (this.gate)
+        {
+            this.startupPending = true;
+        }
+    }
+
+    /// <summary>Re-enable submission once the interactive startup callback has finished.</summary>
+    internal void CompleteStartup()
+    {
+        lock (this.gate)
+        {
+            this.startupPending = false;
+        }
+    }
+
+    /// <summary>Whether startup is still running and submission is therefore blocked.</summary>
+    internal bool StartupPending
+    {
+        get
+        {
+            lock (this.gate)
+            {
+                return this.startupPending;
+            }
+        }
+    }
+
     /// <summary>Persist the actor's latest snapshot so the next shell is seeded from it.</summary>
     public void CaptureSnapshot(UiSessionSnapshot snapshot)
     {
@@ -246,7 +281,7 @@ public sealed class TuiController
         CancellationToken token;
         lock (this.gate)
         {
-            if (Volatile.Read(ref this.exitRequested) || this.dispatchInFlight)
+            if (Volatile.Read(ref this.exitRequested) || this.dispatchInFlight || this.startupPending)
             {
                 return;
             }
