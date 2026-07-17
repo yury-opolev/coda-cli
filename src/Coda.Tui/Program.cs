@@ -75,11 +75,7 @@ var providers = new List<ProviderDescriptor>
 };
 
 using var cts = new CancellationTokenSource();
-System.Console.CancelKeyPress += (_, e) =>
-{
-    e.Cancel = true;
-    cts.Cancel();
-};
+using var cancellationRegistration = new ConsoleCancellationRegistration(cts);
 
 // Resolve the startup provider + model from (in precedence): CODA_PROVIDER env →
 // the connected credential's provider → the first provider descriptor. This mirrors

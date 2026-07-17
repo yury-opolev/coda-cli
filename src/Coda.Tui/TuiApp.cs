@@ -46,7 +46,10 @@ public sealed class TuiApp : IDisposable
                 this.context.Console.Markup($"{Theme.PromptGlyph} ");
             }
 
-            var input = Console.ReadLine();
+            var input = interactive
+                ? await new InteractiveLineEditor(this.context.Console, this.context.Commands)
+                    .ReadLineAsync(cancellationToken).ConfigureAwait(false)
+                : Console.ReadLine();
             if (input is null)
             {
                 break; // EOF
