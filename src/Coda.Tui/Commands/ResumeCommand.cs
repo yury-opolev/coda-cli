@@ -1,5 +1,6 @@
 using Coda.Sdk;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -38,11 +39,53 @@ public sealed class ResumeCommand : ISlashCommand
 
         if (args.Count == 0)
         {
-            return await this.ListSessionsAsync(context, store, cancellationToken).ConfigureAwait(false);
+            return await this.HandleNoArgsAsync(context, store, cancellationToken).ConfigureAwait(false);
         }
 
         var targetId = await ResolveTargetIdAsync(store, args[0], cancellationToken).ConfigureAwait(false);
         return await this.ResumeSessionAsync(context, store, targetId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// With a prompt surface that can answer, present recent sessions (title <c>Choose a session</c>,
+    /// option id = session id, details carry message count, age, and preview) and resume the choice;
+    /// otherwise print the plain listing and never await a prompt. Nothing is mutated until a session
+    /// is picked.
+    /// </summary>
+    private async Task<CommandResult> HandleNoArgsAsync(
+        CommandContext context,
+        SessionTranscriptStore store,
+        CancellationToken cancellationToken)
+    {
+        if (!context.Prompts.IsInteractive)
+        {
+            return await this.ListSessionsAsync(context, store, cancellationToken).ConfigureAwait(false);
+        }
+
+        var summaries = await store.ListAsync(cancellationToken).ConfigureAwait(false);
+        if (summaries.Count == 0)
+        {
+            context.Console.MarkupLine("[grey50]No sessions found. Start a conversation to create one.[/]");
+            return CommandResult.Continue;
+        }
+
+        var options = summaries.Select(s =>
+        {
+            var age = FormatAge(s.CreatedUtc);
+            var preview = s.Preview.Length > 60 ? s.Preview[..60] + "…" : s.Preview;
+            return new UiPromptOption(s.Id, s.Id, $"{s.MessageCount} msgs · {age} · {preview}");
+        });
+
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Choose a session", options),
+            cancellationToken).ConfigureAwait(false);
+
+        if (response.Cancelled || response.SelectedIds.Length == 0)
+        {
+            return CommandResult.Continue; // dismissed — history and session id left untouched
+        }
+
+        return await this.ResumeSessionAsync(context, store, response.SelectedIds[0], cancellationToken).ConfigureAwait(false);
     }
 
     // A bare positive integer within the listing selects the Nth-newest session (1-based);

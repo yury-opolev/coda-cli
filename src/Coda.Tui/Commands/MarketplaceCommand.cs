@@ -1,6 +1,7 @@
 using Coda.Tui.Plugins;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -55,7 +56,26 @@ public sealed class MarketplaceCommand : ISlashCommand
         IReadOnlyList<string> args,
         CancellationToken cancellationToken = default)
     {
-        var subcommand = args.Count > 0 ? args[0].ToLowerInvariant() : "list";
+        string subcommand;
+        if (args.Count > 0)
+        {
+            subcommand = args[0].ToLowerInvariant();
+        }
+        else if (context.Prompts.IsInteractive)
+        {
+            // No subcommand given but a prompt surface can answer — ask which action to run.
+            var chosen = await this.ChooseActionAsync(context, cancellationToken).ConfigureAwait(false);
+            if (chosen is null)
+            {
+                return CommandResult.Continue;
+            }
+
+            subcommand = chosen;
+        }
+        else
+        {
+            subcommand = "list";
+        }
 
         switch (subcommand)
         {
@@ -227,6 +247,27 @@ public sealed class MarketplaceCommand : ISlashCommand
     {
         context.Console.MarkupLine(Theme.WarnMarkup(
             "Usage: /marketplace [add <source> | list | remove <name> | browse <name> | install <plugin> <marketplace>]"));
+    }
+
+    /// <summary>
+    /// Present the marketplace action picker (title <c>Marketplace action</c>, stable option ids
+    /// <c>list/add/remove/browse/install</c>) through the host-neutral prompt surface. Returns the
+    /// chosen action id, or <c>null</c> when the user dismisses the prompt.
+    /// </summary>
+    internal async Task<string?> ChooseActionAsync(CommandContext context, CancellationToken cancellationToken = default)
+    {
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Marketplace action", new[]
+            {
+                new UiPromptOption("list", "List marketplaces"),
+                new UiPromptOption("add", "Add a marketplace"),
+                new UiPromptOption("remove", "Remove a marketplace"),
+                new UiPromptOption("browse", "Browse a marketplace"),
+                new UiPromptOption("install", "Install a plugin from a marketplace"),
+            }),
+            cancellationToken).ConfigureAwait(false);
+
+        return response.Cancelled || response.SelectedIds.Length == 0 ? null : response.SelectedIds[0];
     }
 
     private MarketplaceManager BuildManager()

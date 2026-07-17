@@ -20,7 +20,8 @@ internal static class TestAppBuilder
     public static (TuiApp App, CommandContext Context, TestConsole Console, CredentialManager Credentials) BuildApp(
         ITokenStore? store = null,
         IUiPromptService? prompts = null,
-        IUiEventPublisher? events = null)
+        IUiEventPublisher? events = null,
+        string? workingDirectory = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -38,7 +39,7 @@ internal static class TestAppBuilder
             new("anthropic-api-key", "Anthropic API key", LoginKind.ApiKey, "claude-sonnet-4-6"),
         };
 
-        var session = new SessionState("claude-ai");
+        var session = new SessionState("claude-ai", workingDirectory);
         var registry = new SlashCommandRegistry(new ISlashCommand[]
         {
             new HelpCommand(), new LoginCommand(), new LogoutCommand(), new StatusCommand(),

@@ -2,6 +2,7 @@ using Coda.Agent.Settings;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -56,8 +57,64 @@ public sealed class ModelCommand : ISlashCommand
             context.Session.ModelListCache[providerId] = result;
         }
 
+        // With a prompt surface that can answer, let the user pick from the cached list and switch to
+        // the choice; otherwise print the list and never await a prompt.
+        if (context.Prompts.IsInteractive)
+        {
+            var chosen = await ChooseModelAsync(context, result, cancellationToken).ConfigureAwait(false);
+            if (chosen is null)
+            {
+                return CommandResult.Continue; // dismissed — no model change persisted
+            }
+
+            context.Session.Model = chosen;
+            var note = TryPersistModelForProvider(context.ActiveProvider.Id, chosen);
+            context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(chosen)} {Theme.DimMarkup(note)}");
+            return CommandResult.Continue;
+        }
+
         this.Render(context, result);
         return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// Present the model picker (title <c>Choose a model</c>, option id = model id, with display name
+    /// and context limit as details) over an already-resolved <paramref name="models"/> list through
+    /// the host-neutral prompt surface. Returns the chosen model id, or <c>null</c> when the surface is
+    /// non-interactive or the user dismisses the prompt — the caller mutates nothing until an id returns.
+    /// </summary>
+    internal static async Task<string?> ChooseModelAsync(
+        CommandContext context,
+        ModelListResult models,
+        CancellationToken cancellationToken = default)
+    {
+        if (!context.Prompts.IsInteractive)
+        {
+            return null;
+        }
+
+        var options = models.Models.Select(model =>
+        {
+            var detail = model.DisplayName ?? string.Empty;
+            if (model.ContextLimit is int contextLimit)
+            {
+                var ctx = $"{FormatContext(contextLimit)} ctx";
+                detail = string.IsNullOrEmpty(detail) ? ctx : $"{detail} · {ctx}";
+            }
+
+            return new UiPromptOption(model.Id, model.Id, string.IsNullOrEmpty(detail) ? null : detail);
+        });
+
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Choose a model", options),
+            cancellationToken).ConfigureAwait(false);
+
+        if (response.Cancelled || response.SelectedIds.Length == 0)
+        {
+            return null;
+        }
+
+        return response.SelectedIds[0];
     }
 
     private async Task<ModelListResult> ResolveAsync(CommandContext context, bool refresh, CancellationToken cancellationToken)

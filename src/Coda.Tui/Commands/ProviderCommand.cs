@@ -1,5 +1,6 @@
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Setup;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -31,6 +32,20 @@ public sealed class ProviderCommand : ISlashCommand
 
         if (token is null)
         {
+            // With a prompt surface that can answer, offer the shared picker and connect to the
+            // selection; otherwise keep the plain listing (and never await a prompt).
+            if (context.Prompts.IsInteractive)
+            {
+                var chosen = await SetupWizard.ChooseProviderAsync(context, cancellationToken).ConfigureAwait(false);
+                if (chosen is null)
+                {
+                    return CommandResult.Continue;
+                }
+
+                await LoginCommand.ConnectAsync(context, chosen, cancellationToken).ConfigureAwait(false);
+                return CommandResult.Continue;
+            }
+
             context.Console.MarkupLine($"Active provider: {Theme.AccentMarkup(context.ActiveProvider.DisplayName)} {Theme.DimMarkup($"({context.ActiveProvider.Id})")}");
             context.Console.MarkupLine(Theme.DimMarkup("Available:"));
             foreach (var provider in context.Providers)

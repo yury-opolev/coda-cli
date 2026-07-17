@@ -2,6 +2,7 @@ using Coda.Agent;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using LlmClient;
 using Spectre.Console;
 
@@ -31,7 +32,7 @@ public sealed class TuiApp : IDisposable
         while (!cancellationToken.IsCancellationRequested)
         {
             // Plain line read works both interactively and with piped/scripted input
-            // (Spectre's TextPrompt throws in non-interactive mode). Only show the
+            // (a Spectre text widget throws in non-interactive mode). Only show the
             // glyph when interactive so scripted/piped output stays clean.
             if (interactive)
             {
@@ -91,8 +92,8 @@ public sealed class TuiApp : IDisposable
                 var name = parsed.Name;
                 if (name.Length == 0)
                 {
-                    // Bare "/" -> interactive command menu.
-                    name = this.ShowCommandMenu();
+                    // Bare "/" -> interactive command menu through the host-neutral prompt surface.
+                    name = await this.ShowCommandMenuAsync(cancellationToken).ConfigureAwait(false);
                     if (name is null)
                     {
                         return CommandResult.Continue;
@@ -183,26 +184,29 @@ public sealed class TuiApp : IDisposable
     private static string XmlEscape(string s) =>
         s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
-    private string? ShowCommandMenu()
+    private async Task<string?> ShowCommandMenuAsync(CancellationToken cancellationToken)
     {
-        // The interactive selection menu needs a real terminal; fall back to a hint.
-        if (!this.context.Console.Profile.Capabilities.Interactive)
+        // The interactive selection menu needs a prompt surface that a user can answer;
+        // fall back to a hint otherwise (scripted/piped input) and never await a prompt.
+        if (!this.context.Prompts.IsInteractive)
         {
             this.context.Console.MarkupLine(Theme.DimMarkup("Type /help to list commands."));
             return null;
         }
 
-        var prompt = new SelectionPrompt<string>()
-            .Title(Theme.DimMarkup("Select a command:"))
-            .PageSize(12)
-            .MoreChoicesText(Theme.DimMarkup("(move up and down to reveal more)"));
+        var options = this.context.Commands.ListSorted()
+            .Select(command => new UiPromptOption(command.Name, command.Name, command.Summary));
 
-        foreach (var command in this.context.Commands.ListSorted())
+        var response = await this.context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Select a command", options),
+            cancellationToken).ConfigureAwait(false);
+
+        if (response.Cancelled || response.SelectedIds.Length == 0)
         {
-            prompt.AddChoice(command.Name);
+            return null;
         }
 
-        return this.context.Console.Prompt(prompt);
+        return response.SelectedIds[0];
     }
 
     public void Dispose()
