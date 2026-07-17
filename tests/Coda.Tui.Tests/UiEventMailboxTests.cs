@@ -109,7 +109,7 @@ public sealed class UiEventMailboxTests
         mailbox.Publish(new AgentErrorEvent("e2"));
 
         var publish = Task.Run(() => mailbox.Publish(new AgentErrorEvent("e3")));
-        Assert.False(publish.Wait(200));
+        await AssertStillPendingAsync(publish);
         Assert.Equal(2, mailbox.Count);
 
         var first = await mailbox.ReadAsync();
@@ -128,7 +128,7 @@ public sealed class UiEventMailboxTests
         mailbox.Publish(new AgentErrorEvent("e2"));
 
         var publish = Task.Run(() => mailbox.Publish(new AgentErrorEvent("e3")));
-        Assert.False(publish.Wait(200));
+        await AssertStillPendingAsync(publish);
 
         host.Cancel();
 
@@ -143,7 +143,7 @@ public sealed class UiEventMailboxTests
         mailbox.Publish(new AgentErrorEvent("e2"));
 
         var publish = Task.Run(() => mailbox.Publish(new AgentErrorEvent("e3")));
-        Assert.False(publish.Wait(200));
+        await AssertStillPendingAsync(publish);
 
         mailbox.Dispose();
 
@@ -156,11 +156,17 @@ public sealed class UiEventMailboxTests
         var mailbox = new UiEventMailbox(capacity: 2);
 
         var read = mailbox.ReadAsync().AsTask();
-        Assert.False(read.Wait(200));
+        await AssertStillPendingAsync(read);
 
         mailbox.Dispose();
 
         await Assert.ThrowsAsync<ObjectDisposedException>(() => read);
+    }
+
+    private static async Task AssertStillPendingAsync(Task task)
+    {
+        var completed = await Task.WhenAny(task, Task.Delay(200));
+        Assert.NotSame(task, completed);
     }
 
     [Fact]

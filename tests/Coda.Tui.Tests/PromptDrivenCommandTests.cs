@@ -259,6 +259,19 @@ public sealed class PromptDrivenCommandTests : IDisposable
     }
 
     [Fact]
+    public async Task Setup_uses_prompt_interactivity_instead_of_console_capability()
+    {
+        var prompts = new NonInteractivePromptService();
+        var built = TestAppBuilder.BuildApp(prompts: prompts);
+        built.Console.Profile.Capabilities.Interactive = true;
+
+        await new SetupWizard().RunAsync(built.Context);
+
+        Assert.Equal(0, prompts.RequestCount);
+        Assert.Contains("Non-interactive", built.Console.Output);
+    }
+
+    [Fact]
     public async Task Provider_no_id_non_interactive_lists_without_prompting()
     {
         var prompts = new NonInteractivePromptService();

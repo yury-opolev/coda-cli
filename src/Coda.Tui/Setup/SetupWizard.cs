@@ -31,7 +31,7 @@ public sealed class SetupWizard
         };
         console.Write(intro);
 
-        if (!console.Profile.Capabilities.Interactive)
+        if (!context.Prompts.IsInteractive)
         {
             console.MarkupLine(Theme.DimMarkup("Non-interactive: run /login <claude|copilot> to connect, then type a message."));
             return;
