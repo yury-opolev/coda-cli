@@ -132,7 +132,7 @@ public class McpStdioClient : IMcpClient
         {
             throw McpConnectionException.Canceled(this.ServerName, phase, ex);
         }
-        catch (McpException ex)
+        catch (McpException)
         {
             if (this.process is null)
             {

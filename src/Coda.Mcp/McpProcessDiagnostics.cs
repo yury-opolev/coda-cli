@@ -31,7 +31,7 @@ public sealed class McpProcessDiagnostics
     /// If truncation discards the start of one of these, the retained tail could otherwise expose a
     /// secret suffix the redactor can no longer recognize.
     /// </summary>
-    private static readonly string[] SecretPrefixes = ["sk-", "******"];
+    private static readonly string[] SecretPrefixes = ["sk-", "Bearer"];
 
     private readonly object gate = new();
     private readonly BoundedCharRingBuffer tail;

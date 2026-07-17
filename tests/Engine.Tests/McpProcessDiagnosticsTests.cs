@@ -157,6 +157,31 @@ public sealed class McpProcessDiagnosticsTests
     }
 
     [Fact]
+    public async Task Bearer_prefix_partially_removed_by_truncation_yields_placeholder()
+    {
+        // Padding pushes the case-insensitive "Bearer" keyword out of the retained window; only the
+        // token tail (" ABCDEFGHIJKLMNOPQRSTUVWX") would remain, which the redactor cannot recognize.
+        // The whole retained line must collapse to the placeholder.
+        var diagnostics = new McpProcessDiagnostics(maxTailChars: 64, maxLineChars: 25);
+
+        await diagnostics.DrainAsync(new ChunkedTextReader("0123456789Bearer ABCDEFGHIJKLMNOPQRSTUVWX\n"), default);
+
+        Assert.Equal(SecretRedactor.Placeholder, diagnostics.SnapshotTail());
+        Assert.DoesNotContain("UVWX", diagnostics.SnapshotTail());
+    }
+
+    [Fact]
+    public async Task Bearer_prefix_fully_removed_by_truncation_yields_placeholder()
+    {
+        var diagnostics = new McpProcessDiagnostics(maxTailChars: 64, maxLineChars: 10);
+
+        await diagnostics.DrainAsync(new ChunkedTextReader("bearer ABCDEFGHIJKLMNOPQRSTUVWX\n"), default);
+
+        Assert.Equal(SecretRedactor.Placeholder, diagnostics.SnapshotTail());
+        Assert.DoesNotContain("UVWX", diagnostics.SnapshotTail());
+    }
+
+    [Fact]
     public async Task Secret_fully_within_retained_tail_is_redacted_normally()
     {
         // sk- stays inside the window, so the redactor handles it without the whole-line placeholder.
