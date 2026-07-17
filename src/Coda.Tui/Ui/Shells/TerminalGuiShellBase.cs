@@ -5,20 +5,6 @@ using Coda.Tui.Ui.State;
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>
-/// Receives immutable <see cref="UiSessionSnapshot"/> frames and applies them to a concrete UI. The
-/// engine/runner pushes frames through this seam without knowing which Terminal.Gui shell (inline or
-/// full-screen) renders them.
-/// </summary>
-public interface IUiFrameSink
-{
-    /// <summary>
-    /// Applies <paramref name="snapshot"/>, marshaling onto the UI thread when required. The
-    /// returned task completes only after the snapshot has been applied.
-    /// </summary>
-    ValueTask ApplyAsync(UiSessionSnapshot snapshot, CancellationToken cancellationToken);
-}
-
-/// <summary>
 /// Shared behavior for the Terminal.Gui shells: it hosts the composer, the single-line status label,
 /// and the keyboard-only <see cref="PromptOverlay"/>; forwards composer submissions and named actions
 /// to the shell's owner; and applies snapshots on the UI thread (only touching the status/overlay when
@@ -119,26 +105,48 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink
         }
 
         // Off the UI thread: hop onto it via App.Invoke. The completion source uses asynchronous
-        // continuations so awaiting callers never resume inline on the UI thread and deadlock it.
+        // continuations so awaiting callers never resume inline on the UI thread and deadlock it. A
+        // cancellation registration releases the awaiter even if the UI loop is not pumping (so the
+        // queued callback would otherwise never run), and any synchronous App.Invoke failure (for
+        // example a NotInitializedException on a disposed app) is surfaced through the returned task
+        // rather than thrown at the caller.
         var completion = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        this.app.Invoke(() =>
-        {
-            if (cancellationToken.IsCancellationRequested)
-            {
-                completion.TrySetCanceled(cancellationToken);
-                return;
-            }
+        var registration = cancellationToken.Register(() => completion.TrySetCanceled(cancellationToken));
 
-            try
+        completion.Task.ContinueWith(
+            static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+            registration,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        try
+        {
+            this.app.Invoke(() =>
             {
-                this.Apply(snapshot);
-                completion.TrySetResult();
-            }
-            catch (Exception exception)
-            {
-                completion.TrySetException(exception);
-            }
-        });
+                // Skip the mutation if the awaiter was already released (cancelled) or the token
+                // fired between queueing and running, so a cancelled snapshot is never applied.
+                if (completion.Task.IsCompleted || cancellationToken.IsCancellationRequested)
+                {
+                    completion.TrySetCanceled(cancellationToken);
+                    return;
+                }
+
+                try
+                {
+                    this.Apply(snapshot);
+                    completion.TrySetResult();
+                }
+                catch (Exception exception)
+                {
+                    completion.TrySetException(exception);
+                }
+            });
+        }
+        catch (Exception exception)
+        {
+            completion.TrySetException(exception);
+        }
 
         return new ValueTask(completion.Task);
     }

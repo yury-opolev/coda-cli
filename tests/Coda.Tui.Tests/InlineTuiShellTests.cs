@@ -205,6 +205,67 @@ public sealed class InlineTuiShellTests
     }
 
     [Fact]
+    public void Shell_is_assignable_to_the_ui_actor_frame_sink()
+    {
+        using IApplication app = Application.Create();
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        // The shell must satisfy the frame-sink contract the UiActor consumes, so it can be handed
+        // to UiActor directly. A duplicate IUiFrameSink declared in the Shells namespace would shadow
+        // this one and break the wiring.
+        Assert.IsAssignableFrom<Coda.Tui.Ui.Events.IUiFrameSink>(shell);
+    }
+
+    [Fact]
+    public async Task Apply_off_ui_thread_is_canceled_when_the_loop_is_not_pumping()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        // The app is initialized but no Run loop is pumping, so the queued Invoke callback never runs.
+        using var cts = new CancellationTokenSource();
+        var snapshot = UiSessionSnapshot.Empty with { Model = "never-applied" };
+
+        Task apply = await Task.Factory.StartNew(
+            () => shell.ApplyAsync(snapshot, cts.Token).AsTask(),
+            CancellationToken.None,
+            TaskCreationOptions.None,
+            TaskScheduler.Default);
+        Assert.False(apply.IsCompleted);
+
+        cts.Cancel();
+
+        var completed = await Task.WhenAny(apply, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(apply, completed);
+        await Assert.ThrowsAsync<TaskCanceledException>(() => apply);
+        Assert.DoesNotContain("never-applied", shell.Status.Text ?? string.Empty);
+    }
+
+    [Fact]
+    public async Task Apply_off_ui_thread_without_initialized_app_faults_without_throwing_synchronously()
+    {
+        using IApplication app = Application.Create();
+        using var shell = ShellTestFactory.CreateInline(app);
+        var snapshot = UiSessionSnapshot.Empty with { Model = "unreachable" };
+
+        // Off the UI thread and with no initialized app, ApplyAsync must not throw synchronously; it
+        // must surface the failure through the returned task so awaiting callers observe it uniformly.
+        Task apply = await Task.Factory.StartNew(
+            () => shell.ApplyAsync(snapshot, CancellationToken.None).AsTask(),
+            CancellationToken.None,
+            TaskCreationOptions.None,
+            TaskScheduler.Default);
+
+        var completed = await Task.WhenAny(apply, Task.Delay(TimeSpan.FromSeconds(5)));
+        Assert.Same(apply, completed);
+        await Assert.ThrowsAsync<NotInitializedException>(() => apply);
+    }
+
+    [Fact]
     public async Task Newly_completed_blocks_commit_once_and_identical_snapshots_do_not_duplicate()
     {
         using IApplication app = Application.Create();
