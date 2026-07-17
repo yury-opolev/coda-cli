@@ -149,6 +149,7 @@ public sealed class ResumeCommand : ISlashCommand
 
         var escapedId = Markup.Escape(sessionId);
         context.Console.MarkupLine($"[grey50]Resumed session {escapedId} ({messages.Count} messages).[/]");
+        SessionMetadataEvents.Publish(context);
         return CommandResult.Continue;
     }
 

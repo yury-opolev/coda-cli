@@ -54,6 +54,7 @@ public sealed class PermissionsCommand : ISlashCommand
             ? Theme.WarnMarkup(" (allows every tool without asking)")
             : string.Empty;
         context.Console.MarkupLine($"Permission mode is now {Theme.AccentMarkup(mode.ToString())}.{note}");
+        SessionMetadataEvents.Publish(context);
         return Task.FromResult(CommandResult.Continue);
     }
 

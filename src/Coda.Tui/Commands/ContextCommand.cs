@@ -45,6 +45,18 @@ public sealed class ContextCommand : ISlashCommand
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
+        // Prefer the turn-scoped snapshot cache (forced fresh) so /context reflects the same analysis
+        // the semantic UI uses; fall back to a one-shot analysis when no cache is wired (tests/legacy).
+        var report = context.ContextSnapshots is { } cache
+            ? await cache.GetAsync(force: true, cancellationToken).ConfigureAwait(false)
+            : await AnalyzeOnceAsync(context, cancellationToken).ConfigureAwait(false);
+
+        this.Render(context, report);
+        return CommandResult.Continue;
+    }
+
+    private static async Task<ContextReport> AnalyzeOnceAsync(CommandContext context, CancellationToken cancellationToken)
+    {
         var options = new SessionOptions
         {
             ProviderId = context.Session.ActiveProviderId,
@@ -54,14 +66,8 @@ public sealed class ContextCommand : ISlashCommand
             ExtraTools = context.ExtraTools,
         };
 
-        ContextReport report;
-        using (var session = new CodaSession(context.Credentials, options, history: context.Session.History))
-        {
-            report = await session.AnalyzeContextAsync(cancellationToken).ConfigureAwait(false);
-        }
-
-        this.Render(context, report);
-        return CommandResult.Continue;
+        using var session = new CodaSession(context.Credentials, options, history: context.Session.History);
+        return await session.AnalyzeContextAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private void Render(CommandContext context, ContextReport report)

@@ -13,14 +13,26 @@ public sealed class TuiApp : IDisposable
 {
     private readonly CommandContext context;
     private readonly AgentRunner agentRunner;
+    private readonly bool ownsRunner;
     private readonly IShellExecutor shellExecutor;
 
-    public TuiApp(CommandContext context, Func<IReadOnlyList<Coda.Agent.ITool>>? mcpToolsProvider = null, IShellExecutor? shellExecutor = null)
+    public TuiApp(
+        CommandContext context,
+        Func<IReadOnlyList<Coda.Agent.ITool>>? mcpToolsProvider = null,
+        IShellExecutor? shellExecutor = null,
+        AgentRunner? agentRunner = null)
     {
         this.context = context ?? throw new ArgumentNullException(nameof(context));
-        this.agentRunner = new AgentRunner(mcpToolsProvider);
+
+        // A shared runner (e.g. one the host also hands to the controller for Ctrl-C / mode switches)
+        // is owned by the caller; only a runner we create here is ours to dispose.
+        this.ownsRunner = agentRunner is null;
+        this.agentRunner = agentRunner ?? new AgentRunner(mcpToolsProvider);
         this.shellExecutor = shellExecutor ?? new ProcessShellExecutor();
     }
+
+    /// <summary>The agent runner this host dispatches turns through. Exposed for host wiring/tests.</summary>
+    internal AgentRunner Runner => this.agentRunner;
 
     public async Task RunAsync(CancellationToken cancellationToken = default)
     {
@@ -211,6 +223,9 @@ public sealed class TuiApp : IDisposable
 
     public void Dispose()
     {
-        this.agentRunner.Dispose();
+        if (this.ownsRunner)
+        {
+            this.agentRunner.Dispose();
+        }
     }
 }

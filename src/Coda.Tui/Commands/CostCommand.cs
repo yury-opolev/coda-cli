@@ -1,6 +1,7 @@
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -34,6 +35,8 @@ public sealed class CostCommand : ISlashCommand
 
         var summary = $"Input: {usage.InputTokens:N0} tokens · Output: {usage.OutputTokens:N0} tokens · Total: {usage.Total:N0} tokens · Est. cost: ${estimatedUsd:F4}";
         context.Console.MarkupLine(Theme.DimMarkup(summary));
+
+        context.Events.Publish(new CostEstimateChangedEvent(estimatedUsd));
 
         return Task.FromResult(CommandResult.Continue);
     }

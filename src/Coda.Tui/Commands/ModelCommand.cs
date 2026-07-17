@@ -41,6 +41,7 @@ public sealed class ModelCommand : ISlashCommand
             context.Session.Model = args[0];
             var note = TryPersistModelForProvider(context.ActiveProvider.Id, args[0]);
             context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(args[0])} {Theme.DimMarkup(note)}");
+            SessionMetadataEvents.Publish(context);
             return CommandResult.Continue;
         }
 
@@ -70,6 +71,7 @@ public sealed class ModelCommand : ISlashCommand
             context.Session.Model = chosen;
             var note = TryPersistModelForProvider(context.ActiveProvider.Id, chosen);
             context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(chosen)} {Theme.DimMarkup(note)}");
+            SessionMetadataEvents.Publish(context);
             return CommandResult.Continue;
         }
 

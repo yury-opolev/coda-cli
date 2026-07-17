@@ -1,5 +1,6 @@
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.State;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using Spectre.Console;
@@ -21,6 +22,13 @@ public sealed class StatusCommand : ISlashCommand
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
+        // Semantic mode: render the immutable UI snapshot directly (no mutable-store enumeration).
+        if (context.UiSnapshotProvider is { } snapshotProvider)
+        {
+            RenderSemantic(context, snapshotProvider());
+            return CommandResult.Continue;
+        }
+
         context.Console.MarkupLine(Theme.BoldMarkup("Status"));
 
         foreach (var provider in context.Providers)
@@ -36,6 +44,24 @@ public sealed class StatusCommand : ISlashCommand
         context.Console.MarkupLine($"{Theme.DimMarkup("cwd:")} {Markup.Escape(context.Session.WorkingDirectory)}");
         context.Console.MarkupLine($"{Theme.DimMarkup("permissions:")} {Theme.AccentMarkup(context.Session.PermissionMode.ToString())}");
         return CommandResult.Continue;
+    }
+
+    private static void RenderSemantic(CommandContext context, UiSessionSnapshot snapshot)
+    {
+        var console = context.Console;
+        console.MarkupLine(Theme.BoldMarkup("Status"));
+
+        var connection = snapshot.Connected ? Theme.SuccessMarkup("connected") : Theme.DimMarkup("not connected");
+        console.MarkupLine($"{Theme.DimMarkup("provider:")} {Markup.Escape(snapshot.Provider)} ({connection})");
+        console.MarkupLine($"{Theme.DimMarkup("model:")} {Markup.Escape(snapshot.Model)}");
+        console.MarkupLine($"{Theme.DimMarkup("effort:")} {Markup.Escape(snapshot.EffectiveEffort)}");
+        console.MarkupLine($"{Theme.DimMarkup("permissions:")} {Theme.AccentMarkup(snapshot.Permission.Mode.ToString())}");
+        console.MarkupLine($"{Theme.DimMarkup("cwd:")} {Markup.Escape(snapshot.WorkingDirectory)}");
+
+        if (snapshot.Git is { Branch: { } branch })
+        {
+            console.MarkupLine($"{Theme.DimMarkup("git:")} {Markup.Escape(branch)}{(snapshot.Git.Dirty ? "*" : string.Empty)}");
+        }
     }
 
     private static async Task<ProviderStatus> BuildStatusAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)

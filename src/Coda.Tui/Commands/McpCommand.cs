@@ -1,5 +1,6 @@
 using Coda.Mcp;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
 using Spectre.Console;
 
@@ -125,9 +126,15 @@ public sealed class McpCommand : ISlashCommand
 
         var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
         var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
-        context.Console.MarkupLine(Markup.Escape(result.Connected
-            ? $"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."
-            : $"Failed to start '{name}': {result.Error}"));
+        if (result.Connected)
+        {
+            context.Console.MarkupLine(Markup.Escape($"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."));
+            PublishSnapshot(context);
+        }
+        else
+        {
+            context.Console.MarkupLine(Markup.Escape($"Failed to start '{name}': {result.Error}"));
+        }
     }
 
     private static async Task HandleStop(CommandContext context, IReadOnlyList<string> tail)
@@ -146,9 +153,15 @@ public sealed class McpCommand : ISlashCommand
 
         var name = tail[0];
         var stopped = await context.Mcp.DisconnectServerAsync(name).ConfigureAwait(false);
-        context.Console.MarkupLine(Markup.Escape(stopped
-            ? $"Stopped '{name}' — its tools are removed from the next turn."
-            : $"'{name}' is not running."));
+        if (stopped)
+        {
+            context.Console.MarkupLine(Markup.Escape($"Stopped '{name}' — its tools are removed from the next turn."));
+            PublishSnapshot(context);
+        }
+        else
+        {
+            context.Console.MarkupLine(Markup.Escape($"'{name}' is not running."));
+        }
     }
 
     private static async Task HandleRestart(CommandContext context, IReadOnlyList<string> tail, CancellationToken ct)
@@ -173,9 +186,16 @@ public sealed class McpCommand : ISlashCommand
 
             var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
             var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
-            context.Console.MarkupLine(Markup.Escape(result.Connected
-                ? $"Restarted '{name}' — {result.ToolCount} tool(s)."
-                : $"Failed to restart '{name}': {result.Error}"));
+            if (result.Connected)
+            {
+                context.Console.MarkupLine(Markup.Escape($"Restarted '{name}' — {result.ToolCount} tool(s)."));
+                PublishSnapshot(context);
+            }
+            else
+            {
+                context.Console.MarkupLine(Markup.Escape($"Failed to restart '{name}': {result.Error}"));
+            }
+
             return;
         }
 
@@ -194,6 +214,16 @@ public sealed class McpCommand : ISlashCommand
 
         await context.Mcp.ConnectAllAsync(servers, cancellationToken: ct).ConfigureAwait(false);
         context.Console.MarkupLine(Markup.Escape($"Reconnected MCP servers ({context.Mcp.Clients.Count} connected)."));
+        PublishSnapshot(context);
+    }
+
+    /// <summary>Publish the live MCP runtime snapshot after a successful mutation (no-op when no manager).</summary>
+    private static void PublishSnapshot(CommandContext context)
+    {
+        if (context.Mcp is { } mcp)
+        {
+            context.Events.Publish(new McpRuntimeChangedEvent(mcp.GetSnapshot()));
+        }
     }
 
     /// <summary>Resolve <c>coda-secret:</c> / <c>${VAR}</c> references before a live connect (parity with startup).</summary>
@@ -284,6 +314,7 @@ public sealed class McpCommand : ISlashCommand
         var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
         context.Console.MarkupLine(Markup.Escape(
             $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Run /mcp start {name} to connect it, or it loads on next launch."));
+        PublishSnapshot(context);
 
         // The flag path writes values verbatim (unlike the wizard, which offers encryption). Warn if
         // a literal secret-looking value was persisted so the user can move it out of the file.
@@ -334,6 +365,7 @@ public sealed class McpCommand : ISlashCommand
         }
 
         context.Console.MarkupLine(Markup.Escape($"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."));
+        PublishSnapshot(context);
     }
 
     // ── enable / disable ──────────────────────────────────────────────────
@@ -357,6 +389,7 @@ public sealed class McpCommand : ISlashCommand
         context.Console.MarkupLine(Markup.Escape(disabled
             ? $"Disabled '{name}' — it will not load on next launch. Stop it now with /mcp stop {name} if it is running."
             : $"Enabled '{name}' — it will load on next launch. Connect it now with /mcp start {name}."));
+        PublishSnapshot(context);
     }
 
     // ── interactive wizard ────────────────────────────────────────────────
