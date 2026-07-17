@@ -6,8 +6,10 @@ namespace Coda.Tui.Agent;
 
 /// <summary>
 /// Renders the agent's proposed plan in the TUI and asks the user interactively
-/// whether to approve it. On approval, switches the session to
-/// <see cref="PermissionMode.AcceptEdits"/> so subsequent turns can mutate files.
+/// whether to approve it. When approving out of <see cref="PermissionMode.Plan"/>,
+/// switches the session to <see cref="PermissionMode.AcceptEdits"/> so subsequent
+/// turns can mutate files. More permissive modes (e.g.
+/// <see cref="PermissionMode.BypassPermissions"/>) are left untouched.
 /// </summary>
 public sealed class TuiPlanApprover(IAnsiConsole console, SessionState session) : IPlanApprover
 {
@@ -25,8 +27,10 @@ public sealed class TuiPlanApprover(IAnsiConsole console, SessionState session) 
         console.MarkupLine($"[bold]Proposed plan:[/]\n{escapedPlan}");
 
         var confirmed = console.Confirm("Approve this plan and start implementing?", defaultValue: false);
-        if (confirmed)
+        if (confirmed && session.PermissionMode == PermissionMode.Plan)
         {
+            // Promote out of Plan so edits are allowed. Never downgrade a more
+            // permissive pre-existing mode (e.g. BypassPermissions from --yolo).
             session.PermissionMode = PermissionMode.AcceptEdits;
         }
 
