@@ -13,6 +13,7 @@
 
   <ItemGroup>
     <PackageReference Include="Spectre.Console" Version="0.55.2" />
+    <PackageReference Include="Terminal.Gui" Version="2.4.17" />
   </ItemGroup>
 
   <ItemGroup>
