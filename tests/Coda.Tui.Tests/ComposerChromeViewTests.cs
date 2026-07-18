@@ -33,11 +33,12 @@ public sealed class ComposerChromeViewTests
     {
         using var chrome = new ComposerChromeView(TuiTheme.WarmEmber);
 
-        var rows = chrome.RenderRows(width: 12, height: 3);
+        var rows = chrome.RenderRows(width: 12, height: 4);
 
-        // A warm prompt at column 0, a subtle upper-half-block top edge and lower-half-block bottom edge,
-        // and no vertical accent bar or box border.
-        Assert.Equal([">▀▀▀▀▀▀▀▀▀▀▀", "            ", "▄▄▄▄▄▄▄▄▄▄▄▄"], rows);
+        // A full-width upper-half-block top edge, the warm prompt at column 0 of the first content row (so
+        // the composer's own rows overdraw everything but the gutter), an interior content row, and a
+        // full-width lower-half-block bottom edge — no vertical accent bar or box border.
+        Assert.Equal(["▀▀▀▀▀▀▀▀▀▀▀▀", ">           ", "            ", "▄▄▄▄▄▄▄▄▄▄▄▄"], rows);
         Assert.DoesNotContain(rows, row => row.Contains('▌'));
         Assert.DoesNotContain(rows, row => row.Contains('│'));
         Assert.DoesNotContain(rows, row => row.Contains("Initializing", StringComparison.Ordinal));

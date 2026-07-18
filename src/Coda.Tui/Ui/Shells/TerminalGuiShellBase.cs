@@ -122,10 +122,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     internal ComposerView Composer { get; }
 
     /// <summary>
-    /// The borderless chrome painted over the composer region: a subtle dark background and, when ready,
-    /// the <c>&gt;</c> prompt glyph. During startup it stays blank and dark; the operational status row
-    /// owns the <c>Initializing…</c> message. Non-focusable and
-    /// owned here; concrete shells position it directly beneath the composer in <see cref="BuildLayout"/>.
+    /// The borderless chrome that frames the composer region: a subtle dark background, full-width
+    /// half-block edges above and below the composer content rows, and, when ready, the <c>&gt;</c> prompt
+    /// glyph on the first content row. During startup it stays blank and dark; the operational status row
+    /// owns the <c>Initializing…</c> message. Non-focusable and owned here; concrete shells position it
+    /// around the composer in <see cref="BuildLayout"/>.
     /// </summary>
     internal ComposerChromeView Chrome { get; }
 

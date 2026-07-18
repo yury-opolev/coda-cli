@@ -44,8 +44,11 @@ internal sealed class InlineTuiShell(
         theme,
         statusProjection)
 {
-    /// <summary>The fewest rows the inline region can occupy: header (1), operational (1), composer (3), and status (1).</summary>
-    private const int MinimumInlineHeight = 6;
+    /// <summary>
+    /// The fewest rows the inline region can occupy: header (1), operational (1), the chrome region
+    /// (composer 3 + a half-block edge above and below = 5), and status (1).
+    /// </summary>
+    private const int MinimumInlineHeight = 8;
 
     protected override Dim ResolveShellHeight() => Dim.Func(InlineRegionHeight, this);
 

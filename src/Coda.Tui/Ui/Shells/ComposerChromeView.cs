@@ -6,13 +6,14 @@ using TgScheme = Terminal.Gui.Drawing.Scheme;
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>
-/// The borderless decor drawn beneath the composer. It fills the composer region with the Warm Ember
-/// theme's distinct <see cref="TuiTheme.ComposerPanelBackground"/> (a touch lighter than the shell surface)
-/// and, when the composer is ready for input, draws a single warm <c>&gt;</c> prompt glyph in column 0 plus
-/// subtle half-block edge shading — an upper-half-block (<c>▀</c>) top row and lower-half-block (<c>▄</c>)
-/// bottom row. It never takes focus, never draws box-drawing border characters or a vertical accent bar, and
-/// never owns any status text: during startup it simply stays dark and blank while the operational status
-/// row owns the <c>Initializing</c> message.
+/// The borderless decor drawn around the composer. It fills the region with the Warm Ember theme's distinct
+/// <see cref="TuiTheme.ComposerPanelBackground"/> (a touch lighter than the shell surface) and, when the
+/// composer is ready for input, draws subtle half-block edge shading — a full-width upper-half-block
+/// (<c>▀</c>) top row and lower-half-block (<c>▄</c>) bottom row that frame the composer content rows — plus
+/// a single warm <c>&gt;</c> prompt glyph in column 0 of the first content row (the row just below the top
+/// edge, aligned with the composer's own first line). It never takes focus, never draws box-drawing border
+/// characters or a vertical accent bar, and never owns any status text: during startup it simply stays dark
+/// and blank while the operational status row owns the <c>Initializing</c> message.
 /// </summary>
 /// <remarks>
 /// Colors come entirely from <see cref="TuiTheme"/> so this view carries no independent palette. Rendering
@@ -32,6 +33,12 @@ internal sealed class ComposerChromeView : View
 
     /// <summary>The column at which the prompt glyph is drawn when ready.</summary>
     private const int PromptColumn = 0;
+
+    /// <summary>
+    /// The row carrying the prompt glyph when ready: the first content row (row 1), one below the top edge,
+    /// so the composer's own rows sit directly over it and the warm <c>&gt;</c> shows in the gutter.
+    /// </summary>
+    private const int PromptRow = 1;
 
     private readonly TuiTheme theme;
     private bool ready = true;
@@ -67,11 +74,11 @@ internal sealed class ComposerChromeView : View
     }
 
     /// <summary>
-    /// The plain-text rows the chrome paints for a region of the given size. When ready, the first row
-    /// carries the <c>&gt;</c> prompt glyph in column 0 and an upper-half-block (<c>▀</c>) top edge across the
-    /// remaining columns, and the last row carries a lower-half-block (<c>▄</c>) bottom edge; interior rows are
-    /// blank. During startup every row is blank. No accent bar, vertical rule, or box border is ever drawn.
-    /// Exposed for the shell/tests.
+    /// The plain-text rows the chrome paints for a region of the given size. When ready, the first row is a
+    /// full-width upper-half-block (<c>▀</c>) top edge, the second row (the first content row) carries the
+    /// <c>&gt;</c> prompt glyph in column 0, interior rows are blank, and the last row is a full-width
+    /// lower-half-block (<c>▄</c>) bottom edge. During startup every row is blank. No accent bar, vertical
+    /// rule, or box border is ever drawn. Exposed for the shell/tests.
     /// </summary>
     internal IReadOnlyList<string> RenderRows(int width, int height)
     {
@@ -90,19 +97,15 @@ internal sealed class ComposerChromeView : View
             {
                 if (row == 0)
                 {
-                    for (var column = 0; column < width; column++)
-                    {
-                        buffer[column] = TopEdgeGlyph;
-                    }
-
-                    if (PromptColumn < width)
-                    {
-                        buffer[PromptColumn] = PromptGlyph[0];
-                    }
+                    Array.Fill(buffer, TopEdgeGlyph);
                 }
                 else if (row == height - 1)
                 {
                     Array.Fill(buffer, BottomEdgeGlyph);
+                }
+                else if (row == PromptRow && PromptColumn < width)
+                {
+                    buffer[PromptColumn] = PromptGlyph[0];
                 }
             }
 
@@ -152,11 +155,13 @@ internal sealed class ComposerChromeView : View
                 this.AddStr(new string(ComposerChromeView.BottomEdgeGlyph, width));
             }
 
-            if (PromptColumn < width)
+            // The warm '>' prompt sits on the first content row (one below the top edge) in the gutter, so
+            // the composer's own rows overdraw everything but this glyph.
+            if (PromptRow < height - 1 && PromptColumn < width)
             {
                 var prompt = this.theme.Attribute(this.theme.ComposerPrompt, this.theme.ComposerPanelBackground, driver);
                 this.SetAttribute(prompt);
-                this.Move(PromptColumn, 0);
+                this.Move(PromptColumn, PromptRow);
                 this.AddRune(new Rune(PromptGlyph[0]));
             }
         }
