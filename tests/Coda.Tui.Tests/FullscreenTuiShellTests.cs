@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
@@ -591,6 +592,102 @@ public sealed class FullscreenTuiShellTests
 
         await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
         Assert.False(shell.PromptOverlay.Visible);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Initially_ready_shell_focuses_composer_after_initialization()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Printable_key_from_transcript_focuses_and_inserts_into_composer()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Transcript.SetFocus();
+
+        Assert.True(shell.Transcript.NewKeyDownEvent(new Key('/')));
+
+        Assert.True(shell.Composer.HasFocus);
+        Assert.Equal("/", shell.Composer.GetDraft());
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Transcript_navigation_stays_in_transcript()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Transcript.ReplaceAll(Lines(100));
+        shell.Transcript.SetFocus();
+        var before = shell.Transcript.TopRow;
+
+        shell.Transcript.NewKeyDownEvent(Key.PageUp);
+
+        Assert.True(shell.Transcript.HasFocus);
+        Assert.True(shell.Transcript.TopRow < before);
+        Assert.Equal(string.Empty, shell.Composer.GetDraft());
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Modal_prompt_never_redirects_printable_input()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        var prompt = UiPromptRequest.Text("Name");
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = prompt },
+            CancellationToken.None);
+
+        shell.PromptOverlay.NewKeyDownEvent(new Key('x'));
+
+        Assert.Equal("x", shell.PromptOverlay.BodyText);
+        Assert.Equal(string.Empty, shell.Composer.GetDraft());
+        Assert.True(shell.PromptOverlay.HasFocus);
 
         if (token is not null)
         {

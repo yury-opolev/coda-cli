@@ -56,6 +56,13 @@ internal sealed class VirtualizedTranscriptView : View
     /// </summary>
     internal event Action? TranscriptScrolled;
 
+    /// <summary>
+    /// Raised for a key the transcript itself does not consume (i.e. not one of its navigation or
+    /// expand chords), letting the host redirect printable input to the composer so typing anywhere
+    /// focuses and edits the draft. Returns true when the host handled the key.
+    /// </summary>
+    internal event Func<Key, bool>? UnhandledKeyDown;
+
     /// <summary>Rows appended while scrolled away that have not been seen.</summary>
     public int UnseenRows => this.viewport.UnseenRows;
 
@@ -300,7 +307,7 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        return base.OnKeyDown(key);
+        return this.UnhandledKeyDown?.Invoke(key) == true || base.OnKeyDown(key);
     }
 
     private void ToggleExpansion(Guid id)

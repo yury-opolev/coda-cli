@@ -1,3 +1,4 @@
+using System.Text;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
@@ -34,7 +35,6 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<UiSessionSnapshot, int, string> statusProjection;
 
     private string? statusText;
-    private View? focusBeforePrompt;
     private int statusUpdateCount;
     private bool composerDisabled;
     private bool disposed;
@@ -74,6 +74,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Composer.ActionRequested += this.OnComposerActionRequested;
         this.Composer.CompletionChanged += this.OnCompletionChanged;
         this.Composer.LayoutInvalidated += this.OnComposerLayoutInvalidatedHandler;
+        this.Initialized += this.OnShellInitialized;
 
         this.BuildLayout();
         this.SyncCompletion();
@@ -261,6 +262,23 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>Lays out the composer, status, prompt overlay, and any shell-specific chrome.</summary>
     protected abstract void BuildLayout();
 
+    /// <summary>
+    /// Subscribes the shell to a transcript's unhandled printable keys so typing while the transcript has
+    /// focus redirects into the composer. Concrete shells call this once the transcript is constructed.
+    /// </summary>
+    protected void BindTranscriptInput(VirtualizedTranscriptView transcript)
+    {
+        ArgumentNullException.ThrowIfNull(transcript);
+        transcript.UnhandledKeyDown += this.HandleUnhandledShellKey;
+    }
+
+    /// <summary>Unsubscribes a transcript previously bound with <see cref="BindTranscriptInput"/>.</summary>
+    protected void UnbindTranscriptInput(VirtualizedTranscriptView transcript)
+    {
+        ArgumentNullException.ThrowIfNull(transcript);
+        transcript.UnhandledKeyDown -= this.HandleUnhandledShellKey;
+    }
+
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
     protected abstract void ApplyTranscriptChanges(UiSessionSnapshot previous, UiSessionSnapshot next);
 
@@ -286,9 +304,58 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
             this.Composer.LayoutInvalidated -= this.OnComposerLayoutInvalidatedHandler;
+            this.Initialized -= this.OnShellInitialized;
         }
 
         base.Dispose(disposing);
+    }
+
+    /// <summary>
+    /// Focus the composer once the shell is initialized so an initially ready shell accepts typing without
+    /// a first keystroke to move focus, unless startup is active or a modal prompt owns input.
+    /// </summary>
+    private void OnShellInitialized(object? sender, EventArgs args)
+    {
+        if (!this.composerDisabled &&
+            this.Snapshot.PendingPrompt is null &&
+            !this.PromptOverlay.Visible)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
+    /// <summary>
+    /// Redirects a printable, non-modifier key the transcript did not consume into the composer, focusing it
+    /// first so typing anywhere edits the draft. A pending modal prompt is never redirected.
+    /// </summary>
+    private bool HandleUnhandledShellKey(Key key)
+    {
+        if (this.PromptOverlay.Visible || !TryGetPrintable(key, out var text))
+        {
+            return false;
+        }
+
+        this.Composer.SetFocus();
+        this.Composer.InsertFromShell(text);
+        return true;
+    }
+
+    private static bool TryGetPrintable(Key key, out string text)
+    {
+        text = string.Empty;
+        if (key is null || key.IsCtrl || key.IsAlt)
+        {
+            return false;
+        }
+
+        var rune = key.AsRune;
+        if (rune.Value == 0 || Rune.IsControl(rune))
+        {
+            return false;
+        }
+
+        text = rune.ToString();
+        return true;
     }
 
     private void OnComposerLayoutInvalidatedHandler(object? sender, EventArgs e) =>
@@ -395,21 +462,20 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         if (snapshot.PendingPrompt is { } prompt)
         {
-            if (!this.PromptOverlay.Visible)
-            {
-                this.focusBeforePrompt = this.Composer;
-            }
-
             this.PromptOverlay.Update(prompt);
             this.PromptOverlay.SetFocus();
             return;
         }
 
-        if (this.PromptOverlay.Visible)
+        if (!this.PromptOverlay.Visible)
         {
-            this.PromptOverlay.Update(null);
-            (this.focusBeforePrompt ?? this.Composer).SetFocus();
-            this.focusBeforePrompt = null;
+            return;
+        }
+
+        this.PromptOverlay.Update(null);
+        if (!this.composerDisabled)
+        {
+            this.Composer.SetFocus();
         }
     }
 

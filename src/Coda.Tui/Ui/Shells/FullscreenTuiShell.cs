@@ -95,6 +95,7 @@ internal class FullscreenTuiShell(
 
         this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter);
         this.transcript.TranscriptScrolled += this.RefreshHeaderForViewport;
+        this.BindTranscriptInput(this.transcript);
         this.transcript.X = 0;
         this.transcript.Y = Pos.Bottom(this.header);
         this.transcript.Width = Dim.Fill();
@@ -353,6 +354,7 @@ internal class FullscreenTuiShell(
         if (disposing && this.transcript is not null)
         {
             this.transcript.TranscriptScrolled -= this.RefreshHeaderForViewport;
+            this.UnbindTranscriptInput(this.transcript);
         }
 
         base.Dispose(disposing);

@@ -87,6 +87,30 @@ internal sealed class ComposerView : TextView
         set => this.inputEnabled = value;
     }
 
+    /// <summary>
+    /// An optional shell-level key handler consulted before the composer's own key handling (but after the
+    /// startup-disabled guard). The shell uses it to claim keys it must own regardless of focus; when it
+    /// returns true the composer treats the key as handled and does nothing further.
+    /// </summary>
+    internal Func<Key, bool>? ShellKeyHandler { get; set; }
+
+    /// <summary>
+    /// Inserts <paramref name="text"/> into the draft as if typed, used when the shell redirects printable
+    /// input that arrived while another view had focus. No-op while input is disabled or the text is empty.
+    /// </summary>
+    internal void InsertFromShell(string text)
+    {
+        if (!this.InputEnabled || string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        this.controller.InsertText(text);
+        this.SyncTextView();
+        this.RaiseCompletionIfChanged();
+        this.LayoutInvalidated?.Invoke(this, EventArgs.Empty);
+    }
+
     public void SetDraft(string text, int cursorIndex)
     {
         this.controller.ReplaceDraft(text ?? string.Empty, cursorIndex);
@@ -158,6 +182,11 @@ internal sealed class ComposerView : TextView
         // While startup is active the shell disables input; swallow keys so no submission or edit can
         // race initialization, and never surface a completion change from an ignored keystroke.
         if (!this.inputEnabled)
+        {
+            return true;
+        }
+
+        if (this.ShellKeyHandler?.Invoke(key) == true)
         {
             return true;
         }
