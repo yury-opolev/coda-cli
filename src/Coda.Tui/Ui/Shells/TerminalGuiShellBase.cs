@@ -73,6 +73,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Composer.Submitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
         this.Composer.CompletionChanged += this.OnCompletionChanged;
+        this.Composer.LayoutInvalidated += this.OnComposerLayoutInvalidatedHandler;
 
         this.BuildLayout();
         this.SyncCompletion();
@@ -174,7 +175,24 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         ArgumentNullException.ThrowIfNull(state);
         this.controller.Restore(state);
+
+        // Mirror the draft/caret into the editor first (this resets the preferred column and may retrigger a
+        // layout pass), then re-apply the transferred viewport so the restored scroll row and preferred
+        // column survive the round trip.
         this.Composer.SetDraft(state.Draft, state.CursorIndex);
+        this.controller.UpdateViewport(state.ScrollRow);
+        this.controller.MoveCursorTo(state.CursorIndex, state.PreferredDisplayColumn);
+
+        // Ask for a fresh layout pass so the composer regrows to the restored draft, then focus the editor
+        // unless startup is active or a modal prompt owns input.
+        this.SetNeedsLayout();
+        if (this.Snapshot.ActiveOperation?.Kind != StartupOperationKind
+            && this.Snapshot.PendingPrompt is null
+            && !this.PromptOverlay.Visible
+            && this.Composer.CanFocus)
+        {
+            this.Composer.SetFocus();
+        }
     }
 
     /// <inheritdoc />
@@ -253,6 +271,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// </summary>
     protected abstract void PlaceCompletion(int height, bool visible);
 
+    /// <summary>
+    /// Reacts to a composer content/caret change by remeasuring the composer's height and re-applying its
+    /// internal scroll. Concrete shells recalculate their bottom-anchored geometry here.
+    /// </summary>
+    protected abstract void OnComposerLayoutInvalidated();
+
     protected override void Dispose(bool disposing)
     {
         if (disposing && !this.disposed)
@@ -261,10 +285,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
+            this.Composer.LayoutInvalidated -= this.OnComposerLayoutInvalidatedHandler;
         }
 
         base.Dispose(disposing);
     }
+
+    private void OnComposerLayoutInvalidatedHandler(object? sender, EventArgs e) =>
+        this.OnComposerLayoutInvalidated();
 
     private void Apply(UiSessionSnapshot snapshot)
     {

@@ -49,7 +49,7 @@ internal class FullscreenTuiShell(
         theme,
         statusProjection)
 {
-    /// <summary>The minimum (and, for now, fixed) number of composer input rows.</summary>
+    /// <summary>The minimum number of composer input rows.</summary>
     internal const int MinimumComposerHeight = 3;
 
     /// <summary>
@@ -59,6 +59,7 @@ internal class FullscreenTuiShell(
     internal const int ComposerGutterWidth = 2;
 
     private int composerHeight = MinimumComposerHeight;
+    private bool applyingComposerLayout;
     private Label header = null!;
     private VirtualizedTranscriptView transcript = null!;
 
@@ -67,6 +68,12 @@ internal class FullscreenTuiShell(
 
     /// <summary>The virtualized transcript surface filling the space between header and composer.</summary>
     internal VirtualizedTranscriptView Transcript => this.transcript;
+
+    /// <summary>The current measured composer height in rows; exposed for tests only.</summary>
+    internal int ComposerHeight => this.composerHeight;
+
+    /// <summary>Number of times the composer layout was recalculated; exposed for tests only.</summary>
+    internal int ComposerLayoutUpdateCount { get; private set; }
 
     protected override void BuildLayout()
     {
@@ -91,26 +98,20 @@ internal class FullscreenTuiShell(
         this.transcript.X = 0;
         this.transcript.Y = Pos.Bottom(this.header);
         this.transcript.Width = Dim.Fill();
-        this.transcript.Height = Dim.Fill(this.composerHeight + 2);
 
         // The always-visible operational status row sits directly above the composer, between the
         // transcript and the composer chrome.
         this.Operational.X = 0;
-        this.Operational.Y = Pos.AnchorEnd(this.composerHeight + 2);
         this.Operational.Width = Dim.Fill();
         this.Operational.Height = 1;
 
         // The borderless composer is shifted right by a small gutter so the chrome can paint its prompt
         // glyph to the left; the chrome spans the full width beneath it.
         this.Chrome.X = 0;
-        this.Chrome.Y = Pos.AnchorEnd(this.composerHeight + 1);
         this.Chrome.Width = Dim.Fill();
-        this.Chrome.Height = this.composerHeight;
 
         this.Composer.X = ComposerGutterWidth;
-        this.Composer.Y = Pos.AnchorEnd(this.composerHeight + 1);
         this.Composer.Width = Dim.Fill();
-        this.Composer.Height = this.composerHeight;
         this.Composer.BorderStyle = null;
         this.Composer.SetScheme(this.Chrome.CreateInputScheme(this.HostApp.Driver));
 
@@ -123,8 +124,10 @@ internal class FullscreenTuiShell(
         // is hidden with height 0 until the composer offers suggestions; PlaceCompletion re-anchors it.
         this.Completion.X = 0;
         this.Completion.Width = Dim.Fill();
-        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + 2);
         this.Completion.Height = 0;
+
+        // Anchor everything whose vertical position depends on the current composer height.
+        this.ApplyBottomAnchors();
 
         this.PromptOverlay.X = 0;
         this.PromptOverlay.Y = 0;
@@ -142,6 +145,27 @@ internal class FullscreenTuiShell(
     }
 
     /// <summary>
+    /// Positions every bottom-anchored view relative to the current <see cref="composerHeight"/>: the
+    /// transcript reserves the operational row (1) + composer + status row (1); the operational row, chrome,
+    /// and composer stack directly above the status row; and the hidden completion menu anchors above the
+    /// operational row. Re-run whenever the composer height changes so the shell re-flows around it.
+    /// </summary>
+    private void ApplyBottomAnchors()
+    {
+        this.transcript.Height = Dim.Fill(this.composerHeight + 2);
+
+        this.Operational.Y = Pos.AnchorEnd(this.composerHeight + 2);
+
+        this.Chrome.Y = Pos.AnchorEnd(this.composerHeight + 1);
+        this.Chrome.Height = this.composerHeight;
+
+        this.Composer.Y = Pos.AnchorEnd(this.composerHeight + 1);
+        this.Composer.Height = this.composerHeight;
+
+        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + 2);
+    }
+
+    /// <summary>
     /// The dimension used for the shell's own height. Full-screen fills the alternate screen with
     /// <see cref="Dim.Fill()"/>; the inline shell overrides this because the primary-buffer app model sizes an
     /// unconstrained top-level to its content, so it must fill the remaining screen rows explicitly instead.
@@ -150,13 +174,88 @@ internal class FullscreenTuiShell(
 
     /// <summary>
     /// Anchors the menu so its bottom row sits immediately above the operational row (operational 1 +
-    /// composer 3 + status 1 = 5 bottom rows), overlaying the transcript. The composer, operational row,
+    /// composer + status 1 bottom rows), overlaying the transcript. The composer, operational row,
     /// and status stay pinned to the bottom, so the menu never displaces them.
     /// </summary>
     protected override void PlaceCompletion(int height, bool visible)
     {
         this.Completion.Y = Pos.AnchorEnd(this.composerHeight + height + 2);
         this.Completion.Height = height;
+    }
+
+    /// <summary>
+    /// A composer content/caret change remeasures the composer height and re-applies its internal scroll,
+    /// re-flowing the bottom-anchored views around the new height.
+    /// </summary>
+    protected override void OnComposerLayoutInvalidated() => this.RecalculateComposerLayout();
+
+    /// <inheritdoc />
+    protected override void OnSubViewsLaidOut(LayoutEventArgs args)
+    {
+        base.OnSubViewsLaidOut(args);
+        this.RecalculateComposerLayout();
+    }
+
+    /// <summary>
+    /// Remeasures the composer's desired height for the current draft and screen size. When the height
+    /// changes it re-anchors the bottom views, re-places the completion menu, applies the composer's internal
+    /// scroll, and requests a fresh layout pass; when it is unchanged it only re-applies the internal scroll
+    /// so the caret stays visible. A failed measurement leaves the previous valid height untouched.
+    /// </summary>
+    private void RecalculateComposerLayout()
+    {
+        this.ComposerLayoutUpdateCount++;
+        if (this.applyingComposerLayout)
+        {
+            return;
+        }
+
+        // Skip geometry until the shell has a real frame (for example when a draft is restored before the
+        // shell is begun); the first post-begin layout pass recalculates with correct dimensions.
+        if (this.Frame.Width <= 0 || this.Frame.Height <= 0)
+        {
+            return;
+        }
+
+        var screenHeight = this.HostApp.Screen.Height > 0
+            ? this.HostApp.Screen.Height
+            : this.Frame.Height;
+        var width = Math.Max(1, this.Frame.Width - ComposerGutterWidth);
+        int next;
+        try
+        {
+            next = this.Composer.DesiredHeight(width, screenHeight);
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        if (next == this.composerHeight)
+        {
+            this.Composer.ApplyViewport(width, next);
+            return;
+        }
+
+        this.applyingComposerLayout = true;
+        try
+        {
+            this.composerHeight = next;
+            this.ApplyBottomAnchors();
+            this.PlaceCompletion(this.Completion.DesiredHeight, this.Completion.Visible);
+            this.SetNeedsLayout();
+
+            // Force the height change through to the frames now. OnSubViewsLaidOut runs after the frame has
+            // already been sized, so a resize/deletion detected here would otherwise only take visible effect
+            // on the next layout pass; re-laying out synchronously (guarded against re-entry) keeps the
+            // composer, transcript, and status flush within the same draw.
+            this.Layout();
+            this.Composer.ApplyViewport(width, next);
+        }
+        finally
+        {
+            this.applyingComposerLayout = false;
+        }
     }
 
     protected override void ApplyTranscriptChanges(UiSessionSnapshot previous, UiSessionSnapshot next)

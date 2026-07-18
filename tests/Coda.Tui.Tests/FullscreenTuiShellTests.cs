@@ -1137,4 +1137,61 @@ public sealed class VirtualizedTranscriptViewTests
         Assert.False(view.ProcessMouse(new Mouse { Flags = MouseFlags.WheeledUp }));
         Assert.True(view.AutoFollow);
     }
+
+    [Theory]
+    [InlineData(80, 24, 8)]
+    [InlineData(80, 12, 4)]
+    public void Composer_grows_to_wrapped_content_then_caps(int width, int height, int cap)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, height);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(3, shell.Composer.Frame.Height);
+
+        // Enough wrapped words to exceed the cap at the full-width composer (screen width minus the prompt
+        // gutter), so the composer grows to and stops at the approved maximum instead of the raw line count.
+        var draft = string.Join(' ', Enumerable.Repeat("wrapped", 80));
+        shell.Composer.SetDraft(draft, draft.Length);
+        app.LayoutAndDraw();
+
+        Assert.Equal(cap, shell.Composer.Frame.Height);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Failed_layout_measurement_keeps_previous_valid_height()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        var previous = shell.Composer.Frame.Height;
+        shell.Composer.LayoutFactory = (_, _) =>
+            throw new InvalidOperationException("measurement failed");
+
+        shell.Composer.SetDraft("trigger layout", 14);
+        app.LayoutAndDraw();
+
+        Assert.Equal(previous, shell.Composer.Frame.Height);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
 }

@@ -212,6 +212,70 @@ public sealed class CommandCompletionShellTests
         }
     }
 
+    [Fact]
+    public void Paste_completion_history_and_resize_each_recalculate_composer_layout()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(24, 24);
+        var controller = new ComposerController(
+            new SlashCommandCompletion(new SlashCommandRegistry(Commands())));
+        controller.SeedHistory([string.Join(' ', Enumerable.Repeat("history", 20))]);
+        using var shell = new FullscreenTuiShell(
+            app,
+            controller,
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var beforePaste = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewPasteEvent(string.Join(' ', Enumerable.Repeat("paste", 20)));
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforePaste);
+        Assert.True(shell.Composer.Frame.Height > 3);
+
+        var beforeTyping = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(new Key('x'));
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeTyping);
+
+        shell.Composer.SetDraft("a\nb\nc\nd", 7);
+        app.LayoutAndDraw();
+        Assert.Equal(4, shell.Composer.Frame.Height);
+        var beforeDeletion = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(Key.Backspace);
+        shell.Composer.NewKeyDownEvent(Key.Backspace);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeDeletion);
+        Assert.Equal(3, shell.Composer.Frame.Height);
+
+        shell.Composer.SetDraft("/he", 3);
+        var beforeCompletion = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(Key.Tab);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeCompletion);
+
+        shell.Composer.SetDraft(string.Empty, 0);
+        var beforeHistory = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(Key.CursorUp);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeHistory);
+        Assert.Contains("history", shell.Composer.GetDraft(), StringComparison.Ordinal);
+
+        var beforeResize = shell.ComposerLayoutUpdateCount;
+        app.Driver.SetScreenSize(50, 12);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeResize);
+        Assert.InRange(shell.Composer.Frame.Height, 3, 4);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
     private sealed class TestCommand(string name, string summary) : ISlashCommand
     {
         public string Name { get; } = name;

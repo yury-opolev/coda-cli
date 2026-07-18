@@ -495,6 +495,43 @@ public sealed class InlineTuiShellTests
             app.End(token);
         }
     }
+
+    [Fact]
+    public void Mode_restore_preserves_draft_caret_scroll_height_and_focus()
+    {
+        var state = new ComposerState(
+            Draft: string.Join(' ', Enumerable.Repeat("restored", 20)),
+            CursorIndex: 80,
+            History: ["older"],
+            HistoryIndex: 1,
+            PasteActive: false,
+            ScrollRow: 2,
+            PreferredDisplayColumn: 5);
+
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(24, 18);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        shell.RestoreComposerState(state);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var restored = shell.ExportComposerState();
+        Assert.Equal(state.Draft, restored.Draft);
+        Assert.Equal(state.CursorIndex, restored.CursorIndex);
+        Assert.Equal(state.ScrollRow, restored.ScrollRow);
+        Assert.Equal(state.PreferredDisplayColumn, restored.PreferredDisplayColumn);
+        Assert.True(shell.Composer.Frame.Height > 3);
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
 }
 
 public sealed class PromptOverlayTests

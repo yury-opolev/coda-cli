@@ -37,7 +37,7 @@ internal sealed class ComposerController
     {
         text ??= string.Empty;
         var cursor = Math.Clamp(cursorIndex, 0, text.Length);
-        this.State = this.State with { Draft = text, CursorIndex = cursor };
+        this.State = this.State with { Draft = text, CursorIndex = cursor, PreferredDisplayColumn = null };
         this.RefreshCompletion();
     }
 
@@ -51,7 +51,12 @@ internal sealed class ComposerController
         var draft = this.State.Draft;
         var cursor = Math.Clamp(this.State.CursorIndex, 0, draft.Length);
         var updated = draft.Insert(cursor, text);
-        this.State = this.State with { Draft = updated, CursorIndex = cursor + text.Length };
+        this.State = this.State with
+        {
+            Draft = updated,
+            CursorIndex = cursor + text.Length,
+            PreferredDisplayColumn = null,
+        };
         this.RefreshCompletion();
     }
 
@@ -65,6 +70,30 @@ internal sealed class ComposerController
     public void BeginPaste() => this.State = this.State with { PasteActive = true };
 
     public void EndPaste() => this.State = this.State with { PasteActive = false };
+
+    /// <summary>Records the top visual row currently scrolled into view, clamped to non-negative.</summary>
+    public void UpdateViewport(int scrollRow) =>
+        this.State = this.State with { ScrollRow = Math.Max(0, scrollRow) };
+
+    /// <summary>
+    /// Moves the caret to an explicit UTF-16 index and sets the preferred display column carried across
+    /// vertical movement. Passing <c>null</c> clears the preferred column so the next vertical move re-seeds
+    /// it from the caret's current column.
+    /// </summary>
+    public void MoveCursorTo(int cursorIndex, int? preferredDisplayColumn = null)
+    {
+        var clamped = Math.Clamp(cursorIndex, 0, this.State.Draft.Length);
+        this.State = this.State with
+        {
+            CursorIndex = clamped,
+            PreferredDisplayColumn = preferredDisplayColumn,
+        };
+        this.RefreshCompletion();
+    }
+
+    /// <summary>Clears the preferred display column so the next vertical move re-seeds it from the caret.</summary>
+    public void ResetPreferredDisplayColumn() =>
+        this.State = this.State with { PreferredDisplayColumn = null };
 
     public ComposerActionResult Apply(UiAction action)
     {
@@ -125,7 +154,10 @@ internal sealed class ComposerController
         var cursor = Math.Clamp(state.CursorIndex, 0, draft.Length);
         var history = state.History.IsDefault ? ImmutableArray<string>.Empty : state.History;
         var historyIndex = Math.Clamp(state.HistoryIndex, 0, history.Length);
-        this.State = new ComposerState(draft, cursor, history, historyIndex, state.PasteActive);
+        var scrollRow = Math.Max(0, state.ScrollRow);
+        var preferred = state.PreferredDisplayColumn is { } column && column >= 0 ? column : (int?)null;
+        this.State = new ComposerState(
+            draft, cursor, history, historyIndex, state.PasteActive, scrollRow, preferred);
         this.historyStash = draft;
         this.historyStashCursor = cursor;
         this.RefreshCompletion();
@@ -154,7 +186,7 @@ internal sealed class ComposerController
 
         this.historyStash = string.Empty;
         this.historyStashCursor = 0;
-        this.State = new ComposerState(string.Empty, 0, history, history.Length, false);
+        this.State = ComposerState.Empty with { History = history, HistoryIndex = history.Length };
         this.RefreshCompletion();
         return new ComposerActionResult(draft, true);
     }
@@ -169,7 +201,12 @@ internal sealed class ComposerController
         var draft = this.State.Draft;
         var cursor = Math.Clamp(this.State.CursorIndex, 0, draft.Length);
         var newDraft = completed + draft[cursor..];
-        this.State = this.State with { Draft = newDraft, CursorIndex = completed.Length };
+        this.State = this.State with
+        {
+            Draft = newDraft,
+            CursorIndex = completed.Length,
+            PreferredDisplayColumn = null,
+        };
         this.RefreshCompletion();
     }
 
@@ -191,7 +228,13 @@ internal sealed class ComposerController
         var current = Math.Min(this.State.HistoryIndex, history.Length);
         var newIndex = Math.Max(0, current - 1);
         var entry = history[newIndex];
-        this.State = this.State with { Draft = entry, CursorIndex = entry.Length, HistoryIndex = newIndex };
+        this.State = this.State with
+        {
+            Draft = entry,
+            CursorIndex = entry.Length,
+            HistoryIndex = newIndex,
+            PreferredDisplayColumn = null,
+        };
         this.RefreshCompletion();
     }
 
@@ -208,20 +251,32 @@ internal sealed class ComposerController
         {
             var draft = this.historyStash;
             var cursor = Math.Clamp(this.historyStashCursor, 0, draft.Length);
-            this.State = this.State with { Draft = draft, CursorIndex = cursor, HistoryIndex = history.Length };
+            this.State = this.State with
+            {
+                Draft = draft,
+                CursorIndex = cursor,
+                HistoryIndex = history.Length,
+                PreferredDisplayColumn = null,
+            };
             this.RefreshCompletion();
             return;
         }
 
         var entry = history[newIndex];
-        this.State = this.State with { Draft = entry, CursorIndex = entry.Length, HistoryIndex = newIndex };
+        this.State = this.State with
+        {
+            Draft = entry,
+            CursorIndex = entry.Length,
+            HistoryIndex = newIndex,
+            PreferredDisplayColumn = null,
+        };
         this.RefreshCompletion();
     }
 
     private void MoveCursor(int cursorIndex)
     {
         var clamped = Math.Clamp(cursorIndex, 0, this.State.Draft.Length);
-        this.State = this.State with { CursorIndex = clamped };
+        this.State = this.State with { CursorIndex = clamped, PreferredDisplayColumn = null };
         this.RefreshCompletion();
     }
 

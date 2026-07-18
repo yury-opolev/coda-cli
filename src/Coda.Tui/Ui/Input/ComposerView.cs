@@ -43,6 +43,21 @@ internal sealed class ComposerView : TextView
     public event EventHandler<UiAction>? ActionRequested;
 
     /// <summary>
+    /// Raised whenever the composer's measured content or caret may have changed — a draft replacement,
+    /// printable edit, base editor edit, paste, completion, history navigation, or submission — so the shell
+    /// can remeasure the composer's height and re-apply its internal scroll to keep the caret visible.
+    /// </summary>
+    public event EventHandler? LayoutInvalidated;
+
+    /// <summary>
+    /// The seam that produces the grapheme-aware visual layout used to size and internally scroll the
+    /// composer. Tests substitute a throwing factory to simulate a failed measurement; production uses the
+    /// real <see cref="ComposerVisualLayout.Create"/>.
+    /// </summary>
+    internal Func<string, int, ComposerVisualLayout> LayoutFactory { get; set; } =
+        ComposerVisualLayout.Create;
+
+    /// <summary>
     /// Raised only when the slash-command completion actually changes — its offered suggestions, the
     /// selected index, or its visibility — so a host can (re)render the completion menu without redraw
     /// loops. Never fires while the completion is unchanged (e.g. plain typing with no suggestions).
@@ -77,11 +92,60 @@ internal sealed class ComposerView : TextView
         this.controller.ReplaceDraft(text ?? string.Empty, cursorIndex);
         this.SyncTextView();
         this.RaiseCompletionIfChanged();
+        this.RaiseLayoutInvalidated();
     }
 
     public string GetDraft() => this.controller.State.Draft;
 
     public ComposerState GetState() => this.controller.State;
+
+    /// <summary>
+    /// The composer's maximum height in rows for a given screen height: never below the three-row minimum
+    /// and never above eight, otherwise the floor of 35% of the available screen height.
+    /// </summary>
+    internal static int MaximumHeight(int screenHeight) =>
+        Math.Max(3, Math.Min(8, (int)Math.Floor(Math.Max(0, screenHeight) * 0.35)));
+
+    /// <summary>Measures the current draft's visual layout at <paramref name="width"/> display cells.</summary>
+    internal ComposerVisualLayout MeasureLayout(int width) =>
+        this.LayoutFactory(this.controller.State.Draft, Math.Max(1, width));
+
+    /// <summary>
+    /// The composer's desired height for the given content width and screen height: the wrapped visual line
+    /// count clamped to <c>[3, MaximumHeight(screenHeight)]</c>.
+    /// </summary>
+    internal int DesiredHeight(int width, int screenHeight)
+    {
+        var visualRows = this.MeasureLayout(width).VisualLineCount;
+        return Math.Min(MaximumHeight(screenHeight), Math.Max(3, visualRows));
+    }
+
+    /// <summary>
+    /// Re-measures the draft, scrolls the internal viewport so the caret's visual row stays within the
+    /// visible <paramref name="height"/> rows, records the resulting scroll row on the controller, and
+    /// mirrors the caret to its wrapped visual position.
+    /// </summary>
+    internal void ApplyViewport(int width, int height)
+    {
+        var layout = this.MeasureLayout(width);
+        var caret = layout.PositionForIndex(this.controller.State.CursorIndex);
+        var visibleRows = Math.Max(1, height);
+        var top = this.controller.State.ScrollRow;
+        if (caret.Row < top)
+        {
+            top = caret.Row;
+        }
+        else if (caret.Row >= top + visibleRows)
+        {
+            top = caret.Row - visibleRows + 1;
+        }
+
+        top = Math.Clamp(top, 0, Math.Max(0, layout.VisualLineCount - visibleRows));
+        this.controller.UpdateViewport(top);
+        this.ScrollTo(new System.Drawing.Point(0, top));
+        var position = layout.PositionForIndex(this.controller.State.CursorIndex);
+        this.InsertionPoint = new System.Drawing.Point(position.Column, position.Row);
+    }
 
     /// <summary>
     /// Injects a paste payload the same way the driver would deliver a bracketed paste.
@@ -126,6 +190,7 @@ internal sealed class ComposerView : TextView
             this.SyncCursorFromView();
             this.controller.InsertText(text);
             this.SyncTextView();
+            this.RaiseLayoutInvalidated();
             return true;
         }
 
@@ -133,6 +198,7 @@ internal sealed class ComposerView : TextView
         // base TextView, then mirrored back into the controller.
         var handled = base.OnKeyDown(key);
         this.SyncControllerFromTextView();
+        this.RaiseLayoutInvalidated();
         return handled;
     }
 
@@ -163,6 +229,7 @@ internal sealed class ComposerView : TextView
         }
 
         this.SyncTextView();
+        this.RaiseLayoutInvalidated();
         return true;
     }
 
@@ -173,6 +240,7 @@ internal sealed class ComposerView : TextView
             case UiAction.Submit:
                 var result = this.controller.Apply(UiAction.Submit);
                 this.SyncTextView();
+                this.RaiseLayoutInvalidated();
                 if (result.SubmittedText is { } submitted)
                 {
                     this.Submitted?.Invoke(this, submitted);
@@ -182,9 +250,6 @@ internal sealed class ComposerView : TextView
 
             case UiAction.InsertNewline:
             case UiAction.CompleteSuggestion:
-            case UiAction.CompletionPrevious:
-            case UiAction.CompletionNext:
-            case UiAction.DismissCompletion:
             case UiAction.HistoryPrevious:
             case UiAction.HistoryNext:
             case UiAction.CursorLeft:
@@ -193,6 +258,18 @@ internal sealed class ComposerView : TextView
             case UiAction.WordRight:
             case UiAction.LineStart:
             case UiAction.LineEnd:
+                // Content edits, completion, history, and caret movement can all change the measured height
+                // or push the caret out of view, so remeasure and re-scroll.
+                this.controller.Apply(action);
+                this.SyncTextView();
+                this.RaiseLayoutInvalidated();
+                return true;
+
+            case UiAction.CompletionPrevious:
+            case UiAction.CompletionNext:
+            case UiAction.DismissCompletion:
+                // Completion selection/visibility changes neither the draft nor the caret, so they never
+                // resize or rescroll the composer.
                 this.controller.Apply(action);
                 this.SyncTextView();
                 return true;
@@ -204,8 +281,19 @@ internal sealed class ComposerView : TextView
         }
     }
 
-    private void OnContentsChangedSync(object? sender, ContentsChangedEventArgs e) =>
+    private void OnContentsChangedSync(object? sender, ContentsChangedEventArgs e)
+    {
+        // The base editor applies edits (backspace, delete, cut) through this event, often a beat after the
+        // key is handled. Mirror the draft back and remeasure so the composer resizes/rescrolls for the
+        // post-edit content; skip while we are the ones pushing text in (SyncTextView guards that).
+        if (this.syncingText)
+        {
+            return;
+        }
+
         this.SyncControllerFromTextView();
+        this.RaiseLayoutInvalidated();
+    }
 
     /// <summary>
     /// Fires <see cref="CompletionChanged"/> only when the completion's suggestion identities, selected
@@ -278,7 +366,9 @@ internal sealed class ComposerView : TextView
                 this.Text = text;
             }
 
-            this.ApplyCursor(state.Draft, state.CursorIndex);
+            var layout = ComposerVisualLayout.Create(state.Draft, this.LayoutWidth());
+            var position = layout.PositionForIndex(state.CursorIndex);
+            this.InsertionPoint = new System.Drawing.Point(position.Column, position.Row);
         }
         finally
         {
@@ -294,75 +384,28 @@ internal sealed class ComposerView : TextView
         }
 
         var draft = NormalizeNewlines(this.Text ?? string.Empty);
-        var cursor = FlatCursorIndex(draft, this.InsertionPoint);
+        var point = this.InsertionPoint;
+        var layout = ComposerVisualLayout.Create(draft, this.LayoutWidth());
+        var cursor = layout.IndexForPosition(point.Y, point.X);
         this.controller.ReplaceDraft(draft, cursor);
     }
 
-    private void ApplyCursor(string draft, int cursorIndex)
+    /// <summary>
+    /// The display-cell width the composer wraps at: its laid-out viewport width, falling back to the frame
+    /// width and finally to a single cell so a not-yet-laid-out view never divides by zero.
+    /// </summary>
+    private int LayoutWidth()
     {
-        var clamped = Math.Clamp(cursorIndex, 0, draft.Length);
-        var row = 0;
-        var lineStart = 0;
-        for (var i = 0; i < clamped; i++)
+        var width = this.Viewport.Width;
+        if (width <= 0)
         {
-            if (draft[i] == '\n')
-            {
-                row++;
-                lineStart = i + 1;
-            }
+            width = this.Frame.Width;
         }
 
-        var column = CountRunes(draft.AsSpan(lineStart, clamped - lineStart));
-        this.InsertionPoint = new System.Drawing.Point(column, row);
+        return Math.Max(1, width);
     }
 
-    private static int FlatCursorIndex(string draft, System.Drawing.Point point)
-    {
-        var lines = draft.Split('\n');
-        var row = Math.Clamp(point.Y, 0, lines.Length - 1);
-        var index = 0;
-        for (var i = 0; i < row; i++)
-        {
-            index += lines[i].Length + 1;
-        }
-
-        index += RuneColumnToUtf16Offset(lines[row], point.X);
-        return Math.Clamp(index, 0, draft.Length);
-    }
-
-    private static int RuneColumnToUtf16Offset(string line, int runeColumn)
-    {
-        if (runeColumn <= 0)
-        {
-            return 0;
-        }
-
-        var offset = 0;
-        var count = 0;
-        foreach (var rune in line.EnumerateRunes())
-        {
-            if (count >= runeColumn)
-            {
-                break;
-            }
-
-            offset += rune.Utf16SequenceLength;
-            count++;
-        }
-
-        return Math.Min(offset, line.Length);
-    }
-
-    private static int CountRunes(ReadOnlySpan<char> value)
-    {
-        var count = 0;
-        foreach (var _ in value.EnumerateRunes())
-        {
-            count++;
-        }
-
-        return count;
-    }
+    private void RaiseLayoutInvalidated() => this.LayoutInvalidated?.Invoke(this, EventArgs.Empty);
 
     private static bool TryGetPrintableText(Key key, out string text)
     {

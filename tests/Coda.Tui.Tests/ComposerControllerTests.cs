@@ -98,6 +98,21 @@ public sealed class ComposerControllerTests
     }
 
     [Fact]
+    public void Export_and_restore_preserve_scroll_and_preferred_column()
+    {
+        var controller = CreateController();
+        controller.ReplaceDraft("one\ntwo\nthree", 7);
+        controller.UpdateViewport(scrollRow: 2);
+        controller.MoveCursorTo(6, preferredDisplayColumn: 4);
+
+        var restored = CreateController();
+        restored.Restore(controller.Export());
+
+        Assert.Equal(2, restored.State.ScrollRow);
+        Assert.Equal(4, restored.State.PreferredDisplayColumn);
+    }
+
+    [Fact]
     public void Restore_clamps_and_does_not_alias_source_state()
     {
         var controller = CreateController();
