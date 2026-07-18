@@ -414,6 +414,79 @@ public sealed class FullscreenTuiShellTests
             app.End(token);
         }
     }
+
+    [Theory]
+    [InlineData(60, 12)]
+    [InlineData(80, 24)]
+    [InlineData(140, 40)]
+    public void Fullscreen_layout_places_header_transcript_composer_status_by_row(int width, int height)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, height);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // Header on row 0, status on the final row, composer three rows directly above the status.
+        Assert.Equal(0, shell.Header.Frame.Y);
+        Assert.Equal(1, shell.Header.Frame.Height);
+        Assert.Equal(1, shell.Status.Frame.Height);
+        Assert.Equal(height - 1, shell.Status.Frame.Y);
+        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        // Transcript fills every row between the header and the composer, at least height - 5 rows.
+        Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
+        Assert.True(
+            shell.Transcript.Frame.Height >= height - 5,
+            $"transcript height {shell.Transcript.Frame.Height} should be at least {height - 5}");
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_transcript_shows_user_and_assistant_history_and_autofollows_appends()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var user = new UserTranscriptBlock(Guid.NewGuid(), "run the tests");
+        var assistant = new AssistantTranscriptBlock(Guid.NewGuid(), "all green", Complete: true);
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = [user, assistant] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        var visible = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
+        Assert.Contains("run the tests", visible);
+        Assert.Contains("all green", visible);
+        Assert.True(shell.Transcript.AutoFollow);
+
+        // An appended completed reply stays visible and the viewport keeps auto-following.
+        var reply = new AssistantTranscriptBlock(Guid.NewGuid(), "second reply", Complete: true);
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = [user, assistant, reply] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        var afterAppend = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
+        Assert.Contains("second reply", afterAppend);
+        Assert.True(shell.Transcript.AutoFollow);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
 }
 
 /// <summary>Unit tests for the bounded, virtualized <see cref="TranscriptLayoutIndex"/>.</summary>

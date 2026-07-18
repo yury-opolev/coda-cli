@@ -96,10 +96,12 @@ Coda is its own product, independent of any vendor's official CLI.
 ## Coda — the interactive TUI
 
 The terminal front-end targets **Terminal.Gui v2**. After the compatibility matrix and acceptance
-thresholds pass, **inline mode is the default interactive engine** — the composer sits at the bottom
-and completed output flows into your terminal's native scrollback. An optional **full-screen** mode is
-available for a retained, virtualized transcript. **Spectre.Console remains a migration fallback** for
-environments where Terminal.Gui is not yet accepted, and a **plain** renderer is always available.
+thresholds pass, **full-screen mode is the default interactive engine on a supported terminal** — a
+scrollable, virtualized transcript fills most of the screen, the composer is pinned near the bottom, and
+a one-line status sits on the final row. **Inline mode** (composer at the bottom with output flowing into
+your terminal's native scrollback) remains available as an **explicit legacy/compatibility** choice via
+`--tui=inline`. **Spectre.Console remains a migration fallback** for environments where Terminal.Gui is
+not yet accepted, and a **plain** renderer is always available.
 
 ```powershell
 # Build (bumps the version), then run the TUI:
@@ -107,16 +109,17 @@ environments where Terminal.Gui is not yet accepted, and a **plain** renderer is
 dotnet run --project src/Coda.Tui -c Release
 
 # Choose the interactive engine explicitly:
-dotnet run --project src/Coda.Tui -- --tui=inline       # composer + native scrollback (default target)
 dotnet run --project src/Coda.Tui -- --tui=fullscreen   # retained, virtualized full-screen transcript
-dotnet run --project src/Coda.Tui -- --tui=auto         # pick inline/full-screen/plain by terminal
+dotnet run --project src/Coda.Tui -- --tui=inline       # legacy: composer + native scrollback
+dotnet run --project src/Coda.Tui -- --tui=auto         # default: full-screen on a supported terminal, else plain
 dotnet run --project src/Coda.Tui -- --plain            # plain output (screen readers, CI, redirection)
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
 
 **Keys:** `Enter` submits · `Ctrl+J` inserts a newline · `Ctrl-C` interrupts the active turn ·
-`Ctrl+D` or `/exit` exits · `F2` switches between inline and full-screen. Full-screen has **no
-permanent sidebar** and uses a **virtualized transcript** (context, pickers, permissions, help, and
+`Ctrl+D` or `/exit` exits · `F2` switches between full-screen and inline. Typing a `/` shows a slash-command
+completion menu directly above the composer (Up/Down select, Tab completes, Esc dismisses). Full-screen has
+**no permanent sidebar** and uses a **virtualized transcript** (context, pickers, permissions, help, and
 diffs all use keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI,
 output/input redirection, and terminals that Terminal.Gui does not support.
 

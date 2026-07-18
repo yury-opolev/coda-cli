@@ -26,6 +26,36 @@ public sealed class TuiModePolicyTests
     }
 
     [Fact]
+    public void Auto_uses_fullscreen_on_a_suitable_interactive_terminal()
+    {
+        var caps = new TerminalCapabilities(false, false, 120, 40, true);
+        var decision = TuiModePolicy.SelectInitial(new TuiLaunchOptions(TuiPreference.Auto, false, [], null), caps);
+
+        Assert.Equal(TuiRunMode.Fullscreen, decision.Mode);
+        Assert.Null(decision.Error);
+    }
+
+    [Fact]
+    public void Explicit_inline_preference_stays_inline()
+    {
+        var caps = new TerminalCapabilities(false, false, 120, 40, true);
+        var decision = TuiModePolicy.SelectInitial(new TuiLaunchOptions(TuiPreference.Inline, false, [], null), caps);
+
+        Assert.Equal(TuiRunMode.Inline, decision.Mode);
+        Assert.Null(decision.Error);
+    }
+
+    [Fact]
+    public void Explicit_fullscreen_preference_stays_fullscreen()
+    {
+        var caps = new TerminalCapabilities(false, false, 120, 40, true);
+        var decision = TuiModePolicy.SelectInitial(new TuiLaunchOptions(TuiPreference.Fullscreen, false, [], null), caps);
+
+        Assert.Equal(TuiRunMode.Fullscreen, decision.Mode);
+        Assert.Null(decision.Error);
+    }
+
+    [Fact]
     public void Explicit_interactive_mode_reports_too_small()
     {
         var caps = new TerminalCapabilities(false, false, 59, 12, true);

@@ -29,9 +29,15 @@ public static class TuiModePolicy
             return new(null, $"Terminal.Gui requires at least 60 columns by 12 rows; current size is {caps.Width}x{caps.Height}.");
         }
 
-        return new(
-            options.Preference == TuiPreference.Fullscreen ? TuiRunMode.Fullscreen : TuiRunMode.Inline,
-            null);
+        // Auto now defaults to the full-screen transcript on a suitable interactive terminal; inline is an
+        // explicit legacy/compatibility choice and full-screen an explicit opt-in.
+        var mode = options.Preference switch
+        {
+            TuiPreference.Inline => TuiRunMode.Inline,
+            _ => TuiRunMode.Fullscreen,
+        };
+
+        return new(mode, null);
     }
 
     public static IReadOnlyList<TuiRunMode> FallbacksFrom(TuiRunMode mode) => mode switch

@@ -125,6 +125,85 @@ public sealed class ComposerViewTests
     }
 
     [Fact]
+    public void Completion_changed_fires_on_show_selection_change_and_hide()
+    {
+        var controller = CreateController(
+            new TestCommand("model", "Model"),
+            new TestCommand("mcp", "Mcp"));
+        using var view = new ComposerView(controller);
+        var count = 0;
+        view.CompletionChanged += (_, _) => count++;
+
+        view.SetDraft("/m", 2);
+        Assert.Equal(2, view.Suggestions.Count);
+        Assert.True(count >= 1);
+        var afterShow = count;
+
+        view.NewKeyDownEvent(Key.CursorDown);
+        Assert.Equal(1, view.SelectedSuggestionIndex);
+        Assert.True(count > afterShow);
+        var afterMove = count;
+
+        view.NewKeyDownEvent(Key.Esc);
+        Assert.Empty(view.Suggestions);
+        Assert.True(count > afterMove);
+    }
+
+    [Fact]
+    public void Completion_changed_does_not_fire_for_plain_text_without_suggestions()
+    {
+        var controller = CreateController(new TestCommand("model", "Model"));
+        using var view = new ComposerView(controller);
+        var count = 0;
+        view.CompletionChanged += (_, _) => count++;
+
+        view.NewKeyDownEvent(new Key('h'));
+        view.NewKeyDownEvent(new Key('i'));
+
+        Assert.Equal(0, count);
+        Assert.Empty(view.Suggestions);
+    }
+
+    [Fact]
+    public void Tab_completes_selected_command_hides_menu_and_fires_change()
+    {
+        var controller = CreateController(new TestCommand("help", "Show help"));
+        using var view = new ComposerView(controller);
+        var count = 0;
+        view.CompletionChanged += (_, _) => count++;
+
+        view.SetDraft("/he", 3);
+        Assert.NotEmpty(view.Suggestions);
+        var afterShow = count;
+
+        view.NewKeyDownEvent(Key.Tab);
+
+        Assert.Equal("/help ", view.GetDraft());
+        Assert.Empty(view.Suggestions);
+        Assert.True(count > afterShow);
+    }
+
+    [Fact]
+    public void Editing_after_escape_reactivates_completion()
+    {
+        var controller = CreateController(new TestCommand("help", "Show help"));
+        using var view = new ComposerView(controller);
+        view.SetDraft("/h", 2);
+        Assert.NotEmpty(view.Suggestions);
+
+        view.NewKeyDownEvent(Key.Esc);
+        Assert.Empty(view.Suggestions);
+
+        var count = 0;
+        view.CompletionChanged += (_, _) => count++;
+        view.NewKeyDownEvent(new Key('e'));
+
+        Assert.Equal("/he", view.GetDraft());
+        Assert.NotEmpty(view.Suggestions);
+        Assert.True(count >= 1);
+    }
+
+    [Fact]
     public void Cursor_left_then_printable_inserts_at_moved_caret()
     {
         var controller = CreateController();

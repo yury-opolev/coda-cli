@@ -47,9 +47,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Composer = new ComposerView(controller);
         this.Status = new Label { CanFocus = false };
         this.PromptOverlay = new PromptOverlay(publisher);
+        this.Completion = new CommandCompletionView();
 
         this.Composer.Submitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
+        this.Composer.CompletionChanged += this.OnCompletionChanged;
 
         this.BuildLayout();
     }
@@ -68,6 +70,13 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>The keyboard-only prompt surface, hidden until a prompt is pending.</summary>
     internal PromptOverlay PromptOverlay { get; }
+
+    /// <summary>
+    /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
+    /// position it (via <see cref="PlaceCompletion"/>) and add it to their view tree; it stays hidden with
+    /// height 0 whenever the composer offers no visible suggestions.
+    /// </summary>
+    internal CommandCompletionView Completion { get; }
 
     /// <summary>The most recently applied snapshot.</summary>
     internal UiSessionSnapshot Snapshot { get; private set; }
@@ -177,6 +186,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
     protected abstract void ApplyTranscriptChanges(UiSessionSnapshot previous, UiSessionSnapshot next);
 
+    /// <summary>
+    /// Positions the completion menu for the current suggestion count. <paramref name="height"/> is the
+    /// number of option rows to show (0 when hidden). Concrete shells anchor the menu appropriately —
+    /// full-screen overlays it above the fixed composer, inline expands the region between the active row
+    /// and the composer — without moving the composer or status.
+    /// </summary>
+    protected abstract void PlaceCompletion(int height, bool visible);
+
     protected override void Dispose(bool disposing)
     {
         if (disposing && !this.disposed)
@@ -184,6 +201,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.disposed = true;
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
+            this.Composer.CompletionChanged -= this.OnCompletionChanged;
         }
 
         base.Dispose(disposing);
@@ -246,4 +264,21 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private void OnComposerSubmitted(object? sender, string text) => this.PromptSubmitted?.Invoke(this, text);
 
     private void OnComposerActionRequested(object? sender, UiAction action) => this.ActionRequested?.Invoke(this, action);
+
+    private void OnCompletionChanged(object? sender, EventArgs e) => this.SyncCompletion();
+
+    /// <summary>
+    /// Mirrors the composer's current suggestions/selection into the completion menu, asks the concrete
+    /// shell to position it, and toggles its visibility. Kept hidden with height 0 when there is nothing to
+    /// show so it never affects layout while inactive.
+    /// </summary>
+    private void SyncCompletion()
+    {
+        this.Completion.SetSuggestions(this.Composer.Suggestions, this.Composer.SelectedSuggestionIndex);
+        var height = this.Completion.DesiredHeight;
+        var visible = height > 0;
+        this.PlaceCompletion(height, visible);
+        this.Completion.Visible = visible;
+        this.SetNeedsLayout();
+    }
 }

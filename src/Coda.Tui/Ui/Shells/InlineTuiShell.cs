@@ -56,8 +56,15 @@ internal sealed class InlineTuiShell : TerminalGuiShellBase
         this.ActiveRow.Height = 0;
         this.ActiveRow.Visible = false;
 
+        // The completion menu sits between the active row and the composer, so the inline region grows by
+        // exactly its height only while it is visible and collapses back to the compact layout when hidden.
+        this.Completion.X = 0;
+        this.Completion.Y = Pos.Bottom(this.ActiveRow);
+        this.Completion.Width = Dim.Fill();
+        this.Completion.Height = 0;
+
         this.Composer.X = 0;
-        this.Composer.Y = Pos.Bottom(this.ActiveRow);
+        this.Composer.Y = Pos.Bottom(this.Completion);
         this.Composer.Width = Dim.Fill();
         this.Composer.Height = 3;
         this.Composer.BorderStyle = LineStyle.Single;
@@ -73,10 +80,17 @@ internal sealed class InlineTuiShell : TerminalGuiShellBase
         this.PromptOverlay.Height = Dim.Fill();
 
         this.Add(this.ActiveRow);
+        this.Add(this.Completion);
         this.Add(this.Composer);
         this.Add(this.Status);
         this.Add(this.PromptOverlay);
     }
+
+    /// <summary>
+    /// Grows the inline region between the active row and the composer by the menu's height only while it is
+    /// visible; a hidden menu keeps height 0 so the layout returns to its prior compact size.
+    /// </summary>
+    protected override void PlaceCompletion(int height, bool visible) => this.Completion.Height = height;
 
     protected override void ApplyTranscriptChanges(UiSessionSnapshot previous, UiSessionSnapshot next)
     {

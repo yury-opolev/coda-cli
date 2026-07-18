@@ -29,6 +29,10 @@ internal sealed class ComposerController
     public IReadOnlyList<ISlashCommand> Suggestions =>
         this.completion.IsVisible ? this.completion.Suggestions : [];
 
+    /// <summary>The selected suggestion index while suggestions are visible, or -1 when none/dismissed.</summary>
+    public int SelectedSuggestionIndex =>
+        this.completion.IsVisible ? this.completion.SelectedIndex : -1;
+
     public void ReplaceDraft(string text, int cursorIndex)
     {
         text ??= string.Empty;

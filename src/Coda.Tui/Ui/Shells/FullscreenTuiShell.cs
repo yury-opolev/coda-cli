@@ -72,6 +72,13 @@ internal sealed class FullscreenTuiShell(
         this.Status.Width = Dim.Fill();
         this.Status.Height = 1;
 
+        // The completion menu overlays the transcript's bottom rows directly above the composer. It is
+        // hidden with height 0 until the composer offers suggestions; PlaceCompletion re-anchors it.
+        this.Completion.X = 0;
+        this.Completion.Width = Dim.Fill();
+        this.Completion.Y = Pos.AnchorEnd(4);
+        this.Completion.Height = 0;
+
         this.PromptOverlay.X = 0;
         this.PromptOverlay.Y = 0;
         this.PromptOverlay.Width = Dim.Fill();
@@ -81,7 +88,19 @@ internal sealed class FullscreenTuiShell(
         this.Add(this.transcript);
         this.Add(this.Composer);
         this.Add(this.Status);
+        this.Add(this.Completion);
         this.Add(this.PromptOverlay);
+    }
+
+    /// <summary>
+    /// Anchors the menu so its bottom row sits immediately above the composer (composer 3 + status 1 = 4
+    /// bottom rows), overlaying the transcript. The composer and status stay pinned to the bottom, so the
+    /// menu never displaces them.
+    /// </summary>
+    protected override void PlaceCompletion(int height, bool visible)
+    {
+        this.Completion.Y = Pos.AnchorEnd(4 + height);
+        this.Completion.Height = height;
     }
 
     protected override void ApplyTranscriptChanges(UiSessionSnapshot previous, UiSessionSnapshot next)
