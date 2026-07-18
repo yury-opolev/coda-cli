@@ -82,4 +82,43 @@ public sealed class TuiThemeTests
             new TgColor(TgName.BrightRed),
             view.AttributeFor(TranscriptRole.Permission).Foreground);
     }
+
+    [Fact]
+    public void Surface_scheme_uses_neutral_warm_foreground_over_background_for_every_state()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+
+        var scheme = TuiTheme.WarmEmber.SurfaceScheme(app.Driver);
+
+        var background = TuiTheme.WarmEmber.Background.TrueColor;
+        var foreground = TuiTheme.WarmEmber.TranscriptAssistant.TrueColor;
+
+        // The neutral warm foreground reads over the Warm Ember background...
+        Assert.Equal(foreground, scheme.Normal.Foreground);
+
+        // ...and every scheme state paints the same uniform background, so no inherited surface can
+        // introduce a different backdrop regardless of focus/active/disabled state.
+        foreach (var attribute in new[]
+        {
+            scheme.Normal, scheme.HotNormal, scheme.Focus, scheme.HotFocus, scheme.Active,
+            scheme.HotActive, scheme.Highlight, scheme.Editable, scheme.ReadOnly, scheme.Disabled,
+        })
+        {
+            Assert.Equal(background, attribute.Background);
+        }
+    }
+
+    [Fact]
+    public void Surface_scheme_falls_back_to_named_background_when_forced_to_16_colors()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = true;
+
+        var scheme = TuiTheme.WarmEmber.SurfaceScheme(app.Driver);
+
+        Assert.Equal(new TgColor(TuiTheme.WarmEmber.Background.Fallback), scheme.Normal.Background);
+        Assert.Equal(new TgColor(TuiTheme.WarmEmber.TranscriptAssistant.Fallback), scheme.Normal.Foreground);
+    }
 }

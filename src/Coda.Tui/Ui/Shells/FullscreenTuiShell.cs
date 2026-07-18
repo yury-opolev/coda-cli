@@ -56,6 +56,12 @@ internal class FullscreenTuiShell(
         this.Width = Dim.Fill();
         this.Height = this.ResolveShellHeight();
 
+        // Paint the Warm Ember surface on the top-level shell once the driver is live (the shell is built
+        // after Application.Init) and before the first draw. Header, status, transcript, and completion
+        // carry no explicit scheme, so they inherit this uniform background; the composer and prompt
+        // overlay set their own schemes below and keep them.
+        this.SetScheme(TuiTheme.WarmEmber.SurfaceScheme(this.HostApp.Driver));
+
         this.header = new Label { CanFocus = false };
         this.header.X = 0;
         this.header.Y = 0;

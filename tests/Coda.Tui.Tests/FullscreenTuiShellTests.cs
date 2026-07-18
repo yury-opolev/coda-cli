@@ -4,6 +4,7 @@ using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
+using TgColor = Terminal.Gui.Drawing.Color;
 
 namespace Coda.Tui.Tests;
 
@@ -677,6 +678,95 @@ public sealed class FullscreenTuiShellTests
         var afterAppend = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
         Assert.Contains("second reply", afterAppend);
         Assert.True(shell.Transcript.AutoFollow);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Fullscreen_surface_background_is_inherited_by_header_status_transcript_completion(bool force16)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = force16;
+        app.Driver.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var expected = force16
+            ? new TgColor(TuiTheme.WarmEmber.Background.Fallback)
+            : TuiTheme.WarmEmber.Background.TrueColor;
+
+        // The shell paints the Warm Ember surface, and header/status/transcript/completion carry no
+        // explicit scheme of their own, so each inherits the same normal background from the top level.
+        Assert.Equal(expected, shell.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Header.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Status.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Completion.GetScheme().Normal.Background);
+
+        Assert.False(shell.Header.HasScheme);
+        Assert.False(shell.Status.HasScheme);
+        Assert.False(shell.Transcript.HasScheme);
+        Assert.False(shell.Completion.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Fullscreen_composer_and_prompt_keep_their_own_explicit_schemes()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // The surface scheme must not overwrite the composer's and prompt overlay's own explicit schemes.
+        Assert.True(shell.Composer.HasScheme);
+        Assert.True(shell.PromptOverlay.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_short_transcript_trailing_cells_use_the_surface_scheme_source()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // A short transcript leaves most of the panel empty. Those trailing/empty cells are cleared with
+        // the transcript's inherited scheme, so their backdrop must resolve from the same surface source
+        // as the shell — asserted via the scheme, not sampled pixels.
+        var reply = new AssistantTranscriptBlock(Guid.NewGuid(), "just one line", Complete: true);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [reply] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        var expected = TuiTheme.WarmEmber.Background.TrueColor;
+        Assert.False(shell.Transcript.HasScheme);
+        Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
+        Assert.Equal(shell.GetScheme().Normal.Background, shell.Transcript.GetScheme().Normal.Background);
 
         if (token is not null)
         {

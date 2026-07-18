@@ -86,6 +86,18 @@ internal sealed class TuiTheme
         return SolidScheme(normal, focus);
     }
 
+    /// <summary>
+    /// The top-level surface scheme: a neutral warm foreground (<see cref="TranscriptAssistant"/>) over the
+    /// Warm Ember <see cref="Background"/> for <em>every</em> scheme state, keyed to the driver's color depth.
+    /// Applied to the retained shell so header, status, transcript, and completion — none of which carry an
+    /// explicit scheme — inherit one uniform background regardless of focus/active/disabled state.
+    /// </summary>
+    public TgScheme SurfaceScheme(IDriver? driver)
+    {
+        var normal = this.Attribute(this.TranscriptAssistant, this.Background, driver);
+        return SolidScheme(normal, normal);
+    }
+
     /// <summary>A solid dark prompt-overlay scheme keyed to the driver's color depth.</summary>
     public TgScheme PromptScheme(IDriver? driver)
     {

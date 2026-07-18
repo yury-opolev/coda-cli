@@ -3,9 +3,11 @@ using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Point = System.Drawing.Point;
+using TgColor = Terminal.Gui.Drawing.Color;
 
 namespace Coda.Tui.Tests;
 
@@ -426,6 +428,69 @@ public sealed class InlineTuiShellTests
         var completed = await Task.WhenAny(apply, Task.Delay(TimeSpan.FromSeconds(5)));
         Assert.Same(apply, completed);
         await Assert.ThrowsAsync<NotInitializedException>(() => apply);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Inline_surface_background_is_inherited_by_header_status_transcript_completion(bool force16)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = force16;
+        app.Driver.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var expected = force16
+            ? new TgColor(TuiTheme.WarmEmber.Background.Fallback)
+            : TuiTheme.WarmEmber.Background.TrueColor;
+
+        // Inline reuses the retained shell, so it inherits the same Warm Ember surface background as
+        // full-screen across header/status/transcript/completion.
+        Assert.Equal(expected, shell.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Header.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Status.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Completion.GetScheme().Normal.Background);
+
+        Assert.False(shell.Header.HasScheme);
+        Assert.False(shell.Status.HasScheme);
+        Assert.False(shell.Transcript.HasScheme);
+        Assert.False(shell.Completion.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Inline_composer_and_prompt_keep_their_own_explicit_schemes()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Composer.HasScheme);
+        Assert.True(shell.PromptOverlay.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 }
 
