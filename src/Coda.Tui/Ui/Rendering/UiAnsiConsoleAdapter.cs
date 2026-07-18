@@ -100,7 +100,11 @@ public sealed partial class UiAnsiConsoleAdapter : IAnsiConsole
             return;
         }
 
-        this._publisher.Publish(new CommandOutputEvent(normalized));
+        // Strip only the terminal newline terminators a line-oriented writer (MarkupLine/WriteLine)
+        // appends, so a single rendered row never carries a trailing break that the transcript formatter
+        // would split into an extra blank row. Interior blank lines are preserved.
+        var trimmed = normalized.TrimEnd('\r', '\n');
+        this._publisher.Publish(new CommandOutputEvent(trimmed));
     }
 
     private static string NormalizeNewlines(string value)
