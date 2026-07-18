@@ -99,6 +99,8 @@ public sealed class InlineTuiShellTests
         Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
 
         // Transcript fills every row between the header and the composer, at least height - 5 rows.
+        Assert.Equal(0, shell.Transcript.Frame.X);
+        Assert.Equal(width, shell.Transcript.Frame.Width);
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
         Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
         Assert.True(
