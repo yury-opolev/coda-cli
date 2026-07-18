@@ -7,10 +7,12 @@ using Coda.Tui.Ui.State;
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>
-/// The full-screen shell: a one-row session header, a <see cref="VirtualizedTranscriptView"/> that fills
-/// the remaining space, a bordered composer, and a one-row status line. There is no permanent sidebar —
+/// The retained-transcript shell: a one-row session header, a <see cref="VirtualizedTranscriptView"/> that
+/// fills the remaining space, a bordered composer, and a one-row status line. There is no permanent sidebar —
 /// context, pickers, permissions, help, diffs, and the command palette all use the shared
-/// <see cref="PromptOverlay"/>/modal cards inherited from <see cref="TerminalGuiShellBase"/>.
+/// <see cref="PromptOverlay"/>/modal cards inherited from <see cref="TerminalGuiShellBase"/>. This is the base
+/// for both the full-screen shell and the inline shell (<see cref="InlineTuiShell"/>); the two are identical
+/// except for the Terminal.Gui <c>AppModel</c> the runner selects (alternate screen vs. primary buffer).
 /// </summary>
 /// <remarks>
 /// The transcript is capped at <see cref="MaximumTranscriptWidth"/> columns and centered when the
@@ -21,7 +23,7 @@ namespace Coda.Tui.Ui.Shells;
 /// auto-follow only when the viewport is already at the bottom; otherwise the header shows an
 /// <c>"{n} new — Ctrl+End"</c> indicator.
 /// </remarks>
-internal sealed class FullscreenTuiShell(
+internal class FullscreenTuiShell(
     IApplication app,
     ComposerController controller,
     IUiEventPublisher publisher,
@@ -46,7 +48,7 @@ internal sealed class FullscreenTuiShell(
     {
         this.BorderStyle = null;
         this.Width = Dim.Fill();
-        this.Height = Dim.Fill();
+        this.Height = this.ResolveShellHeight();
 
         this.header = new Label { CanFocus = false };
         this.header.X = 0;
@@ -91,6 +93,13 @@ internal sealed class FullscreenTuiShell(
         this.Add(this.Completion);
         this.Add(this.PromptOverlay);
     }
+
+    /// <summary>
+    /// The dimension used for the shell's own height. Full-screen fills the alternate screen with
+    /// <see cref="Dim.Fill()"/>; the inline shell overrides this because the primary-buffer app model sizes an
+    /// unconstrained top-level to its content, so it must fill the remaining screen rows explicitly instead.
+    /// </summary>
+    protected virtual Dim ResolveShellHeight() => Dim.Fill();
 
     /// <summary>
     /// Anchors the menu so its bottom row sits immediately above the composer (composer 3 + status 1 = 4

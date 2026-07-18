@@ -50,11 +50,32 @@ internal static class ShellTestFactory
 
 public sealed class InlineTuiShellTests
 {
+    private static ImmutableArray<TranscriptBlock> Lines(int count) =>
+        Enumerable.Range(0, count)
+            .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {index}"))
+            .ToImmutableArray();
+
+    /// <summary>
+    /// The inline shell reuses the retained-transcript shell layout, so it must expose the same header
+    /// and virtualized transcript surface as full-screen — the only mode difference lives in the
+    /// Terminal.Gui <c>AppModel</c> selected by the runner, not in the shell's view tree.
+    /// </summary>
+    [Fact]
+    public void Inline_shell_reuses_the_retained_transcript_shell()
+    {
+        using IApplication app = Application.Create();
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        Assert.IsAssignableFrom<FullscreenTuiShell>(shell);
+        Assert.NotNull(shell.Transcript);
+        Assert.NotNull(shell.Header);
+    }
+
     [Theory]
     [InlineData(60, 12)]
     [InlineData(80, 24)]
     [InlineData(140, 40)]
-    public void Inline_layout_keeps_composer_above_one_line_status(int width, int height)
+    public void Inline_layout_places_header_transcript_composer_status_by_row(int width, int height)
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.Inline;
@@ -67,10 +88,20 @@ public sealed class InlineTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        Assert.True(shell.Composer.Frame.Height >= 3);
+        // Header on the top row, status on the shell's final row, composer three rows directly above it.
+        Assert.Equal(shell.Frame.Y, shell.Header.Frame.Y);
+        Assert.Equal(1, shell.Header.Frame.Height);
         Assert.Equal(1, shell.Status.Frame.Height);
-        Assert.Equal(shell.Composer.Frame.Bottom, shell.Status.Frame.Y);
-        Assert.True(shell.Frame.Height <= height);
+        Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
+        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        // Transcript fills every row between the header and the composer, at least height - 5 rows.
+        Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
+        Assert.True(
+            shell.Transcript.Frame.Height >= height - 5,
+            $"transcript height {shell.Transcript.Frame.Height} should be at least {height - 5}");
 
         if (token is not null)
         {
@@ -79,66 +110,107 @@ public sealed class InlineTuiShellTests
     }
 
     [Fact]
-    public void Completed_blocks_are_committed_once()
+    public async Task Inline_transcript_shows_user_assistant_tool_history_and_autofollows_appends()
     {
-        var committer = new InlineTranscriptCommitter();
-        var block = new CommandOutputTranscriptBlock(Guid.NewGuid(), "hello");
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
 
-        Assert.True(committer.TryQueue(block));
-        Assert.False(committer.TryQueue(block));
-        Assert.Equal(new TranscriptBlock[] { block }, committer.Drain());
-        Assert.Empty(committer.Drain());
+        var user = new UserTranscriptBlock(Guid.NewGuid(), "run the tests");
+        var tool = new ToolTranscriptBlock(Guid.NewGuid(), "grep", "{}", 5, "done", IsError: false, Complete: true);
+        var assistant = new AssistantTranscriptBlock(Guid.NewGuid(), "all green", Complete: true);
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = [user, tool, assistant] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        var visible = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
+        Assert.Contains("run the tests", visible);
+        Assert.Contains("all green", visible);
+        Assert.True(shell.Transcript.AutoFollow);
+
+        // An appended completed reply stays visible and the viewport keeps auto-following.
+        var reply = new AssistantTranscriptBlock(Guid.NewGuid(), "second reply", Complete: true);
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = [user, tool, assistant, reply] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        var afterAppend = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
+        Assert.Contains("second reply", afterAppend);
+        Assert.True(shell.Transcript.AutoFollow);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 
     [Fact]
-    public void Active_assistant_and_tool_blocks_are_not_committed_until_complete()
+    public async Task Inline_streaming_updates_the_retained_transcript_incrementally()
     {
-        var committer = new InlineTranscriptCommitter();
-        var assistantId = Guid.NewGuid();
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
 
-        Assert.False(committer.TryQueue(new AssistantTranscriptBlock(assistantId, "partial", Complete: false)));
-        Assert.False(committer.TryQueue(new ToolTranscriptBlock(Guid.NewGuid(), "grep", "{}", null, null, false, Complete: false)));
-        Assert.Empty(committer.Drain());
+        var a = new CommandOutputTranscriptBlock(Guid.NewGuid(), "first");
+        var bId = Guid.NewGuid();
+        var b = new AssistantTranscriptBlock(bId, "second", Complete: false);
+        var bDone = new AssistantTranscriptBlock(bId, "second done", Complete: true);
 
-        // The same streaming block commits exactly once after it completes.
-        Assert.True(committer.TryQueue(new AssistantTranscriptBlock(assistantId, "final", Complete: true)));
-        Assert.False(committer.TryQueue(new AssistantTranscriptBlock(assistantId, "final", Complete: true)));
-        Assert.Single(committer.Drain());
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [a] }, CancellationToken.None);
+        Assert.Equal(1, shell.Transcript.ReplaceAllCount);
+
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [a, b] }, CancellationToken.None);
+        Assert.Equal(1, shell.Transcript.AppendCount);
+
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [a, bDone] }, CancellationToken.None);
+        Assert.Equal(1, shell.Transcript.ReplaceLastCount);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 
     [Fact]
-    public void Pending_permission_and_question_blocks_commit_only_after_resolution()
+    public async Task Inline_scrolled_away_header_shows_the_unseen_indicator()
     {
-        var committer = new InlineTranscriptCommitter();
-        var permissionId = Guid.NewGuid();
-        var questionId = Guid.NewGuid();
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
 
-        // Pending (Allowed/Answer null) blocks share the resolved block's id, so committing them
-        // early would drop the eventual decision/answer from native scrollback.
-        Assert.False(committer.TryQueue(new PermissionTranscriptBlock(permissionId, "write_file", "path", Allowed: null)));
-        Assert.False(committer.TryQueue(new UserQuestionTranscriptBlock(questionId, "Proceed?", Answer: null)));
-        Assert.Empty(committer.Drain());
+        var seed = Lines(50);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-10);
+        Assert.False(shell.Transcript.AutoFollow);
 
-        Assert.True(committer.TryQueue(new PermissionTranscriptBlock(permissionId, "write_file", "path", Allowed: true)));
-        Assert.True(committer.TryQueue(new UserQuestionTranscriptBlock(questionId, "Proceed?", Answer: "yes")));
-        Assert.False(committer.TryQueue(new PermissionTranscriptBlock(permissionId, "write_file", "path", Allowed: true)));
-        Assert.Equal(2, committer.Drain().Length);
-    }
+        var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new tail"));
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
 
-    [Fact]
-    public void Session_clear_permits_future_commits_without_duplicates()
-    {
-        var committer = new InlineTranscriptCommitter();
-        var block = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one");
+        Assert.True(shell.Transcript.UnseenRows > 0);
+        Assert.Contains("Ctrl+End", shell.Header.Text, StringComparison.Ordinal);
 
-        Assert.True(committer.TryQueue(block));
-        committer.Drain();
-        Assert.False(committer.TryQueue(block));
-
-        committer.Reset();
-
-        Assert.True(committer.TryQueue(block));
-        Assert.Equal(new TranscriptBlock[] { block }, committer.Drain());
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 
     [Fact]
@@ -286,77 +358,6 @@ public sealed class InlineTuiShellTests
         var completed = await Task.WhenAny(apply, Task.Delay(TimeSpan.FromSeconds(5)));
         Assert.Same(apply, completed);
         await Assert.ThrowsAsync<NotInitializedException>(() => apply);
-    }
-
-    [Fact]
-    public async Task Newly_completed_blocks_commit_once_and_identical_snapshots_do_not_duplicate()
-    {
-        using IApplication app = Application.Create();
-        app.AppModel = AppModel.Inline;
-        app.ForceInlinePosition = new Point(0, 0);
-        app.Init(DriverRegistry.Names.ANSI);
-        app.Driver!.SetScreenSize(80, 24);
-        using var shell = ShellTestFactory.CreateInline(app);
-        var token = app.Begin(shell);
-        app.LayoutAndDraw();
-
-        var committed = new List<Guid>();
-        shell.BlockCommitted += (_, block) => committed.Add(block.Id);
-
-        var block = new CommandOutputTranscriptBlock(Guid.NewGuid(), "build succeeded");
-        var snapshot = UiSessionSnapshot.Empty with { Transcript = [block] };
-
-        await shell.ApplyAsync(snapshot, CancellationToken.None);
-        await shell.ApplyAsync(snapshot, CancellationToken.None);
-
-        Assert.Equal([block.Id], committed);
-
-        if (token is not null)
-        {
-            app.End(token);
-        }
-    }
-
-    [Fact]
-    public async Task Active_streaming_stays_temporary_and_bounded_then_commits_once()
-    {
-        using IApplication app = Application.Create();
-        app.AppModel = AppModel.Inline;
-        app.ForceInlinePosition = new Point(0, 0);
-        app.Init(DriverRegistry.Names.ANSI);
-        app.Driver!.SetScreenSize(80, 24);
-        using var shell = ShellTestFactory.CreateInline(app);
-        var token = app.Begin(shell);
-        app.LayoutAndDraw();
-
-        var committed = new List<Guid>();
-        shell.BlockCommitted += (_, block) => committed.Add(block.Id);
-
-        var id = Guid.NewGuid();
-        var streaming = UiSessionSnapshot.Empty with
-        {
-            Transcript = [new AssistantTranscriptBlock(id, new string('x', 4000), Complete: false)],
-        };
-        await shell.ApplyAsync(streaming, CancellationToken.None);
-
-        Assert.Empty(committed);
-        Assert.False(string.IsNullOrEmpty(shell.ActiveRow.Text));
-        Assert.True(shell.ActiveRow.Text!.Length <= InlineTuiShell.MaxActiveRowLength);
-        Assert.DoesNotContain('\n', shell.ActiveRow.Text);
-
-        var completed = UiSessionSnapshot.Empty with
-        {
-            Transcript = [new AssistantTranscriptBlock(id, "all done", Complete: true)],
-        };
-        await shell.ApplyAsync(completed, CancellationToken.None);
-
-        Assert.Equal([id], committed);
-        Assert.True(string.IsNullOrEmpty(shell.ActiveRow.Text));
-
-        if (token is not null)
-        {
-            app.End(token);
-        }
     }
 }
 

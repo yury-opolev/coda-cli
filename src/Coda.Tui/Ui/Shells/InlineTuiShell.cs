@@ -1,248 +1,46 @@
-using System.Collections.Immutable;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
-using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>
-/// The composer-first inline shell. It does not own a retained transcript viewport: completed
-/// transcript blocks are committed once into the terminal's native scrollback (above the shell),
-/// while the bordered composer and a single-line status label occupy the inline region. Active
-/// (streaming) assistant/tool output is shown in a bounded temporary row directly above the composer
-/// until it completes, at which point it is committed like any other block.
+/// The inline shell. It reuses the retained, scrollable transcript layout of
+/// <see cref="FullscreenTuiShell"/> verbatim — the same header, virtualized transcript panel, bottom
+/// composer, status row, prompt overlay, and command-completion overlay — so history stays visible and
+/// scrollable exactly as in full-screen. The only intended difference between the two modes is the
+/// Terminal.Gui <c>AppModel</c> the <see cref="Host.TerminalGuiModeRunner"/> selects: inline runs in the
+/// primary buffer / terminal-history model, full-screen on the alternate screen.
 /// </summary>
 /// <remarks>
-/// The window grows only as far as its content needs (<see cref="Dim.Auto(DimAutoStyle, Dim, Dim)"/>
-/// with a four-row minimum), giving the composer at least one content row inside its border and the
-/// status exactly one row. Because native scrollback cannot be asserted deterministically without a
-/// running <c>Application.Run</c> loop, commits also flow through the <see cref="BlockCommitted"/>
-/// seam so a host (or test) can observe that each block is appended exactly once. The shell never
-/// writes to <see cref="System.Console"/> directly.
+/// The one layout concession the inline model forces is height: the primary-buffer app model gives an
+/// unconstrained top-level only as much height as its content needs, so <see cref="Dim.Fill()"/> would
+/// collapse the shell to a single row. <see cref="ResolveShellHeight"/> therefore fills the screen rows
+/// from the shell's inline anchor down to the bottom, giving the retained transcript its full region.
 /// </remarks>
-internal sealed class InlineTuiShell : TerminalGuiShellBase
+internal sealed class InlineTuiShell(
+    IApplication app,
+    ComposerController controller,
+    IUiEventPublisher publisher,
+    UiSessionSnapshot initialSnapshot,
+    Func<UiSessionSnapshot, int, string>? statusProjection = null)
+    : FullscreenTuiShell(app, controller, publisher, initialSnapshot, statusProjection)
 {
-    /// <summary>Maximum characters retained in the bounded active-streaming row.</summary>
-    internal const int MaxActiveRowLength = 500;
+    /// <summary>The fewest rows the inline region can occupy: header (1), composer (3), and status (1).</summary>
+    private const int MinimumInlineHeight = 5;
 
-    private readonly InlineTranscriptCommitter committer = new();
-
-    public InlineTuiShell(
-        IApplication app,
-        ComposerController controller,
-        IUiEventPublisher publisher,
-        UiSessionSnapshot initialSnapshot,
-        Func<UiSessionSnapshot, int, string>? statusProjection = null)
-        : base(app, controller, publisher, initialSnapshot, statusProjection)
-    {
-    }
-
-    /// <summary>Raised once for each transcript block committed to native scrollback.</summary>
-    internal event EventHandler<TranscriptBlock>? BlockCommitted;
-
-    /// <summary>The bounded temporary row that shows active streaming output above the composer.</summary>
-    internal Label ActiveRow { get; } = new() { CanFocus = false };
-
-    protected override void BuildLayout()
-    {
-        this.BorderStyle = null;
-        this.Width = Dim.Fill();
-        this.Height = Dim.Auto(DimAutoStyle.Content, minimumContentDim: 4);
-
-        this.ActiveRow.X = 0;
-        this.ActiveRow.Y = 0;
-        this.ActiveRow.Width = Dim.Fill();
-        this.ActiveRow.Height = 0;
-        this.ActiveRow.Visible = false;
-
-        // The completion menu sits between the active row and the composer, so the inline region grows by
-        // exactly its height only while it is visible and collapses back to the compact layout when hidden.
-        this.Completion.X = 0;
-        this.Completion.Y = Pos.Bottom(this.ActiveRow);
-        this.Completion.Width = Dim.Fill();
-        this.Completion.Height = 0;
-
-        this.Composer.X = 0;
-        this.Composer.Y = Pos.Bottom(this.Completion);
-        this.Composer.Width = Dim.Fill();
-        this.Composer.Height = 3;
-        this.Composer.BorderStyle = LineStyle.Single;
-
-        this.Status.X = 0;
-        this.Status.Y = Pos.Bottom(this.Composer);
-        this.Status.Width = Dim.Fill();
-        this.Status.Height = 1;
-
-        this.PromptOverlay.X = 0;
-        this.PromptOverlay.Y = 0;
-        this.PromptOverlay.Width = Dim.Fill();
-        this.PromptOverlay.Height = Dim.Fill();
-
-        this.Add(this.ActiveRow);
-        this.Add(this.Completion);
-        this.Add(this.Composer);
-        this.Add(this.Status);
-        this.Add(this.PromptOverlay);
-    }
+    protected override Dim ResolveShellHeight() => Dim.Func(InlineRegionHeight, this);
 
     /// <summary>
-    /// Grows the inline region between the active row and the composer by the menu's height only while it is
-    /// visible; a hidden menu keeps height 0 so the layout returns to its prior compact size.
+    /// The inline region fills from the shell's top anchor down to the bottom of the screen, so the
+    /// retained transcript occupies every row not taken by the composer and status. Falls back to the
+    /// full screen height (then a small minimum) when the anchor or screen size is not yet known.
     /// </summary>
-    protected override void PlaceCompletion(int height, bool visible) => this.Completion.Height = height;
-
-    protected override void ApplyTranscriptChanges(UiSessionSnapshot previous, UiSessionSnapshot next)
+    private static int InlineRegionHeight(View? shell)
     {
-        if (IsTranscriptReset(previous, next))
-        {
-            this.committer.Reset();
-        }
-
-        if (!next.Transcript.IsDefaultOrEmpty)
-        {
-            foreach (var block in next.Transcript)
-            {
-                this.committer.TryQueue(block);
-            }
-        }
-
-        foreach (var block in this.committer.Drain())
-        {
-            this.CommitBlock(block);
-        }
-
-        this.UpdateActiveRow(next);
+        var screen = shell?.App?.Screen.Height ?? 0;
+        var top = shell?.Frame.Y ?? 0;
+        var available = screen - top;
+        return available > MinimumInlineHeight ? available : MinimumInlineHeight;
     }
-
-    private static bool IsTranscriptReset(UiSessionSnapshot previous, UiSessionSnapshot next)
-    {
-        if (previous.Transcript.IsDefaultOrEmpty)
-        {
-            return false;
-        }
-
-        if (next.Transcript.IsDefaultOrEmpty)
-        {
-            return true;
-        }
-
-        // A cleared/replaced transcript starts with a different first block; an appended one keeps it.
-        return next.Transcript[0].Id != previous.Transcript[0].Id;
-    }
-
-    private void CommitBlock(TranscriptBlock block)
-    {
-        this.BlockCommitted?.Invoke(this, block);
-        this.RenderCommittedBlock(TranscriptBlockFormatter.FormatPlainText(block, this.CommitWidth()));
-    }
-
-    /// <summary>The wrap width used when committing a block to native scrollback.</summary>
-    private int CommitWidth()
-    {
-        var width = this.Frame.Width;
-        return width > 0 ? width : 80;
-    }
-
-    /// <summary>
-    /// Best-effort append into the inline region: a wrapped label is inserted above the composer,
-    /// drawn (which scrolls prior content into native scrollback), then removed. Any failure is
-    /// swallowed because the authoritative append-once guarantee lives in the commit queue and the
-    /// <see cref="BlockCommitted"/> seam, not in this presentation nicety.
-    /// </summary>
-    private void RenderCommittedBlock(string text)
-    {
-        if (!this.HostApp.Initialized)
-        {
-            return;
-        }
-
-        try
-        {
-            var label = new Label
-            {
-                X = 0,
-                Y = 0,
-                Width = Dim.Fill(),
-                Height = Dim.Auto(DimAutoStyle.Content, minimumContentDim: 1),
-                Text = text,
-                CanFocus = false,
-            };
-
-            this.Add(label);
-            this.HostApp.LayoutAndDraw();
-            this.Remove(label);
-            label.Dispose();
-            this.HostApp.LayoutAndDraw();
-        }
-        catch
-        {
-            // Presentation-only; the commit itself already succeeded.
-        }
-    }
-
-    private void UpdateActiveRow(UiSessionSnapshot snapshot)
-    {
-        var active = FindActiveBlock(snapshot.Transcript);
-        if (active is null)
-        {
-            if (this.ActiveRow.Visible || !string.IsNullOrEmpty(this.ActiveRow.Text))
-            {
-                this.ActiveRow.Text = string.Empty;
-                this.ActiveRow.Visible = false;
-                this.ActiveRow.Height = 0;
-                this.SetNeedsLayout();
-            }
-
-            return;
-        }
-
-        var text = Bound(ActiveRowText(active));
-        if (!string.Equals(text, this.ActiveRow.Text, StringComparison.Ordinal) || !this.ActiveRow.Visible)
-        {
-            this.ActiveRow.Text = text;
-            this.ActiveRow.Visible = true;
-            this.ActiveRow.Height = 1;
-            this.SetNeedsLayout();
-        }
-    }
-
-    private static TranscriptBlock? FindActiveBlock(ImmutableArray<TranscriptBlock> transcript)
-    {
-        if (transcript.IsDefaultOrEmpty)
-        {
-            return null;
-        }
-
-        for (var i = transcript.Length - 1; i >= 0; i--)
-        {
-            switch (transcript[i])
-            {
-                case AssistantTranscriptBlock { Complete: false } assistant:
-                    return assistant;
-                case ToolTranscriptBlock { Complete: false } tool:
-                    return tool;
-            }
-        }
-
-        return null;
-    }
-
-    private static string Bound(string text)
-    {
-        var singleLine = text.Replace("\r", " ").Replace("\n", " ");
-        return singleLine.Length <= MaxActiveRowLength ? singleLine : singleLine[..MaxActiveRowLength];
-    }
-
-    /// <summary>
-    /// The compact, single-row projection of the active (streaming) block shown above the composer.
-    /// Streaming assistant text is shown raw (its markdown is still incomplete); a running tool is shown
-    /// as a short status line. Anything else falls back to the shared formatter's plain-text projection.
-    /// </summary>
-    private static string ActiveRowText(TranscriptBlock block) => block switch
-    {
-        AssistantTranscriptBlock assistant => assistant.Text,
-        ToolTranscriptBlock tool => $"[tool] {tool.ToolName} {(tool.ElapsedMs is { } ms ? ms + "ms" : "running")}",
-        _ => TranscriptBlockFormatter.FormatPlainText(block, MaxActiveRowLength),
-    };
 }

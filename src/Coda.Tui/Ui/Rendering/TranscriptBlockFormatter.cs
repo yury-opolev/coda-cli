@@ -99,7 +99,7 @@ public static class TranscriptBlockFormatter
         return lines;
     }
 
-    /// <summary>Joins the formatted lines with newlines, for the inline shell's native-scrollback commit.</summary>
+    /// <summary>Joins the formatted lines with newlines, for a plain-text projection of a block.</summary>
     public static string FormatPlainText(TranscriptBlock block, int width) =>
         string.Join('\n', Format(block, width).Select(line => line.Text));
 

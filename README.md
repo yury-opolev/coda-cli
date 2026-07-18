@@ -110,7 +110,7 @@ dotnet run --project src/Coda.Tui -c Release
 
 # Choose the interactive engine explicitly:
 dotnet run --project src/Coda.Tui -- --tui=fullscreen   # retained, virtualized full-screen transcript
-dotnet run --project src/Coda.Tui -- --tui=inline       # legacy: composer + native scrollback
+dotnet run --project src/Coda.Tui -- --tui=inline       # optional: same retained transcript, primary buffer (terminal history)
 dotnet run --project src/Coda.Tui -- --tui=auto         # default: full-screen on a supported terminal, else plain
 dotnet run --project src/Coda.Tui -- --plain            # plain output (screen readers, CI, redirection)
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal

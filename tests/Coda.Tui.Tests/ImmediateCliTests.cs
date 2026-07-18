@@ -51,12 +51,12 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
-    public void Help_says_auto_defaults_to_fullscreen_and_inline_is_legacy()
+    public void Help_says_auto_defaults_to_fullscreen_and_inline_is_optional()
     {
         var (_, output) = Run("--help");
 
         Assert.Contains("full-screen", output);
-        Assert.Contains("legacy", output);
+        Assert.Contains("optional", output);
     }
 
     [Fact]

@@ -97,7 +97,7 @@ public sealed class CommandCompletionShellTests
     }
 
     [Fact]
-    public void Inline_completion_region_grows_only_while_visible_and_returns_to_compact_height()
+    public void Inline_shows_completion_menu_above_composer_without_moving_composer_or_status()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.Inline;
@@ -109,22 +109,29 @@ public sealed class CommandCompletionShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        var compactHeight = shell.Frame.Height;
         Assert.False(shell.Completion.Visible);
+        var composerY = shell.Composer.Frame.Y;
+        var statusY = shell.Status.Frame.Y;
 
-        shell.Composer.SetDraft("/m", 2);
+        shell.Composer.SetDraft("/he", 3);
         app.LayoutAndDraw();
 
         Assert.True(shell.Completion.Visible);
-        Assert.True(
-            shell.Frame.Height > compactHeight,
-            $"inline height {shell.Frame.Height} should grow beyond compact {compactHeight} while the menu is visible");
+        var rows = shell.Completion.RenderVisibleRows(80);
+        Assert.Contains(rows, row => row.Contains("help") && row.Contains("Show help"));
+
+        // The menu bottom aligns with the composer top (overlaying the retained transcript), and neither
+        // the composer nor the status moved to make room for it. Escape hides the menu again.
+        Assert.Equal(shell.Composer.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(statusY, shell.Status.Frame.Y);
 
         shell.Composer.NewKeyDownEvent(Key.Esc);
         app.LayoutAndDraw();
 
         Assert.False(shell.Completion.Visible);
-        Assert.Equal(compactHeight, shell.Frame.Height);
+        Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(statusY, shell.Status.Frame.Y);
 
         if (token is not null)
         {
