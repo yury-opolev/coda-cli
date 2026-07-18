@@ -81,7 +81,7 @@ internal class FullscreenTuiShell(
         this.Composer.Width = Dim.Fill();
         this.Composer.Height = 3;
         this.Composer.BorderStyle = null;
-        this.Composer.SetScheme(ComposerChromeView.CreateInputScheme());
+        this.Composer.SetScheme(this.Chrome.CreateInputScheme(this.HostApp.Driver));
 
         this.Status.X = 0;
         this.Status.Y = Pos.AnchorEnd(1);

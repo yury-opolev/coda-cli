@@ -1,11 +1,13 @@
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 
 namespace Coda.Tui.Tests;
 
 /// <summary>
-/// Host-neutral tests for <see cref="ComposerChromeView"/>: the borderless decor that draws the
-/// composer's subtle dark background, its left accent bar, and either a <c>&gt;</c> prompt glyph (ready)
-/// or an <c>Initializing…</c> label (while startup is active). Rendering is exposed through
+/// Host-neutral tests for <see cref="ComposerChromeView"/>: the borderless decor beneath the composer.
+/// When ready it fills the region with the theme's dark background and draws only a warm <c>&gt;</c>
+/// prompt in column 0; during startup it stays dark and draws no chrome text (the operational status row
+/// owns the <c>Initializing</c> message). Rendering is exposed through
 /// <see cref="ComposerChromeView.RenderRows"/> so these assertions need no running application.
 /// </summary>
 public sealed class ComposerChromeViewTests
@@ -27,32 +29,26 @@ public sealed class ComposerChromeViewTests
     }
 
     [Fact]
-    public void Ready_state_renders_accent_bar_and_prompt_glyph()
+    public void Ready_state_is_dark_borderless_and_draws_only_the_warm_prompt()
     {
-        using var chrome = new ComposerChromeView();
+        using var chrome = new ComposerChromeView(TuiTheme.WarmEmber);
 
-        var rows = chrome.RenderRows(width: 40, height: 3);
+        var rows = chrome.RenderRows(width: 12, height: 3);
 
-        Assert.Equal(3, rows.Count);
-        Assert.All(rows, row => Assert.StartsWith(ComposerChromeView.AccentGlyph, row));
-        Assert.Contains(ComposerChromeView.PromptGlyph, rows[0]);
-        Assert.DoesNotContain("Initializing", rows[0]);
+        Assert.Equal([">           ", "            ", "            "], rows);
+        Assert.DoesNotContain(rows, row => row.Contains('▌'));
+        Assert.DoesNotContain(rows, row => row.Contains("Initializing", StringComparison.Ordinal));
     }
 
     [Fact]
-    public void Startup_state_renders_initializing_label_instead_of_prompt()
+    public void Startup_state_keeps_the_dark_region_but_draws_no_chrome_text()
     {
-        using var chrome = new ComposerChromeView();
+        using var chrome = new ComposerChromeView(TuiTheme.WarmEmber);
 
         chrome.SetReady(false);
 
-        Assert.False(chrome.Ready);
-        Assert.Equal(ComposerChromeView.InitializingText, chrome.DisplayText);
-
-        var rows = chrome.RenderRows(width: 40, height: 3);
-        Assert.All(rows, row => Assert.StartsWith(ComposerChromeView.AccentGlyph, row));
-        Assert.Contains(ComposerChromeView.InitializingText, rows[0]);
-        Assert.DoesNotContain(ComposerChromeView.PromptGlyph, rows[0]);
+        Assert.Equal(string.Empty, chrome.DisplayText);
+        Assert.Equal(["            ", "            ", "            "], chrome.RenderRows(12, 3));
     }
 
     [Fact]
@@ -70,12 +66,10 @@ public sealed class ComposerChromeViewTests
     public void Narrow_width_truncates_without_overflow()
     {
         using var chrome = new ComposerChromeView();
-        chrome.SetReady(false);
 
         var rows = chrome.RenderRows(width: 6, height: 2);
 
         Assert.All(rows, row => Assert.True(row.Length <= 6, $"row '{row}' exceeds width 6"));
-        Assert.All(rows, row => Assert.StartsWith(ComposerChromeView.AccentGlyph, row));
     }
 
     private static void AssertNoBorders(IReadOnlyList<string> rows) =>

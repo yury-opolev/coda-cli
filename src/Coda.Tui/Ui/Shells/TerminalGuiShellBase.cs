@@ -55,6 +55,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Chrome = new ComposerChromeView();
         this.Status = new Label { CanFocus = false };
         this.PromptOverlay = new PromptOverlay(publisher);
+        this.PromptOverlay.ApplyTheme(app.Driver);
         this.Completion = new CommandCompletionView();
 
         this.Composer.Submitted += this.OnComposerSubmitted;

@@ -1,7 +1,6 @@
 using System.Collections.Generic;
-using System.Globalization;
-using System.Text;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Rendering;
 using TgAttribute = Terminal.Gui.Drawing.Attribute;
 
 namespace Coda.Tui.Ui.Shells;
@@ -21,12 +20,15 @@ internal sealed class CommandCompletionView : View
     /// <summary>Maximum number of option rows shown at once; the list scrolls beyond this.</summary>
     internal const int MaxVisibleOptions = 8;
 
+    private readonly TuiTheme theme;
+
     private IReadOnlyList<ISlashCommand> suggestions = [];
     private int selectedIndex = -1;
     private int scrollOffset;
 
-    public CommandCompletionView()
+    public CommandCompletionView(TuiTheme? theme = null)
     {
+        this.theme = theme ?? TuiTheme.WarmEmber;
         this.CanFocus = false;
         this.Visible = false;
     }
@@ -87,6 +89,23 @@ internal sealed class CommandCompletionView : View
         return rows;
     }
 
+    /// <summary>
+    /// The foreground/background attribute for a completion row. Selected rows invert to the theme's warm
+    /// highlight; normal rows use the theme's completion foreground over its dark background. Resolved for
+    /// the driver's color depth unless <paramref name="trueColor"/> is forced.
+    /// </summary>
+    internal TgAttribute AttributeFor(bool selected, bool? trueColor = null)
+    {
+        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.App?.Driver);
+        return selected
+            ? new TgAttribute(
+                TuiTheme.Resolve(this.theme.CompletionSelectedText, useTrueColor),
+                TuiTheme.Resolve(this.theme.CompletionSelectedBackground, useTrueColor))
+            : new TgAttribute(
+                TuiTheme.Resolve(this.theme.CompletionNormal, useTrueColor),
+                TuiTheme.Resolve(this.theme.Background, useTrueColor));
+    }
+
     /// <inheritdoc />
     protected override bool OnDrawingContent(DrawContext? context)
     {
@@ -100,8 +119,6 @@ internal sealed class CommandCompletionView : View
             return true;
         }
 
-        var normal = this.GetAttributeForRole(Terminal.Gui.Drawing.VisualRole.Normal);
-        var selected = new TgAttribute(normal.Background, normal.Foreground);
         var width = Math.Max(1, this.Viewport.Width);
         var height = Math.Max(0, this.Viewport.Height);
 
@@ -113,7 +130,7 @@ internal sealed class CommandCompletionView : View
                 break;
             }
 
-            this.SetAttribute(index == this.selectedIndex ? selected : normal);
+            this.SetAttribute(this.AttributeFor(index == this.selectedIndex));
             this.Move(0, row);
             this.AddStr(Fit(this.RowText(index), width));
         }
@@ -151,9 +168,8 @@ internal sealed class CommandCompletionView : View
 
     /// <summary>
     /// Truncates <paramref name="text"/> to at most <paramref name="width"/> display cells without
-    /// splitting a grapheme cluster, collapsing embedded control whitespace to spaces first. Grapheme
-    /// count approximates cell width, which is exact for the ASCII command names/summaries in practice and
-    /// otherwise clipped by the driver, so a row can never overflow the view.
+    /// splitting a grapheme cluster, collapsing embedded control whitespace to spaces first, so a row can
+    /// never overflow the view. Cell-safe slicing is delegated to <see cref="TerminalCellText"/>.
     /// </summary>
     private static string Fit(string text, int width)
     {
@@ -163,20 +179,6 @@ internal sealed class CommandCompletionView : View
         }
 
         var flattened = text.Replace('\n', ' ').Replace('\r', ' ').Replace('\t', ' ');
-        var elements = StringInfo.GetTextElementEnumerator(flattened);
-        var builder = new StringBuilder();
-        var used = 0;
-        while (elements.MoveNext())
-        {
-            if (used >= width)
-            {
-                break;
-            }
-
-            builder.Append((string)elements.Current);
-            used++;
-        }
-
-        return builder.ToString();
+        return TerminalCellText.SliceByCells(flattened, 0, width);
     }
 }

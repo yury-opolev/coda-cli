@@ -1,80 +1,50 @@
 using System.Text;
-using TgAttribute = Terminal.Gui.Drawing.Attribute;
-using TgColor = Terminal.Gui.Drawing.Color;
+using Coda.Tui.Ui.Rendering;
+using Terminal.Gui.Drivers;
 using TgScheme = Terminal.Gui.Drawing.Scheme;
 
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>
-/// The borderless decor drawn beneath and to the left of the composer. It fills the composer region with a
-/// subtle dark background, paints a colored vertical accent bar down its left edge, and shows either a
-/// <c>&gt;</c> prompt glyph (ready) or an accent-colored <c>Initializing…</c> label (while the semantic
-/// startup operation is active). It never takes focus and never draws box-drawing border characters, so the
-/// composer reads as a flat, accented input rather than a bordered box.
+/// The borderless decor drawn beneath the composer. It fills the composer region with the Warm Ember
+/// theme's near-black background and, when the composer is ready for input, draws a single warm
+/// <c>&gt;</c> prompt glyph in column 0. It never takes focus, never draws box-drawing border
+/// characters, and never owns any status text: during startup it simply stays dark and blank while the
+/// operational status row owns the <c>Initializing</c> message.
 /// </summary>
 /// <remarks>
-/// Colors are expressed through fully-qualified <see cref="Terminal.Gui.Drawing"/> types (aliased here as
-/// <c>TgColor</c>/<c>TgAttribute</c>) so the global <c>Color = Spectre.Console.Color</c> alias never leaks
-/// in. The accent is a named 16-color so it degrades cleanly on low-color terminals; the dark panel is a
-/// near-black RGB that quantizes to the terminal's own background there. Rendering is also exposed as plain
-/// rows through <see cref="RenderRows"/> so the shell (and tests) can inspect it without a live draw.
+/// Colors come entirely from <see cref="TuiTheme"/> so this view carries no independent palette. Rendering
+/// is also exposed as plain rows through <see cref="RenderRows"/> so the shell (and tests) can inspect it
+/// without a live draw.
 /// </remarks>
 internal sealed class ComposerChromeView : View
 {
-    /// <summary>The vertical accent bar glyph drawn in the first column of every row.</summary>
-    internal const string AccentGlyph = "▌";
-
     /// <summary>The ready-state prompt glyph marking where input begins.</summary>
     internal const string PromptGlyph = ">";
 
-    /// <summary>The label shown in place of the prompt glyph while startup is active.</summary>
-    internal const string InitializingText = "Initializing…";
+    /// <summary>The column at which the prompt glyph is drawn when ready.</summary>
+    private const int PromptColumn = 0;
 
-    /// <summary>The column at which the prompt glyph / initializing label starts (after the accent + gap).</summary>
-    private const int LabelColumn = 2;
-
-    private static readonly TgColor PanelBackground = new(30, 30, 34);
-    private static readonly TgColor PanelForeground = new(210, 210, 210);
-    private static readonly TgColor PromptForeground = new(235, 235, 235);
-    private static readonly TgColor AccentColor = new(Terminal.Gui.Drawing.ColorName16.BrightCyan);
-    private static readonly Rune AccentRune = new(AccentGlyph[0]);
-
+    private readonly TuiTheme theme;
     private bool ready = true;
 
-    public ComposerChromeView()
+    public ComposerChromeView(TuiTheme? theme = null)
     {
+        this.theme = theme ?? TuiTheme.WarmEmber;
         this.CanFocus = false;
     }
 
     /// <summary>Whether the composer is ready for input; false while the startup operation is active.</summary>
     internal bool Ready => this.ready;
 
-    /// <summary>The text drawn at the input start: the prompt glyph when ready, otherwise the startup label.</summary>
-    internal string DisplayText => this.ready ? PromptGlyph : InitializingText;
+    /// <summary>The text drawn at the input start: the prompt glyph when ready, otherwise nothing.</summary>
+    internal string DisplayText => this.ready ? PromptGlyph : string.Empty;
 
     /// <summary>
-    /// A shared dark input scheme so the composer's own editing surface matches the chrome's panel
-    /// background across the whole composer region, keeping every role (normal, focus, read-only, ...)
-    /// on the same subtle-dark background.
+    /// A shared dark input scheme so the composer's own editing surface matches the chrome's background
+    /// across the whole composer region, keyed to the driver's color depth.
     /// </summary>
-    internal static TgScheme CreateInputScheme()
-    {
-        var normal = new TgAttribute(PanelForeground, PanelBackground);
-        var focus = new TgAttribute(PromptForeground, PanelBackground);
-        return new TgScheme
-        {
-            Normal = normal,
-            HotNormal = normal,
-            Focus = focus,
-            HotFocus = focus,
-            Active = focus,
-            HotActive = focus,
-            Highlight = focus,
-            Editable = normal,
-            ReadOnly = normal,
-            Disabled = normal,
-        };
-    }
+    internal TgScheme CreateInputScheme(IDriver? driver) => this.theme.ComposerScheme(driver);
 
     /// <summary>Sets the readiness state and requests a redraw when it changes.</summary>
     internal void SetReady(bool value)
@@ -89,9 +59,9 @@ internal sealed class ComposerChromeView : View
     }
 
     /// <summary>
-    /// The plain-text rows the chrome paints for a region of the given size: each row begins with the
-    /// accent glyph, the first row carries the prompt glyph / initializing label, and every row is exactly
-    /// <paramref name="width"/> cells so a narrow terminal can never overflow. Exposed for the shell/tests.
+    /// The plain-text rows the chrome paints for a region of the given size: every row is exactly
+    /// <paramref name="width"/> spaces, and the first row carries the <c>&gt;</c> prompt glyph in column 0
+    /// only when ready. No accent bar and no startup label are ever drawn. Exposed for the shell/tests.
     /// </summary>
     internal IReadOnlyList<string> RenderRows(int width, int height)
     {
@@ -105,15 +75,10 @@ internal sealed class ComposerChromeView : View
         {
             var buffer = new char[width];
             Array.Fill(buffer, ' ');
-            buffer[0] = AccentGlyph[0];
 
-            if (row == 0)
+            if (row == 0 && this.ready && PromptColumn < width)
             {
-                var label = this.DisplayText;
-                for (var i = 0; i < label.Length && LabelColumn + i < width; i++)
-                {
-                    buffer[LabelColumn + i] = label[i];
-                }
+                buffer[PromptColumn] = PromptGlyph[0];
             }
 
             rows.Add(new string(buffer));
@@ -137,9 +102,8 @@ internal sealed class ComposerChromeView : View
             return true;
         }
 
-        var background = new TgAttribute(PanelForeground, PanelBackground);
-        var accent = new TgAttribute(AccentColor, PanelBackground);
-        var label = new TgAttribute(this.ready ? PromptForeground : AccentColor, PanelBackground);
+        var driver = this.App?.Driver;
+        var background = this.theme.Attribute(this.theme.ComposerText, this.theme.Background, driver);
 
         var blank = new string(' ', width);
         for (var row = 0; row < height; row++)
@@ -147,29 +111,16 @@ internal sealed class ComposerChromeView : View
             this.SetAttribute(background);
             this.Move(0, row);
             this.AddStr(blank);
-
-            this.SetAttribute(accent);
-            this.Move(0, row);
-            this.AddRune(AccentRune);
         }
 
-        if (LabelColumn < width)
+        if (this.ready && PromptColumn < width)
         {
-            this.SetAttribute(label);
-            this.Move(LabelColumn, 0);
-            this.AddStr(Fit(this.DisplayText, width - LabelColumn));
+            var prompt = this.theme.Attribute(this.theme.ComposerPrompt, this.theme.Background, driver);
+            this.SetAttribute(prompt);
+            this.Move(PromptColumn, 0);
+            this.AddRune(new Rune(PromptGlyph[0]));
         }
 
         return true;
-    }
-
-    private static string Fit(string text, int width)
-    {
-        if (width <= 0)
-        {
-            return string.Empty;
-        }
-
-        return text.Length <= width ? text : text[..width];
     }
 }

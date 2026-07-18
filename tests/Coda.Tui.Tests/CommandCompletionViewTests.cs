@@ -1,4 +1,5 @@
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 
 namespace Coda.Tui.Tests;
@@ -86,6 +87,19 @@ public sealed class CommandCompletionViewTests
         Assert.False(view.HasSuggestions);
         Assert.Equal(-1, view.SelectedIndex);
         Assert.Empty(view.RenderVisibleRows(80));
+    }
+
+    [Fact]
+    public void Completion_attributes_use_warm_ember_normal_and_selected_roles()
+    {
+        using var view = new CommandCompletionView(TuiTheme.WarmEmber);
+
+        var normal = view.AttributeFor(selected: false, trueColor: true);
+        var selected = view.AttributeFor(selected: true, trueColor: true);
+
+        Assert.Equal(TuiTheme.WarmEmber.CompletionNormal.TrueColor, normal.Foreground);
+        Assert.Equal(TuiTheme.WarmEmber.CompletionSelectedBackground.TrueColor, selected.Background);
+        Assert.NotEqual(normal, selected);
     }
 
     private sealed class TestCommand(string name, string summary) : ISlashCommand

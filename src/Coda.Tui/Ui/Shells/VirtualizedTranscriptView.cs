@@ -3,7 +3,6 @@ using System.Collections.Immutable;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using TgAttribute = Terminal.Gui.Drawing.Attribute;
-using TgColor = Terminal.Gui.Drawing.Color;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -27,6 +26,7 @@ internal sealed class VirtualizedTranscriptView : View
     private const int DefaultWidth = 80;
 
     private readonly IApplication app;
+    private readonly TuiTheme theme;
     private readonly TranscriptLayoutIndex index;
     private readonly TranscriptViewportState viewport = new();
     private readonly HashSet<Guid> expanded = new();
@@ -36,9 +36,11 @@ internal sealed class VirtualizedTranscriptView : View
 
     public VirtualizedTranscriptView(
         IApplication app,
-        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null)
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null,
+        TuiTheme? theme = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
+        this.theme = theme ?? TuiTheme.WarmEmber;
         this.index = new TranscriptLayoutIndex(formatter ?? TranscriptBlockFormatter.Format);
         this.CanFocus = true;
     }
@@ -340,24 +342,25 @@ internal sealed class VirtualizedTranscriptView : View
         this.viewport.SetViewportHeight(Math.Max(0, this.Viewport.Height));
     }
 
-    private TgAttribute AttributeFor(TranscriptRole role)
+    internal TgAttribute AttributeFor(TranscriptRole role, bool? trueColor = null)
     {
-        var background = this.GetAttributeForRole(Terminal.Gui.Drawing.VisualRole.Normal).Background;
-        return new TgAttribute(ColorFor(role), background);
+        var foreground = role switch
+        {
+            TranscriptRole.User => this.theme.TranscriptUser,
+            TranscriptRole.Heading => this.theme.Heading,
+            TranscriptRole.Code => this.theme.Code,
+            TranscriptRole.Tool => this.theme.TranscriptTool,
+            TranscriptRole.Diff => this.theme.Diff,
+            TranscriptRole.Permission => this.theme.PermissionApproval,
+            TranscriptRole.Question => this.theme.Question,
+            TranscriptRole.Warning => this.theme.Warning,
+            TranscriptRole.Notification => this.theme.Notification,
+            TranscriptRole.Error => this.theme.Error,
+            _ => this.theme.TranscriptAssistant,
+        };
+        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
+        return new TgAttribute(
+            TuiTheme.Resolve(foreground, useTrueColor),
+            TuiTheme.Resolve(this.theme.Background, useTrueColor));
     }
-
-    private static TgColor ColorFor(TranscriptRole role) => role switch
-    {
-        TranscriptRole.Heading => new TgColor(Terminal.Gui.Drawing.ColorName16.BrightCyan),
-        TranscriptRole.User => new TgColor(Terminal.Gui.Drawing.ColorName16.White),
-        TranscriptRole.Code => new TgColor(Terminal.Gui.Drawing.ColorName16.Gray),
-        TranscriptRole.Tool => new TgColor(Terminal.Gui.Drawing.ColorName16.Blue),
-        TranscriptRole.Diff => new TgColor(Terminal.Gui.Drawing.ColorName16.Yellow),
-        TranscriptRole.Permission => new TgColor(Terminal.Gui.Drawing.ColorName16.Magenta),
-        TranscriptRole.Question => new TgColor(Terminal.Gui.Drawing.ColorName16.BrightYellow),
-        TranscriptRole.Warning => new TgColor(Terminal.Gui.Drawing.ColorName16.Yellow),
-        TranscriptRole.Notification => new TgColor(Terminal.Gui.Drawing.ColorName16.Cyan),
-        TranscriptRole.Error => new TgColor(Terminal.Gui.Drawing.ColorName16.BrightRed),
-        _ => new TgColor(Terminal.Gui.Drawing.ColorName16.Gray),
-    };
 }

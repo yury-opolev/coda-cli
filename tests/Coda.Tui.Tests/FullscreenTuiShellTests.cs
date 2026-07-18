@@ -151,7 +151,7 @@ public sealed class FullscreenTuiShellTests
         Assert.False(shell.Composer.Visible);
         Assert.False(shell.Composer.HasFocus);
         Assert.False(shell.Chrome.Ready);
-        Assert.Equal(ComposerChromeView.InitializingText, shell.Chrome.DisplayText);
+        Assert.Equal(string.Empty, shell.Chrome.DisplayText);
         Assert.False(shell.Completion.Visible);
         Assert.Contains("Starting…", shell.Status.Text);
 
