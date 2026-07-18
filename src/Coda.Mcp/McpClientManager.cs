@@ -15,7 +15,12 @@ namespace Coda.Mcp;
 /// </summary>
 public sealed class McpClientManager : IAsyncDisposable
 {
-    private static readonly TimeSpan ConnectTimeout = TimeSpan.FromSeconds(20);
+    /// <summary>
+    /// Phase attributed to a startup failure that cannot be pinned to a single JSON-RPC method
+    /// (e.g. a generic client that surfaced an <see cref="OperationCanceledException"/> directly).
+    /// The startup handshake is <c>initialize</c> then <c>tools/list</c>.
+    /// </summary>
+    private const string DefaultConnectPhase = "initialize/tools/list";
 
     private readonly List<IMcpClient> clients = [];
     private readonly List<ITool> tools = [];
@@ -23,24 +28,42 @@ public sealed class McpClientManager : IAsyncDisposable
     private readonly IMcpHttpClientFactory? httpFactory;
 
     /// <summary>
+    /// The manager-owned connect (startup) timeout, already normalized so it is always safe to
+    /// hand to <see cref="CancellationTokenSource.CancelAfter(TimeSpan)"/>: a non-positive or
+    /// over-the-limit duration is <see cref="Timeout.InfiniteTimeSpan"/> (no timer scheduled).
+    /// </summary>
+    private readonly TimeSpan connectTimeout;
+
+    /// <summary>
     /// Standard constructor: starts with no clients (use <see cref="ConnectAllAsync"/> to
     /// populate). <paramref name="httpFactory"/> builds clients for HTTP servers; when null,
-    /// HTTP servers are skipped (logged).
+    /// HTTP servers are skipped (logged). <paramref name="connectTimeout"/> overrides the connect
+    /// timeout; when null it is resolved from <see cref="McpConnectTimeout.FromEnvironment"/>. Any
+    /// override is normalized with <see cref="McpConnectTimeout.Normalize"/> exactly like an
+    /// environment value.
     /// </summary>
-    public McpClientManager(IMcpHttpClientFactory? httpFactory = null)
+    public McpClientManager(IMcpHttpClientFactory? httpFactory = null, TimeSpan? connectTimeout = null)
     {
         this.ownsClients = true;
         this.httpFactory = httpFactory;
+        this.connectTimeout = connectTimeout is { } value
+            ? McpConnectTimeout.Normalize(value)
+            : McpConnectTimeout.FromEnvironment();
     }
 
     /// <summary>
     /// Test-only constructor: accepts pre-built clients so tests can inject
-    /// scripted connections without launching real processes.
+    /// scripted connections without launching real processes. The connect timeout defaults to
+    /// <see cref="Timeout.InfiniteTimeSpan"/> (no timer) unless a test supplies an explicit
+    /// <paramref name="connectTimeout"/>, which is normalized like any other value.
     /// </summary>
-    internal McpClientManager(IEnumerable<IMcpClient> prebuiltClients)
+    internal McpClientManager(IEnumerable<IMcpClient> prebuiltClients, TimeSpan? connectTimeout = null)
     {
         this.ownsClients = false;
         this.clients.AddRange(prebuiltClients);
+        this.connectTimeout = connectTimeout is { } value
+            ? McpConnectTimeout.Normalize(value)
+            : Timeout.InfiniteTimeSpan;
     }
 
     public IReadOnlyList<ITool> Tools => this.tools;
@@ -118,27 +141,77 @@ public sealed class McpClientManager : IAsyncDisposable
     /// <summary>Initialize a pre-built client and adopt its tools (a test seam + the shared connect core).</summary>
     internal async Task<McpConnectResult> ConnectClientAsync(IMcpClient client, CancellationToken cancellationToken)
     {
+        // One linked source combines caller cancellation with the manager's own connect policy;
+        // CancelAfter runs only for a finite, positive, normalized duration (infinite => no timer).
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        if (this.connectTimeout != Timeout.InfiniteTimeSpan)
+        {
+            linkedCts.CancelAfter(this.connectTimeout);
+        }
+
+        IReadOnlyList<McpToolInfo> serverTools;
+        List<ITool> newTools;
         try
         {
-            using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            timeoutCts.CancelAfter(ConnectTimeout);
+            serverTools = await client.InitializeAndListToolsAsync(linkedCts.Token).ConfigureAwait(false);
 
-            var serverTools = await client.InitializeAndListToolsAsync(timeoutCts.Token).ConfigureAwait(false);
-
-            this.clients.Add(client);
+            // Build every wrapper into a temporary list before touching manager state, so a wrapper
+            // failure cannot leave a half-registered client or a stray tool behind.
+            newTools = new List<ITool>(serverTools.Count);
             foreach (var toolInfo in serverTools)
             {
-                this.tools.Add(new McpTool(client, client.ServerName, toolInfo));
+                newTools.Add(new McpTool(client, client.ServerName, toolInfo));
             }
-
-            this.Version++;
-            return McpConnectResult.Success(serverTools.Count);
         }
         catch (Exception ex)
         {
             await client.DisposeAsync().ConfigureAwait(false);
-            return McpConnectResult.Failure(ex.Message);
+            var callerCanceled = cancellationToken.IsCancellationRequested;
+            var timedOut = !callerCanceled && linkedCts.IsCancellationRequested;
+            return McpConnectResult.Failure(this.ClassifyFailure(ex, client.ServerName, callerCanceled, timedOut));
         }
+
+        // Atomic adoption: only after initialize and every wrapper succeeded.
+        this.clients.Add(client);
+        this.tools.AddRange(newTools);
+        this.Version++;
+        return McpConnectResult.Success(serverTools.Count);
+    }
+
+    /// <summary>
+    /// Map a connect failure to a user-facing message following a fixed precedence: caller
+    /// cancellation, then the manager-owned timeout, then an existing typed connection error, then
+    /// an unclassified operation cancellation, and finally any other exception's original message.
+    /// A typed <see cref="McpConnectionException.Phase"/> is preserved when reclassifying so a
+    /// timeout that unwound a specific handshake step still names that step; otherwise
+    /// <see cref="DefaultConnectPhase"/> is used. Raw <see cref="OperationCanceledException"/> text
+    /// is never surfaced.
+    /// </summary>
+    private string ClassifyFailure(Exception ex, string serverName, bool callerCanceled, bool timedOut)
+    {
+        var phase = (ex as McpConnectionException)?.Phase ?? DefaultConnectPhase;
+
+        if (callerCanceled)
+        {
+            return McpConnectionException.Canceled(serverName, phase).Message;
+        }
+
+        if (timedOut)
+        {
+            return McpConnectionException.Timeout(serverName, phase, this.connectTimeout).Message;
+        }
+
+        if (ex is McpConnectionException typed)
+        {
+            return typed.Message;
+        }
+
+        if (ex is OperationCanceledException)
+        {
+            return McpConnectionException.Canceled(serverName, phase).Message;
+        }
+
+        return ex.Message;
     }
 
     /// <summary>

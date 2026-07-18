@@ -27,3 +27,6 @@ TestResults/
 
 # Coda runtime/user data — never commit
 .coda/
+
+# Local Git worktrees
+.worktrees/

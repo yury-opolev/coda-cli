@@ -191,6 +191,64 @@ public sealed class McpAuthMetadataClientTests
             "https://auth.example.com/register", "http://127.0.0.1/cb", ["authorization_code"]));
     }
 
+    [Fact]
+    public async Task RegisterClient_returns_null_on_transport_failure()
+    {
+        var handler = new RouteHandler { ThrowOnEveryRequest = true };
+        using var http = new HttpClient(handler);
+        var client = new McpAuthMetadataClient(http);
+
+        // A faulted send (HttpRequestException) must be caught and surfaced as null so the
+        // caller can report the actionable endpoint-specific failure.
+        Assert.Null(await client.RegisterClientAsync(
+            "https://auth.example.com/register", "http://127.0.0.1/cb", ["authorization_code"]));
+    }
+
+    [Fact]
+    public async Task RegisterClient_returns_null_on_malformed_success_body()
+    {
+        var handler = new RouteHandler();
+        handler.Post("https://auth.example.com/register", "{ this is not json");
+
+        using var http = new HttpClient(handler);
+        var client = new McpAuthMetadataClient(http);
+
+        // A 200 whose body is not valid JSON hits the JsonException path -> null, not a throw.
+        Assert.Null(await client.RegisterClientAsync(
+            "https://auth.example.com/register", "http://127.0.0.1/cb", ["authorization_code"]));
+    }
+
+    [Fact]
+    public async Task RegisterClient_returns_null_on_invalid_client_id_shape()
+    {
+        var handler = new RouteHandler();
+        handler.Post("https://auth.example.com/register", """{"client_id":123}""");
+
+        using var http = new HttpClient(handler);
+        var client = new McpAuthMetadataClient(http);
+
+        // Valid JSON but a non-string client_id makes GetString throw
+        // InvalidOperationException; it must be caught and surfaced as null.
+        Assert.Null(await client.RegisterClientAsync(
+            "https://auth.example.com/register", "http://127.0.0.1/cb", ["authorization_code"]));
+    }
+
+    [Fact]
+    public async Task RegisterClient_propagates_caller_cancellation()
+    {
+        var handler = new RouteHandler();
+        handler.Post("https://auth.example.com/register", """{"client_id":"cid"}""");
+
+        using var http = new HttpClient(handler);
+        var client = new McpAuthMetadataClient(http);
+        using var cts = new CancellationTokenSource();
+        await cts.CancelAsync();
+
+        // Genuine caller-requested cancellation must propagate, not be reclassified as null.
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => client.RegisterClientAsync(
+            "https://auth.example.com/register", "http://127.0.0.1/cb", ["authorization_code"], cts.Token));
+    }
+
     private static string AuthDoc() => """
         {"issuer":"https://auth.example.com",
          "authorization_endpoint":"https://auth.example.com/authorize",
@@ -233,6 +291,8 @@ public sealed class McpAuthMetadataClientTests
             {
                 throw new HttpRequestException("connection refused");
             }
+
+            cancellationToken.ThrowIfCancellationRequested();
 
             var url = request.RequestUri!.ToString();
             this.SeenUrls.Add(url);

@@ -303,6 +303,50 @@ with an `auth` block:
 fresh sign-in is skipped with a note to stderr. Pre-authorize such servers once via the TUI or
 `coda run`; the encrypted token is then reused by every process automatically.
 
+**Client id for direct HTTP OAuth.** The flow needs a client id from one of two places: a
+configured `auth.clientId`, or RFC 7591 dynamic client registration when the authorization server
+advertises a registration endpoint. Coda tells the two failure modes apart so the fix is
+unambiguous:
+
+- the authorization server **does not advertise** dynamic registration → set `auth.clientId` to a
+  pre-registered id (below);
+- registration **was attempted and failed** (the registration endpoint erred) → the message names
+  that endpoint; retry or fall back to a configured id.
+
+```json
+{ "mcpServers": { "remote": {
+  "type": "http", "url": "https://mcp.example.com/mcp",
+  "auth": { "mode": "oauth", "clientId": "your-preregistered-client-id", "scopes": ["files:read"] }
+} } }
+```
+
+When a generic HTTP client can't complete OAuth at all, front the server with an **authenticated
+local stdio adapter/proxy** — a locally launched command that holds the credential and speaks plain
+MCP over stdio — and point Coda at that instead of the HTTP endpoint:
+
+```json
+{ "mcpServers": { "remote": { "command": "your-mcp-proxy", "args": ["--upstream", "https://mcp.example.com/mcp"] } } }
+```
+
+**Startup timeout & failure diagnostics.** Connecting a server (the `initialize` then `tools/list`
+handshake) is bounded by a connect timeout so one slow server never blocks the others:
+
+- `CODA_MCP_CONNECT_TIMEOUT` sets the window in **whole seconds** (default **60**).
+- A missing, blank, or non-numeric value uses the default.
+- `0` or a negative value **disables** the timeout (waits indefinitely); a value larger than the
+  platform timer limit is treated the same way (disabled/infinite) rather than erroring.
+
+When a server fails to start it is skipped with a message that names the failed phase and cause:
+
+- a timeout or a caller cancellation names the phase it was in (`initialize` or `tools/list`), and
+  the two are reported distinctly;
+- a child process that exits reports its phase, **exit code**, and a bounded tail of its
+  **sanitized `stderr`** when available — secrets are redacted, so raw tokens or keys never appear
+  in the diagnostics.
+
+A failed connection is atomic: the server's tools, connected client, and version counter are left
+exactly as they were, so a slow or broken server can never half-register.
+
 **`coda serve` MCP controls.** MCP loads by default under serve (parity with the TUI and
 `coda run`). Disable it per session with `--no-mcp` (or `CODA_SERVE_DISABLE_MCP=1`). Point serve
 at an orchestrator-curated config with `CODA_USER_MCP_DIR` — the cleanest way to give a

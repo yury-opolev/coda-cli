@@ -26,6 +26,10 @@
     <ProjectReference Include="..\..\src\LlmAuth\LlmAuth.csproj" />
     <ProjectReference Include="..\..\src\Coda.Mcp\Coda.Mcp.csproj" />
     <ProjectReference Include="..\..\src\Coda.Sdk\Coda.Sdk.csproj" />
+    <!-- Built so the real-stdio integration tests can spawn it, but its assembly is not
+         referenced (it is a standalone test helper executable, not production code). -->
+    <ProjectReference Include="..\McpStdioTestServer\McpStdioTestServer.csproj"
+                      ReferenceOutputAssembly="false" />
   </ItemGroup>
 
 </Project>

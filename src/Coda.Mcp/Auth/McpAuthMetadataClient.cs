@@ -78,15 +78,28 @@ public sealed class McpAuthMetadataClient
             Content = JsonContent.Create(body),
         };
 
-        using var response = await this.http.SendAsync(request, cancellationToken).ConfigureAwait(false);
-        if (!response.IsSuccessStatusCode)
+        try
         {
+            using var response = await this.http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                return null;
+            }
+
+            await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
+            using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
+            return McpClientRegistration.Parse(doc.RootElement.Clone());
+        }
+        catch (Exception ex) when (
+            ex is HttpRequestException or JsonException or InvalidOperationException
+            || (ex is OperationCanceledException && !cancellationToken.IsCancellationRequested))
+        {
+            // A transport failure, a non-caller timeout, a malformed 2xx body, or an invalid
+            // client_id shape all mean "no usable client id" — surface null so the caller
+            // reports the actionable, secret-free endpoint-specific failure. Genuine
+            // caller-requested cancellation is excluded by the filter and propagates.
             return null;
         }
-
-        await using var stream = await response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false);
-        using var doc = await JsonDocument.ParseAsync(stream, cancellationToken: cancellationToken).ConfigureAwait(false);
-        return McpClientRegistration.Parse(doc.RootElement.Clone());
     }
 
     private async Task<JsonElement?> GetJsonAsync(Uri url, CancellationToken cancellationToken)

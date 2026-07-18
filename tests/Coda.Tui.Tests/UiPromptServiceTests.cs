@@ -246,7 +246,10 @@ public sealed class UiPromptServiceTests
     [Fact]
     public async Task Plan_adapter_sets_accept_edits_only_on_approval()
     {
-        var approveSession = new SessionState("claude-ai");
+        var approveSession = new SessionState("claude-ai")
+        {
+            PermissionMode = PermissionMode.Plan,
+        };
         var approveEvents = new RecordingEventPublisher();
         var approver = new TuiPlanApprover(
             new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)),

@@ -7,10 +7,11 @@ using Coda.Tui.Ui.Prompts;
 namespace Coda.Tui.Agent;
 
 /// <summary>
-/// Presents the agent''s proposed plan through the host-neutral prompt surface and asks the user to
+/// Presents the agent's proposed plan through the host-neutral prompt surface and asks the user to
 /// approve it. Publishes <see cref="PlanApprovalRequestedEvent"/>/<see cref="PlanApprovalResolvedEvent"/>.
-/// On approval, switches the session to <see cref="PermissionMode.AcceptEdits"/> so subsequent turns can
-/// mutate files. Non-interactive prompt surfaces decline gracefully.
+/// Approval promotes <see cref="PermissionMode.Plan"/> to <see cref="PermissionMode.AcceptEdits"/>
+/// without downgrading more permissive modes such as <see cref="PermissionMode.BypassPermissions"/>.
+/// Non-interactive prompt surfaces decline gracefully.
 /// </summary>
 public sealed class TuiPlanApprover(IUiPromptService prompts, IUiEventPublisher events, SessionState session) : IPlanApprover
 {
@@ -31,8 +32,10 @@ public sealed class TuiPlanApprover(IUiPromptService prompts, IUiEventPublisher 
             approved = !response.Cancelled && response.SelectedIds.Contains("yes");
         }
 
-        if (approved)
+        if (approved && session.PermissionMode == PermissionMode.Plan)
         {
+            // Promote out of Plan so edits are allowed. Never downgrade a more
+            // permissive pre-existing mode (e.g. BypassPermissions from --yolo).
             session.PermissionMode = PermissionMode.AcceptEdits;
         }
 

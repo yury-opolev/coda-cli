@@ -20,5 +20,6 @@
     <Project Path="tests/Coda.Tui.Tests/Coda.Tui.Tests.csproj" />
     <Project Path="tests/Engine.Tests/Engine.Tests.csproj" />
     <Project Path="tests/LlmAuth.Tests/LlmAuth.Tests.csproj" />
+    <Project Path="tests/McpStdioTestServer/McpStdioTestServer.csproj" />
   </Folder>
 </Solution>
