@@ -1031,6 +1031,22 @@ public sealed class TranscriptLayoutIndexTests
         Assert.Empty(index.GetVisibleRows(firstRow: 0, height: 10, overscan: 2));
         Assert.Equal(0, index.TotalRows);
     }
+
+    [Fact]
+    public void GetRows_returns_arbitrary_global_range_beyond_current_viewport()
+    {
+        var blocks = Blocks(1_000);
+        var index = new TranscriptLayoutIndex(
+            (block, width) => [((CommandOutputTranscriptBlock)block).Text]);
+        index.ReplaceAll(blocks, width: 80);
+
+        var rows = index.GetRows(firstRow: 400, count: 250);
+
+        Assert.Equal(250, rows.Count);
+        Assert.Equal(400, rows[0].GlobalRow);
+        Assert.Equal(649, rows[^1].GlobalRow);
+        Assert.Equal("line 400", rows[0].Text);
+    }
 }
 
 /// <summary>Unit tests for the scroll/auto-follow/unseen bookkeeping in <see cref="TranscriptViewportState"/>.</summary>

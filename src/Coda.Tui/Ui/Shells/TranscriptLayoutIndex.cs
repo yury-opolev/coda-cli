@@ -148,6 +148,20 @@ internal sealed class TranscriptLayoutIndex
     }
 
     /// <summary>
+    /// Returns the rows for an arbitrary half-open global range starting at <paramref name="firstRow"/>
+    /// for up to <paramref name="count"/> rows, clamped only to the transcript bounds and never to the
+    /// current viewport. Only the blocks intersecting the range are formatted (and cached). This may
+    /// materialize a large span because copy operations need the underlying text; normal drawing uses the
+    /// viewport-bounded <see cref="GetVisibleRows"/> instead.
+    /// </summary>
+    public IReadOnlyList<TranscriptRow> GetRows(int firstRow, int count)
+    {
+        var start = Math.Clamp(firstRow, 0, this.TotalRows);
+        var end = Math.Min(this.TotalRows, start + Math.Max(0, count));
+        return this.CollectRows(start, end);
+    }
+
+    /// <summary>
     /// Returns the rows visible for a viewport starting at <paramref name="firstRow"/> of the given
     /// <paramref name="height"/>, plus <paramref name="overscan"/> rows on each side. Only the blocks that
     /// intersect this window are formatted (and cached); the formatter is never invoked for off-screen
@@ -164,8 +178,17 @@ internal sealed class TranscriptLayoutIndex
         var pad = Math.Max(0, overscan);
         var maxTop = Math.Max(0, total - height);
         var effectiveFirst = Math.Clamp(firstRow, 0, maxTop);
-        var start = Math.Max(0, effectiveFirst - pad);
-        var end = Math.Min(total, effectiveFirst + height + pad);
+        return this.CollectRows(
+            Math.Max(0, effectiveFirst - pad),
+            Math.Min(total, effectiveFirst + height + pad));
+    }
+
+    private IReadOnlyList<TranscriptRow> CollectRows(int start, int end)
+    {
+        if (start >= end || this.TotalRows == 0)
+        {
+            return Array.Empty<TranscriptRow>();
+        }
 
         var rows = new List<TranscriptRow>(end - start);
         var blockIndex = this.FindBlock(start);
