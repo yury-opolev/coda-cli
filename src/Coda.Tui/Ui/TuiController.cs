@@ -34,9 +34,6 @@ internal interface ITuiShellHandle
 /// </summary>
 public sealed class TuiController
 {
-    /// <summary>The idle Ctrl-C notice; Ctrl-C never exits, so this points users at an explicit exit.</summary>
-    internal const string IdleNotification = "Nothing is running; use /exit or Ctrl+D to exit.";
-
     /// <summary>The label shown in the status bar while the interactive startup is running.</summary>
     internal const string StartingLabel = "Starting…";
 
@@ -254,21 +251,6 @@ public sealed class TuiController
     /// <summary>Interrupt the active turn, if any. Returns false when nothing was running.</summary>
     public bool TryInterruptActiveTurn() => this.tryInterrupt();
 
-    /// <summary>
-    /// Handle Ctrl-C: interrupt the active turn first; when idle, publish a short notice and never
-    /// exit. Returns whether an active turn was interrupted.
-    /// </summary>
-    public bool HandleCtrlC()
-    {
-        if (this.tryInterrupt())
-        {
-            return true;
-        }
-
-        this.publisher.Publish(new NotificationEvent(IdleNotification, UiNotificationLevel.Information));
-        return false;
-    }
-
     /// <summary>Request application exit and, if a shell is attached, stop it with an exit outcome.</summary>
     public void RequestExit()
     {
@@ -325,7 +307,7 @@ public sealed class TuiController
         switch (action)
         {
             case UiAction.Interrupt:
-                this.HandleCtrlC();
+                this.TryInterruptActiveTurn();
                 break;
             case UiAction.Exit:
                 this.RequestExit();

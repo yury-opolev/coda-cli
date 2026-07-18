@@ -119,6 +119,24 @@ internal sealed class ComposerView : TextView
         this.RaiseLayoutInvalidated();
     }
 
+    /// <summary>
+    /// Dismisses an open slash-command completion, syncing the mirror and raising a completion change so
+    /// the shell can hide the overlay. Returns false (a no-op) when no suggestions are showing, letting the
+    /// shell's chord arbitration fall through to the next handler.
+    /// </summary>
+    internal bool DismissCompletion()
+    {
+        if (this.controller.Suggestions.Count == 0)
+        {
+            return false;
+        }
+
+        this.controller.Apply(UiAction.DismissCompletion);
+        this.SyncTextView();
+        this.RaiseCompletionIfChanged();
+        return true;
+    }
+
     public string GetDraft() => this.controller.State.Draft;
 
     public ComposerState GetState() => this.controller.State;

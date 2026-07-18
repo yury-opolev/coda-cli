@@ -1291,4 +1291,57 @@ public sealed class VirtualizedTranscriptViewTests
             app.End(token);
         }
     }
+
+    [Fact]
+    public void First_escape_dismisses_completion_before_arming_interrupt()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            commands: SlashCommandCatalog.CreateAll());
+        fixture.Shell.Composer.SetDraft("/m", 2);
+        Assert.True(fixture.Shell.Completion.Visible);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.False(fixture.Shell.Completion.Visible);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Escape_arms_then_interrupts_and_ctrl_c_arms_then_exits()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        clock.Advance(TimeSpan.FromMilliseconds(200));
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal([UiAction.Interrupt], fixture.Actions);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal([UiAction.Interrupt, UiAction.Exit], fixture.Actions);
+    }
+
+    [Fact]
+    public async Task Prompt_activation_and_mode_switch_reset_armed_chords()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = UiPromptRequest.Confirm("Allow?", false) },
+            CancellationToken.None);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+
+        await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.F2);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+    }
 }

@@ -12,37 +12,22 @@ namespace Coda.Tui.Tests;
 public sealed class TuiControllerTests
 {
     [Fact]
-    public void Idle_ctrl_c_publishes_a_notification_and_does_not_request_exit()
+    public async Task Interrupt_action_calls_interrupt_without_requesting_exit()
     {
-        var events = new RecordingUiEvents();
+        var interrupts = 0;
         var controller = new TuiController(
             dispatch: (_, _) => Task.CompletedTask,
-            tryInterrupt: () => false,
-            publisher: events,
+            tryInterrupt: () =>
+            {
+                interrupts++;
+                return true;
+            },
+            publisher: new RecordingUiEvents(),
             initialSnapshot: UiSessionSnapshot.Empty);
 
-        var interrupted = controller.HandleCtrlC();
+        await controller.HandleActionAsync(UiAction.Interrupt);
 
-        Assert.False(interrupted);
-        Assert.False(controller.ExitRequested);
-        var note = Assert.IsType<NotificationEvent>(Assert.Single(events.Events));
-        Assert.Equal("Nothing is running; use /exit or Ctrl+D to exit.", note.Message);
-    }
-
-    [Fact]
-    public void Active_ctrl_c_interrupts_without_notifying_or_exiting()
-    {
-        var events = new RecordingUiEvents();
-        var controller = new TuiController(
-            dispatch: (_, _) => Task.CompletedTask,
-            tryInterrupt: () => true,
-            publisher: events,
-            initialSnapshot: UiSessionSnapshot.Empty);
-
-        var interrupted = controller.HandleCtrlC();
-
-        Assert.True(interrupted);
-        Assert.Empty(events.Events);
+        Assert.Equal(1, interrupts);
         Assert.False(controller.ExitRequested);
     }
 

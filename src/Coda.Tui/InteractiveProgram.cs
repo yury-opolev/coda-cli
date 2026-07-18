@@ -209,9 +209,10 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
 
         var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
 
-        // Ctrl-C: interrupt the active turn; a first/idle Ctrl-C never exits (the callback publishes the
-        // idle notice). The explicit exit action is wired separately through the controller.
-        using var cancellation = new ConsoleCancellationRegistration(controller.HandleCtrlC, controller.RequestExit);
+        // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
+        // Terminal.Gui shells own their own Esc/Ctrl+C chords). The explicit exit action is wired
+        // separately through the controller.
+        using var cancellation = new ConsoleCancellationRegistration(controller.TryInterruptActiveTurn, controller.RequestExit);
 
         // The single actor keeps one switchable frame/observer sink for the whole session.
         var frameSink = new SwitchableUiFrameSink();
@@ -330,8 +331,10 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
             composerController.Restore(composer);
 
             TerminalGuiShellBase shell = shellMode == TuiRunMode.Fullscreen
-                ? new FullscreenTuiShell(tgApp, composerController, mailbox, controller.CurrentSnapshot)
-                : new InlineTuiShell(tgApp, composerController, mailbox, controller.CurrentSnapshot);
+                ? new FullscreenTuiShell(
+                    tgApp, composerController, mailbox, controller.CurrentSnapshot, hasActiveWork: () => controller.HasActiveWork)
+                : new InlineTuiShell(
+                    tgApp, composerController, mailbox, controller.CurrentSnapshot, hasActiveWork: () => controller.HasActiveWork);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);

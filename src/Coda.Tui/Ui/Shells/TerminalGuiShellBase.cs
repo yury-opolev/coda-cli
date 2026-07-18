@@ -33,6 +33,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly ComposerController controller;
     private readonly IUiEventPublisher publisher;
     private readonly Func<UiSessionSnapshot, int, string> statusProjection;
+    private readonly Func<bool> hasActiveWork;
+    private readonly ShellCommandChordState chords;
+    private readonly Func<TimeSpan, Func<bool>, object> addTimeout;
+    private readonly Func<object, bool> removeTimeout;
+    private object? chordTimeout;
+    private OperationalStatus? transientOperationalOverride;
 
     private string? statusText;
     private int statusUpdateCount;
@@ -57,10 +63,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
         this.Snapshot = initialSnapshot ?? throw new ArgumentNullException(nameof(initialSnapshot));
         this.statusProjection = statusProjection ?? StatusProjector.Project;
-        this.HasActiveWork = hasActiveWork;
+        this.hasActiveWork = hasActiveWork ?? (() => false);
         this.TimeSource = timeProvider ?? TimeProvider.System;
         this.ClipboardWriter = clipboardWriter;
         this.Theme = theme ?? TuiTheme.WarmEmber;
+
+        // The chord clock and the timeout seams drive the deterministic Esc/Ctrl+C chords: the same
+        // add/remove-timeout delegates the operational row uses (defaulting to the application's own timer)
+        // so tests can expire an armed chord without a running loop.
+        this.chords = new ShellCommandChordState(this.TimeSource);
+        this.addTimeout = addTimeout ?? ((time, callback) => app.AddTimeout(time, callback)!);
+        this.removeTimeout = removeTimeout ?? app.RemoveTimeout;
 
         this.Composer = new ComposerView(controller);
         this.Chrome = new ComposerChromeView(this.Theme);
@@ -69,6 +82,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.PromptOverlay = new PromptOverlay(publisher, this.Theme);
         this.PromptOverlay.ApplyTheme(app.Driver);
         this.Completion = new CommandCompletionView(this.Theme);
+
+        // The composer routes every key through the shell first so the interrupt/exit chords win over the
+        // composer's own printable/action mapping regardless of which view currently holds focus.
+        this.Composer.ShellKeyHandler = this.TryHandleShellKey;
 
         this.Composer.Submitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
@@ -112,16 +129,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The Warm Ember theme shared by every view this shell constructs.</summary>
     protected TuiTheme Theme { get; }
 
-    /// <summary>
-    /// Reports whether the session currently has active work; a future seam for chord handling. Stored now
-    /// so later chord/clipboard tasks do not churn the constructor signature.
-    /// </summary>
-    protected Func<bool>? HasActiveWork { get; }
-
-    /// <summary>The clock used for deterministic timing; a future seam for chord handling.</summary>
+    /// <summary>The clock used for the deterministic interrupt/exit chord windows.</summary>
     protected TimeProvider TimeSource { get; }
 
-    /// <summary>Writes text to the system clipboard; a future seam for the copy chord.</summary>
+    /// <summary>Writes text to the system clipboard; a seam for the Task 12 copy chord.</summary>
     protected Func<string, bool>? ClipboardWriter { get; }
 
     /// <summary>The keyboard-only prompt surface, hidden until a prompt is pending.</summary>
@@ -152,9 +163,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>
     /// Whether a shell-local override currently owns the operational status row, suppressing the projected
-    /// status. Always false today; a later task overrides this to pin transient shell-driven messages.
+    /// status. True while an interrupt/exit chord hint is armed or a transient shell-driven message is
+    /// pinned, so a snapshot apply never stomps the chord/transient message.
     /// </summary>
-    protected virtual bool HasOperationalOverride => false;
+    protected bool HasOperationalOverride =>
+        this.transientOperationalOverride is not null || this.chords.CurrentHint is not null;
 
     /// <summary>Exports the composer state so it survives a shell/mode switch.</summary>
     public ComposerState ExportComposerState() => this.controller.Export();
@@ -167,6 +180,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     public void RequestStop(TuiShellExit outcome)
     {
         ArgumentNullException.ThrowIfNull(outcome);
+        this.ResetChordOverride();
+        this.ClearTransientOperationalOverride();
         this.RequestedExit = outcome;
         this.app.RequestStop();
     }
@@ -300,6 +315,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (disposing && !this.disposed)
         {
             this.disposed = true;
+            this.StopChordTimeout();
+            this.chords.Reset();
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
@@ -325,12 +342,23 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
-    /// Redirects a printable, non-modifier key the transcript did not consume into the composer, focusing it
-    /// first so typing anywhere edits the draft. A pending modal prompt is never redirected.
+    /// Routes a key the transcript did not consume: the interrupt/exit chords win first (so Esc/Ctrl+C work
+    /// with the transcript focused), then a printable, non-modifier key is redirected into the composer,
+    /// focusing it so typing anywhere edits the draft. A pending modal prompt is never redirected.
     /// </summary>
     private bool HandleUnhandledShellKey(Key key)
     {
-        if (this.PromptOverlay.Visible || !TryGetPrintable(key, out var text))
+        if (this.PromptOverlay.Visible)
+        {
+            return false;
+        }
+
+        if (this.TryHandleShellKey(key))
+        {
+            return true;
+        }
+
+        if (!TryGetPrintable(key, out var text))
         {
             return false;
         }
@@ -338,6 +366,193 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Composer.SetFocus();
         this.Composer.InsertFromShell(text);
         return true;
+    }
+
+    /// <summary>
+    /// Arbitrates the shell-owned Esc/Ctrl+C chords before the composer's own mapping. Esc first dismisses
+    /// an open completion, then clears a transcript selection (Task 12 seam), then clears a transient
+    /// operational override, then cancels an armed exit chord, and only then arms/fires the interrupt chord.
+    /// Ctrl+C first copies a transcript selection (Task 12 seam), then arms/fires the exit chord. Returns
+    /// true when the key was consumed here so no printable/action routing runs for it.
+    /// </summary>
+    private bool TryHandleShellKey(Key key)
+    {
+        if (this.PromptOverlay.Visible)
+        {
+            return false;
+        }
+
+        if (key == Key.Esc)
+        {
+            if (this.Completion.Visible)
+            {
+                this.Composer.DismissCompletion();
+                return true;
+            }
+
+            if (this.TryClearTranscriptSelection())
+            {
+                return true;
+            }
+
+            if (this.TryClearTransientOperationalOverride())
+            {
+                return true;
+            }
+
+            if (this.chords.ArmedAction == ShellChordAction.Exit)
+            {
+                this.ResetChordOverride();
+                return true;
+            }
+
+            return this.ApplyChord(this.chords.HandleEscape(this.HasInterruptibleWork()));
+        }
+
+        if (key == Key.C.WithCtrl)
+        {
+            if (this.TryCopyTranscriptSelection())
+            {
+                return true;
+            }
+
+            return this.ApplyChord(this.chords.HandleCtrlC());
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Task 12 seam: clears an active transcript selection when the first Esc arrives, before any chord
+    /// arming. Transcript selection is not implemented until Task 12, so this always returns false today;
+    /// the full-screen shell overrides it once selection exists.
+    /// </summary>
+    protected virtual bool TryClearTranscriptSelection() => false;
+
+    /// <summary>
+    /// Task 12 seam: copies an active transcript selection to the clipboard when Ctrl+C arrives, before any
+    /// exit-chord arming. Transcript selection is not implemented until Task 12, so this always returns
+    /// false today; the full-screen shell overrides it once selection exists.
+    /// </summary>
+    protected virtual bool TryCopyTranscriptSelection() => false;
+
+    /// <summary>
+    /// Whether there is anything an interrupt chord should be allowed to interrupt: the injected active-work
+    /// delegate is true, an operation is active, background tasks are running, or an incomplete tool exists.
+    /// </summary>
+    private bool HasInterruptibleWork()
+    {
+        if (this.hasActiveWork() ||
+            this.Snapshot.ActiveOperation is not null ||
+            this.Snapshot.RunningTasks > 0)
+        {
+            return true;
+        }
+
+        return this.Snapshot.Transcript.Any(
+            block => block is ToolTranscriptBlock { Complete: false });
+    }
+
+    /// <summary>
+    /// Applies a chord result: an unconsumed result lets the key fall through; an arming result pins the
+    /// warning hint and schedules a one-shot expiry timeout; a firing result restores the projected status
+    /// and raises the interrupt/exit action.
+    /// </summary>
+    private bool ApplyChord(ShellChordResult result)
+    {
+        if (!result.Consumed)
+        {
+            return false;
+        }
+
+        this.StopChordTimeout();
+        if (result.Hint is { } hint)
+        {
+            this.Operational.SetStatus(hint);
+            var window = this.chords.ArmedAction == ShellChordAction.Interrupt
+                ? ShellCommandChordState.InterruptWindow
+                : ShellCommandChordState.ExitWindow;
+            this.chordTimeout = this.addTimeout(
+                window + TimeSpan.FromMilliseconds(1),
+                () =>
+                {
+                    this.chordTimeout = null;
+                    if (this.disposed)
+                    {
+                        return false;
+                    }
+
+                    this.chords.Expire();
+                    this.RestoreProjectedOperationalStatus();
+                    return false;
+                });
+            return true;
+        }
+
+        this.RestoreProjectedOperationalStatus();
+        if (result.Action == ShellChordAction.Interrupt)
+        {
+            this.ActionRequested?.Invoke(this, UiAction.Interrupt);
+        }
+        else if (result.Action == ShellChordAction.Exit)
+        {
+            this.ActionRequested?.Invoke(this, UiAction.Exit);
+        }
+
+        return true;
+    }
+
+    /// <summary>Cancels any armed chord, tears down its expiry timeout, and restores the projected status.</summary>
+    private void ResetChordOverride()
+    {
+        this.StopChordTimeout();
+        this.chords.Reset();
+        this.RestoreProjectedOperationalStatus();
+    }
+
+    private void StopChordTimeout()
+    {
+        if (this.chordTimeout is not { } token)
+        {
+            return;
+        }
+
+        this.chordTimeout = null;
+        this.removeTimeout(token);
+    }
+
+    private bool TryClearTransientOperationalOverride()
+    {
+        if (this.transientOperationalOverride is null)
+        {
+            return false;
+        }
+
+        this.ClearTransientOperationalOverride();
+        return true;
+    }
+
+    private void ClearTransientOperationalOverride()
+    {
+        if (this.transientOperationalOverride is null)
+        {
+            return;
+        }
+
+        this.transientOperationalOverride = null;
+        this.RestoreProjectedOperationalStatus();
+    }
+
+    /// <summary>
+    /// Re-derives the operational row from the highest-priority owner: a pinned transient override, then an
+    /// armed chord hint, then the snapshot projection.
+    /// </summary>
+    private void RestoreProjectedOperationalStatus()
+    {
+        var status = this.transientOperationalOverride ??
+            this.chords.CurrentHint ??
+            OperationalStatusProjector.Project(this.Snapshot);
+        this.Operational.SetStatus(status);
     }
 
     private static bool TryGetPrintable(Key key, out string text)
@@ -365,6 +580,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         var previous = this.Snapshot;
         this.Snapshot = snapshot;
+
+        // A completed turn (or otherwise vanished work) must disarm an interrupt chord that now has nothing
+        // to interrupt, so the stale "Press Esc again" hint never survives into an idle frame.
+        if (this.chords.ArmedAction == ShellChordAction.Interrupt &&
+            !this.HasInterruptibleWork())
+        {
+            this.ResetChordOverride();
+        }
 
         this.UpdateMetadata(snapshot);
         this.UpdateProjectedOperationalStatus(snapshot);
@@ -462,6 +685,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         if (snapshot.PendingPrompt is { } prompt)
         {
+            // A modal prompt takes over input, so any armed interrupt/exit chord is abandoned rather than
+            // left pinned behind the overlay.
+            this.ResetChordOverride();
             this.PromptOverlay.Update(prompt);
             this.PromptOverlay.SetFocus();
             return;
@@ -481,7 +707,16 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     private void OnComposerSubmitted(object? sender, string text) => this.PromptSubmitted?.Invoke(this, text);
 
-    private void OnComposerActionRequested(object? sender, UiAction action) => this.ActionRequested?.Invoke(this, action);
+    private void OnComposerActionRequested(object? sender, UiAction action)
+    {
+        // Switching mode abandons any armed chord so a half-typed interrupt/exit never survives the switch.
+        if (action == UiAction.ToggleMode)
+        {
+            this.ResetChordOverride();
+        }
+
+        this.ActionRequested?.Invoke(this, action);
+    }
 
     private void OnCompletionChanged(object? sender, EventArgs e) => this.SyncCompletion();
 
