@@ -153,4 +153,54 @@ public sealed class TerminalCellTextTests
         Assert.Equal(flag, TerminalCellText.SliceByCells(flag, 0, Math.Max(1, element.CellWidth)));
         Assert.Equal(flag, Assert.Single(TerminalCellText.Wrap(flag, width: 1)).Text);
     }
+
+    [Fact]
+    public void Wrap_drops_boundary_whitespace_and_never_emits_a_whitespace_row()
+    {
+        var rows = TerminalCellText.Wrap("hello world", width: 5);
+
+        Assert.Collection(
+            rows,
+            row => Assert.Equal(("hello", 0, 5, 5), (row.Text, row.StartIndex, row.EndIndex, row.CellWidth)),
+            row => Assert.Equal(("world", 6, 11, 5), (row.Text, row.StartIndex, row.EndIndex, row.CellWidth)));
+        Assert.DoesNotContain(rows, row => row.Text.Length > 0 && string.IsNullOrWhiteSpace(row.Text));
+    }
+
+    [Fact]
+    public void Wrap_drops_narrow_boundary_whitespace_between_words()
+    {
+        var rows = TerminalCellText.Wrap("aa bb", width: 2);
+
+        Assert.Collection(
+            rows,
+            row => Assert.Equal(("aa", 0, 2, 2), (row.Text, row.StartIndex, row.EndIndex, row.CellWidth)),
+            row => Assert.Equal(("bb", 3, 5, 2), (row.Text, row.StartIndex, row.EndIndex, row.CellWidth)));
+    }
+
+    [Fact]
+    public void Wrap_drops_trailing_whitespace_without_emitting_a_blank_row()
+    {
+        var row = Assert.Single(TerminalCellText.Wrap("hello ", width: 5));
+
+        Assert.Equal(("hello", 0, 5, 5), (row.Text, row.StartIndex, row.EndIndex, row.CellWidth));
+    }
+
+    [Fact]
+    public void Grouped_regional_indicator_flag_measures_two_cells_and_stays_whole()
+    {
+        const string flag = "\U0001F1EF\U0001F1F5"; // 🇯🇵
+
+        var elements = TerminalCellText.Enumerate(flag);
+        if (elements.Length != 1)
+        {
+            return; // This runtime does not group regional indicators; the grouped-width claim does not apply.
+        }
+
+        var element = elements[0];
+        Assert.Equal(flag, element.Text);
+        Assert.Equal(4, element.Utf16Length);
+        Assert.Equal(2, element.CellWidth);            // grouped flag measures two cells, not the summed pair
+        Assert.Equal(2, TerminalCellText.Width(flag));
+        Assert.Equal(flag, Assert.Single(TerminalCellText.Wrap(flag, width: 1)).Text);
+    }
 }

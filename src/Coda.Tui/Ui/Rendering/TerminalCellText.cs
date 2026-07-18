@@ -50,8 +50,17 @@ internal readonly record struct WrappedCellRow(
 internal static class TerminalCellText
 {
     /// <summary>Total display-cell width of <paramref name="text"/>.</summary>
-    public static int Width(string? text) =>
-        Enumerate(text ?? string.Empty).Sum(element => element.CellWidth);
+    public static int Width(string? text)
+    {
+        var enumerator = StringInfo.GetTextElementEnumerator(text ?? string.Empty);
+        var total = 0;
+        while (enumerator.MoveNext())
+        {
+            total += ElementWidth((string)enumerator.Current);
+        }
+
+        return total;
+    }
 
     /// <summary>
     /// Enumerates the grapheme clusters of <paramref name="text"/>, reporting each one's UTF-16 source
@@ -155,8 +164,21 @@ internal static class TerminalCellText
         var line = source[start..end];
         var elements = Enumerate(line);
         var rowStart = 0;
+        var appended = false;
         while (rowStart < elements.Length)
         {
+            // Skip leading/boundary/trailing whitespace so a run between wrap points is never emitted as
+            // its own row; a non-whitespace grapheme (even one wider than the width) still hard-emits below.
+            while (rowStart < elements.Length && string.IsNullOrWhiteSpace(elements[rowStart].Text))
+            {
+                rowStart++;
+            }
+
+            if (rowStart >= elements.Length)
+            {
+                break;
+            }
+
             var used = 0;
             var cursor = rowStart;
             var lastWhitespace = -1;
@@ -187,10 +209,6 @@ internal static class TerminalCellText
             {
                 rowEnd = lastWhitespace;
                 cursor = lastWhitespace + 1;
-                while (cursor < elements.Length && string.IsNullOrWhiteSpace(elements[cursor].Text))
-                {
-                    cursor++;
-                }
             }
 
             if (rowEnd <= rowStart)
@@ -214,6 +232,14 @@ internal static class TerminalCellText
                 .ToImmutableArray();
             rows.Add(new WrappedCellRow(rowText, absoluteStart, absoluteEnd, Width(rowText), normalized));
             rowStart = cursor;
+            appended = true;
+        }
+
+        if (!appended)
+        {
+            // The logical line was non-empty but all whitespace: preserve the newline structure with an
+            // empty row rather than emitting the whitespace as visible content.
+            rows.Add(new WrappedCellRow(string.Empty, start, end, 0, []));
         }
     }
 
@@ -250,6 +276,7 @@ internal static class TerminalCellText
         (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||   // CJK compatibility
         (codePoint >= 0xFF00 && codePoint <= 0xFF60) ||   // Fullwidth forms
         (codePoint >= 0xFFE0 && codePoint <= 0xFFE6) ||   // Fullwidth signs
+        (codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF) || // Regional indicators (flags)
         (codePoint >= 0x1F300 && codePoint <= 0x1FAFF) || // Emoji / symbols
         (codePoint >= 0x20000 && codePoint <= 0x3FFFD);   // CJK Ext B+
 }
