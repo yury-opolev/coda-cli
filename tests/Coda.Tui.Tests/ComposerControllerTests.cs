@@ -255,6 +255,26 @@ public sealed class ComposerControllerTests
         Assert.Equal(4, controller.State.CursorIndex);
     }
 
+    [Fact]
+    public void Horizontal_edit_and_history_actions_reset_preferred_display_column()
+    {
+        var controller = CreateController();
+        controller.SeedHistory(["older"]);
+        controller.ReplaceDraft("abcdef", 4);
+        controller.MoveCursorTo(4, preferredDisplayColumn: 4);
+
+        controller.Apply(UiAction.CursorLeft);
+        Assert.Null(controller.State.PreferredDisplayColumn);
+
+        controller.MoveCursorTo(3, preferredDisplayColumn: 3);
+        controller.InsertText("x");
+        Assert.Null(controller.State.PreferredDisplayColumn);
+
+        controller.MoveCursorTo(4, preferredDisplayColumn: 4);
+        controller.Apply(UiAction.HistoryPrevious);
+        Assert.Null(controller.State.PreferredDisplayColumn);
+    }
+
     private sealed class TestCommand(string name, string summary) : ISlashCommand
     {
         public string Name { get; } = name;
@@ -275,98 +295,107 @@ public sealed class ComposerControllerTests
 
 public sealed class UiActionMapTests
 {
-    private static readonly UiInputContext Empty = new(ComposerEmpty: true, CompletionVisible: false);
-    private static readonly UiInputContext Typing = new(ComposerEmpty: false, CompletionVisible: false);
-    private static readonly UiInputContext Completing = new(ComposerEmpty: false, CompletionVisible: true);
+    private static readonly UiInputContext Empty =
+        new(true, false, false, false);
+    private static readonly UiInputContext TypingMiddle =
+        new(false, false, true, true);
+    private static readonly UiInputContext TypingTop =
+        new(false, false, false, true);
+    private static readonly UiInputContext TypingBottom =
+        new(false, false, true, false);
+    private static readonly UiInputContext Completing =
+        new(false, true, true, true);
 
     [Fact]
     public void Enter_maps_to_submit()
     {
-        Assert.Equal(UiAction.Submit, UiActionMap.Map(Key.Enter, Typing));
+        Assert.Equal(UiAction.Submit, UiActionMap.Map(Key.Enter, TypingMiddle));
     }
 
     [Fact]
     public void Ctrl_j_maps_to_insert_newline_and_takes_precedence_over_ordinary_j()
     {
-        Assert.Equal(UiAction.InsertNewline, UiActionMap.Map(Key.J.WithCtrl, Typing));
-        Assert.Equal(UiAction.None, UiActionMap.Map(Key.J, Typing));
-        Assert.Equal(UiAction.None, UiActionMap.Map(new Key('j'), Typing));
+        Assert.Equal(UiAction.InsertNewline, UiActionMap.Map(Key.J.WithCtrl, TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(Key.J, TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(new Key('j'), TypingMiddle));
     }
 
     [Fact]
-    public void Ctrl_c_maps_to_interrupt()
+    public void Up_down_precedence_is_completion_then_visual_editor_then_history_boundary()
     {
-        Assert.Equal(UiAction.Interrupt, UiActionMap.Map(Key.C.WithCtrl, Typing));
-    }
-
-    [Fact]
-    public void Ctrl_d_exits_only_when_composer_is_empty()
-    {
-        Assert.Equal(UiAction.Exit, UiActionMap.Map(Key.D.WithCtrl, Empty));
-        Assert.Equal(UiAction.None, UiActionMap.Map(Key.D.WithCtrl, Typing));
-    }
-
-    [Fact]
-    public void Up_and_down_pick_completion_when_visible_and_history_otherwise()
-    {
-        Assert.Equal(UiAction.HistoryPrevious, UiActionMap.Map(Key.CursorUp, Typing));
-        Assert.Equal(UiAction.HistoryNext, UiActionMap.Map(Key.CursorDown, Typing));
         Assert.Equal(UiAction.CompletionPrevious, UiActionMap.Map(Key.CursorUp, Completing));
         Assert.Equal(UiAction.CompletionNext, UiActionMap.Map(Key.CursorDown, Completing));
+        Assert.Equal(UiAction.CursorVisualUp, UiActionMap.Map(Key.CursorUp, TypingMiddle));
+        Assert.Equal(UiAction.CursorVisualDown, UiActionMap.Map(Key.CursorDown, TypingMiddle));
+        Assert.Equal(UiAction.HistoryPrevious, UiActionMap.Map(Key.CursorUp, TypingTop));
+        Assert.Equal(UiAction.HistoryNext, UiActionMap.Map(Key.CursorDown, TypingBottom));
     }
 
     [Fact]
-    public void Tab_completes_and_escape_dismisses()
+    public void Ctrl_up_down_always_navigate_history_and_ctrl_d_is_unmapped()
+    {
+        Assert.Equal(UiAction.HistoryPrevious, UiActionMap.Map(Key.CursorUp.WithCtrl, TypingMiddle));
+        Assert.Equal(UiAction.HistoryNext, UiActionMap.Map(Key.CursorDown.WithCtrl, TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(Key.D.WithCtrl, Empty));
+    }
+
+    [Fact]
+    public void Ctrl_c_is_unmapped_for_shell_handling()
+    {
+        Assert.Equal(UiAction.None, UiActionMap.Map(Key.C.WithCtrl, TypingMiddle));
+    }
+
+    [Fact]
+    public void Tab_completes_and_escape_dismisses_only_visible_completion()
     {
         Assert.Equal(UiAction.CompleteSuggestion, UiActionMap.Map(Key.Tab, Completing));
         Assert.Equal(UiAction.DismissCompletion, UiActionMap.Map(Key.Esc, Completing));
+        Assert.Equal(UiAction.None, UiActionMap.Map(Key.Esc, TypingMiddle));
     }
 
     [Fact]
     public void Page_keys_scroll_transcript_f2_toggles_and_ctrl_l_redraws()
     {
-        Assert.Equal(UiAction.TranscriptUp, UiActionMap.Map(Key.PageUp, Typing));
-        Assert.Equal(UiAction.TranscriptDown, UiActionMap.Map(Key.PageDown, Typing));
-        Assert.Equal(UiAction.ToggleMode, UiActionMap.Map(Key.F2, Typing));
-        Assert.Equal(UiAction.ForceRedraw, UiActionMap.Map(Key.L.WithCtrl, Typing));
+        Assert.Equal(UiAction.TranscriptUp, UiActionMap.Map(Key.PageUp, TypingMiddle));
+        Assert.Equal(UiAction.TranscriptDown, UiActionMap.Map(Key.PageDown, TypingMiddle));
+        Assert.Equal(UiAction.ToggleMode, UiActionMap.Map(Key.F2, TypingMiddle));
+        Assert.Equal(UiAction.ForceRedraw, UiActionMap.Map(Key.L.WithCtrl, TypingMiddle));
     }
 
     [Fact]
     public void Ordinary_unicode_and_unmapped_keys_return_none()
     {
-        Assert.Equal(UiAction.None, UiActionMap.Map(new Key('a'), Typing));
-        Assert.Equal(UiAction.None, UiActionMap.Map(new Key('Z'), Typing));
-        Assert.Equal(UiAction.None, UiActionMap.Map(new Key(' '), Typing));
-        Assert.Equal(UiAction.None, UiActionMap.Map(Key.Backspace, Typing));
-        Assert.Equal(UiAction.None, UiActionMap.Map(Key.Delete, Typing));
+        Assert.Equal(UiAction.None, UiActionMap.Map(new Key('a'), TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(new Key('Z'), TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(new Key(' '), TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(Key.Backspace, TypingMiddle));
+        Assert.Equal(UiAction.None, UiActionMap.Map(Key.Delete, TypingMiddle));
     }
 
     [Fact]
     public void Arrow_and_home_end_keys_map_to_controller_cursor_actions()
     {
-        Assert.Equal(UiAction.CursorLeft, UiActionMap.Map(Key.CursorLeft, Typing));
-        Assert.Equal(UiAction.CursorRight, UiActionMap.Map(Key.CursorRight, Typing));
-        Assert.Equal(UiAction.LineStart, UiActionMap.Map(Key.Home, Typing));
-        Assert.Equal(UiAction.LineEnd, UiActionMap.Map(Key.End, Typing));
+        Assert.Equal(UiAction.CursorLeft, UiActionMap.Map(Key.CursorLeft, TypingMiddle));
+        Assert.Equal(UiAction.CursorRight, UiActionMap.Map(Key.CursorRight, TypingMiddle));
+        Assert.Equal(UiAction.LineStart, UiActionMap.Map(Key.Home, TypingMiddle));
+        Assert.Equal(UiAction.LineEnd, UiActionMap.Map(Key.End, TypingMiddle));
     }
 
     [Fact]
     public void Ctrl_arrow_keys_map_to_word_movement()
     {
-        Assert.Equal(UiAction.WordLeft, UiActionMap.Map(Key.CursorLeft.WithCtrl, Typing));
-        Assert.Equal(UiAction.WordRight, UiActionMap.Map(Key.CursorRight.WithCtrl, Typing));
+        Assert.Equal(UiAction.WordLeft, UiActionMap.Map(Key.CursorLeft.WithCtrl, TypingMiddle));
+        Assert.Equal(UiAction.WordRight, UiActionMap.Map(Key.CursorRight.WithCtrl, TypingMiddle));
     }
 
     [Fact]
-    public void Cursor_navigation_keys_do_not_shadow_completion_and_history_on_up_down()
+    public void Left_right_home_end_win_over_completion_selection()
     {
-        // Left/Right/Home/End are cursor actions even while a completion popup is open,
-        // but Up/Down must still drive completion/history precedence.
+        // Left/Right/Home/End are cursor actions even while a completion popup is open;
+        // only Up/Down drive completion selection there.
         Assert.Equal(UiAction.CursorLeft, UiActionMap.Map(Key.CursorLeft, Completing));
         Assert.Equal(UiAction.CursorRight, UiActionMap.Map(Key.CursorRight, Completing));
-        Assert.Equal(UiAction.CompletionPrevious, UiActionMap.Map(Key.CursorUp, Completing));
-        Assert.Equal(UiAction.CompletionNext, UiActionMap.Map(Key.CursorDown, Completing));
-        Assert.Equal(UiAction.HistoryPrevious, UiActionMap.Map(Key.CursorUp, Typing));
-        Assert.Equal(UiAction.HistoryNext, UiActionMap.Map(Key.CursorDown, Typing));
+        Assert.Equal(UiAction.LineStart, UiActionMap.Map(Key.Home, Completing));
+        Assert.Equal(UiAction.LineEnd, UiActionMap.Map(Key.End, Completing));
     }
 }

@@ -169,15 +169,24 @@ internal sealed class ComposerView : TextView
 
     private bool HandleKeyDown(Key key)
     {
+        var layout = this.MeasureLayout(Math.Max(1, this.Viewport.Width));
+        var caret = layout.PositionForIndex(this.controller.State.CursorIndex);
         var context = new UiInputContext(
             ComposerEmpty: this.controller.State.Draft.Length == 0,
-            CompletionVisible: this.controller.Suggestions.Count > 0);
+            CompletionVisible: this.controller.Suggestions.Count > 0,
+            CanMoveVisualUp: caret.Row > 0,
+            CanMoveVisualDown: caret.Row < layout.VisualLineCount - 1);
         var action = UiActionMap.Map(key, context);
 
         // While a paste is in progress, a stray Enter is text, never a submission.
         if (action == UiAction.Submit && this.controller.State.PasteActive)
         {
             action = UiAction.InsertNewline;
+        }
+
+        if (action is UiAction.CursorVisualUp or UiAction.CursorVisualDown)
+        {
+            return this.MoveVisual(layout, action);
         }
 
         if (action != UiAction.None)
@@ -230,6 +239,23 @@ internal sealed class ComposerView : TextView
 
         this.SyncTextView();
         this.RaiseLayoutInvalidated();
+        return true;
+    }
+
+    /// <summary>
+    /// Moves the caret one visual (wrapped) row using the laid-out map, carrying the preferred display
+    /// column across the move, then remeasures and re-scrolls so the caret stays visible.
+    /// </summary>
+    private bool MoveVisual(ComposerVisualLayout layout, UiAction action)
+    {
+        var delta = action == UiAction.CursorVisualUp ? -1 : 1;
+        var moved = layout.MoveVertical(
+            this.controller.State.CursorIndex,
+            delta,
+            this.controller.State.PreferredDisplayColumn);
+        this.controller.MoveCursorTo(moved.CursorIndex, moved.PreferredColumn);
+        this.SyncTextView();
+        this.ApplyViewport(Math.Max(1, this.Viewport.Width), Math.Max(1, this.Viewport.Height));
         return true;
     }
 

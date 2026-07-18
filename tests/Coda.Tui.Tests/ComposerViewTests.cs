@@ -89,7 +89,7 @@ public sealed class ComposerViewTests
     }
 
     [Fact]
-    public void Ctrl_c_and_f2_raise_action_requested_without_mutating_draft()
+    public void F2_raises_toggle_mode_without_mutating_draft()
     {
         var controller = CreateController();
         using var view = new ComposerView(controller);
@@ -97,11 +97,45 @@ public sealed class ComposerViewTests
         var actions = new List<UiAction>();
         view.ActionRequested += (_, action) => actions.Add(action);
 
-        view.NewKeyDownEvent(Key.C.WithCtrl);
         view.NewKeyDownEvent(Key.F2);
 
-        Assert.Equal([UiAction.Interrupt, UiAction.ToggleMode], actions);
+        Assert.Equal([UiAction.ToggleMode], actions);
         Assert.Equal("busy", view.GetDraft());
+    }
+
+    [Fact]
+    public void Up_down_move_by_visual_wrapped_line_and_preserve_column()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 5, height: 3);
+        view.SetDraft("1234512\n123456", 4);
+
+        view.NewKeyDownEvent(Key.CursorDown);
+        Assert.Equal(7, controller.State.CursorIndex);
+        Assert.Equal(4, controller.State.PreferredDisplayColumn);
+
+        view.NewKeyDownEvent(Key.CursorDown);
+        Assert.Equal(12, controller.State.CursorIndex);
+        Assert.Equal(4, controller.State.PreferredDisplayColumn);
+
+        view.NewKeyDownEvent(Key.CursorUp);
+        Assert.Equal(7, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void Boundary_up_uses_history_but_ctrl_up_uses_history_from_any_visual_row()
+    {
+        var controller = CreateController();
+        controller.SeedHistory(["older"]);
+        using var view = CreateLaidOutView(controller, width: 5, height: 3);
+        view.SetDraft("abcdefghij", 7);
+
+        view.NewKeyDownEvent(Key.CursorUp.WithCtrl);
+        Assert.Equal("older", view.GetDraft());
+
+        view.SetDraft("abcdefghij", 2);
+        view.NewKeyDownEvent(Key.CursorUp);
+        Assert.Equal("older", view.GetDraft());
     }
 
     [Fact]
