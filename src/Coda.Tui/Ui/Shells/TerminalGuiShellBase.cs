@@ -302,6 +302,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown += this.HandleUnhandledShellKey;
+        transcript.CopyRequested += this.HandleTranscriptCopyRequested;
     }
 
     /// <summary>Unsubscribes a transcript previously bound with <see cref="BindTranscriptInput"/>.</summary>
@@ -309,6 +310,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown -= this.HandleUnhandledShellKey;
+        transcript.CopyRequested -= this.HandleTranscriptCopyRequested;
     }
 
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
@@ -466,9 +468,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>
     /// Copies an active transcript selection to the clipboard when Ctrl+C arrives, before any exit-chord
-    /// arming. On success the selection is cleared and the projected status restored; when the clipboard is
-    /// unavailable the selection is preserved and a transient Warning status is pinned for 1.5 seconds.
-    /// Returns true whenever a selection was present, so the exit chord never arms while text is selected.
+    /// arming. Returns true whenever a selection was present, so the exit chord never arms while text is
+    /// selected; the copy itself (success status or the clipboard-unavailable fallback) is handled by
+    /// <see cref="CopyTranscriptSelection"/>.
     /// </summary>
     private bool TryCopyTranscriptSelection()
     {
@@ -477,18 +479,77 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return false;
         }
 
+        this.CopyTranscriptSelection();
+        return true;
+    }
+
+    /// <summary>
+    /// Handles a transcript copy request (a fresh left click on an active selection) by routing through the
+    /// same copy path as Ctrl+C.
+    /// </summary>
+    private void HandleTranscriptCopyRequested() => this.CopyTranscriptSelection();
+
+    /// <summary>
+    /// Copies the active transcript selection to the clipboard. On success the selection is cleared and a
+    /// transient "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds before the projected
+    /// status is restored; when the clipboard is unavailable the selection is preserved and a transient
+    /// "Clipboard unavailable" Warning is pinned instead. No-op when nothing is selected.
+    /// </summary>
+    private void CopyTranscriptSelection()
+    {
+        if (!this.TranscriptView.HasSelection)
+        {
+            return;
+        }
+
         var text = this.TranscriptView.GetSelectedText();
         if (!string.IsNullOrEmpty(text) && this.clipboardWriter(text))
         {
             this.TranscriptView.ClearSelection();
-            this.RestoreProjectedOperationalStatus();
-            return true;
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(CopySuccessMessage(text), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
         }
 
         this.ShowTransientOperationalStatus(
             new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
             TimeSpan.FromSeconds(1.5));
-        return true;
+    }
+
+    /// <summary>
+    /// The transient confirmation for a successful copy, counting the copied Unicode grapheme/text elements
+    /// (combining sequences and emoji count as one each) and excluding CR/LF row separators. Singular for a
+    /// single symbol, plural otherwise.
+    /// </summary>
+    private static string CopySuccessMessage(string text)
+    {
+        var count = CountSymbols(text);
+        return count == 1
+            ? "1 symbol copied to clipboard"
+            : $"{count} symbols copied to clipboard";
+    }
+
+    /// <summary>
+    /// Counts the Unicode grapheme/text elements in <paramref name="text"/>, treating combining sequences
+    /// and emoji as a single symbol and skipping CR/LF separators introduced by the multi-row selection.
+    /// </summary>
+    private static int CountSymbols(string text)
+    {
+        var count = 0;
+        var enumerator = System.Globalization.StringInfo.GetTextElementEnumerator(text);
+        while (enumerator.MoveNext())
+        {
+            var element = (string)enumerator.Current;
+            if (element is "\r" or "\n" or "\r\n")
+            {
+                continue;
+            }
+
+            count++;
+        }
+
+        return count;
     }
 
     /// <summary>

@@ -940,6 +940,139 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
+    public void Left_click_with_selection_copies_clears_without_arming_or_new_drag()
+    {
+        string? copied = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            });
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+
+        // Drag-select the first row, then release so a selection is active and the drag has ended.
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        // A fresh unshifted left press copies the current selection instead of starting a new one.
+        var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        Assert.Equal("line ", copied);
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Left_click_with_unavailable_clipboard_preserves_selection()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => false,
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Copy_status_counts_graphemes_as_symbols_and_excludes_newlines()
+    {
+        string? copied = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            });
+
+        // First row: a + combining acute (one grapheme), b, 👍 (one grapheme) => 3 symbols. Second row:
+        // "cd" => 2 symbols. The joining newline is excluded, so the total is 5 symbols.
+        fixture.Shell.Transcript.ReplaceAll(
+        [
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "a\u0301b\U0001F44D"),
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "cd"),
+        ]);
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 10));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.Equal("a\u0301b\U0001F44D\ncd", copied);
+        Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+    }
+
+    [Fact]
+    public void Copy_status_uses_singular_symbol_for_a_single_selected_element()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => true);
+        fixture.Shell.Transcript.ReplaceAll(
+        [
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "x"),
+        ]);
+
+        // The inclusive selection clamps to the single-cell row, so exactly one glyph is copied.
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(0, 5));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.Equal("1 symbol copied to clipboard", fixture.Shell.Operational.Status.Text);
+    }
+
+    [Fact]
     public void Escape_clears_selection_before_arming_interrupt()
     {
         using var fixture = RetainedShellFixture.Create(activeWork: true);
@@ -1701,6 +1834,61 @@ public sealed class VirtualizedTranscriptViewTests
         // The anchor stays at the original press (column 1); dragging to column 4
         // grows the selection instead of restarting it at each motion report.
         Assert.Equal("rep", view.GetSelectedText());
+    }
+
+    [Fact]
+    public void Fresh_left_press_with_active_selection_requests_copy_and_starts_no_new_drag()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(3));
+
+        // Drag-select the first row, then release so the drag ends and a selection is active.
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        Assert.True(view.HasSelection);
+        var selectedBefore = view.GetSelectedText();
+
+        var copyRequests = 0;
+        view.CopyRequested += () => copyRequests++;
+
+        // A fresh unshifted left press while a selection is active requests a copy and consumes the click.
+        var handled = view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        Assert.Equal(1, copyRequests);
+
+        // No new selection/drag was started: the original selection is untouched and a subsequent release
+        // in a new place neither extends the selection nor toggles expansion.
+        Assert.True(view.HasSelection);
+        Assert.Equal(selectedBefore, view.GetSelectedText());
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(6, 1),
+        });
+        Assert.True(view.HasSelection);
+        Assert.Equal(selectedBefore, view.GetSelectedText());
     }
 
     [Fact]

@@ -68,6 +68,13 @@ internal sealed class VirtualizedTranscriptView : View
     /// </summary>
     internal event Func<Key, bool>? UnhandledKeyDown;
 
+    /// <summary>
+    /// Raised when a fresh unshifted left-button press lands while a selection is active. The host copies
+    /// the current selection to the clipboard in response; the press is consumed here and never begins a
+    /// new selection or toggles tool/diff expansion.
+    /// </summary>
+    internal event Action? CopyRequested;
+
     /// <summary>Rows appended while scrolled away that have not been seen.</summary>
     public int UnseenRows => this.viewport.UnseenRows;
 
@@ -351,6 +358,14 @@ internal sealed class VirtualizedTranscriptView : View
             mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
             !mouse.Flags.HasFlag(MouseFlags.PositionReport))
         {
+            // A fresh press while a selection is active copies that selection instead of starting a new
+            // one: request the copy and consume the click without anchoring a drag or toggling expansion.
+            if (this.selection.HasSelection)
+            {
+                this.CopyRequested?.Invoke();
+                return true;
+            }
+
             var position = this.ToTranscriptPosition(mouse);
             this.BeginSelection(position);
             mouseService.GrabMouse(this);
