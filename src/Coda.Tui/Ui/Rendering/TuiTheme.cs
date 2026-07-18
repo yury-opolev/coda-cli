@@ -48,6 +48,16 @@ internal sealed class TuiTheme
     public TuiThemeColor Notification { get; } = new(new TgColor(191, 174, 156), TgName.Gray);
     public TuiThemeColor Error { get; } = new(new TgColor(217, 104, 93), TgName.Red);
 
+    // Six eye-friendly Warm Ember context-usage colors, one per /context category. Each is a distinct
+    // warm hue (gold → amber → terracotta → rose → taupe → dim warm grey) with a distinct, warm-degrading
+    // 16-color fallback so the categories stay legible by color even when the driver drops to 16 colors.
+    public TuiThemeColor ContextSystemPrompt { get; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
+    public TuiThemeColor ContextSystemTools { get; } = new(new TgColor(222, 146, 74), TgName.Yellow);
+    public TuiThemeColor ContextMcpTools { get; } = new(new TgColor(216, 122, 90), TgName.BrightRed);
+    public TuiThemeColor ContextMessages { get; } = new(new TgColor(214, 96, 96), TgName.Red);
+    public TuiThemeColor ContextAutocompactBuffer { get; } = new(new TgColor(168, 154, 134), TgName.Gray);
+    public TuiThemeColor ContextFreeSpace { get; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
+
     public TuiThemeColor ComposerText { get; } = new(new TgColor(242, 214, 179), TgName.White);
     public TuiThemeColor ComposerPrompt { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 

@@ -34,6 +34,7 @@ public static class UiReducer
         StopReasonEvent e => state with { StopReason = e.StopReason },
 
         CommandOutputEvent e => Append(state, new CommandOutputTranscriptBlock(Guid.NewGuid(), e.Text)),
+        ContextUsageEvent e => Append(state, new ContextUsageTranscriptBlock(Guid.NewGuid(), e.Usage)),
         DiffOutputEvent e => Append(state, new DiffTranscriptBlock(Guid.NewGuid(), e.Patch)),
         WarningEvent e => Notice(state, e.Message, UiNotificationLevel.Warning),
         NotificationEvent e => Notice(state, e.Message, e.Level),

@@ -56,7 +56,7 @@ public sealed class ContextRenderingTests
     }
 
     [Fact]
-    public async Task Context_grid_renders_ten_rows_with_no_blank_rows_between_events()
+    public async Task Context_semantic_pipeline_renders_no_blank_rows_with_all_six_glyphs()
     {
         var report = new ContextReport
         {
@@ -77,14 +77,19 @@ public sealed class ContextRenderingTests
         };
 
         var events = new List<UiEvent>();
-        var console = new UiAnsiConsoleAdapter(new CollectingPublisher(events), 80, 24);
-        var context = BuildContext(console);
+        var publisher = new CollectingPublisher(events);
+        var console = new UiAnsiConsoleAdapter(publisher, 80, 24);
+        var context = BuildContext(console, publisher);
         context.ContextSnapshots = new ContextSnapshotCache(_ => Task.FromResult(report));
 
         await new ContextCommand().ExecuteAsync(context, Array.Empty<string>(), CancellationToken.None);
 
-        // Fold every published command-output event through the reducer and format each block: no rendered
-        // line may be blank, so the grid and legend never show a blank row between semantic events.
+        // The semantic path publishes exactly one typed usage block and no generic command output.
+        Assert.Single(events.OfType<ContextUsageEvent>());
+        Assert.DoesNotContain(events, e => e is CommandOutputEvent);
+
+        // Fold the event through the reducer and format the resulting block: no rendered line may be blank,
+        // and the breakdown must show all six distinct, glyph-legible category markers.
         var snapshot = events.Aggregate(UiSessionSnapshot.Empty, UiReducer.Reduce);
         var lines = snapshot.Transcript
             .SelectMany(block => TranscriptBlockFormatter.Format(block, 80))
@@ -94,30 +99,13 @@ public sealed class ContextRenderingTests
         Assert.DoesNotContain(lines, line => string.IsNullOrWhiteSpace(line.Text));
 
         var glyphSet = ContextCommand.CategoryGlyphs.Values.ToHashSet();
-        var gridRows = lines.Count(line => IsGridRow(line.Text, glyphSet));
-        Assert.Equal(10, gridRows);
+        foreach (var glyph in glyphSet)
+        {
+            Assert.Contains(lines, line => line.Text.Contains(glyph, StringComparison.Ordinal));
+        }
     }
 
-    private static bool IsGridRow(string text, IReadOnlySet<char> glyphs)
-    {
-        var trimmed = text.Trim();
-        if (trimmed.Length == 0)
-        {
-            return false;
-        }
-
-        foreach (var token in trimmed.Split(' ', StringSplitOptions.RemoveEmptyEntries))
-        {
-            if (token.Length != 1 || !glyphs.Contains(token[0]))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    private static CommandContext BuildContext(UiAnsiConsoleAdapter console)
+    private static CommandContext BuildContext(UiAnsiConsoleAdapter console, IUiEventPublisher events)
     {
         var store = new InMemoryTokenStore();
         var credentials = new CredentialManager(
@@ -129,7 +117,8 @@ public sealed class ContextRenderingTests
         };
         var session = new SessionState("claude-ai");
         var registry = new SlashCommandRegistry(Array.Empty<ISlashCommand>());
-        return new CommandContext(console, credentials, session, providers, registry, semanticUiEnabled: true);
+        return new CommandContext(
+            console, credentials, session, providers, registry, events: events, semanticUiEnabled: true);
     }
 
     private sealed class CollectingPublisher(List<UiEvent> events) : IUiEventPublisher

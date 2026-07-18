@@ -86,6 +86,73 @@ public sealed class TuiThemeTests
             view.AttributeFor(TranscriptRole.Permission).Foreground);
     }
 
+    [Theory]
+    [InlineData(TranscriptRole.ContextSystemPrompt, 240, 190, 84)]
+    [InlineData(TranscriptRole.ContextSystemTools, 222, 146, 74)]
+    [InlineData(TranscriptRole.ContextMcpTools, 216, 122, 90)]
+    [InlineData(TranscriptRole.ContextMessages, 214, 96, 96)]
+    [InlineData(TranscriptRole.ContextAutocompactBuffer, 168, 154, 134)]
+    [InlineData(TranscriptRole.ContextFreeSpace, 112, 102, 92)]
+    public void Context_roles_resolve_to_their_distinct_warm_ember_truecolors(
+        TranscriptRole role,
+        int red,
+        int green,
+        int blue)
+    {
+        using IApplication app = Application.Create();
+        using var view = new VirtualizedTranscriptView(app, theme: TuiTheme.WarmEmber);
+
+        var color = view.AttributeFor(role, trueColor: true).Foreground;
+
+        Assert.Equal(new TgColor(red, green, blue), color);
+    }
+
+    [Fact]
+    public void Context_roles_have_distinct_truecolors_and_readable_16_color_fallbacks()
+    {
+        var theme = TuiTheme.WarmEmber;
+        var roles = new[]
+        {
+            theme.ContextSystemPrompt,
+            theme.ContextSystemTools,
+            theme.ContextMcpTools,
+            theme.ContextMessages,
+            theme.ContextAutocompactBuffer,
+            theme.ContextFreeSpace,
+        };
+
+        // Every context role owns an eye-friendly warm truecolor and a named 16-color fallback that are
+        // distinct from one another, so the six categories stay legible by color even in low color.
+        Assert.Equal(roles.Length, roles.Select(r => r.TrueColor).Distinct().Count());
+        Assert.Equal(roles.Length, roles.Select(r => r.Fallback).Distinct().Count());
+
+        // The warm palette never degrades a context role to a cold blue/green/cyan/magenta fallback.
+        foreach (var role in roles)
+        {
+            Assert.DoesNotContain(role.Fallback, new[]
+            {
+                TgName.Blue, TgName.Green, TgName.Cyan, TgName.Magenta,
+                TgName.BrightBlue, TgName.BrightGreen, TgName.BrightCyan, TgName.BrightMagenta,
+            });
+        }
+    }
+
+    [Fact]
+    public void Forced_16_color_driver_resolves_context_roles_to_named_fallbacks()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = true;
+        using var view = new VirtualizedTranscriptView(app, theme: TuiTheme.WarmEmber);
+
+        Assert.Equal(
+            new TgColor(TgName.BrightYellow),
+            view.AttributeFor(TranscriptRole.ContextSystemPrompt).Foreground);
+        Assert.Equal(
+            new TgColor(TgName.DarkGray),
+            view.AttributeFor(TranscriptRole.ContextFreeSpace).Foreground);
+    }
+
     [Fact]
     public void Composer_panel_background_is_a_distinct_warm_surface_from_the_shell_background()
     {

@@ -265,6 +265,58 @@ public sealed class CommandEventPublishTests : IDisposable
         Assert.Contains("cache-model-zzz", console.Output);
     }
 
+    [Fact]
+    public async Task Context_semantic_publishes_one_typed_usage_event_and_no_command_output()
+    {
+        var report = new ContextReport
+        {
+            Model = "semantic-context-model",
+            MaxTokens = 200_000,
+            Categories =
+            [
+                new ContextCategory("System prompt", 10_000),
+                new ContextCategory("Messages", 30_000),
+                new ContextCategory("Free space", 160_000),
+            ],
+            UsedTokens = 40_000,
+            IsExact = true,
+            MessageCount = 2,
+        };
+        var (context, events, console) = this.Build(semanticUi: true);
+        context.ContextSnapshots = new ContextSnapshotCache(_ => Task.FromResult(report));
+
+        await new ContextCommand().ExecuteAsync(context, Array.Empty<string>(), CancellationToken.None);
+
+        var usage = Single<ContextUsageEvent>(events);
+        Assert.Equal("semantic-context-model", usage.Usage.Model);
+        Assert.Equal(40_000, usage.Usage.UsedTokens);
+        Assert.DoesNotContain(events.Events, e => e is CommandOutputEvent);
+
+        // The semantic path publishes the typed block and writes nothing generic to the console.
+        Assert.Empty(console.Output);
+    }
+
+    [Fact]
+    public async Task Context_legacy_writes_grid_to_console_and_publishes_no_usage_event()
+    {
+        var report = new ContextReport
+        {
+            Model = "legacy-context-model",
+            MaxTokens = 200_000,
+            Categories = [new ContextCategory("Free space", 200_000)],
+            UsedTokens = 1_234,
+            IsExact = true,
+            MessageCount = 1,
+        };
+        var (context, events, console) = this.Build(semanticUi: false);
+        context.ContextSnapshots = new ContextSnapshotCache(_ => Task.FromResult(report));
+
+        await new ContextCommand().ExecuteAsync(context, Array.Empty<string>(), CancellationToken.None);
+
+        Assert.Contains("legacy-context-model", console.Output);
+        Assert.DoesNotContain(events.Events, e => e is ContextUsageEvent);
+    }
+
     // ── /status ────────────────────────────────────────────────────────────
 
     [Fact]

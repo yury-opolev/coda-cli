@@ -1,6 +1,8 @@
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.State;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -58,6 +60,15 @@ public sealed class ContextCommand : ISlashCommand
         var report = context.ContextSnapshots is { } cache
             ? await cache.GetAsync(force: true, cancellationToken).ConfigureAwait(false)
             : await AnalyzeOnceAsync(context, cancellationToken).ConfigureAwait(false);
+
+        // In semantic mode the actor/renderer owns the breakdown: publish an immutable, typed usage block
+        // and emit nothing else. Writing the Spectre grid too would duplicate the output as generic command
+        // lines. The legacy REPL keeps its 10×10 grid + legend.
+        if (context.SemanticUiEnabled)
+        {
+            context.Events.Publish(new ContextUsageEvent(ContextUsageData.FromReport(report)));
+            return CommandResult.Continue;
+        }
 
         this.Render(context, report);
         return CommandResult.Continue;

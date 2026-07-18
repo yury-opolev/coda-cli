@@ -546,6 +546,12 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.Warning => this.theme.Warning,
             TranscriptRole.Notification => this.theme.Notification,
             TranscriptRole.Error => this.theme.Error,
+            TranscriptRole.ContextSystemPrompt => this.theme.ContextSystemPrompt,
+            TranscriptRole.ContextSystemTools => this.theme.ContextSystemTools,
+            TranscriptRole.ContextMcpTools => this.theme.ContextMcpTools,
+            TranscriptRole.ContextMessages => this.theme.ContextMessages,
+            TranscriptRole.ContextAutocompactBuffer => this.theme.ContextAutocompactBuffer,
+            TranscriptRole.ContextFreeSpace => this.theme.ContextFreeSpace,
             _ => this.theme.TranscriptAssistant,
         };
         var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
