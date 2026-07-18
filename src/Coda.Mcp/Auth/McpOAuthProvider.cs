@@ -124,10 +124,14 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
         using var listener = this.listenerFactory();
         var redirectUri = listener.RedirectUri;
 
-        var clientId = await this.ResolveClientIdAsync(asMeta, redirectUri, cancellationToken).ConfigureAwait(false);
+        var resolution = await this.ResolveClientIdAsync(asMeta, redirectUri, cancellationToken).ConfigureAwait(false);
+        var clientId = resolution.ClientId;
         if (string.IsNullOrEmpty(clientId))
         {
-            this.log?.Invoke($"No client id available for {asMeta.Issuer} (configure auth.clientId or enable dynamic registration).");
+            // A well-formed resolution always carries an actionable Error here; the fallback
+            // guards only against a malformed result (neither ClientId nor Error).
+            this.log?.Invoke(resolution.Error
+                ?? $"No client id available for {asMeta.Issuer}. Configure auth.clientId or use an authenticated stdio proxy.");
             return false;
         }
 
@@ -179,27 +183,29 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
         return true;
     }
 
-    private async Task<string?> ResolveClientIdAsync(AuthorizationServerMetadata asMeta, string redirectUri, CancellationToken cancellationToken)
+    internal async Task<McpClientIdResolution> ResolveClientIdAsync(AuthorizationServerMetadata asMeta, string redirectUri, CancellationToken cancellationToken)
     {
         // Priority: configured client id → cached DCR registration → fresh DCR.
         if (!string.IsNullOrEmpty(this.config.ClientId))
         {
-            return this.config.ClientId;
+            return McpClientIdResolution.Success(this.config.ClientId);
         }
 
         var cachedJson = await this.tokenStore.GetAsync(ClientKey(asMeta.Issuer), cancellationToken).ConfigureAwait(false);
         if (cachedJson is not null)
         {
             var cached = Deserialize<McpClientRegistration>(cachedJson);
-            if (cached is not null)
+            if (cached is not null && !string.IsNullOrEmpty(cached.ClientId))
             {
-                return cached.ClientId;
+                return McpClientIdResolution.Success(cached.ClientId);
             }
         }
 
         if (string.IsNullOrEmpty(asMeta.RegistrationEndpoint))
         {
-            return null;
+            return McpClientIdResolution.Failure(
+                $"Authorization server {asMeta.Issuer} does not advertise dynamic client registration. "
+                + "Configure auth.clientId or use an authenticated stdio proxy.");
         }
 
         var registration = await this.metadata.RegisterClientAsync(
@@ -208,13 +214,15 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
             ["authorization_code", "refresh_token"],
             cancellationToken).ConfigureAwait(false);
 
-        if (registration is null)
+        if (registration is null || string.IsNullOrEmpty(registration.ClientId))
         {
-            return null;
+            return McpClientIdResolution.Failure(
+                $"Dynamic client registration failed at {asMeta.RegistrationEndpoint}. "
+                + "Configure auth.clientId or use an authenticated stdio proxy.");
         }
 
         await this.tokenStore.SetAsync(ClientKey(asMeta.Issuer), Serialize(registration), cancellationToken).ConfigureAwait(false);
-        return registration.ClientId;
+        return McpClientIdResolution.Success(registration.ClientId);
     }
 
     private async Task<McpStoredToken?> RefreshAsync(McpStoredToken stored, CancellationToken cancellationToken)
