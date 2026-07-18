@@ -532,6 +532,72 @@ public sealed class InlineTuiShellTests
             app.End(token);
         }
     }
+
+    /// <summary>
+    /// When the inline shell is anchored partway down the screen its region is smaller than the full
+    /// screen, so the composer's growth must be capped against that region (<see cref="View.Frame"/>
+    /// height) — not the whole screen. Anchored 10 rows down over a 24-row inline screen the shell owns a
+    /// 14-row region, so a long draft may grow only to <c>max(3, min(8, floor(14 * 0.35))) = 4</c> rows,
+    /// never the <c>floor(24 * 0.35) = 8</c> the full screen would allow, and the status and transcript
+    /// geometry stay pinned exactly as before.
+    /// </summary>
+    [Fact]
+    public void Inline_composer_growth_is_capped_to_the_shell_region_not_the_full_screen()
+    {
+        var draft = string.Join('\n', Enumerable.Range(0, 30).Select(index => $"line {index}"));
+        var state = new ComposerState(
+            Draft: draft,
+            CursorIndex: draft.Length,
+            History: [],
+            HistoryIndex: 0,
+            PasteActive: false,
+            ScrollRow: 0,
+            PreferredDisplayColumn: 0);
+
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 10);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 34);
+        app.Driver.InlinePosition = new Point(0, 10);
+        using var shell = ShellTestFactory.CreateInline(app);
+        shell.RestoreComposerState(state);
+
+        // Anchor the inline top-level 10 rows down, as the runner's inline app model does at run time; the
+        // inline screen is then the 24 rows below it and the shell fills the 14 rows from the anchor down.
+        shell.Y = 10;
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(10, shell.Frame.Y);
+        Assert.Equal(24, app.Screen.Height);
+        Assert.Equal(14, shell.Frame.Height);
+
+        // The composer cap is measured against the 14-row region, not the 24-row screen:
+        // max(3, min(8, floor(14 * 0.35))) = 4 — never the floor(24 * 0.35) = 8 the full screen would allow.
+        var regionCap = Math.Max(3, Math.Min(8, (int)Math.Floor(shell.Frame.Height * 0.35)));
+        var screenCap = Math.Max(3, Math.Min(8, (int)Math.Floor(app.Screen.Height * 0.35)));
+        Assert.Equal(4, regionCap);
+        Assert.Equal(8, screenCap);
+        Assert.Equal(regionCap, shell.Composer.Frame.Height);
+        Assert.NotEqual(screenCap, shell.Composer.Frame.Height);
+
+        // Status and transcript geometry are preserved: the status row is one row pinned to the region
+        // bottom, the operational row and composer stack above it, and the transcript fills every row
+        // between the header and the operational row.
+        Assert.Equal(1, shell.Status.Frame.Height);
+        Assert.Equal(shell.Frame.Height, shell.Status.Frame.Bottom);
+        Assert.Equal(1, shell.Operational.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
 }
 
 public sealed class PromptOverlayTests

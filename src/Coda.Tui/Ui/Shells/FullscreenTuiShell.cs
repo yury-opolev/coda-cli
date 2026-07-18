@@ -217,14 +217,19 @@ internal class FullscreenTuiShell(
             return;
         }
 
-        var screenHeight = this.HostApp.Screen.Height > 0
-            ? this.HostApp.Screen.Height
-            : this.Frame.Height;
+        // Cap the composer against the shell's own region, not the whole screen: inline shells are anchored
+        // partway down the terminal, so their frame is a subset of the screen and the composer must not grow
+        // past the rows it actually owns. Frame.Height is authoritative once the shell has been laid out
+        // (guaranteed here by the guard above); the screen height is only a fallback before a frame exists.
+        // Full-screen is unaffected because its frame fills the screen, so the two heights are equal.
+        var availableHeight = this.Frame.Height > 0
+            ? this.Frame.Height
+            : this.HostApp.Screen.Height;
         var width = Math.Max(1, this.Frame.Width - ComposerGutterWidth);
         int next;
         try
         {
-            next = this.Composer.DesiredHeight(width, screenHeight);
+            next = this.Composer.DesiredHeight(width, availableHeight);
         }
         catch (Exception)
         {
