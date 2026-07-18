@@ -893,7 +893,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
-    private void OnComposerSubmitted(object? sender, string text) => this.PromptSubmitted?.Invoke(this, text);
+    private void OnComposerSubmitted(object? sender, string text)
+    {
+        // Explicit submits (prompts, slash commands, bash) always resume auto-following: jump the transcript
+        // back to the newest row before forwarding so the response the user just asked for is visible even
+        // when they had scrolled up. Background output alone never forces this — only an explicit submit.
+        this.TranscriptView.JumpToNewest();
+        this.PromptSubmitted?.Invoke(this, text);
+    }
 
     private void OnComposerActionRequested(object? sender, UiAction action)
     {

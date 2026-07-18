@@ -576,6 +576,57 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
+    public async Task Submitting_while_scrolled_up_jumps_to_newest_before_forwarding()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var seed = Lines(50);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-20);
+        Assert.False(shell.Transcript.AutoFollow);
+        var scrolledTop = shell.Transcript.TopRow;
+
+        var followedWhenForwarded = false;
+        string? submitted = null;
+        shell.PromptSubmitted += (_, text) =>
+        {
+            followedWhenForwarded = shell.Transcript.AutoFollow;
+            submitted = text;
+        };
+
+        // Submitting a slash command (or any draft) while scrolled up jumps back to the newest row first.
+        shell.Composer.SetDraft("/context", 8);
+        shell.Composer.NewKeyDownEvent(Key.Enter);
+
+        Assert.Equal("/context", submitted);
+        Assert.True(followedWhenForwarded);
+        Assert.True(shell.Transcript.AutoFollow);
+        Assert.Equal(0, shell.Transcript.UnseenRows);
+        Assert.True(shell.Transcript.TopRow > scrolledTop);
+
+        // Output appended after the submit stays visible and unseen-free because the viewport is following.
+        var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "context output tail"));
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.AutoFollow);
+        Assert.Equal(0, shell.Transcript.UnseenRows);
+        var visible = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
+        Assert.Contains("context output tail", visible);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public async Task Prompt_overlay_is_inherited_from_the_shared_base()
     {
         using IApplication app = Application.Create();
