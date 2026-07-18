@@ -319,7 +319,9 @@ internal sealed class VirtualizedTranscriptView : View
     internal bool ProcessMouse(Mouse mouse)
     {
         ArgumentNullException.ThrowIfNull(mouse);
-        if (this.app.Mouse?.IsMouseDisabled == true ||
+        var mouseService = this.app.Mouse;
+        if (mouseService is null ||
+            mouseService.IsMouseDisabled ||
             mouse.Flags.HasFlag(MouseFlags.Shift))
         {
             return false;
@@ -348,7 +350,7 @@ internal sealed class VirtualizedTranscriptView : View
         {
             var position = this.ToTranscriptPosition(mouse);
             this.BeginSelection(position);
-            this.app.Mouse.GrabMouse(this);
+            mouseService.GrabMouse(this);
             return true;
         }
 
@@ -368,7 +370,7 @@ internal sealed class VirtualizedTranscriptView : View
         if (this.dragging && mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
         {
             var position = this.ToTranscriptPosition(mouse);
-            this.app.Mouse.UngrabMouse();
+            mouseService.UngrabMouse();
             this.dragging = false;
             if (!this.selection.HasSelection)
             {
