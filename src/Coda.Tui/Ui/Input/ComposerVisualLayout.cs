@@ -54,6 +54,19 @@ internal sealed class ComposerVisualLayout
                 continue;
             }
 
+            // Disambiguate a hard-wrap seam where no boundary whitespace was dropped: the shared index is
+            // both this row's exclusive EndIndex and the next row's inclusive StartIndex. Bind it to the
+            // continuation row's first column so the caret sits at the start of the wrapped text instead of
+            // past the end of the preceding row, which otherwise stalls vertical navigation on that seam.
+            // Explicit newline and whitespace boundaries drop or consume a character, so the next row's
+            // StartIndex advances past EndIndex and this disambiguation does not apply to them.
+            if (index == current.EndIndex
+                && row + 1 < this.rows.Length
+                && this.rows[row + 1].StartIndex == index)
+            {
+                continue;
+            }
+
             var column = 0;
             foreach (var element in current.Elements)
             {
@@ -88,6 +101,14 @@ internal sealed class ComposerVisualLayout
         return current.EndIndex;
     }
 
+    /// <summary>
+    /// Moves the caret vertically by <paramref name="delta"/>. Only the sign of <paramref name="delta"/>
+    /// matters: the caret moves exactly one visual row in that direction (magnitudes beyond one are treated
+    /// as one), clamped to the first and last rows. A zero delta is a no-op that returns the caret's current
+    /// index and preferred column unchanged rather than snapping horizontally to the preferred column on the
+    /// same row. The preferred display column is carried across calls so a run of vertical moves tracks the
+    /// same column even over shorter rows.
+    /// </summary>
     public (int CursorIndex, int PreferredColumn) MoveVertical(
         int utf16Index,
         int delta,
@@ -95,6 +116,11 @@ internal sealed class ComposerVisualLayout
     {
         var current = this.PositionForIndex(utf16Index);
         var preferred = preferredColumn ?? current.Column;
+        if (delta == 0)
+        {
+            return (Math.Clamp(utf16Index, 0, this.text.Length), preferred);
+        }
+
         var targetRow = Math.Clamp(current.Row + Math.Sign(delta), 0, this.rows.Length - 1);
         return (this.IndexForPosition(targetRow, preferred), preferred);
     }

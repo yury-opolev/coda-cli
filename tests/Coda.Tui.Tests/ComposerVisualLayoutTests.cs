@@ -55,6 +55,94 @@ public sealed class ComposerVisualLayoutTests
     }
 
     [Fact]
+    public void Hard_wrap_shared_boundary_maps_to_continuation_row_start()
+    {
+        // "abcdefgh" hard-wraps to width 4 as "abcd" / "efgh" with no whitespace dropped, so index 4 is
+        // both row 0's exclusive EndIndex and row 1's inclusive StartIndex. The shared seam must bind to
+        // the start of the continuation row rather than to the far end of the preceding row.
+        var layout = ComposerVisualLayout.Create("abcdefgh", width: 4);
+
+        Assert.Equal(2, layout.VisualLineCount);
+        Assert.Equal(new ComposerVisualPosition(1, 0), layout.PositionForIndex(4));
+        Assert.Equal(new ComposerVisualPosition(1, 4), layout.PositionForIndex(8));
+    }
+
+    [Fact]
+    public void Cjk_hard_wrap_shared_boundary_maps_to_continuation_row_start()
+    {
+        // Each ideograph is two cells wide, so "一二三四五六" hard-wraps to width 4 as "一二" / "三四" / "五六".
+        // The shared seams at UTF-16 indices 2 and 4 must bind to the start of their continuation rows.
+        var layout = ComposerVisualLayout.Create("一二三四五六", width: 4);
+
+        Assert.Equal(3, layout.VisualLineCount);
+        Assert.Equal(new ComposerVisualPosition(1, 0), layout.PositionForIndex(2));
+        Assert.Equal(new ComposerVisualPosition(2, 0), layout.PositionForIndex(4));
+    }
+
+    [Fact]
+    public void Repeated_down_movement_from_left_edge_progresses_hard_wrapped_rows()
+    {
+        // "abcdefghijkl" hard-wraps to width 4 as "abcd" / "efgh" / "ijkl". Starting from the left edge of
+        // the first row, repeated downward moves must advance one visual row per step (0 -> 4 -> 8) instead
+        // of stalling on the seam, then settle on the last row once the bottom is reached.
+        var layout = ComposerVisualLayout.Create("abcdefghijkl", width: 4);
+
+        var indices = new List<int>();
+        var rows = new List<int> { layout.PositionForIndex(0).Row };
+        var index = 0;
+        int? preferred = null;
+        for (var step = 0; step < 4; step++)
+        {
+            var moved = layout.MoveVertical(index, delta: 1, preferred);
+            index = moved.CursorIndex;
+            preferred = moved.PreferredColumn;
+            indices.Add(index);
+            rows.Add(layout.PositionForIndex(index).Row);
+        }
+
+        Assert.Equal(new[] { 4, 8, 8, 8 }, indices);
+        Assert.Equal(new[] { 0, 1, 2, 2, 2 }, rows);
+    }
+
+    [Fact]
+    public void Repeated_down_movement_from_left_edge_progresses_cjk_hard_wrapped_rows()
+    {
+        // "一二三四五六" hard-wraps to width 4 as "一二" / "三四" / "五六". Repeated downward moves from the
+        // left edge must advance one visual row per step (0 -> 2 -> 4) rather than stalling on a seam.
+        var layout = ComposerVisualLayout.Create("一二三四五六", width: 4);
+
+        var indices = new List<int>();
+        var rows = new List<int> { layout.PositionForIndex(0).Row };
+        var index = 0;
+        int? preferred = null;
+        for (var step = 0; step < 3; step++)
+        {
+            var moved = layout.MoveVertical(index, delta: 1, preferred);
+            index = moved.CursorIndex;
+            preferred = moved.PreferredColumn;
+            indices.Add(index);
+            rows.Add(layout.PositionForIndex(index).Row);
+        }
+
+        Assert.Equal(new[] { 2, 4, 4 }, indices);
+        Assert.Equal(new[] { 0, 1, 2, 2 }, rows);
+    }
+
+    [Fact]
+    public void Zero_delta_vertical_movement_keeps_index_and_preferred_column()
+    {
+        // A zero delta is a no-op: it must not snap horizontally to the preferred column. The caret sits at
+        // the end of the last row (index 15, column 6) while carrying a preferred column of 0; MoveVertical
+        // with delta 0 must return that same index and preferred column, not jump to column 0's index (9).
+        var layout = ComposerVisualLayout.Create("12345\n12\n123456", width: 20);
+
+        var result = layout.MoveVertical(15, delta: 0, preferredColumn: 0);
+
+        Assert.Equal(15, result.CursorIndex);
+        Assert.Equal(0, result.PreferredColumn);
+    }
+
+    [Fact]
     public void Dropped_wrap_boundary_whitespace_snaps_to_preceding_row_end()
     {
         // Two spaces after "alpha" wrap to width 6: the first space is consumed at the
