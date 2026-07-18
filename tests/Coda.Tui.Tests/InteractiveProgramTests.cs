@@ -11,6 +11,55 @@ namespace Coda.Tui.Tests;
 public sealed class InteractiveProgramTests
 {
     [Fact]
+    public void Semantic_startup_renders_the_helpful_banner_into_the_transcript()
+    {
+        var events = new RecordingUiEvents();
+        var built = TestAppBuilder.BuildApp(events: events, workingDirectory: @"C:\work");
+        var adapter = new UiAnsiConsoleAdapter(events, width: 100, height: 30);
+        built.Context.SetModeEnvironment(
+            adapter,
+            PlainUiPromptService.Instance,
+            events,
+            semanticUiEnabled: true);
+
+        InteractiveProgram.RenderStartupBanner(
+            built.Context,
+            TuiRunMode.Fullscreen,
+            connectedProvider: "github-copilot");
+
+        var text = string.Join(
+            Environment.NewLine,
+            events.Events.OfType<CommandOutputEvent>().Select(item => item.Text));
+        Assert.Contains("Welcome to Coda", text);
+        Assert.Contains($"v{Branding.Version}", text);
+        Assert.Contains(@"cwd: C:\work", text);
+        Assert.Contains("provider: github-copilot", text);
+        Assert.Contains($"model: {built.Context.Session.Model}", text);
+        Assert.Contains("/help", text);
+        Assert.Contains("/exit", text);
+    }
+
+    [Fact]
+    public void Plain_startup_remains_banner_free()
+    {
+        var events = new RecordingUiEvents();
+        var built = TestAppBuilder.BuildApp(events: events);
+        var adapter = new UiAnsiConsoleAdapter(events, width: 100, height: 30);
+        built.Context.SetModeEnvironment(
+            adapter,
+            PlainUiPromptService.Instance,
+            events,
+            semanticUiEnabled: true);
+
+        InteractiveProgram.RenderStartupBanner(
+            built.Context,
+            TuiRunMode.Plain,
+            connectedProvider: "github-copilot");
+
+        Assert.Empty(events.Events);
+    }
+
+    [Fact]
     public async Task Redirected_output_uses_plain_and_preserves_script_text()
     {
         var input = new StringReader("hello\n");
