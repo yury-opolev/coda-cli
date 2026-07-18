@@ -58,8 +58,8 @@ $checklist = @{
     'unicode'       = 'Unicode: wide CJK, emoji, and combining marks render with correct alignment (and IME composition where testable).'
     'paste'         = 'Multiline bracketed paste is inserted verbatim WITHOUT submitting; embedded newlines never trigger a turn.'
     'resize'        = 'Resize while streaming and with a prompt open reflows cleanly; verify minimum sizes 60x12, 59x12, and 60x11.'
-    'cancel'        = 'Ctrl-C interrupts the active turn without corrupting the terminal; an explicit exit (Esc or /exit) then leaves cleanly.'
-    'mouse-off'     = 'With the mouse disabled, keyboard navigation and editing remain fully usable.'
+    'cancel'        = 'Double-Esc interrupts the active turn without corrupting the terminal; /exit or a second Ctrl+C (with no selection) then leaves cleanly, while Ctrl+C over a selection copies.'
+    'mouse-off'     = 'With the mouse disabled, keyboard navigation and editing remain fully usable and Shift-selection replaces drag-selection.'
     'managed-crash' = 'A managed renderer crash restores the terminal (alternate screen/cursor/mouse reset) and exits non-zero — no corruption.'
 }
 
@@ -72,7 +72,7 @@ Write-Host ''
 Write-Host 'Checklist item:' -ForegroundColor Yellow
 Write-Host ("  {0}" -f $checklist[$Scenario])
 Write-Host ''
-Write-Host 'Launching the spike (interact with it, then exit with Esc / Ctrl+D / the exit key)...' -ForegroundColor Green
+Write-Host 'Launching the spike (interact with it, then exit with Esc; the full TUI uses /exit and does not bind Ctrl+D)...' -ForegroundColor Green
 Write-Host ''
 
 # Run the harness live and capture ONLY the exit code. Terminal contents are never captured or stored.

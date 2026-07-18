@@ -60,6 +60,48 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
+    public void Help_documents_the_warm_ember_interaction_model()
+    {
+        var (_, output) = Run("--help");
+
+        // Composer editing and submission.
+        Assert.Contains("Enter", output);
+        Assert.Contains("Ctrl+J", output);
+        Assert.Contains("newline", output);
+
+        // Visual arrow movement plus history at the edges.
+        Assert.Contains("Up / Down", output);
+        Assert.Contains("history", output);
+
+        // Double-Esc interrupts the active turn.
+        Assert.Contains("Esc twice", output);
+        Assert.Contains("interrupt the active turn", output);
+
+        // Ctrl+C copies a selection and only exits on a second press.
+        Assert.Contains("Ctrl+C", output);
+        Assert.Contains("selection", output);
+        Assert.Contains("press twice to exit", output);
+
+        // Selection is made by dragging or holding Shift.
+        Assert.Contains("drag", output);
+        Assert.Contains("Shift", output);
+
+        // Exit is via /exit; F2 still toggles the host model.
+        Assert.Contains("/exit", output);
+        Assert.Contains("F2", output);
+    }
+
+    [Fact]
+    public void Help_does_not_bind_ctrl_d()
+    {
+        var (_, output) = Run("--help");
+
+        // Warm Ember removes the Ctrl+D exit binding; the help must not advertise it.
+        Assert.DoesNotContain("Ctrl+D", output);
+        Assert.DoesNotContain("Ctrl-D", output);
+    }
+
+    [Fact]
     public void No_args_returns_null_to_continue_to_the_interactive_tui()
     {
         var (code, _) = Run();

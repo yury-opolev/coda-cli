@@ -177,7 +177,8 @@ internal sealed class HarnessOptions
           unicode       Render wide CJK, emoji, and combining-mark sequences.
           paste         Exercise multiline bracketed paste inserted without submitting.
           resize        Respond to and log screen-size changes (including 60x12/59x12/60x11).
-          cancel        Demonstrate Ctrl-C interruption without corrupting the terminal.
+          cancel        Demonstrate that an intercepted Ctrl+C keeps the app alive (so it can copy a
+                        selection or, pressed twice, exit); a double Esc interrupts the active turn.
           mouse-off     Disable the mouse before Init; keyboard input remains usable.
           managed-crash Throw from an iteration callback after three frames; the terminal is
                         restored by top-level disposal and the process exits non-zero.
