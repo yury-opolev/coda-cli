@@ -21,10 +21,13 @@ public sealed class TuiThemeTests
 
         Assert.Equal(new TgColor(242, 214, 179), theme.TranscriptAssistant.TrueColor);
         Assert.Equal(new TgColor(230, 168, 74), theme.TranscriptUser.TrueColor);
-        Assert.Equal(new TgColor(215, 168, 75), theme.TranscriptTool.TrueColor);
+        Assert.Equal(new TgColor(240, 190, 84), theme.TranscriptTool.TrueColor);
         Assert.Equal(new TgColor(233, 130, 107), theme.PermissionApproval.TrueColor);
         Assert.Equal(new TgColor(240, 199, 94), theme.Question.TrueColor);
         Assert.Equal(new TgColor(217, 104, 93), theme.Error.TrueColor);
+
+        // Tool gold must read as a distinctly brighter gold than the user's amber, not a near-duplicate.
+        Assert.NotEqual(theme.TranscriptUser.TrueColor, theme.TranscriptTool.TrueColor);
 
         Assert.Equal(TgName.White, theme.TranscriptAssistant.Fallback);
         Assert.Equal(TgName.BrightYellow, theme.TranscriptUser.Fallback);
@@ -48,7 +51,7 @@ public sealed class TuiThemeTests
     [Theory]
     [InlineData(TranscriptRole.Assistant, 242, 214, 179)]
     [InlineData(TranscriptRole.User, 230, 168, 74)]
-    [InlineData(TranscriptRole.Tool, 215, 168, 75)]
+    [InlineData(TranscriptRole.Tool, 240, 190, 84)]
     [InlineData(TranscriptRole.Permission, 233, 130, 107)]
     [InlineData(TranscriptRole.Question, 240, 199, 94)]
     [InlineData(TranscriptRole.Warning, 240, 199, 94)]
@@ -81,6 +84,37 @@ public sealed class TuiThemeTests
         Assert.Equal(
             new TgColor(TgName.BrightRed),
             view.AttributeFor(TranscriptRole.Permission).Foreground);
+    }
+
+    [Fact]
+    public void Composer_panel_background_is_a_distinct_warm_surface_from_the_shell_background()
+    {
+        var theme = TuiTheme.WarmEmber;
+
+        // The composer panel is a slightly lighter warm near-black than the shell surface, so the input
+        // region reads as its own panel rather than blending into the transcript background.
+        Assert.Equal(new TgColor(34, 28, 23), theme.ComposerPanelBackground.TrueColor);
+        Assert.NotEqual(theme.Background.TrueColor, theme.ComposerPanelBackground.TrueColor);
+    }
+
+    [Fact]
+    public void Composer_scheme_paints_the_composer_panel_background_for_every_state()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+
+        var scheme = TuiTheme.WarmEmber.ComposerScheme(app.Driver);
+        var panel = TuiTheme.WarmEmber.ComposerPanelBackground.TrueColor;
+
+        Assert.NotEqual(TuiTheme.WarmEmber.Background.TrueColor, scheme.Normal.Background);
+        foreach (var attribute in new[]
+        {
+            scheme.Normal, scheme.HotNormal, scheme.Focus, scheme.HotFocus, scheme.Active,
+            scheme.HotActive, scheme.Highlight, scheme.Editable, scheme.ReadOnly, scheme.Disabled,
+        })
+        {
+            Assert.Equal(panel, attribute.Background);
+        }
     }
 
     [Fact]

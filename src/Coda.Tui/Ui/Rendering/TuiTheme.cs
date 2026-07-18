@@ -40,7 +40,7 @@ internal sealed class TuiTheme
     public TuiThemeColor TranscriptUser { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
     public TuiThemeColor Heading { get; } = new(new TgColor(240, 179, 91), TgName.BrightYellow);
     public TuiThemeColor Code { get; } = new(new TgColor(200, 184, 166), TgName.Gray);
-    public TuiThemeColor TranscriptTool { get; } = new(new TgColor(215, 168, 75), TgName.BrightYellow);
+    public TuiThemeColor TranscriptTool { get; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
     public TuiThemeColor Diff { get; } = new(new TgColor(201, 138, 82), TgName.Yellow);
     public TuiThemeColor PermissionApproval { get; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
     public TuiThemeColor Question { get; } = new(new TgColor(240, 199, 94), TgName.BrightYellow);
@@ -50,6 +50,14 @@ internal sealed class TuiTheme
 
     public TuiThemeColor ComposerText { get; } = new(new TgColor(242, 214, 179), TgName.White);
     public TuiThemeColor ComposerPrompt { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+
+    /// <summary>A slightly lighter warm near-black than <see cref="Background"/> so the composer input
+    /// region reads as its own panel rather than blending into the transcript surface.</summary>
+    public TuiThemeColor ComposerPanelBackground { get; } = new(new TgColor(34, 28, 23), TgName.Black);
+
+    /// <summary>The half-block edge shading drawn along the composer panel's top and bottom rows: a warm
+    /// tone a touch lighter than the panel so the seam between shell and panel is soft, not a hard border.</summary>
+    public TuiThemeColor ComposerPanelEdge { get; } = new(new TgColor(58, 47, 38), TgName.Black);
 
     public TuiThemeColor OperationalReady { get; } = new(new TgColor(143, 136, 128), TgName.Gray);
     public TuiThemeColor OperationalInitializing { get; } = new(new TgColor(179, 138, 80), TgName.Yellow);
@@ -78,11 +86,12 @@ internal sealed class TuiTheme
     public TgAttribute Attribute(TuiThemeColor foreground, TuiThemeColor background, IDriver? driver) =>
         new(Resolve(foreground, SupportsTrueColor(driver)), Resolve(background, SupportsTrueColor(driver)));
 
-    /// <summary>A solid dark composer scheme keyed to the driver's color depth.</summary>
+    /// <summary>A solid composer panel scheme keyed to the driver's color depth: the warm composer text
+    /// over the distinct <see cref="ComposerPanelBackground"/> so the input region reads as its own panel.</summary>
     public TgScheme ComposerScheme(IDriver? driver)
     {
-        var normal = this.Attribute(this.ComposerText, this.Background, driver);
-        var focus = this.Attribute(this.TranscriptAssistant, this.Background, driver);
+        var normal = this.Attribute(this.ComposerText, this.ComposerPanelBackground, driver);
+        var focus = this.Attribute(this.TranscriptAssistant, this.ComposerPanelBackground, driver);
         return SolidScheme(normal, focus);
     }
 
