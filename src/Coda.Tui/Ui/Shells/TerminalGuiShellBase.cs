@@ -21,6 +21,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 {
     private const int DefaultStatusWidth = 80;
 
+    /// <summary>
+    /// The <see cref="ActiveOperation.Kind"/> published by the controller while the interactive startup
+    /// is running. While an operation of this kind is active the composer is hidden and disabled.
+    /// </summary>
+    private const string StartupOperationKind = "startup";
+
     private readonly IApplication app;
     private readonly ComposerController controller;
     private readonly IUiEventPublisher publisher;
@@ -29,6 +35,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private string? statusText;
     private View? focusBeforePrompt;
     private int statusUpdateCount;
+    private bool composerDisabled;
     private bool disposed;
 
     protected TerminalGuiShellBase(
@@ -45,6 +52,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.statusProjection = statusProjection ?? StatusProjector.Project;
 
         this.Composer = new ComposerView(controller);
+        this.Chrome = new ComposerChromeView();
         this.Status = new Label { CanFocus = false };
         this.PromptOverlay = new PromptOverlay(publisher);
         this.Completion = new CommandCompletionView();
@@ -55,6 +63,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         this.BuildLayout();
         this.SyncCompletion();
+        this.UpdateComposerAvailability(this.Snapshot);
     }
 
     /// <summary>Raised when the composer submits a prompt; carries the submitted text.</summary>
@@ -65,6 +74,13 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>The multiline composer that owns draft/caret/history state.</summary>
     internal ComposerView Composer { get; }
+
+    /// <summary>
+    /// The borderless chrome painted over the composer region: a subtle dark background, a left accent
+    /// bar, and either the <c>&gt;</c> prompt glyph or an <c>Initializing…</c> label. Non-focusable and
+    /// owned here; concrete shells position it directly beneath the composer in <see cref="BuildLayout"/>.
+    /// </summary>
+    internal ComposerChromeView Chrome { get; }
 
     /// <summary>The one-line status label pinned below the composer.</summary>
     internal Label Status { get; }
@@ -213,6 +229,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Snapshot = snapshot;
 
         this.UpdateStatus(snapshot);
+        this.UpdateComposerAvailability(snapshot);
         this.UpdatePrompt(snapshot);
         this.ApplyTranscriptChanges(previous, snapshot);
     }
@@ -237,6 +254,54 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.statusText = text;
         this.Status.Text = text;
         this.statusUpdateCount++;
+    }
+
+    /// <summary>
+    /// Reconciles composer readiness from the semantic snapshot before prompt focus is settled. While the
+    /// startup operation is active the real editor is hidden and disabled and the chrome shows
+    /// <c>Initializing…</c>, so it is visually impossible to type. When startup clears, the editor is shown
+    /// and re-enabled, the chrome shows <c>&gt;</c>, and — only on the transition back to ready and only when
+    /// no prompt is pending — the composer regains focus, so an open prompt overlay is never robbed of it.
+    /// </summary>
+    private void UpdateComposerAvailability(UiSessionSnapshot snapshot)
+    {
+        var startingUp = snapshot.ActiveOperation?.Kind == StartupOperationKind;
+        if (startingUp)
+        {
+            this.Chrome.SetReady(false);
+            this.Composer.InputEnabled = false;
+            this.Composer.CanFocus = false;
+            this.Composer.Visible = false;
+            this.Completion.Visible = false;
+            this.composerDisabled = true;
+            return;
+        }
+
+        this.Chrome.SetReady(true);
+        this.Composer.InputEnabled = true;
+        this.Composer.CanFocus = true;
+        this.Composer.Visible = true;
+
+        if (!this.composerDisabled)
+        {
+            // Already ready on the previous frame: completion visibility is managed by the composer's
+            // own CompletionChanged events, so avoid re-syncing (and re-laying-out) on every snapshot.
+            return;
+        }
+
+        this.composerDisabled = false;
+
+        // Returning from the disabled state: re-evaluate the completion overlay now that suggestions are
+        // relevant again (e.g. a restored slash draft), which also restores the visibility that startup
+        // forced hidden.
+        this.SyncCompletion();
+
+        // Focus the editor on the transition back to ready, but never when a prompt is pending: the modal
+        // overlay stays topmost and keeps focus.
+        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible)
+        {
+            this.Composer.SetFocus();
+        }
     }
 
     private void UpdatePrompt(UiSessionSnapshot snapshot)

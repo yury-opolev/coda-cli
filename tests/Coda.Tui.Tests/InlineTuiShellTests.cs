@@ -109,6 +109,74 @@ public sealed class InlineTuiShellTests
         }
     }
 
+    [Theory]
+    [InlineData(60, 12)]
+    [InlineData(80, 24)]
+    public void Inline_composer_is_borderless_with_chrome_over_the_composer_region(int width, int height)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, height);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // Inline inherits the retained layout, so the borderless composer and its chrome behave identically.
+        Assert.Null(shell.Composer.BorderStyle);
+        Assert.False(shell.Chrome.CanFocus);
+        Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
+        Assert.Equal(width - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
+        Assert.Equal(0, shell.Chrome.Frame.X);
+        Assert.Equal(width, shell.Chrome.Frame.Width);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Composer.Frame.Height, shell.Chrome.Frame.Height);
+        Assert.True(shell.Chrome.Ready);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Inline_startup_then_ready_toggles_initializing_and_prompt()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+
+        Assert.False(shell.Composer.Visible);
+        Assert.False(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.InitializingText, shell.Chrome.DisplayText);
+
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+
+        Assert.True(shell.Composer.Visible);
+        Assert.True(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
     [Fact]
     public async Task Inline_transcript_shows_user_assistant_tool_history_and_autofollows_appends()
     {

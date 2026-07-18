@@ -84,8 +84,204 @@ public sealed class FullscreenTuiShellTests
         app.LayoutAndDraw();
 
         Assert.Equal(width, shell.Header.Frame.Width);
-        Assert.Equal(width, shell.Composer.Frame.Width);
         Assert.Equal(width, shell.Status.Frame.Width);
+
+        // The composer no longer spans the full width: a small fixed gutter is reserved at its left for
+        // the borderless chrome (accent bar + prompt glyph). The chrome itself spans the full width.
+        Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
+        Assert.Equal(width - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
+        Assert.Equal(0, shell.Chrome.Frame.X);
+        Assert.Equal(width, shell.Chrome.Frame.Width);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Theory]
+    [InlineData(60, 12)]
+    [InlineData(80, 24)]
+    [InlineData(140, 40)]
+    public void Fullscreen_composer_is_borderless_with_chrome_over_the_composer_region(int width, int height)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, height);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // No rectangular border around the input.
+        Assert.Null(shell.Composer.BorderStyle);
+
+        // The shell-owned chrome spans exactly the composer's rows, is non-focusable, and reads ready.
+        Assert.False(shell.Chrome.CanFocus);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Composer.Frame.Height, shell.Chrome.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
+        Assert.True(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_startup_snapshot_hides_composer_and_shows_initializing()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+
+        Assert.False(shell.Composer.Visible);
+        Assert.False(shell.Composer.HasFocus);
+        Assert.False(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.InitializingText, shell.Chrome.DisplayText);
+        Assert.False(shell.Completion.Visible);
+        Assert.Contains("Starting…", shell.Status.Text);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_ready_snapshot_shows_composer_prompt_and_focuses()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+        Assert.False(shell.Composer.Visible);
+
+        // Startup completes: the active operation clears, so the composer is shown, focused, and the
+        // chrome flips back to the '>' prompt glyph.
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+
+        Assert.True(shell.Composer.Visible);
+        Assert.True(shell.Composer.CanFocus);
+        Assert.True(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_prompt_pending_keeps_prompt_focus_when_startup_completes()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var prompt = Coda.Tui.Ui.Prompts.UiPromptRequest.Confirm("Allow?", defaultValue: false);
+        var startupWithPrompt = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+            PendingPrompt = prompt,
+        };
+        await shell.ApplyAsync(startupWithPrompt, CancellationToken.None);
+        Assert.True(shell.PromptOverlay.Visible);
+
+        // Startup completes but the prompt is still pending: focus must stay on the prompt overlay and
+        // the composer must not steal it back or appear in front of the modal prompt.
+        var readyWithPrompt = UiSessionSnapshot.Empty with { PendingPrompt = prompt };
+        await shell.ApplyAsync(readyWithPrompt, CancellationToken.None);
+
+        Assert.True(shell.PromptOverlay.Visible);
+        Assert.True(shell.PromptOverlay.HasFocus);
+        Assert.False(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_submission_is_blocked_during_startup_and_works_after_ready()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var submissions = new List<string>();
+        shell.PromptSubmitted += (_, text) => submissions.Add(text);
+        shell.Composer.SetDraft("hello", 5);
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+
+        // Pressing Enter while startup is active must not submit a turn.
+        shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.Empty(submissions);
+
+        // Once ready, the same Enter submits the preserved draft immediately.
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+        shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.Equal(["hello"], submissions);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Fullscreen_narrow_minimum_geometry_reserves_gutter_without_starving_composer()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(60, 12);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
+        Assert.Equal(60 - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
+        Assert.True(shell.Composer.Frame.Width >= 40, "composer should stay comfortably usable at 60 columns");
+        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(60, shell.Chrome.Frame.Width);
 
         if (token is not null)
         {

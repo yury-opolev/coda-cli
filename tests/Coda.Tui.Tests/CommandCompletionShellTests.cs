@@ -51,6 +51,45 @@ public sealed class CommandCompletionShellTests
     }
 
     [Fact]
+    public async Task Completion_is_hidden_during_startup_then_shown_for_restored_slash_draft_when_ready()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var controller = new ComposerController(
+            new SlashCommandCompletion(new SlashCommandRegistry(Commands())));
+        controller.ReplaceDraft("/he", 3);
+        using var shell = new FullscreenTuiShell(
+            app,
+            controller,
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // While startup is active the completion menu is irrelevant and must stay hidden even though the
+        // restored draft would otherwise offer suggestions.
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+        Assert.False(shell.Completion.Visible);
+
+        // Once ready, the restored slash draft's completion reappears.
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+        Assert.True(shell.Completion.Visible);
+        Assert.Contains(shell.Completion.RenderVisibleRows(80), row => row.Contains("help"));
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public void Fullscreen_shows_completion_menu_above_composer_without_moving_composer_or_status()
     {
         using IApplication app = Application.Create();

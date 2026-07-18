@@ -21,6 +21,7 @@ internal sealed class ComposerView : TextView
 {
     private readonly ComposerController controller;
     private bool syncingText;
+    private bool inputEnabled = true;
     private IReadOnlyList<ISlashCommand> lastSuggestions = [];
     private int lastSelectedIndex = -1;
 
@@ -60,6 +61,17 @@ internal sealed class ComposerView : TextView
     /// </summary>
     public int DraftLineCount => this.controller.State.Draft.Count(character => character == '\n') + 1;
 
+    /// <summary>
+    /// Whether the composer accepts key input. The shell disables it while the semantic startup operation
+    /// is active so a submission (or any edit) can never race initialization, then re-enables it once the
+    /// snapshot reports ready. While disabled, key events are swallowed rather than acted on.
+    /// </summary>
+    internal bool InputEnabled
+    {
+        get => this.inputEnabled;
+        set => this.inputEnabled = value;
+    }
+
     public void SetDraft(string text, int cursorIndex)
     {
         this.controller.ReplaceDraft(text ?? string.Empty, cursorIndex);
@@ -79,6 +91,13 @@ internal sealed class ComposerView : TextView
 
     protected override bool OnKeyDown(Key key)
     {
+        // While startup is active the shell disables input; swallow keys so no submission or edit can
+        // race initialization, and never surface a completion change from an ignored keystroke.
+        if (!this.inputEnabled)
+        {
+            return true;
+        }
+
         var handled = this.HandleKeyDown(key);
         this.RaiseCompletionIfChanged();
         return handled;
@@ -119,6 +138,12 @@ internal sealed class ComposerView : TextView
 
     protected override bool OnPaste(string text)
     {
+        // Startup disables input; a bracketed paste must be ignored just like a keystroke.
+        if (!this.inputEnabled)
+        {
+            return true;
+        }
+
         var handled = this.HandlePaste(text);
         this.RaiseCompletionIfChanged();
         return handled;

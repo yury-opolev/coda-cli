@@ -35,6 +35,12 @@ internal class FullscreenTuiShell(
     /// <summary>The transcript is never rendered wider than this many columns.</summary>
     public const int MaximumTranscriptWidth = 120;
 
+    /// <summary>
+    /// Columns reserved at the composer's left edge for the borderless chrome — the accent bar and the
+    /// <c>&gt;</c> prompt glyph. The composer is shifted right by this much and narrowed accordingly.
+    /// </summary>
+    internal const int ComposerGutterWidth = 4;
+
     private Label header = null!;
     private VirtualizedTranscriptView transcript = null!;
 
@@ -63,11 +69,19 @@ internal class FullscreenTuiShell(
         this.transcript.Width = Dim.Func(TranscriptWidth, this);
         this.transcript.Height = Dim.Fill(4);
 
-        this.Composer.X = 0;
+        // The borderless composer is shifted right by a small gutter so the chrome can paint its accent
+        // bar and prompt glyph to its left; the chrome spans the full width beneath it.
+        this.Chrome.X = 0;
+        this.Chrome.Y = Pos.AnchorEnd(4);
+        this.Chrome.Width = Dim.Fill();
+        this.Chrome.Height = 3;
+
+        this.Composer.X = ComposerGutterWidth;
         this.Composer.Y = Pos.AnchorEnd(4);
         this.Composer.Width = Dim.Fill();
         this.Composer.Height = 3;
-        this.Composer.BorderStyle = LineStyle.Single;
+        this.Composer.BorderStyle = null;
+        this.Composer.SetScheme(ComposerChromeView.CreateInputScheme());
 
         this.Status.X = 0;
         this.Status.Y = Pos.AnchorEnd(1);
@@ -88,6 +102,7 @@ internal class FullscreenTuiShell(
 
         this.Add(this.header);
         this.Add(this.transcript);
+        this.Add(this.Chrome);
         this.Add(this.Composer);
         this.Add(this.Status);
         this.Add(this.Completion);
