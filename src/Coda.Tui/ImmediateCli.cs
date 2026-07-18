@@ -52,9 +52,11 @@ public static class ImmediateCli
         writer.WriteLine();
         writer.WriteLine("Interactive display:");
         writer.WriteLine("  --tui=auto|inline|fullscreen");
-        writer.WriteLine("                  Choose the interactive surface. auto (default) selects plain for");
-        writer.WriteLine("                  redirected/non-interactive terminals or ones smaller than 60x12,");
-        writer.WriteLine("                  and the inline Terminal.Gui composer otherwise; fullscreen is opt-in.");
+        writer.WriteLine("                  Choose the interactive surface. auto (default) selects the full-screen");
+        writer.WriteLine("                  Terminal.Gui transcript on a suitable interactive terminal, or plain for");
+        writer.WriteLine("                  redirected/non-interactive terminals or ones smaller than 60x12. inline is");
+        writer.WriteLine("                  an optional retained-transcript surface that runs in the primary buffer");
+        writer.WriteLine("                  (terminal history) instead of the alternate screen; fullscreen forces the full-screen UI.");
         writer.WriteLine("  --plain         Force the plain, line-based surface (no Terminal.Gui, no control");
         writer.WriteLine("                  sequences); wins over --tui. Ideal for scripts, pipes, and CI.");
         writer.WriteLine("  --no-mouse      Disable mouse capture; every action stays available via the keyboard.");

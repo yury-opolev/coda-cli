@@ -21,6 +21,8 @@ internal sealed class ComposerView : TextView
 {
     private readonly ComposerController controller;
     private bool syncingText;
+    private IReadOnlyList<ISlashCommand> lastSuggestions = [];
+    private int lastSelectedIndex = -1;
 
     public ComposerView(ComposerController controller)
     {
@@ -30,6 +32,7 @@ internal sealed class ComposerView : TextView
         this.TabKeyAddsTab = false;
         this.ContentsChanged += this.OnContentsChangedSync;
         this.SyncTextView();
+        this.SnapshotCompletion();
     }
 
     /// <summary>Raised when the user submits the composer; carries the submitted text.</summary>
@@ -38,8 +41,18 @@ internal sealed class ComposerView : TextView
     /// <summary>Raised for shell-level actions (interrupt, exit, toggle mode, transcript scrolling, ...).</summary>
     public event EventHandler<UiAction>? ActionRequested;
 
+    /// <summary>
+    /// Raised only when the slash-command completion actually changes — its offered suggestions, the
+    /// selected index, or its visibility — so a host can (re)render the completion menu without redraw
+    /// loops. Never fires while the completion is unchanged (e.g. plain typing with no suggestions).
+    /// </summary>
+    public event EventHandler? CompletionChanged;
+
     /// <summary>Current slash command suggestions, exposed so the shell can render an overlay.</summary>
     public IReadOnlyList<ISlashCommand> Suggestions => this.controller.Suggestions;
+
+    /// <summary>The selected suggestion index while suggestions are visible, or -1 when none.</summary>
+    public int SelectedSuggestionIndex => this.controller.SelectedSuggestionIndex;
 
     /// <summary>
     /// Number of content lines in the draft. It is independent of suggestion visibility,
@@ -51,6 +64,7 @@ internal sealed class ComposerView : TextView
     {
         this.controller.ReplaceDraft(text ?? string.Empty, cursorIndex);
         this.SyncTextView();
+        this.RaiseCompletionIfChanged();
     }
 
     public string GetDraft() => this.controller.State.Draft;
@@ -64,6 +78,13 @@ internal sealed class ComposerView : TextView
     public bool NewPasteEvent(string text) => this.OnPaste(text ?? string.Empty);
 
     protected override bool OnKeyDown(Key key)
+    {
+        var handled = this.HandleKeyDown(key);
+        this.RaiseCompletionIfChanged();
+        return handled;
+    }
+
+    private bool HandleKeyDown(Key key)
     {
         var context = new UiInputContext(
             ComposerEmpty: this.controller.State.Draft.Length == 0,
@@ -97,6 +118,13 @@ internal sealed class ComposerView : TextView
     }
 
     protected override bool OnPaste(string text)
+    {
+        var handled = this.HandlePaste(text);
+        this.RaiseCompletionIfChanged();
+        return handled;
+    }
+
+    private bool HandlePaste(string text)
     {
         this.SyncCursorFromView();
         this.controller.BeginPaste();
@@ -153,6 +181,48 @@ internal sealed class ComposerView : TextView
 
     private void OnContentsChangedSync(object? sender, ContentsChangedEventArgs e) =>
         this.SyncControllerFromTextView();
+
+    /// <summary>
+    /// Fires <see cref="CompletionChanged"/> only when the completion's suggestion identities, selected
+    /// index, or visibility actually differ from the last observed state, so repeated syncs and plain
+    /// typing that leaves the completion unchanged never trigger a redraw loop.
+    /// </summary>
+    private void RaiseCompletionIfChanged()
+    {
+        var suggestions = this.controller.Suggestions;
+        var selected = this.controller.SelectedSuggestionIndex;
+        if (selected == this.lastSelectedIndex && SameSuggestions(this.lastSuggestions, suggestions))
+        {
+            return;
+        }
+
+        this.SnapshotCompletion();
+        this.CompletionChanged?.Invoke(this, EventArgs.Empty);
+    }
+
+    private void SnapshotCompletion()
+    {
+        this.lastSuggestions = this.controller.Suggestions;
+        this.lastSelectedIndex = this.controller.SelectedSuggestionIndex;
+    }
+
+    private static bool SameSuggestions(IReadOnlyList<ISlashCommand> a, IReadOnlyList<ISlashCommand> b)
+    {
+        if (a.Count != b.Count)
+        {
+            return false;
+        }
+
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (!ReferenceEquals(a[i], b[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
 
     /// <summary>
     /// Defense in depth for caret paths the controller did not directly drive (for

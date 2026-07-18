@@ -51,6 +51,15 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
+    public void Help_says_auto_defaults_to_fullscreen_and_inline_is_optional()
+    {
+        var (_, output) = Run("--help");
+
+        Assert.Contains("full-screen", output);
+        Assert.Contains("optional", output);
+    }
+
+    [Fact]
     public void No_args_returns_null_to_continue_to_the_interactive_tui()
     {
         var (code, _) = Run();

@@ -168,7 +168,7 @@ internal sealed class HarnessOptions
           dotnet run --project samples/Coda.TerminalGuiSpike -- --mode <mode> --scenario <scenario> [options]
 
         Modes (--mode):
-          inline        Inline host model (composer + native scrollback); the acceptance default.
+          inline        Inline host model (primary buffer / terminal history); the acceptance default.
           fullscreen    Full-screen host model with a virtualized transcript viewport.
 
         Scenarios (--scenario):

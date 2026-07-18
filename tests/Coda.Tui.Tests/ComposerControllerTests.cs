@@ -151,6 +151,26 @@ public sealed class ComposerControllerTests
     }
 
     [Fact]
+    public void SelectedSuggestionIndex_tracks_selection_and_is_negative_when_hidden()
+    {
+        var controller = CreateController(
+            new TestCommand("model", "Model"),
+            new TestCommand("mcp", "Mcp"));
+
+        Assert.Equal(-1, controller.SelectedSuggestionIndex);
+
+        controller.ReplaceDraft("/m", 2);
+        Assert.True(controller.Suggestions.Count >= 2);
+        Assert.Equal(0, controller.SelectedSuggestionIndex);
+
+        controller.Apply(UiAction.CompletionNext);
+        Assert.Equal(1, controller.SelectedSuggestionIndex);
+
+        controller.Apply(UiAction.DismissCompletion);
+        Assert.Equal(-1, controller.SelectedSuggestionIndex);
+    }
+
+    [Fact]
     public void History_navigation_preserves_pre_navigation_draft_and_clamps_boundaries()
     {
         var controller = CreateController();
