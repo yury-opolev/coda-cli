@@ -10,7 +10,7 @@ namespace Coda.Tui.Tests;
 /// Shell-level tests for the visible slash-command completion menu. The menu is owned by
 /// <see cref="Coda.Tui.Ui.Shells.TerminalGuiShellBase"/> and synchronized from the composer: in full-screen
 /// it overlays the bottom of the transcript directly above the composer without moving the composer/status,
-/// and in inline mode it sits between the active row and the composer so the region grows only while visible.
+/// and inline mode reuses the same retained overlay geometry in the terminal's primary buffer.
 /// </summary>
 public sealed class CommandCompletionShellTests
 {

@@ -188,9 +188,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>
     /// Positions the completion menu for the current suggestion count. <paramref name="height"/> is the
-    /// number of option rows to show (0 when hidden). Concrete shells anchor the menu appropriately —
-    /// full-screen overlays it above the fixed composer, inline expands the region between the active row
-    /// and the composer — without moving the composer or status.
+    /// number of option rows to show (0 when hidden). Both retained shells overlay it above the fixed
+    /// composer without moving the composer or status.
     /// </summary>
     protected abstract void PlaceCompletion(int height, bool visible);
 
