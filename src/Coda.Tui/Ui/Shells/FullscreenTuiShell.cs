@@ -28,16 +28,37 @@ internal class FullscreenTuiShell(
     ComposerController controller,
     IUiEventPublisher publisher,
     UiSessionSnapshot initialSnapshot,
+    Func<bool>? hasActiveWork = null,
+    TimeProvider? timeProvider = null,
+    Func<string, bool>? clipboardWriter = null,
+    Func<TimeSpan, Func<bool>, object>? addTimeout = null,
+    Func<object, bool>? removeTimeout = null,
+    TuiTheme? theme = null,
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null)
-    : TerminalGuiShellBase(app, controller, publisher, initialSnapshot, statusProjection)
+    : TerminalGuiShellBase(
+        app,
+        controller,
+        publisher,
+        initialSnapshot,
+        hasActiveWork,
+        timeProvider,
+        clipboardWriter,
+        addTimeout,
+        removeTimeout,
+        theme,
+        statusProjection)
 {
+    /// <summary>The minimum (and, for now, fixed) number of composer input rows.</summary>
+    internal const int MinimumComposerHeight = 3;
+
     /// <summary>
     /// Columns reserved at the composer's left edge for the borderless <c>&gt;</c> prompt glyph. The
     /// composer is shifted right by this much and narrowed accordingly.
     /// </summary>
-    internal const int ComposerGutterWidth = 4;
+    internal const int ComposerGutterWidth = 2;
 
+    private int composerHeight = MinimumComposerHeight;
     private Label header = null!;
     private VirtualizedTranscriptView transcript = null!;
 
@@ -70,19 +91,26 @@ internal class FullscreenTuiShell(
         this.transcript.X = 0;
         this.transcript.Y = Pos.Bottom(this.header);
         this.transcript.Width = Dim.Fill();
-        this.transcript.Height = Dim.Fill(4);
+        this.transcript.Height = Dim.Fill(this.composerHeight + 2);
+
+        // The always-visible operational status row sits directly above the composer, between the
+        // transcript and the composer chrome.
+        this.Operational.X = 0;
+        this.Operational.Y = Pos.AnchorEnd(this.composerHeight + 2);
+        this.Operational.Width = Dim.Fill();
+        this.Operational.Height = 1;
 
         // The borderless composer is shifted right by a small gutter so the chrome can paint its prompt
         // glyph to the left; the chrome spans the full width beneath it.
         this.Chrome.X = 0;
-        this.Chrome.Y = Pos.AnchorEnd(4);
+        this.Chrome.Y = Pos.AnchorEnd(this.composerHeight + 1);
         this.Chrome.Width = Dim.Fill();
-        this.Chrome.Height = 3;
+        this.Chrome.Height = this.composerHeight;
 
         this.Composer.X = ComposerGutterWidth;
-        this.Composer.Y = Pos.AnchorEnd(4);
+        this.Composer.Y = Pos.AnchorEnd(this.composerHeight + 1);
         this.Composer.Width = Dim.Fill();
-        this.Composer.Height = 3;
+        this.Composer.Height = this.composerHeight;
         this.Composer.BorderStyle = null;
         this.Composer.SetScheme(this.Chrome.CreateInputScheme(this.HostApp.Driver));
 
@@ -91,11 +119,11 @@ internal class FullscreenTuiShell(
         this.Status.Width = Dim.Fill();
         this.Status.Height = 1;
 
-        // The completion menu overlays the transcript's bottom rows directly above the composer. It is
-        // hidden with height 0 until the composer offers suggestions; PlaceCompletion re-anchors it.
+        // The completion menu overlays the transcript's bottom rows directly above the operational row. It
+        // is hidden with height 0 until the composer offers suggestions; PlaceCompletion re-anchors it.
         this.Completion.X = 0;
         this.Completion.Width = Dim.Fill();
-        this.Completion.Y = Pos.AnchorEnd(4);
+        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + 2);
         this.Completion.Height = 0;
 
         this.PromptOverlay.X = 0;
@@ -107,6 +135,7 @@ internal class FullscreenTuiShell(
         this.Add(this.transcript);
         this.Add(this.Chrome);
         this.Add(this.Composer);
+        this.Add(this.Operational);
         this.Add(this.Status);
         this.Add(this.Completion);
         this.Add(this.PromptOverlay);
@@ -120,13 +149,13 @@ internal class FullscreenTuiShell(
     protected virtual Dim ResolveShellHeight() => Dim.Fill();
 
     /// <summary>
-    /// Anchors the menu so its bottom row sits immediately above the composer (composer 3 + status 1 = 4
-    /// bottom rows), overlaying the transcript. The composer and status stay pinned to the bottom, so the
-    /// menu never displaces them.
+    /// Anchors the menu so its bottom row sits immediately above the operational row (operational 1 +
+    /// composer 3 + status 1 = 5 bottom rows), overlaying the transcript. The composer, operational row,
+    /// and status stay pinned to the bottom, so the menu never displaces them.
     /// </summary>
     protected override void PlaceCompletion(int height, bool visible)
     {
-        this.Completion.Y = Pos.AnchorEnd(4 + height);
+        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + height + 2);
         this.Completion.Height = height;
     }
 

@@ -157,6 +157,10 @@ public sealed class FullscreenTuiShellTests
         Assert.False(shell.Completion.Visible);
         Assert.DoesNotContain("Starting…", shell.Status.Text);
 
+        // The operational row (above the composer) owns the Initializing message; the chrome stays blank.
+        Assert.Equal("Initializing…", shell.Operational.Status.Text);
+        Assert.DoesNotContain("Initializing", string.Join('\n', shell.Chrome.RenderRows(80, 3)));
+
         if (token is not null)
         {
             app.End(token);
@@ -638,20 +642,18 @@ public sealed class FullscreenTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Header on row 0, status on the final row, composer three rows directly above the status.
+        // Retained row order: header, transcript, operational row, composer, metadata (status).
         Assert.Equal(0, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
-        Assert.Equal(1, shell.Status.Frame.Height);
-        Assert.Equal(height - 1, shell.Status.Frame.Y);
         Assert.Equal(3, shell.Composer.Frame.Height);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(1, shell.Operational.Frame.Height);
+        Assert.Equal(1, shell.Status.Frame.Height);
 
-        // Transcript fills every row between the header and the composer, at least height - 5 rows.
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
-        Assert.True(
-            shell.Transcript.Frame.Height >= height - 5,
-            $"transcript height {shell.Transcript.Frame.Height} should be at least {height - 5}");
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
 
         if (token is not null)
         {

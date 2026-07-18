@@ -1,6 +1,7 @@
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Shells;
@@ -43,6 +44,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ComposerController controller,
         IUiEventPublisher publisher,
         UiSessionSnapshot initialSnapshot,
+        Func<bool>? hasActiveWork = null,
+        TimeProvider? timeProvider = null,
+        Func<string, bool>? clipboardWriter = null,
+        Func<TimeSpan, Func<bool>, object>? addTimeout = null,
+        Func<object, bool>? removeTimeout = null,
+        TuiTheme? theme = null,
         Func<UiSessionSnapshot, int, string>? statusProjection = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
@@ -50,13 +57,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
         this.Snapshot = initialSnapshot ?? throw new ArgumentNullException(nameof(initialSnapshot));
         this.statusProjection = statusProjection ?? StatusProjector.Project;
+        this.HasActiveWork = hasActiveWork;
+        this.TimeSource = timeProvider ?? TimeProvider.System;
+        this.ClipboardWriter = clipboardWriter;
+        this.Theme = theme ?? TuiTheme.WarmEmber;
 
         this.Composer = new ComposerView(controller);
-        this.Chrome = new ComposerChromeView();
+        this.Chrome = new ComposerChromeView(this.Theme);
+        this.Operational = new OperationalStatusView(app, this.Theme, addTimeout, removeTimeout);
         this.Status = new Label { CanFocus = false };
-        this.PromptOverlay = new PromptOverlay(publisher);
+        this.PromptOverlay = new PromptOverlay(publisher, this.Theme);
         this.PromptOverlay.ApplyTheme(app.Driver);
-        this.Completion = new CommandCompletionView();
+        this.Completion = new CommandCompletionView(this.Theme);
 
         this.Composer.Submitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
@@ -64,6 +76,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         this.BuildLayout();
         this.SyncCompletion();
+        this.UpdateProjectedOperationalStatus(this.Snapshot);
         this.UpdateComposerAvailability(this.Snapshot);
     }
 
@@ -83,8 +96,30 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// </summary>
     internal ComposerChromeView Chrome { get; }
 
-    /// <summary>The one-line status label pinned below the composer.</summary>
+    /// <summary>
+    /// The always-visible one-row operational status pinned directly above the composer. It owns the
+    /// spinner/timer lifecycle and is themed per <see cref="OperationalTone"/>; concrete shells position it
+    /// between the transcript and the composer in <see cref="BuildLayout"/>.
+    /// </summary>
+    internal OperationalStatusView Operational { get; }
+
+    /// <summary>The one-line stable-metadata label pinned to the shell's final row.</summary>
     internal Label Status { get; }
+
+    /// <summary>The Warm Ember theme shared by every view this shell constructs.</summary>
+    protected TuiTheme Theme { get; }
+
+    /// <summary>
+    /// Reports whether the session currently has active work; a future seam for chord handling. Stored now
+    /// so later chord/clipboard tasks do not churn the constructor signature.
+    /// </summary>
+    protected Func<bool>? HasActiveWork { get; }
+
+    /// <summary>The clock used for deterministic timing; a future seam for chord handling.</summary>
+    protected TimeProvider TimeSource { get; }
+
+    /// <summary>Writes text to the system clipboard; a future seam for the copy chord.</summary>
+    protected Func<string, bool>? ClipboardWriter { get; }
 
     /// <summary>The keyboard-only prompt surface, hidden until a prompt is pending.</summary>
     internal PromptOverlay PromptOverlay { get; }
@@ -111,6 +146,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>The owning application, used by concrete shells for on-thread draw/commit work.</summary>
     protected IApplication HostApp => this.app;
+
+    /// <summary>
+    /// Whether a shell-local override currently owns the operational status row, suppressing the projected
+    /// status. Always false today; a later task overrides this to pin transient shell-driven messages.
+    /// </summary>
+    protected virtual bool HasOperationalOverride => false;
 
     /// <summary>Exports the composer state so it survives a shell/mode switch.</summary>
     public ComposerState ExportComposerState() => this.controller.Export();
@@ -229,7 +270,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         var previous = this.Snapshot;
         this.Snapshot = snapshot;
 
-        this.UpdateStatus(snapshot);
+        this.UpdateMetadata(snapshot);
+        this.UpdateProjectedOperationalStatus(snapshot);
         this.UpdateComposerAvailability(snapshot);
         this.UpdatePrompt(snapshot);
         this.ApplyTranscriptChanges(previous, snapshot);
@@ -238,7 +280,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private bool IsOnUiThread() =>
         this.app.MainThreadId is { } mainThreadId && mainThreadId == Environment.CurrentManagedThreadId;
 
-    private void UpdateStatus(UiSessionSnapshot snapshot)
+    private void UpdateMetadata(UiSessionSnapshot snapshot)
     {
         var width = this.Status.Frame.Width;
         if (width <= 0)
@@ -255,6 +297,20 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.statusText = text;
         this.Status.Text = text;
         this.statusUpdateCount++;
+    }
+
+    /// <summary>
+    /// Projects the semantic snapshot onto the operational status row unless a shell-local override is
+    /// active, driving the spinner/timer lifecycle owned by <see cref="OperationalStatusView"/>.
+    /// </summary>
+    private void UpdateProjectedOperationalStatus(UiSessionSnapshot snapshot)
+    {
+        if (this.HasOperationalOverride)
+        {
+            return;
+        }
+
+        this.Operational.SetStatus(OperationalStatusProjector.Project(snapshot));
     }
 
     /// <summary>

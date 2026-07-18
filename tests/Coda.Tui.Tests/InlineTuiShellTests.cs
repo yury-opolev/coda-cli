@@ -90,22 +90,21 @@ public sealed class InlineTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Header on the top row, status on the shell's final row, composer three rows directly above it.
+        // Retained row order: header, transcript, operational row, composer, metadata (status).
         Assert.Equal(shell.Frame.Y, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
+        Assert.Equal(1, shell.Operational.Frame.Height);
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
         Assert.Equal(3, shell.Composer.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
 
-        // Transcript fills every row between the header and the composer, at least height - 5 rows.
+        // Transcript fills every row between the header and the operational row.
         Assert.Equal(0, shell.Transcript.Frame.X);
         Assert.Equal(width, shell.Transcript.Frame.Width);
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
-        Assert.True(
-            shell.Transcript.Frame.Height >= height - 5,
-            $"transcript height {shell.Transcript.Frame.Height} should be at least {height - 5}");
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
 
         if (token is not null)
         {
@@ -167,6 +166,8 @@ public sealed class InlineTuiShellTests
         Assert.False(shell.Composer.Visible);
         Assert.False(shell.Chrome.Ready);
         Assert.Equal(string.Empty, shell.Chrome.DisplayText);
+        Assert.Equal("Initializing…", shell.Operational.Status.Text);
+        Assert.DoesNotContain("Initializing", string.Join('\n', shell.Chrome.RenderRows(80, 3)));
 
         await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
 

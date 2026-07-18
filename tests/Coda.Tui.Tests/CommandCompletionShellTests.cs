@@ -102,6 +102,7 @@ public sealed class CommandCompletionShellTests
 
         Assert.False(shell.Completion.Visible);
         var composerY = shell.Composer.Frame.Y;
+        var operationalY = shell.Operational.Frame.Y;
         var statusY = shell.Status.Frame.Y;
 
         shell.Composer.SetDraft("/he", 3);
@@ -112,10 +113,11 @@ public sealed class CommandCompletionShellTests
         Assert.Contains(rows, row => row.Contains("help") && row.Contains("Show help"));
         Assert.Contains(rows, row => row.Contains(">"));
 
-        // The menu bottom aligns with the composer top (overlaying the transcript), and neither the
-        // composer nor the status moved to make room for it.
-        Assert.Equal(shell.Composer.Frame.Y, shell.Completion.Frame.Bottom);
+        // The menu bottom aligns with the operational row (overlaying the transcript), and neither the
+        // composer, operational row, nor the status moved to make room for it.
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
         Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(operationalY, shell.Operational.Frame.Y);
         Assert.Equal(statusY, shell.Status.Frame.Y);
 
         if (token is not null)
@@ -179,6 +181,7 @@ public sealed class CommandCompletionShellTests
 
         Assert.False(shell.Completion.Visible);
         var composerY = shell.Composer.Frame.Y;
+        var operationalY = shell.Operational.Frame.Y;
         var statusY = shell.Status.Frame.Y;
 
         shell.Composer.SetDraft("/he", 3);
@@ -188,10 +191,11 @@ public sealed class CommandCompletionShellTests
         var rows = shell.Completion.RenderVisibleRows(80);
         Assert.Contains(rows, row => row.Contains("help") && row.Contains("Show help"));
 
-        // The menu bottom aligns with the composer top (overlaying the retained transcript), and neither
-        // the composer nor the status moved to make room for it. Escape hides the menu again.
-        Assert.Equal(shell.Composer.Frame.Y, shell.Completion.Frame.Bottom);
+        // The menu bottom aligns with the operational row (overlaying the retained transcript), and neither
+        // the composer, operational row, nor the status moved to make room for it. Escape hides the menu.
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
         Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(operationalY, shell.Operational.Frame.Y);
         Assert.Equal(statusY, shell.Status.Frame.Y);
 
         shell.Composer.NewKeyDownEvent(Key.Esc);
@@ -199,6 +203,7 @@ public sealed class CommandCompletionShellTests
 
         Assert.False(shell.Completion.Visible);
         Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(operationalY, shell.Operational.Frame.Y);
         Assert.Equal(statusY, shell.Status.Frame.Y);
 
         if (token is not null)
