@@ -31,6 +31,14 @@ internal sealed class ComposerView : TextView
         this.Multiline = true;
         this.WordWrap = true;
         this.TabKeyAddsTab = false;
+
+        // Slash-command completion is rendered by the shell-owned CommandCompletionView, so keep the base
+        // TextView's built-in word autocomplete inert: an empty suggestion generator ensures it never
+        // surfaces suggestions of its own. Terminal.Gui still parents the (empty) autocomplete popup to the
+        // running top-level on the first edit; the shell strips that stray sub-view so the fixed insertion
+        // order — and the modal prompt overlay's topmost z-order — is preserved.
+        this.Autocomplete.SuggestionGenerator = new NoSuggestionGenerator();
+
         this.ContentsChanged += this.OnContentsChangedSync;
         this.SyncTextView();
         this.SnapshotCompletion();
@@ -500,6 +508,18 @@ internal sealed class ComposerView : TextView
 
     private static string NormalizeNewlines(string value) =>
         value.Replace("\r\n", "\n").Replace("\r", "\n");
+
+    /// <summary>
+    /// A suggestion generator that never offers suggestions, used to keep the base <see cref="TextView"/>
+    /// autocomplete inert so it never surfaces its own suggestions. The composer renders slash-command
+    /// completion through the shell-owned command completion menu instead.
+    /// </summary>
+    private sealed class NoSuggestionGenerator : ISuggestionGenerator
+    {
+        public IEnumerable<Suggestion> GenerateSuggestions(AutocompleteContext context) => [];
+
+        public bool IsWordChar(string text) => false;
+    }
 }
 
 #pragma warning restore CS0618

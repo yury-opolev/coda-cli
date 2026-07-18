@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Point = System.Drawing.Point;
@@ -269,6 +270,84 @@ public sealed class CommandCompletionShellTests
         app.LayoutAndDraw();
         Assert.True(shell.ComposerLayoutUpdateCount > beforeResize);
         Assert.InRange(shell.Composer.Frame.Height, 3, 4);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Completion_operational_composer_metadata_and_prompt_keep_final_z_order()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app, Commands());
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Composer.SetDraft("/m", 2);
+        var prompt = UiPromptRequest.Confirm("Allow?", false);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = prompt },
+            CancellationToken.None);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Completion.Visible);
+        Assert.True(shell.PromptOverlay.Visible);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        var order = shell.SubViews.ToList();
+        Assert.True(order.IndexOf(shell.Chrome) < order.IndexOf(shell.Composer));
+        Assert.True(order.IndexOf(shell.Completion) < order.IndexOf(shell.PromptOverlay));
+        Assert.Equal(order.Count - 1, order.IndexOf(shell.PromptOverlay));
+        Assert.True(shell.PromptOverlay.HasFocus);
+        Assert.False(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Inline_completion_and_rows_keep_adjacency_across_dynamic_height_and_resize()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app, Commands());
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // A slash draft shows the completion menu; its bottom hugs the operational row and every
+        // retained row stays adjacent (completion → operational → composer → status).
+        shell.Composer.SetDraft("/he", 3);
+        app.LayoutAndDraw();
+        Assert.True(shell.Completion.Visible);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        // A dynamic-height (multi-line) draft grows the composer without breaking row adjacency.
+        shell.Composer.SetDraft("a\nb\nc\nd", 7);
+        app.LayoutAndDraw();
+        Assert.True(shell.Composer.Frame.Height >= 4);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        // A driver resize re-flows every row but the operational/composer/status adjacency survives.
+        app.Driver.SetScreenSize(60, 18);
+        app.LayoutAndDraw();
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
 
         if (token is not null)
         {

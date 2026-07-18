@@ -47,6 +47,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private bool composerDisabled;
     private bool disposed;
 
+    /// <summary>
+    /// The exact set of sub-views this shell adds in <see cref="BuildLayout"/>. Any sub-view outside this
+    /// set (the base <see cref="TextView"/> autocomplete popup, which appends itself to the running
+    /// top-level on the first edit) is stripped so the fixed insertion order is preserved and the modal
+    /// <see cref="PromptOverlay"/> always stays the topmost sub-view.
+    /// </summary>
+    private readonly HashSet<View> ownedSubViews;
+
     protected TerminalGuiShellBase(
         IApplication app,
         ComposerController controller,
@@ -97,6 +105,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Initialized += this.OnShellInitialized;
 
         this.BuildLayout();
+        this.ownedSubViews = [.. this.SubViews];
         this.SyncCompletion();
         this.UpdateProjectedOperationalStatus(this.Snapshot);
         this.UpdateComposerAvailability(this.Snapshot);
@@ -322,8 +331,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (disposing && !this.disposed)
         {
             this.disposed = true;
-            this.StopChordTimeout();
-            this.chords.Reset();
+
+            // Tear down both shell-owned status timers first: ResetChordOverride removes the chord expiry
+            // timeout (and re-projects the operational row, which re-arms the spinner for any still-active
+            // work), then ClearTransientOperationalOverride removes a pinned transient timeout. base.Dispose
+            // below disposes the child OperationalStatusView, whose own Dispose removes that spinner timeout,
+            // so no status timer survives the shell.
+            this.ResetChordOverride();
+            this.ClearTransientOperationalOverride();
+            this.Composer.ShellKeyHandler = null;
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
@@ -807,6 +823,22 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         var visible = height > 0;
         this.PlaceCompletion(height, visible);
         this.Completion.Visible = visible;
+        this.StripAutocompletePopup();
         this.SetNeedsLayout();
+    }
+
+    /// <summary>
+    /// Removes any sub-view the base <see cref="TextView"/> autocomplete appended to this shell. The
+    /// composer suppresses word suggestions (see <see cref="ComposerView"/>), but Terminal.Gui still
+    /// parents the autocomplete popup to the running top-level on the first edit, which would append after
+    /// the <see cref="PromptOverlay"/> and break the fixed insertion order. Stripping it keeps the prompt
+    /// overlay topmost without reordering (which desynchronizes Terminal.Gui's disposal bookkeeping).
+    /// </summary>
+    private void StripAutocompletePopup()
+    {
+        foreach (var view in this.SubViews.Where(v => !this.ownedSubViews.Contains(v)).ToList())
+        {
+            this.Remove(view);
+        }
     }
 }

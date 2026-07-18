@@ -110,6 +110,34 @@ public sealed class TerminalGuiModeRunnerTests
         Assert.Equal(AppModel.FullScreen, appModel);
     }
 
+    [Theory]
+    [InlineData(TuiRunMode.Plain)]
+    [InlineData(TuiRunMode.Spectre)]
+    public async Task Non_terminal_modes_never_create_an_application_or_retained_state(TuiRunMode mode)
+    {
+        var applicationFactoryCalls = 0;
+        var shellFactoryCalls = 0;
+        var runner = new TerminalGuiModeRunner(
+            shellFactory: (_, _, _) =>
+            {
+                shellFactoryCalls++;
+                throw new InvalidOperationException("retained shell must not be created");
+            },
+            spectreRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            plainRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            applicationFactory: () =>
+            {
+                applicationFactoryCalls++;
+                return Application.Create();
+            });
+
+        var result = await runner.RunAsync(mode, ComposerState.Empty, CancellationToken.None);
+
+        Assert.Equal(TuiShellExitKind.Exit, result.Kind);
+        Assert.Equal(0, applicationFactoryCalls);
+        Assert.Equal(0, shellFactoryCalls);
+    }
+
     [Fact]
     public void Build_failure_preserves_the_primary_exception_first_in_the_aggregate()
     {

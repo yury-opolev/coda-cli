@@ -953,6 +953,55 @@ public sealed class FullscreenTuiShellTests
         Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
         Assert.Empty(fixture.Actions);
     }
+
+    [Fact]
+    public void Expired_chord_hint_restores_projected_status()
+    {
+        var clock = new ManualTimeProvider();
+        Func<bool>? timeout = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            timeProvider: clock,
+            addTimeout: (_, callback) =>
+            {
+                timeout = callback;
+                return new object();
+            });
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        clock.Advance(TimeSpan.FromMilliseconds(801));
+        Assert.False(timeout!());
+
+        Assert.NotEqual("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(
+            OperationalStatusProjector.Project(fixture.Shell.Snapshot),
+            fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public async Task Disposing_shell_removes_spinner_and_chord_timeouts()
+    {
+        var removed = 0;
+        var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            removeTimeout: _ =>
+            {
+                removed++;
+                return true;
+            });
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                ActiveOperation = new ActiveOperation("turn", "working", null),
+            },
+            CancellationToken.None);
+
+        fixture.Dispose();
+
+        Assert.True(removed >= 2, "spinner and chord timeout must both be removed");
+    }
 }
 
 /// <summary>Unit tests for the bounded, virtualized <see cref="TranscriptLayoutIndex"/>.</summary>
