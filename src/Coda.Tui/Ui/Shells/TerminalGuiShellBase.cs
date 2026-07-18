@@ -504,7 +504,20 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
 
         var text = this.TranscriptView.GetSelectedText();
-        if (!string.IsNullOrEmpty(text) && this.clipboardWriter(text))
+
+        // An empty or newline-only selection has no symbols to copy. Clear it and report a deterministic
+        // "0 symbols copied to clipboard" confirmation instead of routing through the clipboard writer, whose
+        // skipped/failed write would otherwise surface a misleading "Clipboard unavailable" warning.
+        if (CountSymbols(text) == 0)
+        {
+            this.TranscriptView.ClearSelection();
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(CopySuccessMessage(text), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        if (this.clipboardWriter(text))
         {
             this.TranscriptView.ClearSelection();
             this.ShowTransientOperationalStatus(

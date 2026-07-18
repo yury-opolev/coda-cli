@@ -312,19 +312,98 @@ internal sealed class ComposerView : TextView
 
         if (key == Key.Backspace)
         {
-            this.RunNativeEdit(() => this.DeleteCharLeft());
+            this.RunNativeEdit(() => this.NativeDeleteAtControllerCaret(forward: false));
             this.RaiseLayoutInvalidated();
             return true;
         }
 
         if (key == Key.Delete)
         {
-            this.RunNativeEdit(() => this.DeleteCharRight());
+            this.RunNativeEdit(() => this.NativeDeleteAtControllerCaret(forward: true));
             this.RaiseLayoutInvalidated();
             return true;
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Performs a native backspace/forward-delete at the controller's authoritative caret index. The base
+    /// <see cref="TextView"/> deletes at its own caret, but its wrapped <see cref="TextView.InsertionPoint"/>
+    /// coordinates diverge from the composer's grapheme layout once a logical line soft-wraps, so a delete
+    /// after a programmatic (SetDraft/arrow/history) caret placement would otherwise remove the wrong
+    /// character or drift the caret. Toggling <see cref="TextView.WordWrap"/> off makes InsertionPoint a
+    /// direct (grapheme-column, logical-row) address that round-trips exactly; the caret is placed there and
+    /// the delete runs before WordWrap is restored, so exactly the character at the caret is removed and the
+    /// caret never snaps to the first visual row.
+    /// </summary>
+    private void NativeDeleteAtControllerCaret(bool forward)
+    {
+        var draft = this.controller.State.Draft;
+        var index = Math.Clamp(this.controller.State.CursorIndex, 0, draft.Length);
+        var (row, column) = LogicalCaret(draft, index);
+        var previousWrap = this.WordWrap;
+
+        // Reposition the base caret via logical coordinates without mirroring the (unchanged) draft/caret,
+        // then perform the delete as real native input so its ContentsChanged/UnwrappedCursorPositionChanged
+        // events mirror the result back to the controller.
+        this.syncingText = true;
+        try
+        {
+            this.WordWrap = false;
+            this.InsertionPoint = new System.Drawing.Point(column, row);
+        }
+        finally
+        {
+            this.syncingText = false;
+        }
+
+        try
+        {
+            if (forward)
+            {
+                this.DeleteCharRight();
+            }
+            else
+            {
+                this.DeleteCharLeft();
+            }
+        }
+        finally
+        {
+            this.WordWrap = previousWrap;
+        }
+
+        // The delete ran with WordWrap off and the toggle back on leaves the base editor's visible caret at
+        // the origin; restore it to the wrapped position for the (already-correct) controller caret.
+        this.PlaceDisplayCaretFromLayout();
+    }
+
+    /// <summary>
+    /// The base editor's unwrapped caret address for <paramref name="index"/>: the logical (newline-delimited)
+    /// row and the grapheme-cluster column within that row, matching the coordinates
+    /// <see cref="SourceIndexFromUnwrappedPosition"/> maps back from.
+    /// </summary>
+    private static (int Row, int Column) LogicalCaret(string text, int index)
+    {
+        var row = 0;
+        var lineStart = 0;
+        for (var i = 0; i < index; i++)
+        {
+            if (text[i] == '\n')
+            {
+                row++;
+                lineStart = i + 1;
+            }
+        }
+
+        var column = 0;
+        foreach (var _ in TerminalCellText.Enumerate(text[lineStart..index]))
+        {
+            column++;
+        }
+
+        return (row, column);
     }
 
     private bool HandleUnmappedKey(Key key)
@@ -637,13 +716,36 @@ internal sealed class ComposerView : TextView
                 this.FullTextReplacementCount++;
             }
 
-            var layout = ComposerVisualLayout.Create(state.Draft, this.LayoutWidth());
-            var position = layout.PositionForIndex(state.CursorIndex);
-            this.InsertionPoint = new System.Drawing.Point(position.Column, position.Row);
+            this.PlaceDisplayCaretFromLayout();
         }
         finally
         {
             this.syncingText = false;
+        }
+    }
+
+    /// <summary>
+    /// Places the base editor's <em>displayed</em> caret at the Coda layout's wrapped position for the
+    /// controller's caret index, without reassigning <see cref="TextView.Text"/> (so it never counts as a
+    /// full replacement). Used after a native delete to restore the visible caret — the base editor otherwise
+    /// leaves it at the origin once <see cref="TextView.WordWrap"/> is toggled back on. The controller's caret
+    /// (mirrored from the delete's unwrapped event) stays authoritative because the assignment runs under
+    /// <see cref="syncingText"/>, so the resulting caret report is not mirrored back.
+    /// </summary>
+    private void PlaceDisplayCaretFromLayout()
+    {
+        var state = this.controller.State;
+        var layout = ComposerVisualLayout.Create(state.Draft, this.LayoutWidth());
+        var position = layout.PositionForIndex(state.CursorIndex);
+        var previous = this.syncingText;
+        this.syncingText = true;
+        try
+        {
+            this.InsertionPoint = new System.Drawing.Point(position.Column, position.Row);
+        }
+        finally
+        {
+            this.syncingText = previous;
         }
     }
 

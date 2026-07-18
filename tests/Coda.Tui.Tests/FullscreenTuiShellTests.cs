@@ -21,6 +21,11 @@ public sealed class FullscreenTuiShellTests
             .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {index}"))
             .ToImmutableArray();
 
+    private static ImmutableArray<TranscriptBlock> BlankLines(int count) =>
+        Enumerable.Range(0, count)
+            .Select(_ => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), string.Empty))
+            .ToImmutableArray();
+
     [Fact]
     public void Virtualized_view_formats_only_visible_rows()
     {
@@ -994,6 +999,36 @@ public sealed class FullscreenTuiShellTests
         Assert.Equal(
             OperationalStatusProjector.Project(fixture.Shell.Snapshot),
             fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public void Ctrl_c_with_empty_selection_clears_and_reports_zero_without_touching_clipboard()
+    {
+        var clipboardCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ =>
+            {
+                clipboardCalls++;
+                return false;
+            },
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+
+        // Two blank transcript rows selected across yield a newline-only (zero-symbol) selection.
+        fixture.Shell.Transcript.ReplaceAll(BlankLines(2));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 0));
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        // The empty selection is cleared with a deterministic "0 symbols" confirmation, never the misleading
+        // "Clipboard unavailable" warning, and the clipboard writer is never invoked.
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("0 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(0, clipboardCalls);
+        Assert.Empty(fixture.Actions);
     }
 
     [Fact]
