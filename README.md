@@ -98,10 +98,10 @@ Coda is its own product, independent of any vendor's official CLI.
 The terminal front-end targets **Terminal.Gui v2** and follows the **Warm Ember** interaction model.
 After the compatibility matrix and acceptance thresholds pass, **full-screen mode is the default
 interactive engine on a supported terminal**: a scrollable, virtualized transcript fills the **full
-width** of the screen, an **operational status row** (provider, model, turn state, and key hints) sits
+width** of the screen, an **operational status row** (turn, tool, waiting, approval, and key-hint state) sits
 **directly above** the composer, and a **dynamic composer** starts at **three rows** and grows up to a
 **capped height** as you type while staying pinned near the bottom. A separate, **stable metadata row**
-(session and environment details) occupies the **final row**. **Focus** stays on the composer while you
+(model, effort, context, usage, services, git, and cwd) occupies the **final row**. **Focus** stays on the composer while you
 type — keyboard shortcuts drive the transcript, overlays, and completion menu without pulling focus away
 from your prompt. **Inline mode** uses the same retained, scrollable layout in the terminal's primary
 buffer and remains available as an **explicit compatibility** choice via `--tui=inline`.

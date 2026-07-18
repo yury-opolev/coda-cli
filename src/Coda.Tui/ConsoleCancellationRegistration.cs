@@ -1,10 +1,9 @@
 namespace Coda.Tui;
 
 /// <summary>
-/// Bridges the console Ctrl-C signal to the interactive host. In its interruption form, a first Ctrl-C
-/// interrupts the active turn and never exits; the explicit exit action is a separate concern wired
-/// through <see cref="RequestExit"/>. The legacy cancellation-token form is retained so the current
-/// composition root keeps compiling until the host takes over cancellation wiring.
+/// Bridges the console Ctrl-C signal to non-retained fallback hosts. Retained Terminal.Gui shells handle
+/// their own double-key chords; this registration keeps legacy/plain cancellation separate from the
+/// explicit exit action wired through <see cref="RequestExit"/>.
 /// </summary>
 internal sealed class ConsoleCancellationRegistration : IDisposable
 {
@@ -24,9 +23,9 @@ internal sealed class ConsoleCancellationRegistration : IDisposable
     }
 
     /// <summary>
-    /// Interruption form: a Ctrl-C calls <paramref name="tryInterrupt"/> to interrupt the active turn
-    /// (and, when idle, publish a notice) but never exits. <paramref name="requestExit"/> backs the
-    /// explicit exit action and is never invoked by the Ctrl-C handler.
+    /// Interruption form: a Ctrl-C calls <paramref name="tryInterrupt"/> to interrupt an active fallback
+    /// turn but never exits. <paramref name="requestExit"/> backs the explicit exit action and is never
+    /// invoked by the Ctrl-C handler.
     /// </summary>
     public ConsoleCancellationRegistration(Func<bool> tryInterrupt, Action requestExit)
     {
@@ -76,8 +75,8 @@ internal sealed class ConsoleCancellationRegistration : IDisposable
 
     private void HandleInterruptKeyPress(object? sender, ConsoleCancelEventArgs e)
     {
-        // Never let Ctrl-C terminate the process: interrupt the active turn (the callback publishes the
-        // idle notice itself when nothing is running) and keep the application alive.
+        // Never let Ctrl-C terminate the fallback process: interrupt active work when possible and keep
+        // the application alive.
         e.Cancel = true;
         this.tryInterrupt?.Invoke();
     }
