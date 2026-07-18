@@ -1,61 +1,42 @@
 using Coda.Agent;
-using Coda.Tui.Rendering;
-using Spectre.Console;
+using Coda.Tui.Ui.Events;
+using LlmClient;
 
 namespace Coda.Tui.Agent;
 
-/// <summary>Renders live agent events to the console (streaming text, tool calls, results).</summary>
+/// <summary>
+/// Adapts live <see cref="IAgentSink"/> callbacks into semantic <see cref="UiEvent"/>s. Every
+/// callback publishes exactly one matching event with its payload forwarded verbatim; this class
+/// performs no rendering, markup, truncation, or terminal state — the reducer/renderers own that.
+/// </summary>
 public sealed class TuiAgentSink : IAgentSink
 {
-    private readonly IAnsiConsole console;
-    private bool wroteText;
+    private readonly IUiEventPublisher publisher;
 
-    public TuiAgentSink(IAnsiConsole console)
+    public TuiAgentSink(IUiEventPublisher publisher)
     {
-        this.console = console;
+        this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
     }
 
-    public void OnAssistantText(string delta)
-    {
-        // Write raw model text (no markup parsing of bracket characters).
-        this.console.Write(new Text(delta));
-        this.wroteText = true;
-    }
+    public void OnAssistantText(string delta) => this.publisher.Publish(new AssistantTextDeltaEvent(delta));
 
-    public void OnAssistantTextComplete()
-    {
-        if (this.wroteText)
-        {
-            this.console.WriteLine();
-            this.wroteText = false;
-        }
-    }
+    public void OnAssistantTextComplete() => this.publisher.Publish(new AssistantTextCompletedEvent());
 
-    public void OnToolCall(string toolName, string inputJson)
-    {
-        this.console.MarkupLine(Theme.DimMarkup($"⚙ {toolName}({ToolPreview.Compact(inputJson)})"));
-    }
+    public void OnToolCall(string toolName, string inputJson) =>
+        this.publisher.Publish(new ToolStartedEvent(toolName, inputJson));
 
-    public void OnToolResult(string toolName, ToolResult result)
-    {
-        var firstLine = result.Content.Split('\n', 2)[0];
-        if (firstLine.Length > 160)
-        {
-            firstLine = firstLine[..160] + "…";
-        }
+    public void OnToolProgress(string toolName, long elapsedMs) =>
+        this.publisher.Publish(new ToolProgressEvent(toolName, elapsedMs));
 
-        var markup = result.IsError ? Theme.ErrorMarkup(firstLine) : Theme.DimMarkup(firstLine);
-        this.console.MarkupLine($"  {markup}");
-    }
+    public void OnToolResult(string toolName, ToolResult result) =>
+        this.publisher.Publish(new ToolCompletedEvent(toolName, result));
 
-    public void OnError(string message)
-    {
-        this.console.MarkupLine(Theme.ErrorMarkup(message));
-    }
+    public void OnUsage(TokenUsage usage) => this.publisher.Publish(new UsageEvent(usage));
 
-    public void OnLimitReached(string kind, string message)
-    {
-        // A soft, recoverable stop (e.g. max_tokens / iteration cap) — a notice, not an error.
-        this.console.MarkupLine(Theme.DimMarkup($"⏸ {message}"));
-    }
+    public void OnStopReason(string? stopReason) => this.publisher.Publish(new StopReasonEvent(stopReason));
+
+    public void OnLimitReached(string kind, string message) =>
+        this.publisher.Publish(new LimitReachedEvent(kind, message));
+
+    public void OnError(string message) => this.publisher.Publish(new AgentErrorEvent(message));
 }

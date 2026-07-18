@@ -5,6 +5,7 @@ using Coda.Tui.Agent;
 using Coda.Tui.Commands;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using LlmClient;
 using Spectre.Console;
 
@@ -30,17 +31,18 @@ public sealed class SetupWizard
         };
         console.Write(intro);
 
-        if (!console.Profile.Capabilities.Interactive)
+        if (!context.Prompts.IsInteractive)
         {
             console.MarkupLine(Theme.DimMarkup("Non-interactive: run /login <claude|copilot> to connect, then type a message."));
             return;
         }
 
-        var provider = console.Prompt(
-            new SelectionPrompt<ProviderDescriptor>()
-                .Title(Theme.DimMarkup("Choose a provider:"))
-                .UseConverter(p => p.DisplayName)
-                .AddChoices(context.Providers));
+        var provider = await ChooseProviderAsync(context, cancellationToken).ConfigureAwait(false);
+        if (provider is null)
+        {
+            // Cancelled (or no interactive prompt surface) — nothing mutated.
+            return;
+        }
 
         // Reuse the real login flow (browser-loopback / device-code / api-key).
         await new LoginCommand().ExecuteAsync(context, [provider.Id], cancellationToken).ConfigureAwait(false);
@@ -49,6 +51,34 @@ public sealed class SetupWizard
 
         console.MarkupLine(Theme.SuccessMarkup("Setup complete.") + " " +
             Theme.DimMarkup("Type a message to start, or /help for commands."));
+    }
+
+    /// <summary>
+    /// Present the provider picker (title <c>Choose a provider</c>, option id = provider id) through
+    /// the host-neutral prompt surface. Returns the chosen provider, or <c>null</c> when the surface is
+    /// non-interactive or the user dismisses the prompt — the caller mutates nothing until a provider
+    /// is returned.
+    /// </summary>
+    internal static async Task<ProviderDescriptor?> ChooseProviderAsync(
+        CommandContext context,
+        CancellationToken cancellationToken = default)
+    {
+        if (!context.Prompts.IsInteractive)
+        {
+            return null;
+        }
+
+        var options = context.Providers.Select(p => new UiPromptOption(p.Id, p.DisplayName));
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Choose a provider", options),
+            cancellationToken).ConfigureAwait(false);
+
+        if (response.Cancelled || response.SelectedIds.Length == 0)
+        {
+            return null;
+        }
+
+        return context.FindProvider(response.SelectedIds[0]);
     }
 
     private async Task VerifyAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)

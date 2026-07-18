@@ -1,6 +1,7 @@
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Compaction;
+using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
 using Coda.Agent.OutputStyles;
 using Coda.Agent.Scheduling;
@@ -49,6 +50,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly SteeringInbox steeringInbox = new();
     private bool lspInitialized;
     private TokenUsage sessionUsage = TokenUsage.Zero;
+    private GoalStatus? lastGoalStatus;
 
     // Reused across the incremental "record on the go" saves so the store's createdUtc cache
     // survives between turns (a fresh store per call would re-read the file every save).
@@ -275,6 +277,23 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// <summary>Accumulated token usage across all RunAsync calls in this session.</summary>
     public TokenUsage SessionUsage => this.sessionUsage;
 
+    /// <summary>
+    /// An immutable, UI-facing snapshot of the session's runtime state: id, accumulated usage, the
+    /// last observed goal outcome, and copied todo / scheduled-task / background-task / LSP-server
+    /// lists. Carries no mutable engine instances, so the TUI can diff and render it safely.
+    /// </summary>
+    public SessionRuntimeSnapshot GetRuntimeSnapshot()
+    {
+        return new SessionRuntimeSnapshot(
+            this.SessionId,
+            this.sessionUsage,
+            this.lastGoalStatus,
+            [.. this.todos.Items],
+            [.. this.schedules.Items],
+            this.backgroundTasks.GetSnapshot(),
+            this.lspManager?.GetSnapshot() ?? []);
+    }
+
     /// <summary>Clear the conversation.</summary>
     public void Reset() => this.history.Clear();
 
@@ -399,6 +418,16 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
             };
+        }
+        finally
+        {
+            // Remember the most recent goal outcome so GetRuntimeSnapshot can surface it between
+            // turns. Only overwrite on a non-null result so a subsequent goal-less turn does not
+            // erase the last real goal status.
+            if (loop.LastGoalStatus is not null)
+            {
+                this.lastGoalStatus = loop.LastGoalStatus;
+            }
         }
     }
 

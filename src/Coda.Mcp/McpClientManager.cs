@@ -83,6 +83,24 @@ public sealed class McpClientManager : IAsyncDisposable
     public IReadOnlyList<McpTool> ServerTools(string serverName) => McpServerTools.ForServer(this.tools, serverName);
 
     /// <summary>
+    /// A versioned, immutable snapshot of the connected servers for the UI status view: each server's
+    /// name, the identity it reported at initialize, and its tool count. Server list is copied and
+    /// name-ordered; no <see cref="IMcpClient"/> instances are surfaced.
+    /// </summary>
+    public McpRuntimeSnapshot GetSnapshot()
+    {
+        var servers = this.clients
+            .OrderBy(c => c.ServerName, StringComparer.Ordinal)
+            .Select(c => new McpServerRuntimeSnapshot(
+                c.ServerName,
+                c.ServerInfo,
+                McpServerTools.ForServer(this.tools, c.ServerName).Count))
+            .ToList();
+
+        return new McpRuntimeSnapshot(this.Version, servers);
+    }
+
+    /// <summary>
     /// Bumped on every connect/disconnect. A live tool source can compare it to detect changes
     /// (the TUI re-reads <see cref="Tools"/> per turn, so it picks up changes without polling).
     /// </summary>

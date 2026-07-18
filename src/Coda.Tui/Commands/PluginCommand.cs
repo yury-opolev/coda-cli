@@ -1,6 +1,7 @@
 using Coda.Tui.Plugins;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -51,7 +52,26 @@ public sealed class PluginCommand : ISlashCommand
         IReadOnlyList<string> args,
         CancellationToken cancellationToken = default)
     {
-        var subcommand = args.Count > 0 ? args[0].ToLowerInvariant() : "list";
+        string subcommand;
+        if (args.Count > 0)
+        {
+            subcommand = args[0].ToLowerInvariant();
+        }
+        else if (context.Prompts.IsInteractive)
+        {
+            // No subcommand given but a prompt surface can answer — ask which action to run.
+            var chosen = await this.ChooseActionAsync(context, cancellationToken).ConfigureAwait(false);
+            if (chosen is null)
+            {
+                return CommandResult.Continue;
+            }
+
+            subcommand = chosen;
+        }
+        else
+        {
+            subcommand = "list";
+        }
 
         switch (subcommand)
         {
@@ -79,6 +99,25 @@ public sealed class PluginCommand : ISlashCommand
                     $"Unknown subcommand '{subcommand}'. Usage: /plugin [list|install <source>|remove <name>]"));
                 return CommandResult.Continue;
         }
+    }
+
+    /// <summary>
+    /// Present the plugin action picker (title <c>Plugin action</c>, stable option ids
+    /// <c>list/install/remove</c>) through the host-neutral prompt surface. Returns the chosen action
+    /// id, or <c>null</c> when the user dismisses the prompt.
+    /// </summary>
+    internal async Task<string?> ChooseActionAsync(CommandContext context, CancellationToken cancellationToken = default)
+    {
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Plugin action", new[]
+            {
+                new UiPromptOption("list", "List installed plugins"),
+                new UiPromptOption("install", "Install a plugin"),
+                new UiPromptOption("remove", "Remove a plugin"),
+            }),
+            cancellationToken).ConfigureAwait(false);
+
+        return response.Cancelled || response.SelectedIds.Length == 0 ? null : response.SelectedIds[0];
     }
 
     private CommandResult ExecuteList(CommandContext context)

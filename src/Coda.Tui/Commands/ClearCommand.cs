@@ -1,6 +1,7 @@
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
 using LlmClient;
 using Spectre.Console;
 
@@ -23,10 +24,22 @@ public sealed class ClearCommand : ISlashCommand
     {
         context.Session.History.Clear();
         context.Session.SessionUsage = TokenUsage.Zero;
-        context.Session.SessionId = SessionIds.NewId();
-        context.Console.Clear();
-        var connectedProvider = await context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
-        Banner.Render(context.Console, context.Session, connectedProvider, context.Session.Model);
+        var newId = SessionIds.NewId();
+        context.Session.SessionId = newId;
+
+        // Announce the new session boundary and refreshed metadata to the semantic UI.
+        context.Events.Publish(new TranscriptClearedEvent(newId));
+        SessionMetadataEvents.Publish(context);
+
+        // In semantic mode the actor/renderer owns clearing via the event above; a raw console clear
+        // + banner would duplicate that. The legacy REPL still clears its real console and redraws.
+        if (!context.SemanticUiEnabled)
+        {
+            context.Console.Clear();
+            var connectedProvider = await context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
+            Banner.Render(context.Console, context.Session, connectedProvider, context.Session.Model);
+        }
+
         return CommandResult.Continue;
     }
 }

@@ -28,6 +28,7 @@ public sealed class YoloCommand : ISlashCommand
         context.Session.PermissionMode = PermissionMode.BypassPermissions;
         context.Console.MarkupLine(Theme.WarnMarkup("YOLO mode: tools now run without asking for permission.") + " " +
             Theme.DimMarkup("Switch back with /permissions default."));
+        SessionMetadataEvents.Publish(context);
         return Task.FromResult(CommandResult.Continue);
     }
 }

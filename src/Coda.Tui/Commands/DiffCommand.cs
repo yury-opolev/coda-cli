@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -66,8 +67,17 @@ public sealed class DiffCommand : ISlashCommand
                 return CommandResult.Continue;
             }
 
-            // Write raw output without markup interpretation to preserve diff formatting.
-            context.Console.WriteLine(stdout);
+            // In semantic mode the diff flows through the transcript as a typed block; the plain/legacy
+            // path writes raw output to the console. Publishing AND writing would duplicate the output.
+            if (context.SemanticUiEnabled)
+            {
+                context.Events.Publish(new DiffOutputEvent(stdout));
+            }
+            else
+            {
+                // Write raw output without markup interpretation to preserve diff formatting.
+                context.Console.WriteLine(stdout);
+            }
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or FileNotFoundException or InvalidOperationException)
         {

@@ -49,6 +49,7 @@ public sealed class EffortCommand : ISlashCommand
         {
             context.Session.Effort = null;
             context.Console.MarkupLine($"Effort level set to {Theme.AccentMarkup("auto")}.");
+            SessionMetadataEvents.Publish(context);
             return Task.FromResult(CommandResult.Continue);
         }
 
@@ -61,6 +62,7 @@ public sealed class EffortCommand : ISlashCommand
 
         context.Session.Effort = arg;
         context.Console.MarkupLine($"Set effort level to {Theme.AccentMarkup(arg)}: {Theme.DimMarkup(Describe(arg))}");
+        SessionMetadataEvents.Publish(context);
 
         if (isCopilot)
         {

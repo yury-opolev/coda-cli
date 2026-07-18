@@ -95,14 +95,34 @@ Coda is its own product, independent of any vendor's official CLI.
 
 ## Coda — the interactive TUI
 
-The terminal front-end is built on **Spectre.Console** — welcome banner, slash
-commands, streaming replies, and a status line.
+The terminal front-end targets **Terminal.Gui v2**. After the compatibility matrix and acceptance
+thresholds pass, **inline mode is the default interactive engine** — the composer sits at the bottom
+and completed output flows into your terminal's native scrollback. An optional **full-screen** mode is
+available for a retained, virtualized transcript. **Spectre.Console remains a migration fallback** for
+environments where Terminal.Gui is not yet accepted, and a **plain** renderer is always available.
 
 ```powershell
 # Build (bumps the version), then run the TUI:
 ./build.ps1
 dotnet run --project src/Coda.Tui -c Release
+
+# Choose the interactive engine explicitly:
+dotnet run --project src/Coda.Tui -- --tui=inline       # composer + native scrollback (default target)
+dotnet run --project src/Coda.Tui -- --tui=fullscreen   # retained, virtualized full-screen transcript
+dotnet run --project src/Coda.Tui -- --tui=auto         # pick inline/full-screen/plain by terminal
+dotnet run --project src/Coda.Tui -- --plain            # plain output (screen readers, CI, redirection)
+dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
+
+**Keys:** `Enter` submits · `Ctrl+J` inserts a newline · `Ctrl-C` interrupts the active turn ·
+`Ctrl+D` or `/exit` exits · `F2` switches between inline and full-screen. Full-screen has **no
+permanent sidebar** and uses a **virtualized transcript** (context, pickers, permissions, help, and
+diffs all use keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI,
+output/input redirection, and terminals that Terminal.Gui does not support.
+
+> **Compatibility:** the terminal matrix is a *reproducible checklist*, not a claim that every terminal
+> has already passed. See [`docs/terminal-gui-compatibility.md`](docs/terminal-gui-compatibility.md)
+> for the acceptance thresholds and how to run the spike + PTY smoke script to record results.
 
 Inside the REPL:
 
@@ -361,7 +381,7 @@ and the provider config classes (`ClaudeAiOAuthConfig`, `GitHubCopilotConfig`).
 | `src/LlmClient` | `net10.0` | Anthropic Messages streaming client + client fingerprint. |
 | `src/Coda.Agent` | `net10.0` | Agent loop + tools (read/list/glob/grep/edit/write/run + task/subagents). |
 | `src/Coda.Mcp` | `net10.0` | MCP stdio client (JSON-RPC) + tool bridge. |
-| `src/Coda.Tui` | `net10.0` | The **Coda** interactive TUI (Spectre.Console). Requires Windows at runtime (DPAPI). |
+| `src/Coda.Tui` | `net10.0` | The **Coda** interactive TUI (Terminal.Gui v2; Spectre.Console/plain fallbacks). Requires Windows at runtime (DPAPI). |
 | `samples/LlmAuth.Sample` | `net10.0-windows` | Console demo. |
 | `tests/LlmAuth.Tests` | `net10.0` | xUnit unit tests (auth). |
 | `tests/Coda.Tui.Tests` | `net10.0` | xUnit unit tests (TUI). |

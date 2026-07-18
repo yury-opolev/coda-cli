@@ -41,6 +41,16 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
+    public void Help_documents_tui_and_plain_flags()
+    {
+        var (_, output) = Run("--help");
+
+        Assert.Contains("--tui=auto|inline|fullscreen", output);
+        Assert.Contains("--plain", output);
+        Assert.Contains("--no-mouse", output);
+    }
+
+    [Fact]
     public void No_args_returns_null_to_continue_to_the_interactive_tui()
     {
         var (code, _) = Run();

@@ -1,5 +1,7 @@
 using Coda.Mcp;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Prompts;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -60,10 +62,10 @@ public sealed class McpCommand : ISlashCommand
                 RenderInfo(context, tail);
                 break;
             case "add":
-                await HandleAddOrEdit(context, scope, tail, isEdit: false).ConfigureAwait(false);
+                await HandleAddOrEdit(context, scope, tail, isEdit: false, cancellationToken).ConfigureAwait(false);
                 break;
             case "edit":
-                await HandleAddOrEdit(context, scope, tail, isEdit: true).ConfigureAwait(false);
+                await HandleAddOrEdit(context, scope, tail, isEdit: true, cancellationToken).ConfigureAwait(false);
                 break;
             case "remove" or "rm" or "delete":
                 await HandleRemove(context, scope, tail, cancellationToken).ConfigureAwait(false);
@@ -124,9 +126,15 @@ public sealed class McpCommand : ISlashCommand
 
         var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
         var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
-        context.Console.MarkupLine(Markup.Escape(result.Connected
-            ? $"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."
-            : $"Failed to start '{name}': {result.Error}"));
+        if (result.Connected)
+        {
+            context.Console.MarkupLine(Markup.Escape($"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."));
+            PublishSnapshot(context);
+        }
+        else
+        {
+            context.Console.MarkupLine(Markup.Escape($"Failed to start '{name}': {result.Error}"));
+        }
     }
 
     private static async Task HandleStop(CommandContext context, IReadOnlyList<string> tail)
@@ -145,9 +153,15 @@ public sealed class McpCommand : ISlashCommand
 
         var name = tail[0];
         var stopped = await context.Mcp.DisconnectServerAsync(name).ConfigureAwait(false);
-        context.Console.MarkupLine(Markup.Escape(stopped
-            ? $"Stopped '{name}' — its tools are removed from the next turn."
-            : $"'{name}' is not running."));
+        if (stopped)
+        {
+            context.Console.MarkupLine(Markup.Escape($"Stopped '{name}' — its tools are removed from the next turn."));
+            PublishSnapshot(context);
+        }
+        else
+        {
+            context.Console.MarkupLine(Markup.Escape($"'{name}' is not running."));
+        }
     }
 
     private static async Task HandleRestart(CommandContext context, IReadOnlyList<string> tail, CancellationToken ct)
@@ -172,9 +186,16 @@ public sealed class McpCommand : ISlashCommand
 
             var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
             var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
-            context.Console.MarkupLine(Markup.Escape(result.Connected
-                ? $"Restarted '{name}' — {result.ToolCount} tool(s)."
-                : $"Failed to restart '{name}': {result.Error}"));
+            if (result.Connected)
+            {
+                context.Console.MarkupLine(Markup.Escape($"Restarted '{name}' — {result.ToolCount} tool(s)."));
+                PublishSnapshot(context);
+            }
+            else
+            {
+                context.Console.MarkupLine(Markup.Escape($"Failed to restart '{name}': {result.Error}"));
+            }
+
             return;
         }
 
@@ -193,6 +214,16 @@ public sealed class McpCommand : ISlashCommand
 
         await context.Mcp.ConnectAllAsync(servers, cancellationToken: ct).ConfigureAwait(false);
         context.Console.MarkupLine(Markup.Escape($"Reconnected MCP servers ({context.Mcp.Clients.Count} connected)."));
+        PublishSnapshot(context);
+    }
+
+    /// <summary>Publish the live MCP runtime snapshot after a successful mutation (no-op when no manager).</summary>
+    private static void PublishSnapshot(CommandContext context)
+    {
+        if (context.Mcp is { } mcp)
+        {
+            context.Events.Publish(new McpRuntimeChangedEvent(mcp.GetSnapshot()));
+        }
     }
 
     /// <summary>Resolve <c>coda-secret:</c> / <c>${VAR}</c> references before a live connect (parity with startup).</summary>
@@ -220,7 +251,7 @@ public sealed class McpCommand : ISlashCommand
 
     // ── add / edit ────────────────────────────────────────────────────────
 
-    private static async Task HandleAddOrEdit(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool isEdit)
+    private static async Task HandleAddOrEdit(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool isEdit, CancellationToken cancellationToken)
     {
         var verb = isEdit ? "edit" : "add";
         if (tail.Count == 0)
@@ -256,9 +287,9 @@ public sealed class McpCommand : ISlashCommand
 
             config = parsed.Config;
         }
-        else if (context.Console.Profile.Capabilities.Interactive)
+        else if (context.Prompts.IsInteractive)
         {
-            config = await RunWizard(context, name).ConfigureAwait(false);
+            config = await RunWizardAsync(context, name, cancellationToken).ConfigureAwait(false);
             if (config is null)
             {
                 return; // wizard reported the problem / was cancelled
@@ -283,6 +314,7 @@ public sealed class McpCommand : ISlashCommand
         var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
         context.Console.MarkupLine(Markup.Escape(
             $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Run /mcp start {name} to connect it, or it loads on next launch."));
+        PublishSnapshot(context);
 
         // The flag path writes values verbatim (unlike the wizard, which offers encryption). Warn if
         // a literal secret-looking value was persisted so the user can move it out of the file.
@@ -311,11 +343,16 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        if (context.Console.Profile.Capabilities.Interactive
-            && !context.Console.Confirm($"Remove MCP server '{Markup.Escape(name)}' from the {ScopeName(scope)} file?"))
+        if (context.Prompts.IsInteractive)
         {
-            context.Console.MarkupLine("Cancelled.");
-            return;
+            var response = await context.Prompts.RequestAsync(
+                UiPromptRequest.Confirm($"Remove MCP server '{Markup.Escape(name)}' from the {ScopeName(scope)} file?", defaultValue: true),
+                ct).ConfigureAwait(false);
+            if (response.Cancelled || !response.SelectedIds.Contains("yes"))
+            {
+                context.Console.MarkupLine("Cancelled.");
+                return;
+            }
         }
 
         McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
@@ -328,6 +365,7 @@ public sealed class McpCommand : ISlashCommand
         }
 
         context.Console.MarkupLine(Markup.Escape($"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."));
+        PublishSnapshot(context);
     }
 
     // ── enable / disable ──────────────────────────────────────────────────
@@ -351,39 +389,62 @@ public sealed class McpCommand : ISlashCommand
         context.Console.MarkupLine(Markup.Escape(disabled
             ? $"Disabled '{name}' — it will not load on next launch. Stop it now with /mcp stop {name} if it is running."
             : $"Enabled '{name}' — it will load on next launch. Connect it now with /mcp start {name}."));
+        PublishSnapshot(context);
     }
 
     // ── interactive wizard ────────────────────────────────────────────────
 
-    private static async Task<McpServerConfig?> RunWizard(CommandContext context, string name)
+    internal static async Task<McpServerConfig?> RunWizardAsync(CommandContext context, string name, CancellationToken cancellationToken)
     {
-        var transport = context.Console.Prompt(
-            new SelectionPrompt<string>().Title($"Transport for '{Markup.Escape(name)}'?").AddChoices("stdio", "http"));
+        var transport = await SelectAsync(context, $"Transport for '{Markup.Escape(name)}'?", cancellationToken, "stdio", "http").ConfigureAwait(false);
+        if (transport is null)
+        {
+            return null; // cancelled — nothing collected, nothing written
+        }
 
         if (transport == "stdio")
         {
-            var command = context.Console.Ask<string>("Command:");
-            var argsLine = context.Console.Prompt(new TextPrompt<string>("Args (space-separated):").AllowEmpty());
+            var command = await AskAsync(context, "Command", required: true, cancellationToken).ConfigureAwait(false);
+            if (command is null)
+            {
+                return null;
+            }
+
+            var argsLine = await AskAsync(context, "Args (space-separated)", required: false, cancellationToken).ConfigureAwait(false) ?? string.Empty;
             var args = argsLine.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            var env = await PromptPairs(context, name, "env", "Env (KEY=VALUE, blank to finish):").ConfigureAwait(false);
+            var env = await PromptPairs(context, name, "env", "Env (KEY=VALUE, blank to finish)", cancellationToken).ConfigureAwait(false);
             return new McpStdioServerConfig(command, args, env);
         }
 
-        var url = context.Console.Ask<string>("URL:");
+        var url = await AskAsync(context, "URL", required: true, cancellationToken).ConfigureAwait(false);
+        if (url is null)
+        {
+            return null;
+        }
+
         if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
         {
             context.Console.MarkupLine(Markup.Escape($"'{url}' is not a valid absolute URL."));
             return null;
         }
 
-        var headers = await PromptPairs(context, name, "header", "Headers (NAME=VALUE, blank to finish):").ConfigureAwait(false);
-        var authMode = context.Console.Prompt(
-            new SelectionPrompt<string>().Title("Auth?").AddChoices("oauth", "bearer", "none"));
+        var headers = await PromptPairs(context, name, "header", "Headers (NAME=VALUE, blank to finish)", cancellationToken).ConfigureAwait(false);
+        var authMode = await SelectAsync(context, "Auth?", cancellationToken, "oauth", "bearer", "none").ConfigureAwait(false);
+        if (authMode is null)
+        {
+            return null;
+        }
+
         McpAuthConfig auth;
         if (authMode == "bearer")
         {
-            var token = context.Console.Prompt(new TextPrompt<string>("Bearer token:").Secret());
-            token = await MaybeEncrypt(context, name, "auth/token", token).ConfigureAwait(false);
+            var token = await AskSecretAsync(context, "Bearer token", cancellationToken).ConfigureAwait(false);
+            if (token is null)
+            {
+                return null;
+            }
+
+            token = await MaybeEncrypt(context, name, "auth/token", token, cancellationToken).ConfigureAwait(false);
             auth = new McpAuthConfig(McpAuthMode.Bearer, BearerToken: token);
         }
         else
@@ -394,18 +455,40 @@ public sealed class McpCommand : ISlashCommand
         return new McpHttpServerConfig(uri, headers, auth);
     }
 
-    private static async Task<Dictionary<string, string>> PromptPairs(CommandContext context, string server, string fieldPrefix, string title)
+    /// <summary>Single-choice selection over stable lowercase ids, returning the id or null when dismissed.</summary>
+    private static async Task<string?> SelectAsync(CommandContext context, string title, CancellationToken cancellationToken, params string[] ids)
+    {
+        var options = ids.Select(id => new UiPromptOption(id, id));
+        var response = await context.Prompts.RequestAsync(UiPromptRequest.Select(title, options), cancellationToken).ConfigureAwait(false);
+        return response.Cancelled || response.SelectedIds.Length == 0 ? null : response.SelectedIds[0];
+    }
+
+    /// <summary>Free-text entry, returning the text (empty when blank) or null when dismissed.</summary>
+    private static async Task<string?> AskAsync(CommandContext context, string title, bool required, CancellationToken cancellationToken)
+    {
+        var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: required), cancellationToken).ConfigureAwait(false);
+        return response.Cancelled ? null : response.Text ?? string.Empty;
+    }
+
+    /// <summary>Masked, mandatory secret entry, returning the text or null when dismissed.</summary>
+    private static async Task<string?> AskSecretAsync(CommandContext context, string title, CancellationToken cancellationToken)
+    {
+        var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: true, secret: true), cancellationToken).ConfigureAwait(false);
+        return response.Cancelled ? null : response.Text ?? string.Empty;
+    }
+
+    private static async Task<Dictionary<string, string>> PromptPairs(CommandContext context, string server, string fieldPrefix, string title, CancellationToken cancellationToken)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
-        context.Console.MarkupLine(Markup.Escape(title));
         while (true)
         {
-            var line = context.Console.Prompt(new TextPrompt<string>("  >").AllowEmpty());
-            if (string.IsNullOrWhiteSpace(line))
+            var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: false), cancellationToken).ConfigureAwait(false);
+            if (response.Cancelled || string.IsNullOrWhiteSpace(response.Text))
             {
                 break;
             }
 
+            var line = response.Text;
             var index = line.IndexOf('=', StringComparison.Ordinal);
             if (index <= 0)
             {
@@ -414,23 +497,30 @@ public sealed class McpCommand : ISlashCommand
             }
 
             var key = line[..index];
-            map[key] = await MaybeEncrypt(context, server, $"{fieldPrefix}/{key}", line[(index + 1)..]).ConfigureAwait(false);
+            map[key] = await MaybeEncrypt(context, server, $"{fieldPrefix}/{key}", line[(index + 1)..], cancellationToken).ConfigureAwait(false);
         }
 
         return map;
     }
 
     /// <summary>
-    /// Offer to store <paramref name="value"/> encrypted (when a store is available) and return a
-    /// <c>coda-secret:</c> reference instead of the plaintext; otherwise return the literal value.
+    /// Offer to store <paramref name="value"/> encrypted (when a store is available and a prompt surface
+    /// can answer) and return a <c>coda-secret:</c> reference instead of the plaintext; otherwise return
+    /// the literal value.
     /// </summary>
-    private static async Task<string> MaybeEncrypt(CommandContext context, string server, string field, string value)
+    private static async Task<string> MaybeEncrypt(CommandContext context, string server, string field, string value, CancellationToken cancellationToken)
     {
         if (context.CredentialStore is { } store
             && !string.IsNullOrEmpty(value)
-            && context.Console.Confirm("  Store this value encrypted (recommended)?"))
+            && context.Prompts.IsInteractive)
         {
-            return await McpSecretStore.StoreAsync(store, server, field, value).ConfigureAwait(false);
+            var response = await context.Prompts.RequestAsync(
+                UiPromptRequest.Confirm("  Store this value encrypted (recommended)?", defaultValue: true),
+                cancellationToken).ConfigureAwait(false);
+            if (!response.Cancelled && response.SelectedIds.Contains("yes"))
+            {
+                return await McpSecretStore.StoreAsync(store, server, field, value, cancellationToken).ConfigureAwait(false);
+            }
         }
 
         return value;

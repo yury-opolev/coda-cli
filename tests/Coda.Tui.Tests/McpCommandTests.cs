@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Mcp;
 using Coda.Tui.Commands;
+using Coda.Tui.Ui.Events;
 using LlmAuth;
 
 namespace Coda.Tui.Tests;
@@ -279,6 +280,84 @@ public sealed class McpCommandTests
 
         Assert.NotNull(factory.LastConfig);
         Assert.Equal("decrypted-value", factory.LastConfig!.Headers["X-Key"]); // resolved, not the literal ref
+    }
+
+    // ── McpRuntimeChangedEvent publication ────────────────────────────────────
+
+    [Fact]
+    public async Task Start_success_publishes_runtime_snapshot()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "remote": { "type": "http", "url": "https://x/mcp" } } }""");
+        var events = new RecordingUiEvents();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(events: events);
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager(new StubHttpFactory());
+
+        await new McpCommand().ExecuteAsync(context, ["start", "remote"], CancellationToken.None);
+
+        Assert.Single(events.Events.OfType<McpRuntimeChangedEvent>());
+    }
+
+    [Fact]
+    public async Task Start_failure_does_not_publish_runtime_snapshot()
+    {
+        using var dirs = new McpTestDirs();
+        var events = new RecordingUiEvents();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(events: events);
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager();
+
+        await new McpCommand().ExecuteAsync(context, ["start", "nope"], CancellationToken.None);
+
+        Assert.DoesNotContain(events.Events, e => e is McpRuntimeChangedEvent);
+    }
+
+    [Fact]
+    public async Task Stop_success_publishes_runtime_snapshot()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "remote": { "type": "http", "url": "https://x/mcp" } } }""");
+        var events = new RecordingUiEvents();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(events: events);
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager(new StubHttpFactory());
+        var cmd = new McpCommand();
+
+        await cmd.ExecuteAsync(context, ["start", "remote"], CancellationToken.None);
+        await cmd.ExecuteAsync(context, ["stop", "remote"], CancellationToken.None);
+
+        // One snapshot for the start, one for the stop.
+        Assert.Equal(2, events.Events.OfType<McpRuntimeChangedEvent>().Count());
+    }
+
+    [Fact]
+    public async Task Add_with_flags_publishes_runtime_snapshot_when_manager_present()
+    {
+        using var dirs = new McpTestDirs();
+        var events = new RecordingUiEvents();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(events: events);
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager();
+
+        await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx", "--args", "-y srv"], CancellationToken.None);
+
+        Assert.Single(events.Events.OfType<McpRuntimeChangedEvent>());
+    }
+
+    [Fact]
+    public async Task Add_rejected_does_not_publish_runtime_snapshot()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig("""{ "mcpServers": { "github": { "command": "x" } } }""");
+        var events = new RecordingUiEvents();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(events: events);
+        context.Session.WorkingDirectory = dirs.Project;
+        context.Mcp = new McpClientManager();
+
+        await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx"], CancellationToken.None);
+
+        Assert.DoesNotContain(events.Events, e => e is McpRuntimeChangedEvent);
     }
 
     private sealed class StubHttpFactory : IMcpHttpClientFactory
