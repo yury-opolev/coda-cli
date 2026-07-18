@@ -167,6 +167,17 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
+    public void Formatter_uses_shared_cell_width_for_wide_and_combining_graphemes()
+    {
+        // 界界 fills four cells; the combining acute stays attached to e, which overflows to the next row.
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "\u754c\u754ce\u0301");
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+
+        Assert.Equal(["\u754c\u754c", "e\u0301"], lines.Select(line => line.Text));
+    }
+
+    [Fact]
     public void Plain_text_projection_joins_lines_with_newlines()
     {
         var block = new DiffTranscriptBlock(Guid.NewGuid(), "-old\n+new");

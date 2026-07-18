@@ -1,4 +1,4 @@
-using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
 
@@ -9,94 +9,96 @@ namespace Coda.Tui.Ui.Rendering;
 /// source string, and the horizontal cell it starts at together with how many display cells it occupies.
 /// </summary>
 /// <param name="Text">The grapheme cluster (a Unicode text element) as it appears in the source.</param>
-/// <param name="SourceIndex">The UTF-16 index in the source string where the grapheme begins.</param>
-/// <param name="SourceLength">The number of UTF-16 code units the grapheme spans in the source.</param>
+/// <param name="Utf16Start">The UTF-16 index in the source string where the grapheme begins.</param>
+/// <param name="Utf16Length">The number of UTF-16 code units the grapheme spans in the source.</param>
 /// <param name="CellStart">The zero-based terminal cell the grapheme starts at.</param>
-/// <param name="Width">The number of display cells the grapheme occupies (0, 1, or 2).</param>
+/// <param name="CellWidth">The number of display cells the grapheme occupies (0, 1, or 2).</param>
 internal readonly record struct TerminalTextElement(
-    string Text, int SourceIndex, int SourceLength, int CellStart, int Width);
+    string Text,
+    int Utf16Start,
+    int Utf16Length,
+    int CellStart,
+    int CellWidth);
 
 /// <summary>
-/// A wrapped row produced by <see cref="TerminalCellText.Wrap"/>: the row text alongside the half-open
-/// UTF-16 source range it covers and its total display-cell width.
+/// A wrapped row produced by <see cref="TerminalCellText.Wrap"/>: the row text, the half-open UTF-16
+/// source range it covers, its total display-cell width, and the grapheme clusters it contains. Each
+/// element's <see cref="TerminalTextElement.Utf16Start"/> is an absolute index into the original source
+/// string while its <see cref="TerminalTextElement.CellStart"/> is rebased so the first element of the
+/// row starts at cell zero, which downstream selection/caret math relies on.
 /// </summary>
 /// <param name="Text">The visible text of the row (boundary whitespace between rows is dropped).</param>
-/// <param name="SourceStart">The inclusive UTF-16 index in the source where the row begins.</param>
-/// <param name="SourceEnd">The exclusive UTF-16 index in the source where the row ends.</param>
-/// <param name="Width">The total display-cell width of <see cref="Text"/>.</param>
-internal readonly record struct WrappedCellRow(string Text, int SourceStart, int SourceEnd, int Width);
+/// <param name="StartIndex">The inclusive UTF-16 index in the source where the row begins.</param>
+/// <param name="EndIndex">The exclusive UTF-16 index in the source where the row ends.</param>
+/// <param name="CellWidth">The total display-cell width of <see cref="Text"/>.</param>
+/// <param name="Elements">The grapheme clusters of the row with absolute UTF-16 indices and rebased cell starts.</param>
+internal readonly record struct WrappedCellRow(
+    string Text,
+    int StartIndex,
+    int EndIndex,
+    int CellWidth,
+    ImmutableArray<TerminalTextElement> Elements);
 
 /// <summary>
 /// Shared terminal cell-layout primitives used by the transcript renderer and shells. Measures display
-/// width by Unicode rune (combining/format marks are zero width, wide East Asian and emoji runes are two
-/// cells, everything else is one), enumerates grapheme clusters with both their UTF-16 source indices and
-/// their terminal cell offsets, slices by a cell range while keeping every whole grapheme that intersects
-/// it, and word-wraps by display cells without ever splitting a grapheme cluster.
+/// width per grapheme cluster (combining/format marks add nothing and the cluster takes the maximum of
+/// its runes' widths rather than the sum, so multi-rune emoji and ZWJ sequences count as one wide glyph),
+/// enumerates grapheme clusters with both their UTF-16 source indices and their terminal cell offsets,
+/// slices by a cell range while keeping every whole grapheme that intersects it, and word-wraps by
+/// display cells without ever splitting a grapheme cluster.
 /// </summary>
 internal static class TerminalCellText
 {
     /// <summary>Total display-cell width of <paramref name="text"/>.</summary>
-    internal static int Width(string? text)
-    {
-        if (string.IsNullOrEmpty(text))
-        {
-            return 0;
-        }
-
-        var width = 0;
-        foreach (var rune in text.EnumerateRunes())
-        {
-            width += RuneWidth(rune);
-        }
-
-        return width;
-    }
+    public static int Width(string? text) =>
+        Enumerate(text ?? string.Empty).Sum(element => element.CellWidth);
 
     /// <summary>
     /// Enumerates the grapheme clusters of <paramref name="text"/>, reporting each one's UTF-16 source
     /// index, source length, starting terminal cell, and display width.
     /// </summary>
-    internal static IReadOnlyList<TerminalTextElement> Enumerate(string? text)
+    public static ImmutableArray<TerminalTextElement> Enumerate(string? text)
     {
-        var elements = new List<TerminalTextElement>();
-        if (string.IsNullOrEmpty(text))
-        {
-            return elements;
-        }
-
+        text ??= string.Empty;
+        var builder = ImmutableArray.CreateBuilder<TerminalTextElement>();
         var enumerator = StringInfo.GetTextElementEnumerator(text);
         var cell = 0;
         while (enumerator.MoveNext())
         {
-            var grapheme = (string)enumerator.Current;
-            var width = Width(grapheme);
-            elements.Add(new TerminalTextElement(grapheme, enumerator.ElementIndex, grapheme.Length, cell, width));
+            var value = (string)enumerator.Current;
+            var width = ElementWidth(value);
+            builder.Add(new TerminalTextElement(value, enumerator.ElementIndex, value.Length, cell, width));
             cell += width;
         }
 
-        return elements;
+        return builder.ToImmutable();
     }
 
     /// <summary>
     /// Returns the substring of <paramref name="text"/> covering the half-open cell range
-    /// <paramref name="startCell"/>..<paramref name="endCell"/>, including every whole grapheme cluster
-    /// that intersects the range (a wide grapheme straddling the boundary is included in full).
+    /// <paramref name="startCell"/>..<paramref name="endCellExclusive"/>, including every whole grapheme
+    /// cluster that intersects the range (a wide grapheme straddling the boundary is included in full and
+    /// a zero-width grapheme is treated as occupying one cell so it still intersects).
     /// </summary>
-    internal static string SliceByCells(string? text, int startCell, int endCell)
+    public static string SliceByCells(string? text, int startCell, int endCellExclusive)
     {
-        if (string.IsNullOrEmpty(text) || endCell <= startCell)
+        if (string.IsNullOrEmpty(text) || endCellExclusive <= startCell)
         {
             return string.Empty;
         }
 
+        var start = Math.Max(0, startCell);
+        var end = Math.Max(start, endCellExclusive);
         var builder = new StringBuilder();
         foreach (var element in Enumerate(text))
         {
-            var elementEnd = element.CellStart + element.Width;
-            if (element.CellStart < endCell && elementEnd > startCell)
+            var elementEnd = element.CellStart + Math.Max(1, element.CellWidth);
+            if (elementEnd <= start || element.CellStart >= end)
             {
-                builder.Append(element.Text);
+                continue;
             }
+
+            builder.Append(element.Text);
         }
 
         return builder.ToString();
@@ -107,168 +109,134 @@ internal static class TerminalCellText
     /// preserved as row breaks (a trailing or empty line yields an empty row), breaks prefer whitespace,
     /// runs longer than the width are hard-broken at grapheme boundaries, and no grapheme is ever split.
     /// </summary>
-    internal static IReadOnlyList<WrappedCellRow> Wrap(string? text, int width)
+    public static ImmutableArray<WrappedCellRow> Wrap(string? text, int width)
     {
-        var cellWidth = width > 0 ? width : 1;
-        var rows = new List<WrappedCellRow>();
-        var source = text ?? string.Empty;
+        text ??= string.Empty;
+        var safeWidth = Math.Max(1, width);
+        var rows = ImmutableArray.CreateBuilder<WrappedCellRow>();
+        var logicalStart = 0;
 
-        var lineStart = 0;
-        while (true)
+        while (logicalStart <= text.Length)
         {
-            var newline = source.IndexOf('\n', lineStart);
-            var lineEnd = newline < 0 ? source.Length : newline;
-            WrapLogicalLine(rows, source, lineStart, lineEnd, cellWidth);
-
+            var newline = text.IndexOf('\n', logicalStart);
+            var logicalEnd = newline < 0 ? text.Length : newline;
+            AppendLogicalLine(rows, text, logicalStart, logicalEnd, safeWidth);
             if (newline < 0)
             {
                 break;
             }
 
-            lineStart = newline + 1;
+            logicalStart = newline + 1;
+            if (logicalStart == text.Length)
+            {
+                rows.Add(new WrappedCellRow(string.Empty, logicalStart, logicalStart, 0, []));
+                break;
+            }
         }
 
-        return rows;
+        return rows.Count == 0
+            ? [new WrappedCellRow(string.Empty, 0, 0, 0, [])]
+            : rows.ToImmutable();
     }
 
-    private static void WrapLogicalLine(List<WrappedCellRow> rows, string source, int lineStart, int lineEnd, int width)
+    private static void AppendLogicalLine(
+        ImmutableArray<WrappedCellRow>.Builder rows,
+        string source,
+        int start,
+        int end,
+        int width)
     {
-        if (lineEnd <= lineStart)
+        if (start == end)
         {
-            rows.Add(new WrappedCellRow(string.Empty, lineStart, lineStart, 0));
+            rows.Add(new WrappedCellRow(string.Empty, start, end, 0, []));
             return;
         }
 
-        var emittedBefore = rows.Count;
-        int rowStart = -1, rowEnd = -1, rowWidth = 0;
-
-        void EmitRow(int start, int end)
+        var line = source[start..end];
+        var elements = Enumerate(line);
+        var rowStart = 0;
+        while (rowStart < elements.Length)
         {
-            var chunk = source[start..end];
-            rows.Add(new WrappedCellRow(chunk, start, end, Width(chunk)));
-        }
-
-        void PlaceWord(int wordStart, int wordEnd, int wordWidth)
-        {
-            if (wordWidth <= width)
+            var used = 0;
+            var cursor = rowStart;
+            var lastWhitespace = -1;
+            while (cursor < elements.Length)
             {
-                rowStart = wordStart;
-                rowEnd = wordEnd;
-                rowWidth = wordWidth;
-                return;
-            }
-
-            // Word is wider than the line: hard-break it at grapheme boundaries, keeping the tail as the
-            // in-progress row.
-            var chunks = ChunkWord(source, wordStart, wordEnd, width);
-            for (var i = 0; i < chunks.Count; i++)
-            {
-                var (chunkStart, chunkEnd, chunkWidth) = chunks[i];
-                if (i == chunks.Count - 1)
+                var next = elements[cursor];
+                var nextWidth = Math.Max(1, next.CellWidth);
+                if (used > 0 && used + nextWidth > width)
                 {
-                    rowStart = chunkStart;
-                    rowEnd = chunkEnd;
-                    rowWidth = chunkWidth;
+                    break;
                 }
-                else
+
+                used += nextWidth;
+                if (string.IsNullOrWhiteSpace(next.Text))
                 {
-                    EmitRow(chunkStart, chunkEnd);
+                    lastWhitespace = cursor;
+                }
+
+                cursor++;
+                if (used >= width)
+                {
+                    break;
                 }
             }
-        }
 
-        var pos = lineStart;
-        while (pos < lineEnd)
-        {
-            if (source[pos] == ' ')
+            var rowEnd = cursor;
+            if (cursor < elements.Length && lastWhitespace >= rowStart)
             {
-                pos++;
-                continue;
+                rowEnd = lastWhitespace;
+                cursor = lastWhitespace + 1;
+                while (cursor < elements.Length && string.IsNullOrWhiteSpace(elements[cursor].Text))
+                {
+                    cursor++;
+                }
             }
 
-            var wordStart = pos;
-            while (pos < lineEnd && source[pos] != ' ')
+            if (rowEnd <= rowStart)
             {
-                pos++;
+                rowEnd = Math.Min(elements.Length, rowStart + 1);
+                cursor = rowEnd;
             }
 
-            var wordEnd = pos;
-            var wordWidth = Width(source[wordStart..wordEnd]);
-
-            if (rowStart < 0)
-            {
-                PlaceWord(wordStart, wordEnd, wordWidth);
-                continue;
-            }
-
-            var gap = wordStart - rowEnd; // spaces between the previous word and this one, each one cell.
-            if (rowWidth + gap + wordWidth <= width)
-            {
-                rowEnd = wordEnd;
-                rowWidth += gap + wordWidth;
-                continue;
-            }
-
-            EmitRow(rowStart, rowEnd);
-            rowStart = -1;
-            rowWidth = 0;
-            PlaceWord(wordStart, wordEnd, wordWidth);
-        }
-
-        if (rowStart >= 0)
-        {
-            EmitRow(rowStart, rowEnd);
-        }
-
-        if (rows.Count == emittedBefore)
-        {
-            // Whitespace-only line: still occupies a row.
-            rows.Add(new WrappedCellRow(string.Empty, lineStart, lineStart, 0));
+            var rowElements = elements[rowStart..rowEnd];
+            var rowText = string.Concat(rowElements.Select(element => element.Text));
+            var absoluteStart = start + rowElements[0].Utf16Start;
+            var last = rowElements[^1];
+            var absoluteEnd = start + last.Utf16Start + last.Utf16Length;
+            var baseCell = rowElements[0].CellStart;
+            var normalized = rowElements
+                .Select(element => element with
+                {
+                    Utf16Start = start + element.Utf16Start,
+                    CellStart = element.CellStart - baseCell,
+                })
+                .ToImmutableArray();
+            rows.Add(new WrappedCellRow(rowText, absoluteStart, absoluteEnd, Width(rowText), normalized));
+            rowStart = cursor;
         }
     }
 
-    private static List<(int Start, int End, int Width)> ChunkWord(string source, int wordStart, int wordEnd, int width)
+    /// <summary>
+    /// Display width of a single grapheme cluster: combining and format runes contribute nothing, and the
+    /// cluster's width is the maximum of its runes' widths (wide runes are two cells, others one) rather
+    /// than the sum, so a multi-rune emoji or ZWJ sequence occupies a single wide glyph.
+    /// </summary>
+    private static int ElementWidth(string element)
     {
-        var chunks = new List<(int Start, int End, int Width)>();
-        var chunkStart = wordStart;
-        var chunkEnd = wordStart;
-        var chunkWidth = 0;
-
-        foreach (var element in Enumerate(source[wordStart..wordEnd]))
+        var width = 0;
+        foreach (var rune in element.EnumerateRunes())
         {
-            var elementStart = wordStart + element.SourceIndex;
-            var elementEnd = elementStart + element.SourceLength;
-
-            if (chunkWidth > 0 && chunkWidth + element.Width > width)
+            var category = Rune.GetUnicodeCategory(rune);
+            if (category is UnicodeCategory.NonSpacingMark or UnicodeCategory.EnclosingMark or UnicodeCategory.Format)
             {
-                chunks.Add((chunkStart, chunkEnd, chunkWidth));
-                chunkStart = elementStart;
-                chunkWidth = 0;
+                continue;
             }
 
-            chunkEnd = elementEnd;
-            chunkWidth += element.Width;
+            width = Math.Max(width, IsWide(rune.Value) ? 2 : 1);
         }
 
-        chunks.Add((chunkStart, chunkEnd, chunkWidth));
-        return chunks;
-    }
-
-    private static int RuneWidth(System.Text.Rune rune)
-    {
-        var value = rune.Value;
-        if (value == 0)
-        {
-            return 0;
-        }
-
-        var category = System.Text.Rune.GetUnicodeCategory(rune);
-        if (category is UnicodeCategory.NonSpacingMark or UnicodeCategory.EnclosingMark or UnicodeCategory.Format)
-        {
-            return 0;
-        }
-
-        return IsWide(value) ? 2 : 1;
+        return width;
     }
 
     private static bool IsWide(int codePoint) =>

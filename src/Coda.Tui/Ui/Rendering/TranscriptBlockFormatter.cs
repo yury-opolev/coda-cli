@@ -505,7 +505,7 @@ public static class TranscriptBlockFormatter
 
         foreach (var element in TerminalCellText.Enumerate(word))
         {
-            var clusterWidth = element.Width;
+            var clusterWidth = element.CellWidth;
 
             if (builderWidth > 0 && builderWidth + clusterWidth > width)
             {
