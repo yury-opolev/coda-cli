@@ -25,5 +25,8 @@ artifacts/
 TestResults/
 **/TestResults/
 
+# Local Git worktrees
+.worktrees/
+
 # Coda runtime/user data — never commit
 .coda/
