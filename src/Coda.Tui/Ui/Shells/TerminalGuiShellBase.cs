@@ -462,6 +462,16 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         if (!result.Consumed)
         {
+            // The chord state declined the key (e.g. Esc after the interruptible work vanished) and reset
+            // itself in the process. Tear down the now-orphaned expiry timeout and restore the projected
+            // status so a stale "Press Esc again" hint never lingers into an idle frame. The re-projection
+            // re-derives from any pinned transient override first, so an unrelated override is preserved.
+            if (this.chords.ArmedAction == ShellChordAction.None)
+            {
+                this.StopChordTimeout();
+                this.RestoreProjectedOperationalStatus();
+            }
+
             return false;
         }
 

@@ -1344,4 +1344,83 @@ public sealed class VirtualizedTranscriptViewTests
         fixture.Shell.Composer.NewKeyDownEvent(Key.F2);
         Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
     }
+
+    [Fact]
+    public void Armed_interrupt_hint_expiry_callback_restores_projected_status()
+    {
+        var clock = new ManualTimeProvider();
+        Func<bool>? timeout = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            timeProvider: clock,
+            addTimeout: (_, callback) =>
+            {
+                timeout = callback;
+                return new object();
+            });
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        clock.Advance(TimeSpan.FromMilliseconds(801));
+        Assert.NotNull(timeout);
+        Assert.False(timeout!());
+
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(
+            OperationalStatusProjector.Project(fixture.Shell.Snapshot),
+            fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public async Task Applying_idle_snapshot_disarms_stale_interrupt_hint()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: false, timeProvider: clock);
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { RunningTasks = 1 },
+            CancellationToken.None);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(
+            OperationalStatusProjector.Project(UiSessionSnapshot.Empty),
+            fixture.Shell.Operational.Status);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Second_escape_after_work_ends_clears_stale_hint_and_timer_even_when_unconsumed()
+    {
+        var clock = new ManualTimeProvider();
+        var active = true;
+        var chordToken = new object();
+        var removed = new List<object>();
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            timeProvider: clock,
+            hasActiveWork: () => active,
+            addTimeout: (_, _) => chordToken,
+            removeTimeout: token =>
+            {
+                removed.Add(token);
+                return true;
+            });
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        // The interruptible work finishes without a snapshot apply, so the disarm-on-apply path never
+        // runs; the second Esc is declined by the chord state (not consumed) yet must still clear the
+        // stale hint and tear down the orphaned expiry timer immediately.
+        active = false;
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Contains(chordToken, removed);
+        Assert.Empty(fixture.Actions);
+    }
 }

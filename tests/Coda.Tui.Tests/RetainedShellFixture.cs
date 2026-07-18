@@ -31,7 +31,8 @@ internal sealed class RetainedShellFixture : IDisposable
         TimeProvider? timeProvider = null,
         Func<string, bool>? clipboardWriter = null,
         Func<TimeSpan, Func<bool>, object>? addTimeout = null,
-        Func<object, bool>? removeTimeout = null)
+        Func<object, bool>? removeTimeout = null,
+        Func<bool>? hasActiveWork = null)
     {
         IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -45,7 +46,7 @@ internal sealed class RetainedShellFixture : IDisposable
             controller,
             new RecordingUiEvents(),
             UiSessionSnapshot.Empty,
-            hasActiveWork: () => activeWork,
+            hasActiveWork: hasActiveWork ?? (() => activeWork),
             timeProvider: timeProvider,
             clipboardWriter: clipboardWriter,
             addTimeout: addTimeout,
