@@ -284,15 +284,18 @@ internal sealed class VirtualizedTranscriptView : View
         var selectedAttribute = new TgAttribute(
             TuiTheme.Resolve(this.theme.SelectionText, useTrueColor),
             TuiTheme.Resolve(this.theme.SelectionBackground, useTrueColor));
-        var prefix = TerminalCellText.SliceByCells(row.Text, 0, range.Value.StartCell);
-        var selected = TerminalCellText.SliceByCells(
+
+        // Snap the selection range out to whole grapheme boundaries first: a wide glyph (CJK/emoji) whose
+        // trailing cell the selection starts or ends on must not straddle a segment boundary, or it would be
+        // sliced into two adjacent segments and drawn twice. Snapping makes the prefix/selected/suffix
+        // slices partition the row's graphemes exactly once.
+        var (selectStart, selectEnd) = TerminalCellText.SnapRangeToGraphemes(
             row.Text,
             range.Value.StartCell,
             range.Value.EndCellExclusive);
-        var suffix = TerminalCellText.SliceByCells(
-            row.Text,
-            range.Value.EndCellExclusive,
-            rowWidth);
+        var prefix = TerminalCellText.SliceByCells(row.Text, 0, selectStart);
+        var selected = TerminalCellText.SliceByCells(row.Text, selectStart, selectEnd);
+        var suffix = TerminalCellText.SliceByCells(row.Text, selectEnd, rowWidth);
 
         this.SetAttribute(this.AttributeFor(row.Role));
         this.Move(0, screenRow);

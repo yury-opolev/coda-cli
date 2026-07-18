@@ -114,6 +114,46 @@ internal static class TerminalCellText
     }
 
     /// <summary>
+    /// Expands the half-open cell range [<paramref name="startCell"/>, <paramref name="endCellExclusive"/>)
+    /// so both endpoints fall on whole grapheme-cluster boundaries: the start snaps down to the
+    /// <see cref="TerminalTextElement.CellStart"/> of the grapheme it lands inside and the end snaps up to
+    /// that grapheme's trailing cell (a zero-width grapheme is treated as occupying one cell). The result is
+    /// clamped to [0, total width]. Slicing a row into prefix/selected/suffix segments at the snapped
+    /// boundaries makes the three <see cref="SliceByCells"/> slices partition the row's graphemes exactly
+    /// once — no wide glyph straddles a boundary, so concatenating the segments reproduces the source text
+    /// and their widths sum to it.
+    /// </summary>
+    public static (int StartCell, int EndCellExclusive) SnapRangeToGraphemes(
+        string? text,
+        int startCell,
+        int endCellExclusive)
+    {
+        var total = Width(text);
+        var start = Math.Clamp(startCell, 0, total);
+        var end = Math.Clamp(endCellExclusive, start, total);
+        if (string.IsNullOrEmpty(text))
+        {
+            return (start, end);
+        }
+
+        foreach (var element in Enumerate(text))
+        {
+            var elementEnd = element.CellStart + Math.Max(1, element.CellWidth);
+            if (element.CellStart < start && start < elementEnd)
+            {
+                start = element.CellStart;
+            }
+
+            if (element.CellStart < end && end < elementEnd)
+            {
+                end = elementEnd;
+            }
+        }
+
+        return (start, Math.Max(start, end));
+    }
+
+    /// <summary>
     /// Word-wraps <paramref name="text"/> to <paramref name="width"/> display cells. Newlines are
     /// preserved as row breaks (a trailing or empty line yields an empty row), breaks prefer whitespace,
     /// runs longer than the width are hard-broken at grapheme boundaries, and no grapheme is ever split.

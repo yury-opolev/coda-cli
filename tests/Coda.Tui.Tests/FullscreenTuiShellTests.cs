@@ -1726,4 +1726,36 @@ public sealed class VirtualizedTranscriptViewTests
             app.End(token);
         }
     }
+
+    [Fact]
+    public void Cjk_selection_starting_inside_a_wide_cell_draws_the_whole_glyph_highlight()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(40, 12);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // "AB界CD": the wide 界 occupies cells 2-3; selecting from its trailing cell (3) once split the
+        // glyph across the role-colored prefix and the selection segment, corrupting the row.
+        var block = (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), "AB\u754cCD");
+        shell.Transcript.ReplaceAll(ImmutableArray.Create(block));
+        app.LayoutAndDraw();
+
+        var row = shell.Transcript.TopRow;
+        shell.Transcript.BeginSelection(new TranscriptCellPosition(row, 3));
+        shell.Transcript.UpdateSelection(new TranscriptCellPosition(row, 5));
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.HasSelection);
+        Assert.True(shell.Transcript.SelectionDrawCount > 0);
+        Assert.Contains("\u754c", shell.Transcript.GetSelectedText());
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
 }

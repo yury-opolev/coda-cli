@@ -62,6 +62,64 @@ public sealed class TerminalCellTextTests
         Assert.Equal(combining, TerminalCellText.SliceByCells(combining, 0, 1));
     }
 
+    [Theory]
+    // "AB界CD": A0 B1 界2-3 C4 D5 (total 6 cells). An endpoint landing on the wide glyph's trailing
+    // cell (3) must snap outward so the glyph is never straddled by a segment boundary.
+    [InlineData("AB\u754cCD", 3, 5, 2, 5)]   // start inside 界's trailing cell -> snap start down to 2
+    [InlineData("AB\u754cCD", 0, 3, 0, 4)]   // end inside 界's trailing cell -> snap end up to 4
+    [InlineData("AB\u754cCD", 2, 4, 2, 4)]   // already aligned to grapheme edges -> unchanged
+    [InlineData("AB\u754cCD", -3, 100, 0, 6)] // clamped to [0, total]
+    // "A😀B": A0 😀1-2 B3 (total 4 cells).
+    [InlineData("A\U0001F600B", 2, 4, 1, 4)] // start inside emoji's trailing cell -> snap down to 1
+    [InlineData("A\U0001F600B", 0, 2, 0, 3)] // end inside emoji's trailing cell -> snap up to 3
+    public void SnapRangeToGraphemes_expands_endpoints_to_whole_grapheme_boundaries(
+        string text, int startCell, int endCell, int expectedStart, int expectedEnd)
+    {
+        var (start, end) = TerminalCellText.SnapRangeToGraphemes(text, startCell, endCell);
+
+        Assert.Equal((expectedStart, expectedEnd), (start, end));
+    }
+
+    [Theory]
+    // Each case selects across a wide glyph's trailing cell so the selection boundary lands mid-glyph.
+    [InlineData("AB\u754cCD", 3, 5)]        // 界 straddles the selection start
+    [InlineData("AB\u754cCD", 0, 3)]        // 界 straddles the selection end
+    [InlineData("A\U0001F600B", 2, 4)]      // 😀 straddles the selection start
+    [InlineData("A\U0001F600B", 0, 2)]      // 😀 straddles the selection end
+    public void Selection_segments_partition_graphemes_exactly_once(string text, int startCell, int endCell)
+    {
+        var total = TerminalCellText.Width(text);
+        var (start, end) = TerminalCellText.SnapRangeToGraphemes(text, startCell, endCell);
+        var prefix = TerminalCellText.SliceByCells(text, 0, start);
+        var selected = TerminalCellText.SliceByCells(text, start, end);
+        var suffix = TerminalCellText.SliceByCells(text, end, total);
+
+        // The three drawn segments reproduce the original exactly once (no wide glyph duplicated across
+        // adjacent segments) and their widths sum to the row width (no overlap or omission).
+        Assert.Equal(text, prefix + selected + suffix);
+        Assert.Equal(
+            total,
+            TerminalCellText.Width(prefix) + TerminalCellText.Width(selected) + TerminalCellText.Width(suffix));
+    }
+
+    [Theory]
+    [InlineData("AB\u754cCD", 3, 5, "\u754c")]        // whole 界 lives in the selected segment only
+    [InlineData("AB\u754cCD", 0, 3, "\u754c")]
+    [InlineData("A\U0001F600B", 2, 4, "\U0001F600")] // whole 😀 lives in the selected segment only
+    [InlineData("A\U0001F600B", 0, 2, "\U0001F600")]
+    public void Selection_segment_includes_the_whole_wide_glyph(string text, int startCell, int endCell, string glyph)
+    {
+        var total = TerminalCellText.Width(text);
+        var (start, end) = TerminalCellText.SnapRangeToGraphemes(text, startCell, endCell);
+        var prefix = TerminalCellText.SliceByCells(text, 0, start);
+        var selected = TerminalCellText.SliceByCells(text, start, end);
+        var suffix = TerminalCellText.SliceByCells(text, end, total);
+
+        Assert.Contains(glyph, selected);
+        Assert.DoesNotContain(glyph, prefix);
+        Assert.DoesNotContain(glyph, suffix);
+    }
+
     [Fact]
     public void Wrap_preserves_newlines_prefers_whitespace_and_hard_breaks_long_grapheme_runs()
     {
