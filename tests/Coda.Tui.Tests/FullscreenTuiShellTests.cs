@@ -155,7 +155,7 @@ public sealed class FullscreenTuiShellTests
         Assert.False(shell.Chrome.Ready);
         Assert.Equal(string.Empty, shell.Chrome.DisplayText);
         Assert.False(shell.Completion.Visible);
-        Assert.Contains("Starting…", shell.Status.Text);
+        Assert.DoesNotContain("Starting…", shell.Status.Text);
 
         if (token is not null)
         {
