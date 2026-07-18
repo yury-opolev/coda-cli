@@ -69,22 +69,25 @@ public sealed class ImmediateCliTests
         Assert.Contains("Ctrl+J", output);
         Assert.Contains("newline", output);
 
-        // Visual arrow movement plus history at the edges.
+        // Arrows move the composer cursor between lines of a multi-line prompt.
         Assert.Contains("Up / Down", output);
+
+        // Prompt history is a dedicated Ctrl+Up / Ctrl+Down chord, not the plain arrows.
+        Assert.Contains("Ctrl+Up / Ctrl+Down", output);
         Assert.Contains("history", output);
 
         // Double-Esc interrupts the active turn.
         Assert.Contains("Esc twice", output);
         Assert.Contains("interrupt the active turn", output);
 
-        // Ctrl+C copies a selection and only exits on a second press.
+        // Ctrl+C copies the transcript selection and only exits on a second press.
         Assert.Contains("Ctrl+C", output);
         Assert.Contains("selection", output);
         Assert.Contains("press twice to exit", output);
 
-        // Selection is made by dragging or holding Shift.
-        Assert.Contains("drag", output);
-        Assert.Contains("Shift", output);
+        // Left-drag selects the transcript; Shift+drag hands selection/copy to the terminal.
+        Assert.Contains("Left-drag", output);
+        Assert.Contains("Shift+drag", output);
 
         // Exit is via /exit; F2 still toggles the host model.
         Assert.Contains("/exit", output);
@@ -97,8 +100,19 @@ public sealed class ImmediateCliTests
         var (_, output) = Run("--help");
 
         // Warm Ember removes the Ctrl+D exit binding; the help must not advertise it.
-        Assert.DoesNotContain("Ctrl+D", output);
-        Assert.DoesNotContain("Ctrl-D", output);
+        // Match only a standalone Ctrl+D / Ctrl-D chord, not the Ctrl+Down history key.
+        Assert.DoesNotMatch(@"Ctrl[+-]D(?![a-z])", output);
+    }
+
+    [Fact]
+    public void Help_does_not_claim_shift_arrow_selection_or_composer_copy()
+    {
+        var (_, output) = Run("--help");
+
+        // Warm Ember hands text selection to left-drag (in-app) or the terminal (Shift+drag),
+        // so the help must not claim Shift+arrow/Home/End selection or copying composer text.
+        Assert.DoesNotContain("Home/End", output);
+        Assert.DoesNotContain("composer text", output);
     }
 
     [Fact]

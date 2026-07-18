@@ -59,7 +59,7 @@ $checklist = @{
     'paste'         = 'Multiline bracketed paste is inserted verbatim WITHOUT submitting; embedded newlines never trigger a turn.'
     'resize'        = 'Resize while streaming and with a prompt open reflows cleanly; verify minimum sizes 60x12, 59x12, and 60x11.'
     'cancel'        = 'Double-Esc interrupts the active turn without corrupting the terminal; /exit or a second Ctrl+C (with no selection) then leaves cleanly, while Ctrl+C over a selection copies.'
-    'mouse-off'     = 'With the mouse disabled, keyboard navigation and editing remain fully usable and Shift-selection replaces drag-selection.'
+    'mouse-off'     = 'With the mouse disabled, keyboard navigation and editing remain fully usable and native selection/copy is left to the terminal.'
     'managed-crash' = 'A managed renderer crash restores the terminal (alternate screen/cursor/mouse reset) and exits non-zero — no corruption.'
 }
 
