@@ -1,6 +1,5 @@
 using System.Globalization;
 using System.Text;
-using Coda.Agent;
 using LlmClient;
 
 namespace Coda.Tui.Ui.State;
@@ -55,41 +54,34 @@ public static class StatusProjector
             fields.Add(FormatContext(context, width)); // 3 — context window
         }
 
-        fields.Add(FormatPermission(snapshot.Permission)); // 4 — permission
-
-        if (snapshot.ActiveOperation is { } operation)
-        {
-            fields.Add(operation.Label); // 5 — active operation
-        }
-
         if (HasUsage(snapshot.SessionUsage))
         {
-            fields.Add(FormatUsage(snapshot.SessionUsage)); // 6 — token usage
+            fields.Add(FormatUsage(snapshot.SessionUsage)); // 4 — token usage
         }
 
         if (snapshot.EstimatedCost is { } cost)
         {
-            fields.Add(FormatCost(cost)); // 7 — cost
+            fields.Add(FormatCost(cost)); // 5 — cost
         }
 
         if (HasService(snapshot.Mcp))
         {
-            fields.Add(FormatService("MCP", snapshot.Mcp)); // 8 — MCP services
+            fields.Add(FormatService("MCP", snapshot.Mcp)); // 6 — MCP services
         }
 
         if (HasService(snapshot.Lsp))
         {
-            fields.Add(FormatService("LSP", snapshot.Lsp)); // 9 — LSP services
+            fields.Add(FormatService("LSP", snapshot.Lsp)); // 7 — LSP services
         }
 
         if (snapshot.Git is { Branch: { } branch })
         {
-            fields.Add(branch + (snapshot.Git.Dirty ? "*" : string.Empty)); // 10 — git branch
+            fields.Add(branch + (snapshot.Git.Dirty ? "*" : string.Empty)); // 8 — git branch
         }
 
         if (!string.IsNullOrEmpty(snapshot.WorkingDirectory))
         {
-            fields.Add(snapshot.WorkingDirectory); // 11 — working directory
+            fields.Add(snapshot.WorkingDirectory); // 9 — working directory
         }
 
         return fields;
@@ -101,18 +93,6 @@ public static class StatusProjector
         return width < PercentageThresholdColumns
             ? $"ctx {tilde}{context.Percentage}%"
             : $"ctx {tilde}{Compact(context.UsedTokens)}/{Compact(context.MaxTokens)}";
-    }
-
-    private static string FormatPermission(PermissionStatus permission)
-    {
-        if (permission.PendingCount > 0)
-        {
-            return permission.PendingCount == 1
-                ? "1 permission"
-                : $"{permission.PendingCount} permissions";
-        }
-
-        return permission.Mode.ToString().ToLowerInvariant();
     }
 
     private static bool HasUsage(TokenUsage usage) => usage.InputTokens > 0 || usage.OutputTokens > 0;

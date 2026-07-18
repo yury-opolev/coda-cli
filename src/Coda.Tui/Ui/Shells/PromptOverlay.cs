@@ -2,6 +2,8 @@ using System.Collections.Immutable;
 using System.Text;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Rendering;
+using Terminal.Gui.Drivers;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -21,6 +23,7 @@ namespace Coda.Tui.Ui.Shells;
 internal sealed class PromptOverlay : View
 {
     private readonly IUiEventPublisher publisher;
+    private readonly TuiTheme theme;
     private readonly Label titleLabel;
     private readonly Label bodyLabel;
     private readonly HashSet<int> checkedIndices = [];
@@ -30,9 +33,10 @@ internal sealed class PromptOverlay : View
     private int selectedIndex;
     private bool completed;
 
-    public PromptOverlay(IUiEventPublisher publisher)
+    public PromptOverlay(IUiEventPublisher publisher, TuiTheme? theme = null)
     {
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
+        this.theme = theme ?? TuiTheme.WarmEmber;
         this.CanFocus = true;
         this.Visible = false;
         this.BorderStyle = LineStyle.Rounded;
@@ -42,6 +46,10 @@ internal sealed class PromptOverlay : View
         this.Add(this.titleLabel);
         this.Add(this.bodyLabel);
     }
+
+    /// <summary>Applies the Warm Ember prompt scheme, resolved for the given driver's color depth.</summary>
+    internal void ApplyTheme(IDriver? driver) =>
+        this.SetScheme(this.theme.PromptScheme(driver));
 
     /// <summary>The request currently displayed, or <see langword="null"/> when the overlay is hidden.</summary>
     public UiPromptRequest? Request => this.request;

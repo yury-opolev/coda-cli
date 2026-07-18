@@ -33,11 +33,24 @@ automated smoke against an isolated ANSI screen buffer.
 - **Full-screen virtualization:** with **10,000** preloaded transcript blocks, the visible-row
   formatting work per frame stays **bounded by the viewport height** (plus a small overscan), never by
   the total block count.
-- **Restoration:** startup and every exit path (clean exit, Ctrl-C then explicit exit, and a managed
-  renderer crash) restore the alternate screen, cursor, mouse mode, bracketed paste, and scroll region.
+- **Restoration:** startup and every exit path (clean exit, a double-`Esc` interrupt followed by an
+  explicit exit, and a managed renderer crash) restore the alternate screen, cursor, mouse mode,
+  bracketed paste, and scroll region.
 - **Minimum sizes:** **60×12** is the minimum usable interactive layout. **59×12** (too narrow) and
   **60×11** (too short) are below that minimum and instead verify the graceful fallback (auto) and
   usage-error (explicit `--tui`) paths — they are not usable interactive layouts.
+- **Warm Ember layout:** the transcript fills the full width, an **operational status row** sits
+  **directly above** the composer, the **dynamic composer** starts at **three rows** and grows to a
+  **capped height**, and a **stable metadata row** occupies the **final row**; focus stays on the
+  composer while typing.
+- **Composer cursor:** `Up`/`Down` move the composer cursor between the lines of a multi-line prompt,
+  while `Ctrl+Up`/`Ctrl+Down` step through prompt history — the plain arrows never leave the composer.
+- **Selection/copy:** **left-drag** selects transcript text and `Ctrl+C` copies it; **`Shift`-drag**
+  (and `--no-mouse`) hands native selection and copy to the terminal where supported. There is no
+  in-app Shift+arrow/`Home`/`End` selection and no composer-text copy binding.
+- **Chords:** a double `Esc` interrupts the active turn (a single `Esc` only dismisses the menu or
+  clears a selection); `Ctrl+C` copies a selection and, with nothing selected, exits on the second
+  press; `/exit` or `/quit` exits — there is **no `Ctrl+D`** binding.
 
 ## Checklist items (columns)
 
@@ -52,11 +65,11 @@ the terminal supports full-screen:
 6. **Unicode** — wide CJK / emoji / combining marks render with correct alignment.
 7. **IME** — IME composition works (where the platform provides one).
 8. **Paste** — multiline bracketed paste inserts verbatim, without submitting.
-9. **Copy** — native selection/copy works in inline mode.
+9. **Selection/copy** — **left-drag** selects transcript text and `Ctrl+C` copies it; **`Shift`-drag** and `--no-mouse` hand native selection/copy to the terminal (native selection/copy in inline mode).
 10. **Picker** — keyboard-only picker/completion works.
 11. **Mouse off** — with the mouse disabled, the keyboard remains fully usable.
 12. **Plain fallback** — low-color / `TERM=dumb` falls back to plain output.
-13. **Ctrl-C** — Ctrl-C interrupts the active turn, then an explicit exit leaves cleanly.
+13. **Exit/interrupt chords** — a double `Esc` interrupts the active turn; `/exit` or a second `Ctrl+C` (with no selection) then leaves cleanly, while `Ctrl+C` over a selection copies instead of exiting.
 14. **Crash restore** — a managed renderer crash restores the terminal and exits non-zero.
 15. **Bounded 10k** — full-screen visible-row formatting stays bounded with 10,000 blocks.
 16. **Redirected** — redirected input and redirected output both use plain behavior.
@@ -69,7 +82,7 @@ Legend: `☐` untested · `✅` pass · `❌` fail · `➖` not applicable / uns
 Both host models are listed per terminal (`i` = inline, `f` = full-screen). Full-screen is marked `➖`
 for line-oriented tools that do not host an alternate-screen application.
 
-| Terminal | Mode | 1 Restore | 2 Stream+type | 3 No overwrite | 4 Resize (stream) | 5 Resize (prompt) | 6 Unicode | 7 IME | 8 Paste | 9 Copy | 10 Picker | 11 Mouse off | 12 Plain fallback | 13 Ctrl-C | 14 Crash restore | 15 Bounded 10k | 16 Redirected | 17 Min size |
+| Terminal | Mode | 1 Restore | 2 Stream+type | 3 No overwrite | 4 Resize (stream) | 5 Resize (prompt) | 6 Unicode | 7 IME | 8 Paste | 9 Selection/copy | 10 Picker | 11 Mouse off | 12 Plain fallback | 13 Exit/interrupt | 14 Crash restore | 15 Bounded 10k | 16 Redirected | 17 Min size |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | Windows Terminal | i | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ➖ | ☐ | ☐ |
 | Windows Terminal | f | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ➖ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ | ☐ |
@@ -103,10 +116,10 @@ logic alone.
 | `unicode` | 6 Unicode (and 7 IME by operator observation) |
 | `paste` | 8 Paste |
 | `resize` | 4 Resize (stream), 5 Resize (prompt), 17 Min size |
-| `cancel` | 13 Ctrl-C, 1 Restore |
+| `cancel` | 13 Exit/interrupt chords, 1 Restore |
 | `mouse-off` | 11 Mouse off |
 | `managed-crash` | 14 Crash restore, 1 Restore |
-| (operator, around any run) | 9 Copy, 10 Picker, 12 Plain fallback, 16 Redirected |
+| (operator, around any run) | 9 Selection/copy, 10 Picker, 12 Plain fallback, 16 Redirected |
 
 ## Evidence log
 

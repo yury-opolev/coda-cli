@@ -1,9 +1,11 @@
 using System.Collections.Immutable;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
+using TgColor = Terminal.Gui.Drawing.Color;
 
 namespace Coda.Tui.Tests;
 
@@ -57,7 +59,8 @@ public sealed class FullscreenTuiShellTests
 
         Assert.Equal(1, shell.Header.Frame.Height);
         Assert.True(shell.Transcript.Frame.Height >= 3);
-        Assert.Equal(Math.Min(width, FullscreenTuiShell.MaximumTranscriptWidth), shell.Transcript.Frame.Width);
+        Assert.Equal(width, shell.Transcript.Frame.Width);
+        Assert.Equal(0, shell.Transcript.Frame.X);
         Assert.True(shell.Composer.Frame.Height >= 3);
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.DoesNotContain(shell.SubViews, view => view.Id?.Contains("sidebar", StringComparison.OrdinalIgnoreCase) == true);
@@ -84,8 +87,14 @@ public sealed class FullscreenTuiShellTests
         app.LayoutAndDraw();
 
         Assert.Equal(width, shell.Header.Frame.Width);
-        Assert.Equal(width, shell.Composer.Frame.Width);
         Assert.Equal(width, shell.Status.Frame.Width);
+
+        // The composer no longer spans the full width: a small fixed gutter is reserved at its left for
+        // the borderless chrome (accent bar + prompt glyph). The chrome itself spans the full width.
+        Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
+        Assert.Equal(width - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
+        Assert.Equal(0, shell.Chrome.Frame.X);
+        Assert.Equal(width, shell.Chrome.Frame.Width);
 
         if (token is not null)
         {
@@ -93,20 +102,31 @@ public sealed class FullscreenTuiShellTests
         }
     }
 
-    [Fact]
-    public void Transcript_is_centered_only_when_wider_than_the_maximum()
+    [Theory]
+    [InlineData(60, 12)]
+    [InlineData(80, 24)]
+    [InlineData(140, 40)]
+    public void Fullscreen_composer_is_borderless_with_chrome_over_the_composer_region(int width, int height)
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
         app.Init(DriverRegistry.Names.ANSI);
-        app.Driver!.SetScreenSize(160, 40);
+        app.Driver!.SetScreenSize(width, height);
         using var shell = ShellTestFactory.CreateFullscreen(app);
 
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        Assert.Equal(FullscreenTuiShell.MaximumTranscriptWidth, shell.Transcript.Frame.Width);
-        Assert.True(shell.Transcript.Frame.X > 0);
+        // No rectangular border around the input.
+        Assert.Null(shell.Composer.BorderStyle);
+
+        // The shell-owned chrome spans exactly the composer's rows, is non-focusable, and reads ready.
+        Assert.False(shell.Chrome.CanFocus);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Composer.Frame.Height, shell.Chrome.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
+        Assert.True(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
 
         if (token is not null)
         {
@@ -115,7 +135,194 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Transcript_is_flush_left_when_narrower_than_the_maximum()
+    public async Task Fullscreen_startup_snapshot_hides_composer_and_shows_initializing()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+
+        Assert.False(shell.Composer.Visible);
+        Assert.False(shell.Composer.HasFocus);
+        Assert.False(shell.Chrome.Ready);
+        Assert.Equal(string.Empty, shell.Chrome.DisplayText);
+        Assert.False(shell.Completion.Visible);
+        Assert.DoesNotContain("Starting…", shell.Status.Text);
+
+        // The operational row (above the composer) owns the Initializing message; the chrome stays blank.
+        Assert.Equal("Initializing…", shell.Operational.Status.Text);
+        Assert.DoesNotContain("Initializing", string.Join('\n', shell.Chrome.RenderRows(80, 3)));
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_ready_snapshot_shows_composer_prompt_and_focuses()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+        Assert.False(shell.Composer.Visible);
+
+        // Startup completes: the active operation clears, so the composer is shown, focused, and the
+        // chrome flips back to the '>' prompt glyph.
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+
+        Assert.True(shell.Composer.Visible);
+        Assert.True(shell.Composer.CanFocus);
+        Assert.True(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_prompt_pending_keeps_prompt_focus_when_startup_completes()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var prompt = Coda.Tui.Ui.Prompts.UiPromptRequest.Confirm("Allow?", defaultValue: false);
+        var startupWithPrompt = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+            PendingPrompt = prompt,
+        };
+        await shell.ApplyAsync(startupWithPrompt, CancellationToken.None);
+        Assert.True(shell.PromptOverlay.Visible);
+
+        // Startup completes but the prompt is still pending: focus must stay on the prompt overlay and
+        // the composer must not steal it back or appear in front of the modal prompt.
+        var readyWithPrompt = UiSessionSnapshot.Empty with { PendingPrompt = prompt };
+        await shell.ApplyAsync(readyWithPrompt, CancellationToken.None);
+
+        Assert.True(shell.PromptOverlay.Visible);
+        Assert.True(shell.PromptOverlay.HasFocus);
+        Assert.False(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_submission_is_blocked_during_startup_and_works_after_ready()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var submissions = new List<string>();
+        shell.PromptSubmitted += (_, text) => submissions.Add(text);
+        shell.Composer.SetDraft("hello", 5);
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+
+        // Pressing Enter while startup is active must not submit a turn.
+        shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.Empty(submissions);
+
+        // Once ready, the same Enter submits the preserved draft immediately.
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+        shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.Equal(["hello"], submissions);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Fullscreen_narrow_minimum_geometry_reserves_gutter_without_starving_composer()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(60, 12);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
+        Assert.Equal(60 - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
+        Assert.True(shell.Composer.Frame.Width >= 40, "composer should stay comfortably usable at 60 columns");
+        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(60, shell.Chrome.Frame.Width);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Theory]
+    [InlineData(60)]
+    [InlineData(80)]
+    [InlineData(160)]
+    public void Transcript_spans_the_full_width_flush_left(int width)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, 40);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(0, shell.Transcript.Frame.X);
+        Assert.Equal(width, shell.Transcript.Frame.Width);
+        Assert.Equal(width, shell.Transcript.ActiveLayoutWidth);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Transcript_reflows_to_the_full_width_when_the_terminal_is_resized()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -127,7 +334,14 @@ public sealed class FullscreenTuiShellTests
         app.LayoutAndDraw();
 
         Assert.Equal(80, shell.Transcript.Frame.Width);
+        Assert.Equal(80, shell.Transcript.ActiveLayoutWidth);
+
+        app.Driver!.SetScreenSize(160, 40);
+        app.LayoutAndDraw();
+
         Assert.Equal(0, shell.Transcript.Frame.X);
+        Assert.Equal(160, shell.Transcript.Frame.Width);
+        Assert.Equal(160, shell.Transcript.ActiveLayoutWidth);
 
         if (token is not null)
         {
@@ -386,6 +600,102 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
+    public void Initially_ready_shell_focuses_composer_after_initialization()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Printable_key_from_transcript_focuses_and_inserts_into_composer()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Transcript.SetFocus();
+
+        Assert.True(shell.Transcript.NewKeyDownEvent(new Key('/')));
+
+        Assert.True(shell.Composer.HasFocus);
+        Assert.Equal("/", shell.Composer.GetDraft());
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Transcript_navigation_stays_in_transcript()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Transcript.ReplaceAll(Lines(100));
+        shell.Transcript.SetFocus();
+        var before = shell.Transcript.TopRow;
+
+        shell.Transcript.NewKeyDownEvent(Key.PageUp);
+
+        Assert.True(shell.Transcript.HasFocus);
+        Assert.True(shell.Transcript.TopRow < before);
+        Assert.Equal(string.Empty, shell.Composer.GetDraft());
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Modal_prompt_never_redirects_printable_input()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        var prompt = UiPromptRequest.Text("Name");
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = prompt },
+            CancellationToken.None);
+
+        shell.PromptOverlay.NewKeyDownEvent(new Key('x'));
+
+        Assert.Equal("x", shell.PromptOverlay.BodyText);
+        Assert.Equal(string.Empty, shell.Composer.GetDraft());
+        Assert.True(shell.PromptOverlay.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public async Task Drawing_a_populated_transcript_does_not_throw()
     {
         using IApplication app = Application.Create();
@@ -429,20 +739,18 @@ public sealed class FullscreenTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Header on row 0, status on the final row, composer three rows directly above the status.
+        // Retained row order: header, transcript, operational row, composer, metadata (status).
         Assert.Equal(0, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
-        Assert.Equal(1, shell.Status.Frame.Height);
-        Assert.Equal(height - 1, shell.Status.Frame.Y);
         Assert.Equal(3, shell.Composer.Frame.Height);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(1, shell.Operational.Frame.Height);
+        Assert.Equal(1, shell.Status.Frame.Height);
 
-        // Transcript fills every row between the header and the composer, at least height - 5 rows.
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
-        Assert.True(
-            shell.Transcript.Frame.Height >= height - 5,
-            $"transcript height {shell.Transcript.Frame.Height} should be at least {height - 5}");
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
 
         if (token is not null)
         {
@@ -486,6 +794,213 @@ public sealed class FullscreenTuiShellTests
         {
             app.End(token);
         }
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Fullscreen_surface_background_is_inherited_by_header_status_transcript_completion(bool force16)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = force16;
+        app.Driver.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var expected = force16
+            ? new TgColor(TuiTheme.WarmEmber.Background.Fallback)
+            : TuiTheme.WarmEmber.Background.TrueColor;
+
+        // The shell paints the Warm Ember surface, and header/status/transcript/completion carry no
+        // explicit scheme of their own, so each inherits the same normal background from the top level.
+        Assert.Equal(expected, shell.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Header.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Status.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Completion.GetScheme().Normal.Background);
+
+        Assert.False(shell.Header.HasScheme);
+        Assert.False(shell.Status.HasScheme);
+        Assert.False(shell.Transcript.HasScheme);
+        Assert.False(shell.Completion.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Fullscreen_composer_and_prompt_keep_their_own_explicit_schemes()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // The surface scheme must not overwrite the composer's and prompt overlay's own explicit schemes.
+        Assert.True(shell.Composer.HasScheme);
+        Assert.True(shell.PromptOverlay.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_short_transcript_trailing_cells_use_the_surface_scheme_source()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // A short transcript leaves most of the panel empty. Those trailing/empty cells are cleared with
+        // the transcript's inherited scheme, so their backdrop must resolve from the same surface source
+        // as the shell — asserted via the scheme, not sampled pixels.
+        var reply = new AssistantTranscriptBlock(Guid.NewGuid(), "just one line", Complete: true);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [reply] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        var expected = TuiTheme.WarmEmber.Background.TrueColor;
+        Assert.False(shell.Transcript.HasScheme);
+        Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
+        Assert.Equal(shell.GetScheme().Normal.Background, shell.Transcript.GetScheme().Normal.Background);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Ctrl_c_with_selection_copies_clears_and_does_not_arm_exit()
+    {
+        string? copied = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            });
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 4));
+        fixture.Shell.Composer.SetFocus();
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.NotNull(copied);
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Clipboard_unavailable_keeps_selection_and_reports_status()
+    {
+        Func<bool>? timeout = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => false,
+            addTimeout: (_, callback) =>
+            {
+                timeout = callback;
+                return new object();
+            },
+            removeTimeout: _ => true);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(0, 4));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+
+        Assert.False(timeout!());
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal(
+            OperationalStatusProjector.Project(fixture.Shell.Snapshot),
+            fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public void Escape_clears_selection_before_arming_interrupt()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: true);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(0, 4));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Expired_chord_hint_restores_projected_status()
+    {
+        var clock = new ManualTimeProvider();
+        Func<bool>? timeout = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            timeProvider: clock,
+            addTimeout: (_, callback) =>
+            {
+                timeout = callback;
+                return new object();
+            });
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        clock.Advance(TimeSpan.FromMilliseconds(801));
+        Assert.False(timeout!());
+
+        Assert.NotEqual("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(
+            OperationalStatusProjector.Project(fixture.Shell.Snapshot),
+            fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public async Task Disposing_shell_removes_spinner_and_chord_timeouts()
+    {
+        var removed = 0;
+        var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            removeTimeout: _ =>
+            {
+                removed++;
+                return true;
+            });
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                ActiveOperation = new ActiveOperation("turn", "working", null),
+            },
+            CancellationToken.None);
+
+        fixture.Dispose();
+
+        Assert.True(removed >= 2, "spinner and chord timeout must both be removed");
     }
 }
 
@@ -634,6 +1149,22 @@ public sealed class TranscriptLayoutIndexTests
         Assert.Empty(index.GetVisibleRows(firstRow: 0, height: 10, overscan: 2));
         Assert.Equal(0, index.TotalRows);
     }
+
+    [Fact]
+    public void GetRows_returns_arbitrary_global_range_beyond_current_viewport()
+    {
+        var blocks = Blocks(1_000);
+        var index = new TranscriptLayoutIndex(
+            (block, width) => [((CommandOutputTranscriptBlock)block).Text]);
+        index.ReplaceAll(blocks, width: 80);
+
+        var rows = index.GetRows(firstRow: 400, count: 250);
+
+        Assert.Equal(250, rows.Count);
+        Assert.Equal(400, rows[0].GlobalRow);
+        Assert.Equal(649, rows[^1].GlobalRow);
+        Assert.Equal("line 400", rows[0].Text);
+    }
 }
 
 /// <summary>Unit tests for the scroll/auto-follow/unseen bookkeeping in <see cref="TranscriptViewportState"/>.</summary>
@@ -726,12 +1257,20 @@ public sealed class VirtualizedTranscriptViewTests
         var view = new VirtualizedTranscriptView(app, (block, width) =>
         {
             count++;
-            return ["row"];
+            return [BlockText(block)];
         });
         view.Reflow(width: 80);
         view.SetViewportHeight(10);
         return view;
     }
+
+    private static string BlockText(TranscriptBlock block) => block switch
+    {
+        CommandOutputTranscriptBlock command => command.Text,
+        ToolTranscriptBlock tool => tool.ToolName,
+        DiffTranscriptBlock diff => diff.Patch,
+        _ => "row",
+    };
 
     [Fact]
     public void Collects_only_the_visible_rows()
@@ -836,5 +1375,436 @@ public sealed class VirtualizedTranscriptViewTests
         app.Mouse.IsMouseDisabled = true;
         Assert.False(view.ProcessMouse(new Mouse { Flags = MouseFlags.WheeledUp }));
         Assert.True(view.AutoFollow);
+    }
+
+    [Theory]
+    [InlineData(80, 24, 8)]
+    [InlineData(80, 12, 4)]
+    public void Composer_grows_to_wrapped_content_then_caps(int width, int height, int cap)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, height);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(3, shell.Composer.Frame.Height);
+
+        // Enough wrapped words to exceed the cap at the full-width composer (screen width minus the prompt
+        // gutter), so the composer grows to and stops at the approved maximum instead of the raw line count.
+        var draft = string.Join(' ', Enumerable.Repeat("wrapped", 80));
+        shell.Composer.SetDraft(draft, draft.Length);
+        app.LayoutAndDraw();
+
+        Assert.Equal(cap, shell.Composer.Frame.Height);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Failed_layout_measurement_keeps_previous_valid_height()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        var previous = shell.Composer.Frame.Height;
+        shell.Composer.LayoutFactory = (_, _) =>
+            throw new InvalidOperationException("measurement failed");
+
+        shell.Composer.SetDraft("trigger layout", 14);
+        app.LayoutAndDraw();
+
+        Assert.Equal(previous, shell.Composer.Frame.Height);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void First_escape_dismisses_completion_before_arming_interrupt()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            commands: SlashCommandCatalog.CreateAll());
+        fixture.Shell.Composer.SetDraft("/m", 2);
+        Assert.True(fixture.Shell.Completion.Visible);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.False(fixture.Shell.Completion.Visible);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Escape_arms_then_interrupts_and_ctrl_c_arms_then_exits()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        clock.Advance(TimeSpan.FromMilliseconds(200));
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal([UiAction.Interrupt], fixture.Actions);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
+        clock.Advance(TimeSpan.FromSeconds(1));
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal([UiAction.Interrupt, UiAction.Exit], fixture.Actions);
+    }
+
+    [Fact]
+    public async Task Prompt_activation_and_mode_switch_reset_armed_chords()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = UiPromptRequest.Confirm("Allow?", false) },
+            CancellationToken.None);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+
+        await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.F2);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+    }
+
+    [Fact]
+    public void Armed_interrupt_hint_expiry_callback_restores_projected_status()
+    {
+        var clock = new ManualTimeProvider();
+        Func<bool>? timeout = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: true,
+            timeProvider: clock,
+            addTimeout: (_, callback) =>
+            {
+                timeout = callback;
+                return new object();
+            });
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        clock.Advance(TimeSpan.FromMilliseconds(801));
+        Assert.NotNull(timeout);
+        Assert.False(timeout!());
+
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(
+            OperationalStatusProjector.Project(fixture.Shell.Snapshot),
+            fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public async Task Applying_idle_snapshot_disarms_stale_interrupt_hint()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: false, timeProvider: clock);
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { RunningTasks = 1 },
+            CancellationToken.None);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(
+            OperationalStatusProjector.Project(UiSessionSnapshot.Empty),
+            fixture.Shell.Operational.Status);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Second_escape_after_work_ends_clears_stale_hint_and_timer_even_when_unconsumed()
+    {
+        var clock = new ManualTimeProvider();
+        var active = true;
+        var chordToken = new object();
+        var removed = new List<object>();
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            timeProvider: clock,
+            hasActiveWork: () => active,
+            addTimeout: (_, _) => chordToken,
+            removeTimeout: token =>
+            {
+                removed.Add(token);
+                return true;
+            });
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+
+        // The interruptible work finishes without a snapshot apply, so the disarm-on-apply path never
+        // runs; the second Esc is declined by the chord state (not consumed) yet must still clear the
+        // stale hint and tear down the orphaned expiry timer immediately.
+        active = false;
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Contains(chordToken, removed);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Zero_movement_click_keeps_expand_behavior_but_drag_selects()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var view = CreateView(app, out _);
+        var toolId = Guid.NewGuid();
+        view.ReplaceAll(
+        [
+            new ToolTranscriptBlock(
+                toolId,
+                "grep",
+                "{}",
+                2,
+                "hit",
+                IsError: false,
+                Complete: true),
+        ]);
+
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        Assert.True(view.IsExpanded(toolId));
+        Assert.False(view.HasSelection);
+
+        var diffId = Guid.NewGuid();
+        view.ReplaceAll([new DiffTranscriptBlock(diffId, "@@ -1 +1 @@")]);
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        Assert.True(view.IsExpanded(diffId));
+        Assert.False(view.HasSelection);
+
+        view.ReplaceAll(
+        [
+            new ToolTranscriptBlock(
+                toolId,
+                "grep",
+                "{}",
+                2,
+                "hit",
+                IsError: false,
+                Complete: true),
+        ]);
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+
+        Assert.True(view.HasSelection);
+        Assert.Equal("rep", view.GetSelectedText());
+    }
+
+    [Fact]
+    public void Multiple_held_button_drag_reports_preserve_anchor_and_expand_selection()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var view = CreateView(app, out _);
+        var toolId = Guid.NewGuid();
+        view.ReplaceAll(
+        [
+            new ToolTranscriptBlock(
+                toolId,
+                "grep",
+                "{}",
+                2,
+                "hit",
+                IsError: false,
+                Complete: true),
+        ]);
+
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+
+        // Terminal.Gui reports motion during a drag as the button still held
+        // (LeftButtonPressed) combined with PositionReport, once per cell moved.
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(2, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(3, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+
+        Assert.True(view.HasSelection);
+
+        // The anchor stays at the original press (column 1); dragging to column 4
+        // grows the selection instead of restarting it at each motion report.
+        Assert.Equal("rep", view.GetSelectedText());
+    }
+
+    [Fact]
+    public void Selection_spans_rows_and_survives_scroll_and_redraw()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(20, 10);
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(30));
+        view.BeginSelection(new TranscriptCellPosition(20, 2));
+        view.UpdateSelection(new TranscriptCellPosition(22, 4));
+        var selected = view.GetSelectedText();
+
+        view.ScrollBy(-5);
+        view.SetNeedsDraw();
+
+        Assert.True(view.HasSelection);
+        Assert.Equal(selected, view.GetSelectedText());
+    }
+
+    [Fact]
+    public void No_mouse_and_shift_drag_bypass_in_app_selection()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(5));
+
+        app.Mouse.IsMouseDisabled = true;
+        Assert.False(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        }));
+
+        app.Mouse.IsMouseDisabled = false;
+        Assert.False(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.Shift,
+            Position = new System.Drawing.Point(0, 0),
+        }));
+        Assert.False(view.HasSelection);
+    }
+
+    [Fact]
+    public void Selected_cells_are_drawn_through_the_selection_highlight()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(40, 12);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        shell.Transcript.ReplaceAll(Blocks(30));
+        app.LayoutAndDraw();
+
+        var top = shell.Transcript.TopRow;
+        shell.Transcript.BeginSelection(new TranscriptCellPosition(top, 0));
+        shell.Transcript.UpdateSelection(new TranscriptCellPosition(top, 2));
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.HasSelection);
+        Assert.True(shell.Transcript.SelectionDrawCount > 0);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Cjk_selection_starting_inside_a_wide_cell_draws_the_whole_glyph_highlight()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(40, 12);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // "AB界CD": the wide 界 occupies cells 2-3; selecting from its trailing cell (3) once split the
+        // glyph across the role-colored prefix and the selection segment, corrupting the row.
+        var block = (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), "AB\u754cCD");
+        shell.Transcript.ReplaceAll(ImmutableArray.Create(block));
+        app.LayoutAndDraw();
+
+        var row = shell.Transcript.TopRow;
+        shell.Transcript.BeginSelection(new TranscriptCellPosition(row, 3));
+        shell.Transcript.UpdateSelection(new TranscriptCellPosition(row, 5));
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.HasSelection);
+        Assert.True(shell.Transcript.SelectionDrawCount > 0);
+        Assert.Contains("\u754c", shell.Transcript.GetSelectedText());
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 }

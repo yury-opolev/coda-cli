@@ -21,6 +21,8 @@ public enum UiAction
     LineEnd,
     HistoryPrevious,
     HistoryNext,
+    CursorVisualUp,
+    CursorVisualDown,
     CompletionPrevious,
     CompletionNext,
     CompleteSuggestion,

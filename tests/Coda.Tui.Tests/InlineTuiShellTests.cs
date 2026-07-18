@@ -3,9 +3,11 @@ using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Point = System.Drawing.Point;
+using TgColor = Terminal.Gui.Drawing.Color;
 
 namespace Coda.Tui.Tests;
 
@@ -88,20 +90,91 @@ public sealed class InlineTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Header on the top row, status on the shell's final row, composer three rows directly above it.
+        // Retained row order: header, transcript, operational row, composer, metadata (status).
         Assert.Equal(shell.Frame.Y, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
+        Assert.Equal(1, shell.Operational.Frame.Height);
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
         Assert.Equal(3, shell.Composer.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
 
-        // Transcript fills every row between the header and the composer, at least height - 5 rows.
+        // Transcript fills every row between the header and the operational row.
+        Assert.Equal(0, shell.Transcript.Frame.X);
+        Assert.Equal(width, shell.Transcript.Frame.Width);
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Transcript.Frame.Bottom);
-        Assert.True(
-            shell.Transcript.Frame.Height >= height - 5,
-            $"transcript height {shell.Transcript.Frame.Height} should be at least {height - 5}");
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Theory]
+    [InlineData(60, 12)]
+    [InlineData(80, 24)]
+    public void Inline_composer_is_borderless_with_chrome_over_the_composer_region(int width, int height)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(width, height);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // Inline inherits the retained layout, so the borderless composer and its chrome behave identically.
+        Assert.Null(shell.Composer.BorderStyle);
+        Assert.False(shell.Chrome.CanFocus);
+        Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
+        Assert.Equal(width - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
+        Assert.Equal(0, shell.Chrome.Frame.X);
+        Assert.Equal(width, shell.Chrome.Frame.Width);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Composer.Frame.Height, shell.Chrome.Frame.Height);
+        Assert.True(shell.Chrome.Ready);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Inline_startup_then_ready_toggles_initializing_and_prompt()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+
+        Assert.False(shell.Composer.Visible);
+        Assert.False(shell.Chrome.Ready);
+        Assert.Equal(string.Empty, shell.Chrome.DisplayText);
+        Assert.Equal("Initializing…", shell.Operational.Status.Text);
+        Assert.DoesNotContain("Initializing", string.Join('\n', shell.Chrome.RenderRows(80, 3)));
+
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+
+        Assert.True(shell.Composer.Visible);
+        Assert.True(shell.Chrome.Ready);
+        Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
+        Assert.True(shell.Composer.HasFocus);
 
         if (token is not null)
         {
@@ -358,6 +431,172 @@ public sealed class InlineTuiShellTests
         var completed = await Task.WhenAny(apply, Task.Delay(TimeSpan.FromSeconds(5)));
         Assert.Same(apply, completed);
         await Assert.ThrowsAsync<NotInitializedException>(() => apply);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public void Inline_surface_background_is_inherited_by_header_status_transcript_completion(bool force16)
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = force16;
+        app.Driver.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var expected = force16
+            ? new TgColor(TuiTheme.WarmEmber.Background.Fallback)
+            : TuiTheme.WarmEmber.Background.TrueColor;
+
+        // Inline reuses the retained shell, so it inherits the same Warm Ember surface background as
+        // full-screen across header/status/transcript/completion.
+        Assert.Equal(expected, shell.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Header.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Status.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
+        Assert.Equal(expected, shell.Completion.GetScheme().Normal.Background);
+
+        Assert.False(shell.Header.HasScheme);
+        Assert.False(shell.Status.HasScheme);
+        Assert.False(shell.Transcript.HasScheme);
+        Assert.False(shell.Completion.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Inline_composer_and_prompt_keep_their_own_explicit_schemes()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Composer.HasScheme);
+        Assert.True(shell.PromptOverlay.HasScheme);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Mode_restore_preserves_draft_caret_scroll_height_and_focus()
+    {
+        var state = new ComposerState(
+            Draft: string.Join(' ', Enumerable.Repeat("restored", 20)),
+            CursorIndex: 80,
+            History: ["older"],
+            HistoryIndex: 1,
+            PasteActive: false,
+            ScrollRow: 2,
+            PreferredDisplayColumn: 5);
+
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(24, 18);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        shell.RestoreComposerState(state);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var restored = shell.ExportComposerState();
+        Assert.Equal(state.Draft, restored.Draft);
+        Assert.Equal(state.CursorIndex, restored.CursorIndex);
+        Assert.Equal(state.ScrollRow, restored.ScrollRow);
+        Assert.Equal(state.PreferredDisplayColumn, restored.PreferredDisplayColumn);
+        Assert.True(shell.Composer.Frame.Height > 3);
+        Assert.True(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    /// <summary>
+    /// When the inline shell is anchored partway down the screen its region is smaller than the full
+    /// screen, so the composer's growth must be capped against that region (<see cref="View.Frame"/>
+    /// height) — not the whole screen. Anchored 10 rows down over a 24-row inline screen the shell owns a
+    /// 14-row region, so a long draft may grow only to <c>max(3, min(8, floor(14 * 0.35))) = 4</c> rows,
+    /// never the <c>floor(24 * 0.35) = 8</c> the full screen would allow, and the status and transcript
+    /// geometry stay pinned exactly as before.
+    /// </summary>
+    [Fact]
+    public void Inline_composer_growth_is_capped_to_the_shell_region_not_the_full_screen()
+    {
+        var draft = string.Join('\n', Enumerable.Range(0, 30).Select(index => $"line {index}"));
+        var state = new ComposerState(
+            Draft: draft,
+            CursorIndex: draft.Length,
+            History: [],
+            HistoryIndex: 0,
+            PasteActive: false,
+            ScrollRow: 0,
+            PreferredDisplayColumn: 0);
+
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 10);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 34);
+        app.Driver.InlinePosition = new Point(0, 10);
+        using var shell = ShellTestFactory.CreateInline(app);
+        shell.RestoreComposerState(state);
+
+        // Anchor the inline top-level 10 rows down, as the runner's inline app model does at run time; the
+        // inline screen is then the 24 rows below it and the shell fills the 14 rows from the anchor down.
+        shell.Y = 10;
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(10, shell.Frame.Y);
+        Assert.Equal(24, app.Screen.Height);
+        Assert.Equal(14, shell.Frame.Height);
+
+        // The composer cap is measured against the 14-row region, not the 24-row screen:
+        // max(3, min(8, floor(14 * 0.35))) = 4 — never the floor(24 * 0.35) = 8 the full screen would allow.
+        var regionCap = Math.Max(3, Math.Min(8, (int)Math.Floor(shell.Frame.Height * 0.35)));
+        var screenCap = Math.Max(3, Math.Min(8, (int)Math.Floor(app.Screen.Height * 0.35)));
+        Assert.Equal(4, regionCap);
+        Assert.Equal(8, screenCap);
+        Assert.Equal(regionCap, shell.Composer.Frame.Height);
+        Assert.NotEqual(screenCap, shell.Composer.Frame.Height);
+
+        // Status and transcript geometry are preserved: the status row is one row pinned to the region
+        // bottom, the operational row and composer stack above it, and the transcript fills every row
+        // between the header and the operational row.
+        Assert.Equal(1, shell.Status.Frame.Height);
+        Assert.Equal(shell.Frame.Height, shell.Status.Frame.Bottom);
+        Assert.Equal(1, shell.Operational.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 }
 

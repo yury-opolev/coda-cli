@@ -95,13 +95,18 @@ Coda is its own product, independent of any vendor's official CLI.
 
 ## Coda — the interactive TUI
 
-The terminal front-end targets **Terminal.Gui v2**. After the compatibility matrix and acceptance
-thresholds pass, **full-screen mode is the default interactive engine on a supported terminal** — a
-scrollable, virtualized transcript fills most of the screen, the composer is pinned near the bottom, and
-a one-line status sits on the final row. **Inline mode** uses the same retained, scrollable layout in the
-terminal's primary buffer and remains available as an **explicit compatibility** choice via
-`--tui=inline`. **Spectre.Console remains a migration fallback** for environments where Terminal.Gui is
-not yet accepted, and a **plain** renderer is always available.
+The terminal front-end targets **Terminal.Gui v2** and follows the **Warm Ember** interaction model.
+After the compatibility matrix and acceptance thresholds pass, **full-screen mode is the default
+interactive engine on a supported terminal**: a scrollable, virtualized transcript fills the **full
+width** of the screen, an **operational status row** (turn, tool, waiting, approval, and key-hint state) sits
+**directly above** the composer, and a **dynamic composer** starts at **three rows** and grows up to a
+**capped height** as you type while staying pinned near the bottom. A separate, **stable metadata row**
+(model, effort, context, usage, services, git, and cwd) occupies the **final row**. **Focus** stays on the composer while you
+type — keyboard shortcuts drive the transcript, overlays, and completion menu without pulling focus away
+from your prompt. **Inline mode** uses the same retained, scrollable layout in the terminal's primary
+buffer and remains available as an **explicit compatibility** choice via `--tui=inline`.
+**Spectre.Console remains a migration fallback** for environments where Terminal.Gui is not yet accepted,
+and a **plain** renderer is always available.
 
 ```powershell
 # Build (bumps the version), then run the TUI:
@@ -116,12 +121,20 @@ dotnet run --project src/Coda.Tui -- --plain            # plain output (screen r
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
 
-**Keys:** `Enter` submits · `Ctrl+J` inserts a newline · `Ctrl-C` interrupts the active turn ·
-`Ctrl+D` or `/exit` exits · `F2` switches between full-screen and inline. Typing a `/` shows a slash-command
-completion menu directly above the composer (Up/Down select, Tab completes, Esc dismisses). Full-screen has
-**no permanent sidebar** and uses a **virtualized transcript** (context, pickers, permissions, help, and
-diffs all use keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI,
-output/input redirection, and terminals that Terminal.Gui does not support.
+**Keys (Warm Ember):** `Enter` submits · `Ctrl+J` inserts a newline · `Up`/`Down` move the composer
+cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
+press `Esc` **twice** to interrupt the active turn (a single `Esc` only dismisses the slash-command menu
+or clears a selection) · `Ctrl+C` copies the current transcript selection and, with nothing selected,
+exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `F2`
+switches between full-screen and inline. Typing a `/` shows a slash-command completion menu directly
+above the composer (Up/Down select, Tab completes, a single Esc dismisses).
+
+**Mouse:** **left-drag** selects transcript text and `Ctrl+C` copies it; **`Shift`-drag** hands native
+selection and copy to the terminal where supported. `--no-mouse` leaves selection and copy native to the
+terminal, and every action stays reachable from the keyboard. Full-screen has **no permanent sidebar**
+and uses a **virtualized transcript** (context, pickers, permissions, help, and diffs all use
+keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI, output/input
+redirection, and terminals that Terminal.Gui does not support.
 
 > **Compatibility:** the terminal matrix is a *reproducible checklist*, not a claim that every terminal
 > has already passed. See [`docs/terminal-gui-compatibility.md`](docs/terminal-gui-compatibility.md)

@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Tui.Agent;
+using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Setup;
 using Coda.Tui.Ui;
@@ -44,6 +45,25 @@ public interface IInteractiveSessionRunner
 /// </summary>
 public static class InteractiveProgram
 {
+    /// <summary>
+    /// Render the existing welcome banner through the semantic console so Terminal.Gui retains it in
+    /// the transcript. Plain mode stays script-safe, while Spectre renders its own banner when its loop
+    /// starts.
+    /// </summary>
+    internal static void RenderStartupBanner(
+        CommandContext context,
+        TuiRunMode mode,
+        string? connectedProvider)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        if (!context.SemanticUiEnabled || mode == TuiRunMode.Plain)
+        {
+            return;
+        }
+
+        Banner.Render(context.Console, context.Session, connectedProvider, context.Session.Model);
+    }
+
     /// <summary>
     /// Parse <paramref name="args"/>, select the initial mode from <paramref name="capabilities"/>, and
     /// run it. Returns the process exit code; a bad launch request returns <c>2</c> after writing a
@@ -189,9 +209,10 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
 
         var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
 
-        // Ctrl-C: interrupt the active turn; a first/idle Ctrl-C never exits (the callback publishes the
-        // idle notice). The explicit exit action is wired separately through the controller.
-        using var cancellation = new ConsoleCancellationRegistration(controller.HandleCtrlC, controller.RequestExit);
+        // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
+        // Terminal.Gui shells own their own Esc/Ctrl+C chords). The explicit exit action is wired
+        // separately through the controller.
+        using var cancellation = new ConsoleCancellationRegistration(controller.TryInterruptActiveTurn, controller.RequestExit);
 
         // The single actor keeps one switchable frame/observer sink for the whole session.
         var frameSink = new SwitchableUiFrameSink();
@@ -219,9 +240,14 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
                 await ConnectMcpAsync(context, mcp, store, mailbox, hostToken).ConfigureAwait(false);
                 await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
 
+                var currentConnectedProviderId = await credentials
+                    .GetConnectedProviderIdAsync(hostToken)
+                    .ConfigureAwait(false);
+                InteractiveProgram.RenderStartupBanner(context, mode, currentConnectedProviderId);
+
                 // Immutable initial metadata/MCP publication (git/context caches stay unwired, exactly as
                 // the legacy REPL, so no expensive analysis runs at startup).
-                Publish(mailbox, SessionMetadataEvents.Build(context) with { Connected = connectedProviderId is not null });
+                Publish(mailbox, SessionMetadataEvents.Build(context) with { Connected = currentConnectedProviderId is not null });
                 Publish(mailbox, new McpRuntimeChangedEvent(mcp.GetSnapshot()));
             }
             catch (OperationCanceledException) when (hostToken.IsCancellationRequested)
@@ -305,8 +331,10 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
             composerController.Restore(composer);
 
             TerminalGuiShellBase shell = shellMode == TuiRunMode.Fullscreen
-                ? new FullscreenTuiShell(tgApp, composerController, mailbox, controller.CurrentSnapshot)
-                : new InlineTuiShell(tgApp, composerController, mailbox, controller.CurrentSnapshot);
+                ? new FullscreenTuiShell(
+                    tgApp, composerController, mailbox, controller.CurrentSnapshot, hasActiveWork: () => controller.HasActiveWork)
+                : new InlineTuiShell(
+                    tgApp, composerController, mailbox, controller.CurrentSnapshot, hasActiveWork: () => controller.HasActiveWork);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);

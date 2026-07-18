@@ -144,6 +144,18 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
+    public void User_block_wraps_wide_runs_by_display_cells()
+    {
+        // "界界é": 界 and 界 fill four cells, é (one cell) overflows to the next row.
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "\u754c\u754c\u00e9");
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+
+        Assert.Equal(["\u754c\u754c", "\u00e9"], lines.Select(line => line.Text));
+        Assert.All(lines, line => Assert.Equal(TranscriptRole.User, line.Role));
+    }
+
+    [Fact]
     public void Grapheme_clusters_are_never_split_across_lines()
     {
         // "a" + combining acute, then "b" + combining acute: two graphemes, one display cell each.
@@ -152,6 +164,17 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 1);
 
         Assert.Equal(["a\u0301", "b\u0301"], lines.Select(line => line.Text));
+    }
+
+    [Fact]
+    public void Formatter_uses_shared_cell_width_for_wide_and_combining_graphemes()
+    {
+        // 界界 fills four cells; the combining acute stays attached to e, which overflows to the next row.
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "\u754c\u754ce\u0301");
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+
+        Assert.Equal(["\u754c\u754c", "e\u0301"], lines.Select(line => line.Text));
     }
 
     [Fact]

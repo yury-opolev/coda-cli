@@ -1,5 +1,6 @@
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Shells;
@@ -23,11 +24,28 @@ internal sealed class InlineTuiShell(
     ComposerController controller,
     IUiEventPublisher publisher,
     UiSessionSnapshot initialSnapshot,
+    Func<bool>? hasActiveWork = null,
+    TimeProvider? timeProvider = null,
+    Func<string, bool>? clipboardWriter = null,
+    Func<TimeSpan, Func<bool>, object>? addTimeout = null,
+    Func<object, bool>? removeTimeout = null,
+    TuiTheme? theme = null,
     Func<UiSessionSnapshot, int, string>? statusProjection = null)
-    : FullscreenTuiShell(app, controller, publisher, initialSnapshot, statusProjection)
+    : FullscreenTuiShell(
+        app,
+        controller,
+        publisher,
+        initialSnapshot,
+        hasActiveWork,
+        timeProvider,
+        clipboardWriter,
+        addTimeout,
+        removeTimeout,
+        theme,
+        statusProjection)
 {
-    /// <summary>The fewest rows the inline region can occupy: header (1), composer (3), and status (1).</summary>
-    private const int MinimumInlineHeight = 5;
+    /// <summary>The fewest rows the inline region can occupy: header (1), operational (1), composer (3), and status (1).</summary>
+    private const int MinimumInlineHeight = 6;
 
     protected override Dim ResolveShellHeight() => Dim.Func(InlineRegionHeight, this);
 

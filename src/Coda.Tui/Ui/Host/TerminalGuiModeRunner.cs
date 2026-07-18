@@ -119,7 +119,12 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         {
             app = this.applicationFactory();
             app.AppModel = mode == TuiRunMode.Inline ? AppModel.Inline : AppModel.FullScreen;
-            app.Mouse.IsMouseDisabled = this.mouseDisabled;
+            var mouseService = app.Mouse;
+            if (mouseService is not null)
+            {
+                mouseService.IsMouseDisabled = this.mouseDisabled;
+            }
+
             app.Init(this.driverName);
 
             // Register the process-exit stop after Init (so there is a live application to stop) and

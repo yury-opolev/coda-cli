@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Point = System.Drawing.Point;
@@ -51,6 +52,45 @@ public sealed class CommandCompletionShellTests
     }
 
     [Fact]
+    public async Task Completion_is_hidden_during_startup_then_shown_for_restored_slash_draft_when_ready()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var controller = new ComposerController(
+            new SlashCommandCompletion(new SlashCommandRegistry(Commands())));
+        controller.ReplaceDraft("/he", 3);
+        using var shell = new FullscreenTuiShell(
+            app,
+            controller,
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // While startup is active the completion menu is irrelevant and must stay hidden even though the
+        // restored draft would otherwise offer suggestions.
+        var startup = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+        };
+        await shell.ApplyAsync(startup, CancellationToken.None);
+        Assert.False(shell.Completion.Visible);
+
+        // Once ready, the restored slash draft's completion reappears.
+        await shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
+        Assert.True(shell.Completion.Visible);
+        Assert.Contains(shell.Completion.RenderVisibleRows(80), row => row.Contains("help"));
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public void Fullscreen_shows_completion_menu_above_composer_without_moving_composer_or_status()
     {
         using IApplication app = Application.Create();
@@ -63,6 +103,7 @@ public sealed class CommandCompletionShellTests
 
         Assert.False(shell.Completion.Visible);
         var composerY = shell.Composer.Frame.Y;
+        var operationalY = shell.Operational.Frame.Y;
         var statusY = shell.Status.Frame.Y;
 
         shell.Composer.SetDraft("/he", 3);
@@ -73,10 +114,11 @@ public sealed class CommandCompletionShellTests
         Assert.Contains(rows, row => row.Contains("help") && row.Contains("Show help"));
         Assert.Contains(rows, row => row.Contains(">"));
 
-        // The menu bottom aligns with the composer top (overlaying the transcript), and neither the
-        // composer nor the status moved to make room for it.
-        Assert.Equal(shell.Composer.Frame.Y, shell.Completion.Frame.Bottom);
+        // The menu bottom aligns with the operational row (overlaying the transcript), and neither the
+        // composer, operational row, nor the status moved to make room for it.
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
         Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(operationalY, shell.Operational.Frame.Y);
         Assert.Equal(statusY, shell.Status.Frame.Y);
 
         if (token is not null)
@@ -140,6 +182,7 @@ public sealed class CommandCompletionShellTests
 
         Assert.False(shell.Completion.Visible);
         var composerY = shell.Composer.Frame.Y;
+        var operationalY = shell.Operational.Frame.Y;
         var statusY = shell.Status.Frame.Y;
 
         shell.Composer.SetDraft("/he", 3);
@@ -149,10 +192,11 @@ public sealed class CommandCompletionShellTests
         var rows = shell.Completion.RenderVisibleRows(80);
         Assert.Contains(rows, row => row.Contains("help") && row.Contains("Show help"));
 
-        // The menu bottom aligns with the composer top (overlaying the retained transcript), and neither
-        // the composer nor the status moved to make room for it. Escape hides the menu again.
-        Assert.Equal(shell.Composer.Frame.Y, shell.Completion.Frame.Bottom);
+        // The menu bottom aligns with the operational row (overlaying the retained transcript), and neither
+        // the composer, operational row, nor the status moved to make room for it. Escape hides the menu.
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
         Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(operationalY, shell.Operational.Frame.Y);
         Assert.Equal(statusY, shell.Status.Frame.Y);
 
         shell.Composer.NewKeyDownEvent(Key.Esc);
@@ -160,7 +204,150 @@ public sealed class CommandCompletionShellTests
 
         Assert.False(shell.Completion.Visible);
         Assert.Equal(composerY, shell.Composer.Frame.Y);
+        Assert.Equal(operationalY, shell.Operational.Frame.Y);
         Assert.Equal(statusY, shell.Status.Frame.Y);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Paste_completion_history_and_resize_each_recalculate_composer_layout()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(24, 24);
+        var controller = new ComposerController(
+            new SlashCommandCompletion(new SlashCommandRegistry(Commands())));
+        controller.SeedHistory([string.Join(' ', Enumerable.Repeat("history", 20))]);
+        using var shell = new FullscreenTuiShell(
+            app,
+            controller,
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var beforePaste = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewPasteEvent(string.Join(' ', Enumerable.Repeat("paste", 20)));
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforePaste);
+        Assert.True(shell.Composer.Frame.Height > 3);
+
+        var beforeTyping = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(new Key('x'));
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeTyping);
+
+        shell.Composer.SetDraft("a\nb\nc\nd", 7);
+        app.LayoutAndDraw();
+        Assert.Equal(4, shell.Composer.Frame.Height);
+        var beforeDeletion = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(Key.Backspace);
+        shell.Composer.NewKeyDownEvent(Key.Backspace);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeDeletion);
+        Assert.Equal(3, shell.Composer.Frame.Height);
+
+        shell.Composer.SetDraft("/he", 3);
+        var beforeCompletion = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(Key.Tab);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeCompletion);
+
+        shell.Composer.SetDraft(string.Empty, 0);
+        var beforeHistory = shell.ComposerLayoutUpdateCount;
+        shell.Composer.NewKeyDownEvent(Key.CursorUp);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeHistory);
+        Assert.Contains("history", shell.Composer.GetDraft(), StringComparison.Ordinal);
+
+        var beforeResize = shell.ComposerLayoutUpdateCount;
+        app.Driver.SetScreenSize(50, 12);
+        app.LayoutAndDraw();
+        Assert.True(shell.ComposerLayoutUpdateCount > beforeResize);
+        Assert.InRange(shell.Composer.Frame.Height, 3, 4);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Completion_operational_composer_metadata_and_prompt_keep_final_z_order()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app, Commands());
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Composer.SetDraft("/m", 2);
+        var prompt = UiPromptRequest.Confirm("Allow?", false);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = prompt },
+            CancellationToken.None);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Completion.Visible);
+        Assert.True(shell.PromptOverlay.Visible);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        var order = shell.SubViews.ToList();
+        Assert.True(order.IndexOf(shell.Chrome) < order.IndexOf(shell.Composer));
+        Assert.True(order.IndexOf(shell.Completion) < order.IndexOf(shell.PromptOverlay));
+        Assert.Equal(order.Count - 1, order.IndexOf(shell.PromptOverlay));
+        Assert.True(shell.PromptOverlay.HasFocus);
+        Assert.False(shell.Composer.HasFocus);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Inline_completion_and_rows_keep_adjacency_across_dynamic_height_and_resize()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app, Commands());
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        // A slash draft shows the completion menu; its bottom hugs the operational row and every
+        // retained row stays adjacent (completion → operational → composer → status).
+        shell.Composer.SetDraft("/he", 3);
+        app.LayoutAndDraw();
+        Assert.True(shell.Completion.Visible);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        // A dynamic-height (multi-line) draft grows the composer without breaking row adjacency.
+        shell.Composer.SetDraft("a\nb\nc\nd", 7);
+        app.LayoutAndDraw();
+        Assert.True(shell.Composer.Frame.Height >= 4);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+
+        // A driver resize re-flows every row but the operational/composer/status adjacency survives.
+        app.Driver.SetScreenSize(60, 18);
+        app.LayoutAndDraw();
+        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
 
         if (token is not null)
         {

@@ -26,21 +26,38 @@ public sealed class StatusProjectorTests
     };
 
     [Fact]
-    public void Narrow_width_44_renders_exact_prefix()
+    public void Narrow_width_44_renders_only_stable_metadata_prefix()
     {
         var snapshot = UiSessionSnapshot.Empty with
         {
             Model = "gpt-5.6-sol",
             EffectiveEffort = "high",
-            Context = new ContextStatus(UsedTokens: 84_000, MaxTokens: 200_000, Percentage: 42, IsExact: true),
-            Permission = new PermissionStatus(PermissionMode.Default, 0),
+            Context = new ContextStatus(84_000, 200_000, 42, true),
+            Permission = new PermissionStatus(PermissionMode.Default, 1),
             ActiveOperation = new ActiveOperation("tool", "running tool", null),
             WorkingDirectory = string.Empty,
         };
 
-        var line = StatusProjector.Project(snapshot, 44);
+        Assert.Equal(
+            "gpt-5.6-sol | high | ctx 42%",
+            StatusProjector.Project(snapshot, 44));
+    }
 
-        Assert.Equal("gpt-5.6-sol | high | ctx 42% | default", line);
+    [Fact]
+    public void Metadata_never_contains_active_operation_label()
+    {
+        var snapshot = Wide() with
+        {
+            ActiveOperation = new ActiveOperation("tool", "running secret tool label", null),
+        };
+
+        var line = StatusProjector.Project(snapshot, width: 200);
+
+        Assert.DoesNotContain("running secret tool label", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("permission", line, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("default", line, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("gpt-5.6-sol", line, StringComparison.Ordinal);
+        Assert.Contains("ctx 84k/200k", line, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -58,14 +75,14 @@ public sealed class StatusProjectorTests
     }
 
     [Fact]
-    public void Medium_width_80_keeps_usage_but_drops_services_and_git()
+    public void Medium_width_60_keeps_usage_but_drops_services_and_git()
     {
-        var line = StatusProjector.Project(Wide(), 80);
+        var line = StatusProjector.Project(Wide(), 60);
 
         Assert.Contains("18.2k in / 2.4k out", line);
         Assert.DoesNotContain("MCP", line);
         Assert.DoesNotContain("main", line);
-        Assert.True(line.Length <= 80);
+        Assert.True(line.Length <= 60);
     }
 
     [Fact]

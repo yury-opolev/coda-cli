@@ -2,10 +2,16 @@ namespace Coda.Tui.Ui.Input;
 
 /// <summary>
 /// Minimal, immutable context that <see cref="UiActionMap"/> needs to disambiguate
-/// keys whose meaning depends on composer/overlay state (for example, arrow keys drive
-/// completion selection while a completion popup is open and history otherwise).
+/// keys whose meaning depends on composer/overlay state. Up/Down resolve to completion
+/// selection while a completion popup is open, to visual caret movement while the caret
+/// can still move within the wrapped draft, and to history navigation at the draft's
+/// visual boundaries.
 /// </summary>
-public readonly record struct UiInputContext(bool ComposerEmpty, bool CompletionVisible);
+public readonly record struct UiInputContext(
+    bool ComposerEmpty,
+    bool CompletionVisible,
+    bool CanMoveVisualUp,
+    bool CanMoveVisualDown);
 
 /// <summary>
 /// Translates Terminal.Gui <see cref="Key"/> presses into context-independent
@@ -33,29 +39,42 @@ public static class UiActionMap
             return UiAction.Submit;
         }
 
-        if (key == Key.C.WithCtrl)
-        {
-            return UiAction.Interrupt;
-        }
-
-        if (key == Key.D.WithCtrl)
-        {
-            return context.ComposerEmpty ? UiAction.Exit : UiAction.None;
-        }
-
         if (key == Key.L.WithCtrl)
         {
             return UiAction.ForceRedraw;
         }
 
+        // Ctrl+Up/Down always navigate submission history, regardless of the caret's visual row,
+        // so a multiline draft never traps history navigation on an interior row.
+        if (key == Key.CursorUp.WithCtrl)
+        {
+            return UiAction.HistoryPrevious;
+        }
+
+        if (key == Key.CursorDown.WithCtrl)
+        {
+            return UiAction.HistoryNext;
+        }
+
+        // Plain Up/Down: completion selection wins while a popup is open, then visual caret
+        // movement while the caret can still move within the wrapped draft, then history at the
+        // visual boundary.
         if (key == Key.CursorUp)
         {
-            return context.CompletionVisible ? UiAction.CompletionPrevious : UiAction.HistoryPrevious;
+            return context.CompletionVisible
+                ? UiAction.CompletionPrevious
+                : context.CanMoveVisualUp
+                    ? UiAction.CursorVisualUp
+                    : UiAction.HistoryPrevious;
         }
 
         if (key == Key.CursorDown)
         {
-            return context.CompletionVisible ? UiAction.CompletionNext : UiAction.HistoryNext;
+            return context.CompletionVisible
+                ? UiAction.CompletionNext
+                : context.CanMoveVisualDown
+                    ? UiAction.CursorVisualDown
+                    : UiAction.HistoryNext;
         }
 
         // Ctrl+Arrow performs word movement; the plain arrows move by one grapheme. These
@@ -98,7 +117,7 @@ public static class UiActionMap
 
         if (key == Key.Esc)
         {
-            return UiAction.DismissCompletion;
+            return context.CompletionVisible ? UiAction.DismissCompletion : UiAction.None;
         }
 
         if (key == Key.PageUp)

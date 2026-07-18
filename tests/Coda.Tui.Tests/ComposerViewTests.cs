@@ -17,17 +17,59 @@ public sealed class ComposerViewTests
     /// cursor keys are processed. This is what makes the caret-synchronization tests
     /// exercise the real editing surface rather than an inert, unlaid-out view.
     /// </summary>
-    private static ComposerView CreateLaidOutView(ComposerController controller)
+    private static ComposerView CreateLaidOutView(ComposerController controller, int width = 40, int height = 5)
     {
         var view = new ComposerView(controller)
         {
-            Width = 40,
-            Height = 5,
+            Width = width,
+            Height = height,
         };
         view.BeginInit();
         view.EndInit();
-        view.Layout(new System.Drawing.Size(40, 5));
+        view.Layout(new System.Drawing.Size(width, height));
         return view;
+    }
+
+    [Fact]
+    public void Laid_out_view_maps_wrapped_caret_without_headless_origin_regression()
+    {
+        var controller = CreateController();
+        using var view = new ComposerView(controller) { Width = 6, Height = 3 };
+        view.BeginInit();
+        view.EndInit();
+        view.Layout(new System.Drawing.Size(6, 3));
+
+        view.SetDraft("alpha beta", 10);
+
+        Assert.Equal(10, controller.State.CursorIndex);
+        Assert.Equal(new System.Drawing.Point(4, 1), view.InsertionPoint);
+    }
+
+    [Theory]
+    [InlineData(9, 3)]
+    [InlineData(12, 4)]
+    [InlineData(24, 8)]
+    [InlineData(40, 8)]
+    public void Height_cap_is_max_3_min_8_floor_35_percent(int screenHeight, int expected)
+    {
+        Assert.Equal(expected, ComposerView.MaximumHeight(screenHeight));
+    }
+
+    [Fact]
+    public void Text_beyond_cap_is_preserved_and_scroll_keeps_caret_visible()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 8, height: 3);
+        view.SetDraft("one two three four five six seven eight", 39);
+
+        view.ApplyViewport(width: 8, height: 3);
+
+        Assert.Equal("one two three four five six seven eight", view.GetDraft());
+        Assert.True(controller.State.ScrollRow > 0);
+        Assert.InRange(
+            view.InsertionPoint.Y,
+            controller.State.ScrollRow,
+            controller.State.ScrollRow + 2);
     }
 
     [Fact]
@@ -47,7 +89,7 @@ public sealed class ComposerViewTests
     }
 
     [Fact]
-    public void Ctrl_c_and_f2_raise_action_requested_without_mutating_draft()
+    public void F2_raises_toggle_mode_without_mutating_draft()
     {
         var controller = CreateController();
         using var view = new ComposerView(controller);
@@ -55,11 +97,45 @@ public sealed class ComposerViewTests
         var actions = new List<UiAction>();
         view.ActionRequested += (_, action) => actions.Add(action);
 
-        view.NewKeyDownEvent(Key.C.WithCtrl);
         view.NewKeyDownEvent(Key.F2);
 
-        Assert.Equal([UiAction.Interrupt, UiAction.ToggleMode], actions);
+        Assert.Equal([UiAction.ToggleMode], actions);
         Assert.Equal("busy", view.GetDraft());
+    }
+
+    [Fact]
+    public void Up_down_move_by_visual_wrapped_line_and_preserve_column()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 5, height: 3);
+        view.SetDraft("1234512\n123456", 4);
+
+        view.NewKeyDownEvent(Key.CursorDown);
+        Assert.Equal(7, controller.State.CursorIndex);
+        Assert.Equal(4, controller.State.PreferredDisplayColumn);
+
+        view.NewKeyDownEvent(Key.CursorDown);
+        Assert.Equal(12, controller.State.CursorIndex);
+        Assert.Equal(4, controller.State.PreferredDisplayColumn);
+
+        view.NewKeyDownEvent(Key.CursorUp);
+        Assert.Equal(7, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void Boundary_up_uses_history_but_ctrl_up_uses_history_from_any_visual_row()
+    {
+        var controller = CreateController();
+        controller.SeedHistory(["older"]);
+        using var view = CreateLaidOutView(controller, width: 5, height: 3);
+        view.SetDraft("abcdefghij", 7);
+
+        view.NewKeyDownEvent(Key.CursorUp.WithCtrl);
+        Assert.Equal("older", view.GetDraft());
+
+        view.SetDraft("abcdefghij", 2);
+        view.NewKeyDownEvent(Key.CursorUp);
+        Assert.Equal("older", view.GetDraft());
     }
 
     [Fact]
