@@ -31,6 +31,7 @@ public sealed class ForkCommand : ISlashCommand
 
         var escapedId = Markup.Escape(context.Session.SessionId);
         context.Console.MarkupLine($"[grey50]Forked into a new session {escapedId} (original frozen).[/]");
+        SessionMetadataEvents.Publish(context);
         return CommandResult.Continue;
     }
 }

@@ -2,6 +2,7 @@ using Coda.Agent;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Prompts;
 using LlmClient;
 using Spectre.Console;
 
@@ -12,68 +13,130 @@ public sealed class TuiApp : IDisposable
 {
     private readonly CommandContext context;
     private readonly AgentRunner agentRunner;
+    private readonly bool ownsRunner;
     private readonly IShellExecutor shellExecutor;
 
-    public TuiApp(CommandContext context, Func<IReadOnlyList<Coda.Agent.ITool>>? mcpToolsProvider = null, IShellExecutor? shellExecutor = null)
+    public TuiApp(
+        CommandContext context,
+        Func<IReadOnlyList<Coda.Agent.ITool>>? mcpToolsProvider = null,
+        IShellExecutor? shellExecutor = null,
+        AgentRunner? agentRunner = null)
     {
         this.context = context ?? throw new ArgumentNullException(nameof(context));
-        this.agentRunner = new AgentRunner(mcpToolsProvider);
+
+        // A shared runner (e.g. one the host also hands to the controller for Ctrl-C / mode switches)
+        // is owned by the caller; only a runner we create here is ours to dispose.
+        this.ownsRunner = agentRunner is null;
+        this.agentRunner = agentRunner ?? new AgentRunner(mcpToolsProvider);
         this.shellExecutor = shellExecutor ?? new ProcessShellExecutor();
     }
 
-    public async Task RunAsync(CancellationToken cancellationToken = default)
+    /// <summary>The agent runner this host dispatches turns through. Exposed for host wiring/tests.</summary>
+    internal AgentRunner Runner => this.agentRunner;
+
+    /// <summary>
+    /// Backwards-compatible entry point that runs the Spectre REPL. Retained so callers built before
+    /// the host owned mode selection keep compiling; new code selects <see cref="RunSpectreAsync"/> or
+    /// <see cref="RunPlainAsync"/> explicitly.
+    /// </summary>
+    [Obsolete("Use RunSpectreAsync or RunPlainAsync; the interactive host now selects the loop.")]
+    public Task RunAsync(CancellationToken cancellationToken = default) => this.RunSpectreAsync(cancellationToken);
+
+    /// <summary>
+    /// The interactive Spectre REPL loop: render the banner, read a line through the
+    /// <see cref="InteractiveLineEditor"/>, and dispatch it. Used only for a real, interactive terminal
+    /// (the plain/redirected path uses <see cref="RunPlainAsync"/>). Honors cancellation and exit.
+    /// </summary>
+    public async Task RunSpectreAsync(CancellationToken cancellationToken = default)
     {
         var connectedProvider = await this.context.Credentials.GetConnectedProviderIdAsync(cancellationToken).ConfigureAwait(false);
         Banner.Render(this.context.Console, this.context.Session, connectedProvider, this.context.Session.Model);
 
-        var interactive = this.context.Console.Profile.Capabilities.Interactive;
-
         while (!cancellationToken.IsCancellationRequested)
         {
-            // Plain line read works both interactively and with piped/scripted input
-            // (Spectre's TextPrompt throws in non-interactive mode). Only show the
-            // glyph when interactive so scripted/piped output stays clean.
-            if (interactive)
+            if (!string.IsNullOrEmpty(this.context.Session.Goal))
             {
-                if (!string.IsNullOrEmpty(this.context.Session.Goal))
-                {
-                    // Keep the indicator compact; the full goal text is shown by /goal.
-                    var goal = this.context.Session.Goal;
-                    var shown = goal.Length > 40 ? goal[..40] + "…" : goal;
-                    this.context.Console.Markup(Theme.DimMarkup($"[goal: {shown}] "));
-                }
-
-                this.context.Console.Markup($"{Theme.PromptGlyph} ");
+                // Keep the indicator compact; the full goal text is shown by /goal.
+                var goal = this.context.Session.Goal;
+                var shown = goal.Length > 40 ? goal[..40] + "…" : goal;
+                this.context.Console.Markup(Theme.DimMarkup($"[goal: {shown}] "));
             }
 
-            var input = Console.ReadLine();
+            this.context.Console.Markup($"{Theme.PromptGlyph} ");
+
+            var input = await new InteractiveLineEditor(this.context.Console, this.context.Commands)
+                .ReadLineAsync(cancellationToken).ConfigureAwait(false);
             if (input is null)
             {
                 break; // EOF
             }
 
-            CommandResult result;
-            try
-            {
-                result = await this.DispatchAsync(CommandParser.Parse(input), cancellationToken).ConfigureAwait(false);
-            }
-            catch (OperationCanceledException)
-            {
-                this.context.Console.MarkupLine(Theme.DimMarkup("Canceled."));
-                break;
-            }
-            catch (Exception ex)
-            {
-                // A single command must never tear down the whole REPL.
-                this.context.Console.MarkupLine(Theme.ErrorMarkup($"Error: {ex.Message}"));
-                continue;
-            }
-
-            if (result.ShouldExit)
+            if (!await this.DispatchLineAsync(input, cancellationToken).ConfigureAwait(false))
             {
                 break;
             }
         }
+    }
+
+    /// <summary>
+    /// The plain, line-based loop for redirected/non-interactive/CI runs and explicit <c>--plain</c>:
+    /// read a line from <paramref name="input"/> and dispatch it through the shared
+    /// <see cref="DispatchAsync"/> path. No banner, prompt glyph, or control sequences are emitted, and
+    /// all output flows through <see cref="CommandContext.Console"/>/<see cref="CommandContext.Events"/>
+    /// so a single owner serializes it. Honors EOF, cancellation, and <see cref="CommandResult.ShouldExit"/>.
+    /// </summary>
+    public async Task RunPlainAsync(TextReader input, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(input);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            string? line;
+            try
+            {
+                line = await input.ReadLineAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            if (line is null)
+            {
+                break; // EOF
+            }
+
+            if (!await this.DispatchLineAsync(line, cancellationToken).ConfigureAwait(false))
+            {
+                break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Parse and dispatch a single input line, translating cancellation/error into the loop's
+    /// continue/stop decision. Returns false when the loop should stop (cancelled or an exit command).
+    /// </summary>
+    private async Task<bool> DispatchLineAsync(string line, CancellationToken cancellationToken)
+    {
+        CommandResult result;
+        try
+        {
+            result = await this.DispatchAsync(CommandParser.Parse(line), cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            this.context.Console.MarkupLine(Theme.DimMarkup("Canceled."));
+            return false;
+        }
+        catch (Exception ex)
+        {
+            // A single command must never tear down the whole REPL.
+            this.context.Console.MarkupLine(Theme.ErrorMarkup($"Error: {ex.Message}"));
+            return true;
+        }
+
+        return !result.ShouldExit;
     }
 
     /// <summary>Dispatch a single parsed line. Exposed for testing.</summary>
@@ -88,8 +151,8 @@ public sealed class TuiApp : IDisposable
                 var name = parsed.Name;
                 if (name.Length == 0)
                 {
-                    // Bare "/" -> interactive command menu.
-                    name = this.ShowCommandMenu();
+                    // Bare "/" -> interactive command menu through the host-neutral prompt surface.
+                    name = await this.ShowCommandMenuAsync(cancellationToken).ConfigureAwait(false);
                     if (name is null)
                     {
                         return CommandResult.Continue;
@@ -180,30 +243,36 @@ public sealed class TuiApp : IDisposable
     private static string XmlEscape(string s) =>
         s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;");
 
-    private string? ShowCommandMenu()
+    private async Task<string?> ShowCommandMenuAsync(CancellationToken cancellationToken)
     {
-        // The interactive selection menu needs a real terminal; fall back to a hint.
-        if (!this.context.Console.Profile.Capabilities.Interactive)
+        // The interactive selection menu needs a prompt surface that a user can answer;
+        // fall back to a hint otherwise (scripted/piped input) and never await a prompt.
+        if (!this.context.Prompts.IsInteractive)
         {
             this.context.Console.MarkupLine(Theme.DimMarkup("Type /help to list commands."));
             return null;
         }
 
-        var prompt = new SelectionPrompt<string>()
-            .Title(Theme.DimMarkup("Select a command:"))
-            .PageSize(12)
-            .MoreChoicesText(Theme.DimMarkup("(move up and down to reveal more)"));
+        var options = this.context.Commands.ListSorted()
+            .Select(command => new UiPromptOption(command.Name, command.Name, command.Summary));
 
-        foreach (var command in this.context.Commands.ListSorted())
+        var response = await this.context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Select a command", options),
+            cancellationToken).ConfigureAwait(false);
+
+        if (response.Cancelled || response.SelectedIds.Length == 0)
         {
-            prompt.AddChoice(command.Name);
+            return null;
         }
 
-        return this.context.Console.Prompt(prompt);
+        return response.SelectedIds[0];
     }
 
     public void Dispose()
     {
-        this.agentRunner.Dispose();
+        if (this.ownsRunner)
+        {
+            this.agentRunner.Dispose();
+        }
     }
 }

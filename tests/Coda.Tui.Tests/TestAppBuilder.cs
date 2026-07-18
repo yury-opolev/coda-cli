@@ -1,6 +1,8 @@
 using Coda.Tui;
 using Coda.Tui.Commands;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Prompts;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -16,7 +18,10 @@ namespace Coda.Tui.Tests;
 internal static class TestAppBuilder
 {
     public static (TuiApp App, CommandContext Context, TestConsole Console, CredentialManager Credentials) BuildApp(
-        ITokenStore? store = null)
+        ITokenStore? store = null,
+        IUiPromptService? prompts = null,
+        IUiEventPublisher? events = null,
+        string? workingDirectory = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -34,7 +39,7 @@ internal static class TestAppBuilder
             new("anthropic-api-key", "Anthropic API key", LoginKind.ApiKey, "claude-sonnet-4-6"),
         };
 
-        var session = new SessionState("claude-ai");
+        var session = new SessionState("claude-ai", workingDirectory);
         var registry = new SlashCommandRegistry(new ISlashCommand[]
         {
             new HelpCommand(), new LoginCommand(), new LogoutCommand(), new StatusCommand(),
@@ -42,7 +47,7 @@ internal static class TestAppBuilder
             new VersionCommand(), new ExitCommand(), new ImageCommand(), new LogCommand(),
         });
 
-        var context = new CommandContext(console, credentials, session, providers, registry);
+        var context = new CommandContext(console, credentials, session, providers, registry, prompts, events);
         return (new TuiApp(context), context, console, credentials);
     }
 

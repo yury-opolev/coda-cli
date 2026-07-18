@@ -1,6 +1,8 @@
 using Coda.Agent.Settings;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Setup;
+using Coda.Tui.Ui.Prompts;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -33,11 +35,24 @@ public sealed class LoginCommand : ISlashCommand
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        var provider = args.Count > 0 ? context.ResolveProvider(args[0]) : ChooseProvider(context);
-        if (provider is null)
+        ProviderDescriptor? provider;
+        if (args.Count > 0)
         {
-            context.Console.MarkupLine(Theme.ErrorMarkup($"Unknown provider '{args[0]}'."));
-            return CommandResult.Continue;
+            provider = context.ResolveProvider(args[0]);
+            if (provider is null)
+            {
+                context.Console.MarkupLine(Theme.ErrorMarkup($"Unknown provider '{args[0]}'."));
+                return CommandResult.Continue;
+            }
+        }
+        else
+        {
+            provider = await ChooseProviderAsync(context, cancellationToken).ConfigureAwait(false);
+            if (provider is null)
+            {
+                // The user dismissed the picker — nothing to connect to, nothing mutated.
+                return CommandResult.Continue;
+            }
         }
 
         await ConnectAsync(context, provider, cancellationToken).ConfigureAwait(false);
@@ -102,22 +117,18 @@ public sealed class LoginCommand : ISlashCommand
 
     /// <summary>
     /// Pick the provider to sign in to when <c>/login</c> is called with no argument:
-    /// an interactive picker when a terminal is attached and more than one provider
-    /// exists (so the user isn't silently sent to whatever happens to be active),
-    /// otherwise the active provider.
+    /// the shared <see cref="SetupWizard.ChooseProviderAsync"/> picker when a prompt surface
+    /// can answer and more than one provider exists (so the user isn't silently sent to whatever
+    /// happens to be active), otherwise the active provider.
     /// </summary>
-    private static ProviderDescriptor ChooseProvider(CommandContext context)
+    private static async Task<ProviderDescriptor?> ChooseProviderAsync(CommandContext context, CancellationToken cancellationToken)
     {
-        if (!context.Console.Profile.Capabilities.Interactive || context.Providers.Count <= 1)
+        if (!context.Prompts.IsInteractive || context.Providers.Count <= 1)
         {
             return context.ActiveProvider;
         }
 
-        return context.Console.Prompt(
-            new SelectionPrompt<ProviderDescriptor>()
-                .Title(Theme.DimMarkup("Sign in to which provider?"))
-                .UseConverter(p => p.DisplayName)
-                .AddChoices(context.Providers));
+        return await SetupWizard.ChooseProviderAsync(context, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task<Credential> LoginLoopbackAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
@@ -159,29 +170,16 @@ public sealed class LoginCommand : ISlashCommand
     {
         var enterpriseDomain = SettingsLoader.Load(context.Session.WorkingDirectory).GitHubEnterpriseDomain;
 
-        if (context.Console.Profile.Capabilities.Interactive)
+        if (context.Prompts.IsInteractive)
         {
-            const string publicChoice = "Public github.com";
-            const string enterpriseChoice = "GitHub Enterprise (data residency, *.ghe.com)";
-            var deployment = context.Console.Prompt(
-                new SelectionPrompt<string>()
-                    .Title(Theme.DimMarkup("Which GitHub Copilot deployment?"))
-                    .AddChoices(publicChoice, enterpriseChoice));
+            var selection = await PromptCopilotDeploymentAsync(context, enterpriseDomain, cancellationToken).ConfigureAwait(false);
+            if (selection.Cancelled)
+            {
+                // Nothing has been persisted yet — abort cleanly so ConnectAsync reports "Sign-in canceled."
+                throw new OperationCanceledException();
+            }
 
-            if (deployment == enterpriseChoice)
-            {
-                var entered = context.Console.Prompt(
-                    new TextPrompt<string>(Theme.DimMarkup("GitHub Enterprise domain (e.g. octocorp.ghe.com):"))
-                        .DefaultValue(string.IsNullOrWhiteSpace(enterpriseDomain) ? string.Empty : enterpriseDomain)
-                        .Validate(v => string.IsNullOrWhiteSpace(v)
-                            ? ValidationResult.Error("Enter your GitHub Enterprise domain")
-                            : ValidationResult.Success()));
-                enterpriseDomain = entered.Trim();
-            }
-            else
-            {
-                enterpriseDomain = null;
-            }
+            enterpriseDomain = selection.EnterpriseDomain;
 
             // Persist for future sessions (empty string clears back to public github.com).
             SettingsWriter.SetGitHubEnterpriseDomain(enterpriseDomain ?? string.Empty);
@@ -213,6 +211,56 @@ public sealed class LoginCommand : ISlashCommand
         }
 
         return credential;
+    }
+
+    /// <summary>The result of the Copilot deployment picker: whether it was dismissed, and the
+    /// chosen GitHub Enterprise domain (<c>null</c> = public github.com).</summary>
+    internal sealed record CopilotDeploymentSelection(bool Cancelled, string? EnterpriseDomain);
+
+    /// <summary>
+    /// Ask whether to sign in to public github.com or a GitHub Enterprise Cloud data-residency
+    /// tenant (and, for enterprise, collect the required domain) through the host-neutral prompt
+    /// surface. Pure prompting only: it persists nothing, so a cancelled response leaves settings
+    /// and the environment untouched — the caller writes the choice after acceptance.
+    /// </summary>
+    internal static async Task<CopilotDeploymentSelection> PromptCopilotDeploymentAsync(
+        CommandContext context,
+        string? currentEnterpriseDomain,
+        CancellationToken cancellationToken)
+    {
+        var deployment = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select("Which GitHub Copilot deployment", new[]
+            {
+                new UiPromptOption("public", "Public github.com"),
+                new UiPromptOption("enterprise", "GitHub Enterprise (data residency, *.ghe.com)"),
+            }),
+            cancellationToken).ConfigureAwait(false);
+
+        if (deployment.Cancelled || deployment.SelectedIds.Length == 0)
+        {
+            return new CopilotDeploymentSelection(Cancelled: true, EnterpriseDomain: null);
+        }
+
+        if (!string.Equals(deployment.SelectedIds[0], "enterprise", StringComparison.Ordinal))
+        {
+            // Public github.com clears any stored enterprise domain.
+            return new CopilotDeploymentSelection(Cancelled: false, EnterpriseDomain: null);
+        }
+
+        var domain = await context.Prompts.RequestAsync(
+            UiPromptRequest.Text(
+                "GitHub Enterprise domain",
+                defaultValue: string.IsNullOrWhiteSpace(currentEnterpriseDomain) ? null : currentEnterpriseDomain,
+                required: true),
+            cancellationToken).ConfigureAwait(false);
+
+        if (domain.Cancelled || string.IsNullOrWhiteSpace(domain.Text))
+        {
+            // A required domain the user wouldn't provide can't be accepted — treat as cancelled.
+            return new CopilotDeploymentSelection(Cancelled: true, EnterpriseDomain: null);
+        }
+
+        return new CopilotDeploymentSelection(Cancelled: false, EnterpriseDomain: domain.Text.Trim());
     }
 
     private static void ShowDevicePrompt(CommandContext context, ProviderDescriptor provider, DeviceCodePrompt prompt)

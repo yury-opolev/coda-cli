@@ -40,7 +40,7 @@ public static class ImmediateCli
     {
         writer.WriteLine($"{Branding.ProductName} v{Branding.Version} — {Branding.Tagline}");
         writer.WriteLine();
-        writer.WriteLine($"Usage: {Branding.CliName} [options] [--continue] [--resume <id>] [--fork [<id>]]");
+        writer.WriteLine($"Usage: {Branding.CliName} [options] [--tui=auto|inline|fullscreen] [--plain] [--no-mouse] [--continue] [--resume <id>] [--fork [<id>]]");
         writer.WriteLine($"       {Branding.CliName} run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode <mode>] [--provider <id>] [--model <id>] [--effort <level>] [--log-level <level>] [--cwd <path>] [--goal \"<objective>\"] [--session-memory] [--max-continuations <n>]");
         writer.WriteLine($"       {Branding.CliName} serve [--provider <id>] [--model <id>] [--cwd <path>] [--permission-mode <mode>] [--goal \"<objective>\"] [--session-memory] [--telemetry] [--no-mcp] [--no-project-mcp] [--api-key <key>] [--endpoint <name>]");
         writer.WriteLine();
@@ -49,6 +49,15 @@ public static class ImmediateCli
         writer.WriteLine("Options:");
         writer.WriteLine("  -v, --version   Show the version and exit");
         writer.WriteLine("  -h, --help      Show this help and exit");
+        writer.WriteLine();
+        writer.WriteLine("Interactive display:");
+        writer.WriteLine("  --tui=auto|inline|fullscreen");
+        writer.WriteLine("                  Choose the interactive surface. auto (default) selects plain for");
+        writer.WriteLine("                  redirected/non-interactive terminals or ones smaller than 60x12,");
+        writer.WriteLine("                  and the inline Terminal.Gui composer otherwise; fullscreen is opt-in.");
+        writer.WriteLine("  --plain         Force the plain, line-based surface (no Terminal.Gui, no control");
+        writer.WriteLine("                  sequences); wins over --tui. Ideal for scripts, pipes, and CI.");
+        writer.WriteLine("  --no-mouse      Disable mouse capture; every action stays available via the keyboard.");
         writer.WriteLine();
         writer.WriteLine("Subcommands:");
         writer.WriteLine("  run             Run a single task headlessly (for scripting / side-agent use)");

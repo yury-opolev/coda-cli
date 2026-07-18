@@ -1,5 +1,6 @@
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Setup;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -31,6 +32,20 @@ public sealed class ProviderCommand : ISlashCommand
 
         if (token is null)
         {
+            // With a prompt surface that can answer, offer the shared picker and connect to the
+            // selection; otherwise keep the plain listing (and never await a prompt).
+            if (context.Prompts.IsInteractive)
+            {
+                var chosen = await SetupWizard.ChooseProviderAsync(context, cancellationToken).ConfigureAwait(false);
+                if (chosen is null)
+                {
+                    return CommandResult.Continue;
+                }
+
+                await ConnectAndPublishAsync(context, chosen, cancellationToken).ConfigureAwait(false);
+                return CommandResult.Continue;
+            }
+
             context.Console.MarkupLine($"Active provider: {Theme.AccentMarkup(context.ActiveProvider.DisplayName)} {Theme.DimMarkup($"({context.ActiveProvider.Id})")}");
             context.Console.MarkupLine(Theme.DimMarkup("Available:"));
             foreach (var provider in context.Providers)
@@ -51,7 +66,21 @@ public sealed class ProviderCommand : ISlashCommand
         // Connect to the resolved provider — the same login/connect flow /login uses.
         // The credential store enforces a single credential, so this replaces whatever
         // was previously connected; no defaultProvider settings pointer is written.
-        await LoginCommand.ConnectAsync(context, resolved, cancellationToken).ConfigureAwait(false);
+        await ConnectAndPublishAsync(context, resolved, cancellationToken).ConfigureAwait(false);
         return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// Connect to <paramref name="provider"/> and publish a <see cref="Ui.Events.SessionMetadataChangedEvent"/>
+    /// only when the connection was accepted (the session's active provider is now this one). A
+    /// cancelled or failed sign-in leaves the active provider unchanged and publishes nothing.
+    /// </summary>
+    private static async Task ConnectAndPublishAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
+    {
+        await LoginCommand.ConnectAsync(context, provider, cancellationToken).ConfigureAwait(false);
+        if (string.Equals(context.Session.ActiveProviderId, provider.Id, StringComparison.OrdinalIgnoreCase))
+        {
+            SessionMetadataEvents.Publish(context);
+        }
     }
 }
