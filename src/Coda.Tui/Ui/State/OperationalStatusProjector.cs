@@ -11,12 +11,12 @@ internal static class OperationalStatusProjector
         if (snapshot.Permission.PendingCount > 0 ||
             snapshot.PendingPrompt is { Kind: UiPromptKind.Confirm })
         {
-            return new("! Waiting for approval", OperationalTone.Approval, false);
+            return new("Waiting for approval", OperationalTone.Approval, false);
         }
 
         if (snapshot.PendingPrompt is not null)
         {
-            return new("◌ Waiting for input", OperationalTone.Waiting, false);
+            return new("Waiting for input", OperationalTone.Waiting, false);
         }
 
         if (snapshot.ActiveOperation is { Kind: "startup" })

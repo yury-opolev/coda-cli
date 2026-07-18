@@ -17,7 +17,7 @@ public sealed class OperationalStatusProjectorTests
         };
 
         Assert.Equal(
-            new OperationalStatus("! Waiting for approval", OperationalTone.Approval, Animated: false),
+            new OperationalStatus("Waiting for approval", OperationalTone.Approval, Animated: false),
             OperationalStatusProjector.Project(snapshot));
     }
 
@@ -32,7 +32,7 @@ public sealed class OperationalStatusProjectorTests
         };
 
         Assert.Equal(
-            new OperationalStatus("◌ Waiting for input", OperationalTone.Waiting, Animated: false),
+            new OperationalStatus("Waiting for input", OperationalTone.Waiting, Animated: false),
             OperationalStatusProjector.Project(snapshot));
     }
 

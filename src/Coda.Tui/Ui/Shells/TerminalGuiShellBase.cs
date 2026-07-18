@@ -90,8 +90,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     internal ComposerView Composer { get; }
 
     /// <summary>
-    /// The borderless chrome painted over the composer region: a subtle dark background, a left accent
-    /// bar, and either the <c>&gt;</c> prompt glyph or an <c>Initializing…</c> label. Non-focusable and
+    /// The borderless chrome painted over the composer region: a subtle dark background and, when ready,
+    /// the <c>&gt;</c> prompt glyph. During startup it stays blank and dark; the operational status row
+    /// owns the <c>Initializing…</c> message. Non-focusable and
     /// owned here; concrete shells position it directly beneath the composer in <see cref="BuildLayout"/>.
     /// </summary>
     internal ComposerChromeView Chrome { get; }
@@ -315,8 +316,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>
     /// Reconciles composer readiness from the semantic snapshot before prompt focus is settled. While the
-    /// startup operation is active the real editor is hidden and disabled and the chrome shows
-    /// <c>Initializing…</c>, so it is visually impossible to type. When startup clears, the editor is shown
+    /// startup operation is active the real editor is hidden and disabled and the chrome stays blank and
+    /// dark — the operational status row owns the <c>Initializing…</c> message — so it is visually impossible
+    /// to type. When startup clears, the editor is shown
     /// and re-enabled, the chrome shows <c>&gt;</c>, and — only on the transition back to ready and only when
     /// no prompt is pending — the composer regains focus, so an open prompt overlay is never robbed of it.
     /// </summary>
