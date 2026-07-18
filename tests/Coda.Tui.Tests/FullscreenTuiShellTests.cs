@@ -1584,7 +1584,7 @@ public sealed class VirtualizedTranscriptViewTests
         });
         view.ProcessMouse(new Mouse
         {
-            Flags = MouseFlags.PositionReport,
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
             Position = new System.Drawing.Point(4, 0),
         });
         view.ProcessMouse(new Mouse
@@ -1594,6 +1594,63 @@ public sealed class VirtualizedTranscriptViewTests
         });
 
         Assert.True(view.HasSelection);
+        Assert.Equal("rep", view.GetSelectedText());
+    }
+
+    [Fact]
+    public void Multiple_held_button_drag_reports_preserve_anchor_and_expand_selection()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var view = CreateView(app, out _);
+        var toolId = Guid.NewGuid();
+        view.ReplaceAll(
+        [
+            new ToolTranscriptBlock(
+                toolId,
+                "grep",
+                "{}",
+                2,
+                "hit",
+                IsError: false,
+                Complete: true),
+        ]);
+
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+
+        // Terminal.Gui reports motion during a drag as the button still held
+        // (LeftButtonPressed) combined with PositionReport, once per cell moved.
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(2, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(3, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+
+        Assert.True(view.HasSelection);
+
+        // The anchor stays at the original press (column 1); dragging to column 4
+        // grows the selection instead of restarting it at each motion report.
         Assert.Equal("rep", view.GetSelectedText());
     }
 

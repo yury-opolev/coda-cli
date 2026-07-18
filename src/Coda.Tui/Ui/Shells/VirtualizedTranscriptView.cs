@@ -337,7 +337,14 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        if (mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
+        // Terminal.Gui signals a fresh press as a bare LeftButtonPressed. While the
+        // button is held and the pointer moves, it re-reports the same button flag
+        // combined with PositionReport (LeftButtonPressed | PositionReport) once per
+        // cell. Only begin a new selection on the initial press so held-button motion
+        // reports extend the existing selection instead of resetting the anchor.
+        if (!this.dragging &&
+            mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
+            !mouse.Flags.HasFlag(MouseFlags.PositionReport))
         {
             var position = this.ToTranscriptPosition(mouse);
             this.BeginSelection(position);
