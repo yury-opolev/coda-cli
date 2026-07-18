@@ -383,7 +383,7 @@ public static class TranscriptBlockFormatter
             yield break;
         }
 
-        if (DisplayWidth(line) <= cellWidth)
+        if (TerminalCellText.Width(line) <= cellWidth)
         {
             yield return line;
             yield break;
@@ -415,7 +415,7 @@ public static class TranscriptBlockFormatter
                 continue;
             }
 
-            var wordWidth = DisplayWidth(word);
+            var wordWidth = TerminalCellText.Width(word);
 
             if (currentWidth == 0)
             {
@@ -503,11 +503,9 @@ public static class TranscriptBlockFormatter
         var builder = new StringBuilder();
         var builderWidth = 0;
 
-        var enumerator = StringInfo.GetTextElementEnumerator(word);
-        while (enumerator.MoveNext())
+        foreach (var element in TerminalCellText.Enumerate(word))
         {
-            var cluster = (string)enumerator.Current;
-            var clusterWidth = DisplayWidth(cluster);
+            var clusterWidth = element.Width;
 
             if (builderWidth > 0 && builderWidth + clusterWidth > width)
             {
@@ -516,7 +514,7 @@ public static class TranscriptBlockFormatter
                 builderWidth = 0;
             }
 
-            builder.Append(cluster);
+            builder.Append(element.Text);
             builderWidth += clusterWidth;
         }
 
@@ -530,49 +528,6 @@ public static class TranscriptBlockFormatter
             yield return (chunks[i].Chunk, chunks[i].Width, i == chunks.Count - 1);
         }
     }
-
-    /// <summary>Sum of display cells; wide (East Asian) runes count as two, combining marks as zero.</summary>
-    private static int DisplayWidth(string text)
-    {
-        var width = 0;
-        foreach (var rune in text.EnumerateRunes())
-        {
-            width += RuneWidth(rune);
-        }
-
-        return width;
-    }
-
-    private static int RuneWidth(System.Text.Rune rune)
-    {
-        var value = rune.Value;
-        if (value == 0)
-        {
-            return 0;
-        }
-
-        var category = System.Text.Rune.GetUnicodeCategory(rune);
-        if (category is UnicodeCategory.NonSpacingMark or UnicodeCategory.EnclosingMark or UnicodeCategory.Format)
-        {
-            return 0;
-        }
-
-        return IsWide(value) ? 2 : 1;
-    }
-
-    private static bool IsWide(int codePoint) =>
-        (codePoint >= 0x1100 && codePoint <= 0x115F) ||   // Hangul Jamo
-        (codePoint >= 0x2E80 && codePoint <= 0x303E) ||   // CJK radicals, Kangxi
-        (codePoint >= 0x3041 && codePoint <= 0x33FF) ||   // Hiragana … CJK symbols
-        (codePoint >= 0x3400 && codePoint <= 0x4DBF) ||   // CJK Ext A
-        (codePoint >= 0x4E00 && codePoint <= 0x9FFF) ||   // CJK Unified
-        (codePoint >= 0xA000 && codePoint <= 0xA4CF) ||   // Yi
-        (codePoint >= 0xAC00 && codePoint <= 0xD7A3) ||   // Hangul syllables
-        (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||   // CJK compatibility
-        (codePoint >= 0xFF00 && codePoint <= 0xFF60) ||   // Fullwidth forms
-        (codePoint >= 0xFFE0 && codePoint <= 0xFFE6) ||   // Fullwidth signs
-        (codePoint >= 0x1F300 && codePoint <= 0x1FAFF) || // Emoji / symbols
-        (codePoint >= 0x20000 && codePoint <= 0x3FFFD);   // CJK Ext B+
 
     private static string NormalizeNewlines(string value) =>
         value.Replace("\r\n", "\n").Replace('\r', '\n');

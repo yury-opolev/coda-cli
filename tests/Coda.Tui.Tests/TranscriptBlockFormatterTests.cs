@@ -144,6 +144,18 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
+    public void User_block_wraps_wide_runs_by_display_cells()
+    {
+        // "界界é": 界 and 界 fill four cells, é (one cell) overflows to the next row.
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "\u754c\u754c\u00e9");
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+
+        Assert.Equal(["\u754c\u754c", "\u00e9"], lines.Select(line => line.Text));
+        Assert.All(lines, line => Assert.Equal(TranscriptRole.User, line.Role));
+    }
+
+    [Fact]
     public void Grapheme_clusters_are_never_split_across_lines()
     {
         // "a" + combining acute, then "b" + combining acute: two graphemes, one display cell each.
