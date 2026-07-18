@@ -58,7 +58,8 @@ public sealed class FullscreenTuiShellTests
 
         Assert.Equal(1, shell.Header.Frame.Height);
         Assert.True(shell.Transcript.Frame.Height >= 3);
-        Assert.Equal(Math.Min(width, FullscreenTuiShell.MaximumTranscriptWidth), shell.Transcript.Frame.Width);
+        Assert.Equal(width, shell.Transcript.Frame.Width);
+        Assert.Equal(0, shell.Transcript.Frame.X);
         Assert.True(shell.Composer.Frame.Height >= 3);
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.DoesNotContain(shell.SubViews, view => view.Id?.Contains("sidebar", StringComparison.OrdinalIgnoreCase) == true);
@@ -290,20 +291,24 @@ public sealed class FullscreenTuiShellTests
         }
     }
 
-    [Fact]
-    public void Transcript_is_centered_only_when_wider_than_the_maximum()
+    [Theory]
+    [InlineData(60)]
+    [InlineData(80)]
+    [InlineData(160)]
+    public void Transcript_spans_the_full_width_flush_left(int width)
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
         app.Init(DriverRegistry.Names.ANSI);
-        app.Driver!.SetScreenSize(160, 40);
+        app.Driver!.SetScreenSize(width, 40);
         using var shell = ShellTestFactory.CreateFullscreen(app);
 
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        Assert.Equal(FullscreenTuiShell.MaximumTranscriptWidth, shell.Transcript.Frame.Width);
-        Assert.True(shell.Transcript.Frame.X > 0);
+        Assert.Equal(0, shell.Transcript.Frame.X);
+        Assert.Equal(width, shell.Transcript.Frame.Width);
+        Assert.Equal(width, shell.Transcript.ActiveLayoutWidth);
 
         if (token is not null)
         {
@@ -312,7 +317,7 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Transcript_is_flush_left_when_narrower_than_the_maximum()
+    public void Transcript_reflows_to_the_full_width_when_the_terminal_is_resized()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -324,7 +329,14 @@ public sealed class FullscreenTuiShellTests
         app.LayoutAndDraw();
 
         Assert.Equal(80, shell.Transcript.Frame.Width);
+        Assert.Equal(80, shell.Transcript.ActiveLayoutWidth);
+
+        app.Driver!.SetScreenSize(160, 40);
+        app.LayoutAndDraw();
+
         Assert.Equal(0, shell.Transcript.Frame.X);
+        Assert.Equal(160, shell.Transcript.Frame.Width);
+        Assert.Equal(160, shell.Transcript.ActiveLayoutWidth);
 
         if (token is not null)
         {

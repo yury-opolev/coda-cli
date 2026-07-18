@@ -62,6 +62,13 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>The first content row rendered at the top of the viewport.</summary>
     internal int TopRow => this.viewport.TopRow;
 
+    /// <summary>
+    /// The column width the transcript is currently wrapped/laid out at. It tracks the drawable content
+    /// width and is updated on layout via <see cref="Reflow"/>, so a host or test can assert the
+    /// transcript reflows to the full terminal width on resize.
+    /// </summary>
+    internal int ActiveLayoutWidth => this.currentWidth;
+
     /// <summary>Number of times the transcript was fully rebuilt (initial/reseed/resize).</summary>
     internal int ReplaceAllCount { get; private set; }
 

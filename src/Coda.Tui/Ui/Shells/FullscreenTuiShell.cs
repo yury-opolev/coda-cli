@@ -15,8 +15,8 @@ namespace Coda.Tui.Ui.Shells;
 /// except for the Terminal.Gui <c>AppModel</c> the runner selects (alternate screen vs. primary buffer).
 /// </summary>
 /// <remarks>
-/// The transcript is capped at <see cref="MaximumTranscriptWidth"/> columns and centered when the
-/// terminal is wider, while the header, composer, and status remain full width. Snapshots update the
+/// The transcript spans the full terminal width (flush-left, <see cref="Dim.Fill()"/>), while the
+/// header, composer, and status also remain full width. Snapshots update the
 /// transcript incrementally — <see cref="VirtualizedTranscriptView.Append"/> for a new completed block,
 /// <see cref="VirtualizedTranscriptView.ReplaceLast"/> for streaming tail updates, and a full
 /// <see cref="VirtualizedTranscriptView.ReplaceAll"/> only for the initial load or a reseed. New rows
@@ -32,12 +32,9 @@ internal class FullscreenTuiShell(
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null)
     : TerminalGuiShellBase(app, controller, publisher, initialSnapshot, statusProjection)
 {
-    /// <summary>The transcript is never rendered wider than this many columns.</summary>
-    public const int MaximumTranscriptWidth = 120;
-
     /// <summary>
-    /// Columns reserved at the composer's left edge for the borderless chrome — the accent bar and the
-    /// <c>&gt;</c> prompt glyph. The composer is shifted right by this much and narrowed accordingly.
+    /// Columns reserved at the composer's left edge for the borderless <c>&gt;</c> prompt glyph. The
+    /// composer is shifted right by this much and narrowed accordingly.
     /// </summary>
     internal const int ComposerGutterWidth = 4;
 
@@ -70,13 +67,13 @@ internal class FullscreenTuiShell(
 
         this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter);
         this.transcript.TranscriptScrolled += this.RefreshHeaderForViewport;
-        this.transcript.X = Pos.Center();
+        this.transcript.X = 0;
         this.transcript.Y = Pos.Bottom(this.header);
-        this.transcript.Width = Dim.Func(TranscriptWidth, this);
+        this.transcript.Width = Dim.Fill();
         this.transcript.Height = Dim.Fill(4);
 
-        // The borderless composer is shifted right by a small gutter so the chrome can paint its accent
-        // bar and prompt glyph to its left; the chrome spans the full width beneath it.
+        // The borderless composer is shifted right by a small gutter so the chrome can paint its prompt
+        // glyph to the left; the chrome spans the full width beneath it.
         this.Chrome.X = 0;
         this.Chrome.Y = Pos.AnchorEnd(4);
         this.Chrome.Width = Dim.Fill();
@@ -226,21 +223,5 @@ internal class FullscreenTuiShell(
         }
 
         base.Dispose(disposing);
-    }
-
-    private static int TranscriptWidth(View? shell)
-    {
-        var available = shell?.GetContentSize().Width ?? 0;
-        if (available <= 0)
-        {
-            available = shell?.App?.Screen.Width ?? MaximumTranscriptWidth;
-        }
-
-        if (available <= 0)
-        {
-            available = MaximumTranscriptWidth;
-        }
-
-        return Math.Min(available, MaximumTranscriptWidth);
     }
 }
