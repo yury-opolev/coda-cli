@@ -213,7 +213,8 @@ Transcript output is represented as typed render blocks:
 - Notification.
 - Session boundary.
 
-Inline mode commits completed blocks to native scrollback. Full-screen mode renders blocks from the transcript model and virtualizes the visible range.
+Inline and full-screen modes both render a retained, virtualized transcript. Inline uses the primary
+terminal buffer; full-screen uses the alternate screen.
 
 Streaming assistant text remains a mutable active block until completion. Tool progress updates replace the active tool block rather than appending repeated status lines.
 
@@ -277,7 +278,7 @@ The projector truncates or removes lower-priority fields before wrapping. Status
 - Streaming updates are coalesced and frame-rate-limited.
 - Render only on state changes, input changes, resize, or animation ticks.
 - Full-screen transcript rendering is virtualized.
-- Inline mode repaints only the bounded composer/status region.
+- Both interactive modes repaint only their owned retained layout.
 - Hide the cursor during frame application and restore it after.
 - Use synchronized-output mode when supported by the active driver/terminal; fall back safely when unavailable.
 - Avoid terminal capability queries in the render hot path.
@@ -446,7 +447,7 @@ Run it across the compatibility targets before changing the production default.
 
 ## Acceptance criteria
 
-Inline mode can become the default when:
+The interactive TUI can become the default when:
 
 1. Under a synthetic load of 100 coalescible streaming events per second, keystroke-to-paint latency remains below 100 ms at the 95th percentile with no lost or reordered input actions.
 2. Output never overwrites or corrupts the composer/status region.

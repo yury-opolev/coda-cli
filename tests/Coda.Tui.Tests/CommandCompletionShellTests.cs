@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Point = System.Drawing.Point;
@@ -20,6 +21,34 @@ public sealed class CommandCompletionShellTests
         new TestCommand("model", "Pick a model"),
         new TestCommand("mcp", "Manage MCP servers"),
     ];
+
+    [Fact]
+    public void Restored_slash_draft_shows_completion_immediately_after_mode_switch()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var controller = new ComposerController(
+            new SlashCommandCompletion(new SlashCommandRegistry(Commands())));
+        controller.ReplaceDraft("/he", 3);
+        using var shell = new FullscreenTuiShell(
+            app,
+            controller,
+            new RecordingUiEvents(),
+            UiSessionSnapshot.Empty);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Completion.Visible);
+        Assert.Contains(shell.Completion.RenderVisibleRows(80), row => row.Contains("help"));
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
 
     [Fact]
     public void Fullscreen_shows_completion_menu_above_composer_without_moving_composer_or_status()

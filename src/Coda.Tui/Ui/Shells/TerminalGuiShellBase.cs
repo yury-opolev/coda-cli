@@ -54,6 +54,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Composer.CompletionChanged += this.OnCompletionChanged;
 
         this.BuildLayout();
+        this.SyncCompletion();
     }
 
     /// <summary>Raised when the composer submits a prompt; carries the submitted text.</summary>
