@@ -37,7 +37,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly ShellCommandChordState chords;
     private readonly Func<TimeSpan, Func<bool>, object> addTimeout;
     private readonly Func<object, bool> removeTimeout;
+    private readonly Func<string, bool> clipboardWriter;
     private object? chordTimeout;
+    private object? transientOperationalTimeout;
     private OperationalStatus? transientOperationalOverride;
 
     private string? statusText;
@@ -65,7 +67,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.statusProjection = statusProjection ?? StatusProjector.Project;
         this.hasActiveWork = hasActiveWork ?? (() => false);
         this.TimeSource = timeProvider ?? TimeProvider.System;
-        this.ClipboardWriter = clipboardWriter;
+        this.clipboardWriter = clipboardWriter ??
+            (text => this.app.Clipboard?.TrySetClipboardData(text) == true);
         this.Theme = theme ?? TuiTheme.WarmEmber;
 
         // The chord clock and the timeout seams drive the deterministic Esc/Ctrl+C chords: the same
@@ -132,8 +135,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The clock used for the deterministic interrupt/exit chord windows.</summary>
     protected TimeProvider TimeSource { get; }
 
-    /// <summary>Writes text to the system clipboard; a seam for the Task 12 copy chord.</summary>
-    protected Func<string, bool>? ClipboardWriter { get; }
+    /// <summary>
+    /// The concrete virtualized transcript this shell hosts. Exposed so the shared base can route text
+    /// selection, clipboard copy, and Esc-clear through the shell's transcript without a Terminal.Gui type
+    /// leaking into the host-neutral state model.
+    /// </summary>
+    protected abstract VirtualizedTranscriptView TranscriptView { get; }
 
     /// <summary>The keyboard-only prompt surface, hidden until a prompt is pending.</summary>
     internal PromptOverlay PromptOverlay { get; }
@@ -423,18 +430,74 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
-    /// Task 12 seam: clears an active transcript selection when the first Esc arrives, before any chord
-    /// arming. Transcript selection is not implemented until Task 12, so this always returns false today;
-    /// the full-screen shell overrides it once selection exists.
+    /// Clears an active transcript selection when the first Esc arrives, before any chord arming, and
+    /// restores the projected operational status. Returns true when a selection was actually cleared so the
+    /// Esc is consumed here and never falls through to interrupt-chord arming.
     /// </summary>
-    protected virtual bool TryClearTranscriptSelection() => false;
+    private bool TryClearTranscriptSelection()
+    {
+        if (!this.TranscriptView.HasSelection)
+        {
+            return false;
+        }
+
+        this.TranscriptView.ClearSelection();
+        this.RestoreProjectedOperationalStatus();
+        return true;
+    }
 
     /// <summary>
-    /// Task 12 seam: copies an active transcript selection to the clipboard when Ctrl+C arrives, before any
-    /// exit-chord arming. Transcript selection is not implemented until Task 12, so this always returns
-    /// false today; the full-screen shell overrides it once selection exists.
+    /// Copies an active transcript selection to the clipboard when Ctrl+C arrives, before any exit-chord
+    /// arming. On success the selection is cleared and the projected status restored; when the clipboard is
+    /// unavailable the selection is preserved and a transient Warning status is pinned for 1.5 seconds.
+    /// Returns true whenever a selection was present, so the exit chord never arms while text is selected.
     /// </summary>
-    protected virtual bool TryCopyTranscriptSelection() => false;
+    private bool TryCopyTranscriptSelection()
+    {
+        if (!this.TranscriptView.HasSelection)
+        {
+            return false;
+        }
+
+        var text = this.TranscriptView.GetSelectedText();
+        if (!string.IsNullOrEmpty(text) && this.clipboardWriter(text))
+        {
+            this.TranscriptView.ClearSelection();
+            this.RestoreProjectedOperationalStatus();
+            return true;
+        }
+
+        this.ShowTransientOperationalStatus(
+            new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
+            TimeSpan.FromSeconds(1.5));
+        return true;
+    }
+
+    /// <summary>
+    /// Pins a shell-driven transient status onto the operational row and schedules a one-shot timeout that
+    /// clears it and restores the projected status. Any previous transient override (and its timer) is torn
+    /// down first, and the expiry callback is inert once the shell is disposed.
+    /// </summary>
+    private void ShowTransientOperationalStatus(OperationalStatus status, TimeSpan duration)
+    {
+        this.ClearTransientOperationalOverride();
+        this.transientOperationalOverride = status;
+        this.Operational.SetStatus(status);
+        this.transientOperationalTimeout = this.addTimeout(
+            duration,
+            () =>
+            {
+                this.transientOperationalTimeout = null;
+                if (this.disposed)
+                {
+                    return false;
+                }
+
+                this.transientOperationalOverride = null;
+                this.RestoreProjectedOperationalStatus();
+                return false;
+            });
+    }
 
     /// <summary>
     /// Whether there is anything an interrupt chord should be allowed to interrupt: the injected active-work
@@ -539,18 +602,20 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
 
         this.ClearTransientOperationalOverride();
+        this.RestoreProjectedOperationalStatus();
         return true;
     }
 
     private void ClearTransientOperationalOverride()
     {
-        if (this.transientOperationalOverride is null)
+        this.transientOperationalOverride = null;
+        if (this.transientOperationalTimeout is not { } token)
         {
             return;
         }
 
-        this.transientOperationalOverride = null;
-        this.RestoreProjectedOperationalStatus();
+        this.transientOperationalTimeout = null;
+        this.removeTimeout(token);
     }
 
     /// <summary>

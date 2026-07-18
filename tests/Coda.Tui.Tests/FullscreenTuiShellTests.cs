@@ -884,6 +884,75 @@ public sealed class FullscreenTuiShellTests
             app.End(token);
         }
     }
+
+    [Fact]
+    public void Ctrl_c_with_selection_copies_clears_and_does_not_arm_exit()
+    {
+        string? copied = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            });
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 4));
+        fixture.Shell.Composer.SetFocus();
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.NotNull(copied);
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Clipboard_unavailable_keeps_selection_and_reports_status()
+    {
+        Func<bool>? timeout = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => false,
+            addTimeout: (_, callback) =>
+            {
+                timeout = callback;
+                return new object();
+            },
+            removeTimeout: _ => true);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(0, 4));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+
+        Assert.False(timeout!());
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal(
+            OperationalStatusProjector.Project(fixture.Shell.Snapshot),
+            fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public void Escape_clears_selection_before_arming_interrupt()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: true);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(0, 4));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
 }
 
 /// <summary>Unit tests for the bounded, virtualized <see cref="TranscriptLayoutIndex"/>.</summary>
@@ -1139,12 +1208,20 @@ public sealed class VirtualizedTranscriptViewTests
         var view = new VirtualizedTranscriptView(app, (block, width) =>
         {
             count++;
-            return ["row"];
+            return [BlockText(block)];
         });
         view.Reflow(width: 80);
         view.SetViewportHeight(10);
         return view;
     }
+
+    private static string BlockText(TranscriptBlock block) => block switch
+    {
+        CommandOutputTranscriptBlock command => command.Text,
+        ToolTranscriptBlock tool => tool.ToolName,
+        DiffTranscriptBlock diff => diff.Patch,
+        _ => "row",
+    };
 
     [Fact]
     public void Collects_only_the_visible_rows()
@@ -1438,5 +1515,158 @@ public sealed class VirtualizedTranscriptViewTests
         Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
         Assert.Contains(chordToken, removed);
         Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Zero_movement_click_keeps_expand_behavior_but_drag_selects()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var view = CreateView(app, out _);
+        var toolId = Guid.NewGuid();
+        view.ReplaceAll(
+        [
+            new ToolTranscriptBlock(
+                toolId,
+                "grep",
+                "{}",
+                2,
+                "hit",
+                IsError: false,
+                Complete: true),
+        ]);
+
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        Assert.True(view.IsExpanded(toolId));
+        Assert.False(view.HasSelection);
+
+        var diffId = Guid.NewGuid();
+        view.ReplaceAll([new DiffTranscriptBlock(diffId, "@@ -1 +1 @@")]);
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        Assert.True(view.IsExpanded(diffId));
+        Assert.False(view.HasSelection);
+
+        view.ReplaceAll(
+        [
+            new ToolTranscriptBlock(
+                toolId,
+                "grep",
+                "{}",
+                2,
+                "hit",
+                IsError: false,
+                Complete: true),
+        ]);
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(1, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+
+        Assert.True(view.HasSelection);
+        Assert.Equal("rep", view.GetSelectedText());
+    }
+
+    [Fact]
+    public void Selection_spans_rows_and_survives_scroll_and_redraw()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(20, 10);
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(30));
+        view.BeginSelection(new TranscriptCellPosition(20, 2));
+        view.UpdateSelection(new TranscriptCellPosition(22, 4));
+        var selected = view.GetSelectedText();
+
+        view.ScrollBy(-5);
+        view.SetNeedsDraw();
+
+        Assert.True(view.HasSelection);
+        Assert.Equal(selected, view.GetSelectedText());
+    }
+
+    [Fact]
+    public void No_mouse_and_shift_drag_bypass_in_app_selection()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(5));
+
+        app.Mouse.IsMouseDisabled = true;
+        Assert.False(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        }));
+
+        app.Mouse.IsMouseDisabled = false;
+        Assert.False(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.Shift,
+            Position = new System.Drawing.Point(0, 0),
+        }));
+        Assert.False(view.HasSelection);
+    }
+
+    [Fact]
+    public void Selected_cells_are_drawn_through_the_selection_highlight()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(40, 12);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        shell.Transcript.ReplaceAll(Blocks(30));
+        app.LayoutAndDraw();
+
+        var top = shell.Transcript.TopRow;
+        shell.Transcript.BeginSelection(new TranscriptCellPosition(top, 0));
+        shell.Transcript.UpdateSelection(new TranscriptCellPosition(top, 2));
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.HasSelection);
+        Assert.True(shell.Transcript.SelectionDrawCount > 0);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
     }
 }

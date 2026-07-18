@@ -34,6 +34,10 @@ internal sealed class VirtualizedTranscriptView : View
     private int currentWidth = DefaultWidth;
     private Guid? selectedBlockId;
 
+    private readonly TranscriptSelection selection = new();
+    private bool dragging;
+    private TranscriptCellPosition pressPosition;
+
     public VirtualizedTranscriptView(
         IApplication app,
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null,
@@ -43,6 +47,7 @@ internal sealed class VirtualizedTranscriptView : View
         this.theme = theme ?? TuiTheme.WarmEmber;
         this.index = new TranscriptLayoutIndex(formatter ?? TranscriptBlockFormatter.Format);
         this.CanFocus = true;
+        this.MousePositionTracking = true;
     }
 
     /// <summary>Whether the viewport is pinned to the newest output.</summary>
@@ -184,6 +189,54 @@ internal sealed class VirtualizedTranscriptView : View
     internal IReadOnlyList<TranscriptRow> CollectVisibleRows() =>
         this.index.GetVisibleRows(this.viewport.TopRow, this.viewport.ViewportHeight, Overscan);
 
+    /// <summary>Whether an active text selection currently spans at least one cell.</summary>
+    internal bool HasSelection => this.selection.HasSelection;
+
+    /// <summary>Number of selected row segments painted with the selection highlight; exposed for tests only.</summary>
+    internal int SelectionDrawCount { get; private set; }
+
+    /// <summary>Anchors a new selection at <paramref name="position"/> and begins tracking a drag.</summary>
+    internal void BeginSelection(TranscriptCellPosition position)
+    {
+        this.selection.Begin(position);
+        this.pressPosition = position;
+        this.dragging = true;
+    }
+
+    /// <summary>Extends the active selection to <paramref name="position"/> and requests a redraw.</summary>
+    internal void UpdateSelection(TranscriptCellPosition position)
+    {
+        this.selection.Update(position);
+        this.SetNeedsDraw();
+    }
+
+    /// <summary>Clears any active selection and ends drag tracking.</summary>
+    internal void ClearSelection()
+    {
+        this.selection.Clear();
+        this.dragging = false;
+        this.SetNeedsDraw();
+    }
+
+    /// <summary>
+    /// The plain text of the current selection across arbitrary global rows (row breaks preserved), or an
+    /// empty string when nothing is selected. Materializes the selected range from the layout index even when
+    /// it extends beyond the current viewport, since a copy needs the whole span.
+    /// </summary>
+    internal string GetSelectedText()
+    {
+        if (!this.selection.HasSelection)
+        {
+            return string.Empty;
+        }
+
+        var ordered = this.selection.Ordered();
+        var rows = this.index.GetRows(
+            ordered.Start.GlobalRow,
+            ordered.End.GlobalRow - ordered.Start.GlobalRow + 1);
+        return this.selection.CopyText(rows);
+    }
+
     /// <inheritdoc />
     protected override bool OnDrawingContent(DrawContext? context)
     {
@@ -203,12 +256,60 @@ internal sealed class VirtualizedTranscriptView : View
                 continue;
             }
 
-            this.SetAttribute(this.AttributeFor(row.Role));
-            this.Move(0, screenRow);
-            this.AddStr(row.Text);
+            this.DrawRow(row, screenRow);
         }
 
         return true;
+    }
+
+    /// <summary>
+    /// Paints one row at <paramref name="screenRow"/>. Rows with no selection intersection draw once in their
+    /// role color; where the selection covers part (or all) of the row, the row is drawn in three cell-sliced
+    /// segments — role-colored prefix, Warm Ember selection-highlighted middle, role-colored suffix — so the
+    /// highlight is segmented exactly over the selected cells and survives redraw/scroll.
+    /// </summary>
+    private void DrawRow(TranscriptRow row, int screenRow)
+    {
+        var rowWidth = TerminalCellText.Width(row.Text);
+        var range = this.selection.RangeForRow(row.GlobalRow, rowWidth);
+        if (range is null)
+        {
+            this.SetAttribute(this.AttributeFor(row.Role));
+            this.Move(0, screenRow);
+            this.AddStr(row.Text);
+            return;
+        }
+
+        var useTrueColor = TuiTheme.SupportsTrueColor(this.app.Driver);
+        var selectedAttribute = new TgAttribute(
+            TuiTheme.Resolve(this.theme.SelectionText, useTrueColor),
+            TuiTheme.Resolve(this.theme.SelectionBackground, useTrueColor));
+        var prefix = TerminalCellText.SliceByCells(row.Text, 0, range.Value.StartCell);
+        var selected = TerminalCellText.SliceByCells(
+            row.Text,
+            range.Value.StartCell,
+            range.Value.EndCellExclusive);
+        var suffix = TerminalCellText.SliceByCells(
+            row.Text,
+            range.Value.EndCellExclusive,
+            rowWidth);
+
+        this.SetAttribute(this.AttributeFor(row.Role));
+        this.Move(0, screenRow);
+        this.AddStr(prefix);
+        var column = TerminalCellText.Width(prefix);
+        if (selected.Length > 0)
+        {
+            this.SetAttribute(selectedAttribute);
+            this.Move(column, screenRow);
+            this.AddStr(selected);
+            column += TerminalCellText.Width(selected);
+            this.SelectionDrawCount++;
+        }
+
+        this.SetAttribute(this.AttributeFor(row.Role));
+        this.Move(column, screenRow);
+        this.AddStr(suffix);
     }
 
     /// <inheritdoc />
@@ -218,7 +319,8 @@ internal sealed class VirtualizedTranscriptView : View
     internal bool ProcessMouse(Mouse mouse)
     {
         ArgumentNullException.ThrowIfNull(mouse);
-        if (this.app.Mouse?.IsMouseDisabled == true)
+        if (this.app.Mouse?.IsMouseDisabled == true ||
+            mouse.Flags.HasFlag(MouseFlags.Shift))
         {
             return false;
         }
@@ -235,20 +337,67 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        if (mouse.Flags.HasFlag(MouseFlags.LeftButtonClicked))
+        if (mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
         {
-            var localY = mouse.Position?.Y ?? 0;
-            var globalRow = this.viewport.TopRow + localY;
-            if (this.index.BlockIdAt(globalRow) is { } id)
+            var position = this.ToTranscriptPosition(mouse);
+            this.BeginSelection(position);
+            this.app.Mouse.GrabMouse(this);
+            return true;
+        }
+
+        if (this.dragging &&
+            (mouse.Flags.HasFlag(MouseFlags.PositionReport) ||
+             mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed)))
+        {
+            var position = this.ToTranscriptPosition(mouse);
+            if (position != this.pressPosition)
             {
-                this.selectedBlockId = id;
-                this.ToggleExpansion(id);
+                this.UpdateSelection(position);
+            }
+
+            return true;
+        }
+
+        if (this.dragging && mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
+        {
+            var position = this.ToTranscriptPosition(mouse);
+            this.app.Mouse.UngrabMouse();
+            this.dragging = false;
+            if (!this.selection.HasSelection)
+            {
+                this.ToggleExpansionAt(position.GlobalRow);
             }
 
             return true;
         }
 
         return false;
+    }
+
+    /// <summary>
+    /// Maps a mouse event to a transcript cell position: the local Y offset is translated through the current
+    /// <see cref="TranscriptViewportState.TopRow"/> and clamped to a real global row, and X is clamped to a
+    /// non-negative cell column.
+    /// </summary>
+    private TranscriptCellPosition ToTranscriptPosition(Mouse mouse)
+    {
+        var local = mouse.Position ?? System.Drawing.Point.Empty;
+        var globalRow = Math.Clamp(
+            this.viewport.TopRow + Math.Max(0, local.Y),
+            0,
+            Math.Max(0, this.index.TotalRows - 1));
+        return new TranscriptCellPosition(globalRow, Math.Max(0, local.X));
+    }
+
+    private void ToggleExpansionAt(int globalRow)
+    {
+        if (this.index.BlockIdAt(globalRow) is not { } id)
+        {
+            return;
+        }
+
+        this.selectedBlockId = id;
+        this.ToggleExpansion(id);
     }
 
     /// <inheritdoc />

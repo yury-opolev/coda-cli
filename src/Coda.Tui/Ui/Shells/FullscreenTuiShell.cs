@@ -69,6 +69,9 @@ internal class FullscreenTuiShell(
     /// <summary>The virtualized transcript surface filling the space between header and composer.</summary>
     internal VirtualizedTranscriptView Transcript => this.transcript;
 
+    /// <inheritdoc />
+    protected override VirtualizedTranscriptView TranscriptView => this.transcript;
+
     /// <summary>The current measured composer height in rows; exposed for tests only.</summary>
     internal int ComposerHeight => this.composerHeight;
 
