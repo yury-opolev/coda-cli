@@ -6,6 +6,7 @@
 
 using System.Text;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Rendering;
 
 namespace Coda.Tui.Ui.Input;
 
@@ -21,9 +22,20 @@ internal sealed class ComposerView : TextView
 {
     private readonly ComposerController controller;
     private bool syncingText;
+    private bool syncingNativeInput;
+    private bool caretPlaced;
+    private System.Drawing.Point lastUnwrappedPosition;
     private bool inputEnabled = true;
     private IReadOnlyList<ISlashCommand> lastSuggestions = [];
     private int lastSelectedIndex = -1;
+
+    /// <summary>
+    /// Number of times the whole <see cref="TextView.Text"/> was reassigned. Only programmatic draft
+    /// replacement (initial sync, SetDraft, Restore, history/completion swaps) should bump this; native
+    /// printable/delete/paste edits mutate the model incrementally and must never replace the whole text.
+    /// Exposed for tests only.
+    /// </summary>
+    internal int FullTextReplacementCount { get; private set; }
 
     public ComposerView(ComposerController controller)
     {
@@ -40,6 +52,7 @@ internal sealed class ComposerView : TextView
         this.Autocomplete.SuggestionGenerator = new NoSuggestionGenerator();
 
         this.ContentsChanged += this.OnContentsChangedSync;
+        this.UnwrappedCursorPositionChanged += this.OnUnwrappedCursorPositionChanged;
         this.SyncTextView();
         this.SnapshotCompletion();
     }
@@ -113,10 +126,9 @@ internal sealed class ComposerView : TextView
             return;
         }
 
-        this.controller.InsertText(text);
-        this.SyncTextView();
+        this.InsertEdit(text);
         this.RaiseCompletionIfChanged();
-        this.LayoutInvalidated?.Invoke(this, EventArgs.Empty);
+        this.RaiseLayoutInvalidated();
     }
 
     public void SetDraft(string text, int cursorIndex)
@@ -140,7 +152,6 @@ internal sealed class ComposerView : TextView
         }
 
         this.controller.Apply(UiAction.DismissCompletion);
-        this.SyncTextView();
         this.RaiseCompletionIfChanged();
         return true;
     }
@@ -171,9 +182,10 @@ internal sealed class ComposerView : TextView
     }
 
     /// <summary>
-    /// Re-measures the draft, scrolls the internal viewport so the caret's visual row stays within the
-    /// visible <paramref name="height"/> rows, records the resulting scroll row on the controller, and
-    /// mirrors the caret to its wrapped visual position.
+    /// Re-measures the draft and scrolls the internal viewport so the caret's visual row stays within the
+    /// visible <paramref name="height"/> rows, recording the resulting scroll row on the controller. It
+    /// never reassigns <see cref="TextView.InsertionPoint"/>: the native editor owns the caret, so a shell
+    /// layout pass or a native edit must not stomp it with a Coda-computed wrapped position.
     /// </summary>
     internal void ApplyViewport(int width, int height)
     {
@@ -193,8 +205,6 @@ internal sealed class ComposerView : TextView
         top = Math.Clamp(top, 0, Math.Max(0, layout.VisualLineCount - visibleRows));
         this.controller.UpdateViewport(top);
         this.ScrollTo(new System.Drawing.Point(0, top));
-        var position = layout.PositionForIndex(this.controller.State.CursorIndex);
-        this.InsertionPoint = new System.Drawing.Point(position.Column, position.Row);
     }
 
     /// <summary>
@@ -202,6 +212,21 @@ internal sealed class ComposerView : TextView
     /// Public so tests can exercise paste handling without a live console driver.
     /// </summary>
     public bool NewPasteEvent(string text) => this.OnPaste(text ?? string.Empty);
+
+    /// <inheritdoc />
+    protected override void OnSubViewsLaidOut(LayoutEventArgs args)
+    {
+        base.OnSubViewsLaidOut(args);
+
+        // The constructor's caret placement is a no-op on an unlaid-out view (the base editor reports its
+        // insertion point as the origin), so place the caret from the controller once the editor is first
+        // laid out. Later layout passes must not re-place it — the native editor owns the caret after edits.
+        if (!this.caretPlaced && this.IsInitialized)
+        {
+            this.caretPlaced = true;
+            this.SyncTextView();
+        }
+    }
 
     protected override bool OnKeyDown(Key key)
     {
@@ -224,6 +249,10 @@ internal sealed class ComposerView : TextView
 
     private bool HandleKeyDown(Key key)
     {
+        // A previous key's base binding may have edited the model outside our handlers; reconcile before
+        // mapping this key so it acts on the editor's true draft and caret.
+        this.ReconcileFromEditorIfContentDrifted();
+
         var layout = this.MeasureLayout(Math.Max(1, this.Viewport.Width));
         var caret = layout.PositionForIndex(this.controller.State.CursorIndex);
         var context = new UiInputContext(
@@ -244,26 +273,101 @@ internal sealed class ComposerView : TextView
             return this.MoveVisual(layout, action);
         }
 
+        // Native text edits (printable characters, backspace, delete): once the editor is laid out, apply
+        // them incrementally through the base TextView so the wrapped model is only nudged, never rebuilt
+        // from a whole-text assignment. The edit raises ContentsChanged (draft) and
+        // UnwrappedCursorPositionChanged (caret); mirroring the caret from the wrap-independent unwrapped
+        // position — rather than reconstructing it from wrapped coordinates through the Coda layout — is what
+        // keeps typing and deletion near a soft-wrap boundary from swapping word fragments or snapping the
+        // caret to row 0.
+        if (action == UiAction.None && this.IsInitialized && this.TryNativeEdit(key))
+        {
+            return true;
+        }
+
         if (action != UiAction.None)
         {
             return this.HandleAction(action);
         }
 
+        // A key with no mapped action and no native edit (an unbound key, or any edit before layout): let the
+        // base binding attempt it, then mirror the draft from the model.
+        return this.HandleUnmappedKey(key);
+    }
+
+    /// <summary>
+    /// Applies a native incremental edit for <paramref name="key"/> — printable insertion, backspace, or
+    /// delete — through the base <see cref="TextView"/>, with <see cref="syncingNativeInput"/> set so the
+    /// resulting ContentsChanged/UnwrappedCursorPositionChanged events mirror the edit into the controller.
+    /// Returns false when the key is not a native edit.
+    /// </summary>
+    private bool TryNativeEdit(Key key)
+    {
         if (TryGetPrintableText(key, out var text))
         {
-            this.SyncCursorFromView();
+            this.RunNativeEdit(() => this.InsertText(text));
+            this.RaiseLayoutInvalidated();
+            return true;
+        }
+
+        if (key == Key.Backspace)
+        {
+            this.RunNativeEdit(() => this.DeleteCharLeft());
+            this.RaiseLayoutInvalidated();
+            return true;
+        }
+
+        if (key == Key.Delete)
+        {
+            this.RunNativeEdit(() => this.DeleteCharRight());
+            this.RaiseLayoutInvalidated();
+            return true;
+        }
+
+        return false;
+    }
+
+    private bool HandleUnmappedKey(Key key)
+    {
+        if (!this.IsInitialized && TryGetPrintableText(key, out var text))
+        {
+            // Headless construction (before the shell begins): the base editing surface cannot track a caret,
+            // so drive the controller directly and mirror the text programmatically.
             this.controller.InsertText(text);
             this.SyncTextView();
             this.RaiseLayoutInvalidated();
             return true;
         }
 
-        // Ordinary editing keys (backspace, delete, arrows, home/end) are handled by the
-        // base TextView, then mirrored back into the controller.
+        // An unbound key: let the base binding attempt an edit, then mirror the draft from the model. The
+        // caret is corrected by the next native edit or programmatic sync.
         var handled = base.OnKeyDown(key);
-        this.SyncControllerFromTextView();
-        this.RaiseLayoutInvalidated();
+        if (!this.syncingText)
+        {
+            this.controller.SetDraftText(NormalizeNewlines(this.Text ?? string.Empty));
+            this.RaiseLayoutInvalidated();
+        }
+
         return handled;
+    }
+
+    /// <summary>
+    /// Runs a native edit with <see cref="syncingNativeInput"/> set so the base editor's ContentsChanged and
+    /// UnwrappedCursorPositionChanged events are honored as real user input (and not confused with the
+    /// spurious caret reports a layout pass emits).
+    /// </summary>
+    private void RunNativeEdit(Action edit)
+    {
+        var previous = this.syncingNativeInput;
+        this.syncingNativeInput = true;
+        try
+        {
+            edit();
+        }
+        finally
+        {
+            this.syncingNativeInput = previous;
+        }
     }
 
     protected override bool OnPaste(string text)
@@ -281,20 +385,55 @@ internal sealed class ComposerView : TextView
 
     private bool HandlePaste(string text)
     {
-        this.SyncCursorFromView();
+        var payload = NormalizeNewlines(text ?? string.Empty);
+
+        // Guard against a submission mid-paste; the driver delivers the payload as one OnPaste call, but a
+        // trailing Enter that arrives while PasteActive is text, never a submit.
         this.controller.BeginPaste();
         try
         {
-            this.controller.InsertText(NormalizeNewlines(text ?? string.Empty));
+            if (this.IsInitialized)
+            {
+                // Native incremental paste at the editor caret; ContentsChanged/UnwrappedCursorPositionChanged
+                // mirror the inserted text and caret into the controller.
+                this.RunNativeEdit(() => base.OnPaste(payload));
+            }
+            else
+            {
+                this.controller.InsertText(payload);
+                this.SyncTextView();
+            }
         }
         finally
         {
             this.controller.EndPaste();
         }
 
-        this.SyncTextView();
         this.RaiseLayoutInvalidated();
         return true;
+    }
+
+    /// <summary>
+    /// Inserts <paramref name="text"/> at the caret. Once laid out this uses the base
+    /// <see cref="TextView.InsertText(string)"/> so the model mutates incrementally (and the sync events
+    /// mirror it); before layout it drives the controller and mirrors the text programmatically.
+    /// </summary>
+    private void InsertEdit(string text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return;
+        }
+
+        if (this.IsInitialized)
+        {
+            this.RunNativeEdit(() => this.InsertText(text));
+        }
+        else
+        {
+            this.controller.InsertText(text);
+            this.SyncTextView();
+        }
     }
 
     /// <summary>
@@ -330,17 +469,30 @@ internal sealed class ComposerView : TextView
                 return true;
 
             case UiAction.InsertNewline:
+                // A newline is a native incremental insert (via InsertText), not a whole-text replacement.
+                this.InsertEdit("\n");
+                this.RaiseLayoutInvalidated();
+                return true;
+
             case UiAction.CompleteSuggestion:
             case UiAction.HistoryPrevious:
             case UiAction.HistoryNext:
+                // Completion and history swap the whole draft, so replace the text and re-place the caret,
+                // then remeasure and re-scroll for the new content.
+                this.controller.Apply(action);
+                this.SyncTextView();
+                this.RaiseLayoutInvalidated();
+                return true;
+
             case UiAction.CursorLeft:
             case UiAction.CursorRight:
             case UiAction.WordLeft:
             case UiAction.WordRight:
             case UiAction.LineStart:
             case UiAction.LineEnd:
-                // Content edits, completion, history, and caret movement can all change the measured height
-                // or push the caret out of view, so remeasure and re-scroll.
+                // Horizontal caret movement is Coda-driven so the caret source of truth moves immediately and
+                // a subsequent insert/paste lands at the moved position. The caret is re-placed once (via
+                // SyncTextView); native layout passes never reassign it.
                 this.controller.Apply(action);
                 this.SyncTextView();
                 this.RaiseLayoutInvalidated();
@@ -350,9 +502,8 @@ internal sealed class ComposerView : TextView
             case UiAction.CompletionNext:
             case UiAction.DismissCompletion:
                 // Completion selection/visibility changes neither the draft nor the caret, so they never
-                // resize or rescroll the composer.
+                // resize/rescroll the composer and must not reassign the native caret.
                 this.controller.Apply(action);
-                this.SyncTextView();
                 return true;
 
             default:
@@ -364,15 +515,63 @@ internal sealed class ComposerView : TextView
 
     private void OnContentsChangedSync(object? sender, ContentsChangedEventArgs e)
     {
-        // The base editor applies edits (backspace, delete, cut) through this event, often a beat after the
-        // key is handled. Mirror the draft back and remeasure so the composer resizes/rescrolls for the
-        // post-edit content; skip while we are the ones pushing text in (SyncTextView guards that).
+        // A native edit (base key binding, InsertText, or paste) mutated the wrapped model. Mirror the draft
+        // text — the caret is mirrored separately by the unwrapped cursor event — and remeasure so the
+        // composer resizes/rescrolls. Skip while we are the ones pushing text in (SyncTextView guards that).
         if (this.syncingText)
         {
             return;
         }
 
-        this.SyncControllerFromTextView();
+        this.controller.SetDraftText(NormalizeNewlines(this.Text ?? string.Empty));
+        this.RaiseCompletionIfChanged();
+        this.RaiseLayoutInvalidated();
+    }
+
+    private void OnUnwrappedCursorPositionChanged(object? sender, System.Drawing.Point unwrapped)
+    {
+        // Remember the editor's latest caret so a subsequent key can reconcile the controller after a base
+        // binding edited the model outside our own handlers (see ReconcileFromEditorIfContentDrifted).
+        this.lastUnwrappedPosition = unwrapped;
+
+        // A native edit updated the editor caret. Mirror it to the controller using the wrap-independent
+        // unwrapped position (logical row + grapheme column) so soft-wrap divergence can never swap word
+        // fragments or snap the caret to the first line. Honour it only during an actual native edit: while
+        // we drive the caret programmatically (SyncTextView) or a layout pass emits a spurious caret report,
+        // the controller stays authoritative.
+        if (this.syncingText || !this.syncingNativeInput)
+        {
+            return;
+        }
+
+        var index = SourceIndexFromUnwrappedPosition(this.controller.State.Draft, unwrapped);
+        this.controller.MoveCursorTo(index);
+        this.RaiseCompletionIfChanged();
+    }
+
+    /// <summary>
+    /// Reconciles the controller when a previous key's base <see cref="TextView"/> binding (e.g.
+    /// delete-word-left) changed the model outside the composer's own edit handlers. Such bindings run in the
+    /// command pipeline after <see cref="OnKeyDown"/> returns, and some mutate the text without raising
+    /// ContentsChanged, so the controller draft can drift. Runs only on real key input (never during a layout
+    /// pass), mirrors the current text, and maps the caret from the editor's last reported unwrapped position
+    /// — so a following Coda-driven caret move can never restore text the editor already deleted.
+    /// </summary>
+    private void ReconcileFromEditorIfContentDrifted()
+    {
+        if (!this.IsInitialized || this.syncingText)
+        {
+            return;
+        }
+
+        var draft = NormalizeNewlines(this.Text ?? string.Empty);
+        if (string.Equals(draft, this.controller.State.Draft, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        this.controller.SetDraftText(draft);
+        this.controller.MoveCursorTo(SourceIndexFromUnwrappedPosition(draft, this.lastUnwrappedPosition));
         this.RaiseLayoutInvalidated();
     }
 
@@ -419,22 +618,12 @@ internal sealed class ComposerView : TextView
     }
 
     /// <summary>
-    /// Defense in depth for caret paths the controller did not directly drive (for
-    /// example a future mouse click): reconcile the controller from the visible caret
-    /// before inserting. It is a no-op until the view is laid out, because an unlaid-out
-    /// <see cref="TextView"/> reports its insertion point as the origin regardless of the
-    /// controller's authoritative caret.
+    /// Mirrors the controller's draft and caret into the base editor for a programmatic change (initial
+    /// sync, SetDraft, Restore, submit/newline, history, completion, visual movement). The whole
+    /// <see cref="TextView.Text"/> is reassigned only when it actually differs (counted for tests), and the
+    /// caret is placed once from the Coda layout. Native edit/layout passes never call this — they let the
+    /// base editor own the caret.
     /// </summary>
-    private void SyncCursorFromView()
-    {
-        if (this.syncingText || !this.IsInitialized)
-        {
-            return;
-        }
-
-        this.SyncControllerFromTextView();
-    }
-
     private void SyncTextView()
     {
         var state = this.controller.State;
@@ -445,6 +634,7 @@ internal sealed class ComposerView : TextView
             if (!string.Equals(this.Text, text, StringComparison.Ordinal))
             {
                 this.Text = text;
+                this.FullTextReplacementCount++;
             }
 
             var layout = ComposerVisualLayout.Create(state.Draft, this.LayoutWidth());
@@ -455,20 +645,6 @@ internal sealed class ComposerView : TextView
         {
             this.syncingText = false;
         }
-    }
-
-    private void SyncControllerFromTextView()
-    {
-        if (this.syncingText)
-        {
-            return;
-        }
-
-        var draft = NormalizeNewlines(this.Text ?? string.Empty);
-        var point = this.InsertionPoint;
-        var layout = ComposerVisualLayout.Create(draft, this.LayoutWidth());
-        var cursor = layout.IndexForPosition(point.Y, point.X);
-        this.controller.ReplaceDraft(draft, cursor);
     }
 
     /// <summary>
@@ -508,6 +684,56 @@ internal sealed class ComposerView : TextView
 
     private static string NormalizeNewlines(string value) =>
         value.Replace("\r\n", "\n").Replace("\r", "\n");
+
+    /// <summary>
+    /// Maps a Terminal.Gui unwrapped cursor position — a logical newline row and a grapheme column that is
+    /// independent of soft word-wrap — onto a UTF-16 index into <paramref name="text"/>. Combining marks
+    /// and multi-code-unit emoji count as a single column, matching the editor's unwrapped model. Clamped
+    /// to valid bounds.
+    /// </summary>
+    internal static int SourceIndexFromUnwrappedPosition(string text, System.Drawing.Point unwrapped)
+    {
+        text ??= string.Empty;
+        var targetRow = Math.Max(0, unwrapped.Y);
+        var targetColumn = Math.Max(0, unwrapped.X);
+
+        // Advance to the start of the requested logical (newline-delimited) row; a row past the last line
+        // clamps to the end of the text.
+        var lineStart = 0;
+        for (var row = 0; row < targetRow; row++)
+        {
+            var newline = text.IndexOf('\n', lineStart);
+            if (newline < 0)
+            {
+                return text.Length;
+            }
+
+            lineStart = newline + 1;
+        }
+
+        var lineEnd = text.IndexOf('\n', lineStart);
+        if (lineEnd < 0)
+        {
+            lineEnd = text.Length;
+        }
+
+        // Walk targetColumn grapheme clusters into the line; a column past the last grapheme clamps to the
+        // line end.
+        var offset = 0;
+        var consumed = 0;
+        foreach (var element in TerminalCellText.Enumerate(text[lineStart..lineEnd]))
+        {
+            if (consumed >= targetColumn)
+            {
+                break;
+            }
+
+            offset += element.Utf16Length;
+            consumed++;
+        }
+
+        return Math.Clamp(lineStart + offset, 0, text.Length);
+    }
 
     /// <summary>
     /// A suggestion generator that never offers suggestions, used to keep the base <see cref="TextView"/>

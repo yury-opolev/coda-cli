@@ -40,6 +40,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<string, bool> clipboardWriter;
     private object? chordTimeout;
     private object? transientOperationalTimeout;
+    private object? composerLayoutTimeout;
     private OperationalStatus? transientOperationalOverride;
 
     private string? statusText;
@@ -339,6 +340,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             // so no status timer survives the shell.
             this.ResetChordOverride();
             this.ClearTransientOperationalOverride();
+            this.CancelScheduledComposerLayoutRecalc();
             this.Composer.ShellKeyHandler = null;
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
@@ -665,7 +667,41 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     private void OnComposerLayoutInvalidatedHandler(object? sender, EventArgs e) =>
-        this.OnComposerLayoutInvalidated();
+        this.ScheduleComposerLayoutRecalc();
+
+    /// <summary>
+    /// Coalesces composer layout invalidations: many content/caret/completion signals in a single UI
+    /// iteration schedule at most one zero-delay recalc, so a keystroke never triggers several synchronous
+    /// re-layouts. The scheduled callback runs once, clears the token, and re-arms only on the next signal.
+    /// </summary>
+    private void ScheduleComposerLayoutRecalc()
+    {
+        if (this.disposed || this.composerLayoutTimeout is not null)
+        {
+            return;
+        }
+
+        this.composerLayoutTimeout = this.addTimeout(TimeSpan.Zero, () =>
+        {
+            this.composerLayoutTimeout = null;
+            if (!this.disposed)
+            {
+                this.OnComposerLayoutInvalidated();
+            }
+
+            return false;
+        });
+    }
+
+    /// <summary>Removes any pending coalesced composer recalc so no timer survives the shell.</summary>
+    private void CancelScheduledComposerLayoutRecalc()
+    {
+        if (this.composerLayoutTimeout is { } timeout)
+        {
+            this.removeTimeout(timeout);
+            this.composerLayoutTimeout = null;
+        }
+    }
 
     private void Apply(UiSessionSnapshot snapshot)
     {

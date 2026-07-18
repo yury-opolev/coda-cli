@@ -278,6 +278,53 @@ public sealed class CommandCompletionShellTests
     }
 
     [Fact]
+    public void Composer_layout_invalidations_coalesce_into_a_single_scheduled_recalc()
+    {
+        var scheduled = new List<Func<bool>>();
+        Func<TimeSpan, Func<bool>, object> add = (delay, callback) =>
+        {
+            // The composer coalescer schedules with a zero delay; the spinner uses a longer interval, so
+            // filtering on the zero delay isolates the composer's own recalc scheduling.
+            if (delay == TimeSpan.Zero)
+            {
+                scheduled.Add(callback);
+            }
+
+            return new object();
+        };
+        Func<object, bool> remove = _ => true;
+
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            commands: Commands(),
+            addTimeout: add,
+            removeTimeout: remove);
+        var shell = fixture.Shell;
+
+        // Drain whatever the initial layout scheduled so the assertions start from a clean slate.
+        foreach (var callback in scheduled.ToArray())
+        {
+            callback();
+        }
+
+        scheduled.Clear();
+        var before = shell.ComposerLayoutUpdateCount;
+
+        // Several content/caret signals within one UI iteration.
+        shell.Composer.SetDraft("hi", 2);
+        shell.Composer.NewKeyDownEvent(new Key('x'));
+        shell.Composer.NewKeyDownEvent(new Key('y'));
+
+        // They coalesce into exactly one scheduled recalc that has not run yet.
+        Assert.Single(scheduled);
+        Assert.Equal(before, shell.ComposerLayoutUpdateCount);
+
+        // Driving the single callback applies exactly one recalc and does not ask to repeat.
+        Assert.False(scheduled[0]());
+        Assert.Equal(before + 1, shell.ComposerLayoutUpdateCount);
+    }
+
+    [Fact]
     public async Task Completion_operational_composer_metadata_and_prompt_keep_final_z_order()
     {
         using IApplication app = Application.Create();
