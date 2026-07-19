@@ -30,6 +30,7 @@ internal sealed class RetainedShellFixture : IDisposable
         IEnumerable<ISlashCommand>? commands = null,
         TimeProvider? timeProvider = null,
         Func<string, bool>? clipboardWriter = null,
+        Func<ClipboardReadResult>? clipboardReader = null,
         Func<TimeSpan, Func<bool>, object>? addTimeout = null,
         Func<object, bool>? removeTimeout = null,
         Func<bool>? hasActiveWork = null)
@@ -49,6 +50,7 @@ internal sealed class RetainedShellFixture : IDisposable
             hasActiveWork: hasActiveWork ?? (() => activeWork),
             timeProvider: timeProvider,
             clipboardWriter: clipboardWriter,
+            clipboardReader: clipboardReader,
             addTimeout: addTimeout,
             removeTimeout: removeTimeout);
         var token = app.Begin(shell);

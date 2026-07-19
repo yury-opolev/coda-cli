@@ -38,6 +38,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<TimeSpan, Func<bool>, object> addTimeout;
     private readonly Func<object, bool> removeTimeout;
     private readonly Func<string, bool> clipboardWriter;
+    private readonly Func<ClipboardReadResult> clipboardReader;
     private object? chordTimeout;
     private object? transientOperationalTimeout;
     private object? composerLayoutTimeout;
@@ -64,6 +65,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<bool>? hasActiveWork = null,
         TimeProvider? timeProvider = null,
         Func<string, bool>? clipboardWriter = null,
+        Func<ClipboardReadResult>? clipboardReader = null,
         Func<TimeSpan, Func<bool>, object>? addTimeout = null,
         Func<object, bool>? removeTimeout = null,
         TuiTheme? theme = null,
@@ -78,6 +80,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.TimeSource = timeProvider ?? TimeProvider.System;
         this.clipboardWriter = clipboardWriter ??
             (text => this.app.Clipboard?.TrySetClipboardData(text) == true);
+        this.clipboardReader = clipboardReader ?? this.ReadApplicationClipboard;
         this.Theme = theme ?? TuiTheme.WarmEmber;
 
         // The chord clock and the timeout seams drive the deterministic Esc/Ctrl+C chords: the same
@@ -509,37 +512,97 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
-    /// Routes the composer's semantic pointer gestures. A left/right <see cref="ComposerPointerActionKind.CopySelection"/>
-    /// copies the reported selection through the same shell path as Ctrl+C; paste and context-menu gestures
-    /// arrive in a later task. The copy is ignored while a modal prompt is up or the composer is startup-disabled
-    /// so a pointer can never copy behind an overlay or before the editor is live.
+    /// The default <c>clipboardReader</c> seam: reads the running application's clipboard once. A missing
+    /// clipboard backend or a driver that refuses the read is reported as <see cref="ClipboardReadResult.Available"/>
+    /// false (never an exception), so a pointer paste surfaces a deterministic "Clipboard unavailable" warning.
+    /// A successful read returns the retrieved text, which may legitimately be empty.
     /// </summary>
-    private void OnComposerPointerActionRequested(object? sender, ComposerPointerActionRequestedEventArgs e)
-    {
-        switch (e.Kind)
-        {
-            case ComposerPointerActionKind.CopySelection:
-                this.HandleComposerCopyRequested(e.SelectedText);
-                break;
-        }
-    }
+    private ClipboardReadResult ReadApplicationClipboard() =>
+        this.app.Clipboard?.TryGetClipboardData(out var text) == true
+            ? new ClipboardReadResult(true, text)
+            : new ClipboardReadResult(false, string.Empty);
 
     /// <summary>
-    /// Handles a pointer-driven composer copy by routing the reported selection through the shared composer
-    /// copy path, unless a modal prompt is visible or the composer is disabled / not accepting input.
+    /// Routes the composer's semantic pointer gestures through a single guard: while a modal prompt is up,
+    /// the composer is startup-disabled, or it is not accepting input, every pointer action is ignored so a
+    /// pointer can never copy, paste, or open a menu behind an overlay or before the editor is live. A
+    /// <see cref="ComposerPointerActionKind.CopySelection"/> copies the reported selection through the same
+    /// shell path as Ctrl+C; <see cref="ComposerPointerActionKind.PasteClipboard"/> pastes the clipboard at
+    /// the caret the composer already positioned; <see cref="ComposerPointerActionKind.ShowContextMenu"/>
+    /// makes the composer's context menu visible at the pointer.
     /// </summary>
-    private void HandleComposerCopyRequested(string? selectedText)
+    private void OnComposerPointerActionRequested(object? sender, ComposerPointerActionRequestedEventArgs e)
     {
         if (this.PromptOverlay.Visible || this.composerDisabled || !this.Composer.InputEnabled)
         {
             return;
         }
 
-        this.CopyComposerSelection(selectedText ?? string.Empty);
+        switch (e.Kind)
+        {
+            case ComposerPointerActionKind.CopySelection:
+                this.CopyComposerSelection(e.SelectedText ?? string.Empty);
+                break;
+            case ComposerPointerActionKind.PasteClipboard:
+                this.PasteComposerClipboard();
+                break;
+            case ComposerPointerActionKind.ShowContextMenu:
+                this.ShowComposerContextMenu(e.ScreenPosition);
+                break;
+        }
     }
 
     /// <summary>
-    /// Copies the active composer selection to the clipboard. A zero-symbol (newline-only) selection is
+    /// Pastes the clipboard into the composer at the caret the pointer gesture already positioned. The
+    /// clipboard is read exactly once through the <c>clipboardReader</c> seam: an unavailable read leaves the
+    /// draft and caret untouched and pins a transient "Clipboard unavailable" Warning; an available but empty
+    /// read likewise makes no mutation and pins "Clipboard is empty"; a non-empty read is injected as a native
+    /// bracketed paste (incremental insertion at the caret — the draft text and caret are never assigned
+    /// directly) and a transient "{N} symbol(s) pasted from clipboard" Ready status is pinned for 1.5 seconds.
+    /// </summary>
+    private void PasteComposerClipboard()
+    {
+        var result = this.clipboardReader();
+        if (!result.Available)
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        if (string.IsNullOrEmpty(result.Text))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Clipboard is empty", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        this.Composer.NewPasteEvent(result.Text);
+        this.ShowTransientOperationalStatus(
+            new OperationalStatus(ClipboardStatusText.Pasted(result.Text), OperationalTone.Ready, false),
+            TimeSpan.FromSeconds(1.5));
+    }
+
+    /// <summary>
+    /// Makes the composer's existing context menu visible at the pointer's screen position. When the composer
+    /// exposes no context menu the gesture is reported with a transient "Context menu unavailable" Warning
+    /// rather than silently doing nothing.
+    /// </summary>
+    private void ShowComposerContextMenu(System.Drawing.Point screenPosition)
+    {
+        var menu = this.Composer.ContextMenu;
+        if (menu is null)
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Context menu unavailable", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        menu.MakeVisible(screenPosition);
+    }
     /// cleared with a deterministic "0 symbols copied to clipboard" confirmation without touching the clipboard
     /// writer. Otherwise, on a successful write the selection highlight is cleared and a transient
     /// "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds; when the clipboard is unavailable

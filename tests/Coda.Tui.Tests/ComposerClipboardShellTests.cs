@@ -251,6 +251,244 @@ public sealed class ComposerClipboardShellTests
         Assert.Empty(fixture.Actions);
     }
 
+    /// <summary>
+    /// A draft long enough to soft-wrap onto a second visual row in the fixture's 80-column composer, so a
+    /// right click on row 1 lands the caret at a non-zero source index that a paste must respect.
+    /// </summary>
+    private const string WrappingDraft =
+        "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu nu xi omicron pi rho sigma tau";
+
+    /// <summary>
+    /// Right-clicks the composer at (<paramref name="column"/>, <paramref name="row"/>) to position the caret
+    /// natively, then completes the gesture (release + click) to raise exactly one paste. Returns the source
+    /// caret index the press positioned, captured before the terminal click so callers can assert the paste
+    /// landed there.
+    /// </summary>
+    private static int RightClickPaste(RetainedShellFixture fixture, int column, int row)
+    {
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonPressed,
+            Position = new Point(column, row),
+        });
+        var caret = fixture.Shell.Composer.GetState().CursorIndex;
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonReleased,
+            Position = new Point(column, row),
+        });
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonClicked,
+            Position = new Point(column, row),
+        });
+        return caret;
+    }
+
+    [Fact]
+    public void Right_click_without_selection_reads_clipboard_and_pastes_once_at_the_caret()
+    {
+        var readCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardReader: () =>
+            {
+                readCalls++;
+                return new ClipboardReadResult(true, "XY");
+            });
+        fixture.Shell.Composer.SetDraft(WrappingDraft, 0);
+
+        var caret = RightClickPaste(fixture, column: 2, row: 1);
+
+        // The right press positioned the caret onto a wrapped (non-first) visual row before the paste ran.
+        Assert.True(caret > 0, "right click must position the caret at a non-zero source index on a wrapped row");
+        Assert.Equal(1, readCalls);
+        Assert.Equal(WrappingDraft.Insert(caret, "XY"), fixture.Shell.Composer.GetDraft());
+        Assert.Equal(caret + 2, fixture.Shell.Composer.GetState().CursorIndex);
+        Assert.Equal("2 symbols pasted from clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(OperationalTone.Ready, fixture.Shell.Operational.Status.Tone);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Right_click_paste_with_unavailable_reader_reports_unavailable_and_leaves_draft_untouched()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardReader: () => new ClipboardReadResult(false, string.Empty),
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+        fixture.Shell.Composer.SetDraft(WrappingDraft, 0);
+
+        var caret = RightClickPaste(fixture, column: 2, row: 1);
+
+        Assert.True(caret > 0);
+        Assert.Equal(WrappingDraft, fixture.Shell.Composer.GetDraft());
+        Assert.Equal(caret, fixture.Shell.Composer.GetState().CursorIndex);
+        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(OperationalTone.Warning, fixture.Shell.Operational.Status.Tone);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Right_click_paste_with_empty_reader_reports_empty_and_leaves_draft_untouched()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardReader: () => new ClipboardReadResult(true, string.Empty),
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+        fixture.Shell.Composer.SetDraft(WrappingDraft, 0);
+
+        var caret = RightClickPaste(fixture, column: 2, row: 1);
+
+        Assert.True(caret > 0);
+        Assert.Equal(WrappingDraft, fixture.Shell.Composer.GetDraft());
+        Assert.Equal(caret, fixture.Shell.Composer.GetState().CursorIndex);
+        Assert.Equal("Clipboard is empty", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(OperationalTone.Warning, fixture.Shell.Operational.Status.Tone);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Right_click_with_selection_copies_via_writer_and_never_reads_the_clipboard()
+    {
+        string? copied = null;
+        var readCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            },
+            clipboardReader: () =>
+            {
+                readCalls++;
+                return new ClipboardReadResult(true, "XY");
+            });
+        SelectComposerText(fixture, "alpha beta", fromColumn: 0, toColumn: 5);
+        var draftBefore = fixture.Shell.Composer.GetDraft();
+
+        // A right press over a selection copies it and consumes the whole gesture; the reader is never touched.
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonPressed,
+            Position = new Point(2, 0),
+        });
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonReleased,
+            Position = new Point(2, 0),
+        });
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonClicked,
+            Position = new Point(2, 0),
+        });
+
+        Assert.Equal("alpha", copied);
+        Assert.Equal(0, readCalls);
+        Assert.Equal(draftBefore, fixture.Shell.Composer.GetDraft());
+        Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Middle_click_opens_the_composer_context_menu()
+    {
+        var readCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardReader: () =>
+            {
+                readCalls++;
+                return new ClipboardReadResult(true, "XY");
+            });
+        fixture.Shell.Composer.SetDraft("alpha beta", 0);
+
+        var screen = new Point(6, 0);
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.MiddleButtonClicked,
+            Position = new Point(6, 0),
+            ScreenPosition = screen,
+        });
+
+        Assert.NotNull(fixture.Shell.Composer.ContextMenu);
+        Assert.True(fixture.Shell.Composer.ContextMenu!.Visible);
+        Assert.Equal(0, readCalls);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public async Task Prompt_overlay_visible_ignores_pointer_paste_and_menu()
+    {
+        var readCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardReader: () =>
+            {
+                readCalls++;
+                return new ClipboardReadResult(true, "XY");
+            });
+        fixture.Shell.Composer.SetDraft(WrappingDraft, 0);
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { PendingPrompt = UiPromptRequest.Confirm("Allow?", false) },
+            CancellationToken.None);
+        Assert.True(fixture.Shell.PromptOverlay.Visible);
+
+        var draftBefore = fixture.Shell.Composer.GetDraft();
+        RightClickPaste(fixture, column: 2, row: 1);
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.MiddleButtonClicked,
+            Position = new Point(6, 0),
+            ScreenPosition = new Point(6, 0),
+        });
+
+        Assert.Equal(0, readCalls);
+        Assert.Equal(draftBefore, fixture.Shell.Composer.GetDraft());
+        Assert.True(fixture.Shell.Composer.ContextMenu is null || !fixture.Shell.Composer.ContextMenu.Visible);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public async Task Startup_disabled_composer_ignores_pointer_paste_and_menu()
+    {
+        var readCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardReader: () =>
+            {
+                readCalls++;
+                return new ClipboardReadResult(true, "XY");
+            });
+        fixture.Shell.Composer.SetDraft(WrappingDraft, 0);
+        var draftBefore = fixture.Shell.Composer.GetDraft();
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                ActiveOperation = new ActiveOperation("startup", "Starting…", null),
+            },
+            CancellationToken.None);
+
+        RightClickPaste(fixture, column: 2, row: 1);
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.MiddleButtonClicked,
+            Position = new Point(6, 0),
+            ScreenPosition = new Point(6, 0),
+        });
+
+        Assert.Equal(0, readCalls);
+        Assert.Equal(draftBefore, fixture.Shell.Composer.GetDraft());
+        Assert.True(fixture.Shell.Composer.ContextMenu is null || !fixture.Shell.Composer.ContextMenu.Visible);
+        Assert.Empty(fixture.Actions);
+    }
+
     [Fact]
     public void Copy_status_counts_graphemes_as_symbols()
     {
