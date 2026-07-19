@@ -15,6 +15,18 @@ namespace Coda.Tui.Commands;
 /// </summary>
 public sealed class ModelCommand : ISlashCommand
 {
+    private readonly Func<string, string, string> persistModel;
+
+    public ModelCommand()
+        : this(TryPersistModelForProvider)
+    {
+    }
+
+    internal ModelCommand(Func<string, string, string> persistModel)
+    {
+        this.persistModel = persistModel ?? throw new ArgumentNullException(nameof(persistModel));
+    }
+
     public string Name => "model";
 
     public IReadOnlyList<string> Aliases => [];
@@ -38,10 +50,7 @@ public sealed class ModelCommand : ISlashCommand
         {
             // Choosing a model persists it as the default FOR THE ACTIVE PROVIDER (last choice sticks),
             // so the model belongs to its provider and never leaks to another.
-            context.Session.Model = args[0];
-            var note = TryPersistModelForProvider(context.ActiveProvider.Id, args[0]);
-            context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(args[0])} {Theme.DimMarkup(note)}");
-            SessionMetadataEvents.Publish(context);
+            this.ApplyModel(context, args[0]);
             return CommandResult.Continue;
         }
 
@@ -68,15 +77,31 @@ public sealed class ModelCommand : ISlashCommand
                 return CommandResult.Continue; // dismissed — no model change persisted
             }
 
-            context.Session.Model = chosen;
-            var note = TryPersistModelForProvider(context.ActiveProvider.Id, chosen);
-            context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(chosen)} {Theme.DimMarkup(note)}");
-            SessionMetadataEvents.Publish(context);
+            this.ApplyModel(context, chosen);
             return CommandResult.Continue;
         }
 
         this.Render(context, result);
         return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// Apply <paramref name="model"/> as the active model for the session and persist it for the active
+    /// provider. Selecting the current model is a no-op: it neither persists nor publishes a metadata
+    /// change, and just reports that the model is already in use.
+    /// </summary>
+    private void ApplyModel(CommandContext context, string model)
+    {
+        if (string.Equals(context.Session.Model, model, StringComparison.OrdinalIgnoreCase))
+        {
+            context.Console.MarkupLine($"Already using {Theme.AccentMarkup(context.Session.Model)}.");
+            return;
+        }
+
+        context.Session.Model = model;
+        var note = this.persistModel(context.ActiveProvider.Id, model);
+        context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(model)} {Theme.DimMarkup(note)}");
+        SessionMetadataEvents.Publish(context);
     }
 
     /// <summary>
@@ -95,7 +120,12 @@ public sealed class ModelCommand : ISlashCommand
             return null;
         }
 
-        var options = models.Models.Select(model =>
+        // Build every option eagerly and mark the current one case-insensitively, so its canonical id can
+        // be used as the request default. PromptOverlay resolves DefaultValue ordinally, so passing the
+        // list's exact spelling (not the possibly differently-cased session string) makes the default land.
+        var options = new List<UiPromptOption>(models.Models.Count);
+        string? defaultValue = null;
+        foreach (var model in models.Models)
         {
             var detail = model.DisplayName ?? string.Empty;
             if (model.ContextLimit is int contextLimit)
@@ -104,11 +134,17 @@ public sealed class ModelCommand : ISlashCommand
                 detail = string.IsNullOrEmpty(detail) ? ctx : $"{detail} · {ctx}";
             }
 
-            return new UiPromptOption(model.Id, model.Id, string.IsNullOrEmpty(detail) ? null : detail);
-        });
+            var isCurrent = string.Equals(model.Id, context.Session.Model, StringComparison.OrdinalIgnoreCase);
+            if (isCurrent)
+            {
+                defaultValue = model.Id;
+            }
+
+            options.Add(new UiPromptOption(model.Id, model.Id, string.IsNullOrEmpty(detail) ? null : detail, isCurrent));
+        }
 
         var response = await context.Prompts.RequestAsync(
-            UiPromptRequest.Select("Choose a model", options),
+            UiPromptRequest.Select("Choose a model", options, defaultValue),
             cancellationToken).ConfigureAwait(false);
 
         if (response.Cancelled || response.SelectedIds.Length == 0)
