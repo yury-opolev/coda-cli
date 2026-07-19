@@ -310,6 +310,9 @@ public sealed class AgentRunner : IDisposable
         Model = context.Session.Model,
         WorkingDirectory = context.Session.WorkingDirectory,
         PermissionMode = context.Session.PermissionMode,
+        // Pass the session's stable, shared state so a mid-turn /yolo or /permissions change is
+        // observed by the running loop and its subagents' next permission decision.
+        PermissionModeState = context.Session.PermissionModes,
         // Re-read each turn so /mcp start|stop changes take effect from the next turn.
         ExtraTools = this.extraToolsProvider?.Invoke() ?? [],
         InteractivePrompt = new TuiPermissionPrompt(context.Prompts, context.Events),

@@ -182,7 +182,10 @@ public sealed class TurnPipelineBuilder
         }
         else
         {
-            permissions = new ModePermissionPrompt(options.PermissionMode, options.InteractivePrompt);
+            // Read the mode live from the shared session state when supplied, so a mid-run mode
+            // change is applied to the next decision; otherwise wrap a fixed state from the snapshot.
+            var state = options.PermissionModeState ?? new PermissionModeState(options.PermissionMode);
+            permissions = new ModePermissionPrompt(state, options.InteractivePrompt);
         }
 
         // Wrap the base permissions with the allow/deny rule lists when any rules exist.
