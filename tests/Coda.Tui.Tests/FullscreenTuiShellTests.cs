@@ -21,6 +21,11 @@ public sealed class FullscreenTuiShellTests
             .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {index}"))
             .ToImmutableArray();
 
+    private static ImmutableArray<TranscriptBlock> BlankLines(int count) =>
+        Enumerable.Range(0, count)
+            .Select(_ => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), string.Empty))
+            .ToImmutableArray();
+
     [Fact]
     public void Virtualized_view_formats_only_visible_rows()
     {
@@ -120,10 +125,12 @@ public sealed class FullscreenTuiShellTests
         // No rectangular border around the input.
         Assert.Null(shell.Composer.BorderStyle);
 
-        // The shell-owned chrome spans exactly the composer's rows, is non-focusable, and reads ready.
+        // The shell-owned chrome spans the composer's rows plus a half-block edge above and below, is
+        // non-focusable, and reads ready. The composer sits one row below the chrome's top edge.
         Assert.False(shell.Chrome.CanFocus);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y);
-        Assert.Equal(shell.Composer.Frame.Height, shell.Chrome.Frame.Height);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
+        Assert.Equal(shell.Composer.Frame.Height + 2, shell.Chrome.Frame.Height);
+        Assert.Equal(shell.Composer.Frame.Bottom, shell.Chrome.Frame.Bottom - 1);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
         Assert.True(shell.Chrome.Ready);
         Assert.Equal(ComposerChromeView.PromptGlyph, shell.Chrome.DisplayText);
@@ -576,6 +583,57 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
+    public async Task Submitting_while_scrolled_up_jumps_to_newest_before_forwarding()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var seed = Lines(50);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-20);
+        Assert.False(shell.Transcript.AutoFollow);
+        var scrolledTop = shell.Transcript.TopRow;
+
+        var followedWhenForwarded = false;
+        string? submitted = null;
+        shell.PromptSubmitted += (_, text) =>
+        {
+            followedWhenForwarded = shell.Transcript.AutoFollow;
+            submitted = text;
+        };
+
+        // Submitting a slash command (or any draft) while scrolled up jumps back to the newest row first.
+        shell.Composer.SetDraft("/context", 8);
+        shell.Composer.NewKeyDownEvent(Key.Enter);
+
+        Assert.Equal("/context", submitted);
+        Assert.True(followedWhenForwarded);
+        Assert.True(shell.Transcript.AutoFollow);
+        Assert.Equal(0, shell.Transcript.UnseenRows);
+        Assert.True(shell.Transcript.TopRow > scrolledTop);
+
+        // Output appended after the submit stays visible and unseen-free because the viewport is following.
+        var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "context output tail"));
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.AutoFollow);
+        Assert.Equal(0, shell.Transcript.UnseenRows);
+        var visible = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
+        Assert.Contains("context output tail", visible);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public async Task Prompt_overlay_is_inherited_from_the_shared_base()
     {
         using IApplication app = Application.Create();
@@ -739,7 +797,9 @@ public sealed class FullscreenTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Retained row order: header, transcript, operational row, composer, metadata (status).
+        // Retained row order: header, transcript, operational row, chrome (top edge + composer + bottom
+        // edge), metadata (status). The composer sits one row below the chrome's top edge, and the chrome
+        // is exactly two rows taller than the composer (its half-block edges).
         Assert.Equal(0, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
         Assert.Equal(3, shell.Composer.Frame.Height);
@@ -748,8 +808,10 @@ public sealed class FullscreenTuiShellTests
 
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
         Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
+        Assert.Equal(shell.Composer.Frame.Height + 2, shell.Chrome.Frame.Height);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
         Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
 
         if (token is not null)
@@ -937,6 +999,169 @@ public sealed class FullscreenTuiShellTests
         Assert.Equal(
             OperationalStatusProjector.Project(fixture.Shell.Snapshot),
             fixture.Shell.Operational.Status);
+    }
+
+    [Fact]
+    public void Ctrl_c_with_empty_selection_clears_and_reports_zero_without_touching_clipboard()
+    {
+        var clipboardCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ =>
+            {
+                clipboardCalls++;
+                return false;
+            },
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+
+        // Two blank transcript rows selected across yield a newline-only (zero-symbol) selection.
+        fixture.Shell.Transcript.ReplaceAll(BlankLines(2));
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 0));
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        // The empty selection is cleared with a deterministic "0 symbols" confirmation, never the misleading
+        // "Clipboard unavailable" warning, and the clipboard writer is never invoked.
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("0 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(0, clipboardCalls);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Left_click_with_selection_copies_clears_without_arming_or_new_drag()
+    {
+        string? copied = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            });
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+
+        // Drag-select the first row, then release so a selection is active and the drag has ended.
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        // A fresh unshifted left press copies the current selection instead of starting a new one.
+        var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        Assert.Equal("line ", copied);
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Left_click_with_unavailable_clipboard_preserves_selection()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => false,
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Copy_status_counts_graphemes_as_symbols_and_excludes_newlines()
+    {
+        string? copied = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: text =>
+            {
+                copied = text;
+                return true;
+            });
+
+        // First row: a + combining acute (one grapheme), b, 👍 (one grapheme) => 3 symbols. Second row:
+        // "cd" => 2 symbols. The joining newline is excluded, so the total is 5 symbols.
+        fixture.Shell.Transcript.ReplaceAll(
+        [
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "a\u0301b\U0001F44D"),
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "cd"),
+        ]);
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 10));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.Equal("a\u0301b\U0001F44D\ncd", copied);
+        Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.False(fixture.Shell.Transcript.HasSelection);
+    }
+
+    [Fact]
+    public void Copy_status_uses_singular_symbol_for_a_single_selected_element()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => true);
+        fixture.Shell.Transcript.ReplaceAll(
+        [
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "x"),
+        ]);
+
+        // The inclusive selection clamps to the single-cell row, so exactly one glyph is copied.
+        fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(0, 5));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        Assert.Equal("1 symbol copied to clipboard", fixture.Shell.Operational.Status.Text);
     }
 
     [Fact]
@@ -1400,8 +1625,10 @@ public sealed class VirtualizedTranscriptViewTests
 
         Assert.Equal(cap, shell.Composer.Frame.Height);
         Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
+        Assert.Equal(shell.Composer.Frame.Height + 2, shell.Chrome.Frame.Height);
 
         if (token is not null)
         {
@@ -1701,6 +1928,61 @@ public sealed class VirtualizedTranscriptViewTests
         // The anchor stays at the original press (column 1); dragging to column 4
         // grows the selection instead of restarting it at each motion report.
         Assert.Equal("rep", view.GetSelectedText());
+    }
+
+    [Fact]
+    public void Fresh_left_press_with_active_selection_requests_copy_and_starts_no_new_drag()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(3));
+
+        // Drag-select the first row, then release so the drag ends and a selection is active.
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        Assert.True(view.HasSelection);
+        var selectedBefore = view.GetSelectedText();
+
+        var copyRequests = 0;
+        view.CopyRequested += () => copyRequests++;
+
+        // A fresh unshifted left press while a selection is active requests a copy and consumes the click.
+        var handled = view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        Assert.Equal(1, copyRequests);
+
+        // No new selection/drag was started: the original selection is untouched and a subsequent release
+        // in a new place neither extends the selection nor toggles expansion.
+        Assert.True(view.HasSelection);
+        Assert.Equal(selectedBefore, view.GetSelectedText());
+        view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(6, 1),
+        });
+        Assert.True(view.HasSelection);
+        Assert.Equal(selectedBefore, view.GetSelectedText());
     }
 
     [Fact]

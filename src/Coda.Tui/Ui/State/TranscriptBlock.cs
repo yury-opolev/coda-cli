@@ -45,6 +45,12 @@ public sealed record ToolTranscriptBlock(
 /// <summary>Raw command output emitted to the transcript.</summary>
 public sealed record CommandOutputTranscriptBlock(Guid Id, string Text) : TranscriptBlock(Id);
 
+/// <summary>
+/// A semantic context-window usage breakdown, rendered as a compact per-category block with distinct
+/// glyphs, proportional mini-bars, and per-category colors (never as generic command output).
+/// </summary>
+public sealed record ContextUsageTranscriptBlock(Guid Id, ContextUsageData Usage) : TranscriptBlock(Id);
+
 /// <summary>A unified diff patch.</summary>
 public sealed record DiffTranscriptBlock(Guid Id, string Patch) : TranscriptBlock(Id);
 

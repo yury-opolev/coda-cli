@@ -103,14 +103,15 @@ internal class FullscreenTuiShell(
         this.transcript.Y = Pos.Bottom(this.header);
         this.transcript.Width = Dim.Fill();
 
-        // The always-visible operational status row sits directly above the composer, between the
+        // The always-visible operational status row sits directly above the chrome region, between the
         // transcript and the composer chrome.
         this.Operational.X = 0;
         this.Operational.Width = Dim.Fill();
         this.Operational.Height = 1;
 
         // The borderless composer is shifted right by a small gutter so the chrome can paint its prompt
-        // glyph to the left; the chrome spans the full width beneath it.
+        // glyph to the left; the chrome spans the full width and frames the composer with a half-block edge
+        // above and below (its vertical geometry is set in ApplyBottomAnchors).
         this.Chrome.X = 0;
         this.Chrome.Width = Dim.Fill();
 
@@ -150,23 +151,27 @@ internal class FullscreenTuiShell(
 
     /// <summary>
     /// Positions every bottom-anchored view relative to the current <see cref="composerHeight"/>: the
-    /// transcript reserves the operational row (1) + composer + status row (1); the operational row, chrome,
-    /// and composer stack directly above the status row; and the hidden completion menu anchors above the
-    /// operational row. Re-run whenever the composer height changes so the shell re-flows around it.
+    /// transcript reserves the operational row (1) + the chrome region (composer + 2 half-block edges) +
+    /// status row (1); the operational row sits above the chrome; the chrome frames the composer, which sits
+    /// one row below the chrome's top edge; the status row sits below the chrome; and the hidden completion
+    /// menu anchors above the operational row. Re-run whenever the composer height changes so the shell
+    /// re-flows around it.
     /// </summary>
     private void ApplyBottomAnchors()
     {
-        this.transcript.Height = Dim.Fill(this.composerHeight + 2);
+        this.transcript.Height = Dim.Fill(this.composerHeight + 4);
 
-        this.Operational.Y = Pos.AnchorEnd(this.composerHeight + 2);
+        this.Operational.Y = Pos.AnchorEnd(this.composerHeight + 4);
 
-        this.Chrome.Y = Pos.AnchorEnd(this.composerHeight + 1);
-        this.Chrome.Height = this.composerHeight;
+        // The chrome spans the composer plus a half-block edge above and below, so its top/bottom edges stay
+        // visible across the full width; the composer sits one row below the chrome's top edge.
+        this.Chrome.Y = Pos.AnchorEnd(this.composerHeight + 3);
+        this.Chrome.Height = this.composerHeight + 2;
 
-        this.Composer.Y = Pos.AnchorEnd(this.composerHeight + 1);
+        this.Composer.Y = Pos.AnchorEnd(this.composerHeight + 2);
         this.Composer.Height = this.composerHeight;
 
-        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + 2);
+        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + 4);
     }
 
     /// <summary>
@@ -178,12 +183,13 @@ internal class FullscreenTuiShell(
 
     /// <summary>
     /// Anchors the menu so its bottom row sits immediately above the operational row (operational 1 +
-    /// composer + status 1 bottom rows), overlaying the transcript. The composer, operational row,
-    /// and status stay pinned to the bottom, so the menu never displaces them.
+    /// chrome region [composer + 2 half-block edges] + status 1 bottom rows), overlaying the transcript. The
+    /// chrome, composer, operational row, and status stay pinned to the bottom, so the menu never displaces
+    /// them.
     /// </summary>
     protected override void PlaceCompletion(int height, bool visible)
     {
-        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + height + 2);
+        this.Completion.Y = Pos.AnchorEnd(this.composerHeight + height + 4);
         this.Completion.Height = height;
     }
 

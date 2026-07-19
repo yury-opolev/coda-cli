@@ -1,6 +1,8 @@
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.State;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -15,22 +17,30 @@ public sealed class ContextCommand : ISlashCommand
     private const int GridHeight = 10;
     private const int TotalSquares = GridWidth * GridHeight;
 
-    // Distinct color AND glyph per category, so cells are distinguishable by shape
-    // even when colors are hard to tell apart: used categories are a solid block in a
-    // bright hue, the reserved buffer a medium shade, free space a light shade.
+    // Distinct color AND glyph per category, so cells stay legible by shape even after the semantic
+    // adapter strips Spectre colors: each used category owns a unique glyph in a warm accent, the reserved
+    // autocompact buffer a medium shade, and free space a light shade. The glyphs — not the color — carry
+    // the distinction on low-color terminals.
     private static readonly IReadOnlyDictionary<string, (string Color, char Glyph)> Styles =
         new Dictionary<string, (string, char)>(StringComparer.Ordinal)
         {
-            ["System prompt"] = ("blue", '█'),
-            ["System tools"] = ("yellow", '█'),
-            ["MCP tools"] = ("aqua", '█'),
-            ["Messages"] = ("magenta", '█'),
-            ["Autocompact buffer"] = ("grey", '▒'),
-            ["Free space"] = ("grey23", '░'),
+            ["System prompt"] = ("#f0b35b", '◆'),
+            ["System tools"] = ("#d7a84b", '▲'),
+            ["MCP tools"] = ("#d98a52", '●'),
+            ["Messages"] = ("#e6a84a", '■'),
+            ["Autocompact buffer"] = ("#8f8880", '▒'),
+            ["Free space"] = ("#5f574e", '░'),
         };
 
     private static (string Color, char Glyph) StyleFor(string categoryName) =>
-        Styles.TryGetValue(categoryName, out var style) ? style : ("white", '█');
+        Styles.TryGetValue(categoryName, out var style) ? style : ("#f2d6b3", '◆');
+
+    /// <summary>
+    /// The per-category grid/legend glyphs, exposed so tests can assert every context category maps to a
+    /// distinct, glyph-legible marker even after the semantic adapter strips Spectre colors.
+    /// </summary>
+    internal static IReadOnlyDictionary<string, char> CategoryGlyphs =>
+        Styles.ToDictionary(pair => pair.Key, pair => pair.Value.Glyph, StringComparer.Ordinal);
 
     public string Name => "context";
 
@@ -50,6 +60,15 @@ public sealed class ContextCommand : ISlashCommand
         var report = context.ContextSnapshots is { } cache
             ? await cache.GetAsync(force: true, cancellationToken).ConfigureAwait(false)
             : await AnalyzeOnceAsync(context, cancellationToken).ConfigureAwait(false);
+
+        // In semantic mode the actor/renderer owns the breakdown: publish an immutable, typed usage block
+        // and emit nothing else. Writing the Spectre grid too would duplicate the output as generic command
+        // lines. The legacy REPL keeps its 10×10 grid + legend.
+        if (context.SemanticUiEnabled)
+        {
+            context.Events.Publish(new ContextUsageEvent(ContextUsageData.FromReport(report)));
+            return CommandResult.Continue;
+        }
 
         this.Render(context, report);
         return CommandResult.Continue;

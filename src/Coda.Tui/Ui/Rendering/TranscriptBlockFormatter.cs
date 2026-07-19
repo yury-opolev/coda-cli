@@ -22,6 +22,15 @@ public enum TranscriptRole
     Warning,
     Notification,
     Error,
+
+    // Six semantic context-usage roles, one per /context category, so the breakdown stays distinguishable
+    // by color (each pairs with a distinct glyph in the formatter for low-color legibility).
+    ContextSystemPrompt,
+    ContextSystemTools,
+    ContextMcpTools,
+    ContextMessages,
+    ContextAutocompactBuffer,
+    ContextFreeSpace,
 }
 
 /// <summary>A single rendered transcript line: display text plus the role that colors it.</summary>
@@ -75,6 +84,10 @@ public static class TranscriptBlockFormatter
                 AppendPreformatted(lines, command.Text, safeWidth, TranscriptRole.Code);
                 break;
 
+            case ContextUsageTranscriptBlock usage:
+                AppendContextUsage(lines, usage.Usage, safeWidth);
+                break;
+
             case DiffTranscriptBlock diff:
                 AppendDiff(lines, diff.Patch, safeWidth);
                 break;
@@ -102,6 +115,84 @@ public static class TranscriptBlockFormatter
     /// <summary>Joins the formatted lines with newlines, for a plain-text projection of a block.</summary>
     public static string FormatPlainText(TranscriptBlock block, int width) =>
         string.Join('\n', Format(block, width).Select(line => line.Text));
+
+    /// <summary>
+    /// The canonical semantic style for each <c>/context</c> category: a distinct, shape-legible glyph and
+    /// the semantic role that colors its line. Exposed so tests can assert every category maps to a distinct
+    /// marker/role even when the driver drops to 16 colors. Unknown names fall back to a neutral diamond.
+    /// </summary>
+    internal static (char Glyph, TranscriptRole Role) ContextCategoryStyle(string categoryName) => categoryName switch
+    {
+        "System prompt" => ('\u25c6', TranscriptRole.ContextSystemPrompt),       // ◆
+        "System tools" => ('\u25b2', TranscriptRole.ContextSystemTools),         // ▲
+        "MCP tools" => ('\u25cf', TranscriptRole.ContextMcpTools),               // ●
+        "Messages" => ('\u25a0', TranscriptRole.ContextMessages),                // ■
+        "Autocompact buffer" => ('\u2592', TranscriptRole.ContextAutocompactBuffer), // ▒
+        "Free space" => ('\u2591', TranscriptRole.ContextFreeSpace),             // ░
+        _ => ('\u25c6', TranscriptRole.ContextSystemPrompt),
+    };
+
+    /// <summary>
+    /// Projects context-window usage onto a compact, no-blank-line block: a heading, a one-line summary, an
+    /// optional "estimated" note, then exactly one line per category. Each category line carries its distinct
+    /// glyph, a proportional mini-bar (bounded to <see cref="ContextBarWidth"/> repetitions of the glyph),
+    /// the category label, and the token/percentage text — all under the category's semantic role. No empty
+    /// separator rows are emitted, so the breakdown never renders a blank line between events.
+    /// </summary>
+    private static void AppendContextUsage(List<TranscriptRenderLine> lines, ContextUsageData usage, int width)
+    {
+        var approx = usage.IsExact ? string.Empty : "~";
+
+        lines.Add(new TranscriptRenderLine($"Context Usage \u00b7 {usage.Model}", TranscriptRole.Heading));
+
+        var messages = usage.MessageCount == 1 ? "message" : "messages";
+        var summary =
+            $"{approx}{usage.UsedTokens.ToString("N0", CultureInfo.InvariantCulture)} / " +
+            $"{usage.MaxTokens.ToString("N0", CultureInfo.InvariantCulture)} tokens " +
+            $"({usage.Percentage}%) across {usage.MessageCount} {messages}";
+        lines.Add(new TranscriptRenderLine(summary, TranscriptRole.Notification));
+
+        if (!usage.IsExact)
+        {
+            lines.Add(new TranscriptRenderLine(
+                "(estimated \u2014 provider has no token-counting API or it was unavailable)",
+                TranscriptRole.Notification));
+        }
+
+        foreach (var category in usage.Categories)
+        {
+            lines.Add(FormatContextCategory(category, usage.MaxTokens, approx));
+        }
+    }
+
+    /// <summary>The maximum number of glyph repetitions in a category's proportional mini-bar.</summary>
+    private const int ContextBarWidth = 10;
+
+    private static TranscriptRenderLine FormatContextCategory(ContextUsageCategory category, int maxTokens, string approx)
+    {
+        var (glyph, role) = ContextCategoryStyle(category.Name);
+        var pct = maxTokens <= 0 ? 0 : (int)Math.Round(category.Tokens * 100.0 / maxTokens);
+
+        var filled = 0;
+        if (maxTokens > 0 && category.Tokens > 0)
+        {
+            filled = Math.Clamp((int)Math.Round(category.Tokens * (double)ContextBarWidth / maxTokens), 1, ContextBarWidth);
+        }
+
+        var builder = new StringBuilder();
+        builder.Append(glyph);
+        if (filled > 0)
+        {
+            builder.Append(' ').Append(new string(glyph, filled));
+        }
+
+        builder.Append(' ').Append(category.Name);
+        builder.Append("  ").Append(approx)
+            .Append(category.Tokens.ToString("N0", CultureInfo.InvariantCulture))
+            .Append(" tokens (").Append(pct).Append("%)");
+
+        return new TranscriptRenderLine(builder.ToString(), role);
+    }
 
     private static void AppendMarkdown(List<TranscriptRenderLine> lines, string text, int width)
     {

@@ -369,6 +369,74 @@ public sealed class ComposerViewTests
         Assert.Equal(4, controller.State.CursorIndex);
     }
 
+    [Fact]
+    public void Forward_delete_on_a_soft_wrapped_row_removes_one_char_without_first_line_jump()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 6, height: 4);
+
+        // Soft word-wrap at width 6 lays this out as "alpha " / "beta " / "gamma"; the caret sits before
+        // the 'g' at the start of the third visual row (index 11).
+        view.SetDraft("alpha beta gamma", 11);
+        var caretBefore = view.InsertionPoint;
+        var replacementsBefore = view.FullTextReplacementCount;
+        Assert.True(caretBefore.Y > 0, "caret must start on a wrapped (non-first) visual row");
+
+        view.NewKeyDownEvent(Key.Delete);
+
+        // Exactly the char at the caret is removed; the draft is not rebuilt and the caret neither moves
+        // through the model nor snaps up to the first visual row.
+        Assert.Equal("alpha beta amma", view.GetDraft());
+        Assert.Equal("alpha beta amma", Normalize(view.Text));
+        Assert.Equal("alpha beta amma", controller.State.Draft);
+        Assert.Equal(11, controller.State.CursorIndex);
+        Assert.Equal(replacementsBefore, view.FullTextReplacementCount);
+        Assert.Equal(caretBefore, view.InsertionPoint);
+    }
+
+    [Fact]
+    public void Forward_delete_inside_a_long_wrapped_word_removes_one_char_and_keeps_caret_row()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 6, height: 4);
+
+        // A single word wider than the viewport hard-wraps by cell into "abcdef" / "ghijkl" / "mnop"; the
+        // caret sits before the 'i' on the second visual row (index 8).
+        view.SetDraft("abcdefghijklmnop", 8);
+        var caretBefore = view.InsertionPoint;
+        var replacementsBefore = view.FullTextReplacementCount;
+        Assert.True(caretBefore.Y > 0, "caret must start on a wrapped (non-first) visual row");
+
+        view.NewKeyDownEvent(Key.Delete);
+
+        Assert.Equal("abcdefghjklmnop", view.GetDraft());
+        Assert.Equal("abcdefghjklmnop", controller.State.Draft);
+        Assert.Equal(8, controller.State.CursorIndex);
+        Assert.Equal(replacementsBefore, view.FullTextReplacementCount);
+        Assert.Equal(caretBefore.Y, view.InsertionPoint.Y);
+    }
+
+    [Fact]
+    public void Forward_delete_across_a_hard_newline_row_removes_one_char_without_full_replacement()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 8, height: 4);
+
+        // A hard newline puts "world" on its own logical row; the caret sits before its 'w' (index 6).
+        view.SetDraft("hello\nworld", 6);
+        var caretBefore = view.InsertionPoint;
+        var replacementsBefore = view.FullTextReplacementCount;
+        Assert.True(caretBefore.Y > 0, "caret must start on the second logical row");
+
+        view.NewKeyDownEvent(Key.Delete);
+
+        Assert.Equal("hello\norld", view.GetDraft());
+        Assert.Equal("hello\norld", controller.State.Draft);
+        Assert.Equal(6, controller.State.CursorIndex);
+        Assert.Equal(replacementsBefore, view.FullTextReplacementCount);
+        Assert.Equal(caretBefore, view.InsertionPoint);
+    }
+
     private sealed class TestCommand(string name, string summary) : ISlashCommand
     {
         public string Name { get; } = name;

@@ -40,6 +40,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<string, bool> clipboardWriter;
     private object? chordTimeout;
     private object? transientOperationalTimeout;
+    private object? composerLayoutTimeout;
     private OperationalStatus? transientOperationalOverride;
 
     private string? statusText;
@@ -121,10 +122,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     internal ComposerView Composer { get; }
 
     /// <summary>
-    /// The borderless chrome painted over the composer region: a subtle dark background and, when ready,
-    /// the <c>&gt;</c> prompt glyph. During startup it stays blank and dark; the operational status row
-    /// owns the <c>Initializing…</c> message. Non-focusable and
-    /// owned here; concrete shells position it directly beneath the composer in <see cref="BuildLayout"/>.
+    /// The borderless chrome that frames the composer region: a subtle dark background, full-width
+    /// half-block edges above and below the composer content rows, and, when ready, the <c>&gt;</c> prompt
+    /// glyph on the first content row. During startup it stays blank and dark; the operational status row
+    /// owns the <c>Initializing…</c> message. Non-focusable and owned here; concrete shells position it
+    /// around the composer in <see cref="BuildLayout"/>.
     /// </summary>
     internal ComposerChromeView Chrome { get; }
 
@@ -301,6 +303,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown += this.HandleUnhandledShellKey;
+        transcript.CopyRequested += this.HandleTranscriptCopyRequested;
     }
 
     /// <summary>Unsubscribes a transcript previously bound with <see cref="BindTranscriptInput"/>.</summary>
@@ -308,6 +311,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown -= this.HandleUnhandledShellKey;
+        transcript.CopyRequested -= this.HandleTranscriptCopyRequested;
     }
 
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
@@ -339,6 +343,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             // so no status timer survives the shell.
             this.ResetChordOverride();
             this.ClearTransientOperationalOverride();
+            this.CancelScheduledComposerLayoutRecalc();
             this.Composer.ShellKeyHandler = null;
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
@@ -464,9 +469,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>
     /// Copies an active transcript selection to the clipboard when Ctrl+C arrives, before any exit-chord
-    /// arming. On success the selection is cleared and the projected status restored; when the clipboard is
-    /// unavailable the selection is preserved and a transient Warning status is pinned for 1.5 seconds.
-    /// Returns true whenever a selection was present, so the exit chord never arms while text is selected.
+    /// arming. Returns true whenever a selection was present, so the exit chord never arms while text is
+    /// selected; the copy itself (success status or the clipboard-unavailable fallback) is handled by
+    /// <see cref="CopyTranscriptSelection"/>.
     /// </summary>
     private bool TryCopyTranscriptSelection()
     {
@@ -475,18 +480,90 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return false;
         }
 
+        this.CopyTranscriptSelection();
+        return true;
+    }
+
+    /// <summary>
+    /// Handles a transcript copy request (a fresh left click on an active selection) by routing through the
+    /// same copy path as Ctrl+C.
+    /// </summary>
+    private void HandleTranscriptCopyRequested() => this.CopyTranscriptSelection();
+
+    /// <summary>
+    /// Copies the active transcript selection to the clipboard. On success the selection is cleared and a
+    /// transient "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds before the projected
+    /// status is restored; when the clipboard is unavailable the selection is preserved and a transient
+    /// "Clipboard unavailable" Warning is pinned instead. No-op when nothing is selected.
+    /// </summary>
+    private void CopyTranscriptSelection()
+    {
+        if (!this.TranscriptView.HasSelection)
+        {
+            return;
+        }
+
         var text = this.TranscriptView.GetSelectedText();
-        if (!string.IsNullOrEmpty(text) && this.clipboardWriter(text))
+
+        // An empty or newline-only selection has no symbols to copy. Clear it and report a deterministic
+        // "0 symbols copied to clipboard" confirmation instead of routing through the clipboard writer, whose
+        // skipped/failed write would otherwise surface a misleading "Clipboard unavailable" warning.
+        if (CountSymbols(text) == 0)
         {
             this.TranscriptView.ClearSelection();
-            this.RestoreProjectedOperationalStatus();
-            return true;
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(CopySuccessMessage(text), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        if (this.clipboardWriter(text))
+        {
+            this.TranscriptView.ClearSelection();
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(CopySuccessMessage(text), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
         }
 
         this.ShowTransientOperationalStatus(
             new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
             TimeSpan.FromSeconds(1.5));
-        return true;
+    }
+
+    /// <summary>
+    /// The transient confirmation for a successful copy, counting the copied Unicode grapheme/text elements
+    /// (combining sequences and emoji count as one each) and excluding CR/LF row separators. Singular for a
+    /// single symbol, plural otherwise.
+    /// </summary>
+    private static string CopySuccessMessage(string text)
+    {
+        var count = CountSymbols(text);
+        return count == 1
+            ? "1 symbol copied to clipboard"
+            : $"{count} symbols copied to clipboard";
+    }
+
+    /// <summary>
+    /// Counts the Unicode grapheme/text elements in <paramref name="text"/>, treating combining sequences
+    /// and emoji as a single symbol and skipping CR/LF separators introduced by the multi-row selection.
+    /// </summary>
+    private static int CountSymbols(string text)
+    {
+        var count = 0;
+        var enumerator = System.Globalization.StringInfo.GetTextElementEnumerator(text);
+        while (enumerator.MoveNext())
+        {
+            var element = (string)enumerator.Current;
+            if (element is "\r" or "\n" or "\r\n")
+            {
+                continue;
+            }
+
+            count++;
+        }
+
+        return count;
     }
 
     /// <summary>
@@ -665,7 +742,41 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     private void OnComposerLayoutInvalidatedHandler(object? sender, EventArgs e) =>
-        this.OnComposerLayoutInvalidated();
+        this.ScheduleComposerLayoutRecalc();
+
+    /// <summary>
+    /// Coalesces composer layout invalidations: many content/caret/completion signals in a single UI
+    /// iteration schedule at most one zero-delay recalc, so a keystroke never triggers several synchronous
+    /// re-layouts. The scheduled callback runs once, clears the token, and re-arms only on the next signal.
+    /// </summary>
+    private void ScheduleComposerLayoutRecalc()
+    {
+        if (this.disposed || this.composerLayoutTimeout is not null)
+        {
+            return;
+        }
+
+        this.composerLayoutTimeout = this.addTimeout(TimeSpan.Zero, () =>
+        {
+            this.composerLayoutTimeout = null;
+            if (!this.disposed)
+            {
+                this.OnComposerLayoutInvalidated();
+            }
+
+            return false;
+        });
+    }
+
+    /// <summary>Removes any pending coalesced composer recalc so no timer survives the shell.</summary>
+    private void CancelScheduledComposerLayoutRecalc()
+    {
+        if (this.composerLayoutTimeout is { } timeout)
+        {
+            this.removeTimeout(timeout);
+            this.composerLayoutTimeout = null;
+        }
+    }
 
     private void Apply(UiSessionSnapshot snapshot)
     {
@@ -796,7 +907,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
-    private void OnComposerSubmitted(object? sender, string text) => this.PromptSubmitted?.Invoke(this, text);
+    private void OnComposerSubmitted(object? sender, string text)
+    {
+        // Explicit submits (prompts, slash commands, bash) always resume auto-following: jump the transcript
+        // back to the newest row before forwarding so the response the user just asked for is visible even
+        // when they had scrolled up. Background output alone never forces this — only an explicit submit.
+        this.TranscriptView.JumpToNewest();
+        this.PromptSubmitted?.Invoke(this, text);
+    }
 
     private void OnComposerActionRequested(object? sender, UiAction action)
     {

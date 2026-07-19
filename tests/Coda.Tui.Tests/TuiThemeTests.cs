@@ -21,10 +21,13 @@ public sealed class TuiThemeTests
 
         Assert.Equal(new TgColor(242, 214, 179), theme.TranscriptAssistant.TrueColor);
         Assert.Equal(new TgColor(230, 168, 74), theme.TranscriptUser.TrueColor);
-        Assert.Equal(new TgColor(215, 168, 75), theme.TranscriptTool.TrueColor);
+        Assert.Equal(new TgColor(240, 190, 84), theme.TranscriptTool.TrueColor);
         Assert.Equal(new TgColor(233, 130, 107), theme.PermissionApproval.TrueColor);
         Assert.Equal(new TgColor(240, 199, 94), theme.Question.TrueColor);
         Assert.Equal(new TgColor(217, 104, 93), theme.Error.TrueColor);
+
+        // Tool gold must read as a distinctly brighter gold than the user's amber, not a near-duplicate.
+        Assert.NotEqual(theme.TranscriptUser.TrueColor, theme.TranscriptTool.TrueColor);
 
         Assert.Equal(TgName.White, theme.TranscriptAssistant.Fallback);
         Assert.Equal(TgName.BrightYellow, theme.TranscriptUser.Fallback);
@@ -48,7 +51,7 @@ public sealed class TuiThemeTests
     [Theory]
     [InlineData(TranscriptRole.Assistant, 242, 214, 179)]
     [InlineData(TranscriptRole.User, 230, 168, 74)]
-    [InlineData(TranscriptRole.Tool, 215, 168, 75)]
+    [InlineData(TranscriptRole.Tool, 240, 190, 84)]
     [InlineData(TranscriptRole.Permission, 233, 130, 107)]
     [InlineData(TranscriptRole.Question, 240, 199, 94)]
     [InlineData(TranscriptRole.Warning, 240, 199, 94)]
@@ -81,6 +84,104 @@ public sealed class TuiThemeTests
         Assert.Equal(
             new TgColor(TgName.BrightRed),
             view.AttributeFor(TranscriptRole.Permission).Foreground);
+    }
+
+    [Theory]
+    [InlineData(TranscriptRole.ContextSystemPrompt, 240, 190, 84)]
+    [InlineData(TranscriptRole.ContextSystemTools, 222, 146, 74)]
+    [InlineData(TranscriptRole.ContextMcpTools, 216, 122, 90)]
+    [InlineData(TranscriptRole.ContextMessages, 214, 96, 96)]
+    [InlineData(TranscriptRole.ContextAutocompactBuffer, 168, 154, 134)]
+    [InlineData(TranscriptRole.ContextFreeSpace, 112, 102, 92)]
+    public void Context_roles_resolve_to_their_distinct_warm_ember_truecolors(
+        TranscriptRole role,
+        int red,
+        int green,
+        int blue)
+    {
+        using IApplication app = Application.Create();
+        using var view = new VirtualizedTranscriptView(app, theme: TuiTheme.WarmEmber);
+
+        var color = view.AttributeFor(role, trueColor: true).Foreground;
+
+        Assert.Equal(new TgColor(red, green, blue), color);
+    }
+
+    [Fact]
+    public void Context_roles_have_distinct_truecolors_and_readable_16_color_fallbacks()
+    {
+        var theme = TuiTheme.WarmEmber;
+        var roles = new[]
+        {
+            theme.ContextSystemPrompt,
+            theme.ContextSystemTools,
+            theme.ContextMcpTools,
+            theme.ContextMessages,
+            theme.ContextAutocompactBuffer,
+            theme.ContextFreeSpace,
+        };
+
+        // Every context role owns an eye-friendly warm truecolor and a named 16-color fallback that are
+        // distinct from one another, so the six categories stay legible by color even in low color.
+        Assert.Equal(roles.Length, roles.Select(r => r.TrueColor).Distinct().Count());
+        Assert.Equal(roles.Length, roles.Select(r => r.Fallback).Distinct().Count());
+
+        // The warm palette never degrades a context role to a cold blue/green/cyan/magenta fallback.
+        foreach (var role in roles)
+        {
+            Assert.DoesNotContain(role.Fallback, new[]
+            {
+                TgName.Blue, TgName.Green, TgName.Cyan, TgName.Magenta,
+                TgName.BrightBlue, TgName.BrightGreen, TgName.BrightCyan, TgName.BrightMagenta,
+            });
+        }
+    }
+
+    [Fact]
+    public void Forced_16_color_driver_resolves_context_roles_to_named_fallbacks()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.Force16Colors = true;
+        using var view = new VirtualizedTranscriptView(app, theme: TuiTheme.WarmEmber);
+
+        Assert.Equal(
+            new TgColor(TgName.BrightYellow),
+            view.AttributeFor(TranscriptRole.ContextSystemPrompt).Foreground);
+        Assert.Equal(
+            new TgColor(TgName.DarkGray),
+            view.AttributeFor(TranscriptRole.ContextFreeSpace).Foreground);
+    }
+
+    [Fact]
+    public void Composer_panel_background_is_a_distinct_warm_surface_from_the_shell_background()
+    {
+        var theme = TuiTheme.WarmEmber;
+
+        // The composer panel is a slightly lighter warm near-black than the shell surface, so the input
+        // region reads as its own panel rather than blending into the transcript background.
+        Assert.Equal(new TgColor(34, 28, 23), theme.ComposerPanelBackground.TrueColor);
+        Assert.NotEqual(theme.Background.TrueColor, theme.ComposerPanelBackground.TrueColor);
+    }
+
+    [Fact]
+    public void Composer_scheme_paints_the_composer_panel_background_for_every_state()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+
+        var scheme = TuiTheme.WarmEmber.ComposerScheme(app.Driver);
+        var panel = TuiTheme.WarmEmber.ComposerPanelBackground.TrueColor;
+
+        Assert.NotEqual(TuiTheme.WarmEmber.Background.TrueColor, scheme.Normal.Background);
+        foreach (var attribute in new[]
+        {
+            scheme.Normal, scheme.HotNormal, scheme.Focus, scheme.HotFocus, scheme.Active,
+            scheme.HotActive, scheme.Highlight, scheme.Editable, scheme.ReadOnly, scheme.Disabled,
+        })
+        {
+            Assert.Equal(panel, attribute.Background);
+        }
     }
 
     [Fact]

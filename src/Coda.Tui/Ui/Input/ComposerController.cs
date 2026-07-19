@@ -41,6 +41,19 @@ internal sealed class ComposerController
         this.RefreshCompletion();
     }
 
+    /// <summary>
+    /// Mirrors a native editor content change: replaces the draft text while keeping the current caret
+    /// (clamped to the new length). The precise caret is set separately from the editor's unwrapped cursor
+    /// event, so this never reconstructs the caret from wrapped coordinates.
+    /// </summary>
+    public void SetDraftText(string text)
+    {
+        text ??= string.Empty;
+        var cursor = Math.Clamp(this.State.CursorIndex, 0, text.Length);
+        this.State = this.State with { Draft = text, CursorIndex = cursor, PreferredDisplayColumn = null };
+        this.RefreshCompletion();
+    }
+
     public void InsertText(string text)
     {
         if (string.IsNullOrEmpty(text))

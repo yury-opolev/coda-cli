@@ -29,14 +29,18 @@ public sealed class ComposerChromeViewTests
     }
 
     [Fact]
-    public void Ready_state_is_dark_borderless_and_draws_only_the_warm_prompt()
+    public void Ready_state_draws_the_warm_prompt_with_subtle_half_block_edge_shading()
     {
         using var chrome = new ComposerChromeView(TuiTheme.WarmEmber);
 
-        var rows = chrome.RenderRows(width: 12, height: 3);
+        var rows = chrome.RenderRows(width: 12, height: 4);
 
-        Assert.Equal([">           ", "            ", "            "], rows);
+        // A full-width upper-half-block top edge, the warm prompt at column 0 of the first content row (so
+        // the composer's own rows overdraw everything but the gutter), an interior content row, and a
+        // full-width lower-half-block bottom edge — no vertical accent bar or box border.
+        Assert.Equal(["▀▀▀▀▀▀▀▀▀▀▀▀", ">           ", "            ", "▄▄▄▄▄▄▄▄▄▄▄▄"], rows);
         Assert.DoesNotContain(rows, row => row.Contains('▌'));
+        Assert.DoesNotContain(rows, row => row.Contains('│'));
         Assert.DoesNotContain(rows, row => row.Contains("Initializing", StringComparison.Ordinal));
     }
 
@@ -47,6 +51,7 @@ public sealed class ComposerChromeViewTests
 
         chrome.SetReady(false);
 
+        // During startup the panel stays dark and blank — no prompt and no edge shading.
         Assert.Equal(string.Empty, chrome.DisplayText);
         Assert.Equal(["            ", "            ", "            "], chrome.RenderRows(12, 3));
     }

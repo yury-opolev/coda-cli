@@ -47,6 +47,9 @@ public sealed record UsageEvent(TokenUsage Usage) : UiEvent;
 /// <summary>Raw command output to append to the transcript.</summary>
 public sealed record CommandOutputEvent(string Text) : UiEvent;
 
+/// <summary>A typed context-window usage breakdown to append to the transcript as a semantic block.</summary>
+public sealed record ContextUsageEvent(ContextUsageData Usage) : UiEvent;
+
 /// <summary>A unified diff to append to the transcript.</summary>
 public sealed record DiffOutputEvent(string Patch) : UiEvent;
 

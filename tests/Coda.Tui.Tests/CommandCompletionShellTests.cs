@@ -278,6 +278,53 @@ public sealed class CommandCompletionShellTests
     }
 
     [Fact]
+    public void Composer_layout_invalidations_coalesce_into_a_single_scheduled_recalc()
+    {
+        var scheduled = new List<Func<bool>>();
+        Func<TimeSpan, Func<bool>, object> add = (delay, callback) =>
+        {
+            // The composer coalescer schedules with a zero delay; the spinner uses a longer interval, so
+            // filtering on the zero delay isolates the composer's own recalc scheduling.
+            if (delay == TimeSpan.Zero)
+            {
+                scheduled.Add(callback);
+            }
+
+            return new object();
+        };
+        Func<object, bool> remove = _ => true;
+
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            commands: Commands(),
+            addTimeout: add,
+            removeTimeout: remove);
+        var shell = fixture.Shell;
+
+        // Drain whatever the initial layout scheduled so the assertions start from a clean slate.
+        foreach (var callback in scheduled.ToArray())
+        {
+            callback();
+        }
+
+        scheduled.Clear();
+        var before = shell.ComposerLayoutUpdateCount;
+
+        // Several content/caret signals within one UI iteration.
+        shell.Composer.SetDraft("hi", 2);
+        shell.Composer.NewKeyDownEvent(new Key('x'));
+        shell.Composer.NewKeyDownEvent(new Key('y'));
+
+        // They coalesce into exactly one scheduled recalc that has not run yet.
+        Assert.Single(scheduled);
+        Assert.Equal(before, shell.ComposerLayoutUpdateCount);
+
+        // Driving the single callback applies exactly one recalc and does not ask to repeat.
+        Assert.False(scheduled[0]());
+        Assert.Equal(before + 1, shell.ComposerLayoutUpdateCount);
+    }
+
+    [Fact]
     public async Task Completion_operational_composer_metadata_and_prompt_keep_final_z_order()
     {
         using IApplication app = Application.Create();
@@ -298,8 +345,8 @@ public sealed class CommandCompletionShellTests
         Assert.True(shell.Completion.Visible);
         Assert.True(shell.PromptOverlay.Visible);
         Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         var order = shell.SubViews.ToList();
         Assert.True(order.IndexOf(shell.Chrome) < order.IndexOf(shell.Composer));
@@ -328,26 +375,26 @@ public sealed class CommandCompletionShellTests
         app.LayoutAndDraw();
 
         // A slash draft shows the completion menu; its bottom hugs the operational row and every
-        // retained row stays adjacent (completion → operational → composer → status).
+        // retained row stays adjacent (completion → operational → chrome[composer] → status).
         shell.Composer.SetDraft("/he", 3);
         app.LayoutAndDraw();
         Assert.True(shell.Completion.Visible);
         Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         // A dynamic-height (multi-line) draft grows the composer without breaking row adjacency.
         shell.Composer.SetDraft("a\nb\nc\nd", 7);
         app.LayoutAndDraw();
         Assert.True(shell.Composer.Frame.Height >= 4);
-        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         // A driver resize re-flows every row but the operational/composer/status adjacency survives.
         app.Driver.SetScreenSize(60, 18);
         app.LayoutAndDraw();
-        Assert.Equal(shell.Composer.Frame.Y, shell.Operational.Frame.Bottom);
-        Assert.Equal(shell.Status.Frame.Y, shell.Composer.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         if (token is not null)
         {

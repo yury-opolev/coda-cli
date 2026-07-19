@@ -67,6 +67,47 @@ public sealed class UiAnsiConsoleAdapterTests
     }
 
     [Fact]
+    public void Markup_line_output_has_no_trailing_newline_terminator()
+    {
+        var events = new List<UiEvent>();
+        var console = new UiAnsiConsoleAdapter(new CollectingPublisher(events), 80, 24);
+
+        console.MarkupLine("row one");
+
+        var output = Assert.IsType<CommandOutputEvent>(Assert.Single(events));
+        // The terminal line break MarkupLine appends is stripped so a single-line command output never
+        // yields a trailing empty row when the transcript formatter splits it.
+        Assert.Equal("row one", output.Text);
+        Assert.False(output.Text.EndsWith('\n'));
+        Assert.False(output.Text.EndsWith('\r'));
+    }
+
+    [Fact]
+    public void Interior_blank_lines_survive_while_terminal_newlines_are_trimmed()
+    {
+        var events = new List<UiEvent>();
+        var console = new UiAnsiConsoleAdapter(new CollectingPublisher(events), 80, 24);
+
+        // Two content lines separated by an intentional blank line, then a terminal line break.
+        console.MarkupLine("alpha\n\nbeta");
+
+        var output = Assert.IsType<CommandOutputEvent>(Assert.Single(events));
+        var expected = string.Join(Environment.NewLine, "alpha", string.Empty, "beta");
+        Assert.Equal(expected, output.Text);
+    }
+
+    [Fact]
+    public void Standalone_writeline_separator_publishes_no_event()
+    {
+        var events = new List<UiEvent>();
+        var console = new UiAnsiConsoleAdapter(new CollectingPublisher(events), 80, 24);
+
+        console.WriteLine();
+
+        Assert.Empty(events);
+    }
+
+    [Fact]
     public void Truly_empty_render_publishes_no_event()
     {
         var events = new List<UiEvent>();
