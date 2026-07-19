@@ -111,11 +111,31 @@ public static class InteractiveProgram
 /// through the <see cref="TuiHost"/> fallback ladder. The actor keeps one switchable frame/observer
 /// sink across every mode switch and fallback, so nothing but the presentation environment is rebuilt.
 /// </summary>
-internal sealed class DefaultInteractiveSessionRunner(TextWriter output, TerminalCapabilities capabilities)
-    : IInteractiveSessionRunner
+internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunner
 {
-    private readonly TextWriter output = output ?? throw new ArgumentNullException(nameof(output));
-    private readonly TerminalCapabilities capabilities = capabilities;
+    private readonly TextWriter output;
+    private readonly TerminalCapabilities capabilities;
+    private readonly TimeProvider timeProvider;
+    private readonly Action<IAnsiConsole, SessionExitSnapshot> renderExitSummary;
+
+    /// <summary>
+    /// Production entry point. <paramref name="timeProvider"/> (defaulting to
+    /// <see cref="TimeProvider.System"/>) stamps the session start/end, and
+    /// <paramref name="renderExitSummary"/> (defaulting to <see cref="ExitSummaryRenderer.Render"/>)
+    /// is the injectable clean-exit renderer seam; both stay optional so the production constructor is
+    /// unchanged and tests can substitute a fake clock and recording renderer.
+    /// </summary>
+    public DefaultInteractiveSessionRunner(
+        TextWriter output,
+        TerminalCapabilities capabilities,
+        TimeProvider? timeProvider = null,
+        Action<IAnsiConsole, SessionExitSnapshot>? renderExitSummary = null)
+    {
+        this.output = output ?? throw new ArgumentNullException(nameof(output));
+        this.capabilities = capabilities;
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.renderExitSummary = renderExitSummary ?? ExitSummaryRenderer.Render;
+    }
 
     public async Task<int> RunAsync(
         TuiRunMode mode,
@@ -124,6 +144,10 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
         TextWriter error,
         CancellationToken cancellationToken)
     {
+        // Stamp the session start before any startup work runs (startup is triggered lazily inside the
+        // first mode attempt), so the exit card's duration covers the whole interactive lifetime.
+        var startedAt = this.timeProvider.GetUtcNow();
+
         using var hostCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var hostToken = hostCts.Token;
 
@@ -375,28 +399,104 @@ internal sealed class DefaultInteractiveSessionRunner(TextWriter output, Termina
             mouseDisabled: options.MouseDisabled);
         var host = new TuiHost(modeRunner, error, mailbox);
 
+        return await this.RunHostToCleanExitAsync(
+            host,
+            mode,
+            ComposerState.Empty,
+            context,
+            realConsole,
+            startedAt,
+            drainDispatch: ct => DrainDispatchBeforeShutdownAsync(controller, agentRunner, ct),
+            flushUi: ct => FlushUiSafelyAsync(actor, actorTask, ct),
+            finalize: async () =>
+            {
+                hostCts.Cancel();
+                await actorTask.ConfigureAwait(false);
+            },
+            hostToken,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Drive the host to a clean exit, then — once and only after the terminal is restored and the UI
+    /// has drained — render the session card to the restored real console. Mode switches and fallbacks
+    /// happen inside <see cref="TuiHost.RunAsync"/>, so the card is never rendered for an intermediate
+    /// mode; a faulted host run skips the card entirely (the exception propagates), while
+    /// <paramref name="finalize"/> always runs to cancel the host and observe the actor.
+    /// </summary>
+    internal async Task<int> RunHostToCleanExitAsync(
+        TuiHost host,
+        TuiRunMode mode,
+        ComposerState initialComposer,
+        CommandContext context,
+        IAnsiConsole exitConsole,
+        DateTimeOffset startedAt,
+        Func<CancellationToken, Task> drainDispatch,
+        Func<CancellationToken, Task> flushUi,
+        Func<Task> finalize,
+        CancellationToken hostToken,
+        CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(host);
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(exitConsole);
+        ArgumentNullException.ThrowIfNull(drainDispatch);
+        ArgumentNullException.ThrowIfNull(flushUi);
+        ArgumentNullException.ThrowIfNull(finalize);
+
         try
         {
-            await host.RunAsync(mode, ComposerState.Empty, hostToken).ConfigureAwait(false);
+            await host.RunAsync(mode, initialComposer, hostToken).ConfigureAwait(false);
 
             // A clean exit can leave a controller dispatch (a background command/turn) still running —
             // e.g. the Exit action stopped the shell mid-turn. Interrupt the active turn and observe the
             // dispatch, bounded, BEFORE draining and disposing the actor/mailbox, so no late producer
             // publishes into a disposed mailbox.
-            await DrainDispatchBeforeShutdownAsync(controller, agentRunner, cancellationToken).ConfigureAwait(false);
+            await drainDispatch(cancellationToken).ConfigureAwait(false);
 
             // Clean exit (EOF/`/exit`/exhausted fallback): drain the actor so the just-published final
             // command output — which may still be queued or mid-observer — is emitted before the actor
             // is cancelled. Bounded so a stuck observer/frame can never hang shutdown.
-            await FlushUiSafelyAsync(actor, actorTask, cancellationToken).ConfigureAwait(false);
+            await flushUi(cancellationToken).ConfigureAwait(false);
+
+            // The terminal is restored and the UI has drained: render the resumable session card exactly
+            // once, to the real console. Every clean seam (`/exit`, double Ctrl+C, EOF/terminal shutdown)
+            // converges here.
+            this.RenderExitSummary(context, exitConsole, startedAt);
         }
         finally
         {
-            hostCts.Cancel();
-            await actorTask.ConfigureAwait(false);
+            await finalize().ConfigureAwait(false);
         }
 
         return 0;
+    }
+
+    /// <summary>
+    /// Project the live session (plus the latest cached context report and the injected start/end
+    /// timestamps) into an immutable <see cref="SessionExitSnapshot"/> and render it once. Best-effort:
+    /// building the snapshot must never trigger a new provider request or context analysis, and a
+    /// render/output failure must never convert a clean interactive exit into a non-zero process result.
+    /// </summary>
+    internal void RenderExitSummary(CommandContext context, IAnsiConsole console, DateTimeOffset startedAt)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        ArgumentNullException.ThrowIfNull(console);
+
+        try
+        {
+            var snapshot = SessionExitSnapshot.Create(
+                context.Session,
+                context.ContextSnapshots?.Current,
+                startedAt,
+                this.timeProvider.GetUtcNow());
+            this.renderExitSummary(console, snapshot);
+        }
+        catch
+        {
+            // Best-effort: a snapshot-projection or console-output failure at teardown must not fail the
+            // already-clean interactive exit.
+        }
     }
 
     /// <summary>

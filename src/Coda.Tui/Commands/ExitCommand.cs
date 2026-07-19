@@ -1,6 +1,4 @@
-using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
-using Spectre.Console;
 
 namespace Coda.Tui.Commands;
 
@@ -19,7 +17,7 @@ public sealed class ExitCommand : ISlashCommand
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        context.Console.MarkupLine(Theme.DimMarkup("Goodbye."));
+        // The centralized post-exit session card is the only clean-exit output; no standalone line here.
         return Task.FromResult(CommandResult.Exit);
     }
 }

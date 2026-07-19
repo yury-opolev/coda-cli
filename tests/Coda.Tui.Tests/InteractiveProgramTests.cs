@@ -1,10 +1,15 @@
 using Coda.Tui;
+using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Host;
+using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
+using Spectre.Console;
+using Spectre.Console.Testing;
 
 namespace Coda.Tui.Tests;
 
@@ -265,5 +270,202 @@ public sealed class InteractiveProgramTests
             output.WriteLine($"{mode.ToString().ToLowerInvariant()} {line}");
             return 0;
         }
+    }
+}
+
+/// <summary>
+/// Lifecycle tests for the centralized clean-exit session card: it renders once, only after a clean
+/// host return (never during a mode switch or a faulted host run), uses the injected
+/// <see cref="TimeProvider"/> for the duration, degrades to a "not saved" card without a session id,
+/// and treats a render/output failure as best-effort so a clean exit still returns 0.
+/// </summary>
+public sealed class DefaultInteractiveSessionRunnerExitSummaryTests
+{
+    private static readonly DateTimeOffset Start = new(2026, 7, 19, 12, 0, 0, TimeSpan.Zero);
+
+    private static DefaultInteractiveSessionRunner NewRunner(
+        Action<IAnsiConsole, SessionExitSnapshot> renderSeam, TimeProvider? time = null) =>
+        new(TextWriter.Null, new TerminalCapabilities(false, true, 120, 40, true), time ?? TimeProvider.System, renderSeam);
+
+    private static Task<int> RunHostAsync(
+        DefaultInteractiveSessionRunner runner,
+        TuiHost host,
+        CommandContext context,
+        IAnsiConsole exitConsole,
+        TuiRunMode mode = TuiRunMode.Plain,
+        DateTimeOffset? startedAt = null,
+        Func<Task>? finalize = null) =>
+        runner.RunHostToCleanExitAsync(
+            host,
+            mode,
+            ComposerState.Empty,
+            context,
+            exitConsole,
+            startedAt ?? Start,
+            drainDispatch: _ => Task.CompletedTask,
+            flushUi: _ => Task.CompletedTask,
+            finalize: finalize ?? (() => Task.CompletedTask),
+            hostToken: CancellationToken.None,
+            cancellationToken: CancellationToken.None);
+
+    [Fact]
+    public async Task Clean_host_exit_renders_the_session_card_once()
+    {
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        var modeRunner = new ScriptedModeRunner(TuiShellExit.Exited);
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        var code = await RunHostAsync(runner, host, context, console);
+
+        Assert.Equal(0, code);
+        Assert.Equal(1, renderer.Count);
+    }
+
+    [Fact]
+    public async Task Mode_switches_do_not_render_intermediate_cards()
+    {
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        var modeRunner = new ScriptedModeRunner(
+            TuiShellExit.SwitchTo(TuiRunMode.Inline, ComposerState.Empty),
+            TuiShellExit.SwitchTo(TuiRunMode.Spectre, ComposerState.Empty),
+            TuiShellExit.Exited);
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        await RunHostAsync(runner, host, context, console, mode: TuiRunMode.Fullscreen);
+
+        Assert.Equal(3, modeRunner.Runs);
+        Assert.Equal(1, renderer.Count);
+    }
+
+    [Theory]
+    [InlineData("eof")]
+    [InlineData("command")]
+    [InlineData("chord")]
+    public async Task Clean_exit_seams_all_render_exactly_one_card(string seam)
+    {
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        var modeRunner = seam == "chord"
+            ? new ScriptedModeRunner(
+                TuiShellExit.SwitchTo(TuiRunMode.Plain, ComposerState.Empty), TuiShellExit.Exited)
+            : new ScriptedModeRunner(TuiShellExit.Exited);
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        var code = await RunHostAsync(runner, host, context, console);
+
+        Assert.Equal(0, code);
+        Assert.Equal(1, renderer.Count);
+    }
+
+    [Fact]
+    public async Task Faulted_host_run_does_not_render_a_card_but_still_finalizes()
+    {
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        var modeRunner = new ScriptedModeRunner(new InvalidOperationException("host fault"));
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        var finalized = false;
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            RunHostAsync(runner, host, context, console, finalize: () => { finalized = true; return Task.CompletedTask; }));
+
+        Assert.Empty(renderer.Snapshots);
+        Assert.True(finalized);
+    }
+
+    [Fact]
+    public void Exit_summary_for_unsaved_session_says_not_saved()
+    {
+        var console = new TestConsole();
+        console.Profile.Width = 200;
+        var runner = NewRunner(ExitSummaryRenderer.Render);
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.SessionId = null;
+
+        runner.RenderExitSummary(context, console, Start);
+
+        Assert.Contains("not saved", console.Output);
+        Assert.DoesNotContain("--resume", console.Output);
+    }
+
+    [Fact]
+    public void Exit_summary_uses_injected_time_provider_for_duration()
+    {
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render, new FixedTimeProvider(Start.AddSeconds(125)));
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+
+        runner.RenderExitSummary(context, new TestConsole(), Start);
+
+        Assert.Single(renderer.Snapshots);
+        Assert.Equal(TimeSpan.FromSeconds(125), renderer.Snapshots[0].Duration);
+    }
+
+    [Fact]
+    public void Exit_summary_render_failure_is_best_effort()
+    {
+        var runner = NewRunner((_, _) => throw new IOException("console gone"));
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+
+        var exception = Record.Exception(() => runner.RenderExitSummary(context, new TestConsole(), Start));
+
+        Assert.Null(exception);
+    }
+
+    [Fact]
+    public async Task Render_failure_keeps_the_exit_code_zero()
+    {
+        var runner = NewRunner((_, _) => throw new IOException("console gone"));
+        var modeRunner = new ScriptedModeRunner(TuiShellExit.Exited);
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        var code = await RunHostAsync(runner, host, context, console);
+
+        Assert.Equal(0, code);
+    }
+
+    private sealed class RecordingExitRenderer
+    {
+        public List<SessionExitSnapshot> Snapshots { get; } = [];
+
+        public int Count => this.Snapshots.Count;
+
+        public void Render(IAnsiConsole console, SessionExitSnapshot snapshot) => this.Snapshots.Add(snapshot);
+    }
+
+    private sealed class ScriptedModeRunner : ITuiModeRunner
+    {
+        private readonly Queue<TuiShellExit> outcomes;
+        private readonly Exception? fault;
+
+        public ScriptedModeRunner(params TuiShellExit[] outcomes) => this.outcomes = new Queue<TuiShellExit>(outcomes);
+
+        public ScriptedModeRunner(Exception fault)
+        {
+            this.fault = fault;
+            this.outcomes = new Queue<TuiShellExit>();
+        }
+
+        public int Runs { get; private set; }
+
+        public Task<TuiShellExit> RunAsync(TuiRunMode mode, ComposerState composer, CancellationToken cancellationToken)
+        {
+            this.Runs++;
+            return this.fault is not null
+                ? Task.FromException<TuiShellExit>(this.fault)
+                : Task.FromResult(this.outcomes.Dequeue());
+        }
+    }
+
+    private sealed class FixedTimeProvider(DateTimeOffset now) : TimeProvider
+    {
+        public override DateTimeOffset GetUtcNow() => now;
     }
 }
