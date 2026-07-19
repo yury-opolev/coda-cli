@@ -57,6 +57,30 @@ public sealed class AgentLoopTests
         }
     }
 
+    /// <summary>
+    /// A read-only probe that records the <see cref="ToolContext.AllowOutsideWorkingDirectory"/>
+    /// it was handed, then advances the shared <see cref="PermissionModeState"/> to the next
+    /// scripted mode — so the NEXT iteration's context is computed from the mutated live state.
+    /// </summary>
+    private sealed class SandboxProbeTool(PermissionModeState state, Queue<PermissionMode> nextModes, List<bool> observed) : ITool
+    {
+        public string Name => "probe";
+        public string Description => "probe";
+        public string InputSchemaJson => "{\"type\":\"object\"}";
+        public bool IsReadOnly => true;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
+        {
+            observed.Add(context.AllowOutsideWorkingDirectory);
+            if (nextModes.Count > 0)
+            {
+                state.Mode = nextModes.Dequeue();
+            }
+
+            return Task.FromResult(new ToolResult("ok"));
+        }
+    }
+
     private sealed class NullSink : IAgentSink
     {
         public void OnAssistantText(string delta) { }
@@ -81,6 +105,39 @@ public sealed class AgentLoopTests
     }
 
     private static AgentOptions Options() => new() { SystemPrompt = "sys", WorkingDirectory = ".", Model = "m" };
+
+    [Fact]
+    public async Task Tool_sandbox_reflects_live_mode_state_without_rebuilding_the_loop()
+    {
+        // A single loop instance, never rebuilt. The tool records the sandbox flag it is handed
+        // each iteration, then flips the shared live state so the NEXT context recomputes from it.
+        var state = new PermissionModeState(PermissionMode.Default);
+        var observed = new List<bool>();
+        var nextModes = new Queue<PermissionMode>([PermissionMode.BypassPermissions, PermissionMode.Default]);
+        var probe = new SandboxProbeTool(state, nextModes, observed);
+
+        var toolTurn = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock("tu", "probe", "{}")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+        var endTurn = new[]
+        {
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+
+        var loop = new AgentLoop(
+            new ScriptedClient(toolTurn, toolTurn, toolTurn, endTurn),
+            new ToolRegistry([probe]),
+            new AllowAllPermissionPrompt(),
+            Options() with { PermissionModeState = state });
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+        await loop.RunAsync(history, new NullSink(), CancellationToken.None);
+
+        // Default → sandbox on (false); Bypass → sandbox off (true); back to Default → on (false).
+        Assert.Equal([false, true, false], observed);
+    }
 
     [Fact]
     public async Task Runs_tool_then_completes_and_feeds_result_back()

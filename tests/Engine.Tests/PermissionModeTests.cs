@@ -42,6 +42,50 @@ public sealed class PermissionModeStateTests
 
     private static readonly ITool Run = new FakeTool("run_command", false);
 
+    /// <summary>A scripted client: each call returns the next pre-baked turn's events.</summary>
+    private sealed class ScriptedClient(params IReadOnlyList<AssistantStreamEvent>[] turns) : ILlmClient
+    {
+        private int turn;
+
+        public string ProviderId => "fake";
+
+        public async IAsyncEnumerable<AssistantStreamEvent> StreamAsync(
+            ChatRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var events = turns[this.turn++];
+            foreach (var e in events)
+            {
+                await Task.Yield();
+                yield return e;
+            }
+        }
+    }
+
+    /// <summary>A read-only probe that records the sandbox flag its tool context was handed.</summary>
+    private sealed class SandboxProbeTool(List<bool> observed) : ITool
+    {
+        public string Name => "probe";
+        public string Description => "probe";
+        public string InputSchemaJson => "{\"type\":\"object\"}";
+        public bool IsReadOnly => true;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
+        {
+            observed.Add(context.AllowOutsideWorkingDirectory);
+            return Task.FromResult(new ToolResult("ok"));
+        }
+    }
+
+    private sealed class NullSink : IAgentSink
+    {
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+    }
+
     [Fact]
     public void State_defaults_to_the_supplied_mode()
     {
@@ -135,6 +179,81 @@ public sealed class PermissionModeStateTests
             Assert.Equal(PermissionMode.Default, modePrompt.CurrentMode);
             state.Mode = PermissionMode.BypassPermissions;
             Assert.Equal(PermissionMode.BypassPermissions, modePrompt.CurrentMode);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public async Task Subagent_tool_sandbox_reflects_the_inherited_live_state_not_the_snapshot()
+    {
+        var root = Directory.CreateTempSubdirectory("coda_permstate_sub_").FullName;
+        try
+        {
+            // Snapshot mode is Default (sandbox on), but the shared live state is flipped to
+            // Bypass. A subagent must observe the live state, so its tool sees the sandbox off.
+            var state = new PermissionModeState(PermissionMode.Default);
+            state.Mode = PermissionMode.BypassPermissions;
+
+            var observed = new List<bool>();
+            var probe = new SandboxProbeTool(observed);
+
+            var toolTurn = new[]
+            {
+                AssistantStreamEvent.Tool(new ToolUseBlock("tu", "probe", "{}")),
+                AssistantStreamEvent.Finished("tool_use"),
+            };
+            var endTurn = new[] { AssistantStreamEvent.Finished("end_turn") };
+
+            var baseOptions = new AgentOptions
+            {
+                SystemPrompt = "sys",
+                WorkingDirectory = root,
+                Model = "m",
+                PermissionMode = PermissionMode.Default,
+                PermissionModeState = state,
+            };
+
+            var host = new SubagentHost(
+                new ScriptedClient(toolTurn, endTurn),
+                new ToolRegistry([probe]),
+                new AllowAllPermissionPrompt(),
+                baseOptions);
+
+            await host.RunSubagentAsync("general-purpose", "do it", new NullSink(), CancellationToken.None);
+
+            Assert.Equal([true], observed);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public void TurnPipeline_threads_the_live_state_into_the_agent_options()
+    {
+        var root = Directory.CreateTempSubdirectory("coda_permstate_opts_").FullName;
+        try
+        {
+            var state = new PermissionModeState(PermissionMode.Default);
+            var builder = NewBuilder();
+            var options = new SessionOptions
+            {
+                ProviderId = ClaudeAiProvider.Id,
+                Model = "claude-sonnet-4-6",
+                WorkingDirectory = root,
+                PermissionMode = PermissionMode.Default,
+                PermissionModeState = state,
+            };
+
+            var spec = builder.BuildSpec(options, new FakeClient(), CodaSettings.Empty);
+
+            // The agent options carry the exact same live-state instance, so the loop's per-request
+            // sandbox computation reads the same value the permission prompt does.
+            Assert.Same(state, spec.Options.PermissionModeState);
         }
         finally
         {
