@@ -59,4 +59,16 @@ public sealed class BannerTests
 
         Assert.Contains("not signed in", console.Output, StringComparison.OrdinalIgnoreCase);
     }
+
+    [Fact]
+    public void Render_shows_embedded_wordmark_first_and_last_rows()
+    {
+        var console = NewConsole();
+
+        Banner.Render(console, new SessionState("claude-ai", "C:\\work"));
+
+        var output = console.Output;
+        Assert.Contains(" ┌───┐      ┌┐", output);
+        Assert.Contains(" └───┘└──┘└──┘└───┘", output);
+    }
 }

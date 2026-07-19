@@ -131,6 +131,22 @@ public sealed class BrandingTests
     {
         Assert.False(string.IsNullOrWhiteSpace(Branding.Version));
     }
+
+    [Fact]
+    public void BannerLines_are_the_six_line_unicode_wordmark()
+    {
+        string[] expected =
+        [
+            " ┌───┐      ┌┐",
+            " │┬─┐│┌──┐┌─┘│┌──┐",
+            " ││ └┘│┬┐││┬┐││┬┐│",
+            " ││ ┌┐││││││││││││",
+            " │└─┴││└┴││└┴││└┴└┐",
+            " └───┘└──┘└──┘└───┘",
+        ];
+
+        Assert.Equal(expected, Branding.BannerLines);
+    }
 }
 
 public sealed class StatusFormatterTests

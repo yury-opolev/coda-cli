@@ -39,10 +39,11 @@ public static class Banner
         console.WriteLine();
     }
 
-    /// <summary>Big wordmark via Figlet, in the accent colour.</summary>
+    /// <summary>Big embedded Unicode wordmark, in the accent colour.</summary>
     private static void WordmarkInto(IAnsiConsole console)
     {
-        var figlet = new FigletText(Branding.ProductName).LeftJustified().Color(Theme.AccentColor);
-        console.Write(figlet);
+        var wordmark = string.Join(Environment.NewLine, Branding.BannerLines);
+        console.Write(new Text(wordmark, new Style(foreground: Theme.AccentColor)));
+        console.WriteLine();
     }
 }
