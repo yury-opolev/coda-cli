@@ -65,6 +65,24 @@ public static class InteractiveProgram
     }
 
     /// <summary>
+    /// Build the turn-scoped context-window snapshot cache the interactive session wires into its
+    /// <see cref="CommandContext"/>. The cache analyzes lazily and at most once per turn (populated by
+    /// the existing post-turn refresh in <c>AgentRunner</c> and by <c>/context</c>), reusing the same
+    /// one-shot analysis <see cref="Commands.ContextCommand"/> uses so no duplicate provider request is
+    /// issued. Reading <see cref="Coda.Tui.Ui.State.ContextSnapshotCache.Current"/> — as the exit card
+    /// does — never triggers analysis, so shutdown stays analysis-free. <paramref name="analyze"/> is a
+    /// test seam; production leaves it null.
+    /// </summary>
+    internal static Coda.Tui.Ui.State.ContextSnapshotCache CreateContextSnapshotCache(
+        CommandContext context,
+        Func<CancellationToken, Task<Coda.Sdk.ContextReport>>? analyze = null)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        return new Coda.Tui.Ui.State.ContextSnapshotCache(
+            analyze ?? (ct => Commands.ContextCommand.AnalyzeOnceAsync(context, ct)));
+    }
+
+    /// <summary>
     /// Parse <paramref name="args"/>, select the initial mode from <paramref name="capabilities"/>, and
     /// run it. Returns the process exit code; a bad launch request returns <c>2</c> after writing a
     /// one-line reason to <paramref name="error"/> without starting a terminal.
@@ -214,6 +232,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         context.Mcp = mcp;
         context.CredentialStore = store;
 
+        // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
+        // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only
+        // its already-computed Current report, so shutdown never triggers a fresh analysis.
+        context.ContextSnapshots = InteractiveProgram.CreateContextSnapshotCache(context);
+
         // Staleness-gated models.dev catalog refresh (best-effort; honors CODA_DISABLE_MODELS_FETCH).
         _ = Task.Run(async () =>
         {
@@ -269,8 +292,9 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                     .ConfigureAwait(false);
                 InteractiveProgram.RenderStartupBanner(context, mode, currentConnectedProviderId);
 
-                // Immutable initial metadata/MCP publication (git/context caches stay unwired, exactly as
-                // the legacy REPL, so no expensive analysis runs at startup).
+                // Immutable initial metadata/MCP publication. The git cache stays unwired and the context
+                // cache stays lazy (populated only after the first turn), exactly as the legacy REPL, so no
+                // expensive analysis runs at startup.
                 Publish(mailbox, SessionMetadataEvents.Build(context) with { Connected = currentConnectedProviderId is not null });
                 Publish(mailbox, new McpRuntimeChangedEvent(mcp.GetSnapshot()));
             }
@@ -446,7 +470,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
         try
         {
-            await host.RunAsync(mode, initialComposer, hostToken).ConfigureAwait(false);
+            var outcome = await host.RunAsync(mode, initialComposer, hostToken).ConfigureAwait(false);
 
             // A clean exit can leave a controller dispatch (a background command/turn) still running —
             // e.g. the Exit action stopped the shell mid-turn. Interrupt the active turn and observe the
@@ -460,9 +484,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             await flushUi(cancellationToken).ConfigureAwait(false);
 
             // The terminal is restored and the UI has drained: render the resumable session card exactly
-            // once, to the real console. Every clean seam (`/exit`, double Ctrl+C, EOF/terminal shutdown)
-            // converges here.
-            this.RenderExitSummary(context, exitConsole, startedAt);
+            // once, to the real console — but only for an actual clean Exit. A run that merely exhausted
+            // the fallback ladder after failures (Exhausted) already printed its own diagnostics and must
+            // not be crowned with a success card. Every clean seam (`/exit`, double Ctrl+C, EOF/terminal
+            // shutdown) converges on this single render.
+            if (outcome == TuiHostOutcome.Exited)
+            {
+                this.RenderExitSummary(context, exitConsole, startedAt);
+            }
         }
         finally
         {

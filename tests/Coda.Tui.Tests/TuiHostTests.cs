@@ -28,6 +28,51 @@ public sealed class TuiHostTests
     }
 
     [Fact]
+    public async Task Clean_exit_returns_exited_outcome()
+    {
+        var runner = new ScriptedRunner(
+            new Dictionary<TuiRunMode, Queue<TuiShellExit>>
+            {
+                [TuiRunMode.Inline] = new([TuiShellExit.Exited]),
+            });
+        var host = new TuiHost(runner, new StringWriter());
+
+        var outcome = await host.RunAsync(TuiRunMode.Inline, ComposerState.Empty);
+
+        Assert.Equal(TuiHostOutcome.Exited, outcome);
+    }
+
+    [Fact]
+    public async Task Exhausted_fallback_after_failures_returns_exhausted_outcome()
+    {
+        var runner = new ScriptedRunner(
+            new Dictionary<TuiRunMode, Queue<TuiShellExit>>
+            {
+                [TuiRunMode.Spectre] = new([TuiShellExit.Failed(new InvalidOperationException("spectre"))]),
+                [TuiRunMode.Plain] = new([TuiShellExit.Failed(new InvalidOperationException("plain"))]),
+            });
+        var host = new TuiHost(runner, new StringWriter());
+
+        var outcome = await host.RunAsync(TuiRunMode.Spectre, ComposerState.Empty);
+
+        Assert.Equal([TuiRunMode.Spectre, TuiRunMode.Plain], runner.Attempts);
+        Assert.Equal(TuiHostOutcome.Exhausted, outcome);
+    }
+
+    [Fact]
+    public async Task Cancelled_host_returns_exhausted_outcome()
+    {
+        var runner = new ScriptedRunner(new Dictionary<TuiRunMode, Queue<TuiShellExit>>());
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        var host = new TuiHost(runner, new StringWriter());
+
+        var outcome = await host.RunAsync(TuiRunMode.Inline, ComposerState.Empty, cts.Token);
+
+        Assert.Equal(TuiHostOutcome.Exhausted, outcome);
+    }
+
+    [Fact]
     public async Task Mode_switch_preserves_composer_state()
     {
         var draft = new ComposerState("draft", 2, ["one"], 1, false);

@@ -1,3 +1,4 @@
+using Coda.Sdk;
 using Coda.Tui;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -342,11 +343,12 @@ public sealed class DefaultInteractiveSessionRunnerExitSummaryTests
     }
 
     [Theory]
-    [InlineData("eof")]
-    [InlineData("command")]
+    [InlineData("direct")]
     [InlineData("chord")]
     public async Task Clean_exit_seams_all_render_exactly_one_card(string seam)
     {
+        // "direct" covers the identical `/exit` and EOF/terminal-shutdown seams (a single clean Exit);
+        // "chord" covers double Ctrl+C after a mode switch. All converge on one post-host render.
         var renderer = new RecordingExitRenderer();
         var runner = NewRunner(renderer.Render);
         var modeRunner = seam == "chord"
@@ -429,6 +431,109 @@ public sealed class DefaultInteractiveSessionRunnerExitSummaryTests
         var code = await RunHostAsync(runner, host, context, console);
 
         Assert.Equal(0, code);
+    }
+
+    [Fact]
+    public async Task Exhausted_fallback_after_failures_does_not_render_a_card()
+    {
+        // The fallback ladder is exhausted (Plain has no safer mode), so the host returns Exhausted, not a
+        // clean Exit — the success card must not appear on top of the failure diagnostics.
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        var modeRunner = new ScriptedModeRunner(TuiShellExit.Failed(new InvalidOperationException("boom")));
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        var code = await RunHostAsync(runner, host, context, console, mode: TuiRunMode.Plain);
+
+        Assert.Equal(0, code);
+        Assert.Empty(renderer.Snapshots);
+    }
+
+    [Fact]
+    public async Task Clean_exit_drains_then_flushes_then_renders_in_order()
+    {
+        var order = new List<string>();
+        var runner = NewRunner((_, _) => order.Add("render"));
+        var modeRunner = new ScriptedModeRunner(TuiShellExit.Exited);
+        var host = new TuiHost(modeRunner, TextWriter.Null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        await runner.RunHostToCleanExitAsync(
+            host,
+            TuiRunMode.Plain,
+            ComposerState.Empty,
+            context,
+            console,
+            Start,
+            drainDispatch: _ => { order.Add("drain"); return Task.CompletedTask; },
+            flushUi: _ => { order.Add("flush"); return Task.CompletedTask; },
+            finalize: () => Task.CompletedTask,
+            hostToken: CancellationToken.None,
+            cancellationToken: CancellationToken.None);
+
+        Assert.Equal(["drain", "flush", "render"], order);
+    }
+
+    [Fact]
+    public async Task Production_context_cache_wiring_exposes_the_latest_report_to_the_exit_snapshot()
+    {
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var analyzeCalls = 0;
+        var report = new ContextReport
+        {
+            Model = "test-model",
+            MaxTokens = 200_000,
+            UsedTokens = 9_000,
+            Categories = [],
+            IsExact = true,
+            MessageCount = 2,
+        };
+        context.ContextSnapshots = InteractiveProgram.CreateContextSnapshotCache(context, _ =>
+        {
+            analyzeCalls++;
+            return Task.FromResult(report);
+        });
+
+        // A completed turn/context flow computes and caches the report (mirrors AgentRunner post-turn refresh).
+        await context.ContextSnapshots.GetAsync(force: true);
+
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        runner.RenderExitSummary(context, new TestConsole(), Start);
+
+        Assert.Equal(1, analyzeCalls);
+        var snapshotContext = Assert.Single(renderer.Snapshots).Context;
+        Assert.NotNull(snapshotContext);
+        Assert.Equal(9_000, snapshotContext!.UsedTokens);
+        Assert.True(snapshotContext.IsExact);
+    }
+
+    [Fact]
+    public void Exit_card_never_triggers_context_analysis_at_shutdown()
+    {
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var analyzeCalls = 0;
+        context.ContextSnapshots = InteractiveProgram.CreateContextSnapshotCache(context, _ =>
+        {
+            analyzeCalls++;
+            return Task.FromResult(new ContextReport
+            {
+                Model = "test-model",
+                MaxTokens = 1,
+                UsedTokens = 0,
+                Categories = [],
+                IsExact = true,
+                MessageCount = 0,
+            });
+        });
+
+        var renderer = new RecordingExitRenderer();
+        var runner = NewRunner(renderer.Render);
+        runner.RenderExitSummary(context, new TestConsole(), Start);
+
+        Assert.Equal(0, analyzeCalls);
+        Assert.Null(Assert.Single(renderer.Snapshots).Context);
     }
 
     private sealed class RecordingExitRenderer

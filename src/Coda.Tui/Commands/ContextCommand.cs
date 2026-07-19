@@ -74,7 +74,7 @@ public sealed class ContextCommand : ISlashCommand
         return CommandResult.Continue;
     }
 
-    private static async Task<ContextReport> AnalyzeOnceAsync(CommandContext context, CancellationToken cancellationToken)
+    internal static async Task<ContextReport> AnalyzeOnceAsync(CommandContext context, CancellationToken cancellationToken)
     {
         var options = new SessionOptions
         {

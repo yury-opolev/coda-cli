@@ -4,6 +4,19 @@ using Coda.Tui.Ui.Mode;
 
 namespace Coda.Tui.Ui.Host;
 
+/// <summary>How the host's mode lifecycle ended.</summary>
+public enum TuiHostOutcome
+{
+    /// <summary>A mode exited cleanly at the user's request — the only outcome that shows the exit card.</summary>
+    Exited,
+
+    /// <summary>
+    /// The host stopped without a clean exit: the fallback ladder was exhausted after failures, the
+    /// mode-switch budget/target ran out, or cancellation was requested. No success card is shown.
+    /// </summary>
+    Exhausted,
+}
+
 /// <summary>
 /// Owns the interactive-mode lifecycle above a single <see cref="ITuiModeRunner"/>: it starts the
 /// requested mode, honors mode-switch requests, and walks the migration fallback ladder
@@ -33,10 +46,12 @@ public sealed class TuiHost
 
     /// <summary>
     /// Run <paramref name="initial"/> and, on failure, fall back through safer modes; on a mode switch,
-    /// run exactly the requested mode carrying <paramref name="composer"/>. Returns once a mode exits
-    /// cleanly, no safer mode remains, or cancellation is requested.
+    /// run exactly the requested mode carrying <paramref name="composer"/>. Returns
+    /// <see cref="TuiHostOutcome.Exited"/> once a mode exits cleanly, or
+    /// <see cref="TuiHostOutcome.Exhausted"/> when no safer mode remains, the switch budget/target runs
+    /// out, or cancellation is requested.
     /// </summary>
-    public async Task RunAsync(TuiRunMode initial, ComposerState composer, CancellationToken cancellationToken = default)
+    public async Task<TuiHostOutcome> RunAsync(TuiRunMode initial, ComposerState composer, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(composer);
 
@@ -54,13 +69,13 @@ public sealed class TuiHost
             {
                 case TuiShellExitKind.Exit:
                     this.ReportCleanup(mode, exit);
-                    return;
+                    return TuiHostOutcome.Exited;
 
                 case TuiShellExitKind.SwitchMode:
                     this.ReportCleanup(mode, exit);
                     if (++switches > MaxModeSwitches || exit.NextMode is not { } next)
                     {
-                        return;
+                        return TuiHostOutcome.Exhausted;
                     }
 
                     current = exit.Composer;
@@ -78,16 +93,18 @@ public sealed class TuiHost
 
                     if (NextSaferMode(mode) is not { } safer)
                     {
-                        return;
+                        return TuiHostOutcome.Exhausted;
                     }
 
                     mode = safer;
                     continue;
 
                 default:
-                    return;
+                    return TuiHostOutcome.Exhausted;
             }
         }
+
+        return TuiHostOutcome.Exhausted;
     }
 
     /// <summary>
