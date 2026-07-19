@@ -603,11 +603,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         menu.MakeVisible(screenPosition);
     }
-    /// cleared with a deterministic "0 symbols copied to clipboard" confirmation without touching the clipboard
-    /// writer. Otherwise, on a successful write the selection highlight is cleared and a transient
-    /// "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds; when the clipboard is unavailable
-    /// the selection is preserved and a transient "Clipboard unavailable" Warning is pinned instead. The draft
-    /// text and caret are never mutated.
+
+    /// <summary>
+    /// Copies the active composer selection to the clipboard. When the selection contains zero copyable symbols
+    /// the selection is cleared with a deterministic "0 symbols copied to clipboard" confirmation without
+    /// touching the clipboard writer. Otherwise, on a successful write the selection highlight is cleared and a
+    /// transient "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds; when the clipboard is
+    /// unavailable the selection is preserved and a transient "Clipboard unavailable" Warning is pinned instead.
+    /// The draft text and caret are never mutated.
     /// </summary>
     private void CopyComposerSelection(string text)
     {
