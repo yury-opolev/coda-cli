@@ -140,6 +140,42 @@ public sealed class AgentLoopTests
     }
 
     [Fact]
+    public async Task Tool_sandbox_recomputes_between_tools_in_the_same_batch()
+    {
+        // A single assistant turn requests TWO tools. The first probe flips the shared live state,
+        // so the SECOND tool in the SAME batch must observe the recomputed sandbox flag — proving
+        // the flag is computed per individual tool execution, not once per assistant tool batch.
+        var state = new PermissionModeState(PermissionMode.Default);
+        var observed = new List<bool>();
+        var nextModes = new Queue<PermissionMode>([PermissionMode.BypassPermissions]);
+        var probe = new SandboxProbeTool(state, nextModes, observed);
+
+        var toolTurn = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock("tu1", "probe", "{}")),
+            AssistantStreamEvent.Tool(new ToolUseBlock("tu2", "probe", "{}")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+        var endTurn = new[]
+        {
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+
+        var loop = new AgentLoop(
+            new ScriptedClient(toolTurn, endTurn),
+            new ToolRegistry([probe]),
+            new AllowAllPermissionPrompt(),
+            Options() with { PermissionModeState = state });
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+        await loop.RunAsync(history, new NullSink(), CancellationToken.None);
+
+        // First tool: Default → sandbox on (false), then flips the live state to Bypass.
+        // Second tool (same batch): Bypass → sandbox off (true).
+        Assert.Equal([false, true], observed);
+    }
+
+    [Fact]
     public async Task Runs_tool_then_completes_and_feeds_result_back()
     {
         // Turn 1: assistant asks to call echo (stop_reason tool_use).

@@ -119,10 +119,10 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
     }
 
     [Fact]
-    public async Task Bypass_with_classifier_yields_ClassifierPermissionPrompt()
+    public async Task Bypass_with_classifier_yields_LiveBypassClassifierPermissionPrompt()
     {
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: true));
-        Assert.IsType<ClassifierPermissionPrompt>(spec.Permissions);
+        Assert.IsType<LiveBypassClassifierPermissionPrompt>(spec.Permissions);
     }
 
     [Fact]

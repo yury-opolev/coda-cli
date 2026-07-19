@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Classifier;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
 using Coda.Agent.Teams;
@@ -38,6 +39,18 @@ public sealed class PermissionModeStateTests
         public bool IsReadOnly => readOnly;
         public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
             => Task.FromResult(new ToolResult("ok"));
+    }
+
+    /// <summary>A classifier that records how many times it was consulted and returns a scripted verdict.</summary>
+    private sealed class CountingClassifier(ToolActionVerdict verdict) : IToolActionClassifier
+    {
+        public int Calls { get; private set; }
+
+        public Task<ToolActionVerdict> ClassifyAsync(string toolName, string inputJson, CancellationToken cancellationToken = default)
+        {
+            this.Calls++;
+            return Task.FromResult(verdict);
+        }
     }
 
     private static readonly ITool Run = new FakeTool("run_command", false);
@@ -147,6 +160,61 @@ public sealed class PermissionModeStateTests
         var gate = new ModePermissionPrompt(PermissionMode.BypassPermissions, inner);
         Assert.True(await gate.RequestAsync(Run, "x", CancellationToken.None));
         Assert.Equal(0, inner.Calls);
+    }
+
+    [Fact]
+    public async Task Live_default_to_bypass_starts_using_the_classifier()
+    {
+        var inner = new CountingPrompt(true);
+        var classifier = new CountingClassifier(ToolActionVerdict.Allow);
+        var state = new PermissionModeState(PermissionMode.Default);
+        var gate = new LiveBypassClassifierPermissionPrompt(state, classifier, inner);
+
+        // Default mode: the classifier is untouched; the mutating tool asks the inner prompt.
+        Assert.True(await gate.RequestAsync(Run, "x", CancellationToken.None));
+        Assert.Equal(0, classifier.Calls);
+        Assert.Equal(1, inner.Calls);
+
+        // Flip to Bypass mid-run: the NEXT decision routes through the classifier (allow, no ask).
+        state.Mode = PermissionMode.BypassPermissions;
+        Assert.True(await gate.RequestAsync(Run, "x", CancellationToken.None));
+        Assert.Equal(1, classifier.Calls);
+        Assert.Equal(1, inner.Calls);
+    }
+
+    [Fact]
+    public async Task Live_bypass_to_default_stops_using_the_classifier_and_asks()
+    {
+        var inner = new CountingPrompt(true);
+        var classifier = new CountingClassifier(ToolActionVerdict.Allow);
+        var state = new PermissionModeState(PermissionMode.BypassPermissions);
+        var gate = new LiveBypassClassifierPermissionPrompt(state, classifier, inner);
+
+        // Bypass mode: the classifier decides (allow), the inner prompt is not consulted.
+        Assert.True(await gate.RequestAsync(Run, "x", CancellationToken.None));
+        Assert.Equal(1, classifier.Calls);
+        Assert.Equal(0, inner.Calls);
+
+        // Flip back to Default mid-run: the classifier is no longer used; the mutating tool asks.
+        state.Mode = PermissionMode.Default;
+        Assert.True(await gate.RequestAsync(Run, "x", CancellationToken.None));
+        Assert.Equal(1, classifier.Calls);
+        Assert.Equal(1, inner.Calls);
+    }
+
+    [Fact]
+    public async Task Fixed_bypass_classifier_escalates_risky_actions_to_the_inner_prompt()
+    {
+        // A fixed Bypass state (no mid-run change) preserves the classic classifier behaviour:
+        // a risky verdict (Ask) escalates to the inner prompt, whose answer is the decision.
+        var inner = new CountingPrompt(false);
+        var classifier = new CountingClassifier(ToolActionVerdict.Ask("risky"));
+        var state = new PermissionModeState(PermissionMode.BypassPermissions);
+        var gate = new LiveBypassClassifierPermissionPrompt(state, classifier, inner);
+
+        Assert.False(await gate.RequestAsync(Run, "x", CancellationToken.None));
+        Assert.Equal(1, classifier.Calls);
+        Assert.Equal(1, inner.Calls);
     }
 
     [Fact]

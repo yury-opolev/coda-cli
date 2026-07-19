@@ -97,14 +97,14 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     // ---- Permissions: classifier on/off ----
 
     [Fact]
-    public void Bypass_with_classifier_yields_classifier_prompt()
+    public void Bypass_with_classifier_yields_live_classifier_prompt()
     {
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(
             this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: true),
             this.Client(),
             CodaSettings.Empty);
-        Assert.IsType<ClassifierPermissionPrompt>(spec.Permissions);
+        Assert.IsType<LiveBypassClassifierPermissionPrompt>(spec.Permissions);
     }
 
     [Fact]
