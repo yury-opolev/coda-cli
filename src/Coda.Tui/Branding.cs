@@ -19,12 +19,15 @@ public static class Branding
 
     public const string DimColor = "grey50";
 
-    /// <summary>Small decorative accent shown beside the wordmark.</summary>
+    /// <summary>The six-line Unicode wordmark spelling "Coda", rendered in the accent colour.</summary>
     public static IReadOnlyList<string> BannerLines { get; } =
     [
-        "    *      ",
-        "  *  ◆  *  ",
-        "    *      ",
+        " ┌───┐      ┌┐",
+        " │┬─┐│┌──┐┌─┘│┌──┐",
+        " ││ └┘│┬┐││┬┐││┬┐│",
+        " ││ ┌┐││││││││││││",
+        " │└─┴││└┴││└┴││└┴└┐",
+        " └───┘└──┘└──┘└───┘",
     ];
 
     /// <summary>Assembly informational version (without the +sha suffix), e.g. "0.1.2".</summary>
