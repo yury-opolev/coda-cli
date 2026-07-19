@@ -13,6 +13,17 @@ Replace the generated Figlet startup wordmark with the six-line Unicode logo sup
 - Keep the welcome panel, version, provider/model, working directory, and command hints unchanged.
 - The source file's initial blank line is not part of the embedded logo.
 
+The embedded rows use the refreshed file contents:
+
+```text
+ ┌───┐      ┌┐
+ │┬─┐│┌──┐┌─┘│┌──┐
+ ││ └┘│┬┐││┬┐││┬┐│
+ ││ ┌┐││││││││││││
+ │└─┴││└┴││└┴││└┴└┐
+ └───┘└──┘└──┘└───┘
+```
+
 ## Testing
 
 - Add a banner test that asserts the supplied first and last rows appear in rendered output.
