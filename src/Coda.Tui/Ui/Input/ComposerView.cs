@@ -323,26 +323,46 @@ internal sealed class ComposerView : TextView
         var flags = mouse.Flags;
 
         // A copy was already raised on the left press; swallow the rest of the sequence so the release/click
-        // can't start a fresh native drag after the shell clears the old selection.
+        // can't start a fresh native drag after the shell clears the old selection. Terminal.Gui delivers the
+        // gesture as press, release, then a synthesized click, so suppression must survive the release and only
+        // lift on that terminal click — otherwise the trailing click leaks through to the base editor and
+        // repositions the caret.
         if (this.suppressLeftGesture)
         {
-            if (flags.HasFlag(MouseFlags.LeftButtonClicked) || flags.HasFlag(MouseFlags.LeftButtonReleased))
+            if (IsGestureStartingPress(flags))
             {
+                // A truncated gesture (a drag emits no synthesized click) would otherwise leave suppression
+                // armed forever; a fresh press begins a new gesture, so recover and reinterpret it here.
                 this.suppressLeftGesture = false;
             }
+            else
+            {
+                if (flags.HasFlag(MouseFlags.LeftButtonClicked))
+                {
+                    this.suppressLeftGesture = false;
+                }
 
-            return true;
+                return true;
+            }
         }
 
-        // A copy was already raised on the right press; swallow the complete right gesture.
+        // A copy was already raised on the right press; swallow the complete right gesture through its
+        // terminal synthesized click so it can never reach the native context menu.
         if (this.suppressRightGesture)
         {
-            if (flags.HasFlag(MouseFlags.RightButtonClicked) || flags.HasFlag(MouseFlags.RightButtonReleased))
+            if (IsGestureStartingPress(flags))
             {
                 this.suppressRightGesture = false;
             }
+            else
+            {
+                if (flags.HasFlag(MouseFlags.RightButtonClicked))
+                {
+                    this.suppressRightGesture = false;
+                }
 
-            return true;
+                return true;
+            }
         }
 
         // The caret was positioned on the right press; raise exactly one paste when the click completes and
@@ -399,6 +419,18 @@ internal sealed class ComposerView : TextView
         handled = false;
         return false;
     }
+
+    /// <summary>
+    /// True when <paramref name="flags"/> mark the fresh start of a new pointer gesture — a button press that
+    /// is not a drag move (<see cref="MouseFlags.PositionReport"/>). Used to recover a suppression that a
+    /// truncated gesture (for example a drag, which emits no synthesized click) would otherwise leave armed
+    /// forever, so the next real gesture is reinterpreted instead of swallowed.
+    /// </summary>
+    private static bool IsGestureStartingPress(MouseFlags flags) =>
+        !flags.HasFlag(MouseFlags.PositionReport)
+        && (flags.HasFlag(MouseFlags.LeftButtonPressed)
+            || flags.HasFlag(MouseFlags.RightButtonPressed)
+            || flags.HasFlag(MouseFlags.MiddleButtonPressed));
 
     /// <summary>
     /// Positions the native caret from a right press by replaying it as an equivalent left-button press

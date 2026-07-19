@@ -148,6 +148,147 @@ public sealed class ComposerPointerActionTests
     }
 
     [Fact]
+    public void Left_copy_consumes_the_complete_press_release_click_gesture()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 20, height: 4);
+        view.SetDraft("alpha beta gamma", 0);
+        DragSelect(view, fromColumn: 0, toColumn: 5);
+        Assert.Equal("alpha", view.SelectedComposerText);
+
+        var actions = Capture(view);
+
+        // Once a copy has been claimed, the rest of the gesture must never re-enter the native editor: any
+        // native caret positioning raises UnwrappedCursorPositionChanged, so seeing it after the copy proves
+        // the trailing click leaked through to the base TextView (repositioning the caret / dropping the
+        // selection).
+        var copyRaised = false;
+        var nativeActivityAfterCopy = false;
+        view.PointerActionRequested += (_, e) =>
+        {
+            if (e.Kind == ComposerPointerActionKind.CopySelection)
+            {
+                copyRaised = true;
+            }
+        };
+        view.UnwrappedCursorPositionChanged += (_, _) =>
+        {
+            if (copyRaised)
+            {
+                nativeActivityAfterCopy = true;
+            }
+        };
+
+        var caretBeforeGesture = view.InsertionPoint;
+
+        // The real interpreter delivers a button gesture as press, release, then a synthesized click.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonClicked, Position = new Point(2, 0) });
+
+        Assert.Single(actions);
+        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
+        Assert.Equal("alpha", actions[0].SelectedText);
+
+        // The trailing release/click never repositions the caret or starts a new drag: the selection this test
+        // deliberately leaves intact survives and the caret is unchanged.
+        Assert.False(nativeActivityAfterCopy, "the completing release/click must not re-enter the native editor");
+        Assert.True(view.HasComposerSelection);
+        Assert.Equal("alpha", view.SelectedComposerText);
+        Assert.Equal(caretBeforeGesture, view.InsertionPoint);
+    }
+
+    [Fact]
+    public void Right_copy_consumes_the_complete_gesture_and_never_opens_the_context_menu()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 20, height: 4);
+        view.SetDraft("alpha beta gamma", 0);
+        DragSelect(view, fromColumn: 0, toColumn: 5);
+        Assert.Equal("alpha", view.SelectedComposerText);
+
+        var actions = Capture(view);
+
+        var copyRaised = false;
+        var nativeActivityAfterCopy = false;
+        view.PointerActionRequested += (_, e) =>
+        {
+            if (e.Kind == ComposerPointerActionKind.CopySelection)
+            {
+                copyRaised = true;
+            }
+        };
+        view.UnwrappedCursorPositionChanged += (_, _) =>
+        {
+            if (copyRaised)
+            {
+                nativeActivityAfterCopy = true;
+            }
+        };
+
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonClicked, Position = new Point(2, 0) });
+
+        Assert.Single(actions);
+        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
+        Assert.DoesNotContain(actions, a => a.Kind == ComposerPointerActionKind.PasteClipboard);
+
+        // The synthesized right click is fully consumed, so it can never reach the native TextView that would
+        // otherwise raise its own context menu.
+        Assert.False(nativeActivityAfterCopy, "the completing right click must not re-enter the native editor");
+        Assert.True(view.ContextMenu is null || !view.ContextMenu.Visible, "no native context menu may open after a copy");
+    }
+
+    [Fact]
+    public void Left_copy_recovers_when_the_gesture_never_delivers_a_synthesized_click()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 20, height: 4);
+        view.SetDraft("alpha beta gamma", 0);
+        DragSelect(view, fromColumn: 0, toColumn: 5);
+
+        var actions = Capture(view);
+
+        // The first left press over the selection claims a copy and arms suppression.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
+        Assert.Single(actions);
+
+        // A truncated gesture ends with a release but no synthesized click (a drag emits none), so suppression
+        // is never cleared by a terminal click.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
+
+        // A fresh press starts a new gesture and must not be swallowed by the stale suppression: it recovers
+        // and copies again over the still-present selection.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(3, 0) });
+
+        Assert.Equal(2, actions.Count);
+        Assert.All(actions, a => Assert.Equal(ComposerPointerActionKind.CopySelection, a.Kind));
+    }
+
+    [Fact]
+    public void Right_copy_recovers_when_the_gesture_never_delivers_a_synthesized_click()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 20, height: 4);
+        view.SetDraft("alpha beta gamma", 0);
+        DragSelect(view, fromColumn: 0, toColumn: 5);
+
+        var actions = Capture(view);
+
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 0) });
+        Assert.Single(actions);
+
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 0) });
+
+        // A fresh right press recovers the stale suppression and copies again rather than being swallowed.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(3, 0) });
+
+        Assert.Equal(2, actions.Count);
+        Assert.All(actions, a => Assert.Equal(ComposerPointerActionKind.CopySelection, a.Kind));
+    }
+
+    [Fact]
     public void Middle_click_requests_context_menu_at_screen_position()
     {
         var controller = CreateController();
