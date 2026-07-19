@@ -289,6 +289,108 @@ public sealed class ComposerPointerActionTests
     }
 
     [Fact]
+    public void Right_double_click_without_selection_completes_the_second_gesture_and_clears_state()
+    {
+        const string draft = "alpha beta gamma";
+        var controller = CreateController();
+
+        // Soft word-wrap at width 6 lays this out across multiple visual rows.
+        using var view = CreateLaidOutView(controller, width: 6, height: 4);
+        view.SetDraft(draft, 0);
+
+        var actions = Capture(view);
+
+        // Policy: every completed physical right click may request paste exactly once. Terminal.Gui delivers
+        // the first physical click as press, release, then a synthesized RightButtonClicked.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 1) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 1) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonClicked, Position = new Point(2, 1) });
+
+        Assert.Single(actions);
+        Assert.Equal(ComposerPointerActionKind.PasteClipboard, actions[0].Kind);
+
+        // The second physical click terminates with the distinct RightButtonDoubleClicked bit. It must complete
+        // the second armed gesture — requesting exactly one more paste — and leave no pending state behind.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonDoubleClicked, Position = new Point(2, 0) });
+
+        Assert.Equal(2, actions.Count);
+        Assert.All(actions, a => Assert.Equal(ComposerPointerActionKind.PasteClipboard, a.Kind));
+
+        // Proof the pointer path is not wedged: a fresh left press now reaches native handling and moves the
+        // caret (raising UnwrappedCursorPositionChanged) instead of being swallowed by stale pending state.
+        Point unwrapped = new(-1, -1);
+        view.UnwrappedCursorPositionChanged += (_, p) => unwrapped = p;
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(0, 0) });
+
+        Assert.NotEqual(new Point(-1, -1), unwrapped);
+        Assert.Equal(2, actions.Count);
+    }
+
+    [Fact]
+    public void Right_triple_click_terminal_completes_one_gesture_and_clears_state()
+    {
+        const string draft = "alpha beta gamma";
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 6, height: 4);
+        view.SetDraft(draft, 0);
+
+        var actions = Capture(view);
+
+        // A physical right click whose terminal event carries the RightButtonTripleClicked bit must complete
+        // the single armed gesture — emitting exactly one paste — with consistent completion semantics
+        // (clicked/double/triple all complete one armed right gesture).
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 1) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 1) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonTripleClicked, Position = new Point(2, 1) });
+
+        Assert.Single(actions);
+        Assert.Equal(ComposerPointerActionKind.PasteClipboard, actions[0].Kind);
+
+        // State is clear afterwards: a fresh left press reaches native handling and moves the caret rather than
+        // being swallowed, and no further paste is emitted.
+        Point unwrapped = new(-1, -1);
+        view.UnwrappedCursorPositionChanged += (_, p) => unwrapped = p;
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(0, 0) });
+
+        Assert.NotEqual(new Point(-1, -1), unwrapped);
+        Assert.Single(actions);
+    }
+
+    [Fact]
+    public void Truncated_right_paste_recovers_on_a_fresh_press_and_never_pastes_at_the_stale_caret()
+    {
+        const string draft = "alpha beta gamma";
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 6, height: 4);
+        view.SetDraft(draft, 0);
+
+        var actions = Capture(view);
+
+        // A right press arms a pending paste and positions the caret, but the gesture is truncated: a release
+        // arrives with no terminal click (off-view / grab-loss), leaving the pending paste armed indefinitely.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 1) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 1) });
+        Assert.Empty(actions);
+
+        // A fresh left press starts a new gesture; it must clear the stale pending state and be reinterpreted
+        // (reaching native caret positioning) rather than being swallowed.
+        Point unwrapped = new(-1, -1);
+        view.UnwrappedCursorPositionChanged += (_, p) => unwrapped = p;
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(0, 0) });
+
+        Assert.NotEqual(new Point(-1, -1), unwrapped);
+
+        // The stale pending paste must never fire later at the abandoned caret: completing the new left gesture
+        // raises no paste action at all.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(0, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonClicked, Position = new Point(0, 0) });
+
+        Assert.DoesNotContain(actions, a => a.Kind == ComposerPointerActionKind.PasteClipboard);
+    }
+
+    [Fact]
     public void Middle_click_requests_context_menu_at_screen_position()
     {
         var controller = CreateController();
