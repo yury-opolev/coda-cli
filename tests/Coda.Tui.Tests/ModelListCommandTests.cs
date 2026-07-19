@@ -1,10 +1,40 @@
 using Coda.Sdk;
+using Coda.Tui.Commands;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Prompts;
 
 namespace Coda.Tui.Tests;
 
 public sealed class ModelListCommandTests
 {
+    [Fact]
+    public async Task Selecting_current_model_does_not_persist_or_publish_a_change()
+    {
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["model-a"], null));
+        var events = new RecordingUiEvents();
+        var (_, context, console, _) = TestAppBuilder.BuildApp(prompts: prompts, events: events);
+        context.Session.Model = "model-a";
+        context.Session.ModelListCache[context.Session.ActiveProviderId] = new ModelListResult(
+            context.Session.ActiveProviderId,
+            ModelSource.Catalog,
+            [new ModelListEntry("model-a", "A", 200_000), new ModelListEntry("model-b", "B", 200_000)]);
+
+        var persistCount = 0;
+        var command = new ModelCommand((_, _) =>
+        {
+            persistCount++;
+            return "note";
+        });
+
+        await command.ExecuteAsync(context, Array.Empty<string>(), CancellationToken.None);
+
+        Assert.Equal(0, persistCount);
+        Assert.Equal("model-a", context.Session.Model);
+        Assert.DoesNotContain(events.Events, e => e is SessionMetadataChangedEvent);
+        Assert.Contains("Already using", console.Output);
+    }
+
     [Fact]
     public async Task Model_without_args_falls_back_to_catalog_when_live_unavailable()
     {

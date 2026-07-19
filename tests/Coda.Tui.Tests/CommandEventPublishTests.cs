@@ -87,10 +87,11 @@ public sealed class CommandEventPublishTests : IDisposable
     {
         var (context, events, _) = this.Build();
 
-        await new ModelCommand().ExecuteAsync(context, ["claude-sonnet-4-6"], CancellationToken.None);
+        // Switch to a model different from the session default, so this is a real change (not a no-op).
+        await new ModelCommand().ExecuteAsync(context, ["claude-opus-4-8"], CancellationToken.None);
 
         var metadata = Single<SessionMetadataChangedEvent>(events);
-        Assert.Equal("claude-sonnet-4-6", metadata.Model);
+        Assert.Equal("claude-opus-4-8", metadata.Model);
     }
 
     [Fact]

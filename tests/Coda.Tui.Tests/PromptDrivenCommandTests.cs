@@ -76,6 +76,27 @@ public sealed class PromptDrivenCommandTests : IDisposable
     }
 
     [Fact]
+    public async Task Model_picker_marks_and_defaults_to_current_model()
+    {
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["model-b"], null));
+        var built = TestAppBuilder.BuildApp(prompts: prompts);
+        built.Context.Session.Model = "MODEL-B"; // differently-cased session string
+        var models = new ModelListResult(
+            built.Context.ActiveProvider.Id,
+            ModelSource.Catalog,
+            [new ModelListEntry("model-a", "A", 200_000), new ModelListEntry("model-b", "B", 200_000)]);
+
+        await ModelCommand.ChooseModelAsync(built.Context, models);
+
+        var request = Assert.Single(prompts.Requests);
+        Assert.Equal("model-b", request.DefaultValue); // canonical list spelling, usable as ordinal default
+        var optionA = request.Options.Single(option => option.Id == "model-a");
+        var optionB = request.Options.Single(option => option.Id == "model-b");
+        Assert.True(optionB.IsCurrent);
+        Assert.False(optionA.IsCurrent);
+    }
+
+    [Fact]
     public async Task Resume_without_id_prompts_with_recent_session_ids()
     {
         await new SessionTranscriptStore(this.tempDir).SaveAsync(

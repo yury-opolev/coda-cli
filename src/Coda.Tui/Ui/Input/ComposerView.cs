@@ -26,6 +26,9 @@ internal sealed class ComposerView : TextView
     private bool caretPlaced;
     private System.Drawing.Point lastUnwrappedPosition;
     private bool inputEnabled = true;
+    private bool suppressLeftGesture;
+    private bool suppressRightGesture;
+    private bool pendingRightPaste;
     private IReadOnlyList<ISlashCommand> lastSuggestions = [];
     private int lastSelectedIndex = -1;
 
@@ -62,6 +65,14 @@ internal sealed class ComposerView : TextView
 
     /// <summary>Raised for shell-level actions (interrupt, exit, toggle mode, transcript scrolling, ...).</summary>
     public event EventHandler<UiAction>? ActionRequested;
+
+    /// <summary>
+    /// Raised when a pointer gesture over the composer resolves to a semantic clipboard/context action —
+    /// copy the current selection, paste at the caret, or show the context menu. The composer only classifies
+    /// the gesture (using the native <see cref="TextView"/> selection and caret); the shell performs the
+    /// clipboard I/O and menu presentation. See <see cref="ComposerPointerActionRequestedEventArgs"/>.
+    /// </summary>
+    internal event EventHandler<ComposerPointerActionRequestedEventArgs>? PointerActionRequested;
 
     /// <summary>
     /// Raised whenever the composer's measured content or caret may have changed — a draft replacement,
@@ -106,6 +117,32 @@ internal sealed class ComposerView : TextView
     {
         get => this.inputEnabled;
         set => this.inputEnabled = value;
+    }
+
+    /// <summary>
+    /// Whether the composer currently has a non-empty native <see cref="TextView"/> selection. Backed by the
+    /// real selection length so it tracks whatever the base editor selected via keyboard or mouse drag.
+    /// </summary>
+    internal bool HasComposerSelection => this.SelectedLength > 0;
+
+    /// <summary>The native <see cref="TextView.SelectedText"/>, or an empty string when nothing is selected.</summary>
+    internal string SelectedComposerText => this.SelectedText ?? string.Empty;
+
+    /// <summary>
+    /// Whether a left copy gesture has armed suppression of the remainder of its click sequence. It is set on
+    /// the copy press and cleared by the gesture's terminal click; it must never remain armed after the
+    /// gesture completes. Exposed for tests only so the completion contract can be asserted directly.
+    /// </summary>
+    internal bool LeftGestureSuppressed => this.suppressLeftGesture;
+
+    /// <summary>
+    /// Clears only the native selection highlight and repaints. It never mutates the draft text or moves the
+    /// caret, so the shell can drop a selection (e.g. after a copy) without disturbing the edit position.
+    /// </summary>
+    internal void ClearComposerSelection()
+    {
+        this.IsSelecting = false;
+        this.SetNeedsDraw();
     }
 
     /// <summary>
@@ -247,6 +284,249 @@ internal sealed class ComposerView : TextView
         return handled;
     }
 
+    /// <summary>
+    /// Arbitrates a mouse event between semantic composer actions and native editing. Gestures are first
+    /// classified into semantic pointer actions (copy, paste, context menu) by
+    /// <see cref="TryHandlePointerGesture"/>; anything not owned there falls through to the base
+    /// <see cref="TextView"/>, which positions the caret from a mouse click/drag. That native move is mirrored
+    /// into the controller — the caret source of truth. The base editor owns caret positioning for the mouse,
+    /// so rather than mapping the raw pointer x/y through the Coda wrap (which can diverge from the editor's own
+    /// wrapping), the caret it settles on raises <c>UnwrappedCursorPositionChanged</c> and — because
+    /// <see cref="syncingNativeInput"/> is set for the duration — is mirrored from its wrap-independent
+    /// unwrapped position back to a UTF-16 index. That keeps the controller caret on exactly the clicked
+    /// character across soft/hard word-wrap, so a following Delete removes it instead of a stale one and the
+    /// caret never snaps to the first visual row. A layout pass never routes through here, so it can never
+    /// corrupt the controller.
+    /// </summary>
+    protected override bool OnMouseEvent(Mouse mouse)
+    {
+        // Startup disables input; swallow mouse input just like keys so a click can never edit or move the
+        // caret while initialization is in flight.
+        if (!this.inputEnabled)
+        {
+            return true;
+        }
+
+        if (this.TryHandlePointerGesture(mouse, out var gestureHandled))
+        {
+            return gestureHandled;
+        }
+
+        // Every unmatched event continues through the native path so the mouse-caret synchronization fix
+        // (UnwrappedCursorPositionChanged mirroring under syncingNativeInput) stays intact.
+        var handled = false;
+        this.RunNativeEdit(() => handled = base.OnMouseEvent(mouse));
+        return handled;
+    }
+
+    /// <summary>
+    /// Classifies a pointer gesture into a semantic composer action (copy/paste/context menu) or lets it fall
+    /// through to the native editor. Terminal.Gui delivers a button gesture as press, release, then a
+    /// synthesized clicked event (drags interleave <see cref="MouseFlags.PositionReport"/> moves); the small
+    /// state machine below consumes the remainder of a gesture once it has been claimed so a single physical
+    /// action never yields a duplicate. Returns true (with <paramref name="handled"/> set) when the gesture is
+    /// owned here; false to defer to the native path.
+    /// </summary>
+    private bool TryHandlePointerGesture(Mouse mouse, out bool handled)
+    {
+        handled = true;
+        var flags = mouse.Flags;
+
+        // A copy was already raised on the left press; swallow the rest of the sequence so the release/click
+        // can't start a fresh native drag after the shell clears the old selection. Terminal.Gui delivers the
+        // gesture as press, release, then a synthesized click, so suppression must survive the release and only
+        // lift on that terminal click — otherwise the trailing click leaks through to the base editor and
+        // repositions the caret. A second or third physical click reports the distinct
+        // LeftButtonDoubleClicked / LeftButtonTripleClicked bit, so all three complete the armed gesture
+        // (via IsLeftGestureCompletion) — otherwise a multi-click would leave suppression armed until the next
+        // press had to recover it, swallowing native events in between.
+        if (this.suppressLeftGesture)
+        {
+            if (IsGestureStartingPress(flags))
+            {
+                // A truncated / off-view / grab-loss sequence can end without the terminal synthesized click
+                // that would otherwise lift suppression, leaving it armed forever; a fresh press begins a new
+                // gesture, so recover and reinterpret it here.
+                this.suppressLeftGesture = false;
+            }
+            else
+            {
+                if (IsLeftGestureCompletion(flags))
+                {
+                    this.suppressLeftGesture = false;
+                }
+
+                return true;
+            }
+        }
+
+        // A copy was already raised on the right press; swallow the complete right gesture through its
+        // terminal synthesized click so it can never reach the native context menu.
+        if (this.suppressRightGesture)
+        {
+            if (IsGestureStartingPress(flags))
+            {
+                this.suppressRightGesture = false;
+            }
+            else
+            {
+                if (IsRightGestureCompletion(flags))
+                {
+                    this.suppressRightGesture = false;
+                }
+
+                return true;
+            }
+        }
+
+        // The caret was positioned on the right press; raise exactly one paste when the click completes and
+        // consume the release/click in between. A gesture may terminate with any of the distinct
+        // RightButtonClicked / RightButtonDoubleClicked / RightButtonTripleClicked bits (a second physical
+        // click reports the double-click bit, and so on), so all three complete the armed gesture — otherwise a
+        // double right-click would leave this armed, swallow later events, and fire a stale paste. A fresh
+        // gesture-starting press instead recovers a pending paste that a truncated / off-view / grab-loss
+        // sequence left armed, and falls through so the new press is reinterpreted.
+        if (this.pendingRightPaste)
+        {
+            if (IsGestureStartingPress(flags))
+            {
+                this.pendingRightPaste = false;
+            }
+            else
+            {
+                if (IsRightGestureCompletion(flags))
+                {
+                    this.pendingRightPaste = false;
+                    this.RaisePointerAction(ComposerPointerActionKind.PasteClipboard, null, mouse.ScreenPosition);
+                }
+
+                return true;
+            }
+        }
+
+        // A fresh, unshifted left press over an existing selection copies it and consumes the click sequence
+        // instead of starting another drag. PositionReport identifies a drag move (not a new press), which
+        // must keep extending the native selection.
+        if (flags.HasFlag(MouseFlags.LeftButtonPressed)
+            && !flags.HasFlag(MouseFlags.PositionReport)
+            && !flags.HasFlag(MouseFlags.Shift)
+            && this.HasComposerSelection)
+        {
+            this.suppressLeftGesture = true;
+            this.RaisePointerAction(
+                ComposerPointerActionKind.CopySelection, this.SelectedComposerText, mouse.ScreenPosition);
+            return true;
+        }
+
+        // A right press over a selection copies and consumes the gesture; a right press without one positions
+        // the caret natively and defers a single paste to the click.
+        if (flags.HasFlag(MouseFlags.RightButtonPressed) && !flags.HasFlag(MouseFlags.PositionReport))
+        {
+            if (this.HasComposerSelection)
+            {
+                this.suppressRightGesture = true;
+                this.RaisePointerAction(
+                    ComposerPointerActionKind.CopySelection, this.SelectedComposerText, mouse.ScreenPosition);
+                return true;
+            }
+
+            this.pendingRightPaste = true;
+            this.PositionCaretFromPress(mouse);
+            return true;
+        }
+
+        // Middle click surfaces the context menu at the pointer, exactly once.
+        if (flags.HasFlag(MouseFlags.MiddleButtonClicked))
+        {
+            this.RaisePointerAction(ComposerPointerActionKind.ShowContextMenu, null, mouse.ScreenPosition);
+            return true;
+        }
+
+        handled = false;
+        return false;
+    }
+
+    /// <summary>
+    /// True when <paramref name="flags"/> mark the fresh start of a new pointer gesture — a button press that
+    /// is not a drag move (<see cref="MouseFlags.PositionReport"/>). Used to recover an armed suppression or
+    /// pending paste that a truncated / off-view / grab-loss sequence — one that never delivered its terminal
+    /// synthesized click — would otherwise leave armed forever, so the next real gesture is reinterpreted
+    /// instead of swallowed.
+    /// </summary>
+    private static bool IsGestureStartingPress(MouseFlags flags) =>
+        !flags.HasFlag(MouseFlags.PositionReport)
+        && (flags.HasFlag(MouseFlags.LeftButtonPressed)
+            || flags.HasFlag(MouseFlags.RightButtonPressed)
+            || flags.HasFlag(MouseFlags.MiddleButtonPressed));
+
+    /// <summary>
+    /// True when <paramref name="flags"/> carry a terminal completion event for an armed right gesture.
+    /// Terminal.Gui reports the first physical click as <see cref="MouseFlags.RightButtonClicked"/>, the second
+    /// as <see cref="MouseFlags.RightButtonDoubleClicked"/>, and the third as
+    /// <see cref="MouseFlags.RightButtonTripleClicked"/>; each is a single distinct bit for one physical click,
+    /// so testing all three gives consistent completion semantics and never double-counts a lone terminal bit.
+    /// </summary>
+    private static bool IsRightGestureCompletion(MouseFlags flags) =>
+        flags.HasFlag(MouseFlags.RightButtonClicked)
+        || flags.HasFlag(MouseFlags.RightButtonDoubleClicked)
+        || flags.HasFlag(MouseFlags.RightButtonTripleClicked);
+
+    /// <summary>
+    /// True when <paramref name="flags"/> carry a terminal completion event for an armed left gesture, the
+    /// mirror of <see cref="IsRightGestureCompletion"/>. Terminal.Gui reports the first physical click as
+    /// <see cref="MouseFlags.LeftButtonClicked"/>, the second as <see cref="MouseFlags.LeftButtonDoubleClicked"/>,
+    /// and the third as <see cref="MouseFlags.LeftButtonTripleClicked"/>; each is a single distinct bit for one
+    /// physical click, so testing all three completes the armed copy gesture on any of them and never leaves
+    /// suppression stuck armed after a multi-click.
+    /// </summary>
+    private static bool IsLeftGestureCompletion(MouseFlags flags) =>
+        flags.HasFlag(MouseFlags.LeftButtonClicked)
+        || flags.HasFlag(MouseFlags.LeftButtonDoubleClicked)
+        || flags.HasFlag(MouseFlags.LeftButtonTripleClicked);
+
+    /// <summary>
+    /// Positions the native caret from a right press by replaying it as a self-contained left press-and-release
+    /// through the base <see cref="TextView"/>, inside the <see cref="RunNativeEdit"/> synchronization guard so
+    /// the resulting <c>UnwrappedCursorPositionChanged</c> mirrors the clicked wrapped position into the
+    /// controller. Reusing the native handler avoids manually translating wrapped coordinates.
+    ///
+    /// The base editor grabs the application mouse on the left press (so a real drag keeps receiving motion),
+    /// so the caret positioning must hand that grab straight back: the matching synthetic release ungrabs it
+    /// within the same scope. Without it the composer would keep the global grab, silently rerouting the
+    /// transcript's real mouse events to the composer. A press-then-release at one position only moves the
+    /// caret — it selects nothing and raises no semantic action — so caret/controller state is unchanged
+    /// beyond the intended reposition.
+    /// </summary>
+    private void PositionCaretFromPress(Mouse mouse)
+    {
+        var press = new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = mouse.Position,
+            ScreenPosition = mouse.ScreenPosition,
+            View = mouse.View,
+        };
+
+        var release = new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = mouse.Position,
+            ScreenPosition = mouse.ScreenPosition,
+            View = mouse.View,
+        };
+
+        this.RunNativeEdit(() =>
+        {
+            base.OnMouseEvent(press);
+            base.OnMouseEvent(release);
+        });
+    }
+
+    private void RaisePointerAction(
+        ComposerPointerActionKind kind, string? selectedText, System.Drawing.Point screenPosition) =>
+        this.PointerActionRequested?.Invoke(
+            this, new ComposerPointerActionRequestedEventArgs(kind, selectedText, screenPosition));
+
     private bool HandleKeyDown(Key key)
     {
         // A previous key's base binding may have edited the model outside our handlers; reconcile before
@@ -262,8 +542,9 @@ internal sealed class ComposerView : TextView
             CanMoveVisualDown: caret.Row < layout.VisualLineCount - 1);
         var action = UiActionMap.Map(key, context);
 
-        // While a paste is in progress, a stray Enter is text, never a submission.
-        if (action == UiAction.Submit && this.controller.State.PasteActive)
+        // While a paste is in progress, a stray Enter is text, never a submission (with or without an open
+        // completion).
+        if (this.controller.State.PasteActive && action is UiAction.Submit or UiAction.CompleteAndSubmit)
         {
             action = UiAction.InsertNewline;
         }
@@ -537,7 +818,11 @@ internal sealed class ComposerView : TextView
         switch (action)
         {
             case UiAction.Submit:
-                var result = this.controller.Apply(UiAction.Submit);
+            case UiAction.CompleteAndSubmit:
+                // Submit (and, for CompleteAndSubmit, first accept the selected completion) replaces the whole
+                // draft, so re-place the caret and remeasure. Exactly one Submitted fires — CompleteAndSubmit
+                // returns a single submission result, never a separate completion then submission.
+                var result = this.controller.Apply(action);
                 this.SyncTextView();
                 this.RaiseLayoutInvalidated();
                 if (result.SubmittedText is { } submitted)
@@ -615,9 +900,10 @@ internal sealed class ComposerView : TextView
 
         // A native edit updated the editor caret. Mirror it to the controller using the wrap-independent
         // unwrapped position (logical row + grapheme column) so soft-wrap divergence can never swap word
-        // fragments or snap the caret to the first line. Honour it only during an actual native edit: while
-        // we drive the caret programmatically (SyncTextView) or a layout pass emits a spurious caret report,
-        // the controller stays authoritative.
+        // fragments or snap the caret to the first line. Honour it only during genuine native input (a native
+        // edit or a mouse positioning, both of which set syncingNativeInput): while we drive the caret
+        // programmatically (SyncTextView) or a layout pass emits a spurious caret report, the controller
+        // stays authoritative.
         if (this.syncingText || !this.syncingNativeInput)
         {
             return;

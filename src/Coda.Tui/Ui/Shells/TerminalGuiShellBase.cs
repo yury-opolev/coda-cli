@@ -38,6 +38,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<TimeSpan, Func<bool>, object> addTimeout;
     private readonly Func<object, bool> removeTimeout;
     private readonly Func<string, bool> clipboardWriter;
+    private readonly Func<ClipboardReadResult> clipboardReader;
     private object? chordTimeout;
     private object? transientOperationalTimeout;
     private object? composerLayoutTimeout;
@@ -64,6 +65,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<bool>? hasActiveWork = null,
         TimeProvider? timeProvider = null,
         Func<string, bool>? clipboardWriter = null,
+        Func<ClipboardReadResult>? clipboardReader = null,
         Func<TimeSpan, Func<bool>, object>? addTimeout = null,
         Func<object, bool>? removeTimeout = null,
         TuiTheme? theme = null,
@@ -78,6 +80,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.TimeSource = timeProvider ?? TimeProvider.System;
         this.clipboardWriter = clipboardWriter ??
             (text => this.app.Clipboard?.TrySetClipboardData(text) == true);
+        this.clipboardReader = clipboardReader ?? this.ReadApplicationClipboard;
         this.Theme = theme ?? TuiTheme.WarmEmber;
 
         // The chord clock and the timeout seams drive the deterministic Esc/Ctrl+C chords: the same
@@ -101,6 +104,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         this.Composer.Submitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
+        this.Composer.PointerActionRequested += this.OnComposerPointerActionRequested;
         this.Composer.CompletionChanged += this.OnCompletionChanged;
         this.Composer.LayoutInvalidated += this.OnComposerLayoutInvalidatedHandler;
         this.Initialized += this.OnShellInitialized;
@@ -347,6 +351,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.Composer.ShellKeyHandler = null;
             this.Composer.Submitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
+            this.Composer.PointerActionRequested -= this.OnComposerPointerActionRequested;
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
             this.Composer.LayoutInvalidated -= this.OnComposerLayoutInvalidatedHandler;
             this.Initialized -= this.OnShellInitialized;
@@ -400,8 +405,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// Arbitrates the shell-owned Esc/Ctrl+C chords before the composer's own mapping. Esc first dismisses
     /// an open completion, then clears a transcript selection (Task 12 seam), then clears a transient
     /// operational override, then cancels an armed exit chord, and only then arms/fires the interrupt chord.
-    /// Ctrl+C first copies a transcript selection (Task 12 seam), then arms/fires the exit chord. Returns
-    /// true when the key was consumed here so no printable/action routing runs for it.
+    /// Ctrl+C first copies a composer selection, then a transcript selection (Task 12 seam), then arms/fires
+    /// the exit chord. Returns true when the key was consumed here so no printable/action routing runs for it.
     /// </summary>
     private bool TryHandleShellKey(Key key)
     {
@@ -439,6 +444,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         if (key == Key.C.WithCtrl)
         {
+            if (this.TryCopyComposerSelection())
+            {
+                return true;
+            }
+
             if (this.TryCopyTranscriptSelection())
             {
                 return true;
@@ -485,6 +495,149 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
+    /// Copies an active composer selection to the clipboard when Ctrl+C arrives, taking precedence over any
+    /// transcript selection and before any exit-chord arming. Returns true whenever a selection was present,
+    /// so the exit chord never arms while composer text is selected; the copy itself (success status or the
+    /// clipboard-unavailable fallback) is handled by <see cref="CopyComposerSelection"/>.
+    /// </summary>
+    private bool TryCopyComposerSelection()
+    {
+        if (!this.Composer.HasComposerSelection)
+        {
+            return false;
+        }
+
+        this.CopyComposerSelection(this.Composer.SelectedComposerText);
+        return true;
+    }
+
+    /// <summary>
+    /// The default <c>clipboardReader</c> seam: reads the running application's clipboard once. A missing
+    /// clipboard backend or a driver that refuses the read is reported as <see cref="ClipboardReadResult.Available"/>
+    /// false (never an exception), so a pointer paste surfaces a deterministic "Clipboard unavailable" warning.
+    /// A successful read returns the retrieved text, which may legitimately be empty.
+    /// </summary>
+    private ClipboardReadResult ReadApplicationClipboard() =>
+        this.app.Clipboard?.TryGetClipboardData(out var text) == true
+            ? new ClipboardReadResult(true, text)
+            : new ClipboardReadResult(false, string.Empty);
+
+    /// <summary>
+    /// Routes the composer's semantic pointer gestures through a single guard: while a modal prompt is up,
+    /// the composer is startup-disabled, or it is not accepting input, every pointer action is ignored so a
+    /// pointer can never copy, paste, or open a menu behind an overlay or before the editor is live. A
+    /// <see cref="ComposerPointerActionKind.CopySelection"/> copies the reported selection through the same
+    /// shell path as Ctrl+C; <see cref="ComposerPointerActionKind.PasteClipboard"/> pastes the clipboard at
+    /// the caret the composer already positioned; <see cref="ComposerPointerActionKind.ShowContextMenu"/>
+    /// makes the composer's context menu visible at the pointer.
+    /// </summary>
+    private void OnComposerPointerActionRequested(object? sender, ComposerPointerActionRequestedEventArgs e)
+    {
+        if (this.PromptOverlay.Visible || this.composerDisabled || !this.Composer.InputEnabled)
+        {
+            return;
+        }
+
+        switch (e.Kind)
+        {
+            case ComposerPointerActionKind.CopySelection:
+                this.CopyComposerSelection(e.SelectedText ?? string.Empty);
+                break;
+            case ComposerPointerActionKind.PasteClipboard:
+                this.PasteComposerClipboard();
+                break;
+            case ComposerPointerActionKind.ShowContextMenu:
+                this.ShowComposerContextMenu(e.ScreenPosition);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Pastes the clipboard into the composer at the caret the pointer gesture already positioned. The
+    /// clipboard is read exactly once through the <c>clipboardReader</c> seam: an unavailable read leaves the
+    /// draft and caret untouched and pins a transient "Clipboard unavailable" Warning; an available but empty
+    /// read likewise makes no mutation and pins "Clipboard is empty"; a non-empty read is injected as a native
+    /// bracketed paste (incremental insertion at the caret — the draft text and caret are never assigned
+    /// directly) and a transient "{N} symbol(s) pasted from clipboard" Ready status is pinned for 1.5 seconds.
+    /// </summary>
+    private void PasteComposerClipboard()
+    {
+        var result = this.clipboardReader();
+        if (!result.Available)
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        if (string.IsNullOrEmpty(result.Text))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Clipboard is empty", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        this.Composer.NewPasteEvent(result.Text);
+        this.ShowTransientOperationalStatus(
+            new OperationalStatus(ClipboardStatusText.Pasted(result.Text), OperationalTone.Ready, false),
+            TimeSpan.FromSeconds(1.5));
+    }
+
+    /// <summary>
+    /// Makes the composer's existing context menu visible at the pointer's screen position. When the composer
+    /// exposes no context menu the gesture is reported with a transient "Context menu unavailable" Warning
+    /// rather than silently doing nothing.
+    /// </summary>
+    private void ShowComposerContextMenu(System.Drawing.Point screenPosition)
+    {
+        var menu = this.Composer.ContextMenu;
+        if (menu is null)
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Context menu unavailable", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        menu.MakeVisible(screenPosition);
+    }
+
+    /// <summary>
+    /// Copies the active composer selection to the clipboard. When the selection contains zero copyable symbols
+    /// the selection is cleared with a deterministic "0 symbols copied to clipboard" confirmation without
+    /// touching the clipboard writer. Otherwise, on a successful write the selection highlight is cleared and a
+    /// transient "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds; when the clipboard is
+    /// unavailable the selection is preserved and a transient "Clipboard unavailable" Warning is pinned instead.
+    /// The draft text and caret are never mutated.
+    /// </summary>
+    private void CopyComposerSelection(string text)
+    {
+        if (ClipboardStatusText.CountSymbols(text) == 0)
+        {
+            this.Composer.ClearComposerSelection();
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        if (this.clipboardWriter(text))
+        {
+            this.Composer.ClearComposerSelection();
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+            return;
+        }
+
+        this.ShowTransientOperationalStatus(
+            new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
+            TimeSpan.FromSeconds(1.5));
+    }
+
+    /// <summary>
     /// Handles a transcript copy request (a fresh left click on an active selection) by routing through the
     /// same copy path as Ctrl+C.
     /// </summary>
@@ -508,11 +661,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // An empty or newline-only selection has no symbols to copy. Clear it and report a deterministic
         // "0 symbols copied to clipboard" confirmation instead of routing through the clipboard writer, whose
         // skipped/failed write would otherwise surface a misleading "Clipboard unavailable" warning.
-        if (CountSymbols(text) == 0)
+        if (ClipboardStatusText.CountSymbols(text) == 0)
         {
             this.TranscriptView.ClearSelection();
             this.ShowTransientOperationalStatus(
-                new OperationalStatus(CopySuccessMessage(text), OperationalTone.Ready, false),
+                new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
                 TimeSpan.FromSeconds(1.5));
             return;
         }
@@ -521,7 +674,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         {
             this.TranscriptView.ClearSelection();
             this.ShowTransientOperationalStatus(
-                new OperationalStatus(CopySuccessMessage(text), OperationalTone.Ready, false),
+                new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
                 TimeSpan.FromSeconds(1.5));
             return;
         }
@@ -529,41 +682,6 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.ShowTransientOperationalStatus(
             new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
             TimeSpan.FromSeconds(1.5));
-    }
-
-    /// <summary>
-    /// The transient confirmation for a successful copy, counting the copied Unicode grapheme/text elements
-    /// (combining sequences and emoji count as one each) and excluding CR/LF row separators. Singular for a
-    /// single symbol, plural otherwise.
-    /// </summary>
-    private static string CopySuccessMessage(string text)
-    {
-        var count = CountSymbols(text);
-        return count == 1
-            ? "1 symbol copied to clipboard"
-            : $"{count} symbols copied to clipboard";
-    }
-
-    /// <summary>
-    /// Counts the Unicode grapheme/text elements in <paramref name="text"/>, treating combining sequences
-    /// and emoji as a single symbol and skipping CR/LF separators introduced by the multi-row selection.
-    /// </summary>
-    private static int CountSymbols(string text)
-    {
-        var count = 0;
-        var enumerator = System.Globalization.StringInfo.GetTextElementEnumerator(text);
-        while (enumerator.MoveNext())
-        {
-            var element = (string)enumerator.Current;
-            if (element is "\r" or "\n" or "\r\n")
-            {
-                continue;
-            }
-
-            count++;
-        }
-
-        return count;
     }
 
     /// <summary>

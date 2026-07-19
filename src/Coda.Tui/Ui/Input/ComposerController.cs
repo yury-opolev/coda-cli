@@ -114,6 +114,11 @@ internal sealed class ComposerController
         {
             case UiAction.Submit:
                 return this.Submit();
+            case UiAction.CompleteAndSubmit:
+                // Accept the selected suggestion into the draft, then submit it in one step — the caller sees a
+                // single submission result and never a duplicate.
+                this.CompleteSuggestion();
+                return this.Submit();
             case UiAction.InsertNewline:
                 this.InsertText("\n");
                 return Redraw();
