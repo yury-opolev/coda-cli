@@ -129,9 +129,12 @@ exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctr
 switches between full-screen and inline. Typing a `/` shows a slash-command completion menu directly
 above the composer (Up/Down select, Tab completes, a single Esc dismisses).
 
-**Mouse:** **left-drag** selects transcript text and `Ctrl+C` copies it; **`Shift`-drag** hands native
-selection and copy to the terminal where supported. `--no-mouse` leaves selection and copy native to the
-terminal, and every action stays reachable from the keyboard. Full-screen has **no permanent sidebar**
+**Mouse:** in the **transcript**, **left-drag** selects text and `Ctrl+C` copies it. In the **composer**,
+**left-drag** selects text; when a selection exists, `Ctrl+C`, a **left-click**, or a **right-click**
+copies it and clears the selection; a **right-click** with no selection pastes at the clicked caret;
+`Ctrl+V` remains a direct paste; and a **middle-click** opens the editor context menu. **`Shift`-drag**
+hands native selection and copy to the terminal where supported. `--no-mouse` leaves selection and copy
+native to the terminal, and every action stays reachable from the keyboard. Full-screen has **no permanent sidebar**
 and uses a **virtualized transcript** (context, pickers, permissions, help, and diffs all use
 keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI, output/input
 redirection, and terminals that Terminal.Gui does not support.
@@ -167,7 +170,9 @@ Inside the REPL:
   falling back to a built-in list when the provider exposes no such endpoint or the
   call fails (e.g. Claude.ai OAuth, or offline). Each model is annotated with its
   display name and context window from the **model catalog** (see below).
-  `/model refresh` re-fetches the live list *and* refreshes the catalog.
+  `/model refresh` re-fetches the live list *and* refreshes the catalog. Run
+  interactively with no argument, `/model` opens a picker that marks the active
+  model as **Current** and opens with it selected.
 - **`/effort [low|medium|high|max|auto]`** sets the reasoning effort level. It is
   sent to the Anthropic API as `output_config.effort` (with the
   `effort-2025-11-24` beta) and is honored only by models that support it
