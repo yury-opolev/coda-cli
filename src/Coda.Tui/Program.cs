@@ -1,5 +1,11 @@
 using Coda.Tui;
 
+// Force UTF-8 console output before anything captures Console.Out or the ambient Spectre console.
+// The Windows console starts on an OEM codepage (CP437); Terminal.Gui later flips it to UTF-8, but by
+// then the exit-summary renderer would already hold a stale CP437 writer that emits mojibake. Doing
+// this on the very first line guarantees every downstream writer speaks UTF-8 from the start.
+ConsoleOutputEncoding.ConfigureUtf8();
+
 // Headless subcommand: `coda run -p "<task>" [--json] [--yolo] ...` (programmatic / side-agent use).
 if (args.Length > 0 && args[0] == "run")
 {
