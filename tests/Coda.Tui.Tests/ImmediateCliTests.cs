@@ -66,6 +66,7 @@ public sealed class ImmediateCliTests
 
         // Composer editing and submission.
         Assert.Contains("Enter", output);
+        Assert.Contains("Ctrl+Enter", output);
         Assert.Contains("Ctrl+J", output);
         Assert.Contains("newline", output);
 
