@@ -34,9 +34,13 @@ Create a focused `ExitSummaryRenderer` that writes to the restored real console:
 
 - the embedded Coda logo from `Branding.BannerLines`;
 - a compact session summary;
-- exact continuation instructions when a session ID exists:
-  - `coda --cwd "<working-directory>" --resume <session-id>`
-  - `coda --cwd "<working-directory>" --continue`
+- exact continuation instructions when a session ID exists — a directory step followed by valid,
+  standalone Coda commands (the interactive launcher does not consume `--cwd`, so it must never
+  appear in the emitted commands):
+  - `Resume from this directory:`
+  - `cd "<working-directory>"`
+  - `coda --resume "<session-id>"`
+  - `coda --continue`
 
 Paths and IDs are escaped for display. If the session has not been persisted, the card says so and omits resume commands.
 

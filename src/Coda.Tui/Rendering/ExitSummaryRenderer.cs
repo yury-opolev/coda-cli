@@ -36,10 +36,12 @@ public static class ExitSummaryRenderer
         if (snapshot.HasSession)
         {
             console.WriteLine();
-            console.MarkupLine(Theme.DimMarkup("Resume this session:"));
+            console.MarkupLine(Theme.DimMarkup("Resume from this directory:"));
             var cwd = FormatCommandArgument(snapshot.WorkingDirectory);
-            console.MarkupLine(Theme.AccentMarkup($"coda --cwd {cwd} --resume {snapshot.SessionId}"));
-            console.MarkupLine(Theme.AccentMarkup($"coda --cwd {cwd} --continue"));
+            var sessionId = FormatCommandArgument(snapshot.SessionId!);
+            console.MarkupLine(Theme.AccentMarkup($"cd {cwd}"));
+            console.MarkupLine(Theme.AccentMarkup($"coda --resume {sessionId}"));
+            console.MarkupLine(Theme.AccentMarkup("coda --continue"));
         }
         else
         {

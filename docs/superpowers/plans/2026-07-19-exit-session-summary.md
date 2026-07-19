@@ -17,14 +17,16 @@
 - Create: `src/Coda.Tui/Rendering/ExitSummaryRenderer.cs`
 - Test: `tests/Coda.Tui.Tests/ExitSummaryRendererTests.cs`
 
-- [ ] Write RED tests for duration, provider/model/effort, message/token totals, pricing, cached exact/estimated context, missing context, no-session text, logo rows, and both quoted resume commands.
+- [ ] Write RED tests for duration, provider/model/effort, message/token totals, pricing, cached exact/estimated context, missing context, no-session text, logo rows, the directory step, and both valid resume commands (including a round-trip through `SessionCli.ParseStartupIntent` and no unsupported `--cwd`).
 - [ ] Run `dotnet test tests\Coda.Tui.Tests\Coda.Tui.Tests.csproj --filter FullyQualifiedName~ExitSummaryRendererTests`; expect compile failures.
 - [ ] Implement immutable snapshot projection from `SessionState`, `ContextSnapshotCache.Current`, start/end timestamps, `ModelCatalog`, and `Pricing.EstimateUsd`.
-- [ ] Implement a pure renderer using `Branding.BannerLines`, accent styling, escaped values, compact statistics, and conditional commands:
+- [ ] Implement a pure renderer using `Branding.BannerLines`, accent styling, escaped values, compact statistics, and a conditional directory step plus valid standalone commands (the interactive launcher never consumes `--cwd`, so emit a `cd` step instead of a `--cwd` flag):
 
 ```text
-coda --cwd "<cwd>" --resume <id>
-coda --cwd "<cwd>" --continue
+Resume from this directory:
+cd "<cwd>"
+coda --resume "<id>"
+coda --continue
 ```
 
 - [ ] Run focused tests GREEN and commit `feat(tui): render exit session summary`.

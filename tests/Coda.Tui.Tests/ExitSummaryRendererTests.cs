@@ -1,3 +1,4 @@
+using System.Text;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -263,15 +264,165 @@ public sealed class ExitSummaryRendererTests
         return SessionExitSnapshot.Create(session, null, Start, Start.AddSeconds(125), TestCatalog());
     }
 
+    private static SessionExitSnapshot SnapshotWithSessionId(string id)
+    {
+        var session = BuildSession();
+        session.SessionId = id;
+        return SessionExitSnapshot.Create(session, null, Start, Start.AddSeconds(125), TestCatalog());
+    }
+
+    private static string FindCommandLine(string output, string prefix)
+    {
+        foreach (var raw in output.Replace("\r", string.Empty).Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.StartsWith(prefix, StringComparison.Ordinal))
+            {
+                return line;
+            }
+        }
+
+        throw new Xunit.Sdk.XunitException($"No line starting with '{prefix}' in output:\n{output}");
+    }
+
+    // Split a rendered command line into argv following the same double-quote convention
+    // (Windows CommandLineToArgvW) that FormatCommandArgument targets, so the round-trip tests
+    // exercise the exact tokens a shell would hand to Coda.
+    private static List<string> Tokenize(string commandLine)
+    {
+        var args = new List<string>();
+        var current = new StringBuilder();
+        var inQuotes = false;
+        var hasToken = false;
+        var i = 0;
+
+        while (i < commandLine.Length)
+        {
+            var c = commandLine[i];
+            if (c == '\\')
+            {
+                var backslashes = 0;
+                while (i < commandLine.Length && commandLine[i] == '\\')
+                {
+                    backslashes++;
+                    i++;
+                }
+
+                if (i < commandLine.Length && commandLine[i] == '"')
+                {
+                    current.Append('\\', backslashes / 2);
+                    if (backslashes % 2 == 0)
+                    {
+                        inQuotes = !inQuotes;
+                    }
+                    else
+                    {
+                        current.Append('"');
+                    }
+
+                    hasToken = true;
+                    i++;
+                }
+                else
+                {
+                    current.Append('\\', backslashes);
+                    hasToken = true;
+                }
+            }
+            else if (c == '"')
+            {
+                inQuotes = !inQuotes;
+                hasToken = true;
+                i++;
+            }
+            else if (char.IsWhiteSpace(c) && !inQuotes)
+            {
+                if (hasToken)
+                {
+                    args.Add(current.ToString());
+                    current.Clear();
+                    hasToken = false;
+                }
+
+                i++;
+            }
+            else
+            {
+                current.Append(c);
+                hasToken = true;
+                i++;
+            }
+        }
+
+        if (hasToken)
+        {
+            args.Add(current.ToString());
+        }
+
+        return args;
+    }
+
     [Fact]
-    public void Render_with_session_id_shows_both_quoted_resume_commands()
+    public void Render_with_session_id_shows_directory_step_and_valid_commands()
     {
         var console = NewConsole();
 
         ExitSummaryRenderer.Render(console, Snapshot(withSession: true));
 
-        Assert.Contains("coda --cwd \"C:\\work\" --resume sess-123", console.Output);
-        Assert.Contains("coda --cwd \"C:\\work\" --continue", console.Output);
+        // A `cd` into the session directory, then plain Coda commands (no unsupported --cwd flag,
+        // which the interactive launcher never consumes and would silently drop the resume intent).
+        Assert.Contains("Resume from this directory:", console.Output);
+        Assert.Contains("cd \"C:\\work\"", console.Output);
+        Assert.Contains("coda --resume \"sess-123\"", console.Output);
+        Assert.Contains("coda --continue", console.Output);
+        Assert.DoesNotContain("--cwd", console.Output);
+    }
+
+    [Fact]
+    public void Render_resume_command_round_trips_through_startup_intent()
+    {
+        var console = NewConsole();
+
+        ExitSummaryRenderer.Render(console, Snapshot(withSession: true));
+
+        var args = Tokenize(FindCommandLine(console.Output, "coda --resume"));
+        Assert.Equal("coda", args[0]);
+        Assert.DoesNotContain("--cwd", args);
+
+        var intent = SessionCli.ParseStartupIntent(args.Skip(1).ToList());
+        Assert.Equal("sess-123", intent.ResumeId);
+        Assert.False(intent.ContinueLatest);
+    }
+
+    [Fact]
+    public void Render_continue_command_round_trips_through_startup_intent()
+    {
+        var console = NewConsole();
+
+        ExitSummaryRenderer.Render(console, Snapshot(withSession: true));
+
+        var args = Tokenize(FindCommandLine(console.Output, "coda --continue"));
+        Assert.Equal("coda", args[0]);
+        Assert.DoesNotContain("--cwd", args);
+
+        var intent = SessionCli.ParseStartupIntent(args.Skip(1).ToList());
+        Assert.True(intent.ContinueLatest);
+        Assert.Null(intent.ResumeId);
+    }
+
+    [Theory]
+    [InlineData("sess-123")]
+    [InlineData("id with spaces")]
+    [InlineData("weird\"id\\with\\slashes")]
+    public void Render_resume_id_round_trips_even_when_it_needs_escaping(string id)
+    {
+        var console = NewConsole();
+
+        ExitSummaryRenderer.Render(console, SnapshotWithSessionId(id));
+
+        var args = Tokenize(FindCommandLine(console.Output, "coda --resume"));
+        var intent = SessionCli.ParseStartupIntent(args.Skip(1).ToList());
+        Assert.Equal(id, intent.ResumeId);
     }
 
     [Fact]
@@ -283,10 +434,9 @@ public sealed class ExitSummaryRendererTests
 
         // A root path must render as "C:\\" so the closing quote is not escaped and the argument
         // is copy-paste parseable; the buggy single-backslash form "C:\" must never appear.
-        Assert.Contains("coda --cwd \"C:\\\\\" --resume sess-123", console.Output);
-        Assert.Contains("coda --cwd \"C:\\\\\" --continue", console.Output);
-        Assert.DoesNotContain("\"C:\\\" --resume", console.Output);
-        Assert.DoesNotContain("\"C:\\\" --continue", console.Output);
+        Assert.Contains("cd \"C:\\\\\"", console.Output);
+        Assert.DoesNotContain("cd \"C:\\\"\r", console.Output);
+        Assert.DoesNotContain("cd \"C:\\\"\n", console.Output);
     }
 
     [Fact]
@@ -296,9 +446,7 @@ public sealed class ExitSummaryRendererTests
 
         ExitSummaryRenderer.Render(console, SnapshotWithCwd("C:\\work\\"));
 
-        Assert.Contains("coda --cwd \"C:\\work\\\\\" --resume sess-123", console.Output);
-        Assert.Contains("coda --cwd \"C:\\work\\\\\" --continue", console.Output);
-        Assert.DoesNotContain("\"C:\\work\\\" --resume", console.Output);
+        Assert.Contains("cd \"C:\\work\\\\\"", console.Output);
     }
 
     [Fact]
@@ -308,7 +456,7 @@ public sealed class ExitSummaryRendererTests
 
         ExitSummaryRenderer.Render(console, SnapshotWithCwd("C:\\a\"b"));
 
-        Assert.Contains("coda --cwd \"C:\\a\\\"b\" --resume sess-123", console.Output);
+        Assert.Contains("cd \"C:\\a\\\"b\"", console.Output);
     }
 
     [Fact]
@@ -341,6 +489,8 @@ public sealed class ExitSummaryRendererTests
 
         Assert.DoesNotContain("--resume", console.Output);
         Assert.DoesNotContain("--continue", console.Output);
+        Assert.DoesNotContain("Resume from this directory:", console.Output);
+        Assert.DoesNotContain("cd \"", console.Output);
     }
 
     [Fact]
