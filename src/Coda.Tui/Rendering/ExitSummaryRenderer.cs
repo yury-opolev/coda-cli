@@ -1,3 +1,4 @@
+using System.Text;
 using Spectre.Console;
 
 namespace Coda.Tui.Rendering;
@@ -36,9 +37,9 @@ public static class ExitSummaryRenderer
         {
             console.WriteLine();
             console.MarkupLine(Theme.DimMarkup("Resume this session:"));
-            var cwd = snapshot.WorkingDirectory;
-            console.MarkupLine(Theme.AccentMarkup($"coda --cwd \"{cwd}\" --resume {snapshot.SessionId}"));
-            console.MarkupLine(Theme.AccentMarkup($"coda --cwd \"{cwd}\" --continue"));
+            var cwd = FormatCommandArgument(snapshot.WorkingDirectory);
+            console.MarkupLine(Theme.AccentMarkup($"coda --cwd {cwd} --resume {snapshot.SessionId}"));
+            console.MarkupLine(Theme.AccentMarkup($"coda --cwd {cwd} --continue"));
         }
         else
         {
@@ -47,6 +48,55 @@ public static class ExitSummaryRenderer
         }
 
         console.WriteLine();
+    }
+
+    /// <summary>
+    /// Quotes a single argument (e.g. a working directory) for display in a copy-paste-ready
+    /// command line. Follows the standard double-quote convention (Windows
+    /// <c>CommandLineToArgvW</c>, which also parses correctly under a POSIX shell's double quotes
+    /// for filesystem paths): the run of backslashes immediately before a closing double quote is
+    /// doubled so the quote is not accidentally escaped, embedded quotes are backslash-escaped, and
+    /// ordinary interior backslashes are left untouched. Root paths such as <c>C:\</c> therefore
+    /// render as <c>"C:\\"</c> rather than the broken <c>"C:\"</c>.
+    /// </summary>
+    internal static string FormatCommandArgument(string value)
+    {
+        var sb = new StringBuilder(value.Length + 2);
+        sb.Append('"');
+
+        var i = 0;
+        while (i < value.Length)
+        {
+            var backslashes = 0;
+            while (i < value.Length && value[i] == '\\')
+            {
+                backslashes++;
+                i++;
+            }
+
+            if (i == value.Length)
+            {
+                // Trailing backslashes: double them so they don't escape the closing quote.
+                sb.Append('\\', backslashes * 2);
+            }
+            else if (value[i] == '"')
+            {
+                // Backslashes preceding an embedded quote: double them, then escape the quote.
+                sb.Append('\\', backslashes * 2 + 1);
+                sb.Append('"');
+                i++;
+            }
+            else
+            {
+                // Interior backslashes stay literal.
+                sb.Append('\\', backslashes);
+                sb.Append(value[i]);
+                i++;
+            }
+        }
+
+        sb.Append('"');
+        return sb.ToString();
     }
 
     private static string FormatContext(ContextUsageSnapshot? context)
