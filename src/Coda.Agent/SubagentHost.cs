@@ -36,6 +36,13 @@ public sealed class SubagentHost : ISubagentHost
         this.userHooks = userHooks;
     }
 
+    /// <summary>
+    /// The permission prompt shared with the parent loop. Subagents (foreground and background)
+    /// run against this same instance, so a live <see cref="PermissionModeState"/> behind it is
+    /// observed by their next permission decision too.
+    /// </summary>
+    internal IPermissionPrompt Permissions => this.permissions;
+
     public async Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,

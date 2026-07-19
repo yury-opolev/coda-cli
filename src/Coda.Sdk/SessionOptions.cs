@@ -15,6 +15,14 @@ public sealed record SessionOptions
 
     public PermissionMode PermissionMode { get; init; } = PermissionMode.Default;
 
+    /// <summary>
+    /// Optional shared, live permission state. When supplied, the per-turn permission prompt reads
+    /// the current mode from it on every decision, so a mid-run <c>/yolo</c> or <c>/permissions</c>
+    /// change affects the next tool decision of this loop and every subagent that shares it. When
+    /// null (headless/serve), a fixed state is derived from <see cref="PermissionMode"/>.
+    /// </summary>
+    public PermissionModeState? PermissionModeState { get; init; }
+
     /// <summary>Extra tools beyond the built-ins (e.g. MCP tools).</summary>
     public IReadOnlyList<ITool> ExtraTools { get; init; } = [];
 

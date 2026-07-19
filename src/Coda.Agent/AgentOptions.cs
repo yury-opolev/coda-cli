@@ -18,6 +18,14 @@ public sealed record AgentOptions
     public PermissionMode PermissionMode { get; init; } = PermissionMode.Default;
 
     /// <summary>
+    /// Optional shared, live permission-mode state. When supplied, per-tool-request decisions
+    /// (including the filesystem sandbox) read the current mode from it so a mid-run <c>/yolo</c>
+    /// or <c>/permissions</c> change is applied immediately to a still-running loop and its
+    /// subagents. When null (a fixed headless run) the snapshot <see cref="PermissionMode"/> is used.
+    /// </summary>
+    public PermissionModeState? PermissionModeState { get; init; }
+
+    /// <summary>
     /// High backstop on tool-use iterations per user turn — a runaway-loop guard, not a work budget.
     /// Hitting it is a recoverable soft stop (the turn ends and the session returns to idle), not a crash.
     /// </summary>

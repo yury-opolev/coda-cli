@@ -156,6 +156,7 @@ public sealed class TurnPipelineBuilder
                 outputStyle.SystemPromptSuffix),
             WorkingDirectory = options.WorkingDirectory,
             PermissionMode = options.PermissionMode,
+            PermissionModeState = options.PermissionModeState,
             MaxIterations = options.MaxIterations,
             // Resolve max_tokens from the model's REAL published output ceiling (catalog), clamping any
             // explicit override to it — a flat default would 400 a smaller-cap model (e.g. Copilot's
@@ -172,17 +173,23 @@ public sealed class TurnPipelineBuilder
     /// </summary>
     private static IPermissionPrompt BuildPermissions(SessionOptions options, ILlmClient client, CodaSettings settings)
     {
-        // Bypass mode optionally routes each mutating action through the safety
-        // classifier (escalating risky ones) instead of blanket-allowing.
+        // Read the mode live from the shared session state when supplied, so a mid-run mode change
+        // is applied to the next decision; otherwise wrap a fixed state from the snapshot.
+        var state = options.PermissionModeState ?? new PermissionModeState(options.PermissionMode);
+
+        // When the bypass classifier is enabled, build a mode-aware prompt that consults the safety
+        // classifier only while the live mode is Bypass (escalating risky actions) and otherwise
+        // applies the standard mode policy. Building it regardless of the snapshot mode keeps a live
+        // Default→Bypass switch classifier-gated and a live Bypass→Default switch back to asking.
         IPermissionPrompt permissions;
-        if (options.PermissionMode == PermissionMode.BypassPermissions && options.EnableBypassClassifier)
+        if (options.EnableBypassClassifier)
         {
             var classifier = new LlmToolActionClassifier(new ForkedAgentRunner(client, options.Model));
-            permissions = new ClassifierPermissionPrompt(classifier, options.InteractivePrompt);
+            permissions = new LiveBypassClassifierPermissionPrompt(state, classifier, options.InteractivePrompt);
         }
         else
         {
-            permissions = new ModePermissionPrompt(options.PermissionMode, options.InteractivePrompt);
+            permissions = new ModePermissionPrompt(state, options.InteractivePrompt);
         }
 
         // Wrap the base permissions with the allow/deny rule lists when any rules exist.

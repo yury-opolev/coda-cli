@@ -25,8 +25,20 @@ public sealed class SessionState
     /// <summary>The model id used for chat (settable via /model).</summary>
     public string Model { get; set; } = AnthropicModels.DefaultModel;
 
-    /// <summary>Tool-permission mode (settable via /permissions or /yolo).</summary>
-    public Coda.Agent.PermissionMode PermissionMode { get; set; } = Coda.Agent.PermissionMode.Default;
+    /// <summary>
+    /// Stable, shared live permission state for this session. The same instance is passed into every
+    /// turn's <see cref="SessionOptions.PermissionModeState"/>, so a <c>/yolo</c> or <c>/permissions</c>
+    /// change applies to the next tool decision of the running loop and its subagents.
+    /// </summary>
+    public Coda.Agent.PermissionModeState PermissionModes { get; } =
+        new(Coda.Agent.PermissionMode.Default);
+
+    /// <summary>Tool-permission mode (settable via /permissions or /yolo). Delegates to <see cref="PermissionModes"/>.</summary>
+    public Coda.Agent.PermissionMode PermissionMode
+    {
+        get => this.PermissionModes.Mode;
+        set => this.PermissionModes.Mode = value;
+    }
 
     /// <summary>Named output style persona (settable via /output-style).</summary>
     public string OutputStyle { get; set; } = "default";

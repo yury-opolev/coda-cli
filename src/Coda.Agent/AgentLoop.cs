@@ -607,7 +607,6 @@ public sealed partial class AgentLoop : IAgentLoop
         var results = new List<ContentBlock>();
         var context = new ToolContext(this.options.WorkingDirectory)
         {
-            AllowOutsideWorkingDirectory = this.options.PermissionMode == PermissionMode.BypassPermissions,
             Sink = sink,
             Subagents = this.subagents,
             Todos = this.todos,
@@ -694,7 +693,17 @@ public sealed partial class AgentLoop : IAgentLoop
             try
             {
                 using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(toolUse.InputJson) ? "{}" : toolUse.InputJson);
-                result = await tool.ExecuteAsync(doc.RootElement, context, toolCts.Token).ConfigureAwait(false);
+
+                // Recompute the sandbox flag per individual tool execution (not once per batch) so a
+                // mid-batch mode change (Default→Bypass or back) applies to the very next tool. Read
+                // the mode live from the shared state; fall back to the snapshot mode for a fixed
+                // headless run with no shared state.
+                var toolContext = context with
+                {
+                    AllowOutsideWorkingDirectory =
+                        (this.options.PermissionModeState?.Mode ?? this.options.PermissionMode) == PermissionMode.BypassPermissions,
+                };
+                result = await tool.ExecuteAsync(doc.RootElement, toolContext, toolCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (toolCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
             {

@@ -186,6 +186,50 @@ public sealed class AgentRunnerTests : IDisposable
         Assert.True(owned.IsDisposed);
     }
 
+    [Fact]
+    public void SessionState_PermissionMode_delegates_to_the_stable_shared_state()
+    {
+        var session = new SessionState("claude-ai", this.tempDir);
+
+        // The getter reads the shared state; the setter writes through to it.
+        Assert.Equal(PermissionMode.Default, session.PermissionMode);
+        Assert.Equal(PermissionMode.Default, session.PermissionModes.Mode);
+
+        session.PermissionMode = PermissionMode.BypassPermissions;
+        Assert.Equal(PermissionMode.BypassPermissions, session.PermissionModes.Mode);
+
+        // A change straight to the shared state is visible through the property (same instance).
+        session.PermissionModes.Mode = PermissionMode.Plan;
+        Assert.Equal(PermissionMode.Plan, session.PermissionMode);
+    }
+
+    [Fact]
+    public async Task BuildOptions_passes_the_exact_session_permission_state_reference()
+    {
+        var events = new RecordingUiEvents();
+        var context = this.BuildContext(events, out var session);
+        SessionOptions? captured = null;
+        using var runner = new AgentRunner(
+            extraToolsProvider: null,
+            sessionFactory: (ctx, options) =>
+            {
+                captured = options;
+                return new CodaSession(
+                    ctx.Credentials,
+                    options,
+                    httpClient: this.http,
+                    history: ctx.Session.History,
+                    sessionId: ctx.Session.SessionId,
+                    llmClientFactory: new StubClientFactory(new StubClient()),
+                    agentLoopFactory: new SingleLoopFactory(new ScriptedLoop()));
+            });
+
+        await runner.RunAsync(context, "hi", CancellationToken.None);
+
+        Assert.NotNull(captured);
+        Assert.Same(session.PermissionModes, captured!.PermissionModeState);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
 
     private static int IndexOf<T>(IReadOnlyList<UiEvent> events)
