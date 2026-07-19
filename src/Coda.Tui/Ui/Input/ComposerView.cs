@@ -247,6 +247,31 @@ internal sealed class ComposerView : TextView
         return handled;
     }
 
+    /// <summary>
+    /// Positions the caret from a mouse click/drag through the base <see cref="TextView"/>, mirroring the
+    /// resulting genuine native caret move into the controller — the caret source of truth. The base editor
+    /// owns caret positioning for the mouse, so rather than mapping the raw pointer x/y through the Coda wrap
+    /// (which can diverge from the editor's own wrapping), the caret it settles on raises
+    /// <c>UnwrappedCursorPositionChanged</c> and — because <see cref="syncingNativeInput"/> is set for the
+    /// duration — is mirrored from its wrap-independent unwrapped position back to a UTF-16 index. That keeps
+    /// the controller caret on exactly the clicked character across soft/hard word-wrap, so a following Delete
+    /// removes it instead of a stale one and the caret never snaps to the first visual row. A layout pass
+    /// never routes through here, so it can never corrupt the controller.
+    /// </summary>
+    protected override bool OnMouseEvent(Mouse mouse)
+    {
+        // Startup disables input; swallow mouse input just like keys so a click can never edit or move the
+        // caret while initialization is in flight.
+        if (!this.inputEnabled)
+        {
+            return true;
+        }
+
+        var handled = false;
+        this.RunNativeEdit(() => handled = base.OnMouseEvent(mouse));
+        return handled;
+    }
+
     private bool HandleKeyDown(Key key)
     {
         // A previous key's base binding may have edited the model outside our handlers; reconcile before
@@ -615,9 +640,10 @@ internal sealed class ComposerView : TextView
 
         // A native edit updated the editor caret. Mirror it to the controller using the wrap-independent
         // unwrapped position (logical row + grapheme column) so soft-wrap divergence can never swap word
-        // fragments or snap the caret to the first line. Honour it only during an actual native edit: while
-        // we drive the caret programmatically (SyncTextView) or a layout pass emits a spurious caret report,
-        // the controller stays authoritative.
+        // fragments or snap the caret to the first line. Honour it only during genuine native input (a native
+        // edit or a mouse positioning, both of which set syncingNativeInput): while we drive the caret
+        // programmatically (SyncTextView) or a layout pass emits a spurious caret report, the controller
+        // stays authoritative.
         if (this.syncingText || !this.syncingNativeInput)
         {
             return;
