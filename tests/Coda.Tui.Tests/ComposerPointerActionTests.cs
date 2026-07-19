@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Shells;
 using Point = System.Drawing.Point;
 
 namespace Coda.Tui.Tests;
@@ -440,5 +441,99 @@ public sealed class ComposerPointerActionTests
 
         Assert.Empty(actions);
         Assert.False(view.HasComposerSelection);
+    }
+
+    /// <summary>
+    /// Right-click caret positioning replays a synthetic native left press through the base
+    /// <see cref="TextView"/>, which grabs the running application's mouse. Under a live Terminal.Gui
+    /// <see cref="IApplication"/> the composer must never keep that grab after the gesture completes: a leaked
+    /// grab silently reroutes the transcript's real mouse events to the composer and hijacks its
+    /// selection/scroll. Headless views (App == null) cannot grab, so only a running app exposes the leak.
+    /// </summary>
+    [Fact]
+    public void Right_click_caret_positioning_does_not_leak_the_application_mouse_grab()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var composer = shell.Composer;
+        composer.SetDraft("alpha beta gamma", 0);
+        composer.SetFocus();
+        Assert.False(app.Mouse!.IsGrabbed(composer), "the composer must not hold the mouse grab before the gesture");
+
+        // A right press with no selection positions the caret natively (grabbing the application mouse) and
+        // arms a paste; the release and synthesized click complete the gesture.
+        composer.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonPressed, Position = new Point(2, 0) });
+        composer.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonReleased, Position = new Point(2, 0) });
+        composer.NewMouseEvent(new Mouse { Flags = MouseFlags.RightButtonClicked, Position = new Point(2, 0) });
+
+        Assert.False(
+            app.Mouse!.IsGrabbed(composer),
+            "right-click caret positioning must release the application mouse grab it took, not leak it");
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Left_double_click_terminal_completes_the_copy_and_clears_suppression()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 20, height: 4);
+        view.SetDraft("alpha beta gamma", 0);
+        DragSelect(view, fromColumn: 0, toColumn: 5);
+        Assert.Equal("alpha", view.SelectedComposerText);
+
+        var actions = Capture(view);
+
+        // A left press over the selection copies it and arms suppression. Terminal.Gui then delivers the
+        // release and a synthesized terminal click; a second physical click reports the distinct
+        // LeftButtonDoubleClicked bit, which must complete the armed gesture just like LeftButtonClicked.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonDoubleClicked, Position = new Point(2, 0) });
+
+        // Exactly one copy for the whole gesture: the terminal double-click never raises a duplicate.
+        Assert.Single(actions);
+        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
+
+        // The terminal double-click must complete the gesture and clear suppression, symmetric with a plain
+        // terminal click. Left over armed, a following non-press native mouse action would be silently
+        // swallowed until the next press recovered it; the completion must leave no such stale state behind.
+        Assert.False(
+            view.LeftGestureSuppressed,
+            "a terminal double-click must clear left-gesture suppression, not leave it armed");
+    }
+
+    [Fact]
+    public void Left_triple_click_terminal_completes_the_copy_and_clears_suppression()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 20, height: 4);
+        view.SetDraft("alpha beta gamma", 0);
+        DragSelect(view, fromColumn: 0, toColumn: 5);
+        Assert.Equal("alpha", view.SelectedComposerText);
+
+        var actions = Capture(view);
+
+        // A third physical click terminates with the distinct LeftButtonTripleClicked bit; it must complete the
+        // armed left gesture with the same semantics as LeftButtonClicked/DoubleClicked.
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
+        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonTripleClicked, Position = new Point(2, 0) });
+
+        Assert.Single(actions);
+        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
+
+        Assert.False(
+            view.LeftGestureSuppressed,
+            "a terminal triple-click must clear left-gesture suppression, not leave it armed");
     }
 }
