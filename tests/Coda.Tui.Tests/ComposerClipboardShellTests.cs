@@ -40,6 +40,73 @@ public sealed class ComposerClipboardShellTests
         });
     }
 
+    /// <summary>
+    /// Left-drags from <paramref name="fromColumn"/> on <paramref name="fromRow"/> to
+    /// <paramref name="toColumn"/> on <paramref name="toRow"/> to natively select across rows, used to
+    /// isolate the newline separating two composer rows. The draft is set through the composer's own API.
+    /// </summary>
+    private static void SelectComposerRange(
+        RetainedShellFixture fixture,
+        string text,
+        int fromColumn,
+        int fromRow,
+        int toColumn,
+        int toRow)
+    {
+        fixture.Shell.Composer.SetDraft(text, 0);
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new Point(fromColumn, fromRow),
+        });
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new Point(toColumn, toRow),
+        });
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new Point(toColumn, toRow),
+        });
+    }
+
+    [Fact]
+    public void Ctrl_c_with_newline_only_composer_selection_clears_and_copies_zero_symbols()
+    {
+        var clipboardCalls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ =>
+            {
+                clipboardCalls++;
+                return true;
+            });
+
+        // Select only the newline separating "a" and "b": from the end of row 0 to the start of row 1.
+        SelectComposerRange(fixture, "a\nb", fromColumn: 1, fromRow: 0, toColumn: 0, toRow: 1);
+        Assert.True(fixture.Shell.Composer.HasComposerSelection);
+
+        // The native TextView reports the row separator using the platform newline (CRLF on Windows); it is a
+        // newline-only range that normalises to "\n" and carries zero visible symbols.
+        var selectedText = fixture.Shell.Composer.SelectedComposerText;
+        Assert.Equal("\n", selectedText.Replace("\r", string.Empty));
+        Assert.Equal(0, ClipboardStatusText.CountSymbols(selectedText));
+
+        var draftBefore = fixture.Shell.Composer.GetDraft();
+        var caretBefore = fixture.Shell.Composer.GetState().CursorIndex;
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+
+        // A zero-symbol selection clears with a deterministic confirmation without touching the writer.
+        Assert.Equal(0, clipboardCalls);
+        Assert.False(fixture.Shell.Composer.HasComposerSelection);
+        Assert.Equal("0 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.Equal(draftBefore, fixture.Shell.Composer.GetDraft());
+        Assert.Equal(caretBefore, fixture.Shell.Composer.GetState().CursorIndex);
+        Assert.Empty(fixture.Actions);
+    }
+
     [Fact]
     public void Ctrl_c_with_composer_selection_copies_clears_and_does_not_arm_exit()
     {
