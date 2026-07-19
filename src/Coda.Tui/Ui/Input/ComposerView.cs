@@ -287,8 +287,9 @@ internal sealed class ComposerView : TextView
             CanMoveVisualDown: caret.Row < layout.VisualLineCount - 1);
         var action = UiActionMap.Map(key, context);
 
-        // While a paste is in progress, a stray Enter is text, never a submission.
-        if (action == UiAction.Submit && this.controller.State.PasteActive)
+        // While a paste is in progress, a stray Enter is text, never a submission (with or without an open
+        // completion).
+        if (this.controller.State.PasteActive && action is UiAction.Submit or UiAction.CompleteAndSubmit)
         {
             action = UiAction.InsertNewline;
         }
@@ -562,7 +563,11 @@ internal sealed class ComposerView : TextView
         switch (action)
         {
             case UiAction.Submit:
-                var result = this.controller.Apply(UiAction.Submit);
+            case UiAction.CompleteAndSubmit:
+                // Submit (and, for CompleteAndSubmit, first accept the selected completion) replaces the whole
+                // draft, so re-place the caret and remeasure. Exactly one Submitted fires — CompleteAndSubmit
+                // returns a single submission result, never a separate completion then submission.
+                var result = this.controller.Apply(action);
                 this.SyncTextView();
                 this.RaiseLayoutInvalidated();
                 if (result.SubmittedText is { } submitted)

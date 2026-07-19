@@ -36,7 +36,9 @@ public static class UiActionMap
 
         if (key == Key.Enter)
         {
-            return UiAction.Submit;
+            // While the completion menu is open, Enter accepts the selected suggestion and submits in a single
+            // press (equivalent to Tab then Enter); otherwise it is an ordinary submission.
+            return context.CompletionVisible ? UiAction.CompleteAndSubmit : UiAction.Submit;
         }
 
         if (key == Key.L.WithCtrl)
