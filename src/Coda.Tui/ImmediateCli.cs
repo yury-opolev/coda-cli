@@ -64,7 +64,8 @@ public static class ImmediateCli
         writer.WriteLine();
         writer.WriteLine("Interactive keys (Warm Ember):");
         writer.WriteLine("  Enter           Submit the current prompt.");
-        writer.WriteLine("  Ctrl+J          Insert a newline without submitting.");
+        writer.WriteLine("  Ctrl+Enter      Insert a newline without submitting.");
+        writer.WriteLine("  Ctrl+J          Insert a newline (terminal-compatible fallback).");
         writer.WriteLine("  Up / Down       Move the composer cursor between the lines of a multi-line prompt.");
         writer.WriteLine("  Ctrl+Up / Ctrl+Down");
         writer.WriteLine("                  Step back and forward through prompt history.");

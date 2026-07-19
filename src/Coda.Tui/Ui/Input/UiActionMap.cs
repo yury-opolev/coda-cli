@@ -27,9 +27,10 @@ public static class UiActionMap
             return UiAction.None;
         }
 
-        // Ctrl+J is checked before any plain-letter handling so it always wins over an
-        // ordinary "j" keystroke.
-        if (key == Key.J.WithCtrl)
+        // Ctrl+Enter is the intuitive multiline shortcut; Ctrl+J remains the broadly
+        // compatible terminal fallback. Both are checked before any plain-letter or plain
+        // Enter handling so they always win over an ordinary "j" keystroke or a submission.
+        if (key == Key.Enter.WithCtrl || key == Key.J.WithCtrl)
         {
             return UiAction.InsertNewline;
         }
