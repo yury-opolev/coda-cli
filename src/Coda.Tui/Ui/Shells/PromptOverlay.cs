@@ -279,11 +279,7 @@ internal sealed class PromptOverlay : View
                     var mark = req.Kind == UiPromptKind.SelectMany
                         ? (this.checkedIndices.Contains(i) ? "[x] " : "[ ] ")
                         : string.Empty;
-                    builder.Append(cursor).Append(' ').Append(mark).Append(option.Label);
-                    if (option.Detail is { Length: > 0 } detail)
-                    {
-                        builder.Append(" — ").Append(detail);
-                    }
+                    builder.Append(cursor).Append(' ').Append(mark).Append(UiPromptOptionFormatter.Format(option));
 
                     if (i < req.Options.Length - 1)
                     {

@@ -22,7 +22,11 @@ public enum UiPromptKind
 }
 
 /// <summary>A single selectable option, carrying a stable <paramref name="Id"/> distinct from its display label.</summary>
-public sealed record UiPromptOption(string Id, string Label, string? Detail = null);
+public sealed record UiPromptOption(
+    string Id,
+    string Label,
+    string? Detail = null,
+    bool IsCurrent = false);
 
 /// <summary>
 /// A host-neutral description of a prompt the UI must present. Frontends render it however they like
@@ -41,9 +45,9 @@ public sealed record UiPromptRequest(
     public static UiPromptRequest Confirm(string title, bool defaultValue) =>
         new(Guid.NewGuid(), UiPromptKind.Confirm, title, null, [new("yes", "Yes"), new("no", "No")], defaultValue ? "yes" : "no", true);
 
-    /// <summary>A single-choice selection over <paramref name="options"/>.</summary>
-    public static UiPromptRequest Select(string title, IEnumerable<UiPromptOption> options) =>
-        new(Guid.NewGuid(), UiPromptKind.SelectOne, title, null, [.. options], null, true);
+    /// <summary>A single-choice selection over <paramref name="options"/>, optionally pre-selecting <paramref name="defaultValue"/>.</summary>
+    public static UiPromptRequest Select(string title, IEnumerable<UiPromptOption> options, string? defaultValue = null) =>
+        new(Guid.NewGuid(), UiPromptKind.SelectOne, title, null, [.. options], defaultValue, true);
 
     /// <summary>A multi-choice selection over <paramref name="options"/>.</summary>
     public static UiPromptRequest SelectMany(string title, IEnumerable<UiPromptOption> options) =>

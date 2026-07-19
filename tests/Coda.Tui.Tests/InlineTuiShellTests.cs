@@ -651,6 +651,30 @@ public sealed class PromptOverlayTests
     }
 
     [Fact]
+    public void SelectOne_current_option_renders_marker_and_enter_publishes_default_id()
+    {
+        var overlay = CreateOverlay(out var events);
+        var request = UiPromptRequest.Select(
+            "Pick one",
+            new[]
+            {
+                new UiPromptOption("a", "Alpha"),
+                new UiPromptOption("b", "Bravo", Detail: "200K ctx", IsCurrent: true),
+            },
+            defaultValue: "b");
+        overlay.Update(request);
+
+        Assert.Contains("● Bravo", overlay.BodyText);
+        Assert.Contains("Current", overlay.BodyText);
+
+        overlay.NewKeyDownEvent(Key.Enter);
+
+        var response = SingleResponse(events);
+        Assert.Equal(request.Id, response.RequestId);
+        Assert.Equal(new[] { "b" }, response.Response.SelectedIds);
+    }
+
+    [Fact]
     public void SelectMany_space_toggles_and_enter_publishes_all_checked_ids()
     {
         var overlay = CreateOverlay(out var events);

@@ -57,6 +57,25 @@ public sealed class UiPromptServiceTests
     }
 
     [Fact]
+    public async Task Spectre_select_one_marks_current_option_and_defaults_to_it()
+    {
+        using var console = new TestConsole();
+        console.Profile.Capabilities.Interactive = true;
+        console.Input.PushKey(ConsoleKey.Enter);
+        var service = new SpectreUiPromptService(console);
+
+        var response = await service.RequestAsync(
+            UiPromptRequest.Select(
+                "Choose",
+                [new("a", "Alpha"), new("b", "Bravo", Detail: "200K ctx", IsCurrent: true)],
+                defaultValue: "b"));
+
+        Assert.Equal(new[] { "b" }, response.SelectedIds.ToArray());
+        Assert.Contains("● Bravo", console.Output);
+        Assert.Contains("Current", console.Output);
+    }
+
+    [Fact]
     public async Task Actor_cancellation_cancels_only_the_cancelled_prompt()
     {
         using var mailbox = new UiEventMailbox(8);

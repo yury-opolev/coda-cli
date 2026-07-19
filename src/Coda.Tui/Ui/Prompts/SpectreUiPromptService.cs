@@ -54,8 +54,17 @@ public sealed class SpectreUiPromptService : IUiPromptService
     {
         var prompt = new SelectionPrompt<UiPromptOption>()
             .Title(request.Title)
-            .UseConverter(o => o.Label)
+            .UseConverter(o => Markup.Escape(UiPromptOptionFormatter.Format(o)))
             .AddChoices(request.Options);
+
+        if (request.DefaultValue is { Length: > 0 } defaultId)
+        {
+            var defaultOption = request.Options.FirstOrDefault(o => string.Equals(o.Id, defaultId, StringComparison.Ordinal));
+            if (defaultOption is not null)
+            {
+                prompt.DefaultValue(defaultOption);
+            }
+        }
 
         var choice = await _console.PromptAsync(prompt, cancellationToken).ConfigureAwait(false);
         return new UiPromptResponse(false, [choice.Id], choice.Label);
@@ -65,7 +74,7 @@ public sealed class SpectreUiPromptService : IUiPromptService
     {
         var prompt = new MultiSelectionPrompt<UiPromptOption>()
             .Title(request.Title)
-            .UseConverter(o => o.Label)
+            .UseConverter(o => Markup.Escape(UiPromptOptionFormatter.Format(o)))
             .NotRequired()
             .AddChoices(request.Options);
 
