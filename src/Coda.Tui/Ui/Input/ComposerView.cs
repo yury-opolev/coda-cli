@@ -15,7 +15,7 @@ namespace Coda.Tui.Ui.Input;
 /// routed through <see cref="UiActionMap"/> and a Terminal.Gui-independent
 /// <see cref="ComposerController"/>, which owns the authoritative draft/caret/history
 /// state; the <see cref="TextView"/> is kept as a synchronized mirror. Enter submits,
-/// Ctrl+Enter inserts a newline (with Ctrl+J as the terminal-compatible fallback), and
+/// Shift+Enter inserts a newline (with Ctrl+Enter and Ctrl+J as terminal-compatible fallbacks), and
 /// bracketed paste is inserted literally so embedded newlines can never trigger a submission.
 /// </summary>
 internal sealed class ComposerView : TextView

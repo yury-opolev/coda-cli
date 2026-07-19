@@ -121,7 +121,7 @@ dotnet run --project src/Coda.Tui -- --plain            # plain output (screen r
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
 
-**Keys (Warm Ember):** `Enter` submits · `Ctrl+Enter` (or `Ctrl+J` as a terminal-compatible fallback) inserts a newline · `Up`/`Down` move the composer
+**Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 press `Esc` **twice** to interrupt the active turn (a single `Esc` only dismisses the slash-command menu
 or clears a selection) · `Ctrl+C` copies the current transcript selection and, with nothing selected,
