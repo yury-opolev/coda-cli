@@ -329,6 +329,13 @@ public sealed class UiActionMapTests
     }
 
     [Fact]
+    public void Shift_enter_maps_to_insert_newline()
+    {
+        Assert.Equal(UiAction.InsertNewline, UiActionMap.Map(Key.Enter.WithShift, TypingMiddle));
+        Assert.Equal(UiAction.Submit, UiActionMap.Map(Key.Enter, TypingMiddle));
+    }
+
+    [Fact]
     public void Up_down_precedence_is_completion_then_visual_editor_then_history_boundary()
     {
         Assert.Equal(UiAction.CompletionPrevious, UiActionMap.Map(Key.CursorUp, Completing));

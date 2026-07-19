@@ -104,6 +104,21 @@ public sealed class ComposerViewTests
     }
 
     [Fact]
+    public void Shift_enter_inserts_newline_without_submitting()
+    {
+        var controller = CreateController();
+        using var view = new ComposerView(controller);
+        var submissions = new List<string>();
+        view.Submitted += (_, text) => submissions.Add(text);
+        view.SetDraft("hello", 5);
+
+        view.NewKeyDownEvent(Key.Enter.WithShift);
+
+        Assert.Equal("hello\n", view.GetDraft());
+        Assert.Empty(submissions);
+    }
+
+    [Fact]
     public void F2_raises_toggle_mode_without_mutating_draft()
     {
         var controller = CreateController();

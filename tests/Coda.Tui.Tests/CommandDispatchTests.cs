@@ -71,6 +71,19 @@ public sealed class CommandDispatchTests
 
         Assert.True(result.ShouldExit);
     }
+
+    [Fact]
+    public async Task Exit_command_prints_no_goodbye_line()
+    {
+        // The centralized exit card is now the only clean-exit output; the standalone "Goodbye." line
+        // is gone so it can never duplicate or precede the card.
+        var (app, _, console, _) = TestAppBuilder.BuildApp();
+
+        var result = await app.DispatchAsync(ParsedInput.Slash("exit", Array.Empty<string>()), CancellationToken.None);
+
+        Assert.True(result.ShouldExit);
+        Assert.DoesNotContain("Goodbye", console.Output);
+    }
 }
 
 public sealed class ProviderCommandTests
