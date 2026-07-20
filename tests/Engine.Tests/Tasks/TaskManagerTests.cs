@@ -433,5 +433,61 @@ public class TaskManagerTests
             disposeTask.Wait(TimeSpan.FromSeconds(5)),
             "Dispose did not complete.");
     }
+    [Fact]
+    public void ReadFromMainCursor_ConcurrentReaders_DeliverEachChunkExactlyOnce()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+
+        // A large body of fixed-width, uniquely numbered tokens so any duplicate delivery
+        // is detectable by counting token occurrences across all readers' combined output.
+        const int tokenCount = 4000;
+        var expected = new System.Text.StringBuilder();
+        for (var i = 0; i < tokenCount; i++)
+        {
+            expected.Append($"<{i:D6}>");
+        }
+        var expectedText = expected.ToString();
+
+        using var stop = new ManualResetEventSlim(false);
+        var buffers = new System.Collections.Concurrent.ConcurrentBag<string>();
+
+        // Multiple readers hammer the shared main cursor while a producer streams output.
+        var readers = Enumerable.Range(0, 6).Select(_ => Task.Run(() =>
+        {
+            var sb = new System.Text.StringBuilder();
+            while (true)
+            {
+                var (_, text, _, _) = mgr.ReadForMainAgent(t.Id);
+                sb.Append(text);
+                if (stop.IsSet && text.Length == 0) break;
+            }
+            buffers.Add(sb.ToString());
+        })).ToArray();
+
+        var producer = Task.Run(() =>
+        {
+            for (var i = 0; i < tokenCount; i++)
+            {
+                mgr.AppendOutput(t.Id, $"<{i:D6}>");
+            }
+        });
+
+        Assert.True(producer.Wait(TimeSpan.FromSeconds(10)), "producer did not finish.");
+        // Give readers a moment to drain, then signal completion.
+        Thread.Sleep(50);
+        stop.Set();
+        Assert.True(Task.WaitAll(readers, TimeSpan.FromSeconds(10)), "readers did not finish.");
+
+        var combined = string.Concat(buffers);
+
+        // No duplicate delivery: total delivered length equals appended length exactly.
+        Assert.Equal(expectedText.Length, combined.Length);
+
+        // Every token was delivered exactly once across all readers.
+        var matches = System.Text.RegularExpressions.Regex.Matches(combined, "<\\d{6}>");
+        Assert.Equal(tokenCount, matches.Count);
+        Assert.Equal(tokenCount, matches.Select(m => m.Value).Distinct().Count());
+    }
 #pragma warning restore xUnit1031
 }

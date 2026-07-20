@@ -1,6 +1,7 @@
 using Coda.Agent;
 using Coda.Agent.Tasks;
 using Coda.Agent.Tools;
+using LlmClient;
 using Xunit;
 
 namespace Engine.Tests.Tasks;
@@ -16,6 +17,135 @@ public class SubagentManagerTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+    }
+
+    /// <summary>A parent sink that records how many times each event reached it.</summary>
+    private sealed class RecordingSink : IAgentSink
+    {
+        public int AssistantText { get; private set; }
+        public int AssistantTextComplete { get; private set; }
+        public int ToolCall { get; private set; }
+        public int ToolResult { get; private set; }
+        public int ToolProgress { get; private set; }
+        public int Error { get; private set; }
+        public int LimitReached { get; private set; }
+        public int StopReason { get; private set; }
+        public int Usage { get; private set; }
+
+        public void OnAssistantText(string delta) => this.AssistantText++;
+        public void OnAssistantTextComplete() => this.AssistantTextComplete++;
+        public void OnToolCall(string toolName, string inputPreview) => this.ToolCall++;
+        public void OnToolResult(string toolName, ToolResult result) => this.ToolResult++;
+        public void OnToolProgress(string toolName, long elapsedMs) => this.ToolProgress++;
+        public void OnError(string message) => this.Error++;
+        public void OnLimitReached(string kind, string message) => this.LimitReached++;
+        public void OnStopReason(string? stopReason) => this.StopReason++;
+        public void OnUsage(TokenUsage usage) => this.Usage++;
+    }
+
+    /// <summary>A host that emits exactly one of every IAgentSink event before returning.</summary>
+    private sealed class EventEmittingHost : ISubagentHost
+    {
+        public Task<string> RunSubagentAsync(
+            string subagentType, string prompt, IAgentSink sink, SteeringInbox steering,
+            string taskId, int depth, CancellationToken cancellationToken = default)
+        {
+            sink.OnAssistantText("hello");
+            sink.OnAssistantTextComplete();
+            sink.OnToolCall("read_file", "{}");
+            sink.OnToolProgress("read_file", 1234);
+            sink.OnToolResult("read_file", new ToolResult("ok"));
+            sink.OnUsage(new TokenUsage(7, 11));
+            sink.OnLimitReached("max_tokens", "truncated");
+            sink.OnError("something odd");
+            sink.OnStopReason("end_turn");
+            return Task.FromResult("done");
+        }
+    }
+
+    /// <summary>A host that blocks on the cancellation token so the caller can drive stops.</summary>
+    private sealed class BlockingHost : ISubagentHost
+    {
+        private readonly TaskCompletionSource _started = new();
+
+        public Task Started => this._started.Task;
+
+        public async Task<string> RunSubagentAsync(
+            string subagentType, string prompt, IAgentSink sink, SteeringInbox steering,
+            string taskId, int depth, CancellationToken cancellationToken = default)
+        {
+            this._started.TrySetResult();
+            await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            return "unreachable";
+        }
+    }
+
+    [Fact]
+    public async Task Foreground_ForwardsEveryOptionalSinkEventToParentExactlyOnce()
+    {
+        var mgr = NewManager();
+        var parent = new RecordingSink();
+
+        await mgr.RunSubagentForegroundAsync(
+            new EventEmittingHost(), "general-purpose", "go", "desc", parent, parentTaskId: null);
+
+        Assert.Equal(1, parent.AssistantText);
+        Assert.Equal(1, parent.AssistantTextComplete);
+        Assert.Equal(1, parent.ToolCall);
+        Assert.Equal(1, parent.ToolResult);
+        Assert.Equal(1, parent.ToolProgress);
+        Assert.Equal(1, parent.Error);
+        Assert.Equal(1, parent.LimitReached);
+        Assert.Equal(1, parent.StopReason);
+        Assert.Equal(1, parent.Usage);
+    }
+
+    [Fact]
+    public async Task Foreground_KeepsLimitStopAndErrorMarkersVisibleInRing()
+    {
+        var mgr = NewManager();
+
+        await mgr.RunSubagentForegroundAsync(
+            new EventEmittingHost(), "general-purpose", "go", "desc", new NullSink(), parentTaskId: null);
+
+        var ring = mgr.TryPeek("task-0001", 4000) ?? string.Empty;
+        Assert.Contains("max_tokens", ring);
+        Assert.Contains("end_turn", ring);
+        Assert.Contains("something odd", ring);
+    }
+
+    [Fact]
+    public async Task Foreground_CallerCancellation_StopsTaskAndRethrows()
+    {
+        var mgr = NewManager();
+        var host = new BlockingHost();
+        using var caller = new CancellationTokenSource();
+
+        var run = mgr.RunSubagentForegroundAsync(
+            host, "general-purpose", "go", "desc", new NullSink(), parentTaskId: null, caller.Token);
+
+        await host.Started;
+        caller.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => run);
+        Assert.Equal(TaskRunStatus.Stopped, mgr.Get("task-0001")!.Status);
+    }
+
+    [Fact]
+    public async Task Foreground_TaskScopedStop_ReturnsCompatibilityResultWithoutThrowing()
+    {
+        var mgr = NewManager();
+        var host = new BlockingHost();
+
+        var run = mgr.RunSubagentForegroundAsync(
+            host, "general-purpose", "go", "desc", new NullSink(), parentTaskId: null);
+
+        await host.Started;
+        Assert.Equal(TaskActionResult.Ok, mgr.RequestStop("task-0001"));
+
+        var result = await run;
+        Assert.Equal("(subagent stopped)", result);
+        Assert.Equal(TaskRunStatus.Stopped, mgr.Get("task-0001")!.Status);
     }
 
     /// <summary>Fake host implementing the new ISubagentHost signature; records what it was given.</summary>

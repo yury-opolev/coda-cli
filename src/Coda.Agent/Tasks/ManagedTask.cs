@@ -146,19 +146,18 @@ internal sealed class ManagedTask : IDisposable
     /// <summary>
     /// Reads output since the main agent's server-side cursor (backs <c>task_output</c>) and
     /// advances that cursor. Truncated is true when eviction overtook the cursor.
+    ///
+    /// The whole cursor-read → ring-read → cursor-update sequence runs under the task gate so
+    /// concurrent readers serialize and never deliver the same span twice. The nested lock
+    /// order here (task gate → ring gate, via <see cref="OutputRing.ReadFrom"/>) matches the
+    /// append path (<see cref="TryAppend"/> also takes task gate → ring gate), so holding the
+    /// gate across the ring read introduces no lock inversion.
     /// </summary>
     public (string Text, bool Truncated, TaskRunStatus Status) ReadFromMainCursor()
     {
-        long cursor;
         lock (_gate)
         {
-            cursor = _mainCursor;
-        }
-
-        var (text, next, truncated) = _output.ReadFrom(cursor);
-
-        lock (_gate)
-        {
+            var (text, next, truncated) = _output.ReadFrom(_mainCursor);
             _mainCursor = next;
             return (text, truncated, _status);
         }

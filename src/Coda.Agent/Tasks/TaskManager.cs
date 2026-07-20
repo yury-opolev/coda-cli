@@ -84,6 +84,10 @@ public sealed partial class TaskManager : IDisposable
         lock (_gate)
         {
             var id = $"task-{++_nextId:D4}";
+            // Migration note: this runtime issues `task-NNNN` ids. Legacy background subagents
+            // still live in the separate BackgroundTaskRunner and use `bgNNNN` ids; the two id
+            // spaces coexist during Task 5. Task 6 removes BackgroundTaskRunner and unifies all
+            // ids here, so do not add cross-routing for `bgNNNN` here — treat it as legacy-only.
             var logPath = Path.Combine(LogRoot, SessionId, id + ".log");
             task = new ManagedTask(
                 id, parentTaskId, depth, kind, description, logPath, _outputRingBytes, OnTaskTerminal);

@@ -1,3 +1,5 @@
+using LlmClient;
+
 namespace Coda.Agent.Tasks;
 
 public sealed partial class TaskManager
@@ -30,8 +32,19 @@ public sealed partial class TaskManager
             Complete(task.Id, result);
             return result;
         }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            // The caller's own token (turn/caller cancellation) fired: this task is being torn
+            // down as part of unwinding the enclosing turn. Mark it Stopped, then rethrow so the
+            // parent AgentLoop unwinds immediately instead of swallowing the cancellation.
+            Stop(task.Id);
+            throw;
+        }
         catch (OperationCanceledException)
         {
+            // Only the task-scoped token fired (task_stop / RequestStop): this is a graceful,
+            // self-contained stop. Report it via the legacy compatibility result so the caller
+            // keeps running rather than unwinding.
             Stop(task.Id);
             return "(subagent stopped)";
         }
@@ -120,7 +133,13 @@ public sealed partial class TaskManager
     /// <summary>
     /// A sink that appends a subagent's assistant text and tool activity to the task's
     /// ring/log while forwarding every event to the parent sink (real for foreground,
-    /// <see cref="NullAgentSink"/> for background).
+    /// <see cref="NullAgentSink"/> for background). Forwarding is total: every
+    /// <see cref="IAgentSink"/> event — including the optional
+    /// <see cref="IAgentSink.OnToolProgress"/>, <see cref="IAgentSink.OnLimitReached"/>,
+    /// <see cref="IAgentSink.OnStopReason"/>, and <see cref="IAgentSink.OnUsage"/> pulses —
+    /// reaches the parent exactly once. High-frequency progress/usage pulses are deliberately
+    /// kept out of the ring/log to avoid drowning the readable transcript, but concise
+    /// limit/stop/error markers are appended so those milestones stay visible in task_output.
     /// </summary>
     private sealed class TaskOutputSink : IAgentSink
     {
@@ -155,11 +174,38 @@ public sealed partial class TaskManager
             _parent.OnToolResult(toolName, result);
         }
 
+        // A liveness pulse: forwarded so an orchestrator sees the subagent is alive, but kept
+        // out of the ring/log because it fires repeatedly and would flood the transcript.
+        public void OnToolProgress(string toolName, long elapsedMs) =>
+            _parent.OnToolProgress(toolName, elapsedMs);
+
         public void OnError(string message)
         {
             _manager.AppendOutput(_taskId, $"[error: {message}]\n");
             _parent.OnError(message);
         }
+
+        // A recoverable per-turn limit — a meaningful milestone, so it earns a ring marker.
+        public void OnLimitReached(string kind, string message)
+        {
+            _manager.AppendOutput(_taskId, $"[limit: {kind}: {message}]\n");
+            _parent.OnLimitReached(kind, message);
+        }
+
+        // The turn's stop reason — appended as a concise marker so it stays visible.
+        public void OnStopReason(string? stopReason)
+        {
+            if (!string.IsNullOrEmpty(stopReason))
+            {
+                _manager.AppendOutput(_taskId, $"[stop: {stopReason}]\n");
+            }
+
+            _parent.OnStopReason(stopReason);
+        }
+
+        // Token usage: forwarded for accounting, but kept out of the ring/log as it is
+        // per-iteration accounting noise rather than readable transcript content.
+        public void OnUsage(TokenUsage usage) => _parent.OnUsage(usage);
     }
 
     /// <summary>An IAgentSink that discards everything — used as the parent for background subagents.</summary>
@@ -171,6 +217,10 @@ public sealed partial class TaskManager
         public void OnAssistantTextComplete() { }
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnToolProgress(string toolName, long elapsedMs) { }
         public void OnError(string message) { }
+        public void OnLimitReached(string kind, string message) { }
+        public void OnStopReason(string? stopReason) { }
+        public void OnUsage(TokenUsage usage) { }
     }
 }
