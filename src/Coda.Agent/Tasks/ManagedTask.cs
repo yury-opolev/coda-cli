@@ -9,6 +9,11 @@ internal sealed class ManagedTask : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
     private readonly TaskCompletionSource _detach = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Completes exactly once when the task reaches a terminal state (or is disposed). Lets the
+    // manager's graceful shutdown await real completion of every running task deterministically
+    // — covering foreground work active in other callers as well as Task.Run workers — rather
+    // than polling status.
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _gate = new();
     private readonly OutputRing _output;
     private readonly Action<ManagedTask>? _onTerminal;
@@ -85,6 +90,13 @@ internal sealed class ManagedTask : IDisposable
     /// <summary>Completes when a caller requests this shell task be promoted to the background.</summary>
     public Task DetachRequested => _detach.Task;
 
+    /// <summary>
+    /// Completes once the task reaches a terminal state (completed/failed/stopped) or is disposed.
+    /// Never faults. The manager awaits this during graceful shutdown so it can wait — bounded —
+    /// for running tasks to finish on their own before force-marking any straggler terminal.
+    /// </summary>
+    public Task Completion => _completion.Task;
+
     /// <summary>Signals a detach request; returns false if one was already signalled.</summary>
     internal bool TryRequestDetach() => _detach.TrySetResult();
 
@@ -149,6 +161,9 @@ internal sealed class ManagedTask : IDisposable
         // held, avoiding lock-ordering deadlocks with registry readers.
         try { _onTerminal?.Invoke(this); }
         catch { /* best-effort; a hook failure must never surface from a transition. */ }
+
+        // Signal terminal completion last so any shutdown waiter observes the terminal status.
+        _completion.TrySetResult();
 
         return true;
     }
@@ -216,6 +231,9 @@ internal sealed class ManagedTask : IDisposable
     {
         try { _cts.Cancel(); } catch (ObjectDisposedException) { }
         _cts.Dispose();
+        // Wake any shutdown waiter even if the task never transitioned through a status change
+        // (e.g. a bare-registered task torn down directly). Idempotent — no-op once set.
+        _completion.TrySetResult();
         // Drop per-consumer cursors so they are released when the task is torn down; the task
         // count is bounded per session, so this keeps cursor state from outliving its task.
         lock (_gate) { _cursors.Clear(); }

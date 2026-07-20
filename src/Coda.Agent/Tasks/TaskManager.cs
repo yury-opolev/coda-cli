@@ -65,6 +65,15 @@ public sealed partial class TaskManager : IDisposable
         string? parentTaskId,
         TaskExecutionMode mode = TaskExecutionMode.Foreground)
     {
+        // Once shutdown has begun the manager stops accepting registrations so no new subagent
+        // loop or shell process can start during teardown and outlive it. Checked first, before
+        // any id assignment, so a rejected start leaves the registry untouched.
+        if (_shuttingDown)
+        {
+            throw new InvalidOperationException(
+                "Task manager is shutting down; no new tasks may be registered.");
+        }
+
         int depth;
         if (parentTaskId is null)
         {
@@ -162,6 +171,50 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>Returns the live task for an id, or null. Internal for tools/host use.</summary>
     internal ManagedTask? Find(string id) =>
         _tasks.TryGetValue(id, out var t) ? t : null;
+
+    /// <summary>
+    /// Removes a terminal task from the manager. Returns <see cref="TaskActionResult.Rejected"/>
+    /// while it is still running, <see cref="TaskActionResult.NotFound"/> for unknown ids, and
+    /// <see cref="TaskActionResult.Ok"/> once removed: the task is dropped from the registry and
+    /// order list, its per-consumer cursors/steering/process refs are released via
+    /// <see cref="ManagedTask.Dispose"/>, its log writer (if any) is disposed (flushing/closing
+    /// it), and a <see cref="TaskChangeKind.Removed"/> change is published at the task's final
+    /// version so subscribers observe the removal.
+    /// </summary>
+    public TaskActionResult Remove(string id)
+    {
+        ManagedTask task;
+        lock (_gate)
+        {
+            var index = _order.FindIndex(t => t.Id == id);
+            if (index < 0)
+            {
+                return TaskActionResult.NotFound;
+            }
+
+            task = _order[index];
+            if (task.Status == TaskRunStatus.Running)
+            {
+                // Only terminal tasks may be removed; a running task must be stopped first.
+                return TaskActionResult.Rejected;
+            }
+
+            _order.RemoveAt(index);
+        }
+
+        _tasks.TryRemove(id, out _);
+        if (_logs.TryRemove(id, out var log))
+        {
+            log.Dispose();
+        }
+
+        // Publish the task's final version with the Removed kind. The task is already terminal,
+        // so its version is stable and no further change can follow it.
+        var version = task.Version;
+        task.Dispose();
+        Publish(id, version, TaskChangeKind.Removed);
+        return TaskActionResult.Ok;
+    }
 
     /// <summary>
     /// Appends output to a task's ring and persistent log, then publishes an Output change
@@ -281,6 +334,10 @@ public sealed partial class TaskManager : IDisposable
         TaskSubscription[] subs;
         lock (_gate)
         {
+            // Idempotent: a second Dispose (e.g. after ShutdownAsync already disposed) is a no-op.
+            if (_disposed) return;
+            _disposed = true;
+
             tasks = _order.ToArray();
             // Snapshot AND clear subscriptions under the lock so no late publish reaches a
             // subscription after this point, then close them outside the lock (below).

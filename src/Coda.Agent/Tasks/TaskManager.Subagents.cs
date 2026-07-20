@@ -125,6 +125,43 @@ public sealed partial class TaskManager
     }
 
     /// <summary>
+    /// Lists the tasks visible to <paramref name="callerTaskId"/>: the main agent (null caller)
+    /// sees every task in the session; a subagent sees only its <em>strict descendants</em> (its
+    /// own subtree). A subagent never sees itself, its ancestors, siblings, or unrelated branches,
+    /// so the snapshot leaks no ids outside its subtree.
+    /// </summary>
+    public IReadOnlyList<TaskSnapshot> List(string? callerTaskId)
+    {
+        if (callerTaskId is null) return List();
+
+        lock (_gate)
+        {
+            // IsAuthorizedCaller reads the parent graph via Find (ConcurrentDictionary), never the
+            // registry lock, so evaluating it under _gate introduces no re-entrancy or inversion.
+            return _order
+                .Where(t => IsAuthorizedCaller(t.Id, callerTaskId))
+                .Select(t => t.ToSnapshot())
+                .ToList();
+        }
+    }
+
+    /// <summary>
+    /// Returns the snapshot for <paramref name="id"/> only when <paramref name="callerTaskId"/> is
+    /// authorized for it. An unauthorized target and an unknown id both return null, so a subagent
+    /// cannot distinguish a task it does not own from one that does not exist.
+    /// </summary>
+    public TaskSnapshot? Get(string id, string? callerTaskId) =>
+        IsAuthorizedCaller(id, callerTaskId) ? Get(id) : null;
+
+    /// <summary>
+    /// Peeks the output tail for <paramref name="id"/> on behalf of <paramref name="callerTaskId"/>
+    /// without advancing any cursor. Returns null when the id is unknown OR the caller is
+    /// unauthorized (indistinguishable), and the peeked text otherwise (empty when no output yet).
+    /// </summary>
+    public string? TryPeek(string id, int maxChars, string? callerTaskId) =>
+        IsAuthorizedCaller(id, callerTaskId) ? TryPeek(id, maxChars) : null;
+
+    /// <summary>
     /// Requests cancellation of a running task on behalf of <paramref name="callerTaskId"/>
     /// (backs <c>task_stop</c>). Returns <see cref="TaskActionResult.Denied"/> when the caller is
     /// not authorized for the target, checked BEFORE any state inspection so an unauthorized
@@ -143,17 +180,30 @@ public sealed partial class TaskManager
     /// <summary>Compatibility overload for the main agent (full authority over every task).</summary>
     public TaskActionResult RequestStop(string id) => RequestStop(id, callerTaskId: null);
 
-    /// <summary>Queues a steering message for a running subagent (backs <c>task_send</c>).</summary>
-    public TaskActionResult Steer(string id, string message)
+    /// <summary>
+    /// Queues a steering message for a running subagent on behalf of <paramref name="callerTaskId"/>
+    /// (backs <c>task_send</c>). The main agent (null caller) may steer any task; a subagent may
+    /// steer only its own running descendants. Authorization is checked BEFORE any state
+    /// inspection — right after the existence check — so an unauthorized caller (mapped to the
+    /// same wording as NotFound by the tool) cannot distinguish a shell from a subagent, a running
+    /// task from a terminal one, or probe the existence of tasks outside its subtree. Returns
+    /// <see cref="TaskActionResult.Rejected"/> for a shell or a subagent with no steering inbox,
+    /// and <see cref="TaskActionResult.InvalidState"/> for a terminal subagent.
+    /// </summary>
+    public TaskActionResult Steer(string id, string message, string? callerTaskId)
     {
         var t = Find(id);
         if (t is null) return TaskActionResult.NotFound;
+        if (!IsAuthorizedCaller(id, callerTaskId)) return TaskActionResult.Denied;
         if (t.Kind != TaskKind.Subagent) return TaskActionResult.Rejected;
         if (t.Status != TaskRunStatus.Running) return TaskActionResult.InvalidState;
         if (t.Steering is null) return TaskActionResult.Rejected;
         t.Steering.Enqueue(message);
         return TaskActionResult.Ok;
     }
+
+    /// <summary>Compatibility overload for the main agent (full authority over every task).</summary>
+    public TaskActionResult Steer(string id, string message) => Steer(id, message, callerTaskId: null);
 
     /// <summary>
     /// Reads incremental output for a caller's own server-side cursor (backs <c>task_output</c>).

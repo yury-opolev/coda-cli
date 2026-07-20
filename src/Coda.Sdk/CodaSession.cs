@@ -750,7 +750,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        this.tasks.Dispose();
+        // Graceful, bounded shutdown of all subagent/shell tasks: cancels running work, kills shell
+        // process trees, waits the dispose budget, then force-stops stragglers. Idempotent.
+        await this.tasks.DisposeAsync().ConfigureAwait(false);
 
         // Shut down LSP servers before releasing the HTTP client.
         if (this.lspManager is not null)
