@@ -45,6 +45,37 @@ public class ParityToolsTests : IDisposable
         Assert.Equal(TaskRunStatus.Running, mgr.Get(t.Id)!.Status); // not stopped by the timeout
     }
 
+    [Theory]
+    [InlineData(0, 600)]       // <= 0 falls back to the default
+    [InlineData(-5, 600)]      // negatives fall back to the default
+    [InlineData(1, 1)]         // small positive values pass through
+    [InlineData(600, 600)]     // the default passes through
+    [InlineData(1800, 1800)]   // exactly the ceiling passes through
+    [InlineData(1801, 1800)]   // just over the ceiling clamps down
+    [InlineData(int.MaxValue, 1800)] // pathological values clamp to the ceiling
+    public void NormalizeTimeoutSeconds_ClampsToBounds(int input, int expected) =>
+        Assert.Equal(expected, TaskWaitTool.NormalizeTimeoutSeconds(input));
+
+    [Fact]
+    public async Task TaskWait_HugeTimeout_DoesNotThrow_AndIsBounded()
+    {
+        var mgr = NewManager();
+
+        // int.MaxValue seconds would overflow CancelAfter (ArgumentOutOfRange) if not clamped.
+        // Use an unknown id so WaitForTerminalAsync returns immediately — no 30-minute wait.
+        var result = await new TaskWaitTool().ExecuteAsync(
+            Input("""{"task_id":"task-9999","timeout_seconds":2147483647}"""), Ctx(mgr), CancellationToken.None);
+
+        Assert.Contains("not found", result.Content);
+        Assert.False(result.IsError);
+    }
+
+    [Theory]
+    [InlineData(null, "Task 't-1' finished.")] // concurrently pruned after Terminal — no bogus "status finished"
+    [InlineData("completed", "Task 't-1' finished with status completed.")]
+    public void FormatFinished_OmitsStatusClauseWhenMissing(string? status, string expected) =>
+        Assert.Equal(expected, TaskWaitTool.FormatFinished("t-1", status));
+
     [Fact]
     public async Task TaskWait_UnauthorizedTask_IsIndistinguishableFromNotFound()
     {
