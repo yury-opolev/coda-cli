@@ -10,6 +10,14 @@ internal static class ToolInput
             ? value.GetString()
             : null;
 
+    public static int? GetInt(JsonElement input, string name) =>
+        input.ValueKind == JsonValueKind.Object
+        && input.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.Number
+        && value.TryGetInt32(out var n)
+            ? n
+            : null;
+
     /// <summary>Resolve a (possibly relative) path against the working directory.</summary>
     public static string ResolvePath(string workingDirectory, string path) =>
         Path.IsPathRooted(path) ? Path.GetFullPath(path) : Path.GetFullPath(Path.Combine(workingDirectory, path));

@@ -168,6 +168,26 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
         // process environment, so it is asserted precisely in the isolated builder step tests.
     }
 
+    [Fact]
+    public async Task ParentTools_include_all_task_parity_tools()
+    {
+        var spec = await this.CaptureSpecAsync(this.Options());
+        var names = spec.Tools.All.Select(t => t.Name).ToHashSet();
+
+        // The parent (leader) registry the interactive path runs against exposes every task_*
+        // tool — the pre-existing set and the new wait/background/remove parity tools — so a
+        // normal interactive turn can wait on, background, and remove tasks. This is assembled
+        // from BuiltInTools.All() by the same TurnPipelineBuilder serve uses (see
+        // ServeParityToolsTests for the interactive-vs-serve parity characterization).
+        Assert.Contains("task_list", names);
+        Assert.Contains("task_get", names);
+        Assert.Contains("task_peek", names);
+        Assert.Contains("task_send", names);
+        Assert.Contains("task_wait", names);
+        Assert.Contains("task_background", names);
+        Assert.Contains("task_remove", names);
+    }
+
     // ---- AgentOptions ----
 
     [Fact]
