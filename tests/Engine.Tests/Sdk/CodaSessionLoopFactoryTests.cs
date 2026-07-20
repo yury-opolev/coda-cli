@@ -101,7 +101,6 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
             UserQuestion: null,
             UserHooks: null,
             PlanApprover: null,
-            BackgroundTasks: null,
             Lsp: null,
             LspDiagnostics: null,
             ToolSearch: null,

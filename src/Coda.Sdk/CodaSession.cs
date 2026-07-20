@@ -39,7 +39,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly List<ChatMessage> history;
     private readonly TodoStore todos = new();
     private readonly ScheduledTaskStore schedules;
-    private readonly BackgroundTaskRunner backgroundTasks = new();
     private readonly TaskManager tasks;
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
@@ -168,7 +167,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.turnPipelineBuilder = new TurnPipelineBuilder(
             this.todos,
             this.schedules,
-            this.backgroundTasks,
             this.tasks,
             this.lspManager,
             this.lspDiagnostics,
@@ -242,8 +240,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     public ScheduledTaskStore Schedules => this.schedules;
 
-    public BackgroundTaskRunner BackgroundTasks => this.backgroundTasks;
-
     /// <summary>The session's task manager (subagent and shell tasks).</summary>
     public TaskManager Tasks => this.tasks;
 
@@ -265,9 +261,29 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lastGoalStatus,
             [.. this.todos.Items],
             [.. this.schedules.Items],
-            this.backgroundTasks.GetSnapshot(),
+            MapTaskSnapshots(this.tasks.List()),
             this.lspManager?.GetSnapshot() ?? []);
     }
+
+    private static IReadOnlyList<BackgroundTaskSnapshot> MapTaskSnapshots(IReadOnlyList<TaskSnapshot> tasks)
+    {
+        var result = new BackgroundTaskSnapshot[tasks.Count];
+        for (var i = 0; i < tasks.Count; i++)
+        {
+            result[i] = new BackgroundTaskSnapshot(tasks[i].Id, MapStatus(tasks[i].Status));
+        }
+
+        return result;
+    }
+
+    private static BackgroundTaskStatus MapStatus(TaskRunStatus status) => status switch
+    {
+        TaskRunStatus.Running => BackgroundTaskStatus.Running,
+        TaskRunStatus.Completed => BackgroundTaskStatus.Completed,
+        TaskRunStatus.Failed => BackgroundTaskStatus.Failed,
+        TaskRunStatus.Stopped => BackgroundTaskStatus.Stopped,
+        _ => BackgroundTaskStatus.Running,
+    };
 
     /// <summary>Clear the conversation.</summary>
     public void Reset() => this.history.Clear();
@@ -734,7 +750,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        this.backgroundTasks.Dispose();
         this.tasks.Dispose();
 
         // Shut down LSP servers before releasing the HTTP client.

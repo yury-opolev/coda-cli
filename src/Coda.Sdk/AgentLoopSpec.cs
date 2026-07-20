@@ -1,5 +1,4 @@
 using Coda.Agent;
-using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
@@ -29,7 +28,6 @@ namespace Coda.Sdk;
 /// <param name="UserQuestion">Optional prompt used when a tool asks the user a question.</param>
 /// <param name="UserHooks">Optional user-configured hook runner from settings.</param>
 /// <param name="PlanApprover">Optional approver consulted for plan-mode turns.</param>
-/// <param name="BackgroundTasks">Optional runner for background (detached) tasks.</param>
 /// <param name="Lsp">Optional language-server manager for LSP-backed tools.</param>
 /// <param name="LspDiagnostics">Optional registry of LSP diagnostics surfaced to the model.</param>
 /// <param name="ToolSearch">Optional coordinator backing the tool-search tool.</param>
@@ -53,7 +51,6 @@ public sealed record AgentLoopSpec(
     IUserQuestionPrompt? UserQuestion,
     UserHookRunner? UserHooks,
     IPlanApprover? PlanApprover,
-    BackgroundTaskRunner? BackgroundTasks,
     LspServerManager? Lsp,
     LspDiagnosticRegistry? LspDiagnostics,
     ToolSearchCoordinator? ToolSearch,

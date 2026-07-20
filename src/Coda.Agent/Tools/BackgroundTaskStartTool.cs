@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Coda.Agent.Tasks;
 
 namespace Coda.Agent.Tools;
 
@@ -24,11 +25,18 @@ public sealed class BackgroundTaskStartTool : ITool
 
     public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
     {
-        if (context.BackgroundTasks is null || context.Subagents is null)
+        if (context.Tasks is null || context.Subagents is null)
         {
             return Task.FromResult(new ToolResult(
                 "Background tasks are not available in this context.",
                 IsError: false));
+        }
+
+        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        {
+            return Task.FromResult(new ToolResult(
+                "Cannot start a background subagent from here: the maximum subagent nesting depth has been reached.",
+                IsError: true));
         }
 
         var prompt = ToolInput.GetString(input, "prompt");
@@ -38,7 +46,7 @@ public sealed class BackgroundTaskStartTool : ITool
         }
 
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
-        var id = context.BackgroundTasks.Start(context.Subagents, subagentType, prompt);
+        var id = context.Tasks.StartSubagentBackground(context.Subagents, subagentType, prompt, subagentType, context.CurrentTaskId);
 
         return Task.FromResult(new ToolResult(
             $"Started background task {id}. Use task_output to read its progress."));

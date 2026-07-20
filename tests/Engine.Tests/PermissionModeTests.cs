@@ -1,6 +1,5 @@
 using System.Text.Json;
 using Coda.Agent;
-using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Classifier;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
@@ -333,7 +332,6 @@ public sealed class PermissionModeStateTests
     private static TurnPipelineBuilder NewBuilder() => new(
         new TodoStore(),
         new ScheduledTaskStore(),
-        new BackgroundTaskRunner(),
         new TaskManager(sessionId: "perm-builder", logRoot: null),
         lspManager: null,
         lspDiagnostics: null,

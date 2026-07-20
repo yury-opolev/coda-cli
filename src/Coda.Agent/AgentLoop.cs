@@ -2,7 +2,6 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Coda.Common;
-using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
@@ -36,7 +35,6 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly IUserQuestionPrompt? userQuestion;
     private readonly UserHookRunner? userHooks;
     private readonly IPlanApprover? planApprover;
-    private readonly BackgroundTaskRunner? backgroundTasks;
     private readonly TaskManager? tasks;
     private readonly string? currentTaskId;
     private readonly int currentDepth;
@@ -100,7 +98,6 @@ public sealed partial class AgentLoop : IAgentLoop
         IUserQuestionPrompt? userQuestion = null,
         UserHookRunner? userHooks = null,
         IPlanApprover? planApprover = null,
-        BackgroundTaskRunner? backgroundTasks = null,
         TaskManager? tasks = null,
         string? currentTaskId = null,
         int currentDepth = 0,
@@ -127,7 +124,6 @@ public sealed partial class AgentLoop : IAgentLoop
         this.userQuestion = userQuestion;
         this.userHooks = userHooks;
         this.planApprover = planApprover;
-        this.backgroundTasks = backgroundTasks;
         this.tasks = tasks;
         this.currentTaskId = currentTaskId;
         this.currentDepth = currentDepth;
@@ -592,7 +588,6 @@ public sealed partial class AgentLoop : IAgentLoop
             Schedules = this.schedules,
             UserQuestion = this.userQuestion,
             PlanApprover = this.planApprover,
-            BackgroundTasks = this.backgroundTasks,
             Tasks = this.tasks,
             CurrentTaskId = this.currentTaskId,
             CurrentDepth = this.currentDepth,

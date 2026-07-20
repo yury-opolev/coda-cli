@@ -1,5 +1,4 @@
 using Coda.Agent;
-using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Classifier;
 using Coda.Agent.Goals;
@@ -37,7 +36,6 @@ public sealed class TurnPipelineBuilder
 {
     private readonly TodoStore todos;
     private readonly ScheduledTaskStore schedules;
-    private readonly BackgroundTaskRunner backgroundTasks;
     private readonly TaskManager tasks;
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
@@ -51,7 +49,6 @@ public sealed class TurnPipelineBuilder
     /// </summary>
     /// <param name="todos">Shared todo store across the session.</param>
     /// <param name="schedules">Scheduled-task store backing the schedule tools.</param>
-    /// <param name="backgroundTasks">Runner for background (detached) tasks.</param>
     /// <param name="tasks">Task manager owning subagent and shell tasks.</param>
     /// <param name="lspManager">Language-server manager, or null when no LSP servers are configured.</param>
     /// <param name="lspDiagnostics">Diagnostics registry paired with <paramref name="lspManager"/>, or null.</param>
@@ -64,7 +61,6 @@ public sealed class TurnPipelineBuilder
     public TurnPipelineBuilder(
         TodoStore todos,
         ScheduledTaskStore schedules,
-        BackgroundTaskRunner backgroundTasks,
         TaskManager tasks,
         LspServerManager? lspManager,
         LspDiagnosticRegistry? lspDiagnostics,
@@ -74,7 +70,6 @@ public sealed class TurnPipelineBuilder
     {
         this.todos = todos ?? throw new ArgumentNullException(nameof(todos));
         this.schedules = schedules ?? throw new ArgumentNullException(nameof(schedules));
-        this.backgroundTasks = backgroundTasks ?? throw new ArgumentNullException(nameof(backgroundTasks));
         this.tasks = tasks ?? throw new ArgumentNullException(nameof(tasks));
         this.lspManager = lspManager;
         this.lspDiagnostics = lspDiagnostics;
@@ -130,7 +125,6 @@ public sealed class TurnPipelineBuilder
             UserQuestion: options.UserQuestionPrompt,
             UserHooks: userHooks,
             PlanApprover: options.PlanApprover,
-            BackgroundTasks: this.backgroundTasks,
             Tasks: this.tasks,
             Lsp: this.lspManager,
             LspDiagnostics: this.lspDiagnostics,

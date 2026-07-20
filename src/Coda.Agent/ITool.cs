@@ -1,5 +1,4 @@
 using System.Text.Json;
-using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
@@ -37,9 +36,6 @@ public sealed record ToolContext(string WorkingDirectory)
 
     /// <summary>Plan-approval callback, when an interactive user is available (null for headless/subagents).</summary>
     public IPlanApprover? PlanApprover { get; init; }
-
-    /// <summary>Background-task runner, when available (null for subagents).</summary>
-    public BackgroundTaskRunner? BackgroundTasks { get; init; }
 
     /// <summary>Task manager for subagent and shell tasks; null when not wired (e.g. some tests).</summary>
     public TaskManager? Tasks { get; init; }

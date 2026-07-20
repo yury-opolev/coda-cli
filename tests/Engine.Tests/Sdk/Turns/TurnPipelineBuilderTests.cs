@@ -1,5 +1,4 @@
 using Coda.Agent;
-using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Classifier;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
@@ -53,7 +52,6 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         return new TurnPipelineBuilder(
             new TodoStore(),
             new ScheduledTaskStore(),
-            new BackgroundTaskRunner(),
             new TaskManager(sessionId: "t", logRoot: null),
             lspManager,
             lspDiagnostics,
@@ -306,7 +304,6 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         Assert.Same(client, spec.Client);
         Assert.NotNull(spec.Todos);
         Assert.NotNull(spec.Schedules);
-        Assert.NotNull(spec.BackgroundTasks);
         Assert.NotNull(spec.Tasks);
         Assert.NotNull(spec.Subagents);
         Assert.NotNull(spec.Logger);
@@ -393,19 +390,19 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     public void Constructor_rejects_null_required_collaborators()
     {
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            null!, new ScheduledTaskStore(), new BackgroundTaskRunner(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
+            null!, new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
             NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), null!, new BackgroundTaskRunner(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
+            new TodoStore(), null!, new TaskManager(sessionId: "t", logRoot: null), null, null, null,
             NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), null!, new TaskManager(sessionId: "t", logRoot: null), null, null, null,
+            new TodoStore(), new ScheduledTaskStore(), null!, null, null, null,
             NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
+            new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
             null!, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
+            new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
             NullLoggerFactory.Instance, null!));
     }
 

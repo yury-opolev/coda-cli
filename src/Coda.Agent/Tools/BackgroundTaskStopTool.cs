@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Coda.Agent.Tasks;
 
 namespace Coda.Agent.Tools;
 
@@ -21,7 +22,7 @@ public sealed class BackgroundTaskStopTool : ITool
 
     public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
     {
-        if (context.BackgroundTasks is null)
+        if (context.Tasks is null)
         {
             return Task.FromResult(new ToolResult(
                 "Background tasks are not available in this context.",
@@ -34,12 +35,13 @@ public sealed class BackgroundTaskStopTool : ITool
             return Task.FromResult(new ToolResult("Missing required 'task_id'.", IsError: true));
         }
 
-        var found = context.BackgroundTasks.Stop(taskId);
-        if (!found)
+        var outcome = context.Tasks.RequestStop(taskId);
+        return Task.FromResult(outcome switch
         {
-            return Task.FromResult(new ToolResult($"Task '{taskId}' not found."));
-        }
-
-        return Task.FromResult(new ToolResult($"Task '{taskId}' has been stopped."));
+            TaskActionResult.Ok => new ToolResult($"Task '{taskId}' has been stopped."),
+            TaskActionResult.NotFound => new ToolResult($"Task '{taskId}' not found."),
+            TaskActionResult.InvalidState => new ToolResult($"Task '{taskId}' is already finished and cannot be stopped."),
+            _ => new ToolResult($"Task '{taskId}' cannot be stopped."),
+        });
     }
 }
