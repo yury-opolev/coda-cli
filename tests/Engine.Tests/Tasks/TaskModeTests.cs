@@ -131,7 +131,7 @@ public class TaskModeTests
         Assert.Equal(versionBefore + 1, versionAfter);
 
         var (changes, _) = sub.Drain();
-        var mode = Assert.Single(changes.Where(c => c.Kind == TaskChangeKind.Mode));
+        var mode = Assert.Single(changes, c => c.Kind == TaskChangeKind.Mode);
         Assert.Equal(t.Id, mode.TaskId);
         Assert.Equal(versionAfter, mode.Version);
     }
@@ -204,8 +204,8 @@ public class TaskModeTests
         Assert.Equal(TaskRunStatus.Stopped, snap.Status);
 
         var (changes, _) = sub.Drain();
-        var modeChange = Assert.Single(changes.Where(c => c.Kind == TaskChangeKind.Mode));
-        var statusChange = Assert.Single(changes.Where(c => c.Kind == TaskChangeKind.Status));
+        var modeChange = Assert.Single(changes, c => c.Kind == TaskChangeKind.Mode);
+        var statusChange = Assert.Single(changes, c => c.Kind == TaskChangeKind.Status);
         Assert.Equal(modeVersion, modeChange.Version);
         Assert.Equal(stopVersion, statusChange.Version);
         Assert.True(modeChange.Version < statusChange.Version);
