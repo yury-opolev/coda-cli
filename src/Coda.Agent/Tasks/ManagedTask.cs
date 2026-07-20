@@ -10,6 +10,7 @@ internal sealed class ManagedTask : IDisposable
     private readonly CancellationTokenSource _cts = new();
     private readonly object _gate = new();
     private readonly OutputRing _output;
+    private readonly Action<ManagedTask>? _onTerminal;
     private long _version;
     private TaskRunStatus _status = TaskRunStatus.Running;
     private DateTimeOffset? _endedAt;
@@ -23,7 +24,8 @@ internal sealed class ManagedTask : IDisposable
         TaskKind kind,
         string description,
         string logPath,
-        long outputRingBytes)
+        long outputRingBytes,
+        Action<ManagedTask>? onTerminal = null)
     {
         Id = id;
         ParentId = parentId;
@@ -33,6 +35,7 @@ internal sealed class ManagedTask : IDisposable
         LogPath = logPath;
         StartedAt = DateTimeOffset.UtcNow;
         _output = new OutputRing(outputRingBytes);
+        _onTerminal = onTerminal;
     }
 
     public string Id { get; }
@@ -74,8 +77,15 @@ internal sealed class ManagedTask : IDisposable
             _error = error;
             _endedAt = DateTimeOffset.UtcNow;
             _version++;
-            return true;
         }
+
+        // Invoke the manager-supplied terminal hook OUTSIDE the task lock so that log
+        // flushing (disk I/O) and registry mutation never run while this task's gate is
+        // held, avoiding lock-ordering deadlocks with registry readers.
+        try { _onTerminal?.Invoke(this); }
+        catch { /* best-effort; a hook failure must never surface from a transition. */ }
+
+        return true;
     }
 
     public TaskSnapshot ToSnapshot()

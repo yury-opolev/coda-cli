@@ -81,7 +81,8 @@ public sealed partial class TaskManager : IDisposable
         {
             var id = $"task-{++_nextId:D4}";
             var logPath = Path.Combine(LogRoot, SessionId, id + ".log");
-            var task = new ManagedTask(id, parentTaskId, depth, kind, description, logPath, _outputRingBytes);
+            var task = new ManagedTask(
+                id, parentTaskId, depth, kind, description, logPath, _outputRingBytes, OnTaskTerminal);
             // Publish to the dictionary and the order list atomically under the
             // same lock so id assignment, registration order, and lookup never
             // observe a task in one collection but not the other.
@@ -93,6 +94,23 @@ public sealed partial class TaskManager : IDisposable
             return task;
         }
     }
+
+    /// <summary>
+    /// Terminal-state hook invoked by <see cref="ManagedTask"/> outside its own lock. Closes and
+    /// removes the task's log writer, flushing any buffered final output. Runs without the
+    /// registry lock (ConcurrentDictionary), so it cannot deadlock against readers, and it never
+    /// performs disk I/O under <see cref="_gate"/>.
+    /// </summary>
+    private void OnTaskTerminal(ManagedTask task)
+    {
+        if (_logs.TryRemove(task.Id, out var log))
+        {
+            log.Dispose();
+        }
+    }
+
+    /// <summary>Test seam: true while a live log writer is registered for the task id.</summary>
+    internal bool HasLogWriter(string id) => _logs.ContainsKey(id);
 
     /// <summary>Returns the snapshot for a task, or null if the id is unknown.</summary>
     public TaskSnapshot? Get(string id) =>

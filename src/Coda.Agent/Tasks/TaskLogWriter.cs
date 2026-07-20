@@ -1,22 +1,25 @@
 using System.Text;
-using Coda.Common;
 
 namespace Coda.Agent.Tasks;
 
 /// <summary>
 /// Persistent, secret-redacted, UTF-8 (no BOM) append-only diagnostic log for a
-/// single task. Owner-only where the OS supports it (file mode 0600 and containing
-/// directory mode 0700 on Unix; Windows relies on the user-profile ACL).
+/// single task. Owner-only where the OS supports it: on Unix the file is created
+/// with mode 0600 and its containing directory with 0700 <em>atomically</em> (via
+/// the create-time Unix mode APIs, so there is no chmod-only exposure window);
+/// Windows relies on the user-profile ACL.
 ///
-/// Redaction is resilient to chunk boundaries: incoming text is accumulated in a
-/// pending buffer and only complete lines are redacted and flushed, so a secret
-/// split across multiple <see cref="Append"/> calls is joined before redaction and
-/// never persisted. Any remaining pending text is redacted and flushed on
-/// <see cref="Dispose"/>.
+/// Redaction is resilient to chunk boundaries: incoming text is streamed through a
+/// <see cref="StreamingSecretRedactor"/> that confirms a secret as soon as its
+/// minimum length is reached, emits a placeholder, and discards the remaining token
+/// characters. A secret split across many <see cref="Append"/> calls — even one far
+/// larger than any buffer — is therefore never persisted, and no unbounded secret
+/// content is retained.
 ///
-/// When appending would exceed <see cref="_maxBytes"/>, the newest UTF-8-valid
-/// content that fits the cap is retained (never splitting a code point) rather than
-/// resetting the log to empty or retaining unbounded content.
+/// When appending would exceed <see cref="_maxBytes"/>, the log is trimmed to a
+/// code-point-valid newest suffix that leaves headroom, so sustained writing past
+/// the cap costs only an amortized, bounded number of rewrites rather than one per
+/// append.
 ///
 /// Logging is best-effort: any I/O or permission failure disables the writer
 /// without throwing, so diagnostics never disrupt task execution.
@@ -25,25 +28,20 @@ internal sealed class TaskLogWriter : IDisposable
 {
     public const long DefaultMaxBytes = 50L * 1024 * 1024; // 50 MiB
 
-    /// <summary>Force a flush of a runaway line without newlines beyond this size.</summary>
-    private const int MaxPendingChars = 64 * 1024;
-
-    /// <summary>
-    /// Raw tail retained across a forced flush so a secret straddling the forced-flush
-    /// boundary is re-joined and redacted on the next round. Chosen comfortably larger
-    /// than any expected secret token.
-    /// </summary>
-    private const int OverlapChars = 1024;
+    /// <summary>Smallest headroom to reclaim on a trim, so tiny caps still amortize.</summary>
+    private const long MinHeadroomBytes = 512;
 
     private static readonly UTF8Encoding Utf8NoBom = new(encoderShouldEmitUTF8Identifier: false);
 
     private readonly string _path;
     private readonly long _maxBytes;
     private readonly object _gate = new();
-    private readonly StringBuilder _pending = new();
+    private readonly StreamingSecretRedactor _redactor = new();
+    private readonly StringBuilder _scratch = new();
 
     private StreamWriter? _writer;
     private long _bytesWritten;
+    private int _trimCount;
     private bool _faulted;
     private bool _disposed;
 
@@ -53,7 +51,19 @@ internal sealed class TaskLogWriter : IDisposable
         _maxBytes = maxBytes > 0 ? maxBytes : DefaultMaxBytes;
     }
 
-    /// <summary>Appends text (redacted on line boundaries). Never throws.</summary>
+    /// <summary>
+    /// Number of cap-enforcing trims performed. Instrumentation seam for tests that
+    /// assert sustained post-cap writing amortizes to a small, bounded trim count.
+    /// </summary>
+    internal int TrimCount => _trimCount;
+
+    /// <summary>
+    /// Test seam for the trim-time read of existing log content. When null, the real
+    /// file is read. A read failure faults the writer without overwriting the prior log.
+    /// </summary>
+    internal Func<string, string>? ReadExistingOverride { get; set; }
+
+    /// <summary>Appends text (streamed through the redactor). Never throws.</summary>
     public void Append(string text)
     {
         if (string.IsNullOrEmpty(text)) return;
@@ -62,11 +72,11 @@ internal sealed class TaskLogWriter : IDisposable
             if (_faulted || _disposed) return;
             try
             {
-                _pending.Append(text);
-                DrainCompleteLines();
-                if (_pending.Length > MaxPendingChars)
+                _scratch.Clear();
+                _redactor.Process(text, _scratch);
+                if (_scratch.Length > 0)
                 {
-                    ForceDrain();
+                    Emit(_scratch.ToString());
                 }
             }
             catch
@@ -84,10 +94,14 @@ internal sealed class TaskLogWriter : IDisposable
             _disposed = true;
             try
             {
-                if (!_faulted && _pending.Length > 0)
+                if (!_faulted)
                 {
-                    Emit(SecretRedactor.Redact(_pending.ToString()));
-                    _pending.Clear();
+                    _scratch.Clear();
+                    _redactor.Flush(_scratch);
+                    if (_scratch.Length > 0)
+                    {
+                        Emit(_scratch.ToString());
+                    }
                 }
             }
             catch
@@ -99,85 +113,99 @@ internal sealed class TaskLogWriter : IDisposable
         }
     }
 
-    /// <summary>Redacts and writes every complete line, leaving the trailing partial line buffered.</summary>
-    private void DrainCompleteLines()
-    {
-        int lastNewline = LastIndexOf(_pending, '\n');
-        if (lastNewline < 0) return;
-
-        int flushLen = lastNewline + 1;
-        var flushable = _pending.ToString(0, flushLen);
-        _pending.Remove(0, flushLen);
-        Emit(SecretRedactor.Redact(flushable));
-    }
-
-    /// <summary>
-    /// Flushes a runaway newline-free buffer, retaining a raw overlap tail so a secret
-    /// straddling the flush point is re-joined and redacted next round.
-    /// </summary>
-    private void ForceDrain()
-    {
-        int emitLen = _pending.Length - OverlapChars;
-        if (emitLen <= 0) return;
-
-        // Never cut in the middle of a surrogate pair.
-        if (char.IsLowSurrogate(_pending[emitLen]))
-        {
-            emitLen--;
-            if (emitLen <= 0) return;
-        }
-
-        var flushable = _pending.ToString(0, emitLen);
-        _pending.Remove(0, emitLen);
-        Emit(SecretRedactor.Redact(flushable));
-    }
-
-    /// <summary>Writes already-redacted text, enforcing the size cap by retaining the newest content.</summary>
+    /// <summary>Writes already-redacted text, enforcing the size cap by amortized trimming.</summary>
     private void Emit(string redacted)
     {
         if (string.IsNullOrEmpty(redacted)) return;
 
-        var bytes = Utf8NoBom.GetByteCount(redacted);
         EnsureOpen();
+        if (_writer is null) return; // open faulted
 
-        if (_bytesWritten + bytes > _maxBytes)
+        var bytes = Utf8NoBom.GetByteCount(redacted);
+        if (_bytesWritten + bytes <= _maxBytes)
         {
-            WriteWithCap(redacted);
+            _writer.Write(redacted);
+            _writer.Flush();
+            _bytesWritten += bytes;
             return;
         }
 
-        _writer!.Write(redacted);
-        _writer.Flush();
-        _bytesWritten += bytes;
+        TrimAndWrite(redacted, bytes);
     }
 
     /// <summary>
-    /// The write would exceed the cap: combine the current file content with the new
-    /// text, retain the newest UTF-8-valid suffix that fits the cap (never splitting a
-    /// code point), and rewrite the file.
+    /// Appending <paramref name="redacted"/> would exceed the cap. Trim the existing log to a
+    /// newest suffix that leaves headroom, then rewrite it followed by the new text. Because a
+    /// trim reclaims a fixed fraction of the cap, a run of small appends past the cap triggers
+    /// only an amortized, bounded number of trims instead of a rewrite each time.
     /// </summary>
-    private void WriteWithCap(string redacted)
+    private void TrimAndWrite(string redacted, int newBytes)
     {
+        // Close the append handle before rewriting the file.
         _writer!.Flush();
         _writer.Dispose();
         _writer = null;
 
-        string existing;
-        try { existing = File.ReadAllText(_path, Utf8NoBom); }
-        catch { existing = string.Empty; }
+        var headroom = _maxBytes / 4;
+        if (headroom < MinHeadroomBytes) headroom = MinHeadroomBytes;
+        var maxHeadroom = Math.Max(1, _maxBytes / 2);
+        if (headroom > maxHeadroom) headroom = maxHeadroom;
+        var keptNew = redacted;
+        string tail;
 
-        var combined = existing + redacted;
-        var kept = NewestSuffixWithinCap(combined, _maxBytes);
+        if (newBytes > _maxBytes)
+        {
+            // Even the incoming text alone exceeds the cap: keep only its newest valid suffix.
+            keptNew = NewestSuffixWithinCap(redacted, _maxBytes);
+            tail = string.Empty;
+        }
+        else
+        {
+            var keepExistingBudget = _maxBytes - headroom - newBytes;
+            if (keepExistingBudget <= 0)
+            {
+                tail = string.Empty;
+            }
+            else
+            {
+                string existing;
+                try
+                {
+                    existing = ReadExisting();
+                }
+                catch
+                {
+                    // Reading the prior log failed: fault without overwriting it.
+                    Fault();
+                    return;
+                }
 
-        var stream = new FileStream(_path, FileMode.Create, FileAccess.Write, FileShare.Read);
-        var writer = new StreamWriter(stream, Utf8NoBom);
-        writer.Write(kept);
-        writer.Flush();
+                tail = NewestSuffixWithinCap(existing, keepExistingBudget);
+            }
+        }
 
-        _writer = writer;
-        _bytesWritten = Utf8NoBom.GetByteCount(kept);
-        TrySetOwnerOnly();
+        var combined = tail.Length == 0 ? keptNew : string.Concat(tail, keptNew);
+
+        try
+        {
+            var stream = OpenStream(FileMode.Create);
+            var writer = new StreamWriter(stream, Utf8NoBom);
+            writer.Write(combined);
+            writer.Flush();
+            _writer = writer;
+            _bytesWritten = Utf8NoBom.GetByteCount(combined);
+        }
+        catch
+        {
+            Fault();
+            return;
+        }
+
+        _trimCount++;
     }
+
+    private string ReadExisting() =>
+        ReadExistingOverride is { } read ? read(_path) : File.ReadAllText(_path, Utf8NoBom);
 
     private void EnsureOpen()
     {
@@ -186,35 +214,81 @@ internal sealed class TaskLogWriter : IDisposable
         var dir = Path.GetDirectoryName(_path);
         if (!string.IsNullOrEmpty(dir))
         {
-            Directory.CreateDirectory(dir);
-            TrySetDirectoryOwnerOnly(dir);
+            CreateDirectoryRestrictive(dir);
         }
 
-        var stream = new FileStream(_path, FileMode.Append, FileAccess.Write, FileShare.Read);
+        var stream = OpenStream(FileMode.Append);
         _bytesWritten = stream.Length;
         _writer = new StreamWriter(stream, Utf8NoBom);
-        TrySetOwnerOnly();
+    }
+
+    /// <summary>
+    /// Opens the log file, creating it (on Unix) with mode 0600 atomically at creation time
+    /// so there is no window during which the file is world-readable.
+    /// </summary>
+    private FileStream OpenStream(FileMode mode)
+    {
+        var options = new FileStreamOptions
+        {
+            Mode = mode,
+            Access = FileAccess.Write,
+            Share = FileShare.Read,
+        };
+
+        if (!OperatingSystem.IsWindows())
+        {
+            options.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        return new FileStream(_path, options);
+    }
+
+    /// <summary>
+    /// Creates the containing directory, on Unix with mode 0700 atomically at creation time.
+    /// </summary>
+    private static void CreateDirectoryRestrictive(string dir)
+    {
+        if (OperatingSystem.IsWindows())
+        {
+            Directory.CreateDirectory(dir);
+        }
+        else
+        {
+            Directory.CreateDirectory(
+                dir,
+                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
+        }
     }
 
     /// <summary>
     /// Returns the newest suffix of <paramref name="s"/> whose UTF-8 encoding fits in
-    /// <paramref name="maxBytes"/>, cut on a code-point boundary. If even the last rune
-    /// alone exceeds the cap, that whole rune is still retained rather than emitting an
-    /// empty, lossy result.
+    /// <paramref name="maxBytes"/>, cut on a code-point boundary. If even the last rune alone
+    /// exceeds the cap, that whole rune is still retained rather than emitting an empty result.
+    /// Byte sizing is computed arithmetically per rune, with a single final substring.
     /// </summary>
     private static string NewestSuffixWithinCap(string s, long maxBytes)
     {
+        if (maxBytes <= 0 || s.Length == 0) return string.Empty;
+
         long bytes = 0;
         var i = s.Length;
         while (i > 0)
         {
-            var step = 1;
-            if (char.IsLowSurrogate(s[i - 1]) && i >= 2 && char.IsHighSurrogate(s[i - 2]))
+            int step;
+            int codePoint;
+            var last = s[i - 1];
+            if (char.IsLowSurrogate(last) && i >= 2 && char.IsHighSurrogate(s[i - 2]))
             {
                 step = 2;
+                codePoint = char.ConvertToUtf32(s[i - 2], last);
+            }
+            else
+            {
+                step = 1;
+                codePoint = last;
             }
 
-            var runeBytes = Utf8NoBom.GetByteCount(s.Substring(i - step, step));
+            var runeBytes = Utf8ByteLength(codePoint);
             if (bytes + runeBytes > maxBytes)
             {
                 if (i == s.Length) i -= step; // guarantee at least the newest rune
@@ -225,46 +299,16 @@ internal sealed class TaskLogWriter : IDisposable
             i -= step;
         }
 
-        return i <= 0 ? s : s.Substring(i);
+        return i <= 0 ? s : s[i..];
     }
 
-    private static int LastIndexOf(StringBuilder sb, char c)
+    private static int Utf8ByteLength(int codePoint) => codePoint switch
     {
-        for (var i = sb.Length - 1; i >= 0; i--)
-        {
-            if (sb[i] == c) return i;
-        }
-
-        return -1;
-    }
-
-    private void TrySetOwnerOnly()
-    {
-        if (OperatingSystem.IsWindows()) return;
-        try
-        {
-            File.SetUnixFileMode(_path, UnixFileMode.UserRead | UnixFileMode.UserWrite);
-        }
-        catch
-        {
-            // best-effort; a filesystem that rejects chmod must not fault the writer.
-        }
-    }
-
-    private static void TrySetDirectoryOwnerOnly(string dir)
-    {
-        if (OperatingSystem.IsWindows()) return;
-        try
-        {
-            File.SetUnixFileMode(
-                dir,
-                UnixFileMode.UserRead | UnixFileMode.UserWrite | UnixFileMode.UserExecute);
-        }
-        catch
-        {
-            // best-effort.
-        }
-    }
+        < 0x80 => 1,
+        < 0x800 => 2,
+        < 0x10000 => 3,
+        _ => 4,
+    };
 
     private void Fault()
     {

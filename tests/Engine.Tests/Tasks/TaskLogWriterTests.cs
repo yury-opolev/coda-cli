@@ -125,19 +125,180 @@ public class TaskLogWriterTests : IDisposable
     }
 
     [Fact]
-    public void Append_BeyondCap_RetainsNewestAcrossMultipleAppends()
+    public void Append_BeyondCap_DropsOldestAndRetainsNewestWithinCap()
     {
+        // Amortized trimming drops the oldest content (the 'a's) to make room, keeping the
+        // newest content (the 'b's). Output must never exceed the cap.
         var path = Path.Combine(_dir, "cap-multi.log");
         using (var w = new TaskLogWriter(path, maxBytes: 16))
         {
             w.Append(new string('a', 12));
-            w.Append(new string('b', 12)); // total 24 bytes > 16 -> retain newest 16
+            w.Append(new string('b', 12)); // total 24 bytes > 16 -> trim, keep newest
         }
 
         var text = File.ReadAllText(path, Encoding.UTF8);
-        Assert.Equal(16, Encoding.UTF8.GetByteCount(text));
-        Assert.EndsWith(new string('b', 12), text);
-        Assert.Equal(new string('a', 4) + new string('b', 12), text);
+        Assert.True(Encoding.UTF8.GetByteCount(text) <= 16);
+        Assert.EndsWith("b", text);
+        Assert.Contains("bbbbbbbbbbbb", text); // all newest 12 'b's retained
+        Assert.DoesNotContain("a", text); // oldest content dropped
+    }
+
+    [Fact]
+    public void Append_RedactsSkSecret_Exceeding64KiBWithoutNewline()
+    {
+        // A newline-free secret far larger than the old 64 KiB force-drain boundary must
+        // collapse to a single placeholder; no token bytes may survive.
+        var path = Path.Combine(_dir, "big-sk.log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append("sk-" + new string('a', 70_000));
+        }
+
+        var text = File.ReadAllText(path, Encoding.UTF8);
+        Assert.Equal("***redacted***", text);
+        Assert.True(new FileInfo(path).Length < 1024, "secret content must not be retained.");
+    }
+
+    [Fact]
+    public void Append_RedactsBearerSecret_Exceeding64KiBWithoutNewline()
+    {
+        var path = Path.Combine(_dir, "big-bearer.log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append("Bearer " + new string('x', 70_000) + " end");
+        }
+
+        var text = File.ReadAllText(path, Encoding.UTF8);
+        Assert.DoesNotContain(new string('x', 100), text);
+        Assert.Contains("******", text);
+        Assert.Contains(" end", text);
+        Assert.True(new FileInfo(path).Length < 1024, "secret content must not be retained.");
+    }
+
+    [Fact]
+    public void Append_RedactsSecretWithPrefixSplitAcrossAppends()
+    {
+        // The 'sk-' prefix itself is split across Append boundaries.
+        var path = Path.Combine(_dir, "split-prefix.log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append("id=s");
+            w.Append("k-abcd");
+            w.Append("efgh tail");
+        }
+
+        var text = File.ReadAllText(path, Encoding.UTF8);
+        Assert.DoesNotContain("sk-abcdefgh", text);
+        Assert.Contains("***redacted***", text);
+        Assert.Contains("id=", text);
+        Assert.Contains("tail", text);
+    }
+
+    [Fact]
+    public void Append_RedactsSkSecret_AtMinimumLength()
+    {
+        var path = Path.Combine(_dir, "sk-min.log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append("k=sk-abcdefgh done"); // 8 body chars -> secret
+        }
+
+        var text = File.ReadAllText(path, Encoding.UTF8);
+        Assert.DoesNotContain("sk-abcdefgh", text);
+        Assert.Contains("***redacted***", text);
+    }
+
+    [Fact]
+    public void Append_DoesNotRedactSkSecret_BelowMinimumLength()
+    {
+        var path = Path.Combine(_dir, "sk-below.log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append("k=sk-abcdefg done"); // 7 body chars -> not a secret
+        }
+
+        var text = File.ReadAllText(path, Encoding.UTF8);
+        Assert.Equal("k=sk-abcdefg done", text);
+    }
+
+    [Theory]
+    [InlineData("skirt and basket, no secrets here")]
+    [InlineData("Use a bearer token for authentication")]
+    [InlineData("sk-short")]
+    [InlineData("Bearer tooShort")]
+    [InlineData("plain text without tokens")]
+    public void Append_PreservesOrdinaryTextExactly(string input)
+    {
+        var path = Path.Combine(_dir, "ordinary-" + input.GetHashCode().ToString("X") + ".log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append(input);
+        }
+
+        Assert.Equal(input, File.ReadAllText(path, Encoding.UTF8));
+    }
+
+    [Fact]
+    public void Dispose_FlushesIncompleteNonSecretCandidate()
+    {
+        // A trailing, unconfirmed candidate with no delimiter must be flushed as ordinary
+        // text on Dispose, not silently dropped.
+        var path = Path.Combine(_dir, "flush-tail.log");
+        using (var w = new TaskLogWriter(path))
+        {
+            w.Append("value=sk-abc"); // incomplete sk candidate
+        }
+
+        Assert.Equal("value=sk-abc", File.ReadAllText(path, Encoding.UTF8));
+    }
+
+    [Fact]
+    public void Append_SustainedPostCap_TrimsAreBoundedAndSmall()
+    {
+        // Thousands of small appends past the cap must trigger only a small, bounded number
+        // of trims (amortized), not a full rewrite per append. Output stays within the cap
+        // and the newest text is retained.
+        var path = Path.Combine(_dir, "amortized.log");
+        const int cap = 8192;
+        const int appends = 5000;
+        var w = new TaskLogWriter(path, maxBytes: cap);
+        for (var i = 0; i < appends; i++)
+        {
+            w.Append("abcdefghij"); // 10 ASCII bytes, no secrets
+        }
+
+        var trims = w.TrimCount;
+        w.Dispose(); // close the handle before reading the file back
+
+        // A per-append rewrite would trim thousands of times; amortization keeps it tiny.
+        Assert.True(trims > 0, "expected at least one trim past the cap.");
+        Assert.True(
+            trims < 100,
+            $"expected a small bounded trim count, got {trims} for {appends} appends.");
+
+        var bytes = new FileInfo(path).Length;
+        Assert.True(bytes <= cap, $"output {bytes} exceeded cap {cap}.");
+        Assert.EndsWith("abcdefghij", File.ReadAllText(path, Encoding.UTF8));
+    }
+
+    [Fact]
+    public void Append_ReadFailureDuringTrim_FaultsWithoutOverwritingPriorLog()
+    {
+        var path = Path.Combine(_dir, "read-fail.log");
+        var prior = new string('x', 1020);
+        using var w = new TaskLogWriter(path, maxBytes: 1024);
+        w.Append(prior); // under cap, flushed to disk
+
+        // Force the trim-time read to fail; the writer must fault and leave the prior log intact.
+        w.ReadExistingOverride = _ => throw new IOException("simulated read failure");
+        w.Append("yyyyy"); // pushes over the cap -> trim -> read fails -> fault
+
+        Assert.Equal(prior, File.ReadAllText(path, Encoding.UTF8));
+
+        // Once faulted, further appends are silently ignored (best-effort, no throw).
+        var ex = Record.Exception(() => w.Append("more"));
+        Assert.Null(ex);
+        Assert.Equal(prior, File.ReadAllText(path, Encoding.UTF8));
     }
 
     [Fact]

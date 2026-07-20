@@ -295,9 +295,106 @@ public class TaskManagerTests
         }
     }
 
-    // Deliberately blocking waits with timeouts keep this concurrency regression bounded
-    // and deterministic; async/await would not exercise the lock-scoped deadlock.
+    [Fact]
+    public void Terminal_ClosesAndRemovesTaskLogWriter()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "coda-term-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var mgr = new TaskManager(sessionId: "sess-term", logRoot: root);
+            var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+            mgr.AppendOutput(t.Id, "before-terminal\n");
+            Assert.True(mgr.HasLogWriter(t.Id), "writer should exist while running.");
+
+            Assert.True(t.TryComplete("done"));
+
+            Assert.False(mgr.HasLogWriter(t.Id), "writer should be removed on terminal state.");
+
+            var logPath = t.ToSnapshot().LogPath;
+            Assert.Contains("before-terminal", File.ReadAllText(logPath));
+
+            // The writer handle is closed, so post-terminal output does not reach the log.
+            mgr.AppendOutput(t.Id, "after-terminal\n");
+            Assert.DoesNotContain("after-terminal", File.ReadAllText(logPath));
+
+            mgr.Dispose();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void Terminal_FlushesFinalPartialOutputBeforeClosing()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "coda-term-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var mgr = new TaskManager(sessionId: "sess-flush", logRoot: root);
+            var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+            mgr.AppendOutput(t.Id, "tail-without-newline");
+            Assert.True(t.TryFail("boom"));
+
+            Assert.Contains("tail-without-newline", File.ReadAllText(t.ToSnapshot().LogPath));
+            mgr.Dispose();
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    // Deliberately blocking waits with timeouts keep this concurrency regression bounded.
 #pragma warning disable xUnit1031
+    [Fact]
+    public void Terminal_HookRunsOutsideTaskLock()
+    {
+        using var entered = new ManualResetEventSlim(false);
+        using var release = new ManualResetEventSlim(false);
+
+        ManagedTask? task = null;
+        task = new ManagedTask(
+            "task-x", parentId: null, depth: 1, TaskKind.Shell, "d", "unused.log", 1024,
+            onTerminal: _ =>
+            {
+                entered.Set();
+                release.Wait(TimeSpan.FromSeconds(5));
+            });
+
+        var completeTask = Task.Run(() => task!.TryComplete("x"));
+        Assert.True(entered.Wait(TimeSpan.FromSeconds(5)), "terminal hook did not run.");
+
+        // If the hook were invoked while holding the task lock, ToSnapshot (which takes the
+        // same lock) would block until the hook returns and deadlock this test.
+        var snapshotTask = Task.Run(() => task!.ToSnapshot());
+        Assert.True(
+            snapshotTask.Wait(TimeSpan.FromSeconds(5)),
+            "ToSnapshot blocked: terminal hook held the task lock.");
+
+        release.Set();
+        Assert.True(completeTask.Wait(TimeSpan.FromSeconds(5)), "transition did not complete.");
+    }
+
+    [Fact]
+    public void Terminal_ConcurrentWithRegistryReaders_NoDeadlock()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+
+        var reader = Task.Run(() =>
+        {
+            for (var i = 0; i < 1000; i++)
+            {
+                _ = mgr.List();
+            }
+        });
+        var completer = Task.Run(() => t.TryComplete("done"));
+
+        Assert.True(Task.WaitAll(new[] { reader, completer }, TimeSpan.FromSeconds(5)),
+            "terminal transition deadlocked against registry readers.");
+    }
+
     [Fact]
     public void Dispose_DisposesTasksOutsideManagerLock_NoDeadlockWithConcurrentReaders()
     {
