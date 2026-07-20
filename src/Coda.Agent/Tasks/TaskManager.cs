@@ -15,6 +15,7 @@ public sealed partial class TaskManager : IDisposable
     private readonly object _gate = new();
     private readonly List<ManagedTask> _order = new();
     private readonly ConcurrentDictionary<string, ManagedTask> _tasks = new();
+    private readonly ConcurrentDictionary<string, TaskLogWriter> _logs = new();
     private readonly long _outputRingBytes;
     private int _nextId;
 
@@ -27,6 +28,16 @@ public sealed partial class TaskManager : IDisposable
         SessionId = sessionId;
         LogRoot = logRoot ?? DefaultLogRoot;
         _outputRingBytes = outputRingBytes;
+
+        // Best-effort startup housekeeping; never blocks or throws into construction.
+        try
+        {
+            TaskLogRetention.Cleanup(LogRoot, TaskLogRetention.MaxAge, TaskLogRetention.GlobalCapBytes);
+        }
+        catch
+        {
+            // ignore — logging is diagnostic, not load-bearing.
+        }
     }
 
     public string SessionId { get; }
@@ -76,6 +87,9 @@ public sealed partial class TaskManager : IDisposable
             // observe a task in one collection but not the other.
             _order.Add(task);
             _tasks[id] = task;
+            // The writer constructor performs no I/O (it only stores the path), so it is
+            // safe to create under the registry lock; disk I/O happens lazily on Append.
+            _logs[id] = new TaskLogWriter(task.LogPath);
             return task;
         }
     }
@@ -97,8 +111,18 @@ public sealed partial class TaskManager : IDisposable
     internal ManagedTask? Find(string id) =>
         _tasks.TryGetValue(id, out var t) ? t : null;
 
-    /// <summary>Appends output to a task. No-op if the id is unknown.</summary>
-    public void AppendOutput(string id, string text) => Find(id)?.Append(text);
+    /// <summary>Appends output to a task's ring and persistent log. No-op if the id is unknown.</summary>
+    public void AppendOutput(string id, string text)
+    {
+        // Deliberately not under _gate: writing to the ring and the persistent log
+        // (disk I/O) must never happen while the registry lock is held.
+        if (Find(id) is not { } t) return;
+        t.Append(text);
+        if (_logs.TryGetValue(id, out var log))
+        {
+            log.Append(text);
+        }
+    }
 
     /// <summary>Reads incremental output for a task. Returns null if the id is unknown.</summary>
     public (string Text, long NextCursor, bool Truncated)? TryReadIncremental(string id, long cursor) =>
@@ -112,7 +136,8 @@ public sealed partial class TaskManager : IDisposable
         // Snapshot the task set under the lock, then dispose outside it. Disposing a
         // ManagedTask cancels its token, which synchronously runs user cancellation
         // callbacks; holding _gate across those callbacks can deadlock against readers
-        // (List/Get) that need the same lock.
+        // (List/Get) that need the same lock. Log writers flush to disk on Dispose, so
+        // they must also be closed outside the lock (no disk I/O under the registry lock).
         ManagedTask[] tasks;
         lock (_gate)
         {
@@ -122,6 +147,11 @@ public sealed partial class TaskManager : IDisposable
         foreach (var t in tasks)
         {
             t.Dispose();
+        }
+
+        foreach (var log in _logs.Values)
+        {
+            log.Dispose();
         }
     }
 }

@@ -231,6 +231,70 @@ public class TaskManagerTests
         Assert.True(type.IsNotPublic);
     }
 
+    [Fact]
+    public void AppendOutput_WritesToPersistentLog()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "coda-mgrlog-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var mgr = new TaskManager(sessionId: "sess-log", logRoot: root);
+            var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+            mgr.AppendOutput(t.Id, "persist me\n");
+            mgr.Dispose(); // flush + close writers
+
+            var logPath = t.ToSnapshot().LogPath;
+            Assert.True(File.Exists(logPath));
+            Assert.Contains("persist me", File.ReadAllText(logPath));
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void AppendOutput_RedactsSecretsInPersistentLog()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "coda-mgrlog-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var mgr = new TaskManager(sessionId: "sess-redact", logRoot: root);
+            var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+            mgr.AppendOutput(t.Id, "auth token=sk-abcdefghijklmnop trailing\n");
+            mgr.Dispose();
+
+            var text = File.ReadAllText(t.ToSnapshot().LogPath);
+            Assert.DoesNotContain("sk-abcdefghijklmnop", text);
+            Assert.Contains("***redacted***", text);
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
+    [Fact]
+    public void Constructor_RunsRetentionCleanup_DeletingAgedLogs()
+    {
+        var root = Path.Combine(Path.GetTempPath(), "coda-mgrclean-" + Guid.NewGuid().ToString("N"));
+        try
+        {
+            var sessionDir = Path.Combine(root, "sess-old");
+            Directory.CreateDirectory(sessionDir);
+            var aged = Path.Combine(sessionDir, "task-9999.log");
+            File.WriteAllBytes(aged, new byte[10]);
+            File.SetLastWriteTimeUtc(aged, DateTime.UtcNow.AddDays(-30));
+
+            using var mgr = new TaskManager(sessionId: "sess-new", logRoot: root);
+
+            Assert.False(File.Exists(aged), "constructor should run retention cleanup on aged logs.");
+        }
+        finally
+        {
+            try { Directory.Delete(root, recursive: true); } catch { /* best-effort */ }
+        }
+    }
+
     // Deliberately blocking waits with timeouts keep this concurrency regression bounded
     // and deterministic; async/await would not exercise the lock-scoped deadlock.
 #pragma warning disable xUnit1031
