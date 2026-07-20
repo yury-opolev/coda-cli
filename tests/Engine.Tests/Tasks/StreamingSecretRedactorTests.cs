@@ -73,9 +73,13 @@ public class StreamingSecretRedactorTests
     [Fact]
     public void RedactsBearerTokenAtMinimumLength()
     {
-        var token = new string('a', 20);
-        var output = Redact($"auth Bearer {token} more");
+        // Real token of exactly the 20-char Bearer minimum must be redacted, prefix and all.
+        var token = "A1b2C3d4E5f6G7h8I9j0"; // 20 body chars
+        var input = $"auth Bearer {token} more";
+        var output = Redact(input);
         Assert.DoesNotContain(token, output);
+        Assert.DoesNotContain($"Bearer {token}", output);
+        Assert.NotEqual(input, output);
         Assert.Contains("******", output);
         Assert.Contains("auth ", output);
         Assert.Contains("more", output);
@@ -84,8 +88,12 @@ public class StreamingSecretRedactorTests
     [Fact]
     public void DoesNotRedactBearerTokenBelowMinimumLength()
     {
-        var output = Redact("auth Bearer shorttoken end");
-        Assert.Equal("auth Bearer shorttoken end", output);
+        // Real token one char below the 20-char minimum is not a secret and is preserved verbatim.
+        var token = "A1b2C3d4E5f6G7h8I9j"; // 19 body chars
+        var input = $"auth Bearer {token} end";
+        var output = Redact(input);
+        Assert.Equal(input, output);
+        Assert.DoesNotContain("******", output);
     }
 
     [Fact]
@@ -118,8 +126,10 @@ public class StreamingSecretRedactorTests
     [Fact]
     public void ConsumesTrailingEqualsOfBearerToken()
     {
-        var token = new string('a', 20);
-        var output = Redact($"Bearer {token}== next");
+        // A real 20-char token with trailing '=' padding: the token and its '=' must not survive.
+        var token = "A1b2C3d4E5f6G7h8I9j0"; // 20 body chars
+        var input = $"Bearer {token}== next";
+        var output = Redact(input);
         Assert.DoesNotContain(token, output);
         Assert.Contains("******", output);
         Assert.DoesNotContain("==", output);

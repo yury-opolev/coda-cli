@@ -43,14 +43,23 @@ internal sealed class StreamingSecretRedactor
         DiscardSkBody,
         BearerPrefix,
         BearerSpace,
+        BearerSpaceStreaming,
         BearerBody,
         DiscardBearerBody,
+        DiscardBearerSpace,
         DiscardBearerEq,
     }
 
     private readonly StringBuilder _pending = new();
     private Mode _mode = Mode.Text;
     private int _bodyCount;
+
+    /// <summary>
+    /// Length of the trailing run of characters (within a discard state) that matches the
+    /// case-insensitive <c>bearer</c> prefix. Lets a committed secret's greedy discard notice
+    /// a nested <c>Bearer&#160;</c> prefix and keep redacting its body instead of leaking it.
+    /// </summary>
+    private int _bearerMatch;
 
     /// <summary>Processes <paramref name="input"/>, appending redacted output to <paramref name="output"/>.</summary>
     public void Process(string input, StringBuilder output)
@@ -62,19 +71,34 @@ internal sealed class StreamingSecretRedactor
     }
 
     /// <summary>
-    /// Emits any incomplete, unconfirmed candidate as ordinary text and resets state.
+    /// Drains any incomplete, unconfirmed candidate at end of stream. Rather than emitting the
+    /// held candidate verbatim (which could leak a secret that starts later inside a failed
+    /// candidate, e.g. an <c>sk-</c> key inside a too-short <c>Bearer</c> body), each pass emits
+    /// only the first held character as ordinary text and rescans the remainder through the state
+    /// machine so any nested secret is still confirmed and redacted. Every pass permanently emits
+    /// at least one character, so the loop strictly shrinks the candidate and terminates.
     /// A confirmed secret already emitted its placeholder, so nothing secret is retained.
     /// </summary>
     public void Flush(StringBuilder output)
     {
-        if (_pending.Length > 0)
+        while (_pending.Length > 0)
         {
-            output.Append(_pending);
+            var held = _pending.ToString();
+            _pending.Clear();
+            _mode = Mode.Text;
+            _bodyCount = 0;
+            _bearerMatch = 0;
+
+            output.Append(held[0]);
+            for (var i = 1; i < held.Length; i++)
+            {
+                Step(held[i], output);
+            }
         }
 
-        _pending.Clear();
         _mode = Mode.Text;
         _bodyCount = 0;
+        _bearerMatch = 0;
     }
 
     private void Step(char c, StringBuilder output)
@@ -107,6 +131,7 @@ internal sealed class StreamingSecretRedactor
                     {
                         _mode = Mode.SkBody;
                         _bodyCount = 0;
+                        _bearerMatch = 0;
                     }
                 }
                 else
@@ -120,6 +145,9 @@ internal sealed class StreamingSecretRedactor
                 if (IsSkBody(c))
                 {
                     _pending.Append(c);
+                    // Track a nested "bearer" prefix continuously so it is still detected even if
+                    // the token confirms partway through the word (the tail alone would miss it).
+                    _bearerMatch = AdvanceBearerMatch(_bearerMatch, c);
                     if (++_bodyCount >= SkMinBody)
                     {
                         // Confirmed: emit the placeholder and discard the rest of the token.
@@ -136,9 +164,22 @@ internal sealed class StreamingSecretRedactor
                 break;
 
             case Mode.DiscardSkBody:
-                if (!IsSkBody(c))
+                if (IsSkBody(c))
+                {
+                    // The greedy sk- discard also consumes the letters of a nested "Bearer"
+                    // prefix; track how much of it we have seen so a following whitespace can
+                    // hand off to nested-Bearer redaction instead of leaking the bearer body.
+                    _bearerMatch = AdvanceBearerMatch(_bearerMatch, c);
+                }
+                else if (_bearerMatch == BearerPrefixLower.Length && char.IsWhiteSpace(c))
+                {
+                    _mode = Mode.DiscardBearerSpace;
+                    _bearerMatch = 0;
+                }
+                else
                 {
                     _mode = Mode.Text;
+                    _bearerMatch = 0;
                     Step(c, output);
                 }
 
@@ -167,8 +208,14 @@ internal sealed class StreamingSecretRedactor
                     {
                         if (_pending.Length >= MaxCandidate)
                         {
-                            // Pathological whitespace run: flush and stop holding it.
-                            Backtrack(c, output);
+                            // Pathological whitespace run. The "Bearer" prefix and its whitespace
+                            // are not themselves secret, so stream them as ordinary text and keep
+                            // only a compact state that still redacts a body if one arrives. This
+                            // bounds memory without abandoning Bearer protection.
+                            output.Append(_pending);
+                            output.Append(c);
+                            _pending.Clear();
+                            _mode = Mode.BearerSpaceStreaming;
                         }
                         else
                         {
@@ -179,6 +226,7 @@ internal sealed class StreamingSecretRedactor
                     {
                         _pending.Append(c);
                         _bodyCount = 1;
+                        _bearerMatch = AdvanceBearerMatch(0, c);
                         _mode = Mode.BearerBody;
                     }
                     else
@@ -189,10 +237,34 @@ internal sealed class StreamingSecretRedactor
 
                 break;
 
+            case Mode.BearerSpaceStreaming:
+                if (char.IsWhiteSpace(c))
+                {
+                    // Whitespace is not secret: stream it directly, retaining O(1) state.
+                    output.Append(c);
+                }
+                else if (IsBearerBody(c))
+                {
+                    _pending.Append(c);
+                    _bodyCount = 1;
+                    _bearerMatch = AdvanceBearerMatch(0, c);
+                    _mode = Mode.BearerBody;
+                }
+                else
+                {
+                    output.Append(c);
+                    _mode = Mode.Text;
+                }
+
+                break;
+
             case Mode.BearerBody:
                 if (IsBearerBody(c))
                 {
                     _pending.Append(c);
+                    // Track a nested "bearer" prefix continuously so a nested Bearer secret is
+                    // still detected even when this token confirms partway through that word.
+                    _bearerMatch = AdvanceBearerMatch(_bearerMatch, c);
                     if (++_bodyCount >= BearerMinBody)
                     {
                         output.Append(BearerPlaceholder);
@@ -212,9 +284,40 @@ internal sealed class StreamingSecretRedactor
                 {
                     _mode = Mode.DiscardBearerEq;
                 }
-                else if (!IsBearerBody(c))
+                else if (IsBearerBody(c))
+                {
+                    _bearerMatch = AdvanceBearerMatch(_bearerMatch, c);
+                }
+                else if (_bearerMatch == BearerPrefixLower.Length && char.IsWhiteSpace(c))
+                {
+                    _mode = Mode.DiscardBearerSpace;
+                    _bearerMatch = 0;
+                }
+                else
                 {
                     _mode = Mode.Text;
+                    _bearerMatch = 0;
+                    Step(c, output);
+                }
+
+                break;
+
+            case Mode.DiscardBearerSpace:
+                if (char.IsWhiteSpace(c))
+                {
+                    // Keep discarding the whitespace of a nested "Bearer " prefix (O(1) state).
+                }
+                else if (IsBearerBody(c))
+                {
+                    // Conservatively redact the complete nested Bearer secret rather than risk
+                    // leaking it; output may differ from the batch regex but never leaks.
+                    _mode = Mode.DiscardBearerBody;
+                    _bearerMatch = AdvanceBearerMatch(0, c);
+                }
+                else
+                {
+                    _mode = Mode.Text;
+                    _bearerMatch = 0;
                     Step(c, output);
                 }
 
@@ -244,6 +347,7 @@ internal sealed class StreamingSecretRedactor
         _pending.Clear();
         _mode = Mode.Text;
         _bodyCount = 0;
+        _bearerMatch = 0;
 
         output.Append(held[0]);
         for (var i = 1; i < held.Length; i++)
@@ -252,6 +356,22 @@ internal sealed class StreamingSecretRedactor
         }
 
         Step(c, output);
+    }
+
+    /// <summary>
+    /// Advances the case-insensitive rolling match against the <c>bearer</c> prefix. The word
+    /// "bearer" has no proper prefix that is also a suffix, so a failed extension can only restart
+    /// a fresh match at a leading <c>b</c>; this keeps the tracker O(1) and allocation-free.
+    /// </summary>
+    private static int AdvanceBearerMatch(int match, char c)
+    {
+        var lower = char.ToLowerInvariant(c);
+        if (match < BearerPrefixLower.Length && lower == BearerPrefixLower[match])
+        {
+            return match + 1;
+        }
+
+        return lower == BearerPrefixLower[0] ? 1 : 0;
     }
 
     private static bool IsSkBody(char c) =>
