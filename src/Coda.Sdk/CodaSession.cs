@@ -398,24 +398,33 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         };
         var loop = this.agentLoopFactory.Create(loopSpec);
 
-        if (options.AutoCompactTokenThreshold > 0
-            && this.history.Count > 0
-            && TokenEstimator.Estimate(this.history) > options.AutoCompactTokenThreshold)
-        {
-            await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
-        }
-
         var recording = new RecordingSink(sink);
+
+        // Snapshot BEFORE any agentic work. Reassigned after compaction so a turn failure rolls back
+        // only the turn's own user message, never a successful compaction. If compaction itself
+        // faults, history is left untouched (it mutates only after its model call returns), so this
+        // pre-compaction count still makes rollback a safe no-op.
         var snapshot = this.history.Count;
-        this.history.Add(new ChatMessage(ChatRole.User, userContent));
 
         try
         {
-            // Scope the whole run in the execution gate so IsExecuting is true for its duration and
-            // the scope closes on success, error, OR cancel — a pause requested mid-run is reached
-            // at the next boundary, and if the turn ends first the gate still reports "reached".
+            // One execution scope spans ALL agentic work in the turn: pre-turn auto-compaction (a
+            // forked model call) AND the agent loop. IsExecuting stays true for the whole span, so a
+            // pause requested during compaction is not reported reached until a safe boundary or the
+            // turn ends. The scope closes BEFORE persistence (non-agentic) and on success, error, OR
+            // cancel — if the turn ends before offering a boundary the gate still reports "reached".
             using (this.ExecutionGate.BeginExecution())
             {
+                if (options.AutoCompactTokenThreshold > 0
+                    && this.history.Count > 0
+                    && TokenEstimator.Estimate(this.history) > options.AutoCompactTokenThreshold)
+                {
+                    await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
+                }
+
+                snapshot = this.history.Count;
+                this.history.Add(new ChatMessage(ChatRole.User, userContent));
+
                 await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
             }
 

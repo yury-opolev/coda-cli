@@ -11,6 +11,15 @@ namespace Coda.Agent;
 /// iteration boundaries, and wrap a run in <see cref="BeginExecution"/>. The gate itself never
 /// interrupts in-flight model or tool work; it only parks at the boundaries the loop offers.
 /// </para>
+/// <para>
+/// Shutdown ownership: the gate deliberately has no "release every lease" escape hatch. A parked
+/// loop is always unparked through the caller's <see cref="CancellationToken"/> (see
+/// <see cref="WaitIfPaused"/>, which propagates cancellation), and the outside actor that took a
+/// pause lease owns releasing it in its own <c>finally</c>. Session disposal cancels the run token,
+/// so a lease owner that fails to release still cannot leave the loop parked. A blanket release
+/// would undermine the reference counting that lets independent actors hold leases concurrently, so
+/// it is intentionally omitted.
+/// </para>
 /// </summary>
 public sealed class AgentExecutionGate
 {
@@ -148,8 +157,12 @@ public sealed class AgentExecutionGate
             this.leaseCount--;
             if (this.leaseCount == 0)
             {
-                // Last lease released: wake parked boundaries and disarm the episode.
+                // Last lease released: wake parked boundaries and disarm the episode. A still-pending
+                // WaitUntilPaused waiter (the episode ended before any boundary or turn-end reached
+                // it) must be completed here too, otherwise it would hang forever on the orphaned
+                // reached-source we are about to clear.
                 this.resumeSource?.TrySetResult();
+                this.reachedSource?.TrySetResult();
                 this.resumeSource = null;
                 this.reachedSource = null;
                 this.reached = false;

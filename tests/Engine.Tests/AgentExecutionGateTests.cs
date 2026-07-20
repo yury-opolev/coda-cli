@@ -77,6 +77,35 @@ public sealed class AgentExecutionGateTests
     }
 
     [Fact]
+    public async Task Final_lease_released_before_any_boundary_completes_a_pending_waiter()
+    {
+        var gate = new AgentExecutionGate();
+        using var execution = gate.BeginExecution();
+
+        // Pause requested mid-execution: not reached yet (nothing has parked or ended).
+        var lease = gate.RequestPause();
+        var reached = gate.WaitUntilPaused(CancellationToken.None);
+        await ShouldStayParked(reached);
+
+        // The final lease is released before ANY boundary or turn-end. The reached source must be
+        // completed as the episode ends, or the waiter would hang forever on an orphaned signal.
+        lease.Dispose();
+
+        await ShouldComplete(reached);
+        Assert.False(gate.IsPaused);
+
+        // Re-arm: a fresh pause episode still parks and reaches normally after the early release.
+        using var lease2 = gate.RequestPause();
+        Assert.True(gate.IsPaused);
+        var parked = gate.WaitIfPaused(CancellationToken.None);
+        await ShouldStayParked(parked);
+        lease2.Dispose();
+        await ShouldComplete(parked);
+
+        execution.Dispose();
+    }
+
+    [Fact]
     public async Task All_leases_must_be_released_before_a_parked_turn_resumes()
     {
         var gate = new AgentExecutionGate();
