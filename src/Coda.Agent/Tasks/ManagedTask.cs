@@ -59,16 +59,28 @@ internal sealed class ManagedTask : IDisposable
         catch (ObjectDisposedException) { /* already disposed; ignore */ }
     }
 
-    internal bool TryComplete(string? result) => Transition(TaskRunStatus.Completed, result, error: null);
-    internal bool TryFail(string? error) => Transition(TaskRunStatus.Failed, result: null, error);
-    internal bool TryStop() => Transition(TaskRunStatus.Stopped, result: null, error: null);
+    // Compatibility bool overloads. The out-version overloads are authoritative: they
+    // report the EXACT version assigned by the transition so the manager can publish that
+    // precise value rather than re-reading a later, possibly-advanced version.
+    internal bool TryComplete(string? result) => TryComplete(result, out _);
+    internal bool TryFail(string? error) => TryFail(error, out _);
+    internal bool TryStop() => TryStop(out _);
 
-    private bool Transition(TaskRunStatus next, string? result, string? error)
+    internal bool TryComplete(string? result, out long version) =>
+        Transition(TaskRunStatus.Completed, result, error: null, out version);
+    internal bool TryFail(string? error, out long version) =>
+        Transition(TaskRunStatus.Failed, result: null, error, out version);
+    internal bool TryStop(out long version) =>
+        Transition(TaskRunStatus.Stopped, result: null, error: null, out version);
+
+    private bool Transition(TaskRunStatus next, string? result, string? error, out long version)
     {
         lock (_gate)
         {
             if (_status != TaskRunStatus.Running)
             {
+                // Already terminal: report the current (unchanged) version and refuse.
+                version = _version;
                 return false;
             }
 
@@ -76,7 +88,7 @@ internal sealed class ManagedTask : IDisposable
             _result = result;
             _error = error;
             _endedAt = DateTimeOffset.UtcNow;
-            _version++;
+            version = ++_version;
         }
 
         // Invoke the manager-supplied terminal hook OUTSIDE the task lock so that log
@@ -98,14 +110,22 @@ internal sealed class ManagedTask : IDisposable
         }
     }
 
-    /// <summary>Appends output and bumps the version so subscribers observe progress.</summary>
-    public void Append(string text)
+    /// <summary>
+    /// Appends output and, if it happened, bumps the version and returns the EXACT version
+    /// assigned to this append. Returns <c>null</c> — a complete no-op — when the text is
+    /// empty/null or the task is already terminal: no version bump, no ring write. Output and
+    /// version assignment happen under the same lock so the returned version is authoritative.
+    /// </summary>
+    public long? TryAppend(string text)
     {
-        if (string.IsNullOrEmpty(text)) return;
-        _output.Append(text);
+        if (string.IsNullOrEmpty(text)) return null;
         lock (_gate)
         {
-            _version++;
+            // Reject output once terminal so status ordering stays clean: no append can bump
+            // the version after the final Completed/Failed/Stopped transition.
+            if (_status != TaskRunStatus.Running) return null;
+            _output.Append(text);
+            return ++_version;
         }
     }
 

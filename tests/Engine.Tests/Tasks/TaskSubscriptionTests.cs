@@ -223,11 +223,11 @@ public class TaskSubscriptionTests
     }
 
     [Fact]
-    public void Unsubscribe_StopsFurtherNotifications()
+    public void Dispose_StopsFurtherNotifications()
     {
         var mgr = NewManager();
         var sub = mgr.Subscribe();
-        mgr.Unsubscribe(sub);
+        sub.Dispose();
 
         var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
         mgr.AppendOutput(t.Id, "x");

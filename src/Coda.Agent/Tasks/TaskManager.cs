@@ -153,21 +153,32 @@ public sealed partial class TaskManager : IDisposable
     internal ManagedTask? Find(string id) =>
         _tasks.TryGetValue(id, out var t) ? t : null;
 
-    /// <summary>Appends output to a task's ring and persistent log. No-op if the id is unknown.</summary>
+    /// <summary>
+    /// Appends output to a task's ring and persistent log, then publishes an Output change
+    /// carrying the EXACT version the append assigned. A no-op — no version bump, no log
+    /// write, no notification, no waiter wake — when the id is unknown, the text is
+    /// empty/null, or the task is already terminal.
+    /// </summary>
     public void AppendOutput(string id, string text)
     {
+        // Empty/null input is a complete no-op: short-circuit before touching the task,
+        // the log, or any subscriber.
+        if (string.IsNullOrEmpty(text)) return;
+
         // Deliberately not under _gate: writing to the ring and the persistent log
         // (disk I/O) must never happen while the registry lock is held.
         if (Find(id) is not { } t) return;
-        t.Append(text);
+        if (t.TryAppend(text) is not { } version) return; // terminal or no-op append
+
         if (_logs.TryGetValue(id, out var log))
         {
             log.Append(text);
         }
 
-        // Publish after the ring/log append so a woken subscriber that reads output
-        // observes the just-appended text.
-        Publish(id, t.Version, TaskChangeKind.Output);
+        // Publish the exact assigned version (never a re-read of the live version) so
+        // subscribers can validate contiguity. The ring/log append already happened, so a
+        // woken subscriber that reads output observes the just-appended text.
+        Publish(id, version, TaskChangeKind.Output);
     }
 
     /// <summary>Reads incremental output for a task. Returns null if the id is unknown.</summary>
@@ -190,8 +201,13 @@ public sealed partial class TaskManager : IDisposable
         }
     }
 
-    /// <summary>Removes a subscription so it stops receiving notifications. Safe if unknown.</summary>
-    public void Unsubscribe(TaskSubscription subscription)
+    /// <summary>
+    /// Closes and detaches a subscription. Internal callback wired into each subscription's
+    /// <see cref="TaskSubscription.Dispose"/> so the only public teardown path is
+    /// <c>Dispose</c>, which both stops delivery and wakes waiters — there is no public
+    /// "unsubscribe but keep hanging" footgun.
+    /// </summary>
+    private void Unsubscribe(TaskSubscription subscription)
     {
         lock (_gate)
         {
@@ -202,24 +218,24 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>Transitions a task to Completed and publishes a status change. Returns false if already terminal or unknown.</summary>
     public bool Complete(string id, string? result)
     {
-        if (Find(id) is not { } t || !t.TryComplete(result)) return false;
-        Publish(id, t.Version, TaskChangeKind.Status);
+        if (Find(id) is not { } t || !t.TryComplete(result, out var version)) return false;
+        Publish(id, version, TaskChangeKind.Status);
         return true;
     }
 
     /// <summary>Transitions a task to Failed and publishes a status change. Returns false if already terminal or unknown.</summary>
     public bool Fail(string id, string? error)
     {
-        if (Find(id) is not { } t || !t.TryFail(error)) return false;
-        Publish(id, t.Version, TaskChangeKind.Status);
+        if (Find(id) is not { } t || !t.TryFail(error, out var version)) return false;
+        Publish(id, version, TaskChangeKind.Status);
         return true;
     }
 
     /// <summary>Transitions a task to Stopped and publishes a status change. Returns false if already terminal or unknown.</summary>
     public bool Stop(string id)
     {
-        if (Find(id) is not { } t || !t.TryStop()) return false;
-        Publish(id, t.Version, TaskChangeKind.Status);
+        if (Find(id) is not { } t || !t.TryStop(out var version)) return false;
+        Publish(id, version, TaskChangeKind.Status);
         return true;
     }
 
@@ -252,9 +268,21 @@ public sealed partial class TaskManager : IDisposable
         // (List/Get) that need the same lock. Log writers flush to disk on Dispose, so
         // they must also be closed outside the lock (no disk I/O under the registry lock).
         ManagedTask[] tasks;
+        TaskSubscription[] subs;
         lock (_gate)
         {
             tasks = _order.ToArray();
+            // Snapshot AND clear subscriptions under the lock so no late publish reaches a
+            // subscription after this point, then close them outside the lock (below).
+            subs = _subs.ToArray();
+            _subs.Clear();
+        }
+
+        // Close subscriptions outside the lock: Close() takes each subscription's own gate
+        // and wakes any pending waiter so blocked consumers can observe IsClosed and exit.
+        foreach (var sub in subs)
+        {
+            sub.Close();
         }
 
         foreach (var t in tasks)
