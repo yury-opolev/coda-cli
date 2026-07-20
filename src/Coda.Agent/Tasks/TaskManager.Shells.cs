@@ -36,47 +36,127 @@ public sealed partial class TaskManager
         string CapturedOut() { lock (stdout) { return stdout.ToString(); } }
         string CapturedErr() { lock (stderr) { return stderr.ToString(); } }
 
-        using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, task.Token);
-        ManagedShellProcess? shell = null;
+        ManagedShellProcess shell;
         try
         {
             shell = ManagedShellProcess.Start(command, workingDirectory);
-            var (exitCode, timedOut) = await shell
-                .RunToEndAsync(OnStdout, OnStderr, timeout, linked.Token)
-                .ConfigureAwait(false);
-
-            if (timedOut)
-            {
-                Fail(task.Id, "timed out");
-                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: true, Detached: false, task.Id);
-            }
-
-            if (exitCode == 0)
-            {
-                Complete(task.Id, $"exit code: {exitCode}");
-            }
-            else
-            {
-                Fail(task.Id, $"exit code: {exitCode}");
-            }
-
-            return new ShellRunResult(exitCode, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
-        }
-        catch (OperationCanceledException)
-        {
-            shell?.TryKillTree();
-            Stop(task.Id);
-            return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
         }
         catch (Exception ex)
         {
-            shell?.TryKillTree();
             Fail(task.Id, ex.Message);
-            return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+            return new ShellRunResult(-1, string.Empty, string.Empty, TimedOut: false, Detached: false, task.Id);
         }
-        finally
+
+        // The process lifetime is governed ONLY by the task's own token, never by the originating
+        // turn's cancellationToken — that is what lets a *detached* shell outlive the turn that
+        // started it. Turn cancellation is observed separately below and matters only while the
+        // shell is still in the foreground (before a successful detach).
+        var runTask = shell.RunToEndAsync(OnStdout, OnStderr, timeout, task.Token);
+
+        var turnCancelled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        using var turnRegistration = cancellationToken.Register(
+            static s => ((TaskCompletionSource)s!).TrySetResult(), turnCancelled);
+
+        // Race completion against (a) a promotion request and (b) turn cancellation.
+        var completed = await Task.WhenAny(runTask, task.DetachRequested, turnCancelled.Task).ConfigureAwait(false);
+
+        // (a) Detach wins: hand the still-running process to a background finalizer bound only to
+        // task.Token and return immediately. Do NOT dispose/kill here — the shell keeps streaming,
+        // and disposing the turn registration means turn cancellation can no longer reach it.
+        if (completed == task.DetachRequested)
         {
-            shell?.Dispose();
+            _ = FinalizeDetachedShellAsync(task, runTask, shell);
+            return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: true, task.Id);
+        }
+
+        // (b) Turn cancelled before any detach: the foreground still honors it — kill the tree,
+        // drain the now-terminating run, mark the task stopped, and return.
+        if (completed != runTask)
+        {
+            using (shell)
+            {
+                shell.TryKillTree();
+                try { await runTask.ConfigureAwait(false); } catch { /* killed process may fault */ }
+                Stop(task.Id);
+                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+            }
+        }
+
+        using (shell)
+        {
+            try
+            {
+                var (exitCode, timedOut) = await runTask.ConfigureAwait(false);
+                if (timedOut)
+                {
+                    Fail(task.Id, "timed out");
+                    return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: true, Detached: false, task.Id);
+                }
+
+                if (exitCode == 0)
+                {
+                    Complete(task.Id, $"exit code: {exitCode}");
+                }
+                else
+                {
+                    Fail(task.Id, $"exit code: {exitCode}");
+                }
+
+                return new ShellRunResult(exitCode, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+            }
+            catch (OperationCanceledException)
+            {
+                shell.TryKillTree();
+                Stop(task.Id);
+                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+            }
+            catch (Exception ex)
+            {
+                shell.TryKillTree();
+                Fail(task.Id, ex.Message);
+                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Finalizes a shell task that was promoted to the background: awaits the still-running process
+    /// (bound only to the task's own token, so the originating turn's cancellation can no longer kill
+    /// it), sets its terminal status, and owns disposal of the process.
+    /// </summary>
+    private async Task FinalizeDetachedShellAsync(
+        ManagedTask task,
+        Task<(int ExitCode, bool TimedOut)> runTask,
+        ManagedShellProcess shell)
+    {
+        using (shell)
+        {
+            try
+            {
+                var (exitCode, timedOut) = await runTask.ConfigureAwait(false);
+                if (timedOut)
+                {
+                    Fail(task.Id, "timed out");
+                }
+                else if (exitCode == 0)
+                {
+                    Complete(task.Id, $"exit code: {exitCode}");
+                }
+                else
+                {
+                    Fail(task.Id, $"exit code: {exitCode}");
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                shell.TryKillTree();
+                Stop(task.Id);
+            }
+            catch (Exception ex)
+            {
+                shell.TryKillTree();
+                Fail(task.Id, ex.Message);
+            }
         }
     }
 

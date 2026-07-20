@@ -8,6 +8,7 @@ namespace Coda.Agent.Tasks;
 internal sealed class ManagedTask : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
+    private readonly TaskCompletionSource _detach = new(TaskCreationOptions.RunContinuationsAsynchronously);
     private readonly object _gate = new();
     private readonly OutputRing _output;
     private readonly Action<ManagedTask>? _onTerminal;
@@ -76,6 +77,12 @@ internal sealed class ManagedTask : IDisposable
         try { _cts.Cancel(); }
         catch (ObjectDisposedException) { /* already disposed; ignore */ }
     }
+
+    /// <summary>Completes when a caller requests this shell task be promoted to the background.</summary>
+    public Task DetachRequested => _detach.Task;
+
+    /// <summary>Signals a detach request; returns false if one was already signalled.</summary>
+    internal bool TryRequestDetach() => _detach.TrySetResult();
 
     // Compatibility bool overloads. The out-version overloads are authoritative: they
     // report the EXACT version assigned by the transition so the manager can publish that
