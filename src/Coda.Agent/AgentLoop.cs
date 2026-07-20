@@ -44,6 +44,7 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly GoalSupervisor? goal;
     private readonly Func<List<ChatMessage>, CancellationToken, Task>? compactAsync;
     private readonly SteeringInbox? steering;
+    private readonly AgentExecutionGate? gate;
     private readonly ILogger logger;
     private readonly TimeSpan toolProgressInterval;
     private readonly TimeSpan toolMaxDuration;
@@ -111,7 +112,8 @@ public sealed partial class AgentLoop : IAgentLoop
         TimeSpan? toolProgressInterval = null,
         Func<CancellationToken, Task>? persistTurnAsync = null,
         TimeSpan? toolMaxDuration = null,
-        TimeSpan? transportRetryDelay = null)
+        TimeSpan? transportRetryDelay = null,
+        AgentExecutionGate? gate = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -133,6 +135,7 @@ public sealed partial class AgentLoop : IAgentLoop
         this.goal = goal;
         this.compactAsync = compactAsync;
         this.steering = steering;
+        this.gate = gate;
         this.logger = logger ?? NullLogger.Instance;
         this.toolProgressInterval = toolProgressInterval is { } interval && interval > TimeSpan.Zero
             ? interval
@@ -241,6 +244,14 @@ public sealed partial class AgentLoop : IAgentLoop
         {
             for (var iteration = 0; ; iteration++)
             {
+                // COOPERATIVE PAUSE BOUNDARY: the first statement of every iteration, before any
+                // model or tool work. When an execution gate is wired and a pause is active, park
+                // here until every pause lease is released; otherwise this returns immediately.
+                if (this.gate is not null)
+                {
+                    await this.gate.WaitIfPaused(cancellationToken).ConfigureAwait(false);
+                }
+
                 // When no goal is active, honour the MaxIterations bound exactly as before.
                 if (this.goal is null && iteration >= this.options.MaxIterations)
                 {

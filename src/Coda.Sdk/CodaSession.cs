@@ -253,6 +253,16 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// <summary>The session's task manager (subagent and shell tasks).</summary>
     public TaskManager Tasks => this.tasks;
 
+    /// <summary>
+    /// The stable cooperative execution gate for this session's main agent. An outside actor
+    /// (e.g. the TUI) can <see cref="AgentExecutionGate.RequestPause"/> and await
+    /// <see cref="AgentExecutionGate.WaitUntilPaused"/> to bring a running turn to rest at an
+    /// iteration boundary, then release the lease to resume. Owned for the session's lifetime and
+    /// passed to every turn's loop via the spec; inert until a pause is actually requested, so
+    /// serve/headless behavior is unchanged.
+    /// </summary>
+    public AgentExecutionGate ExecutionGate { get; } = new();
+
     public IReadOnlyList<ChatMessage> History => this.history;
 
     /// <summary>Accumulated token usage across all RunAsync calls in this session.</summary>
@@ -382,6 +392,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             // Record on the go: the loop persists the transcript after every turn/tool cycle, so a
             // session killed mid-run still leaves a record (not just the once-at-the-end save below).
             PersistTurnAsync = this.PersistTranscriptAsync,
+            // The stable per-session cooperative gate: lets an outside actor pause the loop at an
+            // iteration boundary. Inert unless a pause is requested, so serve/headless are unchanged.
+            Gate = this.ExecutionGate,
         };
         var loop = this.agentLoopFactory.Create(loopSpec);
 
@@ -398,7 +411,14 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
         try
         {
-            await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
+            // Scope the whole run in the execution gate so IsExecuting is true for its duration and
+            // the scope closes on success, error, OR cancel — a pause requested mid-run is reached
+            // at the next boundary, and if the turn ends first the gate still reports "reached".
+            using (this.ExecutionGate.BeginExecution())
+            {
+                await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
+            }
+
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
             await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
