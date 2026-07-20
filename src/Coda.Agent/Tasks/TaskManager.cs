@@ -16,6 +16,7 @@ public sealed partial class TaskManager : IDisposable
     private readonly List<ManagedTask> _order = new();
     private readonly ConcurrentDictionary<string, ManagedTask> _tasks = new();
     private readonly ConcurrentDictionary<string, TaskLogWriter> _logs = new();
+    private readonly List<TaskSubscription> _subs = new();
     private readonly long _outputRingBytes;
     private int _nextId;
 
@@ -77,11 +78,14 @@ public sealed partial class TaskManager : IDisposable
                 $"Subagent nesting depth {depth} exceeds maximum {MaxSubagentDepth}.");
         }
 
+        ManagedTask task;
+        long createdVersion;
+        TaskSubscription[] subs;
         lock (_gate)
         {
             var id = $"task-{++_nextId:D4}";
             var logPath = Path.Combine(LogRoot, SessionId, id + ".log");
-            var task = new ManagedTask(
+            task = new ManagedTask(
                 id, parentTaskId, depth, kind, description, logPath, _outputRingBytes, OnTaskTerminal);
             // Publish to the dictionary and the order list atomically under the
             // same lock so id assignment, registration order, and lookup never
@@ -91,8 +95,28 @@ public sealed partial class TaskManager : IDisposable
             // The writer constructor performs no I/O (it only stores the path), so it is
             // safe to create under the registry lock; disk I/O happens lazily on Append.
             _logs[id] = new TaskLogWriter(task.LogPath);
-            return task;
+            createdVersion = task.Version;
+            // Capture the subscriber list in the SAME critical section that publishes the
+            // task. This makes Subscribe and Register race-consistent: a concurrent
+            // subscriber either takes its snapshot before this lock (so it is in _subs here
+            // and receives the Created change) or after (so the task is already in its
+            // initial snapshot and it is absent from this captured list) — exactly one path,
+            // never both, never neither.
+            subs = _subs.Count == 0 ? Array.Empty<TaskSubscription>() : _subs.ToArray();
         }
+
+        // Post outside the registry lock so a slow/blocking subscriber cannot stall
+        // registration or invert lock ordering against the subscription's own gate.
+        if (subs.Length > 0)
+        {
+            var change = new TaskChange(task.Id, createdVersion, TaskChangeKind.Created);
+            foreach (var sub in subs)
+            {
+                sub.Post(change);
+            }
+        }
+
+        return task;
     }
 
     /// <summary>
@@ -140,6 +164,10 @@ public sealed partial class TaskManager : IDisposable
         {
             log.Append(text);
         }
+
+        // Publish after the ring/log append so a woken subscriber that reads output
+        // observes the just-appended text.
+        Publish(id, t.Version, TaskChangeKind.Output);
     }
 
     /// <summary>Reads incremental output for a task. Returns null if the id is unknown.</summary>
@@ -148,6 +176,73 @@ public sealed partial class TaskManager : IDisposable
 
     /// <summary>Returns the output tail for a task, or null if the id is unknown.</summary>
     public string? TryPeek(string id, int maxChars) => Find(id)?.Peek(maxChars);
+
+    /// <summary>Creates a subscription seeded with the current task list.</summary>
+    public TaskSubscription Subscribe(int capacity = TaskSubscription.DefaultCapacity)
+    {
+        lock (_gate)
+        {
+            // List() and _subs.Add run in one critical section so the initial snapshot and
+            // the subscriber's registration are consistent with concurrent Register calls.
+            var sub = new TaskSubscription(List(), capacity, Unsubscribe);
+            _subs.Add(sub);
+            return sub;
+        }
+    }
+
+    /// <summary>Removes a subscription so it stops receiving notifications. Safe if unknown.</summary>
+    public void Unsubscribe(TaskSubscription subscription)
+    {
+        lock (_gate)
+        {
+            _subs.Remove(subscription);
+        }
+    }
+
+    /// <summary>Transitions a task to Completed and publishes a status change. Returns false if already terminal or unknown.</summary>
+    public bool Complete(string id, string? result)
+    {
+        if (Find(id) is not { } t || !t.TryComplete(result)) return false;
+        Publish(id, t.Version, TaskChangeKind.Status);
+        return true;
+    }
+
+    /// <summary>Transitions a task to Failed and publishes a status change. Returns false if already terminal or unknown.</summary>
+    public bool Fail(string id, string? error)
+    {
+        if (Find(id) is not { } t || !t.TryFail(error)) return false;
+        Publish(id, t.Version, TaskChangeKind.Status);
+        return true;
+    }
+
+    /// <summary>Transitions a task to Stopped and publishes a status change. Returns false if already terminal or unknown.</summary>
+    public bool Stop(string id)
+    {
+        if (Find(id) is not { } t || !t.TryStop()) return false;
+        Publish(id, t.Version, TaskChangeKind.Status);
+        return true;
+    }
+
+    /// <summary>
+    /// Fans a change out to every current subscriber. The subscriber list is snapshotted
+    /// under the registry lock, but <see cref="TaskSubscription.Post"/> is invoked OUTSIDE
+    /// the lock so a slow subscriber cannot stall producers or invert lock ordering.
+    /// </summary>
+    private void Publish(string taskId, long version, TaskChangeKind kind)
+    {
+        TaskSubscription[] subs;
+        lock (_gate)
+        {
+            if (_subs.Count == 0) return;
+            subs = _subs.ToArray();
+        }
+
+        var change = new TaskChange(taskId, version, kind);
+        foreach (var sub in subs)
+        {
+            sub.Post(change);
+        }
+    }
 
     public void Dispose()
     {
