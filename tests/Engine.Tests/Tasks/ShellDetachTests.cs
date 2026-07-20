@@ -104,6 +104,22 @@ public class ShellDetachTests
     }
 
     [Fact]
+    public async Task RunCommandTool_RunInBackground_NullTasks_ReturnsUnavailableError()
+    {
+        // With no task runtime attached, a background request must fail loudly rather than
+        // silently run synchronously (which would swallow the caller's background intent).
+        var tool = new RunCommandTool();
+        var ctx = new ToolContext(Directory.GetCurrentDirectory());
+
+        var result = await tool.ExecuteAsync(
+            Input("""{"command":"echo bg-unavailable","run_in_background":true}"""), ctx, CancellationToken.None);
+
+        Assert.True(result.IsError);
+        Assert.DoesNotContain("exit code", result.Content);
+        Assert.DoesNotContain("bg-unavailable", result.Content);
+    }
+
+    [Fact]
     public async Task RunShellAsync_DetachedShell_SurvivesTurnCancellation()
     {
         var mgr = NewManager();

@@ -20,6 +20,7 @@ internal sealed class ManagedTask : IDisposable
     private readonly Dictionary<string, long> _cursors = new(StringComparer.Ordinal);
     private long _version;
     private TaskRunStatus _status = TaskRunStatus.Running;
+    private TaskExecutionMode _mode;
     private DateTimeOffset? _endedAt;
     private string? _result;
     private string? _error;
@@ -38,6 +39,7 @@ internal sealed class ManagedTask : IDisposable
         string description,
         string logPath,
         long outputRingBytes,
+        TaskExecutionMode mode = TaskExecutionMode.Foreground,
         Action<ManagedTask>? onTerminal = null)
     {
         Id = id;
@@ -47,6 +49,7 @@ internal sealed class ManagedTask : IDisposable
         Description = description;
         LogPath = logPath;
         StartedAt = DateTimeOffset.UtcNow;
+        _mode = mode;
         _output = new OutputRing(outputRingBytes);
         _onTerminal = onTerminal;
     }
@@ -70,6 +73,7 @@ internal sealed class ManagedTask : IDisposable
 
     public long Version { get { lock (_gate) { return _version; } } }
     public TaskRunStatus Status { get { lock (_gate) { return _status; } } }
+    public TaskExecutionMode Mode { get { lock (_gate) { return _mode; } } }
 
     /// <summary>Requests cancellation of the underlying work without changing status.</summary>
     internal void Cancel()
@@ -83,6 +87,30 @@ internal sealed class ManagedTask : IDisposable
 
     /// <summary>Signals a detach request; returns false if one was already signalled.</summary>
     internal bool TryRequestDetach() => _detach.TrySetResult();
+
+    /// <summary>
+    /// Atomically promotes a still-running foreground task to the background and, when it happens,
+    /// bumps the version and returns the EXACT version assigned to the promotion. Returns
+    /// <c>false</c> — a complete no-op, no version bump — when the task is already terminal or
+    /// already in the background. Runs under the same lock as status transitions so a promotion
+    /// and a concurrent terminal transition serialize: exactly one wins the "still Running" gate.
+    /// </summary>
+    internal bool TryPromoteToBackground(out long version)
+    {
+        lock (_gate)
+        {
+            if (_status != TaskRunStatus.Running || _mode != TaskExecutionMode.Foreground)
+            {
+                // Terminal, or already background: report the current (unchanged) version and refuse.
+                version = _version;
+                return false;
+            }
+
+            _mode = TaskExecutionMode.Background;
+            version = ++_version;
+            return true;
+        }
+    }
 
     // Compatibility bool overloads. The out-version overloads are authoritative: they
     // report the EXACT version assigned by the transition so the manager can publish that
@@ -131,7 +159,7 @@ internal sealed class ManagedTask : IDisposable
         {
             return new TaskSnapshot(
                 Id, ParentId, Depth, Kind, Description,
-                _status, _version, StartedAt, _endedAt, LogPath, _result, _error);
+                _status, _mode, _version, StartedAt, _endedAt, LogPath, _result, _error);
         }
     }
 

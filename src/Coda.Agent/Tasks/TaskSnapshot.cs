@@ -8,6 +8,7 @@ public sealed record TaskSnapshot(
     TaskKind Kind,
     string Description,
     TaskRunStatus Status,
+    TaskExecutionMode Mode,
     long Version,
     DateTimeOffset StartedAt,
     DateTimeOffset? EndedAt,

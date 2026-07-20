@@ -15,7 +15,7 @@ public class TaskSubscriptionSemanticsTests
 
     private static TaskSnapshot RunningSnapshot(string id, long version) =>
         new(id, ParentId: null, Depth: 1, TaskKind.Shell, "d",
-            TaskRunStatus.Running, version, DateTimeOffset.UtcNow, EndedAt: null, "log", Result: null, Error: null);
+            TaskRunStatus.Running, TaskExecutionMode.Foreground, version, DateTimeOffset.UtcNow, EndedAt: null, "log", Result: null, Error: null);
 
     // ---- Finding 1: authoritative versions & gap detection ----
 

@@ -6,6 +6,9 @@ public enum TaskChangeKind
     Created,
     Status,
     Output,
+
+    /// <summary>The task's execution mode changed (e.g. a foreground shell promoted to the background).</summary>
+    Mode,
     Removed,
 }
 

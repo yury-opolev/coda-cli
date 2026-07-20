@@ -17,7 +17,7 @@ public sealed partial class TaskManager
         string? parentTaskId = null,
         CancellationToken cancellationToken = default)
     {
-        var task = Register(TaskKind.Shell, command, parentTaskId);
+        var task = Register(TaskKind.Shell, command, parentTaskId, TaskExecutionMode.Foreground);
         var stdout = new StringBuilder();
         var stderr = new StringBuilder();
 
@@ -170,7 +170,7 @@ public sealed partial class TaskManager
         TimeSpan timeout,
         string? parentTaskId = null)
     {
-        var task = Register(TaskKind.Shell, command, parentTaskId);
+        var task = Register(TaskKind.Shell, command, parentTaskId, TaskExecutionMode.Background);
 
         _ = Task.Run(async () =>
         {

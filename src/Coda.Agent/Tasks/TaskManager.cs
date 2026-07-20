@@ -54,9 +54,16 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>
     /// Registers a new task and returns it in the Running state. Derives depth
     /// from the parent (null parent => depth 1). Throws when the parent id is
-    /// unknown, or when a Subagent would exceed MaxSubagentDepth.
+    /// unknown, or when a Subagent would exceed MaxSubagentDepth. The optional
+    /// <paramref name="mode"/> records whether the task runs in the foreground or the
+    /// background; it defaults to <see cref="TaskExecutionMode.Foreground"/> so existing call
+    /// sites are unchanged.
     /// </summary>
-    internal ManagedTask Register(TaskKind kind, string description, string? parentTaskId)
+    internal ManagedTask Register(
+        TaskKind kind,
+        string description,
+        string? parentTaskId,
+        TaskExecutionMode mode = TaskExecutionMode.Foreground)
     {
         int depth;
         if (parentTaskId is null)
@@ -89,7 +96,7 @@ public sealed partial class TaskManager : IDisposable
             // been removed.
             var logPath = Path.Combine(LogRoot, SessionId, id + ".log");
             task = new ManagedTask(
-                id, parentTaskId, depth, kind, description, logPath, _outputRingBytes, OnTaskTerminal);
+                id, parentTaskId, depth, kind, description, logPath, _outputRingBytes, mode, OnTaskTerminal);
             // Publish to the dictionary and the order list atomically under the
             // same lock so id assignment, registration order, and lookup never
             // observe a task in one collection but not the other.

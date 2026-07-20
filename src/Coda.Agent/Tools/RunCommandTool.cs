@@ -36,16 +36,27 @@ public sealed class RunCommandTool : ITool
         }
 
         var timeout = ResolveTimeout(TryGetTimeoutSeconds(input), Environment.GetEnvironmentVariable(TimeoutEnv));
+        var runInBackground = TryGetRunInBackground(input);
 
-        // No task manager wired (e.g. some unit tests): run directly, unmanaged and unobservable.
+        // No task manager wired (e.g. some unit tests): a background request cannot be honored
+        // (there is nothing to observe or stop it), so fail loudly rather than silently running
+        // it synchronously and discarding the caller's background intent. A normal foreground
+        // command still falls back to direct, unmanaged execution exactly as before.
         if (context.Tasks is null)
         {
+            if (runInBackground)
+            {
+                return new ToolResult(
+                    "Cannot run in background: no task runtime is available in this session.",
+                    IsError: true);
+            }
+
             var executor = new ProcessShellExecutor(context.Logger, this.Name);
             var direct = await executor.RunAsync(command, context.WorkingDirectory, timeout, cancellationToken).ConfigureAwait(false);
             return FormatResult(direct.ExitCode, direct.Stdout, direct.Stderr, direct.TimedOut, timeout);
         }
 
-        if (TryGetRunInBackground(input))
+        if (runInBackground)
         {
             var id = context.Tasks.StartShellBackground(command, context.WorkingDirectory, timeout, context.CurrentTaskId);
             return new ToolResult($"Started background task {id}. Use task_output to read its progress.");

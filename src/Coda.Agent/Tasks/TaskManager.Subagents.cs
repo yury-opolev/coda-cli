@@ -18,7 +18,7 @@ public sealed partial class TaskManager
         string? parentTaskId,
         CancellationToken cancellationToken = default)
     {
-        var task = Register(TaskKind.Subagent, description, parentTaskId);
+        var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Foreground);
         var steering = new SteeringInbox();
         task.AttachSteering(steering);
 
@@ -66,7 +66,7 @@ public sealed partial class TaskManager
         string description,
         string? parentTaskId)
     {
-        var task = Register(TaskKind.Subagent, description, parentTaskId);
+        var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Background);
         var steering = new SteeringInbox();
         task.AttachSteering(steering);
         var sink = new TaskOutputSink(this, task.Id, NullAgentSink.Instance);
