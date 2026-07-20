@@ -23,10 +23,7 @@ public sealed partial class ProcessShellExecutor : IShellExecutor
     {
         this.LogToolStart(this.toolName, command, workingDirectory);
         var stopwatch = Stopwatch.StartNew();
-        var shell = OperatingSystem.IsWindows() ? "powershell.exe" : "/bin/bash";
-        var args = OperatingSystem.IsWindows()
-            ? new[] { "-NoProfile", "-NonInteractive", "-Command", command }
-            : new[] { "-c", command };
+        var (shell, args) = ShellCommandLine.For(command);
 
         var startInfo = new ProcessStartInfo
         {
