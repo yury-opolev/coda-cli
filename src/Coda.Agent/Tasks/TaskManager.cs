@@ -20,6 +20,14 @@ public sealed partial class TaskManager : IDisposable
     private readonly long _outputRingBytes;
     private int _nextId;
 
+    /// <summary>
+    /// Test-only barrier invoked inside <see cref="Register"/> after its pre-lock validation but
+    /// BEFORE the registry lock is taken. Lets a test deterministically interleave a concurrent
+    /// shutdown between a registration's checks and its under-lock commit to prove the atomicity
+    /// of the shutdown/registration recheck. Null (and therefore free) in production.
+    /// </summary>
+    internal Action? RegisterBarrier { get; set; }
+
     public TaskManager(
         string sessionId,
         string? logRoot = null,
@@ -54,7 +62,8 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>
     /// Registers a new task and returns it in the Running state. Derives depth
     /// from the parent (null parent => depth 1). Throws when the parent id is
-    /// unknown, or when a Subagent would exceed MaxSubagentDepth. The optional
+    /// unknown, when a Subagent would exceed MaxSubagentDepth, or when the manager is shutting
+    /// down/disposed. The optional
     /// <paramref name="mode"/> records whether the task runs in the foreground or the
     /// background; it defaults to <see cref="TaskExecutionMode.Foreground"/> so existing call
     /// sites are unchanged.
@@ -65,10 +74,10 @@ public sealed partial class TaskManager : IDisposable
         string? parentTaskId,
         TaskExecutionMode mode = TaskExecutionMode.Foreground)
     {
-        // Once shutdown has begun the manager stops accepting registrations so no new subagent
-        // loop or shell process can start during teardown and outlive it. Checked first, before
-        // any id assignment, so a rejected start leaves the registry untouched.
-        if (_shuttingDown)
+        // Fast pre-lock rejection once shutdown has begun: skips depth work in the common
+        // already-shutdown case. NOT authoritative on its own — the authoritative check runs under
+        // _gate below, immediately before id/task creation, to close the register-vs-shutdown race.
+        if (_shuttingDown || _disposed)
         {
             throw new InvalidOperationException(
                 "Task manager is shutting down; no new tasks may be registered.");
@@ -94,11 +103,27 @@ public sealed partial class TaskManager : IDisposable
                 $"Subagent nesting depth {depth} exceeds maximum {MaxSubagentDepth}.");
         }
 
+        // Test seam: deterministically interleave a concurrent shutdown here, after the pre-lock
+        // checks but before the registry lock, to exercise the under-lock recheck below.
+        RegisterBarrier?.Invoke();
+
         ManagedTask task;
         long createdVersion;
         TaskSubscription[] subs;
         lock (_gate)
         {
+            // Authoritative recheck under the SAME lock that ShutdownAsync uses to set
+            // _shuttingDown and snapshot the task set. This closes the race where a registration
+            // passed the pre-lock check and then committed a task after shutdown had already
+            // snapshotted/disposed — leaving a task that shutdown never cancelled or, worse, a
+            // worker/log starting after disposal. If shutdown won the lock first, we throw here and
+            // no id, task, or log writer is ever created.
+            if (_shuttingDown || _disposed)
+            {
+                throw new InvalidOperationException(
+                    "Task manager is shutting down; no new tasks may be registered.");
+            }
+
             var id = $"task-{++_nextId:D4}";
             // This runtime issues `task-NNNN` ids and is now the single owner of all subagent
             // and shell tasks; the legacy background-task runner (and its `bgNNNN` id space) has
@@ -178,12 +203,15 @@ public sealed partial class TaskManager : IDisposable
     /// <see cref="TaskActionResult.Ok"/> once removed: the task is dropped from the registry and
     /// order list, its per-consumer cursors/steering/process refs are released via
     /// <see cref="ManagedTask.Dispose"/>, its log writer (if any) is disposed (flushing/closing
-    /// it), and a <see cref="TaskChangeKind.Removed"/> change is published at the task's final
-    /// version so subscribers observe the removal.
+    /// it), and a <see cref="TaskChangeKind.Removed"/> change is published. Removal atomically
+    /// bumps the task's version from N to N+1 under the registry lock before dropping it, so the
+    /// Removed change is contiguous for a subscriber current at N — it observes the removal
+    /// without a spurious resync.
     /// </summary>
     public TaskActionResult Remove(string id)
     {
         ManagedTask task;
+        long removedVersion;
         lock (_gate)
         {
             var index = _order.FindIndex(t => t.Id == id);
@@ -199,6 +227,10 @@ public sealed partial class TaskManager : IDisposable
                 return TaskActionResult.Rejected;
             }
 
+            // Atomically bump the version (N => N+1) BEFORE removal so the Removed change is
+            // contiguous with the version a subscriber already holds. The task is terminal, so no
+            // other transition competes for the version; this bump is the removal's own event.
+            removedVersion = task.BumpVersionForRemoval();
             _order.RemoveAt(index);
         }
 
@@ -208,11 +240,10 @@ public sealed partial class TaskManager : IDisposable
             log.Dispose();
         }
 
-        // Publish the task's final version with the Removed kind. The task is already terminal,
-        // so its version is stable and no further change can follow it.
-        var version = task.Version;
+        // Publish the removal at the bumped version. The task is already terminal and now removed,
+        // so no further change can follow it.
         task.Dispose();
-        Publish(id, version, TaskChangeKind.Removed);
+        Publish(id, removedVersion, TaskChangeKind.Removed);
         return TaskActionResult.Ok;
     }
 

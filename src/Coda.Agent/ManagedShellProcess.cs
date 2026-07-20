@@ -17,6 +17,12 @@ public sealed class ManagedShellProcess : IDisposable
     /// <summary>The OS process id of the managed shell (for tree-ownership tracking).</summary>
     public int ProcessId => _process.Id;
 
+    /// <summary>
+    /// Optional hook invoked exactly once when this process is disposed, so an owner (e.g. the
+    /// backing <c>ManagedTask</c>) can clear its retained kill handle and avoid a stale reference.
+    /// </summary>
+    public Action? OnDisposed { get; set; }
+
     /// <summary>Starts the command in <paramref name="workingDirectory"/> with stdin closed.</summary>
     public static ManagedShellProcess Start(string command, string workingDirectory)
     {
@@ -151,5 +157,10 @@ public sealed class ManagedShellProcess : IDisposable
         _disposed = true;
         TryKillTree();
         _process.Dispose();
+
+        // Notify the owner (if any) so it clears its retained kill handle: the process is dead and
+        // its reference must not be used again. Best-effort; a hook failure must not surface here.
+        try { OnDisposed?.Invoke(); }
+        catch { /* best-effort finalizer notification */ }
     }
 }

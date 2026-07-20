@@ -47,6 +47,12 @@ public sealed partial class TaskManager
             return new ShellRunResult(-1, string.Empty, string.Empty, TimedOut: false, Detached: false, task.Id);
         }
 
+        // Give the task direct ownership of the live process so graceful shutdown can tree-kill it
+        // explicitly (not only via token cancellation). The handle is cleared when the process is
+        // disposed, so no dead reference is retained.
+        task.AttachShellKill(shell.TryKillTree);
+        shell.OnDisposed = task.DetachShellKill;
+
         // The process lifetime is governed ONLY by the task's own token, never by the originating
         // turn's cancellationToken — that is what lets a *detached* shell outlive the turn that
         // started it. Turn cancellation is observed separately below and matters only while the
@@ -178,6 +184,10 @@ public sealed partial class TaskManager
             try
             {
                 shell = ManagedShellProcess.Start(command, workingDirectory);
+                // Give the task direct ownership of the live process so graceful shutdown can
+                // tree-kill it explicitly. Cleared when the process is disposed (below).
+                task.AttachShellKill(shell.TryKillTree);
+                shell.OnDisposed = task.DetachShellKill;
                 var (exitCode, timedOut) = await shell
                     .RunToEndAsync(
                         chunk => AppendOutput(task.Id, chunk),

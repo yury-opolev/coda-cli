@@ -191,4 +191,171 @@ public class TaskManagerShutdownTests
         await mgr.DisposeAsync();
         await mgr.DisposeAsync();
     }
+
+    // ---- Task 9.1: registration/shutdown atomicity ----
+
+    [Fact]
+    public async Task Register_WhenRegistrationWins_TaskIsIncludedAndDrivenTerminal()
+    {
+        var mgr = NewManager();
+
+        // Order A: registration wins (happens before shutdown begins). Shutdown must then include
+        // the task in its running snapshot and drive it to a terminal state — never leave it running.
+        var t = mgr.Register(TaskKind.Subagent, "won", parentTaskId: null);
+        await mgr.ShutdownAsync(TimeSpan.FromMilliseconds(200));
+
+        Assert.NotEqual(TaskRunStatus.Running, mgr.Get(t.Id)!.Status);
+    }
+
+    [Fact]
+    public void Register_WhenShutdownWinsUnderLock_Throws_AndLeavesRegistryUntouched()
+    {
+        var mgr = NewManager();
+
+        // Order B: force the dangerous interleaving deterministically. The barrier fires while a
+        // Register call is in flight but BEFORE it takes the registry lock; inside it we run a full
+        // shutdown to completion (sets _shuttingDown/_disposed and snapshots). When Register then
+        // takes the lock its under-lock recheck must observe shutdown and throw, so no id/task/log
+        // is ever created after disposal.
+        mgr.RegisterBarrier = () =>
+        {
+            mgr.RegisterBarrier = null; // fire exactly once
+            mgr.ShutdownAsync(TimeSpan.Zero).GetAwaiter().GetResult();
+        };
+
+        Assert.Throws<InvalidOperationException>(
+            () => mgr.Register(TaskKind.Shell, "raced", parentTaskId: null));
+
+        // Nothing leaked into the registry: no task, no order entry, no log writer.
+        Assert.Empty(mgr.List());
+        Assert.Null(mgr.Get("task-0001"));
+        Assert.False(mgr.HasLogWriter("task-0001"));
+    }
+
+    [Fact]
+    public async Task Register_ConcurrentWithShutdown_NeverLeavesRunningTaskAndNeverStartsAfterDisposed()
+    {
+        // Genuine race: each iteration a Register and a Shutdown are released simultaneously by a
+        // barrier. The invariant must hold every time — either registration is rejected, or its
+        // task is included and driven terminal — with both orderings observed across the run.
+        var registrationWon = 0;
+        var shutdownWon = 0;
+
+        for (var i = 0; i < 60; i++)
+        {
+            var mgr = NewManager();
+            using var barrier = new Barrier(2);
+            string? startedId = null;
+            InvalidOperationException? rejected = null;
+            var host = new BlockingHost();
+
+            var reg = Task.Run(() =>
+            {
+                barrier.SignalAndWait();
+                try
+                {
+                    startedId = mgr.StartSubagentBackground(host, "general-purpose", "go", "desc", parentTaskId: null);
+                }
+                catch (InvalidOperationException ex)
+                {
+                    rejected = ex;
+                }
+            });
+
+            var shut = Task.Run(async () =>
+            {
+                barrier.SignalAndWait();
+                await mgr.ShutdownAsync(TimeSpan.FromMilliseconds(200));
+            });
+
+            await Task.WhenAll(reg, shut);
+
+            if (rejected is not null)
+            {
+                shutdownWon++;
+                // A rejected registration must leave nothing behind and never start a worker.
+                Assert.Null(startedId);
+            }
+            else
+            {
+                registrationWon++;
+                Assert.NotNull(startedId);
+                // Registration won the lock, so shutdown must have cancelled it: it must be terminal.
+                await WaitUntil(() => mgr.Get(startedId!) is not { Status: TaskRunStatus.Running });
+                Assert.NotEqual(TaskRunStatus.Running, mgr.Get(startedId!)!.Status);
+            }
+        }
+
+        Assert.True(registrationWon > 0, "expected some iterations where registration won the race");
+        Assert.True(shutdownWon > 0, "expected some iterations where shutdown won the race");
+    }
+
+    // ---- Task 9.3: direct shell ownership — explicit tree-kill before the budget wait ----
+
+    [Fact]
+    public async Task ShutdownAsync_TreeKillsAttachedShellBeforeWaitingOnBudget()
+    {
+        var mgr = NewManager();
+
+        // An uncooperative shell task: it never terminates on token cancellation alone. Only an
+        // explicit tree-kill stops it. We model the kill's effect (the process dying, its worker
+        // finishing) by transitioning the task terminal from inside the attached kill delegate.
+        var t = mgr.Register(TaskKind.Shell, "uncooperative", parentTaskId: null);
+        var killRequested = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        t.AttachShellKill(() =>
+        {
+            killRequested.TrySetResult();
+            mgr.Stop(t.Id);
+        });
+
+        // A long budget: if shutdown only cancelled the token and waited, it would block the full
+        // 30s on this never-self-terminating task. Because it tree-kills BEFORE waiting, the task
+        // goes terminal immediately and the wait short-circuits.
+        var sw = Stopwatch.StartNew();
+        await mgr.ShutdownAsync(TimeSpan.FromSeconds(30));
+        sw.Stop();
+
+        Assert.True(killRequested.Task.IsCompletedSuccessfully, "shutdown must request a tree-kill of the attached shell");
+        Assert.True(sw.Elapsed < TimeSpan.FromSeconds(5), $"kill-before-wait should short-circuit the budget; took {sw.Elapsed}");
+        Assert.NotEqual(TaskRunStatus.Running, mgr.Get(t.Id)!.Status);
+    }
+
+    [Fact]
+    public void DetachShellKill_ClearsHandle_SoLaterKillIsNoOp()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Shell, "detachable", parentTaskId: null);
+        var kills = 0;
+        t.AttachShellKill(() => kills++);
+
+        // Detaching (as happens when the shell process is disposed) clears the handle so a
+        // subsequent kill request is a safe no-op — no double-dispose of a dead process.
+        t.DetachShellKill();
+        t.KillAttachedShell();
+
+        Assert.Equal(0, kills);
+    }
+
+    // ---- Task 9.4: clean Removed versions ----
+
+    [Fact]
+    public void Remove_TerminalTask_BumpsVersionAndPublishesContiguousRemoved_NoResyncForCurrentSubscriber()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Subagent, "s", parentTaskId: null);
+        mgr.Complete(t.Id, "done");
+        var terminalVersion = mgr.Get(t.Id)!.Version;
+
+        // Subscribe AFTER the task is terminal: the subscriber is current at version N.
+        using var sub = mgr.Subscribe();
+        Assert.Equal(TaskActionResult.Ok, mgr.Remove(t.Id));
+
+        var (changes, resync) = sub.Drain();
+        var removed = Assert.Single(changes);
+        Assert.Equal(TaskChangeKind.Removed, removed.Kind);
+        // Removal atomically bumps the version to N+1 so the Removed change is contiguous for a
+        // subscriber current at N — it must NOT resync merely because the task was removed.
+        Assert.Equal(terminalVersion + 1, removed.Version);
+        Assert.False(resync);
+    }
 }

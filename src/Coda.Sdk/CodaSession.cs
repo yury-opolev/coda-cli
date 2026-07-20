@@ -28,7 +28,17 @@ namespace Coda.Sdk;
 public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 {
     /// <summary>Bounded timeout for graceful teardown of the LSP servers on dispose.</summary>
-    private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan LspDisposeTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Budget for the synchronous <see cref="Dispose"/>, which drives the whole async teardown on a
+    /// worker thread. It sums the TaskManager shutdown budget (running work + shell tree-kills) and
+    /// <see cref="LspDisposeTimeout"/> so HTTP/logger/LSP disposal completes before the sync call
+    /// returns — bounded (never unbounded), yet large enough not to sever a still-progressing
+    /// teardown at the shorter LSP-only timeout.
+    /// </summary>
+    internal static readonly TimeSpan SyncDisposeBudget =
+        TaskManager.DefaultShutdownBudget + LspDisposeTimeout;
 
     private readonly CredentialManager credentials;
     private readonly ClientFingerprint fingerprint;
@@ -743,7 +753,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Asynchronously tears the session down: shuts down LSP servers (bounded by
-    /// <see cref="DisposeTimeout"/>) without any sync-over-async
+    /// <see cref="LspDisposeTimeout"/>) without any sync-over-async
     /// blocking, then releases the owned HTTP client and logger factory. This is the path
     /// <c>coda serve</c> uses — see <c>ServeHost</c>, which awaits it from its run loop so a
     /// not-fully-disposed session never leaks across turns.
@@ -759,7 +769,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             try
             {
-                using var cts = new CancellationTokenSource(DisposeTimeout);
+                using var cts = new CancellationTokenSource(LspDisposeTimeout);
                 await this.lspManager.ShutdownAsync(cts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -775,15 +785,16 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Synchronous dispose for non-async callers (the TUI / headless commands). Delegates to
-    /// <see cref="DisposeAsync"/> on a worker thread, bounded by <see cref="DisposeTimeout"/>,
-    /// so it never blocks the caller indefinitely. Async callers (serve) should prefer
-    /// <see cref="DisposeAsync"/>.
+    /// <see cref="DisposeAsync"/> on a worker thread, bounded by <see cref="SyncDisposeBudget"/>
+    /// (the TaskManager shutdown budget plus <see cref="LspDisposeTimeout"/>), so it never blocks
+    /// the caller indefinitely yet still lets HTTP/logger/LSP disposal finish before returning.
+    /// Async callers (serve) should prefer <see cref="DisposeAsync"/>.
     /// </summary>
     public void Dispose()
     {
         try
         {
-            Task.Run(() => this.DisposeAsync().AsTask()).Wait(DisposeTimeout);
+            Task.Run(() => this.DisposeAsync().AsTask()).Wait(SyncDisposeBudget);
         }
         catch (Exception ex)
         {

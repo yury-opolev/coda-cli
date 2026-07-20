@@ -29,6 +29,11 @@ internal sealed class ManagedTask : IDisposable
     private DateTimeOffset? _endedAt;
     private string? _result;
     private string? _error;
+    // Best-effort tree-kill delegate for the live shell process backing this task (shells only;
+    // null otherwise). Set via AttachShellKill while the process is alive and cleared via
+    // DetachShellKill when it is disposed, so a stale handle is never retained and a kill after
+    // disposal is a safe no-op. Guarded by _gate.
+    private Action? _killShell;
 
     /// <summary>
     /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide with an
@@ -85,6 +90,49 @@ internal sealed class ManagedTask : IDisposable
     {
         try { _cts.Cancel(); }
         catch (ObjectDisposedException) { /* already disposed; ignore */ }
+    }
+
+    /// <summary>
+    /// Attaches a best-effort tree-kill delegate for the live shell process backing this task so
+    /// graceful shutdown can kill the process directly, not merely cancel the token. Replaces any
+    /// prior handle. Paired with <see cref="DetachShellKill"/>, which the shell's disposal invokes
+    /// to clear the handle so no stale/dead process reference is retained.
+    /// </summary>
+    internal void AttachShellKill(Action killShell)
+    {
+        lock (_gate) { _killShell = killShell; }
+    }
+
+    /// <summary>
+    /// Clears the attached shell-kill delegate. Invoked when the shell process is disposed so a
+    /// later <see cref="KillAttachedShell"/> is a safe no-op (no double-kill of a dead process).
+    /// </summary>
+    internal void DetachShellKill()
+    {
+        lock (_gate) { _killShell = null; }
+    }
+
+    /// <summary>
+    /// Requests a tree-kill of the attached shell process, if any. Best-effort and idempotent: a
+    /// no-op when no shell is attached or it was already killed/detached. Never throws.
+    /// </summary>
+    internal void KillAttachedShell()
+    {
+        Action? kill;
+        lock (_gate) { kill = _killShell; }
+        try { kill?.Invoke(); }
+        catch { /* best-effort; a kill failure must never surface from shutdown. */ }
+    }
+
+    /// <summary>
+    /// Bumps the version by one for a terminal removal and returns the new value. Valid only on a
+    /// terminal task (the manager checks status before calling): removal advances the version so
+    /// the published <see cref="TaskChangeKind.Removed"/> change is contiguous (N =&gt; N+1) for a
+    /// subscriber current at N, which must not resync merely because the task was removed.
+    /// </summary>
+    internal long BumpVersionForRemoval()
+    {
+        lock (_gate) { return ++_version; }
     }
 
     /// <summary>Completes when a caller requests this shell task be promoted to the background.</summary>
@@ -236,6 +284,6 @@ internal sealed class ManagedTask : IDisposable
         _completion.TrySetResult();
         // Drop per-consumer cursors so they are released when the task is torn down; the task
         // count is bounded per session, so this keeps cursor state from outliving its task.
-        lock (_gate) { _cursors.Clear(); }
+        lock (_gate) { _cursors.Clear(); _killShell = null; }
     }
 }

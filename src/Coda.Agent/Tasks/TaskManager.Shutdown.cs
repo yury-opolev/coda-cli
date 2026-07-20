@@ -8,43 +8,51 @@ namespace Coda.Agent.Tasks;
 /// </summary>
 public sealed partial class TaskManager : IAsyncDisposable
 {
-    /// <summary>Set once shutdown begins; <see cref="Register"/> reads it to refuse new tasks.</summary>
+    /// <summary>Set once shutdown begins (under <see cref="_gate"/>, atomically with the running-task snapshot); <see cref="Register"/> rechecks it under the same lock to refuse new tasks.</summary>
     private volatile bool _shuttingDown;
 
     /// <summary>Guards <see cref="Dispose"/> so double disposal is a safe no-op.</summary>
     private bool _disposed;
 
-    /// <summary>Default teardown budget matching <c>CodaSession.DisposeTimeout</c>.</summary>
-    private static readonly TimeSpan DefaultShutdownBudget = TimeSpan.FromSeconds(5);
+    /// <summary>Default teardown budget. Also composed into <c>CodaSession</c>'s sync-dispose budget.</summary>
+    public static readonly TimeSpan DefaultShutdownBudget = TimeSpan.FromSeconds(5);
 
     /// <summary>
-    /// Gracefully shuts the manager down: atomically stops accepting registrations, cancels every
-    /// running task (subagent loops observe the token; shell <c>RunToEndAsync</c> tree-kills its
-    /// process on cancellation), waits up to <paramref name="budget"/> for them to reach a terminal
-    /// state on their own via each task's terminal completion signal, then force-marks any
-    /// straggler <c>stopped</c> so a snapshot never shows a phantom running task, and finally runs
-    /// the hard synchronous teardown (subscriptions closed and waiters woken, per-task resources
-    /// released, logs flushed). Best-effort and idempotent — a second call is a no-op-ish safe
-    /// pass. Never throws from a task/worker (their exceptions are observed internally), so no
-    /// unobserved exception escapes. On return every task is terminal and every process is dead.
+    /// Gracefully shuts the manager down: atomically stops accepting registrations and snapshots
+    /// the running set under the registry lock (so a concurrent <see cref="Register"/> either
+    /// commits before the snapshot and is included, or is rejected by its under-lock recheck),
+    /// cancels every running task's token AND explicitly tree-kills every attached shell process
+    /// BEFORE the wait (so an uncooperative shell that ignores cancellation is still torn down
+    /// promptly), waits up to <paramref name="budget"/> for tasks to reach a terminal state on
+    /// their own via each task's terminal completion signal, then force-marks any straggler
+    /// <c>stopped</c> so a snapshot never shows a phantom running task, and finally runs the hard
+    /// synchronous teardown (subscriptions closed and waiters woken, per-task resources released,
+    /// logs flushed). Best-effort and idempotent — a second call is a safe no-op-ish pass. Never
+    /// throws from a task/worker (their exceptions are observed internally). On return every task
+    /// is terminal and every managed shell process has been tree-killed.
     /// </summary>
     public async Task ShutdownAsync(TimeSpan budget)
     {
-        // Atomically refuse new registrations before enumerating so nothing new can slip in
-        // between the snapshot and the cancellation below.
-        _shuttingDown = true;
-
+        // Set _shuttingDown and snapshot the running set in ONE critical section, under the same
+        // lock Register commits under. This makes the register-vs-shutdown decision atomic: a
+        // registration that commits before this lock is in the snapshot (and cancelled below); one
+        // that arrives after sees _shuttingDown under the lock and is rejected — never a task that
+        // shutdown misses, and never a worker/log starting after teardown.
         List<ManagedTask> running;
         lock (_gate)
         {
+            _shuttingDown = true;
             running = _order.Where(t => t.Status == TaskRunStatus.Running).ToList();
         }
 
-        // Cancel every running task's token. This both unblocks subagent loops and drives shell
-        // process-tree kills through ManagedShellProcess.RunToEndAsync's cancellation handling.
+        // Cancel every running task's token AND explicitly tree-kill its attached shell process (if
+        // any) before waiting. Cancellation unblocks subagent loops and cooperative shell runners;
+        // the explicit kill guarantees an uncooperative shell that ignores the token is still
+        // killed here, not left to outlive the budget wait below.
         foreach (var t in running)
         {
             t.Cancel();
+            t.KillAttachedShell();
         }
 
         // Wait, bounded, for tasks to reach a terminal state on their own. Using each task's
@@ -59,7 +67,7 @@ public sealed partial class TaskManager : IAsyncDisposable
         }
 
         // Force-mark any straggler terminal so the snapshot never shows a phantom running task.
-        // Their process trees were already tree-killed by the token cancellation above.
+        // Their process trees were already tree-killed above (explicit kill + token cancellation).
         foreach (var t in running)
         {
             if (t.Status == TaskRunStatus.Running)
