@@ -21,6 +21,7 @@ public sealed class SubagentHost : ISubagentHost
     private readonly bool includeAnthropicSystemPrefix;
     private readonly UserHookRunner? userHooks;
     private readonly TaskManager tasks;
+    private readonly TimeSpan? toolProgressInterval;
 
     public SubagentHost(
         ILlmClient client,
@@ -29,7 +30,8 @@ public sealed class SubagentHost : ISubagentHost
         AgentOptions baseOptions,
         TaskManager tasks,
         bool includeAnthropicSystemPrefix = true,
-        UserHookRunner? userHooks = null)
+        UserHookRunner? userHooks = null,
+        TimeSpan? toolProgressInterval = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -38,6 +40,10 @@ public sealed class SubagentHost : ISubagentHost
         this.tasks = tasks ?? throw new ArgumentNullException(nameof(tasks));
         this.includeAnthropicSystemPrefix = includeAnthropicSystemPrefix;
         this.userHooks = userHooks;
+        // A test seam only: overrides the nested loop's tool-progress heartbeat cadence so a
+        // regression test can observe a pulse without waiting the production default. Null in
+        // production → the child loop uses AgentLoop's own default interval.
+        this.toolProgressInterval = toolProgressInterval;
     }
 
     /// <summary>
@@ -102,7 +108,8 @@ public sealed class SubagentHost : ISubagentHost
             tasks: this.tasks,
             currentTaskId: taskId,
             currentDepth: depth,
-            steering: steering);
+            steering: steering,
+            toolProgressInterval: this.toolProgressInterval);
 
         var collecting = new CollectingSink(sink);
         var history = new List<ChatMessage> { ChatMessage.UserText(prompt) };
@@ -126,7 +133,12 @@ public sealed class SubagentHost : ISubagentHost
     private static ToolRegistry StripCreationTools(ToolRegistry tools) =>
         new(tools.All.Where(t => t.Name is not ("task" or "task_start")));
 
-    /// <summary>Forwards events to the parent sink while collecting the subagent's text.</summary>
+    /// <summary>
+    /// Forwards every event to the parent sink while collecting the subagent's text. Forwarding is
+    /// total: the optional default-interface pulses (<see cref="IAgentSink.OnToolProgress"/> and
+    /// <see cref="IAgentSink.OnUsage"/>, plus limit/stop) are overridden here so they reach the
+    /// parent — a sink that leaves them as the interface no-op would silently swallow them.
+    /// </summary>
     private sealed class CollectingSink : IAgentSink
     {
         private readonly IAgentSink parent;
@@ -151,10 +163,14 @@ public sealed class SubagentHost : ISubagentHost
 
         public void OnToolResult(string toolName, ToolResult result) => this.parent.OnToolResult(toolName, result);
 
+        public void OnToolProgress(string toolName, long elapsedMs) => this.parent.OnToolProgress(toolName, elapsedMs);
+
         public void OnError(string message) => this.parent.OnError(message);
 
         public void OnLimitReached(string kind, string message) => this.parent.OnLimitReached(kind, message);
 
         public void OnStopReason(string? stopReason) => this.parent.OnStopReason(stopReason);
+
+        public void OnUsage(TokenUsage usage) => this.parent.OnUsage(usage);
     }
 }
