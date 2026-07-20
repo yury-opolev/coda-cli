@@ -1,3 +1,4 @@
+using System.Reflection;
 using Coda.Agent.Tasks;
 using Xunit;
 
@@ -152,4 +153,78 @@ public class TaskManagerTests
         Assert.Equal(100, ids.Count);
         Assert.Equal(100, ids.Distinct().Count());
     }
+
+    [Fact]
+    public void TryFail_MovesToFailedWithErrorAndBumpsVersion()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+        Assert.True(t.TryFail("boom"));
+        var snap = t.ToSnapshot();
+        Assert.Equal(TaskRunStatus.Failed, snap.Status);
+        Assert.Equal("boom", snap.Error);
+        Assert.Null(snap.Result);
+        Assert.Equal(1, snap.Version);
+        Assert.NotNull(snap.EndedAt);
+    }
+
+    [Fact]
+    public void Register_LogPath_IsComposedUnderSessionLogRoot()
+    {
+        var mgr = new TaskManager(sessionId: "sess-test", logRoot: "logroot");
+        var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+        var expected = Path.Combine("logroot", "sess-test", t.Id + ".log");
+        Assert.Equal(expected, t.ToSnapshot().LogPath);
+    }
+
+    [Fact]
+    public void ManagedTask_IsNotPublic()
+    {
+        var type = typeof(ManagedTask);
+        Assert.False(type.IsPublic, "ManagedTask must not be public; it is an internal lifecycle type.");
+        Assert.True(type.IsNotPublic);
+    }
+
+    // Deliberately blocking waits with timeouts keep this concurrency regression bounded
+    // and deterministic; async/await would not exercise the lock-scoped deadlock.
+#pragma warning disable xUnit1031
+    [Fact]
+    public void Dispose_DisposesTasksOutsideManagerLock_NoDeadlockWithConcurrentReaders()
+    {
+        var mgr = NewManager();
+        var task = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+
+        using var callbackEntered = new ManualResetEventSlim(false);
+        using var listCompleted = new ManualResetEventSlim(false);
+
+        // This cancellation callback fires synchronously from ManagedTask.Dispose ->
+        // _cts.Cancel(). It blocks until another thread completes a manager.List() call.
+        // If TaskManager.Dispose holds the manager lock while cancelling, the reader
+        // cannot acquire that lock and the two threads deadlock.
+        using var registration = task.Token.Register(() =>
+        {
+            callbackEntered.Set();
+            listCompleted.Wait(TimeSpan.FromSeconds(5));
+        });
+
+        var disposeTask = Task.Run(() => mgr.Dispose());
+
+        Assert.True(
+            callbackEntered.Wait(TimeSpan.FromSeconds(5)),
+            "cancellation callback did not start");
+
+        var readerTask = Task.Run(() =>
+        {
+            _ = mgr.List();
+            listCompleted.Set();
+        });
+
+        Assert.True(
+            readerTask.Wait(TimeSpan.FromSeconds(5)),
+            "manager.List() blocked: Dispose held the manager lock while cancelling tasks.");
+        Assert.True(
+            disposeTask.Wait(TimeSpan.FromSeconds(5)),
+            "Dispose did not complete.");
+    }
+#pragma warning restore xUnit1031
 }

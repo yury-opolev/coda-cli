@@ -5,7 +5,7 @@ namespace Coda.Agent.Tasks;
 /// a monotonic version, and its lifecycle status. Extended in later tasks with
 /// an output ring, steering inbox, and OS process.
 /// </summary>
-public sealed class ManagedTask : IDisposable
+internal sealed class ManagedTask : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
     private readonly object _gate = new();
@@ -47,15 +47,15 @@ public sealed class ManagedTask : IDisposable
     public TaskRunStatus Status { get { lock (_gate) { return _status; } } }
 
     /// <summary>Requests cancellation of the underlying work without changing status.</summary>
-    public void Cancel()
+    internal void Cancel()
     {
         try { _cts.Cancel(); }
         catch (ObjectDisposedException) { /* already disposed; ignore */ }
     }
 
-    public bool TryComplete(string? result) => Transition(TaskRunStatus.Completed, result, error: null);
-    public bool TryFail(string? error) => Transition(TaskRunStatus.Failed, result: null, error);
-    public bool TryStop() => Transition(TaskRunStatus.Stopped, result: null, error: null);
+    internal bool TryComplete(string? result) => Transition(TaskRunStatus.Completed, result, error: null);
+    internal bool TryFail(string? error) => Transition(TaskRunStatus.Failed, result: null, error);
+    internal bool TryStop() => Transition(TaskRunStatus.Stopped, result: null, error: null);
 
     private bool Transition(TaskRunStatus next, string? result, string? error)
     {

@@ -93,12 +93,19 @@ public sealed partial class TaskManager : IDisposable
 
     public void Dispose()
     {
+        // Snapshot the task set under the lock, then dispose outside it. Disposing a
+        // ManagedTask cancels its token, which synchronously runs user cancellation
+        // callbacks; holding _gate across those callbacks can deadlock against readers
+        // (List/Get) that need the same lock.
+        ManagedTask[] tasks;
         lock (_gate)
         {
-            foreach (var t in _order)
-            {
-                t.Dispose();
-            }
+            tasks = _order.ToArray();
+        }
+
+        foreach (var t in tasks)
+        {
+            t.Dispose();
         }
     }
 }
