@@ -4,7 +4,6 @@ using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
-using Coda.Agent.Teams;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
 using LlmClient;
@@ -32,7 +31,6 @@ namespace Coda.Sdk;
 /// <param name="BackgroundTasks">Optional runner for background (detached) tasks.</param>
 /// <param name="Lsp">Optional language-server manager for LSP-backed tools.</param>
 /// <param name="LspDiagnostics">Optional registry of LSP diagnostics surfaced to the model.</param>
-/// <param name="Teams">Optional team manager backing the team/teammate tools.</param>
 /// <param name="ToolSearch">Optional coordinator backing the tool-search tool.</param>
 /// <param name="Goal">Optional goal supervisor governing long, goal-driven runs.</param>
 /// <param name="CompactAsync">Optional in-loop compaction callback for goal runs.</param>
@@ -56,7 +54,6 @@ public sealed record AgentLoopSpec(
     BackgroundTaskRunner? BackgroundTasks,
     LspServerManager? Lsp,
     LspDiagnosticRegistry? LspDiagnostics,
-    TeamManager? Teams,
     ToolSearchCoordinator? ToolSearch,
     GoalSupervisor? Goal,
     Func<List<ChatMessage>, CancellationToken, Task>? CompactAsync,

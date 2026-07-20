@@ -47,7 +47,6 @@ public static class SlashCommandCatalog
         new DiffCommand(),
         new DoctorCommand(),
         new VersionCommand(),
-        new TeamCommand(),
         new ExitCommand(),
     ];
 }

@@ -4,7 +4,6 @@ using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Classifier;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
-using Coda.Agent.Teams;
 using Coda.Sdk;
 using Coda.Sdk.Turns;
 using LlmAuth.Providers.ClaudeAi;
@@ -335,14 +334,9 @@ public sealed class PermissionModeStateTests
         new BackgroundTaskRunner(),
         lspManager: null,
         lspDiagnostics: null,
-        StubTeamManager(),
         toolSearchCoordinator: null,
         NullLoggerFactory.Instance,
         (_, _, _) => Task.CompletedTask);
-
-    private static TeamManager StubTeamManager() => new(
-        Directory.CreateTempSubdirectory("coda_permstate_teams_").FullName,
-        (_, _) => throw new InvalidOperationException("teammate factory not expected during BuildSpec"));
 
     private sealed class FakeClient : ILlmClient
     {
