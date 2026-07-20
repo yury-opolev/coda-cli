@@ -105,7 +105,7 @@ $ coda serve --api-key "$KEY" --cwd /repo
 
 ## 2. `Coda.Sdk` — embed the engine in-process (.NET 10)
 
-Reference `Coda.Sdk` (which pulls in `Coda.Agent`, `Coda.Mcp`, `LlmClient`, `LlmAuth*`). The entry point is **`CodaSession`** — the callable engine that wires the provider client, tools, subagents, teams, LSP, and permission policy, and keeps the conversation across calls.
+Reference `Coda.Sdk` (which pulls in `Coda.Agent`, `Coda.Mcp`, `LlmClient`, `LlmAuth*`). The entry point is **`CodaSession`** — the callable engine that wires the provider client, tools, subagents, LSP, and permission policy, and keeps the conversation across calls.
 
 ### `CodaSession`
 
@@ -127,14 +127,13 @@ public sealed class CodaSession : IDisposable
     public TodoStore Todos { get; }
     public ScheduledTaskStore Schedules { get; }
     public BackgroundTaskRunner BackgroundTasks { get; }
-    public TeamManager TeamManager { get; }
 
     public Task InitializeAsync(CancellationToken ct = default);            // starts configured LSP servers (no-op if none)
     public Task<RunResult> RunAsync(string prompt, IAgentSink? sink = null, CancellationToken ct = default);
     public Task<RunResult> RunAsync(IReadOnlyList<ContentBlock> userContent, IAgentSink? sink = null, CancellationToken ct = default); // text + images
     public Task CompactAsync(CancellationToken ct = default);              // summarize history in place
     public void Reset();                                                   // clear the conversation
-    public void Dispose();                                                 // tears down teams, LSP, owned HttpClient
+    public void Dispose();                                                 // tears down LSP, owned HttpClient
 }
 ```
 
@@ -244,7 +243,7 @@ For headless automation, leave `InteractivePrompt`/`UserQuestionPrompt`/`PlanApp
 
 ## Appendix — agent capabilities (built-in tools)
 
-The model can call these built-in tools (subject to the permission mode). MCP servers, LSP, subagents/teams, and tool-search add more at runtime.
+The model can call these built-in tools (subject to the permission mode). MCP servers, LSP, subagents, and tool-search add more at runtime.
 
 | Tool | Read-only? | Purpose |
 |---|---|---|
@@ -260,5 +259,4 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `git_worktree` | no (gated) | list/add/remove git worktrees |
 | `task` | — | delegate a self-contained subtask to a subagent |
 | `lsp` | yes | code intelligence (when language servers are configured) |
-| team tools (`team_create`, `spawn_teammate`, `send_message`, task board, …) | — | multi-agent teams |
 | `mcp__<server>__<tool>` | varies | tools advertised by configured MCP servers |

@@ -66,9 +66,8 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
     `todo_write` (a live checklist), plan mode, cron-style `schedule`, and
     `background_task` (long-running jobs).
-- **Subagents & teams** — delegate a self-contained subtask with `task`, or spin up
-  a **multi-agent team** of named teammates that message each other and share a task
-  board.
+- **Subagents** — delegate a self-contained subtask with `task`, which runs a nested
+  agent loop in its own context with a scoped toolset.
 - **Code intelligence (LSP)** — when language servers are configured, an `lsp` tool
   provides definitions/references/hover/symbols/diagnostics.
 - **MCP** — drop a `.mcp.json` in the working dir and Coda connects the servers,
@@ -598,7 +597,6 @@ project files if they exist (it never writes to them).
 | Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
 | Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |
 | Scheduled tasks | `<project>/.coda/scheduled_tasks.json` | |
-| Teams | `~/.coda/teams/` | |
 | Plugins | `~/.coda/`, `<project>/.coda/plugins/` | |
 | Skills | `~/.coda/skills/`, `<project>/.coda/skills/` (+ read-only `~/.claude/skills/`) | `SKILL.md` per skill |
 | MCP servers | `~/.coda/.mcp.json`, `<project>/.mcp.json` | stdio + HTTP; project overrides user |

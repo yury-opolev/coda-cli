@@ -90,8 +90,8 @@ Eleven projects under `src/`, three test projects under `tests/`. All target `ne
 - **`Coda.Agent`** *(library; the agent core)* — `AgentLoop` (the tool-use cycle),
   all built-in `Tools/`, the `ToolRegistry`, the permission model
   (`PermissionMode`, `ModePermissionPrompt`, `Permissions/`, `Classifier/`), goals &
-  budgets (`Goals/`), conversation compaction (`Compaction/`), subagents & teams
-  (`SubagentHost`, `Teams/`), background tasks, schedules, hooks, output styles, the
+  budgets (`Goals/`), conversation compaction (`Compaction/`), subagents
+  (`SubagentHost`), background tasks, schedules, hooks, output styles, the
   shell executor (`ProcessShellExecutor`), settings loading (`Settings/` — including the
   `TelemetrySettings` config record), and an **LSP client** (`Lsp/` — the
   language-server-specific code; `LspClient` now builds its transport on the neutral
@@ -229,8 +229,8 @@ exact handlers.
      user `PreToolUse` hooks → permission gate (skipped for read-only tools) → `ExecuteAsync`
      → `PostToolUse` hooks → result block. Tool errors are caught and returned as error
      results (the turn continues); only `OperationCanceledException` propagates.
-   - Results are appended to history and the loop repeats; LSP diagnostics, team-inbox
-     messages, and deferred-tool reminders are injected between iterations as synthetic
+   - Results are appended to history and the loop repeats; LSP diagnostics
+     and deferred-tool reminders are injected between iterations as synthetic
      user messages.
 8. **Tool execution example — `run_command`.** `RunCommandTool` (`src/Coda.Agent/Tools/
    RunCommandTool.cs`) resolves its timeout (default 10 min, `CODA_RUN_COMMAND_TIMEOUT`
@@ -382,7 +382,7 @@ In serve mode the "interactive prompt" is `WirePermissionPrompt` (server-initiat
 ### 4.7 Sessions & persistence
 
 `CodaSession` is the engine instance: it holds the conversation `history`, accumulated token
-usage, the todo/schedule/background-task/team stores, the optional LSP manager, and the
+usage, the todo/schedule/background-task stores, the optional LSP manager, and the
 telemetry logger. It is both `IDisposable` and `IAsyncDisposable`; **serve uses the async
 path** and `ServeHost` awaits `DisposeAsync` (cancel-first teardown — cancel the turn, await
 session disposal, dispose the connection last) so a turn-running session never leaks across
@@ -557,13 +557,13 @@ startup race) is a genuine *improvement* in layering, not a regression.
 - **What.** `CodaSession` is the largest file in the repo (749 lines) and `RunAsync`
   (`CodaSession.cs:249-413`) single-handedly builds the provider client, system prompt,
   output style, permission stack (mode → rules → classifier), goal supervisor + budget,
-  hooks, four separate tool registries (subagent, parent, LSP-conditional, team,
+  hooks, four separate tool registries (subagent, parent, LSP-conditional,
   tool-search), the `AgentLoop`, *and* performs pre-turn auto-compaction — on **every
-  turn**. The constructor (`CodaSession.cs:51-163`) separately builds LSP, teams, and the
+  turn**. The constructor (`CodaSession.cs:51-163`) separately builds LSP and the
   tool-search coordinator.
 - **Why it's a problem.** The per-turn assembly is hard to test in isolation, re-allocates
   the entire tool/permission graph each turn, and concentrates change-risk: nearly every
-  feature (goals, teams, LSP, tool-search, classifier) has a tendril here. It is the single
+  feature (goals, LSP, tool-search, classifier) has a tendril here. It is the single
   place most likely to grow without bound.
 - **Direction.** Extract a `TurnPipelineBuilder` (or per-turn `AgentLoopFactory`) that takes
   a snapshot of `SessionOptions` and returns a ready `AgentLoop`; cache the stable parts
