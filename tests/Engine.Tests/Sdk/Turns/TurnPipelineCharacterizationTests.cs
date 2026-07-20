@@ -2,6 +2,7 @@ using Coda.Agent;
 using Coda.Agent.Classifier;
 using Coda.Agent.Goals;
 using Coda.Agent.Permissions;
+using Coda.Agent.Tools;
 using Coda.Sdk;
 using Engine.Tests.TestSupport;
 using LlmAuth.Providers.ClaudeAi;
@@ -151,15 +152,16 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
     // ---- Parent tool registry contents ----
 
     [Fact]
-    public async Task ParentTools_always_include_task_and_team_tools_and_builtins()
+    public async Task ParentTools_always_include_task_and_builtins()
     {
         var spec = await this.CaptureSpecAsync(this.Options());
         var names = spec.Tools.All.Select(t => t.Name).ToHashSet();
 
         Assert.Contains("task", names);
-        Assert.Contains("team_create", names);
-        Assert.Contains("send_message", names);
         Assert.Contains("read_file", names);
+        // The execution task_stop must resolve to the background-task stop tool now that the
+        // Teams task-board stop tool has been removed.
+        Assert.IsType<BackgroundTaskStopTool>(spec.Tools.Resolve("task_stop"));
         // LSP is only added when an LSP manager is configured (none here, no lspServers in settings).
         Assert.DoesNotContain("lsp", names);
         // Note: tool_search depends on the ENABLE_TOOL_SEARCH env var, which can leak into the
@@ -227,7 +229,6 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
         Assert.NotNull(spec.Todos);
         Assert.NotNull(spec.Schedules);
         Assert.NotNull(spec.BackgroundTasks);
-        Assert.NotNull(spec.Teams);
         Assert.NotNull(spec.Subagents);
         Assert.NotNull(spec.Logger);
     }

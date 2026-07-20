@@ -104,7 +104,6 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
             BackgroundTasks: null,
             Lsp: null,
             LspDiagnostics: null,
-            Teams: null,
             ToolSearch: null,
             Goal: null,
             CompactAsync: null,

@@ -6,7 +6,6 @@ using Coda.Agent.Lsp;
 using Coda.Agent.OutputStyles;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
-using Coda.Agent.Teams;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
 using Coda.Agent.Watchers;
@@ -27,7 +26,7 @@ namespace Coda.Sdk;
 /// </summary>
 public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 {
-    /// <summary>Bounded timeout for graceful teardown of the team manager / LSP servers on dispose.</summary>
+    /// <summary>Bounded timeout for graceful teardown of the LSP servers on dispose.</summary>
     private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(5);
 
     private readonly CredentialManager credentials;
@@ -42,7 +41,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly BackgroundTaskRunner backgroundTasks = new();
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
-    private readonly TeamManager teamManager;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
     private readonly ILoggerFactory loggerFactory;
     private readonly ILogger logger;
@@ -131,33 +129,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lspDiagnostics = new LspDiagnosticRegistry();
         }
 
-        // Build the team manager. The teams base dir lives under the user's ~/.coda directory
-        // (not the working directory). The teammate-agent factory builds an in-process nested
-        // AgentLoop that wraps a real ITeammateAgent per teammate identity.
-        //
-        // FIX 2 (chicken-and-egg): the factory closure needs to capture the shared TeamManager
-        // that hasn't been constructed yet. We resolve this by declaring a nullable local,
-        // constructing TeamManager (which stores the factory but does NOT invoke it during
-        // construction), then assigning both the local and this.teamManager afterward.
-        // When the factory is later invoked (during SpawnTeammateAsync), the local is already
-        // assigned, so mgr! is safe.
-        var userCodaDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".coda");
-        var teamsBaseDir = Path.Combine(userCodaDir, "teams");
-
-        TeamManager? mgr = null;
-        mgr = new TeamManager(
-            teamsBaseDir,
-            (identity, prompt) => new InProcessTeammateAgent(
-                identity,
-                this.credentials,
-                this.fingerprint,
-                this.http,
-                options,
-                mgr!));
-        this.teamManager = mgr;
-
         // Build the tool-search coordinator from the ENABLE_TOOL_SEARCH environment variable.
         // Only store (and later pass to the leader loop) when mode is active; Standard mode
         // keeps the coordinator null so the agent loop behaves byte-identically to before.
@@ -194,7 +165,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.backgroundTasks,
             this.lspManager,
             this.lspDiagnostics,
-            this.teamManager,
             this.toolSearchCoordinator,
             this.loggerFactory,
             this.CompactHistoryAsync);
@@ -209,9 +179,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "audit persistence failed for session {sessionId} (best-effort; the turn is unaffected)")]
     private partial void LogAuditPersistFailed(string sessionId, Exception ex);
-
-    [LoggerMessage(Level = LogLevel.Debug, Message = "team manager dispose failed (best-effort) during session teardown: session={sessionId}")]
-    private partial void LogTeamManagerDisposeFailed(string sessionId, Exception ex);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "LSP shutdown failed (best-effort) during session teardown: session={sessionId}")]
     private partial void LogLspShutdownFailed(string sessionId, Exception ex);
@@ -269,8 +236,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     public ScheduledTaskStore Schedules => this.schedules;
 
     public BackgroundTaskRunner BackgroundTasks => this.backgroundTasks;
-
-    public TeamManager TeamManager => this.teamManager;
 
     public IReadOnlyList<ChatMessage> History => this.history;
 
@@ -744,8 +709,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     }
 
     /// <summary>
-    /// Asynchronously tears the session down: cancels running teammates and shuts down LSP
-    /// servers (both bounded by <see cref="DisposeTimeout"/>) without any sync-over-async
+    /// Asynchronously tears the session down: shuts down LSP servers (bounded by
+    /// <see cref="DisposeTimeout"/>) without any sync-over-async
     /// blocking, then releases the owned HTTP client and logger factory. This is the path
     /// <c>coda serve</c> uses — see <c>ServeHost</c>, which awaits it from its run loop so a
     /// not-fully-disposed session never leaks across turns.
@@ -753,17 +718,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         this.backgroundTasks.Dispose();
-
-        // Tear down the team manager (cancel all running teammates) before the HTTP client.
-        try
-        {
-            await this.teamManager.DisposeAsync().AsTask().WaitAsync(DisposeTimeout).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            // Best-effort — swallow on dispose.
-            this.LogTeamManagerDisposeFailed(this.SessionId, ex);
-        }
 
         // Shut down LSP servers before releasing the HTTP client.
         if (this.lspManager is not null)

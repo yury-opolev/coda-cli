@@ -2,7 +2,6 @@ using System.Text.Json;
 using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
-using Coda.Agent.Teams;
 using LlmClient;
 using Microsoft.Extensions.Logging;
 
@@ -43,24 +42,6 @@ public sealed record ToolContext(string WorkingDirectory)
 
     /// <summary>LSP server manager for code-intelligence operations; null when no LSP servers are configured.</summary>
     public LspServerManager? Lsp { get; init; }
-
-    /// <summary>Shared task board for the active team; null when not running inside a team context.</summary>
-    public TaskBoard? TeamTasks { get; init; }
-
-    /// <summary>Name of the active team; null when not running inside a team context.</summary>
-    public string? TeamName { get; init; }
-
-    /// <summary>Mailbox for the active team; null when not running inside a team context.</summary>
-    public Mailbox? TeamMailbox { get; init; }
-
-    /// <summary>Team store for the active team; null when not running inside a team context.</summary>
-    public TeamStore? TeamStore { get; init; }
-
-    /// <summary>Name of the current agent (e.g. "team-lead" or a teammate name); null when not in a team context.</summary>
-    public string? AgentName { get; init; }
-
-    /// <summary>Team manager for spawn/delete/drain operations; null when not in a team context.</summary>
-    public TeamManager? Teams { get; init; }
 
     /// <summary>The full registered tool set (deferred + non-deferred); null when not wired by the coordinator.</summary>
     public IReadOnlyList<ITool>? AllTools { get; init; }

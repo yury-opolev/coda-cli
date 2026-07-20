@@ -29,7 +29,6 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             backgroundTasks: spec.BackgroundTasks,
             lsp: spec.Lsp,
             lspDiagnostics: spec.LspDiagnostics,
-            teams: spec.Teams,
             toolSearch: spec.ToolSearch,
             goal: spec.Goal,
             compactAsync: spec.CompactAsync,

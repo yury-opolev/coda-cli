@@ -6,7 +6,6 @@ using Coda.Agent.Lsp;
 using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
-using Coda.Agent.Teams;
 using Coda.Agent.ToolSearch;
 using Coda.Sdk;
 using Coda.Sdk.Turns;
@@ -34,15 +33,6 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     private ILlmClient Client() =>
         LlmClientFactory.Create(ClaudeAiProvider.Id, SignedInClaude(), new ClientFingerprint(), this.http)!;
 
-    private static TeamManager StubTeamManager()
-    {
-        // The factory is never invoked during BuildSpec (only on SpawnTeammateAsync), so a throwing
-        // stub is fine here.
-        return new TeamManager(
-            Directory.CreateTempSubdirectory("coda_turn_teams_").FullName,
-            (_, _) => throw new InvalidOperationException("teammate factory not expected during BuildSpec"));
-    }
-
     private static LspServerManager StubLspManager()
     {
         var configs = new Dictionary<string, LspServerConfig>
@@ -65,7 +55,6 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             new BackgroundTaskRunner(),
             lspManager,
             lspDiagnostics,
-            StubTeamManager(),
             toolSearch,
             NullLoggerFactory.Instance,
             (_, _, _) =>
@@ -316,7 +305,6 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         Assert.NotNull(spec.Todos);
         Assert.NotNull(spec.Schedules);
         Assert.NotNull(spec.BackgroundTasks);
-        Assert.NotNull(spec.Teams);
         Assert.NotNull(spec.Subagents);
         Assert.NotNull(spec.Logger);
         Assert.Equal("claude-sonnet-4-6", spec.Options.Model);
@@ -402,22 +390,19 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     public void Constructor_rejects_null_required_collaborators()
     {
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            null!, new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, StubTeamManager(), null,
+            null!, new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, null,
             NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), null!, new BackgroundTaskRunner(), null, null, StubTeamManager(), null,
+            new TodoStore(), null!, new BackgroundTaskRunner(), null, null, null,
             NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), null!, null, null, StubTeamManager(), null,
+            new TodoStore(), new ScheduledTaskStore(), null!, null, null, null,
             NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, null!, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
-        Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, StubTeamManager(), null,
+            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, null,
             null!, (_, _, _) => Task.CompletedTask));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
-            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, StubTeamManager(), null,
+            new TodoStore(), new ScheduledTaskStore(), new BackgroundTaskRunner(), null, null, null,
             NullLoggerFactory.Instance, null!));
     }
 

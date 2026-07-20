@@ -61,7 +61,7 @@ public sealed class ServeHost : IAsyncDisposable
     public async Task RunAsync(CancellationToken cancellationToken)
     {
         // Build the connection WITHOUT starting its read loop. Building the session below is
-        // slow (tools/teams/telemetry — ~seconds in production), and the orchestrator sends
+        // slow (tools/telemetry — ~seconds in production), and the orchestrator sends
         // `initialize` the instant it connects. If the read loop were live during that window,
         // the request would land before RegisterHandlers ran and be answered with -32601
         // (Method not found), so initialize would never succeed. Deferring the loop until

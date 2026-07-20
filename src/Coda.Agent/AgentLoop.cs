@@ -8,7 +8,6 @@ using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
-using Coda.Agent.Teams;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
 using LlmClient;
@@ -39,7 +38,6 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly BackgroundTaskRunner? backgroundTasks;
     private readonly LspServerManager? lsp;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
-    private readonly TeamManager? teams;
     private readonly ToolSearchCoordinator? toolSearch;
     private readonly GoalSupervisor? goal;
     private readonly Func<List<ChatMessage>, CancellationToken, Task>? compactAsync;
@@ -101,7 +99,6 @@ public sealed partial class AgentLoop : IAgentLoop
         BackgroundTaskRunner? backgroundTasks = null,
         LspServerManager? lsp = null,
         LspDiagnosticRegistry? lspDiagnostics = null,
-        TeamManager? teams = null,
         ToolSearchCoordinator? toolSearch = null,
         GoalSupervisor? goal = null,
         Func<List<ChatMessage>, CancellationToken, Task>? compactAsync = null,
@@ -126,7 +123,6 @@ public sealed partial class AgentLoop : IAgentLoop
         this.backgroundTasks = backgroundTasks;
         this.lsp = lsp;
         this.lspDiagnostics = lspDiagnostics;
-        this.teams = teams;
         this.toolSearch = toolSearch;
         this.goal = goal;
         this.compactAsync = compactAsync;
@@ -284,36 +280,9 @@ public sealed partial class AgentLoop : IAgentLoop
                     }
                 }
 
-                // LEADER INBOX SEAM: after at least one iteration, drain any messages
-                // that teammates have posted to the team-lead inbox and inject them as a
-                // synthetic user message so the leader model sees them before the next turn.
-                // Mirrors the LSP diagnostics seam above. Swallows non-cancellation errors.
-                if (iteration > 0 && this.teams is not null && this.teams.TeamName is not null)
-                {
-                    IReadOnlyList<string> inboxBlocks;
-                    try
-                    {
-                        inboxBlocks = await this.teams.DrainLeaderInboxAsync(cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch
-                    {
-                        inboxBlocks = [];
-                    }
-
-                    if (inboxBlocks.Count > 0)
-                    {
-                        var inboxText = string.Join("\n\n", inboxBlocks);
-                        history.Add(new ChatMessage(ChatRole.User, [new TextBlock(inboxText)]));
-                    }
-                }
-
                 // STEERING INBOX SEAM: drain operator steering comments posted mid-turn (via the
                 // serve `session/steer` request) and inject them as a synthetic user message before
-                // the next model call, so a running turn can be redirected. Mirrors the leader-inbox
+                // the next model call, so a running turn can be redirected. Mirrors the LSP diagnostics
                 // seam; runs every iteration so a steer is honored at the next iteration boundary.
                 if (this.steering is not null)
                 {
@@ -329,7 +298,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 // <deferred-tools> reminder block before each model request so the model
                 // knows which tools exist but whose schemas are not yet loaded. We only
                 // append when the reminder text changes (or is first injected) to avoid
-                // re-injecting an identical block every turn. Mirrors the LSP/teams seams.
+                // re-injecting an identical block every turn. Mirrors the LSP seam.
                 if (this.toolSearch is not null && this.toolSearch.IsActive)
                 {
                     var reminder = this.toolSearch.BuildDeferredToolsReminder(this.tools);
@@ -615,12 +584,6 @@ public sealed partial class AgentLoop : IAgentLoop
             PlanApprover = this.planApprover,
             BackgroundTasks = this.backgroundTasks,
             Lsp = this.lsp,
-            Teams = this.teams,
-            TeamTasks = this.teams?.Board,
-            TeamMailbox = this.teams?.Mailbox,
-            TeamStore = this.teams?.Store,
-            TeamName = this.teams?.TeamName,
-            AgentName = this.teams is not null ? TeamConstants.TeamLeadName : null,
             AllTools = this.tools.All,
             OnToolsDiscovered = names => this.toolSearch?.AddDiscovered(names),
             Logger = this.logger,

@@ -8,7 +8,6 @@ using Coda.Agent.OutputStyles;
 using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
-using Coda.Agent.Teams;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
 using Coda.Agent.Watchers;
@@ -26,7 +25,7 @@ namespace Coda.Sdk.Turns;
 /// <remarks>
 /// Extracted from <c>CodaSession.RunAsync</c> so the ~120-line assembly is a focused,
 /// independently-testable unit. The builder holds the session's STABLE collaborators (stores,
-/// LSP/team/tool-search managers, the logger factory, and a compaction delegate) and is
+/// LSP/tool-search managers, the logger factory, and a compaction delegate) and is
 /// constructed once per session; only the per-turn <see cref="BuildSpec"/> inputs vary. Each
 /// private step has a single responsibility and is exercised in isolation by tests.
 ///
@@ -40,7 +39,6 @@ public sealed class TurnPipelineBuilder
     private readonly BackgroundTaskRunner backgroundTasks;
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
-    private readonly TeamManager teamManager;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
     private readonly ILoggerFactory loggerFactory;
     private readonly Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync;
@@ -54,7 +52,6 @@ public sealed class TurnPipelineBuilder
     /// <param name="backgroundTasks">Runner for background (detached) tasks.</param>
     /// <param name="lspManager">Language-server manager, or null when no LSP servers are configured.</param>
     /// <param name="lspDiagnostics">Diagnostics registry paired with <paramref name="lspManager"/>, or null.</param>
-    /// <param name="teamManager">Team manager backing the team/teammate tools.</param>
     /// <param name="toolSearchCoordinator">Coordinator backing the tool-search tool, or null in Standard mode.</param>
     /// <param name="loggerFactory">Factory for the loop's tool/turn loggers.</param>
     /// <param name="compactHistoryAsync">
@@ -67,7 +64,6 @@ public sealed class TurnPipelineBuilder
         BackgroundTaskRunner backgroundTasks,
         LspServerManager? lspManager,
         LspDiagnosticRegistry? lspDiagnostics,
-        TeamManager teamManager,
         ToolSearchCoordinator? toolSearchCoordinator,
         ILoggerFactory loggerFactory,
         Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync)
@@ -77,7 +73,6 @@ public sealed class TurnPipelineBuilder
         this.backgroundTasks = backgroundTasks ?? throw new ArgumentNullException(nameof(backgroundTasks));
         this.lspManager = lspManager;
         this.lspDiagnostics = lspDiagnostics;
-        this.teamManager = teamManager ?? throw new ArgumentNullException(nameof(teamManager));
         this.toolSearchCoordinator = toolSearchCoordinator;
         this.loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         this.compactHistoryAsync = compactHistoryAsync ?? throw new ArgumentNullException(nameof(compactHistoryAsync));
@@ -133,7 +128,6 @@ public sealed class TurnPipelineBuilder
             BackgroundTasks: this.backgroundTasks,
             Lsp: this.lspManager,
             LspDiagnostics: this.lspDiagnostics,
-            Teams: this.teamManager,
             ToolSearch: this.toolSearchCoordinator,
             Goal: goalSupervisor,
             // The loop runs on the session history, which the compaction delegate compacts in
@@ -246,7 +240,7 @@ public sealed class TurnPipelineBuilder
     }
 
     /// <summary>
-    /// Builds the parent (leader) tool registry: the built-ins + extra tools, plus the LSP, team,
+    /// Builds the parent (leader) tool registry: the built-ins + extra tools, plus the LSP
     /// and tool-search tools gated on whether their backing collaborators are configured.
     /// </summary>
     private ToolRegistry BuildParentTools(SessionOptions options)
@@ -257,28 +251,13 @@ public sealed class TurnPipelineBuilder
             ? new ITool[] { new TaskTool(), new LspTool() }
             : new ITool[] { new TaskTool() };
 
-        // Team tools are always registered for the leader; they self-guard on context.Teams/TeamName
-        // and return "not in a team context" until team_create is called.
-        var teamTools = new ITool[]
-        {
-            new TeamCreateTool(),
-            new SpawnTeammateTool(),
-            new TeamDeleteTool(),
-            new SendMessageTool(),
-            new TaskCreateTool(),
-            new TaskListTool(),
-            new TaskGetTool(),
-            new TaskUpdateTool(),
-            new TaskStopTool(),
-        };
-
         // Register ToolSearchTool only when tool search is active; in Standard mode it
         // is unnecessary and would appear as a confusing extra tool in the inline list.
         var toolSearchTools = this.toolSearchCoordinator is not null
             ? new ITool[] { new ToolSearchTool() }
             : [];
 
-        return new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools, .. extraLspTools, .. teamTools, .. toolSearchTools]);
+        return new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools, .. extraLspTools, .. toolSearchTools]);
     }
 
     /// <summary>Builds the watcher/stop-hook bus from the opt-in options, or null when none are enabled.</summary>
