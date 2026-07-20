@@ -27,6 +27,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             userHooks: spec.UserHooks,
             planApprover: spec.PlanApprover,
             backgroundTasks: spec.BackgroundTasks,
+            tasks: spec.Tasks,
             lsp: spec.Lsp,
             lspDiagnostics: spec.LspDiagnostics,
             toolSearch: spec.ToolSearch,

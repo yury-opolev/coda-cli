@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
@@ -39,6 +40,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly TodoStore todos = new();
     private readonly ScheduledTaskStore schedules;
     private readonly BackgroundTaskRunner backgroundTasks = new();
+    private readonly TaskManager tasks;
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
@@ -82,6 +84,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.agentLoopFactory = agentLoopFactory ?? new DefaultAgentLoopFactory();
         this.history = history ?? [];
         this.SessionId = sessionId ?? SessionIds.NewId();
+        // The manager groups persistent task logs under the session id captured HERE. If the id
+        // is later adopted (AdoptSessionId/Resume), the manager keeps this original grouping so
+        // active task logs are never moved out from under open writers — see AdoptSessionId.
+        this.tasks = new TaskManager(this.SessionId);
         if (httpClient is null)
         {
             // No HttpClient.Timeout: it would cap the TOTAL stream duration and kill a
@@ -163,6 +169,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.todos,
             this.schedules,
             this.backgroundTasks,
+            this.tasks,
             this.lspManager,
             this.lspDiagnostics,
             this.toolSearchCoordinator,
@@ -237,6 +244,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     public BackgroundTaskRunner BackgroundTasks => this.backgroundTasks;
 
+    /// <summary>The session's task manager (subagent and shell tasks).</summary>
+    public TaskManager Tasks => this.tasks;
+
     public IReadOnlyList<ChatMessage> History => this.history;
 
     /// <summary>Accumulated token usage across all RunAsync calls in this session.</summary>
@@ -281,6 +291,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// replacing history. Used by the TUI, whose history list is shared by reference (so
     /// <see cref="Resume"/>, which swaps history, is not appropriate there).
     /// </summary>
+    /// <remarks>
+    /// The <see cref="Tasks"/> manager keeps the session id it was constructed with, so already-open
+    /// task logs are never moved to a new directory (which would be unsafe against live writers).
+    /// Adoption happens at session bootstrap before any task is registered, so this grouping choice
+    /// is not observable to running tasks. Task 6 revisits log grouping when the manager owns the
+    /// runtime snapshot.
+    /// </remarks>
     public void AdoptSessionId(string sessionId)
     {
         ArgumentException.ThrowIfNullOrEmpty(sessionId);
@@ -718,6 +735,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     public async ValueTask DisposeAsync()
     {
         this.backgroundTasks.Dispose();
+        this.tasks.Dispose();
 
         // Shut down LSP servers before releasing the HTTP client.
         if (this.lspManager is not null)

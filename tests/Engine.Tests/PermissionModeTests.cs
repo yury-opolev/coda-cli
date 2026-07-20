@@ -4,6 +4,7 @@ using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Classifier;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
+using Coda.Agent.Tasks;
 using Coda.Sdk;
 using Coda.Sdk.Turns;
 using LlmAuth.Providers.ClaudeAi;
@@ -287,9 +288,10 @@ public sealed class PermissionModeStateTests
                 new ScriptedClient(toolTurn, endTurn),
                 new ToolRegistry([probe]),
                 new AllowAllPermissionPrompt(),
-                baseOptions);
+                baseOptions,
+                new TaskManager(sessionId: "perm-sub", logRoot: null));
 
-            await host.RunSubagentAsync("general-purpose", "do it", new NullSink(), CancellationToken.None);
+            await host.RunSubagentAsync("general-purpose", "do it", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
             Assert.Equal([true], observed);
         }
@@ -332,6 +334,7 @@ public sealed class PermissionModeStateTests
         new TodoStore(),
         new ScheduledTaskStore(),
         new BackgroundTaskRunner(),
+        new TaskManager(sessionId: "perm-builder", logRoot: null),
         lspManager: null,
         lspDiagnostics: null,
         toolSearchCoordinator: null,

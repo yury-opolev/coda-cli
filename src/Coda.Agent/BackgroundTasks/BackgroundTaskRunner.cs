@@ -27,7 +27,7 @@ public sealed class BackgroundTaskRunner : IDisposable
             try
             {
                 var sink = new CapturingSink(task);
-                var result = await host.RunSubagentAsync(subagentType, prompt, sink, task.Token).ConfigureAwait(false);
+                var result = await host.RunSubagentAsync(subagentType, prompt, sink, new SteeringInbox(), id, 1, task.Token).ConfigureAwait(false);
                 task.MarkCompleted(result);
             }
             catch (OperationCanceledException)

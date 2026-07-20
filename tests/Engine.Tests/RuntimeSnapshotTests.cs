@@ -64,7 +64,9 @@ public sealed class RuntimeSnapshotTests
         public GatedSubagentHost(TaskCompletionSource gate) => this.gate = gate;
 
         public async Task<string> RunSubagentAsync(
-            string subagentType, string prompt, IAgentSink parentSink, CancellationToken cancellationToken = default)
+            string subagentType, string prompt, IAgentSink parentSink,
+            SteeringInbox steering, string taskId, int depth,
+            CancellationToken cancellationToken = default)
         {
             await this.gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
             return "done";

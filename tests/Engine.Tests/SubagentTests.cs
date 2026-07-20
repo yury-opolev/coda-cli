@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using Coda.Agent;
+using Coda.Agent.Tasks;
 using Coda.Agent.Tools;
 using LlmClient;
 
@@ -63,9 +64,10 @@ public sealed class SubagentTests
 
         var client = new ScriptedClient(parentTurn1, subagentTurn, parentTurn2);
         var subagentTools = new ToolRegistry([]);
-        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), includeAnthropicSystemPrefix: false);
+        var mgr = new TaskManager(sessionId: "subagent-test", logRoot: null);
+        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), mgr, includeAnthropicSystemPrefix: false);
         var parentTools = new ToolRegistry([new TaskTool()]);
-        var loop = new AgentLoop(client, parentTools, new AllowAllPermissionPrompt(), Options(), host);
+        var loop = new AgentLoop(client, parentTools, new AllowAllPermissionPrompt(), Options(), host, tasks: mgr);
 
         var history = new List<ChatMessage> { ChatMessage.UserText("go") };
         await loop.RunAsync(history, new NullSink(), CancellationToken.None);

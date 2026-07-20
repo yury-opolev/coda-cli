@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
 using LlmClient;
@@ -39,6 +40,15 @@ public sealed record ToolContext(string WorkingDirectory)
 
     /// <summary>Background-task runner, when available (null for subagents).</summary>
     public BackgroundTaskRunner? BackgroundTasks { get; init; }
+
+    /// <summary>Task manager for subagent and shell tasks; null when not wired (e.g. some tests).</summary>
+    public TaskManager? Tasks { get; init; }
+
+    /// <summary>The current task's id when running inside a subagent task; null at the main agent (depth 0).</summary>
+    public string? CurrentTaskId { get; init; }
+
+    /// <summary>Nesting depth: 0 at the main agent, 1 for a child subagent, 2 for a grandchild.</summary>
+    public int CurrentDepth { get; init; }
 
     /// <summary>LSP server manager for code-intelligence operations; null when no LSP servers are configured.</summary>
     public LspServerManager? Lsp { get; init; }

@@ -29,6 +29,9 @@ public sealed class BackgroundTaskTests
             string subagentType,
             string prompt,
             IAgentSink parentSink,
+            SteeringInbox steering,
+            string taskId,
+            int depth,
             CancellationToken cancellationToken = default)
         {
             parentSink.OnAssistantText(this.outputText);
@@ -60,6 +63,9 @@ public sealed class BackgroundTaskTests
             string subagentType,
             string prompt,
             IAgentSink parentSink,
+            SteeringInbox steering,
+            string taskId,
+            int depth,
             CancellationToken cancellationToken = default)
         {
             parentSink.OnAssistantText(this.outputText);

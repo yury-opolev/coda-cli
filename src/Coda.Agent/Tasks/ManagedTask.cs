@@ -12,6 +12,7 @@ internal sealed class ManagedTask : IDisposable
     private readonly OutputRing _output;
     private readonly Action<ManagedTask>? _onTerminal;
     private long _version;
+    private long _mainCursor;
     private TaskRunStatus _status = TaskRunStatus.Running;
     private DateTimeOffset? _endedAt;
     private string? _result;
@@ -45,6 +46,12 @@ internal sealed class ManagedTask : IDisposable
     public string Description { get; }
     public string LogPath { get; }
     public DateTimeOffset StartedAt { get; }
+
+    /// <summary>The task-specific steering inbox (subagents only); null until attached.</summary>
+    public SteeringInbox? Steering { get; private set; }
+
+    /// <summary>Attaches a steering inbox so the running subagent loop can drain it at its boundary.</summary>
+    internal void AttachSteering(SteeringInbox inbox) => Steering = inbox;
 
     /// <summary>Cancellation token for the underlying work. Signalled by Cancel().</summary>
     public CancellationToken Token => _cts.Token;
@@ -135,6 +142,27 @@ internal sealed class ManagedTask : IDisposable
 
     /// <summary>Returns the last maxChars characters of buffered output.</summary>
     public string Peek(int maxChars) => _output.Peek(maxChars);
+
+    /// <summary>
+    /// Reads output since the main agent's server-side cursor (backs <c>task_output</c>) and
+    /// advances that cursor. Truncated is true when eviction overtook the cursor.
+    /// </summary>
+    public (string Text, bool Truncated, TaskRunStatus Status) ReadFromMainCursor()
+    {
+        long cursor;
+        lock (_gate)
+        {
+            cursor = _mainCursor;
+        }
+
+        var (text, next, truncated) = _output.ReadFrom(cursor);
+
+        lock (_gate)
+        {
+            _mainCursor = next;
+            return (text, truncated, _status);
+        }
+    }
 
     public void Dispose()
     {
