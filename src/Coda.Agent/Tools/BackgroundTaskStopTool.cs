@@ -35,11 +35,13 @@ public sealed class BackgroundTaskStopTool : ITool
             return Task.FromResult(new ToolResult("Missing required 'task_id'.", IsError: true));
         }
 
-        var outcome = context.Tasks.RequestStop(taskId);
+        var outcome = context.Tasks.RequestStop(taskId, context.CurrentTaskId);
         return Task.FromResult(outcome switch
         {
             TaskActionResult.Ok => new ToolResult($"Task '{taskId}' has been stopped."),
-            TaskActionResult.NotFound => new ToolResult($"Task '{taskId}' not found."),
+            // NotFound and Denied share identical wording so a subagent cannot distinguish a
+            // task it is not allowed to stop from one that does not exist (no existence leak).
+            TaskActionResult.NotFound or TaskActionResult.Denied => new ToolResult($"Task '{taskId}' not found."),
             TaskActionResult.InvalidState => new ToolResult($"Task '{taskId}' is already finished and cannot be stopped."),
             _ => new ToolResult($"Task '{taskId}' cannot be stopped."),
         });

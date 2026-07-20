@@ -1,6 +1,7 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Agent;
+using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
@@ -45,6 +46,16 @@ public sealed class RuntimeSnapshotTests
         var entry = Assert.Single(mgr.List());
         Assert.Equal(task.Id, entry.Id);
         Assert.Equal(TaskRunStatus.Running, entry.Status);
+    }
+
+    [Theory]
+    [InlineData(TaskRunStatus.Running, BackgroundTaskStatus.Running)]
+    [InlineData(TaskRunStatus.Completed, BackgroundTaskStatus.Completed)]
+    [InlineData(TaskRunStatus.Failed, BackgroundTaskStatus.Failed)]
+    [InlineData(TaskRunStatus.Stopped, BackgroundTaskStatus.Stopped)]
+    public void CodaSession_MapStatus_maps_every_runtime_status(TaskRunStatus runtime, BackgroundTaskStatus expected)
+    {
+        Assert.Equal(expected, CodaSession.MapStatus(runtime));
     }
 
     // ─── LspServerManager ───────────────────────────────────────────────────

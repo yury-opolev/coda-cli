@@ -93,15 +93,55 @@ public sealed partial class TaskManager
         return task.Id;
     }
 
-    /// <summary>Requests cancellation of a running task (backs <c>task_stop</c>).</summary>
-    public TaskActionResult RequestStop(string id)
+    /// <summary>
+    /// True when <paramref name="callerTaskId"/> is authorized to read or stop
+    /// <paramref name="targetId"/>. The main agent (null caller) has authority over every task in
+    /// the session. A subagent has authority only over its own descendants: the caller must be a
+    /// <em>strict</em> ancestor of the target, walking the target's parent chain from the trusted
+    /// registry graph — never from caller-supplied depth. Consequently a task can never act on
+    /// itself, its parent, a sibling, or an unrelated task, and unknown targets are unauthorized.
+    /// </summary>
+    internal bool IsAuthorizedCaller(string targetId, string? callerTaskId)
+    {
+        // Main agent: full authority over the whole session's task set.
+        if (callerTaskId is null) return true;
+
+        var target = Find(targetId);
+        if (target is null) return false;
+
+        // Walk strict ancestors of the target. The parent graph is a tree rooted at the main
+        // agent, so this terminates; the counter is a defensive cap against a corrupt graph.
+        var parentId = target.ParentId;
+        var guard = 0;
+        while (parentId is not null)
+        {
+            if (parentId == callerTaskId) return true;
+            if (++guard > 64) return false;
+            if (Find(parentId) is not { } parent) return false;
+            parentId = parent.ParentId;
+        }
+
+        return false;
+    }
+
+    /// <summary>
+    /// Requests cancellation of a running task on behalf of <paramref name="callerTaskId"/>
+    /// (backs <c>task_stop</c>). Returns <see cref="TaskActionResult.Denied"/> when the caller is
+    /// not authorized for the target, checked BEFORE any state inspection so an unauthorized
+    /// caller cannot distinguish a running task from a finished one.
+    /// </summary>
+    public TaskActionResult RequestStop(string id, string? callerTaskId)
     {
         var t = Find(id);
         if (t is null) return TaskActionResult.NotFound;
+        if (!IsAuthorizedCaller(id, callerTaskId)) return TaskActionResult.Denied;
         if (t.Status != TaskRunStatus.Running) return TaskActionResult.InvalidState;
         t.Cancel();
         return TaskActionResult.Ok;
     }
+
+    /// <summary>Compatibility overload for the main agent (full authority over every task).</summary>
+    public TaskActionResult RequestStop(string id) => RequestStop(id, callerTaskId: null);
 
     /// <summary>Queues a steering message for a running subagent (backs <c>task_send</c>).</summary>
     public TaskActionResult Steer(string id, string message)
@@ -116,19 +156,32 @@ public sealed partial class TaskManager
     }
 
     /// <summary>
-    /// Reads incremental output for the main agent's server-side cursor (backs <c>task_output</c>).
-    /// Returns Found=false when the id is unknown.
+    /// Reads incremental output for a caller's own server-side cursor (backs <c>task_output</c>).
+    /// The main agent (null caller) may read any task; a subagent may read only its own
+    /// descendants. Returns Found=false when the id is unknown OR the caller is unauthorized —
+    /// the two are indistinguishable so a subagent cannot probe the existence of tasks it does
+    /// not own. Each consumer (main sentinel or caller task id) advances an independent cursor,
+    /// so consumers never steal one another's incremental output.
     /// </summary>
-    public (bool Found, string Text, bool Truncated, TaskRunStatus Status) ReadForMainAgent(string id)
+    public (bool Found, string Text, bool Truncated, TaskRunStatus Status) ReadOutput(string id, string? callerTaskId)
     {
-        if (Find(id) is not { } t)
+        var t = Find(id);
+        if (t is null || !IsAuthorizedCaller(id, callerTaskId))
         {
             return (false, string.Empty, false, TaskRunStatus.Running);
         }
 
-        var (text, truncated, status) = t.ReadFromMainCursor();
+        var consumerId = callerTaskId ?? ManagedTask.MainConsumerId;
+        var (text, truncated, status) = t.ReadFromCursor(consumerId);
         return (true, text, truncated, status);
     }
+
+    /// <summary>
+    /// Compatibility overload: reads incremental output on the main agent's cursor (full
+    /// authority). Returns Found=false when the id is unknown.
+    /// </summary>
+    public (bool Found, string Text, bool Truncated, TaskRunStatus Status) ReadForMainAgent(string id) =>
+        ReadOutput(id, callerTaskId: null);
 
     /// <summary>
     /// A sink that appends a subagent's assistant text and tool activity to the task's

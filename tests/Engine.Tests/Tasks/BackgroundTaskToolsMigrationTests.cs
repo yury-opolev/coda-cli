@@ -338,4 +338,57 @@ public sealed class BackgroundTaskToolsMigrationTests
         Assert.False(result.IsError);
         Assert.Equal($"Task '{task.Id}' is already finished and cannot be stopped.", result.Content);
     }
+
+    // ─── caller-scoped isolation (context.CurrentTaskId flows to the manager) ─
+
+    [Fact]
+    public async Task Stop_denied_when_target_outside_callers_subtree_looks_like_not_found()
+    {
+        using var mgr = NewManager();
+        var a = mgr.Register(TaskKind.Subagent, "a", parentTaskId: null);
+        var b = mgr.Register(TaskKind.Subagent, "b", parentTaskId: null);
+        var tool = new BackgroundTaskStopTool();
+
+        // Caller task "a" tries to stop unrelated task "b": the denial is reported with the same
+        // not-found wording so the caller cannot probe existence, and "b" keeps running.
+        var context = Context(tasks: mgr, currentTaskId: a.Id, currentDepth: 1);
+        var result = await tool.ExecuteAsync(Json($$"""{"task_id":"{{b.Id}}"}"""), context);
+
+        Assert.False(result.IsError);
+        Assert.Equal($"Task '{b.Id}' not found.", result.Content);
+        Assert.Equal(TaskRunStatus.Running, mgr.Get(b.Id)!.Status);
+    }
+
+    [Fact]
+    public async Task Output_denied_when_target_outside_callers_subtree_looks_like_not_found()
+    {
+        using var mgr = NewManager();
+        var a = mgr.Register(TaskKind.Subagent, "a", parentTaskId: null);
+        var b = mgr.Register(TaskKind.Subagent, "b", parentTaskId: null);
+        mgr.AppendOutput(b.Id, "secret");
+        var tool = new BackgroundTaskOutputTool();
+
+        var context = Context(tasks: mgr, currentTaskId: a.Id, currentDepth: 1);
+        var result = await tool.ExecuteAsync(Json($$"""{"task_id":"{{b.Id}}"}"""), context);
+
+        Assert.False(result.IsError);
+        Assert.Equal($"Task '{b.Id}' not found.", result.Content);
+        Assert.DoesNotContain("secret", result.Content);
+    }
+
+    [Fact]
+    public async Task Output_allowed_for_callers_own_descendant()
+    {
+        using var mgr = NewManager();
+        var parent = mgr.Register(TaskKind.Subagent, "p", parentTaskId: null);
+        var child = mgr.Register(TaskKind.Subagent, "c", parentTaskId: parent.Id);
+        mgr.AppendOutput(child.Id, "child progress");
+        var tool = new BackgroundTaskOutputTool();
+
+        var context = Context(tasks: mgr, currentTaskId: parent.Id, currentDepth: 1);
+        var result = await tool.ExecuteAsync(Json($$"""{"task_id":"{{child.Id}}"}"""), context);
+
+        Assert.False(result.IsError);
+        Assert.Equal("child progress\n[status: running]", result.Content);
+    }
 }

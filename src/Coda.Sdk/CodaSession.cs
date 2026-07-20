@@ -276,7 +276,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         return result;
     }
 
-    private static BackgroundTaskStatus MapStatus(TaskRunStatus status) => status switch
+    internal static BackgroundTaskStatus MapStatus(TaskRunStatus status) => status switch
     {
         TaskRunStatus.Running => BackgroundTaskStatus.Running,
         TaskRunStatus.Completed => BackgroundTaskStatus.Completed,

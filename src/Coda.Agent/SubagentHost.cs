@@ -77,18 +77,14 @@ public sealed class SubagentHost : ISubagentHost
         };
 
         // SECURITY: a read-only agent definition (e.g. Explore) must never be able to escape its
-        // read-only restriction by delegating to a full-tool child. The `task`/`task_start`
-        // creation tools are themselves read-only (launching is not a mutation), so ReadOnly()
-        // does NOT strip them. We must therefore explicitly deny both the creation tools AND the
-        // subagent host to a read-only child, even at depth 1 — otherwise it could spawn a
-        // general-purpose grandchild with write/exec tools.
+        // read-only restriction by delegating to a full-tool child, and a max-depth grandchild
+        // must not be able to read or stop tasks. Both therefore receive NO runtime
+        // task-management tools at all — not just the creation tools (task/task_start) but also
+        // the output/cancellation tools (task_output/task_stop) — and no subagent host, so they
+        // can neither spawn children nor read or stop any task in the session. A depth-1
+        // general-purpose child keeps them to manage its own descendants. See ResolveChildTools.
         var readOnlyDefinition = definition.ReadOnlyToolsOnly;
-        var baseTools = readOnlyDefinition ? this.subagentTools.ReadOnly() : this.subagentTools;
-        var tools = SelectChildTools(baseTools, depth);
-        if (readOnlyDefinition)
-        {
-            tools = StripCreationTools(tools);
-        }
+        var tools = ResolveChildTools(this.subagentTools, readOnlyDefinition, depth);
 
         var atMaxDepth = depth >= TaskManager.MaxSubagentDepth;
 
@@ -121,17 +117,42 @@ public sealed class SubagentHost : ISubagentHost
     }
 
     /// <summary>
-    /// Selects the child's tool set: grandchildren (depth &gt;= <see cref="TaskManager.MaxSubagentDepth"/>)
-    /// receive no <c>task</c>/<c>task_start</c> creation tools; shallower children keep them.
+    /// Computes a child's advertised tool set. A read-only definition (e.g. Explore) or a
+    /// grandchild at <see cref="TaskManager.MaxSubagentDepth"/> receives NO runtime
+    /// task-management tools at all — neither the creation tools (<c>task</c>/<c>task_start</c>)
+    /// nor the output/cancellation tools (<c>task_output</c>/<c>task_stop</c>, and any future
+    /// <c>task_*</c> runtime tool) — so it can neither spawn children nor read or stop any task
+    /// in the session. A depth-1 general-purpose child keeps them to manage its own descendants.
+    /// </summary>
+    internal static ToolRegistry ResolveChildTools(ToolRegistry subagentTools, bool readOnlyDefinition, int depth)
+    {
+        var baseTools = readOnlyDefinition ? subagentTools.ReadOnly() : subagentTools;
+        var denyTaskManagement = readOnlyDefinition || depth >= TaskManager.MaxSubagentDepth;
+        return denyTaskManagement ? StripTaskManagementTools(baseTools) : baseTools;
+    }
+
+    /// <summary>
+    /// Selects the child's tool set by depth alone: grandchildren (depth &gt;=
+    /// <see cref="TaskManager.MaxSubagentDepth"/>) lose all task-management tools; shallower
+    /// children keep them. Read-only definitions are handled by <see cref="ResolveChildTools"/>.
     /// </summary>
     internal static ToolRegistry SelectChildTools(ToolRegistry tools, int depth) =>
         depth >= TaskManager.MaxSubagentDepth
-            ? StripCreationTools(tools)
+            ? StripTaskManagementTools(tools)
             : tools;
 
-    /// <summary>Returns a registry with the subagent-creation tools (<c>task</c>/<c>task_start</c>) removed.</summary>
-    private static ToolRegistry StripCreationTools(ToolRegistry tools) =>
-        new(tools.All.Where(t => t.Name is not ("task" or "task_start")));
+    /// <summary>
+    /// True for any runtime task-management tool: the <c>task</c> tool itself or any
+    /// <c>task_*</c> tool (<c>task_start</c>/<c>task_output</c>/<c>task_stop</c> today, and any
+    /// future <c>task_*</c> runtime tool). Kept as a single predicate so new task tools are
+    /// denied to read-only/max-depth children by default rather than leaking through.
+    /// </summary>
+    internal static bool IsTaskManagementTool(string name) =>
+        name == "task" || name.StartsWith("task_", StringComparison.Ordinal);
+
+    /// <summary>Returns a registry with every runtime task-management tool removed.</summary>
+    private static ToolRegistry StripTaskManagementTools(ToolRegistry tools) =>
+        new(tools.All.Where(t => !IsTaskManagementTool(t.Name)));
 
     /// <summary>
     /// Forwards every event to the parent sink while collecting the subagent's text. Forwarding is

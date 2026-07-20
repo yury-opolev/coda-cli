@@ -11,12 +11,23 @@ internal sealed class ManagedTask : IDisposable
     private readonly object _gate = new();
     private readonly OutputRing _output;
     private readonly Action<ManagedTask>? _onTerminal;
+    // One incremental read cursor per consumer, keyed by a stable consumer id (the main
+    // sentinel or an authorized caller's task id). Keeping cursors per-consumer stops one
+    // consumer from stealing another's incremental output. The map is naturally bounded: only
+    // authorized consumers (the main agent plus this task's strict ancestors) ever read it, and
+    // it dies with the task, so it cannot leak unboundedly.
+    private readonly Dictionary<string, long> _cursors = new(StringComparer.Ordinal);
     private long _version;
-    private long _mainCursor;
     private TaskRunStatus _status = TaskRunStatus.Running;
     private DateTimeOffset? _endedAt;
     private string? _result;
     private string? _error;
+
+    /// <summary>
+    /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide with an
+    /// issued <c>task-NNNN</c> id, so a subagent can never masquerade as the main consumer.
+    /// </summary>
+    internal const string MainConsumerId = "\u0000main";
 
     internal ManagedTask(
         string id,
@@ -144,8 +155,10 @@ internal sealed class ManagedTask : IDisposable
     public string Peek(int maxChars) => _output.Peek(maxChars);
 
     /// <summary>
-    /// Reads output since the main agent's server-side cursor (backs <c>task_output</c>) and
-    /// advances that cursor. Truncated is true when eviction overtook the cursor.
+    /// Reads output since the given consumer's server-side cursor (backs <c>task_output</c>) and
+    /// advances that consumer's cursor. Each consumer id owns an independent cursor, so parallel
+    /// consumers (e.g. the main agent and this task's parent) never steal one another's spans.
+    /// Truncated is true when eviction overtook the cursor.
     ///
     /// The whole cursor-read → ring-read → cursor-update sequence runs under the task gate so
     /// concurrent readers serialize and never deliver the same span twice. The nested lock
@@ -153,12 +166,13 @@ internal sealed class ManagedTask : IDisposable
     /// append path (<see cref="TryAppend"/> also takes task gate → ring gate), so holding the
     /// gate across the ring read introduces no lock inversion.
     /// </summary>
-    public (string Text, bool Truncated, TaskRunStatus Status) ReadFromMainCursor()
+    public (string Text, bool Truncated, TaskRunStatus Status) ReadFromCursor(string consumerId)
     {
         lock (_gate)
         {
-            var (text, next, truncated) = _output.ReadFrom(_mainCursor);
-            _mainCursor = next;
+            var cursor = _cursors.TryGetValue(consumerId, out var c) ? c : 0;
+            var (text, next, truncated) = _output.ReadFrom(cursor);
+            _cursors[consumerId] = next;
             return (text, truncated, _status);
         }
     }
@@ -167,5 +181,8 @@ internal sealed class ManagedTask : IDisposable
     {
         try { _cts.Cancel(); } catch (ObjectDisposedException) { }
         _cts.Dispose();
+        // Drop per-consumer cursors so they are released when the task is torn down; the task
+        // count is bounded per session, so this keeps cursor state from outliving its task.
+        lock (_gate) { _cursors.Clear(); }
     }
 }

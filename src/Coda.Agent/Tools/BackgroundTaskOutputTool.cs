@@ -37,7 +37,7 @@ public sealed class BackgroundTaskOutputTool : ITool
             return Task.FromResult(new ToolResult("Missing required 'task_id'.", IsError: true));
         }
 
-        var (found, newText, truncated, status) = context.Tasks.ReadForMainAgent(taskId);
+        var (found, newText, truncated, status) = context.Tasks.ReadOutput(taskId, context.CurrentTaskId);
         if (!found)
         {
             return Task.FromResult(new ToolResult($"Task '{taskId}' not found."));
