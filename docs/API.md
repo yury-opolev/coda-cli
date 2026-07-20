@@ -110,7 +110,7 @@ Reference `Coda.Sdk` (which pulls in `Coda.Agent`, `Coda.Mcp`, `LlmClient`, `Llm
 ### `CodaSession`
 
 ```csharp
-public sealed class CodaSession : IDisposable
+public sealed class CodaSession : IDisposable, IAsyncDisposable
 {
     public CodaSession(
         CredentialManager credentials,
@@ -126,14 +126,15 @@ public sealed class CodaSession : IDisposable
     public TokenUsage SessionUsage { get; }              // cumulative across runs
     public TodoStore Todos { get; }
     public ScheduledTaskStore Schedules { get; }
-    public BackgroundTaskRunner BackgroundTasks { get; }
+    public TaskManager Tasks { get; }                    // unified in-process runtime: background subagents + shells
 
     public Task InitializeAsync(CancellationToken ct = default);            // starts configured LSP servers (no-op if none)
     public Task<RunResult> RunAsync(string prompt, IAgentSink? sink = null, CancellationToken ct = default);
     public Task<RunResult> RunAsync(IReadOnlyList<ContentBlock> userContent, IAgentSink? sink = null, CancellationToken ct = default); // text + images
     public Task CompactAsync(CancellationToken ct = default);              // summarize history in place
     public void Reset();                                                   // clear the conversation
-    public void Dispose();                                                 // tears down LSP, owned HttpClient
+    public void Dispose();                                                 // tears down tasks (bounded), LSP, owned HttpClient
+    public ValueTask DisposeAsync();                                       // graceful path: awaits TaskManager shutdown, then teardown
 }
 ```
 
@@ -249,12 +250,13 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 |---|---|---|
 | `read_file`, `list_dir`, `glob`, `grep` | yes (auto-run) | inspect files/tree, find by glob, search content |
 | `edit_file`, `write_file` | no (gated) | modify / create files (sandboxed to the working dir) |
-| `run_command` | no (gated) | run a shell command |
+| `run_command` | no (gated) | run a shell command (optionally `run_in_background`, then poll with `task_output`) |
 | `web_fetch`, `web_search` | yes | fetch a URL as text; DuckDuckGo search |
 | `todo_write` | yes | maintain a live session checklist |
 | `ask_user_question`, `exit_plan_mode` | — | ask the host a question; submit a plan for approval |
 | `schedule_create`, `schedule_list`, `schedule_delete` | mixed | cron-style scheduled tasks |
-| `background_task_start`, `_output`, `_stop`, `sleep` | mixed | long-running background jobs + polling |
+| `task_start`, `task_output`, `task_stop`, `sleep` | mixed | long-running background jobs + polling |
+| `task_list`, `task_get`, `task_peek`, `task_send` | yes | list all tasks, read one task, peek recent output, steer a running subagent |
 | `notebook_edit` | no (gated) | edit Jupyter notebook cells |
 | `git_worktree` | no (gated) | list/add/remove git worktrees |
 | `task` | — | delegate a self-contained subtask to a subagent |
