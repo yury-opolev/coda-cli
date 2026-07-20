@@ -23,6 +23,7 @@ public sealed partial class TaskManager : IDisposable
         string? logRoot = null,
         long outputRingBytes = OutputRing.DefaultMaxBytes)
     {
+        if (outputRingBytes <= 0) throw new ArgumentOutOfRangeException(nameof(outputRingBytes));
         SessionId = sessionId;
         LogRoot = logRoot ?? DefaultLogRoot;
         _outputRingBytes = outputRingBytes;

@@ -208,6 +208,22 @@ public class TaskManagerTests
     }
 
     [Fact]
+    public void TryReadIncremental_UnknownId_ReturnsNull()
+    {
+        var mgr = NewManager();
+        Assert.Null(mgr.TryReadIncremental("task-0001", 0));
+    }
+
+    [Fact]
+    public void Constructor_NonPositiveRingBytes_Throws()
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new TaskManager(sessionId: "sess-test", logRoot: null, outputRingBytes: 0));
+        Assert.Throws<ArgumentOutOfRangeException>(
+            () => new TaskManager(sessionId: "sess-test", logRoot: null, outputRingBytes: -1));
+    }
+
+    [Fact]
     public void ManagedTask_IsNotPublic()
     {
         var type = typeof(ManagedTask);
