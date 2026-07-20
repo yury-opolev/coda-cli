@@ -15,12 +15,17 @@ public sealed partial class TaskManager : IDisposable
     private readonly object _gate = new();
     private readonly List<ManagedTask> _order = new();
     private readonly ConcurrentDictionary<string, ManagedTask> _tasks = new();
+    private readonly long _outputRingBytes;
     private int _nextId;
 
-    public TaskManager(string sessionId, string? logRoot = null)
+    public TaskManager(
+        string sessionId,
+        string? logRoot = null,
+        long outputRingBytes = OutputRing.DefaultMaxBytes)
     {
         SessionId = sessionId;
         LogRoot = logRoot ?? DefaultLogRoot;
+        _outputRingBytes = outputRingBytes;
     }
 
     public string SessionId { get; }
@@ -64,7 +69,7 @@ public sealed partial class TaskManager : IDisposable
         {
             var id = $"task-{++_nextId:D4}";
             var logPath = Path.Combine(LogRoot, SessionId, id + ".log");
-            var task = new ManagedTask(id, parentTaskId, depth, kind, description, logPath);
+            var task = new ManagedTask(id, parentTaskId, depth, kind, description, logPath, _outputRingBytes);
             // Publish to the dictionary and the order list atomically under the
             // same lock so id assignment, registration order, and lookup never
             // observe a task in one collection but not the other.
@@ -90,6 +95,16 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>Returns the live task for an id, or null. Internal for tools/host use.</summary>
     internal ManagedTask? Find(string id) =>
         _tasks.TryGetValue(id, out var t) ? t : null;
+
+    /// <summary>Appends output to a task. No-op if the id is unknown.</summary>
+    public void AppendOutput(string id, string text) => Find(id)?.Append(text);
+
+    /// <summary>Reads incremental output for a task. Returns null if the id is unknown.</summary>
+    public (string Text, long NextCursor, bool Truncated)? TryReadIncremental(string id, long cursor) =>
+        Find(id) is { } t ? t.ReadIncremental(cursor) : null;
+
+    /// <summary>Returns the output tail for a task, or null if the id is unknown.</summary>
+    public string? TryPeek(string id, int maxChars) => Find(id)?.Peek(maxChars);
 
     public void Dispose()
     {

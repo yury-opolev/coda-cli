@@ -9,6 +9,7 @@ internal sealed class ManagedTask : IDisposable
 {
     private readonly CancellationTokenSource _cts = new();
     private readonly object _gate = new();
+    private readonly OutputRing _output;
     private long _version;
     private TaskRunStatus _status = TaskRunStatus.Running;
     private DateTimeOffset? _endedAt;
@@ -21,7 +22,8 @@ internal sealed class ManagedTask : IDisposable
         int depth,
         TaskKind kind,
         string description,
-        string logPath)
+        string logPath,
+        long outputRingBytes)
     {
         Id = id;
         ParentId = parentId;
@@ -30,6 +32,7 @@ internal sealed class ManagedTask : IDisposable
         Description = description;
         LogPath = logPath;
         StartedAt = DateTimeOffset.UtcNow;
+        _output = new OutputRing(outputRingBytes);
     }
 
     public string Id { get; }
@@ -84,6 +87,24 @@ internal sealed class ManagedTask : IDisposable
                 _status, _version, StartedAt, _endedAt, LogPath, _result, _error);
         }
     }
+
+    /// <summary>Appends output and bumps the version so subscribers observe progress.</summary>
+    public void Append(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return;
+        _output.Append(text);
+        lock (_gate)
+        {
+            _version++;
+        }
+    }
+
+    /// <summary>Reads output at or after the absolute cursor. See OutputRing.ReadFrom.</summary>
+    public (string Text, long NextCursor, bool Truncated) ReadIncremental(long cursor) =>
+        _output.ReadFrom(cursor);
+
+    /// <summary>Returns the last maxChars characters of buffered output.</summary>
+    public string Peek(int maxChars) => _output.Peek(maxChars);
 
     public void Dispose()
     {

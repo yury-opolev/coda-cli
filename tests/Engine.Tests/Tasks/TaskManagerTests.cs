@@ -178,6 +178,36 @@ public class TaskManagerTests
     }
 
     [Fact]
+    public void AppendOutput_ThenReadIncremental_RoundTrips()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+        mgr.AppendOutput(t.Id, "line1\n");
+        mgr.AppendOutput(t.Id, "line2\n");
+        var read = mgr.TryReadIncremental(t.Id, 0);
+        Assert.NotNull(read);
+        Assert.Equal("line1\nline2\n", read!.Value.Text);
+        Assert.False(read.Value.Truncated);
+    }
+
+    [Fact]
+    public void AppendOutput_BumpsVersion()
+    {
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Shell, "s", parentTaskId: null);
+        var before = t.ToSnapshot().Version;
+        mgr.AppendOutput(t.Id, "x");
+        Assert.True(t.ToSnapshot().Version > before);
+    }
+
+    [Fact]
+    public void TryPeek_UnknownId_ReturnsNull()
+    {
+        var mgr = NewManager();
+        Assert.Null(mgr.TryPeek("task-0001", 10));
+    }
+
+    [Fact]
     public void ManagedTask_IsNotPublic()
     {
         var type = typeof(ManagedTask);
