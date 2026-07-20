@@ -443,11 +443,24 @@ and a nesting **depth** (main agent = 0, subagents at depth 1 and 2; `MaxSubagen
 - **Bounded output + persistent logs.** Each task keeps a byte-bounded `OutputRing`
   of recent output (for fast `task_output`/`task_peek`) and streams a full,
   secret-redacted transcript to a persistent log under `~/.coda/task-logs`
-  (`TaskLogWriter`, `StreamingSecretRedactor`), pruned by `TaskLogRetention`.
+  (`TaskLogWriter`, `StreamingSecretRedactor`), pruned by `TaskLogRetention`. The
+  ring is a single raw combined stream, but the log writer keeps an **independent
+  streaming-redactor state per output channel** (`TaskOutputChannel`
+  General/Stdout/Stderr) so a secret split across chunks on one stream is never
+  corrupted — and therefore never leaked — by interleaved chunks on another. To keep
+  the registry and runtime snapshots bounded over a long session, the manager retains
+  at most `maxRetainedTerminalTasks` **terminal** tasks (default 256, configurable):
+  as tasks finish, the oldest terminal tasks are auto-pruned (running tasks are never
+  pruned) with a contiguous `Removed` change, while their persistent log files are
+  preserved on disk. Explicit `Remove` still works, and a foreground caller still
+  returns its result safely even if its own task is auto-pruned on completion.
 - **Shell detach (API only).** A running foreground shell can be promoted to the
   background via `TaskManager.TryDetach` (shells only; subagents are rejected). The
   promotion is API-complete and publishes a `Mode` change; the interactive UI to
-  drive it lands later.
+  drive it lands later. On detach the foreground stdout/stderr capture
+  (`ShellOutputCapture`) is atomically snapshotted for the returned `ShellRunResult`
+  and disabled, so the background finalizer keeps streaming into the ring/log without
+  growing capture memory.
 - **Subscriptions.** `Subscribe()` returns a bounded, version-gap-resyncing
   `TaskSubscription` seeded with the current task list — the substrate a future TUI
   panel or serve API will consume; nothing renders it yet.

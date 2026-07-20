@@ -1,5 +1,3 @@
-using System.Text;
-
 namespace Coda.Agent.Tasks;
 
 public sealed partial class TaskManager
@@ -18,23 +16,22 @@ public sealed partial class TaskManager
         CancellationToken cancellationToken = default)
     {
         var task = Register(TaskKind.Shell, command, parentTaskId, TaskExecutionMode.Foreground);
-        var stdout = new StringBuilder();
-        var stderr = new StringBuilder();
+        var capture = new ShellOutputCapture();
 
+        // stdout/stderr are captured separately (so the caller keeps exact per-stream output) and
+        // streamed into the ring/log on their own channels (so interleaving never corrupts or
+        // leaks a secret straddling chunk boundaries on either stream).
         void OnStdout(string chunk)
         {
-            lock (stdout) { stdout.Append(chunk); }
-            AppendOutput(task.Id, chunk);
+            capture.AppendStdout(chunk);
+            AppendOutput(task.Id, chunk, TaskOutputChannel.Stdout);
         }
 
         void OnStderr(string chunk)
         {
-            lock (stderr) { stderr.Append(chunk); }
-            AppendOutput(task.Id, chunk);
+            capture.AppendStderr(chunk);
+            AppendOutput(task.Id, chunk, TaskOutputChannel.Stderr);
         }
-
-        string CapturedOut() { lock (stdout) { return stdout.ToString(); } }
-        string CapturedErr() { lock (stderr) { return stderr.ToString(); } }
 
         ManagedShellProcess shell;
         try
@@ -69,10 +66,13 @@ public sealed partial class TaskManager
         // (a) Detach wins: hand the still-running process to a background finalizer bound only to
         // task.Token and return immediately. Do NOT dispose/kill here — the shell keeps streaming,
         // and disposing the turn registration means turn cancellation can no longer reach it.
+        // Atomically disable+snapshot capture first so the finalizer's continued pumping streams
+        // only into the ring/log and cannot grow the capture buffers unbounded.
         if (completed == task.DetachRequested)
         {
+            var (stdoutSnap, stderrSnap) = capture.DisableAndSnapshot();
             _ = FinalizeDetachedShellAsync(task, runTask, shell);
-            return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: true, task.Id);
+            return new ShellRunResult(-1, stdoutSnap, stderrSnap, TimedOut: false, Detached: true, task.Id);
         }
 
         // (b) Turn cancelled before any detach: the foreground still honors it — kill the tree,
@@ -84,7 +84,7 @@ public sealed partial class TaskManager
                 shell.TryKillTree();
                 try { await runTask.ConfigureAwait(false); } catch { /* killed process may fault */ }
                 Stop(task.Id);
-                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+                return new ShellRunResult(-1, capture.Stdout, capture.Stderr, TimedOut: false, Detached: false, task.Id);
             }
         }
 
@@ -96,7 +96,7 @@ public sealed partial class TaskManager
                 if (timedOut)
                 {
                     Fail(task.Id, "timed out");
-                    return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: true, Detached: false, task.Id);
+                    return new ShellRunResult(-1, capture.Stdout, capture.Stderr, TimedOut: true, Detached: false, task.Id);
                 }
 
                 if (exitCode == 0)
@@ -108,19 +108,19 @@ public sealed partial class TaskManager
                     Fail(task.Id, $"exit code: {exitCode}");
                 }
 
-                return new ShellRunResult(exitCode, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+                return new ShellRunResult(exitCode, capture.Stdout, capture.Stderr, TimedOut: false, Detached: false, task.Id);
             }
             catch (OperationCanceledException)
             {
                 shell.TryKillTree();
                 Stop(task.Id);
-                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+                return new ShellRunResult(-1, capture.Stdout, capture.Stderr, TimedOut: false, Detached: false, task.Id);
             }
             catch (Exception ex)
             {
                 shell.TryKillTree();
                 Fail(task.Id, ex.Message);
-                return new ShellRunResult(-1, CapturedOut(), CapturedErr(), TimedOut: false, Detached: false, task.Id);
+                return new ShellRunResult(-1, capture.Stdout, capture.Stderr, TimedOut: false, Detached: false, task.Id);
             }
         }
     }
@@ -190,8 +190,8 @@ public sealed partial class TaskManager
                 shell.OnDisposed = task.DetachShellKill;
                 var (exitCode, timedOut) = await shell
                     .RunToEndAsync(
-                        chunk => AppendOutput(task.Id, chunk),
-                        chunk => AppendOutput(task.Id, chunk),
+                        chunk => AppendOutput(task.Id, chunk, TaskOutputChannel.Stdout),
+                        chunk => AppendOutput(task.Id, chunk, TaskOutputChannel.Stderr),
                         timeout,
                         task.Token)
                     .ConfigureAwait(false);

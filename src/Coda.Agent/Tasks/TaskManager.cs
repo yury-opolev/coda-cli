@@ -12,12 +12,20 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>Maximum subagent nesting depth. Main agent is depth 0; deepest subagent is depth 2.</summary>
     public const int MaxSubagentDepth = 2;
 
+    /// <summary>
+    /// Default upper bound on retained <em>terminal</em> tasks. Once more terminal tasks than this
+    /// accumulate, the oldest are auto-pruned (running tasks are never pruned) so the registry,
+    /// runtime snapshots, and <see cref="List()"/> stay bounded over a long session.
+    /// </summary>
+    public const int DefaultMaxRetainedTerminalTasks = 256;
+
     private readonly object _gate = new();
     private readonly List<ManagedTask> _order = new();
     private readonly ConcurrentDictionary<string, ManagedTask> _tasks = new();
     private readonly ConcurrentDictionary<string, TaskLogWriter> _logs = new();
     private readonly List<TaskSubscription> _subs = new();
     private readonly long _outputRingBytes;
+    private readonly int _maxRetainedTerminalTasks;
     private int _nextId;
 
     /// <summary>
@@ -31,12 +39,19 @@ public sealed partial class TaskManager : IDisposable
     public TaskManager(
         string sessionId,
         string? logRoot = null,
-        long outputRingBytes = OutputRing.DefaultMaxBytes)
+        long outputRingBytes = OutputRing.DefaultMaxBytes,
+        int maxRetainedTerminalTasks = DefaultMaxRetainedTerminalTasks)
     {
         if (outputRingBytes <= 0) throw new ArgumentOutOfRangeException(nameof(outputRingBytes));
+        if (maxRetainedTerminalTasks < 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(maxRetainedTerminalTasks));
+        }
+
         SessionId = sessionId;
         LogRoot = logRoot ?? DefaultLogRoot;
         _outputRingBytes = outputRingBytes;
+        _maxRetainedTerminalTasks = maxRetainedTerminalTasks;
 
         // Best-effort startup housekeeping; never blocks or throws into construction.
         try
@@ -165,15 +180,74 @@ public sealed partial class TaskManager : IDisposable
 
     /// <summary>
     /// Terminal-state hook invoked by <see cref="ManagedTask"/> outside its own lock. Closes and
-    /// removes the task's log writer, flushing any buffered final output. Runs without the
-    /// registry lock (ConcurrentDictionary), so it cannot deadlock against readers, and it never
-    /// performs disk I/O under <see cref="_gate"/>.
+    /// removes the task's log writer, flushing any buffered final output, then prunes the oldest
+    /// terminal tasks back to <see cref="_maxRetainedTerminalTasks"/>. Runs without the registry
+    /// lock held on entry (ConcurrentDictionary), so it cannot deadlock against readers, and it
+    /// never performs disk I/O under <see cref="_gate"/>.
     /// </summary>
     private void OnTaskTerminal(ManagedTask task)
     {
         if (_logs.TryRemove(task.Id, out var log))
         {
             log.Dispose();
+        }
+
+        PruneTerminalTasks();
+    }
+
+    /// <summary>
+    /// Auto-prunes the oldest <em>terminal</em> tasks until at most
+    /// <see cref="_maxRetainedTerminalTasks"/> remain. Running tasks are never pruned. Each pruned
+    /// task is dropped from the registry and order list, its version is bumped N =&gt; N+1 under the
+    /// registry lock so the published <see cref="TaskChangeKind.Removed"/> change stays contiguous
+    /// for a subscriber current at N, its per-consumer/process resources are released via
+    /// <see cref="ManagedTask.Dispose"/>, and its log writer (if any) is closed — but its
+    /// <em>persistent log file is preserved</em> for post-hoc diagnostics. The registry mutation
+    /// runs under <see cref="_gate"/>; disposal and publication run outside it (matching
+    /// <see cref="Remove"/>) so no disk I/O or subscriber callback happens under the lock.
+    /// </summary>
+    private void PruneTerminalTasks()
+    {
+        List<(string Id, long Version, ManagedTask Task)>? pruned = null;
+        lock (_gate)
+        {
+            var terminalCount = 0;
+            foreach (var t in _order)
+            {
+                if (t.Status != TaskRunStatus.Running) terminalCount++;
+            }
+
+            var index = 0;
+            while (terminalCount > _maxRetainedTerminalTasks && index < _order.Count)
+            {
+                var t = _order[index];
+                if (t.Status == TaskRunStatus.Running)
+                {
+                    index++; // never prune a running task; skip it and keep scanning older-first.
+                    continue;
+                }
+
+                var version = t.BumpVersionForRemoval();
+                _order.RemoveAt(index); // removed in place; do not advance index.
+                (pruned ??= new()).Add((t.Id, version, t));
+                terminalCount--;
+            }
+        }
+
+        if (pruned is null) return;
+
+        foreach (var (id, version, t) in pruned)
+        {
+            _tasks.TryRemove(id, out _);
+            // Close the log writer if one somehow survived (terminal tasks close theirs above), but
+            // never delete the persistent log file — it stays on disk for later inspection.
+            if (_logs.TryRemove(id, out var log))
+            {
+                log.Dispose();
+            }
+
+            t.Dispose();
+            Publish(id, version, TaskChangeKind.Removed);
         }
     }
 
@@ -251,9 +325,19 @@ public sealed partial class TaskManager : IDisposable
     /// Appends output to a task's ring and persistent log, then publishes an Output change
     /// carrying the EXACT version the append assigned. A no-op — no version bump, no log
     /// write, no notification, no waiter wake — when the id is unknown, the text is
-    /// empty/null, or the task is already terminal.
+    /// empty/null, or the task is already terminal. Output is attributed to
+    /// <see cref="TaskOutputChannel.General"/>; use the channel overload for shell stdout/stderr.
     /// </summary>
-    public void AppendOutput(string id, string text)
+    public void AppendOutput(string id, string text) =>
+        AppendOutput(id, text, TaskOutputChannel.General);
+
+    /// <summary>
+    /// Appends output on a specific <paramref name="channel"/>. The in-memory ring stays a single
+    /// raw combined stream (channel-agnostic), but the persistent log routes the text through the
+    /// writer's independent per-channel redactor so interleaved stdout/stderr writes cannot
+    /// corrupt or leak a secret straddling chunk boundaries on either stream.
+    /// </summary>
+    public void AppendOutput(string id, string text, TaskOutputChannel channel)
     {
         // Empty/null input is a complete no-op: short-circuit before touching the task,
         // the log, or any subscriber.
@@ -266,7 +350,7 @@ public sealed partial class TaskManager : IDisposable
 
         if (_logs.TryGetValue(id, out var log))
         {
-            log.Append(text);
+            log.Append(text, channel);
         }
 
         // Publish the exact assigned version (never a re-read of the live version) so

@@ -10,11 +10,12 @@ namespace Coda.Agent.Tasks;
 /// Windows relies on the user-profile ACL.
 ///
 /// Redaction is resilient to chunk boundaries: incoming text is streamed through a
-/// <see cref="StreamingSecretRedactor"/> that confirms a secret as soon as its
+/// per-channel <see cref="StreamingSecretRedactor"/> that confirms a secret as soon as its
 /// minimum length is reached, emits a placeholder, and discards the remaining token
-/// characters. A secret split across many <see cref="Append"/> calls — even one far
-/// larger than any buffer — is therefore never persisted, and no unbounded secret
-/// content is retained.
+/// characters. A secret split across many <see cref="Append(string, TaskOutputChannel)"/> calls
+/// on the same channel — even one far larger than any buffer — is therefore never persisted,
+/// and interleaved writes on a different channel cannot corrupt or leak it because each channel
+/// keeps its own redactor state.
 ///
 /// When appending would exceed <see cref="_maxBytes"/>, the log is trimmed to a
 /// code-point-valid newest suffix that leaves headroom, so sustained writing past
@@ -36,7 +37,16 @@ internal sealed class TaskLogWriter : IDisposable
     private readonly string _path;
     private readonly long _maxBytes;
     private readonly object _gate = new();
-    private readonly StreamingSecretRedactor _redactor = new();
+    // One independent streaming-redactor state per output channel. Keeping the states separate
+    // means a secret split across chunks on one channel is never spliced together with — and
+    // therefore never corrupted or leaked by — interleaved chunks on another channel. Indexed by
+    // (int)TaskOutputChannel; the scratch buffer is shared because every Append holds _gate.
+    private readonly StreamingSecretRedactor[] _redactors =
+    {
+        new(), // General
+        new(), // Stdout
+        new(), // Stderr
+    };
     private readonly StringBuilder _scratch = new();
 
     private StreamWriter? _writer;
@@ -63,8 +73,12 @@ internal sealed class TaskLogWriter : IDisposable
     /// </summary>
     internal Func<string, string>? ReadExistingOverride { get; set; }
 
-    /// <summary>Appends text (streamed through the redactor). Never throws.</summary>
-    public void Append(string text)
+    /// <summary>
+    /// Appends text on the given channel (streamed through that channel's independent redactor).
+    /// Never throws. Each channel keeps its own redactor state so interleaved writes from
+    /// different channels cannot corrupt or leak a secret straddling chunk boundaries.
+    /// </summary>
+    public void Append(string text, TaskOutputChannel channel = TaskOutputChannel.General)
     {
         if (string.IsNullOrEmpty(text)) return;
         lock (_gate)
@@ -73,7 +87,7 @@ internal sealed class TaskLogWriter : IDisposable
             try
             {
                 _scratch.Clear();
-                _redactor.Process(text, _scratch);
+                _redactors[(int)channel].Process(text, _scratch);
                 if (_scratch.Length > 0)
                 {
                     Emit(_scratch.ToString());
@@ -96,11 +110,16 @@ internal sealed class TaskLogWriter : IDisposable
             {
                 if (!_faulted)
                 {
-                    _scratch.Clear();
-                    _redactor.Flush(_scratch);
-                    if (_scratch.Length > 0)
+                    // Flush every channel's trailing unconfirmed candidate so nothing buffered is
+                    // silently dropped.
+                    foreach (var redactor in _redactors)
                     {
-                        Emit(_scratch.ToString());
+                        _scratch.Clear();
+                        redactor.Flush(_scratch);
+                        if (_scratch.Length > 0)
+                        {
+                            Emit(_scratch.ToString());
+                        }
                     }
                 }
             }
