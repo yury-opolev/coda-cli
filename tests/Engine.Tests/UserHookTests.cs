@@ -2,6 +2,7 @@ using System.Text.Json;
 using Coda.Agent;
 using Coda.Agent.Hooks;
 using Coda.Agent.Settings;
+using Coda.Agent.Tasks;
 using LlmClient;
 
 namespace Engine.Tests;
@@ -659,10 +660,11 @@ public sealed class AgentLoopUserHookIntegrationTests
             subagentTools,
             new AllowAllPermissionPrompt(),
             Options(),
+            new TaskManager(sessionId: "hook-sub", logRoot: null),
             includeAnthropicSystemPrefix: false,
             userHooks: userHooks);
 
-        await subagentHost.RunSubagentAsync("general", "do something", new NullSink(), CancellationToken.None);
+        await subagentHost.RunSubagentAsync("general", "do something", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
         Assert.False(dangerTool.Executed);
     }

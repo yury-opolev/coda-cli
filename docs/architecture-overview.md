@@ -26,6 +26,7 @@
    - [4.6 Permissions](#46-permissions)
    - [4.7 Sessions & persistence](#47-sessions--persistence)
    - [4.8 Where the timeouts live](#48-where-the-timeouts-live)
+   - [4.9 In-process task runtime](#49-in-process-task-runtime)
 5. [Diagrams](#5-diagrams)
 6. [Architectural assessment ("smells")](#6-architectural-assessment-smells)
 
@@ -91,8 +92,11 @@ Eleven projects under `src/`, three test projects under `tests/`. All target `ne
   all built-in `Tools/`, the `ToolRegistry`, the permission model
   (`PermissionMode`, `ModePermissionPrompt`, `Permissions/`, `Classifier/`), goals &
   budgets (`Goals/`), conversation compaction (`Compaction/`), subagents
-  (`SubagentHost`), background tasks, schedules, hooks, output styles, the
-  shell executor (`ProcessShellExecutor`), settings loading (`Settings/` — including the
+  (`SubagentHost`), the unified in-process task runtime (`Tasks/` — one `TaskManager`
+  owning both background subagents and shell commands, with bounded output rings and
+  persistent redacted logs), schedules, hooks, output styles, the shell executors
+  (`ProcessShellExecutor` for direct runs, `ManagedShellProcess` for managed task shells),
+  settings loading (`Settings/` — including the
   `TelemetrySettings` config record), and an **LSP client** (`Lsp/` — the
   language-server-specific code; `LspClient` now builds its transport on the neutral
   `JsonRpcConnection` from `Coda.JsonRpc` rather than hosting its own framing engine).
@@ -412,6 +416,66 @@ genuinely-progressing-but-slow turn from a true stall, so it risked truncating h
 turns. Pushing the bound down to where the bytes actually flow (the HTTP stream) fixed that —
 a chunk resets the idle clock, so only real silence trips it. This is a textbook case of
 *moving a timeout from a coarse outer layer to the operation it actually guards.*
+
+---
+
+### 4.9 In-process task runtime
+
+`Coda.Agent/Tasks/` holds a single `TaskManager` per session that owns **all**
+long-running work — background subagents and shell commands — behind one shared
+model: a `task-NNNN` id, a `TaskRunStatus` (`Running`/`Completed`/`Failed`/`Stopped`),
+a `TaskKind` (`Subagent`/`Shell`), a `TaskExecutionMode` (`Foreground`/`Background`),
+and a nesting **depth** (main agent = 0, subagents at depth 1 and 2; `MaxSubagentDepth`
+= 2 is enforced at registration).
+
+- **Tools.** The manager backs `task`/`task_start` (start a subagent),
+  `task_output` (poll incremental output), `task_stop` (cancel), and the four
+  inspection/steering tools `task_list`, `task_get`, `task_peek`, and `task_send`
+  (steer a running subagent). `run_command` gained a `run_in_background` flag that
+  registers a managed shell and returns its id to poll with `task_output`. The tool
+  names and schemas are unchanged from the previous `background_task_*`
+  implementation — this migration is transparent to callers.
+- **Access scope.** The main agent (null caller task id) has authority over every
+  task in the session; a subagent may only see and act on its own **strict
+  descendants**, walking the trusted parent graph — never caller-supplied depth — so
+  a subagent can never read, stop, steer, or even probe the existence of a sibling,
+  ancestor, or unrelated task (`TaskManager.Subagents.cs`).
+- **Bounded output + persistent logs.** Each task keeps a byte-bounded `OutputRing`
+  of recent output (for fast `task_output`/`task_peek`) and streams a full,
+  secret-redacted transcript to a persistent log under `~/.coda/task-logs`
+  (`TaskLogWriter`, `StreamingSecretRedactor`), pruned by `TaskLogRetention`. The
+  ring is a single raw combined stream, but the log writer keeps an **independent
+  streaming-redactor state per output channel** (`TaskOutputChannel`
+  General/Stdout/Stderr) so a secret split across chunks on one stream is never
+  corrupted — and therefore never leaked — by interleaved chunks on another. To keep
+  the registry and runtime snapshots bounded over a long session, the manager retains
+  at most `maxRetainedTerminalTasks` **terminal** tasks (default 256, configurable):
+  as tasks finish, the oldest terminal tasks are auto-pruned (running tasks are never
+  pruned) with a contiguous `Removed` change, while their persistent log files are
+  preserved on disk. Explicit `Remove` still works, and a foreground caller still
+  returns its result safely even if its own task is auto-pruned on completion.
+- **Shell detach (API only).** A running foreground shell can be promoted to the
+  background via `TaskManager.TryDetach` (shells only; subagents are rejected). The
+  promotion is API-complete and publishes a `Mode` change; the interactive UI to
+  drive it lands later. On detach the foreground stdout/stderr capture
+  (`ShellOutputCapture`) is atomically snapshotted for the returned `ShellRunResult`
+  and disabled, so the background finalizer keeps streaming into the ring/log without
+  growing capture memory.
+- **Subscriptions.** `Subscribe()` returns a bounded, version-gap-resyncing
+  `TaskSubscription` seeded with the current task list — the substrate a future TUI
+  panel or serve API will consume; nothing renders it yet.
+- **Shutdown.** `ShutdownAsync` (wired into `CodaSession` disposal, so it runs when
+  Coda exits) atomically stops accepting new tasks, cancels and tree-kills every
+  running task within a bounded budget, and flushes logs. Tasks are **in-process
+  only** — they do not survive across processes, and a visual `/tasks` manager and a
+  serve-side task API are explicitly future work (no `/tasks` command ships today).
+
+The runtime state surfaced to the TUI still uses the legacy `BackgroundTasks` DTO
+naming: `SessionRuntimeSnapshot.BackgroundTasks` is a list of `BackgroundTaskSnapshot`
+(`BackgroundTaskStatus`) mapped from `TaskSnapshot` in `CodaSession`. The DTO names are
+kept for wire/reducer stability even though the underlying store is now the unified
+`TaskManager`; shell tasks now appear in that list alongside subagents, which the
+`UiReducer` counts the same way.
 
 ---
 

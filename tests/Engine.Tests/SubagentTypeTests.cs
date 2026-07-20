@@ -2,6 +2,8 @@ using System.Runtime.CompilerServices;
 using System.Text.Json;
 using Coda.Agent;
 using Coda.Agent.Subagents;
+using Coda.Agent.Tasks;
+using Coda.Agent.Tools;
 using LlmClient;
 
 namespace Engine.Tests;
@@ -174,9 +176,9 @@ public sealed class SubagentTypeTests
 
         var client = new ScriptedClient(subagentTurn1, subagentTurn2);
         var subagentTools = new ToolRegistry([readOnlyTool, mutatingTool]);
-        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), includeAnthropicSystemPrefix: false);
+        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), new TaskManager(sessionId: "type-sub", logRoot: null), includeAnthropicSystemPrefix: false);
 
-        await host.RunSubagentAsync("explore", "do something", new NullSink(), CancellationToken.None);
+        await host.RunSubagentAsync("explore", "do something", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
         // The mutating tool must NOT have been called.
         Assert.False(mutatingTool.Executed, "explore subagent must not execute mutating tools");
@@ -202,9 +204,9 @@ public sealed class SubagentTypeTests
 
         var client = new ScriptedClient(subagentTurn1, subagentTurn2);
         var subagentTools = new ToolRegistry([readOnlyTool, mutatingTool]);
-        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), includeAnthropicSystemPrefix: false);
+        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), new TaskManager(sessionId: "type-sub", logRoot: null), includeAnthropicSystemPrefix: false);
 
-        await host.RunSubagentAsync("explore", "read something", new NullSink(), CancellationToken.None);
+        await host.RunSubagentAsync("explore", "read something", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
         Assert.True(readOnlyTool.Executed, "explore subagent must be able to execute read-only tools");
     }
@@ -229,11 +231,46 @@ public sealed class SubagentTypeTests
 
         var client = new ScriptedClient(subagentTurn1, subagentTurn2);
         var subagentTools = new ToolRegistry([readOnlyTool, mutatingTool]);
-        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), includeAnthropicSystemPrefix: false);
+        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), new TaskManager(sessionId: "type-sub", logRoot: null), includeAnthropicSystemPrefix: false);
 
-        await host.RunSubagentAsync("general-purpose", "do something", new NullSink(), CancellationToken.None);
+        await host.RunSubagentAsync("general-purpose", "do something", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
         Assert.True(mutatingTool.Executed, "general-purpose subagent must be able to execute mutating tools");
+    }
+
+    [Fact]
+    public async Task Explore_subagent_is_denied_task_creation_tools_and_host()
+    {
+        // SECURITY: a read-only (explore) subagent must not be able to escalate by delegating to a
+        // full-tool child. Even at depth 1 it must receive NEITHER the `task` creation tool NOR a
+        // subagent host, so a `task` call cannot spawn a general-purpose grandchild. Here the
+        // explore child tries to delegate a mutation; with the fix the `task` tool is stripped, so
+        // no grandchild is ever registered and no mutation occurs.
+        var exploreTurn1 = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock(
+                "id1", "task", """{"description":"escalate","prompt":"mutate","subagent_type":"general-purpose"}""")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+        var exploreTurn2 = new[]
+        {
+            AssistantStreamEvent.Delta("done"),
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+
+        var mutatingTool = new MutatingTool();
+        var client = new ScriptedClient(exploreTurn1, exploreTurn2);
+        var subagentTools = new ToolRegistry([new TaskTool(), mutatingTool, new ReadOnlyTool()]);
+        var mgr = new TaskManager(sessionId: "explore-escalation", logRoot: null);
+        var host = new SubagentHost(client, subagentTools, new AllowAllPermissionPrompt(), Options(), mgr, includeAnthropicSystemPrefix: false);
+
+        // Run through the manager so task-0001 (the explore task) is a valid parent id; an insecure
+        // implementation would then register a grandchild task-0002 for the delegated mutation.
+        await mgr.RunSubagentForegroundAsync(host, "explore", "investigate", "desc", new NullSink(), parentTaskId: null);
+
+        // Only the explore task itself is registered — no escalated grandchild — and nothing mutated.
+        Assert.Single(mgr.List());
+        Assert.False(mutatingTool.Executed, "read-only explore subagent must not spawn a full-tool child");
     }
 
     // ---------------------------------------------------------------------------
@@ -250,9 +287,9 @@ public sealed class SubagentTypeTests
         };
 
         var client = new CapturingScriptedClient(endTurn);
-        var host = new SubagentHost(client, new ToolRegistry([]), new AllowAllPermissionPrompt(), Options(), includeAnthropicSystemPrefix: true);
+        var host = new SubagentHost(client, new ToolRegistry([]), new AllowAllPermissionPrompt(), Options(), new TaskManager(sessionId: "type-sub", logRoot: null), includeAnthropicSystemPrefix: true);
 
-        await host.RunSubagentAsync("general-purpose", "hello", new NullSink(), CancellationToken.None);
+        await host.RunSubagentAsync("general-purpose", "hello", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
         Assert.NotNull(client.LastSystem);
         Assert.StartsWith(AnthropicModels.AnthropicSystemPrefix, client.LastSystem);
@@ -268,9 +305,9 @@ public sealed class SubagentTypeTests
         };
 
         var client = new CapturingScriptedClient(endTurn);
-        var host = new SubagentHost(client, new ToolRegistry([]), new AllowAllPermissionPrompt(), Options(), includeAnthropicSystemPrefix: false);
+        var host = new SubagentHost(client, new ToolRegistry([]), new AllowAllPermissionPrompt(), Options(), new TaskManager(sessionId: "type-sub", logRoot: null), includeAnthropicSystemPrefix: false);
 
-        await host.RunSubagentAsync("general-purpose", "hello", new NullSink(), CancellationToken.None);
+        await host.RunSubagentAsync("general-purpose", "hello", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
 
         Assert.NotNull(client.LastSystem);
         Assert.DoesNotContain(AnthropicModels.AnthropicSystemPrefix, client.LastSystem);

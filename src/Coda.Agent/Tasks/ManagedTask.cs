@@ -1,0 +1,289 @@
+namespace Coda.Agent.Tasks;
+
+/// <summary>
+/// One live unit of work (subagent or shell). Owns a cancellation source,
+/// a monotonic version, and its lifecycle status. Extended in later tasks with
+/// an output ring, steering inbox, and OS process.
+/// </summary>
+internal sealed class ManagedTask : IDisposable
+{
+    private readonly CancellationTokenSource _cts = new();
+    private readonly TaskCompletionSource _detach = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    // Completes exactly once when the task reaches a terminal state (or is disposed). Lets the
+    // manager's graceful shutdown await real completion of every running task deterministically
+    // — covering foreground work active in other callers as well as Task.Run workers — rather
+    // than polling status.
+    private readonly TaskCompletionSource _completion = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    private readonly object _gate = new();
+    private readonly OutputRing _output;
+    private readonly Action<ManagedTask>? _onTerminal;
+    // One incremental read cursor per consumer, keyed by a stable consumer id (the main
+    // sentinel or an authorized caller's task id). Keeping cursors per-consumer stops one
+    // consumer from stealing another's incremental output. The map is naturally bounded: only
+    // authorized consumers (the main agent plus this task's strict ancestors) ever read it, and
+    // it dies with the task, so it cannot leak unboundedly.
+    private readonly Dictionary<string, long> _cursors = new(StringComparer.Ordinal);
+    private long _version;
+    private TaskRunStatus _status = TaskRunStatus.Running;
+    private TaskExecutionMode _mode;
+    private DateTimeOffset? _endedAt;
+    private string? _result;
+    private string? _error;
+    // Best-effort tree-kill delegate for the live shell process backing this task (shells only;
+    // null otherwise). Set via AttachShellKill while the process is alive and cleared via
+    // DetachShellKill when it is disposed, so a stale handle is never retained and a kill after
+    // disposal is a safe no-op. Guarded by _gate.
+    private Action? _killShell;
+
+    /// <summary>
+    /// Stable consumer id for the main agent's cursor. The leading NUL cannot collide with an
+    /// issued <c>task-NNNN</c> id, so a subagent can never masquerade as the main consumer.
+    /// </summary>
+    internal const string MainConsumerId = "\u0000main";
+
+    internal ManagedTask(
+        string id,
+        string? parentId,
+        int depth,
+        TaskKind kind,
+        string description,
+        string logPath,
+        long outputRingBytes,
+        TaskExecutionMode mode = TaskExecutionMode.Foreground,
+        Action<ManagedTask>? onTerminal = null)
+    {
+        Id = id;
+        ParentId = parentId;
+        Depth = depth;
+        Kind = kind;
+        Description = description;
+        LogPath = logPath;
+        StartedAt = DateTimeOffset.UtcNow;
+        _mode = mode;
+        _output = new OutputRing(outputRingBytes);
+        _onTerminal = onTerminal;
+    }
+
+    public string Id { get; }
+    public string? ParentId { get; }
+    public int Depth { get; }
+    public TaskKind Kind { get; }
+    public string Description { get; }
+    public string LogPath { get; }
+    public DateTimeOffset StartedAt { get; }
+
+    /// <summary>The task-specific steering inbox (subagents only); null until attached.</summary>
+    public SteeringInbox? Steering { get; private set; }
+
+    /// <summary>Attaches a steering inbox so the running subagent loop can drain it at its boundary.</summary>
+    internal void AttachSteering(SteeringInbox inbox) => Steering = inbox;
+
+    /// <summary>Cancellation token for the underlying work. Signalled by Cancel().</summary>
+    public CancellationToken Token => _cts.Token;
+
+    public long Version { get { lock (_gate) { return _version; } } }
+    public TaskRunStatus Status { get { lock (_gate) { return _status; } } }
+    public TaskExecutionMode Mode { get { lock (_gate) { return _mode; } } }
+
+    /// <summary>Requests cancellation of the underlying work without changing status.</summary>
+    internal void Cancel()
+    {
+        try { _cts.Cancel(); }
+        catch (ObjectDisposedException) { /* already disposed; ignore */ }
+    }
+
+    /// <summary>
+    /// Attaches a best-effort tree-kill delegate for the live shell process backing this task so
+    /// graceful shutdown can kill the process directly, not merely cancel the token. Replaces any
+    /// prior handle. Paired with <see cref="DetachShellKill"/>, which the shell's disposal invokes
+    /// to clear the handle so no stale/dead process reference is retained.
+    /// </summary>
+    internal void AttachShellKill(Action killShell)
+    {
+        lock (_gate) { _killShell = killShell; }
+    }
+
+    /// <summary>
+    /// Clears the attached shell-kill delegate. Invoked when the shell process is disposed so a
+    /// later <see cref="KillAttachedShell"/> is a safe no-op (no double-kill of a dead process).
+    /// </summary>
+    internal void DetachShellKill()
+    {
+        lock (_gate) { _killShell = null; }
+    }
+
+    /// <summary>
+    /// Requests a tree-kill of the attached shell process, if any. Best-effort and idempotent: a
+    /// no-op when no shell is attached or it was already killed/detached. Never throws.
+    /// </summary>
+    internal void KillAttachedShell()
+    {
+        Action? kill;
+        lock (_gate) { kill = _killShell; }
+        try { kill?.Invoke(); }
+        catch { /* best-effort; a kill failure must never surface from shutdown. */ }
+    }
+
+    /// <summary>
+    /// Bumps the version by one for a terminal removal and returns the new value. Valid only on a
+    /// terminal task (the manager checks status before calling): removal advances the version so
+    /// the published <see cref="TaskChangeKind.Removed"/> change is contiguous (N =&gt; N+1) for a
+    /// subscriber current at N, which must not resync merely because the task was removed.
+    /// </summary>
+    internal long BumpVersionForRemoval()
+    {
+        lock (_gate) { return ++_version; }
+    }
+
+    /// <summary>Completes when a caller requests this shell task be promoted to the background.</summary>
+    public Task DetachRequested => _detach.Task;
+
+    /// <summary>
+    /// Completes once the task reaches a terminal state (completed/failed/stopped) or is disposed.
+    /// Never faults. The manager awaits this during graceful shutdown so it can wait — bounded —
+    /// for running tasks to finish on their own before force-marking any straggler terminal.
+    /// </summary>
+    public Task Completion => _completion.Task;
+
+    /// <summary>Signals a detach request; returns false if one was already signalled.</summary>
+    internal bool TryRequestDetach() => _detach.TrySetResult();
+
+    /// <summary>
+    /// Atomically promotes a still-running foreground task to the background and, when it happens,
+    /// bumps the version and returns the EXACT version assigned to the promotion. Returns
+    /// <c>false</c> — a complete no-op, no version bump — when the task is already terminal or
+    /// already in the background. Runs under the same lock as status transitions so a promotion
+    /// and a concurrent terminal transition serialize: exactly one wins the "still Running" gate.
+    /// </summary>
+    internal bool TryPromoteToBackground(out long version)
+    {
+        lock (_gate)
+        {
+            if (_status != TaskRunStatus.Running || _mode != TaskExecutionMode.Foreground)
+            {
+                // Terminal, or already background: report the current (unchanged) version and refuse.
+                version = _version;
+                return false;
+            }
+
+            _mode = TaskExecutionMode.Background;
+            version = ++_version;
+            return true;
+        }
+    }
+
+    // Compatibility bool overloads. The out-version overloads are authoritative: they
+    // report the EXACT version assigned by the transition so the manager can publish that
+    // precise value rather than re-reading a later, possibly-advanced version.
+    internal bool TryComplete(string? result) => TryComplete(result, out _);
+    internal bool TryFail(string? error) => TryFail(error, out _);
+    internal bool TryStop() => TryStop(out _);
+
+    internal bool TryComplete(string? result, out long version) =>
+        Transition(TaskRunStatus.Completed, result, error: null, out version);
+    internal bool TryFail(string? error, out long version) =>
+        Transition(TaskRunStatus.Failed, result: null, error, out version);
+    internal bool TryStop(out long version) =>
+        Transition(TaskRunStatus.Stopped, result: null, error: null, out version);
+
+    private bool Transition(TaskRunStatus next, string? result, string? error, out long version)
+    {
+        lock (_gate)
+        {
+            if (_status != TaskRunStatus.Running)
+            {
+                // Already terminal: report the current (unchanged) version and refuse.
+                version = _version;
+                return false;
+            }
+
+            _status = next;
+            _result = result;
+            _error = error;
+            _endedAt = DateTimeOffset.UtcNow;
+            version = ++_version;
+        }
+
+        // Invoke the manager-supplied terminal hook OUTSIDE the task lock so that log
+        // flushing (disk I/O) and registry mutation never run while this task's gate is
+        // held, avoiding lock-ordering deadlocks with registry readers.
+        try { _onTerminal?.Invoke(this); }
+        catch { /* best-effort; a hook failure must never surface from a transition. */ }
+
+        // Signal terminal completion last so any shutdown waiter observes the terminal status.
+        _completion.TrySetResult();
+
+        return true;
+    }
+
+    public TaskSnapshot ToSnapshot()
+    {
+        lock (_gate)
+        {
+            return new TaskSnapshot(
+                Id, ParentId, Depth, Kind, Description,
+                _status, _mode, _version, StartedAt, _endedAt, LogPath, _result, _error);
+        }
+    }
+
+    /// <summary>
+    /// Appends output and, if it happened, bumps the version and returns the EXACT version
+    /// assigned to this append. Returns <c>null</c> — a complete no-op — when the text is
+    /// empty/null or the task is already terminal: no version bump, no ring write. Output and
+    /// version assignment happen under the same lock so the returned version is authoritative.
+    /// </summary>
+    public long? TryAppend(string text)
+    {
+        if (string.IsNullOrEmpty(text)) return null;
+        lock (_gate)
+        {
+            // Reject output once terminal so status ordering stays clean: no append can bump
+            // the version after the final Completed/Failed/Stopped transition.
+            if (_status != TaskRunStatus.Running) return null;
+            _output.Append(text);
+            return ++_version;
+        }
+    }
+
+    /// <summary>Reads output at or after the absolute cursor. See OutputRing.ReadFrom.</summary>
+    public (string Text, long NextCursor, bool Truncated) ReadIncremental(long cursor) =>
+        _output.ReadFrom(cursor);
+
+    /// <summary>Returns the last maxChars characters of buffered output.</summary>
+    public string Peek(int maxChars) => _output.Peek(maxChars);
+
+    /// <summary>
+    /// Reads output since the given consumer's server-side cursor (backs <c>task_output</c>) and
+    /// advances that consumer's cursor. Each consumer id owns an independent cursor, so parallel
+    /// consumers (e.g. the main agent and this task's parent) never steal one another's spans.
+    /// Truncated is true when eviction overtook the cursor.
+    ///
+    /// The whole cursor-read → ring-read → cursor-update sequence runs under the task gate so
+    /// concurrent readers serialize and never deliver the same span twice. The nested lock
+    /// order here (task gate → ring gate, via <see cref="OutputRing.ReadFrom"/>) matches the
+    /// append path (<see cref="TryAppend"/> also takes task gate → ring gate), so holding the
+    /// gate across the ring read introduces no lock inversion.
+    /// </summary>
+    public (string Text, bool Truncated, TaskRunStatus Status) ReadFromCursor(string consumerId)
+    {
+        lock (_gate)
+        {
+            var cursor = _cursors.TryGetValue(consumerId, out var c) ? c : 0;
+            var (text, next, truncated) = _output.ReadFrom(cursor);
+            _cursors[consumerId] = next;
+            return (text, truncated, _status);
+        }
+    }
+
+    public void Dispose()
+    {
+        try { _cts.Cancel(); } catch (ObjectDisposedException) { }
+        _cts.Dispose();
+        // Wake any shutdown waiter even if the task never transitioned through a status change
+        // (e.g. a bare-registered task torn down directly). Idempotent — no-op once set.
+        _completion.TrySetResult();
+        // Drop per-consumer cursors so they are released when the task is torn down; the task
+        // count is bounded per session, so this keeps cursor state from outliving its task.
+        lock (_gate) { _cursors.Clear(); _killShell = null; }
+    }
+}

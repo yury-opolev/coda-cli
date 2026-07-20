@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
 using Coda.Mcp;
@@ -15,60 +16,46 @@ namespace Engine.Tests;
 
 /// <summary>
 /// Verifies the immutable runtime snapshot accessors added for the TUI status bar:
-/// <see cref="BackgroundTaskRunner.GetSnapshot"/>, <see cref="LspServerManager.GetSnapshot"/>,
+/// <see cref="TaskManager.List"/>, <see cref="LspServerManager.GetSnapshot"/>,
 /// <see cref="McpClientManager.GetSnapshot"/> and <see cref="CodaSession.GetRuntimeSnapshot"/>.
 /// Each returns fresh, copied, engine-instance-free value snapshots.
 /// </summary>
 public sealed class RuntimeSnapshotTests
 {
-    // ─── BackgroundTaskRunner ───────────────────────────────────────────────
+    // ─── TaskManager snapshot ───────────────────────────────────────────────
 
     [Fact]
-    public void BackgroundTaskRunner_GetSnapshot_returns_fresh_copy_each_call()
+    public void TaskManager_List_returns_fresh_copy_each_call()
     {
-        using var runner = new BackgroundTaskRunner();
+        using var mgr = new TaskManager(sessionId: "snap-a", logRoot: null);
 
-        var first = runner.GetSnapshot();
-        var second = runner.GetSnapshot();
+        var first = mgr.List();
+        var second = mgr.List();
 
         Assert.Empty(first);
         Assert.Empty(second);
-        // A fresh copy every call — even when empty — so callers can never alias engine state.
         Assert.NotSame(first, second);
     }
 
     [Fact]
-    public void BackgroundTaskRunner_GetSnapshot_includes_running_task()
+    public void TaskManager_List_includes_running_task_with_status()
     {
-        // Not disposed on purpose: the engine's registry outlives the assertion, matching the
-        // existing BackgroundTaskTests which never dispose the runner mid-task.
-        var runner = new BackgroundTaskRunner();
-        var gate = new TaskCompletionSource();
-        var host = new GatedSubagentHost(gate);
+        using var mgr = new TaskManager(sessionId: "snap-b", logRoot: null);
+        var task = mgr.Register(TaskKind.Subagent, "do work", parentTaskId: null);
 
-        var id = runner.Start(host, "explore", "do work");
-
-        var snapshot = runner.GetSnapshot();
-
-        var entry = Assert.Single(snapshot);
-        Assert.Equal(id, entry.Id);
-        Assert.Equal(BackgroundTaskStatus.Running, entry.Status);
-
-        gate.TrySetResult();
+        var entry = Assert.Single(mgr.List());
+        Assert.Equal(task.Id, entry.Id);
+        Assert.Equal(TaskRunStatus.Running, entry.Status);
     }
 
-    private sealed class GatedSubagentHost : ISubagentHost
+    [Theory]
+    [InlineData(TaskRunStatus.Running, BackgroundTaskStatus.Running)]
+    [InlineData(TaskRunStatus.Completed, BackgroundTaskStatus.Completed)]
+    [InlineData(TaskRunStatus.Failed, BackgroundTaskStatus.Failed)]
+    [InlineData(TaskRunStatus.Stopped, BackgroundTaskStatus.Stopped)]
+    public void CodaSession_MapStatus_maps_every_runtime_status(TaskRunStatus runtime, BackgroundTaskStatus expected)
     {
-        private readonly TaskCompletionSource gate;
-
-        public GatedSubagentHost(TaskCompletionSource gate) => this.gate = gate;
-
-        public async Task<string> RunSubagentAsync(
-            string subagentType, string prompt, IAgentSink parentSink, CancellationToken cancellationToken = default)
-        {
-            await this.gate.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
-            return "done";
-        }
+        Assert.Equal(expected, CodaSession.MapStatus(runtime));
     }
 
     // ─── LspServerManager ───────────────────────────────────────────────────

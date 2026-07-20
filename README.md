@@ -64,10 +64,20 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   - permission-gated: `edit_file`, `write_file`, `run_command` (all file tools are
     sandboxed to the working directory, symlink-aware)
   - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
-    `todo_write` (a live checklist), plan mode, cron-style `schedule`, and
-    `background_task` (long-running jobs).
+    `todo_write` (a live checklist), plan mode, cron-style `schedule`, and the
+    unified task tools (`task_start` / `task_output` / `task_stop` plus
+    `task_list` / `task_get` / `task_peek` / `task_send`) for long-running jobs.
+- **Unified task runtime** — one in-process `TaskManager` owns every long-running
+  job in the session (background **subagents** and shell commands alike). It gives
+  each task a shared id/status/depth model, a bounded ring of recent output, and a
+  persistent, secret-redacted log under `~/.coda/task-logs`. `run_command` accepts
+  `run_in_background` (then poll with `task_output`); the manager stops all tasks
+  when Coda exits. Tasks are in-process only — they do **not** survive across
+  processes, and a visual `/tasks` manager / serve API is future work.
 - **Subagents** — delegate a self-contained subtask with `task`, which runs a nested
-  agent loop in its own context with a scoped toolset.
+  agent loop in its own context with a scoped toolset. Nesting is bounded (main
+  agent at depth 0, subagents at depth 1 and 2); the main agent can inspect and
+  steer every task, while a subagent can only see and act on its own descendants.
 - **Code intelligence (LSP)** — when language servers are configured, an `lsp` tool
   provides definitions/references/hover/symbols/diagnostics.
 - **MCP** — drop a `.mcp.json` in the working dir and Coda connects the servers,

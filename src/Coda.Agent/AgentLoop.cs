@@ -2,7 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using Coda.Common;
-using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
@@ -35,7 +35,9 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly IUserQuestionPrompt? userQuestion;
     private readonly UserHookRunner? userHooks;
     private readonly IPlanApprover? planApprover;
-    private readonly BackgroundTaskRunner? backgroundTasks;
+    private readonly TaskManager? tasks;
+    private readonly string? currentTaskId;
+    private readonly int currentDepth;
     private readonly LspServerManager? lsp;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearch;
@@ -96,7 +98,9 @@ public sealed partial class AgentLoop : IAgentLoop
         IUserQuestionPrompt? userQuestion = null,
         UserHookRunner? userHooks = null,
         IPlanApprover? planApprover = null,
-        BackgroundTaskRunner? backgroundTasks = null,
+        TaskManager? tasks = null,
+        string? currentTaskId = null,
+        int currentDepth = 0,
         LspServerManager? lsp = null,
         LspDiagnosticRegistry? lspDiagnostics = null,
         ToolSearchCoordinator? toolSearch = null,
@@ -120,7 +124,9 @@ public sealed partial class AgentLoop : IAgentLoop
         this.userQuestion = userQuestion;
         this.userHooks = userHooks;
         this.planApprover = planApprover;
-        this.backgroundTasks = backgroundTasks;
+        this.tasks = tasks;
+        this.currentTaskId = currentTaskId;
+        this.currentDepth = currentDepth;
         this.lsp = lsp;
         this.lspDiagnostics = lspDiagnostics;
         this.toolSearch = toolSearch;
@@ -582,7 +588,9 @@ public sealed partial class AgentLoop : IAgentLoop
             Schedules = this.schedules,
             UserQuestion = this.userQuestion,
             PlanApprover = this.planApprover,
-            BackgroundTasks = this.backgroundTasks,
+            Tasks = this.tasks,
+            CurrentTaskId = this.currentTaskId,
+            CurrentDepth = this.currentDepth,
             Lsp = this.lsp,
             AllTools = this.tools.All,
             OnToolsDiscovered = names => this.toolSearch?.AddDiscovered(names),

@@ -1,4 +1,5 @@
 using System.Text.Json;
+using Coda.Agent.Tasks;
 
 namespace Coda.Agent.Tools;
 
@@ -28,9 +29,16 @@ public sealed class TaskTool : ITool
 
     public async Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
     {
-        if (context.Subagents is null)
+        if (context.Subagents is null || context.Tasks is null)
         {
             return new ToolResult("Subagents are not available in this context.", IsError: true);
+        }
+
+        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        {
+            return new ToolResult(
+                "Cannot launch a subagent from here: the maximum subagent nesting depth has been reached.",
+                IsError: true);
         }
 
         var prompt = ToolInput.GetString(input, "prompt");
@@ -40,10 +48,11 @@ public sealed class TaskTool : ITool
         }
 
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
+        var description = ToolInput.GetString(input, "description") ?? subagentType;
         var parentSink = context.Sink ?? NullAgentSink.Instance;
 
-        var report = await context.Subagents
-            .RunSubagentAsync(subagentType, prompt, parentSink, cancellationToken)
+        var report = await context.Tasks
+            .RunSubagentForegroundAsync(context.Subagents, subagentType, prompt, description, parentSink, context.CurrentTaskId, cancellationToken)
             .ConfigureAwait(false);
 
         return new ToolResult(report);

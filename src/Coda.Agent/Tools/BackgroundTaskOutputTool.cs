@@ -1,5 +1,5 @@
 using System.Text.Json;
-using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 
 namespace Coda.Agent.Tools;
 
@@ -24,7 +24,7 @@ public sealed class BackgroundTaskOutputTool : ITool
 
     public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
     {
-        if (context.BackgroundTasks is null)
+        if (context.Tasks is null)
         {
             return Task.FromResult(new ToolResult(
                 "Background tasks are not available in this context.",
@@ -37,7 +37,7 @@ public sealed class BackgroundTaskOutputTool : ITool
             return Task.FromResult(new ToolResult("Missing required 'task_id'.", IsError: true));
         }
 
-        var (found, newText, status) = context.BackgroundTasks.ReadFull(taskId);
+        var (found, newText, truncated, status) = context.Tasks.ReadOutput(taskId, context.CurrentTaskId);
         if (!found)
         {
             return Task.FromResult(new ToolResult($"Task '{taskId}' not found."));
@@ -45,16 +45,21 @@ public sealed class BackgroundTaskOutputTool : ITool
 
         var outputSection = newText.Length > 0
             ? newText
-            : status == BackgroundTaskStatus.Running
+            : status == TaskRunStatus.Running
                 ? "(no new output yet; still running)"
                 : "(no new output since last read)";
 
+        if (truncated)
+        {
+            outputSection = "[earlier output truncated]\n" + outputSection;
+        }
+
         var statusLabel = status switch
         {
-            BackgroundTaskStatus.Running => "running",
-            BackgroundTaskStatus.Completed => "completed",
-            BackgroundTaskStatus.Failed => "failed",
-            BackgroundTaskStatus.Stopped => "stopped",
+            TaskRunStatus.Running => "running",
+            TaskRunStatus.Completed => "completed",
+            TaskRunStatus.Failed => "failed",
+            TaskRunStatus.Stopped => "stopped",
             _ => status.ToString().ToLowerInvariant(),
         };
 

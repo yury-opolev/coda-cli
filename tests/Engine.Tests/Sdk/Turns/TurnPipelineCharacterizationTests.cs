@@ -228,7 +228,7 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
         var spec = await this.CaptureSpecAsync(this.Options());
         Assert.NotNull(spec.Todos);
         Assert.NotNull(spec.Schedules);
-        Assert.NotNull(spec.BackgroundTasks);
+        Assert.NotNull(spec.Tasks);
         Assert.NotNull(spec.Subagents);
         Assert.NotNull(spec.Logger);
     }

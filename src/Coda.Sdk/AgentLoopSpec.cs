@@ -1,5 +1,5 @@
 using Coda.Agent;
-using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
@@ -28,7 +28,6 @@ namespace Coda.Sdk;
 /// <param name="UserQuestion">Optional prompt used when a tool asks the user a question.</param>
 /// <param name="UserHooks">Optional user-configured hook runner from settings.</param>
 /// <param name="PlanApprover">Optional approver consulted for plan-mode turns.</param>
-/// <param name="BackgroundTasks">Optional runner for background (detached) tasks.</param>
 /// <param name="Lsp">Optional language-server manager for LSP-backed tools.</param>
 /// <param name="LspDiagnostics">Optional registry of LSP diagnostics surfaced to the model.</param>
 /// <param name="ToolSearch">Optional coordinator backing the tool-search tool.</param>
@@ -39,6 +38,7 @@ namespace Coda.Sdk;
 /// <param name="PersistTurnAsync">Optional callback invoked after each assistant turn and
 /// tool cycle so the transcript is recorded incrementally ("on the go") — a session killed
 /// mid-run then still leaves a record of everything up to the kill.</param>
+/// <param name="Tasks">Task manager owning subagent and shell tasks (parallel to the legacy runner during migration).</param>
 public sealed record AgentLoopSpec(
     ILlmClient Client,
     ToolRegistry Tools,
@@ -51,7 +51,6 @@ public sealed record AgentLoopSpec(
     IUserQuestionPrompt? UserQuestion,
     UserHookRunner? UserHooks,
     IPlanApprover? PlanApprover,
-    BackgroundTaskRunner? BackgroundTasks,
     LspServerManager? Lsp,
     LspDiagnosticRegistry? LspDiagnostics,
     ToolSearchCoordinator? ToolSearch,
@@ -59,4 +58,5 @@ public sealed record AgentLoopSpec(
     Func<List<ChatMessage>, CancellationToken, Task>? CompactAsync,
     ILogger Logger,
     SteeringInbox? Steering = null,
-    Func<CancellationToken, Task>? PersistTurnAsync = null);
+    Func<CancellationToken, Task>? PersistTurnAsync = null,
+    TaskManager? Tasks = null);

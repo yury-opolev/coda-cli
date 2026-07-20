@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
+using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
@@ -27,7 +28,17 @@ namespace Coda.Sdk;
 public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 {
     /// <summary>Bounded timeout for graceful teardown of the LSP servers on dispose.</summary>
-    private static readonly TimeSpan DisposeTimeout = TimeSpan.FromSeconds(5);
+    internal static readonly TimeSpan LspDisposeTimeout = TimeSpan.FromSeconds(5);
+
+    /// <summary>
+    /// Budget for the synchronous <see cref="Dispose"/>, which drives the whole async teardown on a
+    /// worker thread. It sums the TaskManager shutdown budget (running work + shell tree-kills) and
+    /// <see cref="LspDisposeTimeout"/> so HTTP/logger/LSP disposal completes before the sync call
+    /// returns — bounded (never unbounded), yet large enough not to sever a still-progressing
+    /// teardown at the shorter LSP-only timeout.
+    /// </summary>
+    internal static readonly TimeSpan SyncDisposeBudget =
+        TaskManager.DefaultShutdownBudget + LspDisposeTimeout;
 
     private readonly CredentialManager credentials;
     private readonly ClientFingerprint fingerprint;
@@ -38,7 +49,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly List<ChatMessage> history;
     private readonly TodoStore todos = new();
     private readonly ScheduledTaskStore schedules;
-    private readonly BackgroundTaskRunner backgroundTasks = new();
+    private readonly TaskManager tasks;
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
@@ -82,6 +93,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.agentLoopFactory = agentLoopFactory ?? new DefaultAgentLoopFactory();
         this.history = history ?? [];
         this.SessionId = sessionId ?? SessionIds.NewId();
+        // The manager groups persistent task logs under the session id captured HERE. If the id
+        // is later adopted (AdoptSessionId/Resume), the manager keeps this original grouping so
+        // active task logs are never moved out from under open writers — see AdoptSessionId.
+        this.tasks = new TaskManager(this.SessionId);
         if (httpClient is null)
         {
             // No HttpClient.Timeout: it would cap the TOTAL stream duration and kill a
@@ -162,7 +177,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.turnPipelineBuilder = new TurnPipelineBuilder(
             this.todos,
             this.schedules,
-            this.backgroundTasks,
+            this.tasks,
             this.lspManager,
             this.lspDiagnostics,
             this.toolSearchCoordinator,
@@ -235,7 +250,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     public ScheduledTaskStore Schedules => this.schedules;
 
-    public BackgroundTaskRunner BackgroundTasks => this.backgroundTasks;
+    /// <summary>The session's task manager (subagent and shell tasks).</summary>
+    public TaskManager Tasks => this.tasks;
 
     public IReadOnlyList<ChatMessage> History => this.history;
 
@@ -255,9 +271,29 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lastGoalStatus,
             [.. this.todos.Items],
             [.. this.schedules.Items],
-            this.backgroundTasks.GetSnapshot(),
+            MapTaskSnapshots(this.tasks.List()),
             this.lspManager?.GetSnapshot() ?? []);
     }
+
+    private static IReadOnlyList<BackgroundTaskSnapshot> MapTaskSnapshots(IReadOnlyList<TaskSnapshot> tasks)
+    {
+        var result = new BackgroundTaskSnapshot[tasks.Count];
+        for (var i = 0; i < tasks.Count; i++)
+        {
+            result[i] = new BackgroundTaskSnapshot(tasks[i].Id, MapStatus(tasks[i].Status));
+        }
+
+        return result;
+    }
+
+    internal static BackgroundTaskStatus MapStatus(TaskRunStatus status) => status switch
+    {
+        TaskRunStatus.Running => BackgroundTaskStatus.Running,
+        TaskRunStatus.Completed => BackgroundTaskStatus.Completed,
+        TaskRunStatus.Failed => BackgroundTaskStatus.Failed,
+        TaskRunStatus.Stopped => BackgroundTaskStatus.Stopped,
+        _ => BackgroundTaskStatus.Running,
+    };
 
     /// <summary>Clear the conversation.</summary>
     public void Reset() => this.history.Clear();
@@ -281,6 +317,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// replacing history. Used by the TUI, whose history list is shared by reference (so
     /// <see cref="Resume"/>, which swaps history, is not appropriate there).
     /// </summary>
+    /// <remarks>
+    /// The <see cref="Tasks"/> manager keeps the session id it was constructed with, so already-open
+    /// task logs are never moved to a new directory (which would be unsafe against live writers).
+    /// Adoption happens at session bootstrap before any task is registered, so this grouping choice
+    /// is not observable to running tasks. Task 6 revisits log grouping when the manager owns the
+    /// runtime snapshot.
+    /// </remarks>
     public void AdoptSessionId(string sessionId)
     {
         ArgumentException.ThrowIfNullOrEmpty(sessionId);
@@ -710,21 +753,23 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Asynchronously tears the session down: shuts down LSP servers (bounded by
-    /// <see cref="DisposeTimeout"/>) without any sync-over-async
+    /// <see cref="LspDisposeTimeout"/>) without any sync-over-async
     /// blocking, then releases the owned HTTP client and logger factory. This is the path
     /// <c>coda serve</c> uses — see <c>ServeHost</c>, which awaits it from its run loop so a
     /// not-fully-disposed session never leaks across turns.
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        this.backgroundTasks.Dispose();
+        // Graceful, bounded shutdown of all subagent/shell tasks: cancels running work, kills shell
+        // process trees, waits the dispose budget, then force-stops stragglers. Idempotent.
+        await this.tasks.DisposeAsync().ConfigureAwait(false);
 
         // Shut down LSP servers before releasing the HTTP client.
         if (this.lspManager is not null)
         {
             try
             {
-                using var cts = new CancellationTokenSource(DisposeTimeout);
+                using var cts = new CancellationTokenSource(LspDisposeTimeout);
                 await this.lspManager.ShutdownAsync(cts.Token).ConfigureAwait(false);
             }
             catch (Exception ex)
@@ -740,15 +785,16 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     /// <summary>
     /// Synchronous dispose for non-async callers (the TUI / headless commands). Delegates to
-    /// <see cref="DisposeAsync"/> on a worker thread, bounded by <see cref="DisposeTimeout"/>,
-    /// so it never blocks the caller indefinitely. Async callers (serve) should prefer
-    /// <see cref="DisposeAsync"/>.
+    /// <see cref="DisposeAsync"/> on a worker thread, bounded by <see cref="SyncDisposeBudget"/>
+    /// (the TaskManager shutdown budget plus <see cref="LspDisposeTimeout"/>), so it never blocks
+    /// the caller indefinitely yet still lets HTTP/logger/LSP disposal finish before returning.
+    /// Async callers (serve) should prefer <see cref="DisposeAsync"/>.
     /// </summary>
     public void Dispose()
     {
         try
         {
-            Task.Run(() => this.DisposeAsync().AsTask()).Wait(DisposeTimeout);
+            Task.Run(() => this.DisposeAsync().AsTask()).Wait(SyncDisposeBudget);
         }
         catch (Exception ex)
         {
