@@ -380,6 +380,136 @@ public sealed class UiReducerTests
         Assert.Equal(UiNotificationLevel.Warning, level);
     }
 
+    // ── Task 8 quality: model-controlled name/task id are sanitized (spoof-proof) ─
+
+    // A hostile schedule name that tries to spoof extra transcript rows: an embedded newline, an ANSI
+    // colour + screen-clear escape, a C0 BEL/NUL control, and bidi override/mark formatting controls.
+    private const string SpoofName =
+        "Deploy\n\u001b[31mFAKE ROW\u001b[0m\u202Espoofed\u0007\u0000\u200Etail";
+
+    // A hostile managed task id carrying CR/LF, a clear-screen escape, and bidi controls.
+    private const string SpoofTaskId = "job-7\r\n\u001b[2Jcleared\u202D\u0001end";
+
+    [Fact]
+    public void Schedule_started_notice_sanitizes_malicious_name_and_task_id()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.Contains(" started as ", text);
+        Assert.Contains("Deploy", text); // safe leading name text preserved
+        Assert.Contains("job-7", text);  // safe leading task id text preserved
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_completed_notice_sanitizes_malicious_name()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, "big result body"));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.EndsWith(" completed", text);
+        Assert.Contains("Deploy", text);
+        Assert.DoesNotContain("big result body", text); // result never surfaced on completion
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_notice_sanitizes_malicious_name_and_stays_bounded()
+    {
+        var noisy = "line one\nline two\u001b[31mred" + new string('x', 400);
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, noisy));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.Contains(" failed", text);
+        Assert.Contains("Deploy", text);
+        // Bounded even with a hostile name AND a 400+ char summary body.
+        Assert.True(text.Length < 320, $"notice not bounded: {text.Length}");
+        Assert.Equal(UiNotificationLevel.Error, level);
+    }
+
+    [Fact]
+    public void Schedule_stopped_notice_sanitizes_malicious_name()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Stopped, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.EndsWith(" stopped", text);
+        Assert.Contains("Deploy", text);
+        Assert.Equal(UiNotificationLevel.Warning, level);
+    }
+
+    [Fact]
+    public void Schedule_notice_bounds_an_absurdly_long_name()
+    {
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", new string('n', 500), "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.True(text.Length < 160, $"name not bounded: {text.Length}");
+    }
+
+    [Fact]
+    public void Schedule_notice_falls_back_to_definition_id_when_name_sanitizes_to_blank()
+    {
+        // A name made entirely of escape/control/bidi flattens to empty after sanitization.
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "\u001b[2J\u0007\u202E\n\t", "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.Equal("Scheduled task def-1 started as task-9", text);
+    }
+
+    [Fact]
+    public void Schedule_notice_falls_back_to_neutral_label_when_name_and_id_blank()
+    {
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "\u0007\u202E", "\n\t\u001b[0m", "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.Equal("Scheduled task schedule completed", text);
+    }
+
+    [Fact]
+    public void Schedule_notice_preserves_printable_unicode_and_emoji_in_name()
+    {
+        // Sanitization must not double-escape or strip printable Unicode / emoji.
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Café 🚀 build", "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Café 🚀 build completed", text);
+    }
+
+    private static void AssertSingleSanitizedLine(string text)
+    {
+        Assert.DoesNotContain('\n', text);
+        Assert.DoesNotContain('\r', text);
+        Assert.DoesNotContain('\t', text);
+        Assert.DoesNotContain('\u001b', text);
+
+        foreach (var ch in text)
+        {
+            Assert.False(char.IsControl(ch), $"control char U+{(int)ch:X4} survived: {text}");
+        }
+
+        foreach (var bidi in new[]
+                 {
+                     '\u061C', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
+                     '\u2066', '\u2067', '\u2068', '\u2069', '\u200E', '\u200F',
+                 })
+        {
+            Assert.DoesNotContain(bidi, text);
+        }
+    }
+
     private static (string Text, UiNotificationLevel Level) ReduceLifecycle(ScheduleLifecycleEvent lifecycle)
     {
         var state = UiReducer.Reduce(UiSessionSnapshot.Empty, new ScheduleLifecycleChangedEvent(lifecycle));

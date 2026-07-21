@@ -146,16 +146,34 @@ public static class UiReducer
     // compact and single-line; the full task result/output is never surfaced here.
     private const int MaxScheduleSummaryLength = 200;
 
+    // Longest sanitized schedule label (definition name or managed task id) surfaced in a lifecycle
+    // notice before it is ellipsized. Keeps the single-line notice compact; ordinary short names and
+    // task ids are well under this bound and are never truncated.
+    private const int MaxScheduleLabelLength = 80;
+
     private static UiSessionSnapshot ScheduleNotice(UiSessionSnapshot state, ScheduleLifecycleEvent lifecycle)
     {
-        var name = string.IsNullOrWhiteSpace(lifecycle.DefinitionName)
-            ? lifecycle.DefinitionId
-            : lifecycle.DefinitionName!;
+        // Definition name and task id are model-controlled and may carry newlines, ANSI/OSC escapes,
+        // C0/C1 controls, or bidi overrides that would otherwise spoof extra transcript rows or the
+        // terminal. Flatten them to a single safe line before interpolation, falling back to the
+        // sanitized definition id (then a neutral label) when nothing printable survives.
+        var name = SanitizeScheduleLabel(lifecycle.DefinitionName);
+        if (name.Length == 0)
+        {
+            name = SanitizeScheduleLabel(lifecycle.DefinitionId);
+        }
+
+        if (name.Length == 0)
+        {
+            name = "schedule";
+        }
+
+        var taskId = SanitizeScheduleLabel(lifecycle.TaskId);
 
         var (text, level) = lifecycle.Kind switch
         {
             ScheduleLifecycleKind.Started => (
-                $"Scheduled task {name} started as {lifecycle.TaskId}",
+                $"Scheduled task {name} started as {taskId}",
                 UiNotificationLevel.Information),
             ScheduleLifecycleKind.Completed => (
                 $"Scheduled task {name} completed",
@@ -170,6 +188,18 @@ public static class UiReducer
         };
 
         return Notice(state, text, level);
+    }
+
+    // Flattens a model-controlled schedule label (definition name or managed task id) to a single safe,
+    // length-bounded line via the same primitive the /tasks views use, so ANSI/control/bidi sequences
+    // and embedded newlines can never spoof the terminal or split the notice across rows. Printable
+    // Unicode and emoji are preserved untouched. Returns empty when nothing printable survives.
+    private static string SanitizeScheduleLabel(string? value)
+    {
+        var single = TerminalTextSanitizer.SanitizeSingleLine(value);
+        return single.Length > MaxScheduleLabelLength
+            ? single[..MaxScheduleLabelLength] + "…"
+            : single;
     }
 
     // Appends a sanitized, single-line, length-bounded summary to a failure headline. Sanitization is
