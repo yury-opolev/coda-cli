@@ -17,6 +17,7 @@ public static class SlashCommandCatalog
         new LoginCommand(),
         new LogoutCommand(),
         new StatusCommand(),
+        new TasksCommand(),
         new ProviderCommand(),
         new ModelCommand(),
         new EffortCommand(),
