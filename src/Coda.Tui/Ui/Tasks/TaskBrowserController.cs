@@ -33,6 +33,10 @@ internal sealed record TaskBrowserProvider(TaskManager Tasks, AgentExecutionGate
 /// </summary>
 internal sealed class TaskBrowserController
 {
+    /// <summary>True only for a bare <c>/tasks</c> submission (surrounding whitespace tolerated).</summary>
+    public static bool IsOpenRequest(string? text) =>
+        string.Equals(text?.Trim(), "/tasks", StringComparison.Ordinal);
+
     private const int MaxRingChars = 8000;
     private static readonly TimeSpan StopConfirmWindow = TimeSpan.FromSeconds(1.5);
 
@@ -901,7 +905,9 @@ internal sealed class TaskBrowserController
         lock (this._sync)
         {
             composerLocked = this._isAttaching || this._isAttached;
-            p = this._bound;
+            // The chord fires while the browser is closed (never Open'd), so fall back to the live provider
+            // when nothing is bound — Ctrl+B backgrounds a running foreground shell without opening the browser.
+            p = this._bound ?? this.provider();
             selectedId = this._state.SelectedTaskId;
         }
 

@@ -3,6 +3,7 @@ using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
+using Coda.Tui.Ui.Tasks;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -36,7 +37,8 @@ internal class FullscreenTuiShell(
     Func<object, bool>? removeTimeout = null,
     TuiTheme? theme = null,
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
-    Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null)
+    Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
+    Func<TaskBrowserProvider?>? taskBrowserProvider = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -49,7 +51,8 @@ internal class FullscreenTuiShell(
         addTimeout,
         removeTimeout,
         theme,
-        statusProjection)
+        statusProjection,
+        taskBrowserProvider: taskBrowserProvider)
 {
     /// <summary>The minimum number of composer input rows.</summary>
     internal const int MinimumComposerHeight = 3;
@@ -148,6 +151,20 @@ internal class FullscreenTuiShell(
         this.Add(this.Operational);
         this.Add(this.Status);
         this.Add(this.Completion);
+
+        // The task browser is a full-screen overlay above the normal surface/completion but below the modal
+        // PromptOverlay (permission prompts always win): add it immediately before the prompt overlay so the
+        // prompt stays the topmost sub-view. The two are only ever visible together when a prompt arrives
+        // while the browser is open, and the prompt renders on top / holds focus.
+        if (this.TaskOverlay is { } taskOverlay)
+        {
+            taskOverlay.X = 0;
+            taskOverlay.Y = 0;
+            taskOverlay.Width = Dim.Fill();
+            taskOverlay.Height = Dim.Fill();
+            this.Add(taskOverlay);
+        }
+
         this.Add(this.PromptOverlay);
     }
 
