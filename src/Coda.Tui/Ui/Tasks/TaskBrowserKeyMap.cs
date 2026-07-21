@@ -77,7 +77,7 @@ internal static class TaskBrowserKeyMap
 
     private static TaskBrowserCommand MapDetail(Key key)
     {
-        if (key == Key.Esc) return TaskBrowserCommand.Close;
+        if (key == Key.Esc) return TaskBrowserCommand.ReturnToList;
         if (key == Key.B.WithCtrl) return TaskBrowserCommand.ReturnToList;
         if (key == new Key('s')) return TaskBrowserCommand.BeginSteering;
         if (key == new Key('a')) return TaskBrowserCommand.Attach;

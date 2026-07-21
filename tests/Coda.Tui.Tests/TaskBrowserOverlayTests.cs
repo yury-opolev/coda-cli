@@ -244,8 +244,13 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             var footer = overlay.FooterText.ToLowerInvariant();
             Assert.Contains("steer", footer);
             Assert.Contains("attach", footer);
-            Assert.Contains("back", footer);
-            Assert.Contains("close", footer);
+            Assert.Contains("esc back", footer);
+            Assert.DoesNotContain("esc close", footer);
+
+            overlay.NewKeyDownEvent(Key.Esc);
+
+            Assert.True(overlay.Visible);
+            Assert.Equal(TaskBrowserView.List, controller.State.View);
         }
         finally
         {
