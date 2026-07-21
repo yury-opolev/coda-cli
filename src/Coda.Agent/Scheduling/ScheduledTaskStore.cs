@@ -153,17 +153,91 @@ public sealed partial class ScheduledTaskStore
         try
         {
             var json = File.ReadAllText(this.persistPath);
-            var loaded = JsonSerializer.Deserialize<List<ScheduledTask>>(json, SerializerOptions);
-            if (loaded is not null)
-            {
-                this.items = loaded;
-            }
+            this.items = DeserializeItems(json);
         }
         catch
         {
             // Corrupt or unreadable file → start empty.
             this.items = [];
         }
+    }
+
+    /// <summary>
+    /// Legacy on-disk shape (schema v1): <c>Id,Cron,Prompt,Recurring,NextRunUtc</c>. Retained only
+    /// so <see cref="Load"/> can migrate old records into the versioned <see cref="ScheduledTask"/>.
+    /// </summary>
+    private sealed record LegacyScheduledTask(
+        string Id,
+        string Cron,
+        string Prompt,
+        bool Recurring,
+        DateTimeOffset NextRunUtc);
+
+    /// <summary>
+    /// Deserializes the persisted array element-by-element, detecting legacy (schema v1) records by
+    /// their <c>Recurring</c> field and migrating them to the versioned <see cref="ScheduledTask"/>
+    /// shape. Versioned records (those carrying <c>SchemaVersion</c>) load normally. This is a narrow
+    /// Task-1 compatibility loader; full per-element recovery and atomic persistence arrive in Task 2.
+    /// </summary>
+    private static List<ScheduledTask> DeserializeItems(string json)
+    {
+        using var document = JsonDocument.Parse(json);
+        if (document.RootElement.ValueKind != JsonValueKind.Array)
+        {
+            return [];
+        }
+
+        var result = new List<ScheduledTask>();
+        foreach (var element in document.RootElement.EnumerateArray())
+        {
+            if (element.ValueKind != JsonValueKind.Object)
+            {
+                continue;
+            }
+
+            if (element.TryGetProperty("SchemaVersion", out _))
+            {
+                var task = element.Deserialize<ScheduledTask>(SerializerOptions);
+                if (task is not null)
+                {
+                    result.Add(task);
+                }
+            }
+            else if (element.TryGetProperty("Recurring", out _))
+            {
+                var legacy = element.Deserialize<LegacyScheduledTask>(SerializerOptions);
+                if (legacy is not null)
+                {
+                    result.Add(MigrateLegacy(legacy));
+                }
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Maps a legacy (schema v1) record onto the versioned <see cref="ScheduledTask"/>: recurring
+    /// entries become UTC <see cref="ScheduleKind.Cron"/> schedules; one-shot entries become
+    /// <see cref="ScheduleKind.At"/> schedules whose instant is the persisted next-run time.
+    /// </summary>
+    private static ScheduledTask MigrateLegacy(LegacyScheduledTask legacy)
+    {
+        var nextRun = legacy.NextRunUtc;
+        return new ScheduledTask(
+            ScheduledTask.CurrentSchemaVersion,
+            legacy.Id,
+            Name: null,
+            Kind: legacy.Recurring ? ScheduleKind.Cron : ScheduleKind.At,
+            Prompt: legacy.Prompt,
+            Interval: null,
+            AtUtc: legacy.Recurring ? null : nextRun,
+            Cron: legacy.Recurring ? legacy.Cron : null,
+            TimeZoneId: ScheduleTimeZones.FixedOffsetId(TimeSpan.Zero),
+            NextRunUtc: nextRun,
+            CreatedAtUtc: nextRun,
+            UpdatedAtUtc: nextRun,
+            LastTerminalOutcome: null);
     }
 
     private void Save()

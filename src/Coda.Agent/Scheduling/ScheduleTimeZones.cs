@@ -38,13 +38,34 @@ public static partial class ScheduleTimeZones
         {
             var hours = int.Parse(match.Groups["hh"].Value, CultureInfo.InvariantCulture);
             var minutes = int.Parse(match.Groups["mm"].Value, CultureInfo.InvariantCulture);
+            if (minutes > 59)
+            {
+                return false;
+            }
+
             var offset = new TimeSpan(hours, minutes, 0);
             if (match.Groups["sign"].Value == "-")
             {
                 offset = -offset;
             }
 
-            zone = TimeZoneInfo.CreateCustomTimeZone(trimmed, offset, trimmed, trimmed);
+            // TimeZoneInfo only accepts fixed offsets within ±14 hours; reject out-of-range
+            // values up front so a malformed id yields false instead of throwing.
+            if (offset < TimeSpan.FromHours(-14) || offset > TimeSpan.FromHours(14))
+            {
+                return false;
+            }
+
+            try
+            {
+                zone = TimeZoneInfo.CreateCustomTimeZone(trimmed, offset, trimmed, trimmed);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                zone = null;
+                return false;
+            }
+
             return true;
         }
 
