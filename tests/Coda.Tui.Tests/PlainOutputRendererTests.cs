@@ -171,6 +171,22 @@ public sealed class PlainOutputRendererTests
     }
 
     [Fact]
+    public async Task External_osc_hyperlink_escapes_are_stripped_after_shared_sanitizer_extraction()
+    {
+        // Characterization: PlainOutputRenderer now delegates escape stripping to the shared
+        // TaskTextSanitizer regex, which also removes OSC hyperlink sequences (previously untouched).
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer);
+
+        await renderer.ApplyEventAsync(
+            new CommandOutputEvent("\x1B]8;;https://example.com\x07link\x1B]8;;\x07"),
+            CancellationToken.None);
+
+        Assert.Equal("link" + Environment.NewLine, writer.ToString());
+        Assert.DoesNotContain('\u001b', writer.ToString());
+    }
+
+    [Fact]
     public async Task Frame_only_events_produce_no_plain_output()
     {
         var writer = new StringWriter();
