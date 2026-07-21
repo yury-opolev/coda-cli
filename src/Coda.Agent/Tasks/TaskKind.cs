@@ -5,4 +5,5 @@ public enum TaskKind
 {
     Subagent,
     Shell,
+    Scheduled,
 }

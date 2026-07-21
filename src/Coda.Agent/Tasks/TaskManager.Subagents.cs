@@ -181,21 +181,22 @@ public sealed partial class TaskManager
     public TaskActionResult RequestStop(string id) => RequestStop(id, callerTaskId: null);
 
     /// <summary>
-    /// Queues a steering message for a running subagent on behalf of <paramref name="callerTaskId"/>
-    /// (backs <c>task_send</c>). The main agent (null caller) may steer any task; a subagent may
-    /// steer only its own running descendants. Authorization is checked BEFORE any state
-    /// inspection — right after the existence check — so an unauthorized caller (mapped to the
-    /// same wording as NotFound by the tool) cannot distinguish a shell from a subagent, a running
-    /// task from a terminal one, or probe the existence of tasks outside its subtree. Returns
-    /// <see cref="TaskActionResult.Rejected"/> for a shell or a subagent with no steering inbox,
-    /// and <see cref="TaskActionResult.InvalidState"/> for a terminal subagent.
+    /// Queues a steering message for a running steerable agent task (a subagent OR a scheduled
+    /// root) on behalf of <paramref name="callerTaskId"/> (backs <c>task_send</c>). The main agent
+    /// (null caller) may steer any task; a managed task may steer only its own running descendants,
+    /// so a scheduled root cannot act on an unrelated task. Authorization is checked BEFORE any
+    /// state inspection — right after the existence check — so an unauthorized caller (mapped to
+    /// the same wording as NotFound by the tool) cannot distinguish a shell from a steerable agent,
+    /// a running task from a terminal one, or probe the existence of tasks outside its subtree.
+    /// Returns <see cref="TaskActionResult.Rejected"/> for a shell (or a steerable task with no
+    /// steering inbox), and <see cref="TaskActionResult.InvalidState"/> for a terminal task.
     /// </summary>
     public TaskActionResult Steer(string id, string message, string? callerTaskId)
     {
         var t = Find(id);
         if (t is null) return TaskActionResult.NotFound;
         if (!IsAuthorizedCaller(id, callerTaskId)) return TaskActionResult.Denied;
-        if (t.Kind != TaskKind.Subagent) return TaskActionResult.Rejected;
+        if (t.Kind is not (TaskKind.Subagent or TaskKind.Scheduled)) return TaskActionResult.Rejected;
         if (t.Status != TaskRunStatus.Running) return TaskActionResult.InvalidState;
         if (t.Steering is null) return TaskActionResult.Rejected;
         t.Steering.Enqueue(message);
