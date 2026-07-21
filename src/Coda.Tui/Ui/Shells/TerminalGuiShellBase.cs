@@ -427,11 +427,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
-    /// Arbitrates the shell-owned Esc/Ctrl+C chords before the composer's own mapping. Esc first dismisses
-    /// an open completion, then clears a transcript selection (Task 12 seam), then clears a transient
-    /// operational override, then cancels an armed exit chord, and only then arms/fires the interrupt chord.
-    /// Ctrl+C first copies a composer selection, then a transcript selection (Task 12 seam), then arms/fires
-    /// the exit chord. Returns true when the key was consumed here so no printable/action routing runs for it.
+    /// Arbitrates the shell-owned Esc/Ctrl+C keys before the composer's own mapping. Esc is a local
+    /// dismiss/cancel key only: it dismisses an open completion, clears a transcript selection, clears a
+    /// transient operational override, or cancels an armed chord — and is otherwise consumed as a no-op so
+    /// it can never bubble to Terminal.Gui's default Esc quit binding or arm a global interrupt. Ctrl+C
+    /// first copies a composer selection, then a transcript selection, then arms/fires the explicit exit
+    /// chord. Returns true when the key was consumed here so no printable/action routing runs for it.
     /// </summary>
     private bool TryHandleShellKey(Key key)
     {
@@ -465,13 +466,19 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                 return true;
             }
 
-            if (this.chords.ArmedAction == ShellChordAction.Exit)
+            // Cancel any armed chord (e.g. a pending Ctrl+C exit) so no stale "Press … again" hint or chord
+            // state survives an Esc — even the Esc that just dismissed an overlay.
+            if (this.chords.ArmedAction != ShellChordAction.None)
             {
                 this.ResetChordOverride();
                 return true;
             }
 
-            return this.ApplyChord(this.chords.HandleEscape(this.HasInterruptibleWork()));
+            // Escape is a local dismiss/cancel key only. With nothing left to dismiss it is still fully
+            // consumed (returns true) so it can never fall through to Terminal.Gui's default Esc quit
+            // binding and close the application, and it never arms or fires a global interrupt chord —
+            // interrupting/terminating the session stays on the explicit Ctrl+C chord.
+            return true;
         }
 
         if (key == Key.C.WithCtrl)

@@ -78,9 +78,10 @@ public sealed class ImmediateCliTests
         Assert.Contains("Ctrl+Up / Ctrl+Down", output);
         Assert.Contains("history", output);
 
-        // Double-Esc interrupts the active turn.
-        Assert.Contains("Esc twice", output);
-        Assert.Contains("interrupt the active turn", output);
+        // Esc only dismisses local UI and never exits the assistant.
+        Assert.Contains("Esc", output);
+        Assert.Contains("Dismiss the active menu or overlay", output);
+        Assert.Contains("Esc never exits the assistant", output);
 
         // Ctrl+C copies the transcript selection and only exits on a second press.
         Assert.Contains("Ctrl+C", output);

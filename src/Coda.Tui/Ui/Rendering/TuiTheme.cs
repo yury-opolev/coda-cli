@@ -38,6 +38,13 @@ internal sealed class TuiTheme
     public TuiThemeColor Background { get; } = new(new TgColor(23, 19, 16), TgName.Black);
     public TuiThemeColor TranscriptAssistant { get; } = new(new TgColor(242, 214, 179), TgName.White);
     public TuiThemeColor TranscriptUser { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+
+    /// <summary>A subtly different, slightly lighter warm near-black behind a submitted user message so it
+    /// reads as its own full-width block. In 16-color mode it degrades to the shell background (no block).</summary>
+    public TuiThemeColor TranscriptUserBackground { get; } = new(new TgColor(38, 30, 24), TgName.Black);
+
+    /// <summary>The dim warm tone of the right-aligned sent-time indicator on a user message block.</summary>
+    public TuiThemeColor TranscriptUserTime { get; } = new(new TgColor(150, 128, 104), TgName.Gray);
     public TuiThemeColor Heading { get; } = new(new TgColor(240, 179, 91), TgName.BrightYellow);
     public TuiThemeColor Code { get; } = new(new TgColor(200, 184, 166), TgName.Gray);
     public TuiThemeColor TranscriptTool { get; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);

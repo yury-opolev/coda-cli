@@ -70,8 +70,8 @@ public static class ImmediateCli
         writer.WriteLine("  Up / Down       Move the composer cursor between the lines of a multi-line prompt.");
         writer.WriteLine("  Ctrl+Up / Ctrl+Down");
         writer.WriteLine("                  Step back and forward through prompt history.");
-        writer.WriteLine("  Esc Esc         Press Esc twice to interrupt the active turn (a single Esc only");
-        writer.WriteLine("                  dismisses the slash-command menu or clears a selection).");
+        writer.WriteLine("  Esc             Dismiss the active menu or overlay, or clear a selection.");
+        writer.WriteLine("                  Esc never exits the assistant.");
         writer.WriteLine("  Ctrl+C          Copy the current transcript selection. With no selection,");
         writer.WriteLine("                  press twice to exit the assistant.");
         writer.WriteLine("  Left-drag       Select transcript text with the mouse; Ctrl+C copies it. Shift+drag");

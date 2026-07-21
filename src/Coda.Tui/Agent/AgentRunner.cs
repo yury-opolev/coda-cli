@@ -22,6 +22,7 @@ public sealed class AgentRunner : IDisposable
 {
     private readonly Func<IReadOnlyList<ITool>>? extraToolsProvider;
     private readonly Func<CommandContext, SessionOptions, CodaSession> sessionFactory;
+    private readonly TimeProvider timeProvider;
     private readonly object turnGate = new();
 
     private CodaSession? session;
@@ -38,10 +39,12 @@ public sealed class AgentRunner : IDisposable
 
     internal AgentRunner(
         Func<IReadOnlyList<ITool>>? extraToolsProvider,
-        Func<CommandContext, SessionOptions, CodaSession> sessionFactory)
+        Func<CommandContext, SessionOptions, CodaSession> sessionFactory,
+        TimeProvider? timeProvider = null)
     {
         this.extraToolsProvider = extraToolsProvider;
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     /// <summary>True while a turn is running (between <see cref="RunAsync"/> start and completion).</summary>
@@ -116,8 +119,9 @@ public sealed class AgentRunner : IDisposable
         try
         {
             // Publish the prompt + turn start BEFORE any model/sink activity, so the transcript and
-            // status reflect the in-flight turn immediately.
-            context.Events.Publish(new UserPromptSubmittedEvent(prompt));
+            // status reflect the in-flight turn immediately. The send time is captured here (local) from the
+            // injected TimeProvider so the transcript's send-time indicator is stable across redraws/resume.
+            context.Events.Publish(new UserPromptSubmittedEvent(prompt, this.timeProvider.GetLocalNow()));
             context.Events.Publish(new TurnStartedEvent(prompt));
 
             await this.EnsureSessionAsync(context, turnCts.Token).ConfigureAwait(false);

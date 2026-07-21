@@ -32,10 +32,14 @@ internal static class OperationalStatusProjector
 
         if (snapshot.ActiveOperation is { } operation)
         {
-            if (operation.Kind == "turn" &&
-                snapshot.EffectiveEffort is "high" or "max")
+            if (operation.Kind == "turn")
             {
-                return new("Thinking deeply", OperationalTone.Thinking, true);
+                // A running turn shows a concise, generic status. High/max effort may still surface the
+                // "Thinking deeply" hint, but the turn's label (the last submitted prompt) is never echoed
+                // beside "Working" — that just repeats the user's input while work is in flight.
+                return snapshot.EffectiveEffort is "high" or "max"
+                    ? new("Thinking deeply", OperationalTone.Thinking, true)
+                    : new("Working", OperationalTone.Working, true);
             }
 
             var label = string.IsNullOrWhiteSpace(operation.Label)

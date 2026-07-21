@@ -11,8 +11,9 @@ namespace Coda.Tui.Ui.Events;
 /// <summary>Base type for every semantic UI event fed to <see cref="Coda.Tui.Ui.State.UiReducer"/>.</summary>
 public abstract record UiEvent;
 
-/// <summary>The user submitted a prompt.</summary>
-public sealed record UserPromptSubmittedEvent(string Text) : UiEvent;
+/// <summary>The user submitted a prompt. <see cref="SentAt"/> is captured at event creation from a testable
+/// TimeProvider seam (local time), so the rendered send-time indicator is stable across redraws.</summary>
+public sealed record UserPromptSubmittedEvent(string Text, DateTimeOffset? SentAt = null) : UiEvent;
 
 /// <summary>Replace the transcript with a projected history (e.g. on resume).</summary>
 public sealed record TranscriptSeededEvent(ImmutableArray<TranscriptBlock> Blocks) : UiEvent;

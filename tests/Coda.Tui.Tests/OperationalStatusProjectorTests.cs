@@ -93,7 +93,7 @@ public sealed class OperationalStatusProjectorTests
     [InlineData("auto")]
     [InlineData("low")]
     [InlineData("medium")]
-    public void Other_active_turns_project_working(string effort)
+    public void Other_active_turns_project_generic_working_without_echoing_the_prompt(string effort)
     {
         var snapshot = UiSessionSnapshot.Empty with
         {
@@ -101,8 +101,24 @@ public sealed class OperationalStatusProjectorTests
             ActiveOperation = new ActiveOperation("turn", "running tests", null),
         };
 
+        // A running turn shows a concise, generic status; it must never echo the last submitted prompt
+        // (the turn's label) beside "Working".
         Assert.Equal(
-            new OperationalStatus("Working · running tests", OperationalTone.Working, Animated: true),
+            new OperationalStatus("Working", OperationalTone.Working, Animated: true),
+            OperationalStatusProjector.Project(snapshot));
+    }
+
+    [Fact]
+    public void Running_turn_never_echoes_a_multiline_prompt()
+    {
+        var snapshot = UiSessionSnapshot.Empty with
+        {
+            EffectiveEffort = "low",
+            ActiveOperation = new ActiveOperation("turn", "please summarize\nthe whole file", null),
+        };
+
+        Assert.Equal(
+            new OperationalStatus("Working", OperationalTone.Working, Animated: true),
             OperationalStatusProjector.Project(snapshot));
     }
 

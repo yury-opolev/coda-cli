@@ -127,6 +127,32 @@ public sealed class UiReducerTests
     }
 
     [Fact]
+    public void Projector_omits_the_sent_time_for_resumed_history_without_a_timestamp()
+    {
+        var history = new List<ChatMessage> { ChatMessage.UserText("question") };
+
+        var blocks = SessionHistoryProjector.Project(history);
+
+        // The persisted ChatMessage model has no timestamp, so resumed user blocks carry a stable null
+        // SentAt (the renderer omits the time) rather than inventing a changing draw-time value.
+        Assert.Null(Assert.IsType<UserTranscriptBlock>(blocks[0]).SentAt);
+    }
+
+    [Fact]
+    public void User_prompt_event_carries_its_sent_time_onto_the_transcript_block()
+    {
+        var sentAt = new DateTimeOffset(2026, 7, 21, 8, 24, 0, TimeSpan.FromHours(2));
+
+        var state = UiReducer.Reduce(
+            UiSessionSnapshot.Empty,
+            new UserPromptSubmittedEvent("hi", sentAt));
+
+        var block = Assert.IsType<UserTranscriptBlock>(Assert.Single(state.Transcript));
+        Assert.Equal("hi", block.Text);
+        Assert.Equal(sentAt, block.SentAt);
+    }
+
+    [Fact]
     public void Projector_does_not_mutate_history()
     {
         var history = new List<ChatMessage> { ChatMessage.UserText("q") };

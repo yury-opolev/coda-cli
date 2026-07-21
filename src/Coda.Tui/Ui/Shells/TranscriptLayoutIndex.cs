@@ -6,7 +6,14 @@ using Coda.Tui.Ui.State;
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>A single visible transcript row, carrying enough metadata to draw and hit-test it.</summary>
-public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int GlobalRow, string Text, TranscriptRole Role);
+public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int GlobalRow, string Text, TranscriptRole Role)
+{
+    /// <summary>Whether the row paints its background across the full viewport width (user message blocks).</summary>
+    public bool FillWidth { get; init; }
+
+    /// <summary>An optional right-aligned annotation (e.g. a sent-time HH:mm) drawn at the row's right edge.</summary>
+    public string? RightText { get; init; }
+}
 
 /// <summary>
 /// A bounded, virtualized layout index over an immutable transcript. It stores the active wrap
@@ -218,7 +225,11 @@ internal sealed class TranscriptLayoutIndex
                 }
 
                 var line = local < lines.Count ? lines[local] : default;
-                rows.Add(new TranscriptRow(block.Id, local, global, line.Text ?? string.Empty, line.Role));
+                rows.Add(new TranscriptRow(block.Id, local, global, line.Text ?? string.Empty, line.Role)
+                {
+                    FillWidth = line.FillWidth,
+                    RightText = line.RightText,
+                });
             }
 
             blockIndex++;

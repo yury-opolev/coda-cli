@@ -138,8 +138,8 @@ dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave t
 
 **Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
-press `Esc` **twice** to interrupt the active turn (a single `Esc` only dismisses the slash-command menu
-or clears a selection) · `Ctrl+C` copies the current transcript selection and, with nothing selected,
+`Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda ·
+`Ctrl+C` copies the current transcript selection and, with nothing selected,
 exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `F2`
 switches between full-screen and inline · `Ctrl+B` sends the selected (or latest) running **foreground
 shell** to the background — and, inside the `/tasks` browser, releases an output attachment — without ever

@@ -210,12 +210,13 @@ internal sealed class ComposerView : TextView
 
     /// <summary>
     /// The composer's desired height for the given content width and screen height: the wrapped visual line
-    /// count clamped to <c>[3, MaximumHeight(screenHeight)]</c>.
+    /// count clamped to <c>[1, MaximumHeight(screenHeight)]</c>. A draft that fits on one visual line uses a
+    /// single content row; it only grows when explicit newlines or wrapping need more visual rows.
     /// </summary>
     internal int DesiredHeight(int width, int screenHeight)
     {
         var visualRows = this.MeasureLayout(width).VisualLineCount;
-        return Math.Min(MaximumHeight(screenHeight), Math.Max(3, visualRows));
+        return Math.Min(MaximumHeight(screenHeight), Math.Max(1, visualRows));
     }
 
     /// <summary>
