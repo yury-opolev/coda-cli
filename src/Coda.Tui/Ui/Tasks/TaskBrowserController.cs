@@ -68,6 +68,11 @@ internal sealed class TaskBrowserController
     private string? _pendingStopId;
     private long _pendingStopStamp;
 
+    // ---- Test-only seam: awaited at the attach boundary AFTER WaitUntilPaused returns but BEFORE the
+    // finalize lock records the attachment, so a test can deterministically drive the target terminal
+    // inside the finalize TOCTOU window. Null in production. ----
+    internal Func<Task>? AttachBoundaryReachedHook;
+
     public TaskBrowserController(
         Func<TaskBrowserProvider?> provider,
         TimeProvider time,
@@ -674,7 +679,9 @@ internal sealed class TaskBrowserController
     /// leave the browser attached while the pause lease has already been dropped. Finalization also re-checks
     /// the live registry: if the target completed/failed/stopped (or was pruned) while the pause was pending
     /// — a transition whose event may have been drained before the target id was recorded — the lease is
-    /// released immediately instead of attaching to a dead shell.</para>
+    /// released immediately instead of attaching to a dead shell. That re-check runs under the finalize
+    /// <c>_sync</c> lock, atomically with recording the attachment (<see cref="TaskManager.Get"/> is
+    /// lock-free, so no manager lock is nested), so no completion can slip between the check and the set.</para>
     /// </summary>
     public async Task AttachAsync(CancellationToken cancellationToken)
     {
@@ -732,12 +739,12 @@ internal sealed class TaskBrowserController
             // Esc (ReleaseAttachment) cancelled the pending wait, or the caller's token fired.
         }
 
-        // Re-check the live registry at the boundary. While the pause was pending the target may have
-        // completed/failed/stopped (or been pruned) and its terminal change may have already been drained by
-        // a Sync BEFORE AttachedTaskId was set — so the Sync-time auto-release never saw it. Attaching now
-        // would pin the pause lease to a dead shell with no further Sync to release it, so finalize must
-        // resume the main agent instead. The read is a cheap lock-free registry lookup done outside _sync.
-        var targetLive = reached && !token.IsCancellationRequested && IsTargetAttachable(p, targetId);
+        if (this.AttachBoundaryReachedHook is { } hook)
+        {
+            await hook().ConfigureAwait(false);
+        }
+
+        var reachedBoundary = reached && !token.IsCancellationRequested;
 
         var attached = false;
         var releaseInline = false;
@@ -750,7 +757,17 @@ internal sealed class TaskBrowserController
                 return;
             }
 
-            if (reached && !token.IsCancellationRequested && targetLive)
+            // Re-check the live registry INSIDE the finalize lock, immediately before recording the
+            // attachment. While the pause was pending — or in the narrow window after any earlier check but
+            // before AttachedTaskId is set — the target may have completed/failed/stopped (or been pruned),
+            // and its terminal change may have already been drained by a Sync while AttachedTaskId was still
+            // null, so the Sync-time auto-release never saw it. Attaching now would pin the pause lease to a
+            // dead shell with no further Sync to release it. Doing the lookup here (TaskManager.Get is
+            // lock-free, so no manager-lock nesting) makes the check atomic with setting the attach flags,
+            // closing that TOCTOU: no completion can slip between the check and the recorded attachment.
+            var targetLive = reachedBoundary && IsTargetAttachable(p, targetId);
+
+            if (targetLive)
             {
                 this._isAttaching = false;
                 this._isAttached = true;
@@ -760,7 +777,7 @@ internal sealed class TaskBrowserController
             else
             {
                 releaseInline = true;
-                if (reached && !token.IsCancellationRequested && !targetLive)
+                if (reachedBoundary)
                 {
                     // Reached the boundary but the target is no longer a running background shell.
                     goneStatus = $"Attached shell '{targetId}' finished; resuming the agent.";

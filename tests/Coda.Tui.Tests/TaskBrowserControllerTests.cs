@@ -569,6 +569,43 @@ public sealed class TaskBrowserControllerTests : IDisposable
     }
 
     [Fact]
+    public async Task Attach_TargetGoesTerminalInsideFinalizeWindow_NeverAttaches_WithoutFurtherSync()
+    {
+        // The finalize-time TOCTOU: the target can go terminal AFTER the attach boundary is reached but
+        // BEFORE the finalize records the attachment (_isAttached/_attachedTaskId). Its terminal event is
+        // drained by a pump WHILE _attachedTaskId is still null, so the Sync-time auto-release never sees
+        // it. Finalization must re-check the live registry under the finalize lock, immediately before
+        // recording the attachment, and release the lease instead of pinning the pause to a dead shell
+        // (there is no further Sync afterwards to rescue it).
+        var shell = _mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);
+        _controller.Open();
+        await _controller.SyncAsync(CancellationToken.None);
+        _controller.OpenDetail();
+
+        // Deterministic seam: fires once at the attach boundary, inside the finalize TOCTOU window,
+        // to complete the target and drain its terminal event via a pump pass while still only "attaching".
+        var fired = false;
+        _controller.AttachBoundaryReachedHook = async () =>
+        {
+            if (fired)
+            {
+                return;
+            }
+
+            fired = true;
+            Assert.Null(_controller.AttachedTaskId); // window is open: no target recorded yet
+            Assert.True(_mgr.Complete(shell.Id, "done"));
+            await _controller.SyncAsync(CancellationToken.None); // pump drains the terminal event with no attached id
+        };
+
+        await _controller.AttachAsync(CancellationToken.None); // no further Sync happens after finalize
+
+        AssertFullyReleased();
+        Assert.Contains(shell.Id, _controller.State.StatusMessage!);
+        Assert.Contains("resuming", _controller.State.StatusMessage!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task Pump_SurvivesThrowingChangedHandler_AndProcessesLaterEvents()
     {
         // A throwing Changed subscriber must not permanently kill the pump: the first change throws, but a
