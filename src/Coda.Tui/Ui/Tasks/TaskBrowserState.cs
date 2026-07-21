@@ -109,7 +109,21 @@ internal sealed record TaskBrowserState
     public TaskBrowserState NewlineSteering() => this with { SteeringDraft = SteeringDraft + "\n" };
 
     public TaskBrowserState BackspaceSteering() =>
-        SteeringDraft.Length == 0 ? this : this with { SteeringDraft = SteeringDraft[..^1] };
+        SteeringDraft.Length == 0 ? this : this with { SteeringDraft = RemoveLastScalar(SteeringDraft) };
+
+    /// <summary>
+    /// Removes the final Unicode scalar (rune) from <paramref name="text"/>, not one UTF-16 code unit, so an
+    /// astral emoji (a surrogate pair) is deleted whole and never leaves a lone, invalid surrogate. A
+    /// combining mark is its own scalar and is removed on its own — one keypress deletes one rune, which is
+    /// the accepted grapheme-cluster behaviour.
+    /// </summary>
+    private static string RemoveLastScalar(string text)
+    {
+        var last = text.Length - 1;
+        return last > 0 && char.IsLowSurrogate(text[last]) && char.IsHighSurrogate(text[last - 1])
+            ? text[..(last - 1)]
+            : text[..last];
+    }
 
     public TaskBrowserState CancelSteering() =>
         this with { View = TaskBrowserView.Detail, SteeringDraft = string.Empty };

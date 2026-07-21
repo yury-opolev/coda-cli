@@ -87,6 +87,12 @@ internal sealed class TaskBrowserController
     /// <summary>Raised after any state, output, or attachment change (marshal to the UI thread in the overlay).</summary>
     public event Action? Changed;
 
+    /// <summary>
+    /// The number of live <see cref="Changed"/> subscribers (test seam): the overlay must subscribe exactly
+    /// once across an idempotent Show, and unsubscribe on Hide/Dispose, so this stays 0 or 1.
+    /// </summary>
+    internal int ChangedSubscriberCount => this.Changed?.GetInvocationList().Length ?? 0;
+
     public TaskBrowserState State
     {
         get { lock (this._sync) { return this._state; } }

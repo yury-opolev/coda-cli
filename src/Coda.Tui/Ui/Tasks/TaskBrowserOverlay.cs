@@ -18,6 +18,11 @@ namespace Coda.Tui.Ui.Tasks;
 /// <see cref="IApplication.Invoke"/>, so no Terminal.Gui control is ever touched off the UI thread, and
 /// the callback is isolated so a closed/disposed overlay cannot throw. Key-driven actions run on the UI
 /// thread and render synchronously.</para>
+///
+/// <para><b>Lifecycle.</b> <see cref="Show"/> and <see cref="Hide"/> are idempotent (a repeated Show never
+/// double-subscribes/double-pumps; a repeated Hide never re-notifies), and <see cref="Dispose(bool)"/>
+/// mirrors <see cref="Hide"/>'s safety-critical <see cref="Teardown"/> so a parent Dispose cascade still
+/// cancels the pump, unsubscribes, releases the pause lease, and closes the controller.</para>
 /// </summary>
 internal sealed class TaskBrowserOverlay : View
 {
@@ -79,6 +84,16 @@ internal sealed class TaskBrowserOverlay : View
     {
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
 
+        // Idempotent: a second Show while already active must never add a duplicate Changed handler,
+        // subscription, pump, or CTS. Re-focus and re-render the existing session instead.
+        if (this.active)
+        {
+            this.Visible = true;
+            this.SetFocus();
+            this.Render();
+            return;
+        }
+
         this.controller.Open();
         this.controller.Changed += this.OnControllerChanged;
 
@@ -94,6 +109,26 @@ internal sealed class TaskBrowserOverlay : View
     /// <summary>Cancels the pump, unsubscribes, closes the controller, releases any attachment, and hides.</summary>
     public void Hide()
     {
+        // Idempotent: if already hidden, do not tear down again or fire a duplicate onChanged notification.
+        // (Task 7 will restore composer focus to the shell here.)
+        if (!this.active)
+        {
+            return;
+        }
+
+        this.Teardown();
+        this.Visible = false;
+        this.onChanged?.Invoke();
+    }
+
+    /// <summary>
+    /// Safety-critical teardown shared by <see cref="Hide"/> and <see cref="Dispose(bool)"/>: cancel + dispose
+    /// the pump/CTS, unsubscribe <see cref="TaskBrowserController.Changed"/>, release any attachment (so no
+    /// pause lease survives), and close the controller. Every step is idempotent so a Hide-then-Dispose (or a
+    /// parent Dispose cascade with no prior Hide) runs cleanly either way.
+    /// </summary>
+    private void Teardown()
+    {
         this.active = false;
 
         this.pumpCts?.Cancel();
@@ -103,9 +138,6 @@ internal sealed class TaskBrowserOverlay : View
         this.controller.Changed -= this.OnControllerChanged;
         this.controller.ReleaseAttachment();
         this.controller.Close();
-
-        this.Visible = false;
-        this.onChanged?.Invoke();
     }
 
     /// <summary>Renders the current controller state synchronously (test/diagnostic seam; UI thread only).</summary>
@@ -158,14 +190,21 @@ internal sealed class TaskBrowserOverlay : View
             case TaskBrowserCommand.CancelSteering: this.controller.CancelSteering(); break;
             case TaskBrowserCommand.None:
             default:
-                // Steering is fully modal: an ordinary printable key is draft text (never a task action);
-                // everywhere else an unmapped key falls through so the shell can act on it later (Task 7).
-                if (view == TaskBrowserView.Steering && TryGetPrintable(key, out var text))
+                if (view == TaskBrowserView.Steering)
                 {
-                    this.controller.AppendSteering(text);
-                    break;
+                    // Steering is fully modal: a printable key is draft text (never a task action), and
+                    // every other unmapped key (Tab/arrows/Page/Home/Delete/F-keys) is swallowed so nothing
+                    // can escape the modal to move focus or reach the shell.
+                    if (TryGetPrintable(key, out var text))
+                    {
+                        this.controller.AppendSteering(text);
+                        this.RenderAndNotify();
+                    }
+
+                    return true;
                 }
 
+                // Outside steering an unmapped key falls through so the shell can act on it later (Task 7).
                 return base.OnKeyDown(key);
         }
 
@@ -479,11 +518,13 @@ internal sealed class TaskBrowserOverlay : View
         if (disposing && !this.disposed)
         {
             this.disposed = true;
-            this.active = false;
-            this.controller.Changed -= this.OnControllerChanged;
-            this.pumpCts?.Cancel();
-            this.pumpCts?.Dispose();
-            this.pumpCts = null;
+
+            // Mirror Hide's safety-critical cleanup: a parent view Dispose cascade never calls Hide, so
+            // Dispose itself must cancel/dispose the pump, unsubscribe Changed, release the attachment (no
+            // pause lease may outlive the parent cascade), and close the controller. Teardown is idempotent,
+            // so this is a no-op when Hide already ran.
+            this.Teardown();
+            this.Visible = false;
         }
 
         base.Dispose(disposing);

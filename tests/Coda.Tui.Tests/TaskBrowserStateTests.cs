@@ -163,4 +163,37 @@ public sealed class TaskBrowserStateTests
         var state = TaskBrowserState.Empty.WithProjection(Proj(Snap("task-0001"))).OpenDetail().BeginSteering();
         Assert.Equal(string.Empty, state.BackspaceSteering().SteeringDraft);
     }
+
+    [Fact]
+    public void BackspaceSteering_RemovesWholeAstralEmoji_NotOneUtf16CodeUnit()
+    {
+        // "😀" is a single Unicode scalar encoded as a UTF-16 surrogate pair (two code units). One backspace
+        // must delete the whole rune so the draft is never left holding a lone (invalid) surrogate.
+        var emoji = "😀";
+        Assert.Equal(2, emoji.Length); // sanity: astral scalar is a surrogate pair in UTF-16
+
+        var state = TaskBrowserState.Empty
+            .WithProjection(Proj(Snap("task-0001"))).OpenDetail().BeginSteering()
+            .AppendSteering("a").AppendSteering(emoji);
+        Assert.Equal("a" + emoji, state.SteeringDraft);
+
+        var back = state.BackspaceSteering();
+        Assert.Equal("a", back.SteeringDraft); // the entire emoji is gone, "a" survives
+
+        Assert.Equal(string.Empty, back.BackspaceSteering().SteeringDraft);
+    }
+
+    [Fact]
+    public void BackspaceSteering_CombiningMark_RemovesOneRune()
+    {
+        // "e\u0301" is 'e' + a combining acute accent: two runes. Deleting one rune (the combining mark) is
+        // the accepted behaviour — one keypress removes one scalar, not the whole grapheme cluster.
+        var state = TaskBrowserState.Empty
+            .WithProjection(Proj(Snap("task-0001"))).OpenDetail().BeginSteering()
+            .AppendSteering("e\u0301");
+        Assert.Equal("e\u0301", state.SteeringDraft);
+
+        var back = state.BackspaceSteering();
+        Assert.Equal("e", back.SteeringDraft); // combining mark removed, base letter remains
+    }
 }

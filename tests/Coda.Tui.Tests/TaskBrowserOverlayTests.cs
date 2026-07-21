@@ -18,6 +18,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "coda-ovl-" + Guid.NewGuid().ToString("N"));
     private readonly IApplication _app;
     private readonly TaskManager _mgr;
+    private readonly AgentExecutionGate _gate = new();
 
     public TaskBrowserOverlayTests()
     {
@@ -36,8 +37,9 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         try { Directory.Delete(_dir, recursive: true); } catch { }
     }
 
+    // Uses the shared gate so attach/pause tests can observe the lease being resumed.
     private TaskBrowserController NewController() =>
-        new(() => new TaskBrowserProvider(_mgr, new AgentExecutionGate()), TimeProvider.System);
+        new(() => new TaskBrowserProvider(_mgr, _gate), TimeProvider.System);
 
     private static int LeadingSpaces(string line)
     {
@@ -386,6 +388,179 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         finally
         {
             overlay.Hide();
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Fact]
+    public async Task Dispose_WhileAttachedAndPausing_ReleasesGate_AndClosesController()
+    {
+        // A parent Dispose cascade never calls Hide, so Dispose must mirror Hide's safety-critical cleanup:
+        // cancel the pump, unsubscribe Changed, release the attachment (pause lease), and close the controller.
+        _mgr.Register(TaskKind.Shell, "bg-dispose", parentTaskId: null, mode: TaskExecutionMode.Background);
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host);
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+            overlay.NewKeyDownEvent(Key.Enter);                   // open detail on the background shell
+
+            await controller.AttachAsync(CancellationToken.None); // attach → pause lease held
+            Assert.True(controller.IsAttached);
+            Assert.True(_gate.IsPaused);
+            Assert.Equal(1, controller.ChangedSubscriberCount);
+
+            overlay.Dispose();                                    // simulate the parent view Dispose cascade
+
+            Assert.False(controller.IsAttached);
+            Assert.False(controller.IsComposerLocked);
+            Assert.False(_gate.IsPaused);                         // gate resumed — no pause lease survived
+            Assert.False(overlay.IsPumping);                      // pump cancelled + CTS disposed
+            Assert.Equal(0, controller.ChangedSubscriberCount);   // Changed unsubscribed
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();                                    // idempotent: a second Dispose is a no-op
+            host.Dispose();
+        }
+    }
+
+    [Fact]
+    public void Show_WhenAlreadyActive_DoesNotDuplicateSubscriptionPumpOrCallback()
+    {
+        _mgr.Register(TaskKind.Subagent, "idempotent-show", parentTaskId: null);
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host);
+        try
+        {
+            overlay.Show();
+            Assert.True(overlay.IsPumping);
+            Assert.Equal(1, controller.ChangedSubscriberCount);   // exactly one Changed handler / pump callback
+
+            overlay.Show();                                       // repeated Show must not duplicate anything
+            overlay.Show();
+
+            Assert.Equal(1, controller.ChangedSubscriberCount);   // still a single subscription (no duplicate)
+            Assert.True(overlay.IsPumping);                       // still a single pump (no second CTS)
+            Assert.True(overlay.Visible);
+            Assert.True(overlay.HasFocus);
+
+            overlay.Hide();
+            Assert.Equal(0, controller.ChangedSubscriberCount);   // Hide removes the single subscription
+            Assert.False(overlay.IsPumping);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Fact]
+    public void Hide_WhenAlreadyHidden_DoesNotInvokeOnChangedAgain()
+    {
+        _mgr.Register(TaskKind.Subagent, "idempotent-hide", parentTaskId: null);
+        var controller = NewController();
+        var host = new Window();
+        var hides = 0;
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber, onChanged: () => hides++);
+        host.Add(overlay);
+
+        var token = _app.Begin(host);
+        try
+        {
+            overlay.Show();
+            hides = 0;
+
+            overlay.Hide();                        // first Hide tears down and notifies once
+            Assert.Equal(1, hides);
+            Assert.False(overlay.IsPumping);
+
+            overlay.Hide();                        // already hidden: no duplicate teardown or onChanged
+            overlay.Hide();
+            Assert.Equal(1, hides);
+            Assert.Equal(0, controller.ChangedSubscriberCount);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData(nameof(Key.Tab))]
+    [InlineData(nameof(Key.CursorUp))]
+    [InlineData(nameof(Key.CursorDown))]
+    [InlineData(nameof(Key.CursorLeft))]
+    [InlineData(nameof(Key.CursorRight))]
+    [InlineData(nameof(Key.PageUp))]
+    [InlineData(nameof(Key.PageDown))]
+    [InlineData(nameof(Key.Home))]
+    [InlineData(nameof(Key.End))]
+    [InlineData(nameof(Key.Delete))]
+    [InlineData(nameof(Key.F1))]
+    [InlineData(nameof(Key.F5))]
+    public void Steering_IsFullyModal_SwallowsUnmappedNonPrintableKeys(string keyName)
+    {
+        var t = _mgr.Register(TaskKind.Subagent, "modal-task", parentTaskId: null);
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var key = keyName switch
+        {
+            nameof(Key.Tab) => Key.Tab,
+            nameof(Key.CursorUp) => Key.CursorUp,
+            nameof(Key.CursorDown) => Key.CursorDown,
+            nameof(Key.CursorLeft) => Key.CursorLeft,
+            nameof(Key.CursorRight) => Key.CursorRight,
+            nameof(Key.PageUp) => Key.PageUp,
+            nameof(Key.PageDown) => Key.PageDown,
+            nameof(Key.Home) => Key.Home,
+            nameof(Key.End) => Key.End,
+            nameof(Key.Delete) => Key.Delete,
+            nameof(Key.F1) => Key.F1,
+            _ => Key.F5,
+        };
+
+        var token = _app.Begin(host);
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+            overlay.NewKeyDownEvent(Key.Enter);   // open detail
+            overlay.NewKeyDownEvent(new Key('s')); // begin steering
+            overlay.NewKeyDownEvent(new Key('h')); // seed the draft
+            Assert.Equal(TaskBrowserView.Steering, controller.State.View);
+
+            // The unmapped, non-printable key is fully consumed: it must not escape focus, change the draft,
+            // leave the modal, or fire a task action.
+            var handled = overlay.NewKeyDownEvent(key);
+
+            Assert.True(handled);
+            Assert.True(overlay.HasFocus);
+            Assert.Equal(TaskBrowserView.Steering, controller.State.View);
+            Assert.Equal("h", controller.State.SteeringDraft);
+            Assert.Equal(TaskRunStatus.Running, _mgr.Get(t.Id)!.Status);
+        }
+        finally
+        {
             _app.End(token);
             overlay.Dispose();
             host.Dispose();
