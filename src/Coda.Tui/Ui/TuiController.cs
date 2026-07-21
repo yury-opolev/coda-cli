@@ -50,6 +50,13 @@ public sealed class TuiController
     private bool dispatchInFlight;
     private CancellationTokenSource? dispatchCts;
     private Task? dispatchTask;
+
+    // The FIFO chain of out-of-band permission commands (see OnSubmitted). It only ever grows by
+    // appending a continuation that awaits the previous tail, so multiple mid-turn permission commands
+    // apply in submission order. It is deliberately independent of dispatchTask/dispatchInFlight so a
+    // side-band command never cancels, replaces, or gates the main turn.
+    private Task sidebandChain = Task.CompletedTask;
+
     private bool exitRequested;
     private bool startupPending;
     private TuiRunMode? pendingModeSwitch;
@@ -183,6 +190,18 @@ public sealed class TuiController
         }
     }
 
+    /// <summary>Test seam: the current tail of the FIFO side-band permission-command chain.</summary>
+    internal Task CurrentSideband
+    {
+        get
+        {
+            lock (this.gate)
+            {
+                return this.sidebandChain;
+            }
+        }
+    }
+
     /// <summary>Bind the controller to the shell that is now running in <paramref name="mode"/>.</summary>
     internal void AttachShell(ITuiShellHandle handle, TuiRunMode mode)
     {
@@ -276,8 +295,10 @@ public sealed class TuiController
 
     /// <summary>
     /// Schedule a submitted prompt/command for dispatch on a controller-owned task and return
-    /// immediately so the Terminal.Gui UI loop keeps rendering. Additional submits are rejected while a
-    /// dispatch is in flight; completion (or failure) re-enables submission.
+    /// immediately so the Terminal.Gui UI loop keeps rendering. While a dispatch is already in flight,
+    /// ordinary submissions are rejected — except the safe live permission commands (<c>/yolo</c>,
+    /// <c>/permissions [mode]</c>, <c>/mode [mode]</c>), which run out-of-band on a serialized side-band
+    /// chain so the user can change permission mode mid-turn. Completion (or failure) re-enables submission.
     /// </summary>
     public void OnSubmitted(string text)
     {
@@ -289,8 +310,21 @@ public sealed class TuiController
         CancellationToken token;
         lock (this.gate)
         {
-            if (Volatile.Read(ref this.exitRequested) || this.dispatchInFlight || this.startupPending)
+            // Exit/startup always reject every submission, including permission commands.
+            if (Volatile.Read(ref this.exitRequested) || this.startupPending)
             {
+                return;
+            }
+
+            if (this.dispatchInFlight)
+            {
+                // Busy: only a safe live permission command may run out-of-band; everything else is
+                // rejected exactly as before. The main turn is left completely untouched.
+                if (LivePermissionCommands.IsLivePermissionCommand(CommandParser.Parse(text)))
+                {
+                    this.QueueSidebandCommand(text);
+                }
+
                 return;
             }
 
@@ -298,6 +332,58 @@ public sealed class TuiController
             this.dispatchCts = CancellationTokenSource.CreateLinkedTokenSource(this.hostToken);
             token = this.dispatchCts.Token;
             this.dispatchTask = Task.Run(() => this.RunDispatchAsync(text, token));
+        }
+    }
+
+    /// <summary>
+    /// Append <paramref name="text"/> to the side-band permission chain. Called under <see cref="gate"/>;
+    /// it only schedules a continuation (never awaits), so no lock is held across an await. Each command
+    /// awaits the previous tail before running, giving deterministic FIFO application.
+    /// </summary>
+    private void QueueSidebandCommand(string text)
+    {
+        var previous = this.sidebandChain;
+        this.sidebandChain = Task.Run(() => this.RunSidebandAsync(previous, text));
+    }
+
+    /// <summary>
+    /// Run one out-of-band permission command after its predecessor completes. It reuses the injected
+    /// dispatch delegate so output, session-metadata events, live permission state, and validation wording
+    /// stay a single source of truth. It never touches the main dispatch's state and observes all of its
+    /// own faults so nothing surfaces as an unobserved task exception during shutdown.
+    /// </summary>
+    private async Task RunSidebandAsync(Task previous, string text)
+    {
+        try
+        {
+            // FIFO: wait for the previous side-band command; its own faults are already observed there.
+            await previous.ConfigureAwait(false);
+        }
+        catch
+        {
+            // A failed predecessor must not prevent this queued command from running.
+        }
+
+        // Host shutting down: do not start executing queued commands.
+        if (this.hostToken.IsCancellationRequested)
+        {
+            return;
+        }
+
+        // Mark the flow (same AsyncLocal the main dispatch uses) so a re-entrant WaitForDispatchAsync
+        // called from inside the command never self-joins and deadlocks.
+        this.inDispatch.Value = true;
+        try
+        {
+            await this.dispatch(text, this.hostToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            // The host token was cancelled mid-command during shutdown; nothing to report.
+        }
+        catch (Exception ex)
+        {
+            this.PublishDispatchError(ex);
         }
     }
 
@@ -382,12 +468,13 @@ public sealed class TuiController
     }
 
     /// <summary>
-    /// Observe the in-flight dispatch (if any) so a host shutdown can await it before the actor is
-    /// flushed and the mailbox disposed — otherwise a late producer could publish into a disposed
-    /// mailbox. Bounded by <paramref name="cancellationToken"/> and safe against races: it returns at
-    /// once when idle, when the dispatch is already completing, or when invoked from within the dispatch
-    /// task itself (a self-join would otherwise deadlock). It never rethrows the dispatch's own faults,
-    /// which are handled inside <see cref="RunDispatchAsync"/>.
+    /// Observe the in-flight dispatch and the side-band permission chain (if any) so a host shutdown can
+    /// await them before the actor is flushed and the mailbox disposed — otherwise a late producer could
+    /// publish into a disposed mailbox. Bounded by <paramref name="cancellationToken"/> and safe against
+    /// races: it returns at once when idle, when work is already completing, or when invoked from within a
+    /// dispatch/side-band task itself (a self-join would otherwise deadlock). It never rethrows those
+    /// tasks' own faults, which are handled inside <see cref="RunDispatchAsync"/> and
+    /// <see cref="RunSidebandAsync"/>.
     /// </summary>
     public async Task WaitForDispatchAsync(CancellationToken cancellationToken = default)
     {
@@ -397,19 +484,28 @@ public sealed class TuiController
         }
 
         Task? current;
+        Task sideband;
         lock (this.gate)
         {
             current = this.dispatchTask;
+            sideband = this.sidebandChain;
         }
 
-        if (current is null || current.IsCompleted)
+        await ObserveQuietlyAsync(current, cancellationToken).ConfigureAwait(false);
+        await ObserveQuietlyAsync(sideband, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Await <paramref name="task"/> for teardown, absorbing cancellation and its own faults.</summary>
+    private static async Task ObserveQuietlyAsync(Task? task, CancellationToken cancellationToken)
+    {
+        if (task is null || task.IsCompleted)
         {
             return;
         }
 
         try
         {
-            await current.WaitAsync(cancellationToken).ConfigureAwait(false);
+            await task.WaitAsync(cancellationToken).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -417,7 +513,7 @@ public sealed class TuiController
         }
         catch (Exception)
         {
-            // RunDispatchAsync owns its faults; observing the task here must never rethrow into shutdown.
+            // The awaited task owns its faults; observing it here must never rethrow into shutdown.
         }
     }
 
