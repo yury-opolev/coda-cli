@@ -437,6 +437,18 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         Assert.Same(view, second.ScheduleRuntime);
     }
 
+    [Fact]
+    public void BuildSpec_leaves_the_scheduled_identity_unset_for_main_turns()
+    {
+        // Main turns are the leader agent (depth 0) with no scheduled task id; only the isolated
+        // BuildScheduledSpec path sets these. This locks the default so a future change cannot
+        // accidentally start tagging main turns with a scheduled identity.
+        var builder = this.NewBuilder();
+        var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
+        Assert.Null(spec.CurrentTaskId);
+        Assert.Equal(0, spec.CurrentDepth);
+    }
+
     public void Dispose()
     {
         this.http.Dispose();

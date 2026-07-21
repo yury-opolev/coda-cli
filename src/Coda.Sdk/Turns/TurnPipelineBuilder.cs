@@ -147,6 +147,114 @@ public sealed class TurnPipelineBuilder
             ScheduleRuntime: this.scheduleRuntimeProvider());
     }
 
+    /// <summary>
+    /// Assembles the <see cref="AgentLoopSpec"/> for one ISOLATED scheduled firing. The scheduled
+    /// root runs an independent conversation that never touches the session's main history, yet
+    /// reuses the CURRENT session's provider/model/effort/output style (via <paramref name="options"/>),
+    /// the same live <see cref="BuildPermissions"/> path (including the shared
+    /// <see cref="PermissionModeState"/>, classifier, and rules), the shared task manager, LSP,
+    /// user hooks, and prompt services.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately diverges from <see cref="BuildSpec"/> for isolation:
+    /// <list type="bullet">
+    ///   <item>No todos/schedules/schedule-runtime, no goal supervisor or in-loop compaction, no
+    ///     incremental persistence or execution gate — the isolated history is transient.</item>
+    ///   <item>No SessionMemory post-sampling hook bus; user-configured hooks (from settings) still
+    ///     apply to tool executions so behavior stays consistent.</item>
+    ///   <item>Every <c>schedule_*</c> tool is removed from BOTH the scheduled root's registry and
+    ///     the child subagent host's registry, so a scheduled agent can neither create nor manage
+    ///     schedules (and a depth-2 child cannot reintroduce them). Task lifecycle tools are kept so
+    ///     the scheduled agent can inspect/manage only its authorized descendants.</item>
+    ///   <item><see cref="AgentLoopSpec.CurrentTaskId"/>/<see cref="AgentLoopSpec.CurrentDepth"/> are
+    ///     set from the caller so the tool context carries the scheduled root's trusted identity.</item>
+    /// </list>
+    /// Steering is intentionally NOT set here — the host applies the task's steering inbox via
+    /// <c>with { Steering = ... }</c>.
+    /// </remarks>
+    /// <param name="options">The current session options snapshot for this firing.</param>
+    /// <param name="client">The per-execution provider chat client for this firing.</param>
+    /// <param name="settings">The settings loaded by the caller (never re-loaded here).</param>
+    /// <param name="taskId">The scheduled root task's id (from the task manager).</param>
+    /// <param name="depth">The scheduled root task's depth (1 for a scheduled root).</param>
+    public AgentLoopSpec BuildScheduledSpec(SessionOptions options, ILlmClient client, CodaSettings settings, string taskId, int depth)
+    {
+        ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(client);
+        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentException.ThrowIfNullOrEmpty(taskId);
+
+        var includeAnthropicSystemPrefix = options.ProviderId != GitHubCopilotProvider.Id;
+
+        var agentOptions = this.BuildAgentOptions(options, includeAnthropicSystemPrefix);
+
+        var permissions = BuildPermissions(options, client, settings);
+
+        var userHooks = settings.Hooks.Count > 0 ? new UserHookRunner(settings.Hooks) : null;
+
+        // A normal child host so the scheduled root (depth 1) can create depth-2 children; depth-3
+        // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
+        // stripped so a depth-2 child cannot reintroduce them.
+        var subagentTools = StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools]);
+        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks);
+
+        var tools = this.BuildScheduledTools(options);
+
+        return new AgentLoopSpec(
+            client,
+            tools,
+            permissions,
+            agentOptions,
+            subagentHost,
+            // No SessionMemory watcher for the isolated scheduled history.
+            Hooks: null,
+            // Isolated: no session todo/schedule stores, no schedule runtime.
+            Todos: null,
+            Schedules: null,
+            UserQuestion: options.UserQuestionPrompt,
+            UserHooks: userHooks,
+            PlanApprover: options.PlanApprover,
+            Lsp: this.lspManager,
+            LspDiagnostics: this.lspDiagnostics,
+            ToolSearch: this.toolSearchCoordinator,
+            // No goal supervisor / in-loop compaction for the isolated run.
+            Goal: null,
+            CompactAsync: null,
+            Logger: this.loggerFactory.CreateLogger("Coda.Tool"),
+            // Steering is applied by the host from the task's inbox.
+            Steering: null,
+            // No incremental persistence for the transient scheduled history.
+            PersistTurnAsync: null,
+            // Share the task manager so descendants are visible/authorized.
+            Tasks: this.tasks,
+            Gate: null,
+            ScheduleRuntime: null,
+            CurrentTaskId: taskId,
+            CurrentDepth: depth);
+    }
+
+    /// <summary>
+    /// Builds the scheduled root's tool registry: the same built-ins + extra tools + TaskTool +
+    /// LSP/tool-search (when configured) as a main turn, but with every <c>schedule_*</c> tool
+    /// removed so a scheduled agent cannot create or manage schedules.
+    /// </summary>
+    private ToolRegistry BuildScheduledTools(SessionOptions options)
+    {
+        var extraLspTools = this.lspManager is not null
+            ? new ITool[] { new TaskTool(), new LspTool() }
+            : new ITool[] { new TaskTool() };
+
+        var toolSearchTools = this.toolSearchCoordinator is not null
+            ? new ITool[] { new ToolSearchTool() }
+            : [];
+
+        return StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools, .. extraLspTools, .. toolSearchTools]);
+    }
+
+    /// <summary>Returns a registry with every <c>schedule_*</c> tool removed.</summary>
+    private static ToolRegistry StripScheduleTools(IEnumerable<ITool> tools) =>
+        new(tools.Where(t => !t.Name.StartsWith("schedule_", StringComparison.Ordinal)));
+
     /// <summary>Builds the agent options: system prompt (with/without the anthropic prefix) + output style + base bounds.</summary>
     private AgentOptions BuildAgentOptions(SessionOptions options, bool includeAnthropicSystemPrefix)
     {
