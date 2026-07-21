@@ -306,8 +306,17 @@ public sealed class ScheduledTaskStoreTests
     }
 
     [Fact]
-    public void Persist_failure_keeps_old_disk_json_but_updates_memory_version_and_logs()
+    public void Persist_failure_keeps_old_disk_json_but_updates_memory_version_and_logs_on_windows()
     {
+        // Windows-only: holding the target open with FileShare.None makes the atomic File.Move
+        // overwrite fail while leaving the previous bytes intact. POSIX rename semantics allow the
+        // replace to succeed even against an open handle, so this proof-of-intactness cannot hold
+        // cross-platform (the portable failure mode is covered by the sibling test below).
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
         var path = NewTempPath();
         try
         {
@@ -336,6 +345,43 @@ public sealed class ScheduledTaskStoreTests
         finally
         {
             Cleanup(path);
+        }
+    }
+
+    [Fact]
+    public void Persist_failure_updates_memory_version_and_logs_on_all_platforms()
+    {
+        var dir = NewTempDir();
+        try
+        {
+            // Deterministic cross-platform failure: a regular file stands in for what the store
+            // treats as a parent directory, so Directory.CreateDirectory / temp-file creation under
+            // it throws on Windows, Linux, and macOS alike. No target can exist beneath a regular
+            // file, so this test intentionally does not assert on old target bytes.
+            var blocker = Path.Combine(dir, "blocker");
+            File.WriteAllText(blocker, "not a directory");
+            var persistPath = Path.Combine(blocker, "nested", "scheduled_tasks.json");
+
+            var logger = new CapturingLogger();
+            var store = new ScheduledTaskStore(persistPath, logger);
+
+            var versionBefore = store.GetSnapshot().Version;
+
+            store.Add(CronDraft(), Now);
+
+            var snap = store.GetSnapshot();
+            Assert.Single(snap.Items);                      // in-memory Add succeeded
+            Assert.Equal(versionBefore + 1, snap.Version);  // version advanced / change signalled
+            Assert.Contains(logger.Entries, e => e.Message.Contains("persistence failed"));
+
+            // The regular file used as a would-be parent was never turned into a directory,
+            // and no temp/target artefacts leaked beneath it.
+            Assert.True(File.Exists(blocker));
+            Assert.False(Directory.Exists(blocker));
+        }
+        finally
+        {
+            CleanupDir(dir);
         }
     }
 
