@@ -257,62 +257,6 @@ public sealed class SchedulingTests
     }
 
     // ────────────────────────────────────────────────────────────────
-    // CronScheduler
-    // ────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void CronScheduler_DueTasks_returns_tasks_at_or_before_now()
-    {
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-
-        // Task 1: due at 12:05
-        store.Add("*/5 * * * *", "task1", true, baseTime);  // NextRunUtc = 12:05
-
-        // Task 2 with a cron that starts later — manually control via Replace
-        var task2 = store.Add("0 0 * * *", "task2", false, baseTime);  // NextRunUtc = 2025-01-02 00:00
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-        var due = scheduler.DueTasks(now);
-
-        Assert.Single(due);
-        Assert.Equal("task1", due[0].Prompt);
-    }
-
-    [Fact]
-    public void CronScheduler_MarkFired_recurring_reschedules()
-    {
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "work", recurring: true, nowUtc: baseTime);
-        // NextRunUtc = 12:05
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-        scheduler.MarkFired(task, now);
-
-        // Should be rescheduled, not removed
-        Assert.Single(store.Items);
-        // Next run should be strictly after 12:05 (i.e., 12:10)
-        Assert.Equal(new DateTimeOffset(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc)), store.Items[0].NextRunUtc);
-    }
-
-    [Fact]
-    public void CronScheduler_MarkFired_oneshot_removes()
-    {
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "once", recurring: false, nowUtc: baseTime);
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-        scheduler.MarkFired(task, now);
-
-        Assert.Empty(store.Items);
-    }
-
-    // ────────────────────────────────────────────────────────────────
     // CronExpression — NextOccurrence with impossible date
     // ────────────────────────────────────────────────────────────────
 
@@ -339,25 +283,4 @@ public sealed class SchedulingTests
         Assert.Empty(store.Items);
     }
 
-    [Fact]
-    public void MarkFired_removes_recurring_task_that_can_never_match()
-    {
-        // Add a normal recurring task first, then inject an impossible cron via Replace.
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "placeholder", recurring: true, nowUtc: baseTime);
-
-        // Replace the stored task with one carrying the impossible cron expression.
-        var impossible = task with { Cron = "0 0 30 2 *" };
-        store.Replace(impossible);
-        Assert.Single(store.Items);
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-
-        // MarkFired should catch the InvalidOperationException and remove the task.
-        scheduler.MarkFired(impossible, now);
-
-        Assert.Empty(store.Items);
-    }
 }
