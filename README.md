@@ -676,9 +676,12 @@ one-message conversation, never the interactive history.
 Offset-less `at` values and `cron` rules are interpreted in the **machine-local
 timezone** by default. Provide `timeZone` (an IANA id like `"America/New_York"`, a
 Windows id, or a fixed offset like `"UTC-05:00"`) to override it; an `at` value with
-an explicit offset is honored as written. Across DST transitions a nonexistent
-spring-forward local time is **skipped**, and an ambiguous fall-back local time
-resolves to the **earlier** UTC instant (it is not run twice).
+an explicit offset is honored as written. Across DST transitions the two schedule
+kinds treat a nonexistent spring-forward local time differently: an offset-less
+one-shot `at` value that lands in the gap is **rejected with an error** (there is
+no such instant to resolve), while `cron` **skips** the nonexistent local minutes
+and fires at the next valid occurrence. An ambiguous fall-back local time resolves
+to the **earlier** UTC instant for both kinds (it is not run twice).
 
 ### When schedules run
 

@@ -425,7 +425,13 @@ public sealed class CodaSessionScheduleRuntimeTests : IDisposable
         await session.InitializeAsync();
 
         var sw = Stopwatch.StartNew();
-        var completed = Task.Run(() => session.Dispose()).Wait(TimeSpan.FromSeconds(30));
+        var disposeTask = Task.Run(() => session.Dispose());
+        var completed = await Task.WhenAny(disposeTask, Task.Delay(TimeSpan.FromSeconds(30))) == disposeTask;
+        if (completed)
+        {
+            await disposeTask; // observe completion (Dispose swallows internally, but await is cleaner)
+        }
+
         sw.Stop();
 
         Assert.True(completed, "synchronous Dispose did not return");
