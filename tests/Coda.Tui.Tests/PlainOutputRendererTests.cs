@@ -174,7 +174,7 @@ public sealed class PlainOutputRendererTests
     public async Task External_osc_hyperlink_escapes_are_stripped_after_shared_sanitizer_extraction()
     {
         // Characterization: PlainOutputRenderer now delegates escape stripping to the shared
-        // TaskTextSanitizer regex, which also removes OSC hyperlink sequences (previously untouched).
+        // TerminalTextSanitizer regex, which also removes OSC hyperlink sequences (previously untouched).
         var writer = new StringWriter();
         var renderer = new PlainOutputRenderer(writer);
 

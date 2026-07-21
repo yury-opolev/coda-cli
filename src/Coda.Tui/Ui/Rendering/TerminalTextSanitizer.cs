@@ -118,9 +118,10 @@ internal static partial class TerminalTextSanitizer
 
     // Unicode bidirectional formatting controls (category Cf) that can visually reorder rendered text:
     // the embeddings/overrides U+202A-202E, the isolates U+2066-2069, and the directional marks
-    // LRM (U+200E) and RLM (U+200F). U+200D (ZERO WIDTH JOINER) is deliberately excluded so emoji
-    // ZWJ sequences keep rendering correctly.
+    // LRM (U+200E), RLM (U+200F), and ALM (U+061C ARABIC LETTER MARK). U+200D (ZERO WIDTH JOINER) is
+    // deliberately excluded so emoji ZWJ sequences keep rendering correctly.
     private static bool IsBidiFormattingControl(char ch) => ch is
+        '\u061C' or
         '\u202A' or '\u202B' or '\u202C' or '\u202D' or '\u202E' or
         '\u2066' or '\u2067' or '\u2068' or '\u2069' or
         '\u200E' or '\u200F';

@@ -205,6 +205,19 @@ public sealed class TerminalTextSanitizerTests
     }
 
     [Fact]
+    public void Sanitize_RemovesArabicLetterMarkButKeepsArabicText()
+    {
+        // U+061C ARABIC LETTER MARK is an invisible bidi formatting control that can visually reorder
+        // text to spoof output. It must be dropped while the surrounding Arabic letters stay intact.
+        var input = "\u0645\u0631\u062D\u0628\u0627\u061C\u064A\u0648\u0645"; // مرحبا + ALM + يوم
+
+        var result = TerminalTextSanitizer.Sanitize(input);
+
+        Assert.DoesNotContain('\u061C', result);
+        Assert.Equal("\u0645\u0631\u062D\u0628\u0627\u064A\u0648\u0645", result);
+    }
+
+    [Fact]
     public void Sanitize_PreservesEmojiZeroWidthJoinerSequences()
     {
         // The ZWJ (U+200D) binds emoji into a single glyph (family, profession, flags). It is NOT a
