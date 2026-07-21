@@ -85,7 +85,8 @@ Eleven projects under `src/`, three test projects under `tests/`. All target `ne
   callable engine that builds the loop and holds conversation state), the `serve`
   JSON-RPC host (`Serve/ServeHost.cs` + wire DTOs + transports), `LlmClientFactory`
   (provider id → `ILlmClient`), the model catalog / pricing, session transcript
-  persistence, the cron scheduler, and the **telemetry** stack
+  persistence, the schedule runtime (`Scheduling/ScheduleRuntime.cs` — executes due
+  schedule definitions as background agents), and the **telemetry** stack
   (`Telemetry/` — logger factory, JSON-lines file sink, resolver).
 
 - **`Coda.Agent`** *(library; the agent core)* — `AgentLoop` (the tool-use cycle),
@@ -386,7 +387,9 @@ In serve mode the "interactive prompt" is `WirePermissionPrompt` (server-initiat
 ### 4.7 Sessions & persistence
 
 `CodaSession` is the engine instance: it holds the conversation `history`, accumulated token
-usage, the todo/schedule/background-task stores, the optional LSP manager, and the
+usage, the todo/schedule/background-task stores, the optional LSP manager, the optional
+schedule runtime (started by `InitializeAsync` when `EnableScheduleRuntime` is set, torn down
+strictly before the task manager), and the
 telemetry logger. It is both `IDisposable` and `IAsyncDisposable`; **serve uses the async
 path** and `ServeHost` awaits `DisposeAsync` (cancel-first teardown — cancel the turn, await
 session disposal, dispose the connection last) so a turn-running session never leaks across

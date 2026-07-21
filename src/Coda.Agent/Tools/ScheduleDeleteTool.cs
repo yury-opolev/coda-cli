@@ -3,9 +3,9 @@ using System.Text.Json;
 namespace Coda.Agent.Tools;
 
 /// <summary>
-/// Deletes a scheduled task by its Id. Removes only the definition so no future execution starts;
-/// any in-progress run continues to completion (runtime stop handling is a later concern).
-/// Bookkeeping-only; runs without a permission prompt.
+/// Deletes a scheduled task by its Id. Removes the definition so no future or pending run starts;
+/// an already-running firing continues to its terminal state (stop it with <c>task_stop</c>). The
+/// tool only mutates the schedule store, so it runs without a user permission prompt.
 /// </summary>
 public sealed class ScheduleDeleteTool : ITool
 {

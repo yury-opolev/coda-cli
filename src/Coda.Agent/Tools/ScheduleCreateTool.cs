@@ -6,8 +6,9 @@ namespace Coda.Agent.Tools;
 /// <summary>
 /// Creates a new scheduled task from an <c>every</c>/<c>at</c>/<c>cron</c> selector. Validates and
 /// normalizes the request via <see cref="ScheduleDefinitionParser"/> and adds the resulting
-/// definition to the session's <see cref="ScheduledTaskStore"/>. Bookkeeping-only (no file/system
-/// side effects), so it runs without a user permission prompt.
+/// definition to the session's <see cref="ScheduledTaskStore"/>. The tool itself only mutates the
+/// schedule store (no file/system side effects), so it runs without a user permission prompt; the
+/// session's schedule runtime is what later executes each due definition as a background agent.
 /// </summary>
 public sealed class ScheduleCreateTool : ITool
 {

@@ -128,7 +128,7 @@ public sealed class CodaSession : IDisposable, IAsyncDisposable
     public ScheduledTaskStore Schedules { get; }
     public TaskManager Tasks { get; }                    // unified in-process runtime: background subagents + shells
 
-    public Task InitializeAsync(CancellationToken ct = default);            // starts configured LSP servers (no-op if none)
+    public Task InitializeAsync(CancellationToken ct = default);            // starts configured LSP servers + schedule runtime when EnableScheduleRuntime (no-op if neither)
     public Task<RunResult> RunAsync(string prompt, IAgentSink? sink = null, CancellationToken ct = default);
     public Task<RunResult> RunAsync(IReadOnlyList<ContentBlock> userContent, IAgentSink? sink = null, CancellationToken ct = default); // text + images
     public Task CompactAsync(CancellationToken ct = default);              // summarize history in place
@@ -138,7 +138,7 @@ public sealed class CodaSession : IDisposable, IAsyncDisposable
 }
 ```
 
-`RunAsync` runs **one user turn**: it streams the assistant reply (with tool use) to the optional `sink`, keeps the conversation in `History`, and returns a `RunResult`. On failure the turn is rolled back so history never corrupts. Call `InitializeAsync` once after construction if you configured LSP servers.
+`RunAsync` runs **one user turn**: it streams the assistant reply (with tool use) to the optional `sink`, keeps the conversation in `History`, and returns a `RunResult`. On failure the turn is rolled back so history never corrupts. Call `InitializeAsync` once after construction if you configured LSP servers or set `EnableScheduleRuntime` (it starts the schedule runtime that executes due `schedule_*` definitions while the session is open; see [Scheduled tasks](../README.md#scheduled-tasks)).
 
 ### `SessionOptions`
 
@@ -164,6 +164,7 @@ public sealed record SessionOptions
     public int MaxStopContinuations { get; init; } = 10;
     public int AutoCompactTokenThreshold { get; init; } = 100_000; // 0 disables auto-compaction
     public string? OutputStyle { get; init; }                    // persona, e.g. "concise"
+    public bool EnableScheduleRuntime { get; init; }             // execute due schedules while the session is open (interactive/serve; default false)
 }
 ```
 
@@ -254,7 +255,7 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `web_fetch`, `web_search` | yes | fetch a URL as text; DuckDuckGo search |
 | `todo_write` | yes | maintain a live session checklist |
 | `ask_user_question`, `exit_plan_mode` | — | ask the host a question; submit a plan for approval |
-| `schedule_create`, `schedule_list`, `schedule_delete` | mixed | cron-style scheduled tasks |
+| `schedule_create`, `schedule_list`, `schedule_delete` | mixed | create/list/delete scheduled tasks (`every`/`at`/`cron`); each firing runs as a `TaskKind.Scheduled` background agent while the session is open |
 | `task_start`, `task_output`, `task_stop`, `sleep` | mixed | long-running background jobs + polling |
 | `task_list`, `task_get`, `task_peek`, `task_send` | yes | list all tasks, read one task, peek recent output, steer a running agent task (subagent or scheduled) |
 | `task_wait`, `task_background`, `task_remove` | yes | wait for a task to finish (optional `timeout_seconds`, default 600, max 1800; timeout leaves it running), move a running foreground shell to the background, remove a finished task (log preserved) |

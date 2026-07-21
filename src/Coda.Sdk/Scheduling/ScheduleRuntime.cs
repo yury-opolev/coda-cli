@@ -14,7 +14,7 @@ namespace Coda.Sdk.Scheduling;
 /// or finalize one-shots. Deletion, terminal, and disposal races are resolved by the loop rather
 /// than by locks shared with the store, so store and runtime locks never invert.
 ///
-/// <para>The runtime never disposes the <see cref="TaskManager"/>; a later task orders runtime
+/// <para>The runtime never disposes the <see cref="TaskManager"/>; <c>CodaSession</c> orders runtime
 /// shutdown strictly before task-manager disposal so a due firing cannot register after task
 /// shutdown begins.</para>
 /// </summary>
@@ -179,7 +179,7 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
 
     /// <summary>
     /// Idempotently stops the loop and awaits its completion. Prevents any further claims and
-    /// completes before the caller (a later task) disposes the <see cref="TaskManager"/>. Does
+    /// completes before the caller (<c>CodaSession</c>) disposes the <see cref="TaskManager"/>. Does
     /// <em>not</em> dispose the task manager.
     /// </summary>
     public async ValueTask DisposeAsync()

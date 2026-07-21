@@ -6,7 +6,7 @@ namespace Coda.Agent.Tools;
 
 /// <summary>
 /// Lists all currently scheduled tasks, combining the persisted store snapshot with the live
-/// runtime-state view (idle/running/pending). Bookkeeping-only; runs without a permission prompt.
+/// runtime-state view (idle/running/pending). Read-only; runs without a permission prompt.
 /// </summary>
 public sealed class ScheduleListTool : ITool
 {
