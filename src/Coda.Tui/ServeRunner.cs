@@ -455,6 +455,10 @@ public static class ServeRunner
             GoalMaxContinuations = options.GoalMaxContinuations,
             // MCP (and any future host-supplied) tools. Empty unless serve connected MCP servers.
             ExtraTools = extraTools ?? [],
+            // Serve owns the schedule runtime (parity with interactive) so persisted, project-scoped
+            // schedules resume and fire as isolated agent runs. Headless one-shot (`coda run`) keeps
+            // the default (false). ServeHost drives CodaSession.InitializeAsync to start it.
+            EnableScheduleRuntime = true,
             // Telemetry layering (force-on, level, "off" special case) lives entirely in
             // TelemetryResolver — the single authority. Serve only passes its inputs through.
             TelemetryOverride = TelemetryResolver.ResolveServeOverride(

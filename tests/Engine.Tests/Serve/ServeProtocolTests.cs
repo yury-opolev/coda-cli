@@ -38,6 +38,7 @@ public sealed class ServeProtocolTests
         Assert.Equal("event/stop", ServeMethods.EventStop);
         Assert.Equal("event/usage", ServeMethods.EventUsage);
         Assert.Equal("event/turnComplete", ServeMethods.EventTurnComplete);
+        Assert.Equal("event/scheduleLifecycle", ServeMethods.EventScheduleLifecycle);
         Assert.Equal("request/permission", ServeMethods.RequestPermission);
         Assert.Equal("request/question", ServeMethods.RequestQuestion);
         Assert.Equal("request/planApproval", ServeMethods.RequestPlanApproval);
@@ -314,6 +315,58 @@ public sealed class ServeProtocolTests
         var result = RoundTrip(original);
         Assert.Equal(original.StopReason, result.StopReason);
         Assert.Equal(original.Interrupted, result.Interrupted);
+    }
+
+    // ── ScheduleLifecycleEvent (event/scheduleLifecycle wire DTO) ────────────
+
+    [Fact]
+    public void ScheduleLifecycleEvent_round_trips()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-21T12:34:56+00:00");
+        var original = new ScheduleLifecycleEvent("def-1", "nightly backup", "task-9", "started", ts, "spawned");
+        var result = RoundTrip(original);
+        Assert.Equal("def-1", result.DefinitionId);
+        Assert.Equal("nightly backup", result.DefinitionName);
+        Assert.Equal("task-9", result.TaskId);
+        Assert.Equal("started", result.State);
+        Assert.Equal(ts, result.Timestamp);
+        Assert.Equal("spawned", result.Summary);
+    }
+
+    [Fact]
+    public void ScheduleLifecycleEvent_wire_keys_are_camelCase_named_fields_not_valuetuple()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-21T12:34:56+00:00");
+        var node = ServeJson.ToNode(
+            new ScheduleLifecycleEvent("def-1", "nightly", "task-9", "completed", ts, "done"))!;
+
+        Assert.Equal("def-1", node["definitionId"]!.GetValue<string>());
+        Assert.Equal("nightly", node["definitionName"]!.GetValue<string>());
+        Assert.Equal("task-9", node["taskId"]!.GetValue<string>());
+        Assert.Equal("completed", node["state"]!.GetValue<string>());
+        Assert.NotNull(node["timestamp"]);
+        Assert.Equal("done", node["summary"]!.GetValue<string>());
+
+        // A positional record must never serialize as a ValueTuple (Item1/Item2/…).
+        Assert.Null(node["item1"]);
+        Assert.Null(node["Item1"]);
+    }
+
+    [Fact]
+    public void ScheduleLifecycleEvent_optional_fields_omitted_when_null()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-21T12:34:56+00:00");
+        var node = ServeJson.ToNode(
+            new ScheduleLifecycleEvent("def-1", null, null, "failed", ts, null))!;
+
+        Assert.Null(node["definitionName"]);
+        Assert.Null(node["taskId"]);
+        Assert.Null(node["summary"]);
+
+        // Required fields are always present.
+        Assert.Equal("def-1", node["definitionId"]!.GetValue<string>());
+        Assert.Equal("failed", node["state"]!.GetValue<string>());
+        Assert.NotNull(node["timestamp"]);
     }
 
     [Fact]

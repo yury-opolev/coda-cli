@@ -27,6 +27,7 @@ public static class ServeMethods
     public const string EventTurnComplete = "event/turnComplete";
     public const string EventStreamProgress = "event/streamProgress";
     public const string EventToolProgress = "event/toolProgress";
+    public const string EventScheduleLifecycle = "event/scheduleLifecycle";
 
     // Server-initiated requests (Coda → orchestrator)
     public const string RequestPermission = "request/permission";

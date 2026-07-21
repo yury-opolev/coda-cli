@@ -24,6 +24,13 @@ public sealed class ServeHost : IAsyncDisposable
     private volatile bool authenticated;
     private readonly TaskCompletionSource shutdownTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    // The shared initialization gate. Created BEFORE the read loop starts so a handler dispatched the
+    // instant the loop goes live (initialize/prompt) can await the SAME readiness signal instead of
+    // racing a not-yet-created task. RunAsync — never a handler — drives CodaSession.InitializeAsync
+    // and completes/faults/cancels this gate, so `initialize` awaiting it can never deadlock on itself.
+    private readonly TaskCompletionSource initializationGate =
+        new(TaskCreationOptions.RunContinuationsAsynchronously);
+
     // Built in RunAsync before handlers are registered.
     private JsonRpcConnection? connection;
     private CodaSession? session;
@@ -79,10 +86,32 @@ public sealed class ServeHost : IAsyncDisposable
         // mid-LLM-call turn reads as "working", not "hung".
         this.session.StreamProgressSink = new WireStreamProgressSink(this.connection);
 
+        // Wire the schedule-lifecycle sink BEFORE initialization so the session-owned schedule
+        // runtime (started by InitializeAsync below) publishes typed event/scheduleLifecycle
+        // notifications through the live connection. Set before Start; nothing writes until a turn
+        // streams or a schedule fires.
+        this.session.ScheduleLifecycleSink = new WireScheduleLifecycleSink(this.connection);
+
+        // Observe the shared gate's fault so a failed initialization is never surfaced as an
+        // unobserved task exception even if no handler happens to await it.
+        ObserveGateFault(this.initializationGate.Task);
+
         this.RegisterHandlers(cancellationToken);
 
-        // All handlers exist now — safe to start reading inbound requests.
+        // All handlers exist now — safe to start reading inbound requests. The read loop must be
+        // live BEFORE InitializeAsync so a schedule that fires during startup can issue a
+        // server→client permission/question/plan request (and read its response) without deadlock.
         this.connection.Start();
+
+        // Drive initialization AFTER Start, off the read-loop thread. CodaSession.InitializeAsync is
+        // idempotent and concurrency-safe, so although `initialize`'s auth + session resume runs
+        // concurrently with this, the schedule runtime starts exactly once (never twice). Chosen
+        // ordering: the schedule store is project-scoped (it lives under the working directory, not
+        // the transcript id) and every scheduled run is isolated (its own history), so the runtime
+        // does not depend on the resumed session id/history — concurrent resume is safe. The
+        // `initialize` and `session/prompt` handlers await this same gate before reporting readiness
+        // / running a turn.
+        _ = this.DriveInitializationAsync(cancellationToken);
 
         // Wait until shutdown is requested, the CT fires, or the connection closes.
         using var reg = cancellationToken.Register(() => this.shutdownTcs.TrySetResult());
@@ -96,7 +125,11 @@ public sealed class ServeHost : IAsyncDisposable
             // Cancel-first teardown. Cancel any running turn so its token reaches the
             // in-flight HttpClient.SendAsync and the turn unwinds, THEN await the session's
             // async disposal (no sync-over-async — that previously self-deadlocked/leaked a
-            // turn-running session across the host's lifetime). Dispose the connection last.
+            // turn-running session across the host's lifetime). CodaSession.DisposeAsync stops the
+            // schedule runtime strictly before the task manager, so no schedule can fire after
+            // teardown begins. The connection is disposed LAST so a disposal-time lifecycle event
+            // still reaches the orchestrator (never a write after the transport is gone). Bounded by
+            // the session's own SyncDisposeBudget (never a shorter, redundant timeout).
             this.CancelTurn();
 
             if (this.session is not null)
@@ -105,7 +138,7 @@ public sealed class ServeHost : IAsyncDisposable
                 {
                     await this.session.DisposeAsync()
                         .AsTask()
-                        .WaitAsync(TimeSpan.FromSeconds(5))
+                        .WaitAsync(CodaSession.SyncDisposeBudget)
                         .ConfigureAwait(false);
                 }
                 catch
@@ -130,8 +163,9 @@ public sealed class ServeHost : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        // Same cancel-first order as RunAsync's finally: cancel the turn, await the
-        // session's async disposal, then dispose the connection.
+        // Same cancel-first order as RunAsync's finally: cancel the turn, await the session's async
+        // disposal (bounded by the session's own SyncDisposeBudget so the schedule runtime + task
+        // manager tear down within a consistent, non-shorter bound), then dispose the connection.
         this.CancelTurn();
 
         if (this.session is not null)
@@ -140,7 +174,7 @@ public sealed class ServeHost : IAsyncDisposable
             {
                 await this.session.DisposeAsync()
                     .AsTask()
-                    .WaitAsync(TimeSpan.FromSeconds(5))
+                    .WaitAsync(CodaSession.SyncDisposeBudget)
                     .ConfigureAwait(false);
             }
             catch
@@ -161,6 +195,42 @@ public sealed class ServeHost : IAsyncDisposable
             }
         }
     }
+
+    /// <summary>
+    /// Drives the session's initialization (LSP servers + schedule runtime) after the read loop is
+    /// live, then completes/faults/cancels the shared <see cref="initializationGate"/> so every
+    /// handler awaiting it observes the outcome consistently. A fault is surfaced to those awaiters
+    /// (e.g. as an <c>initialize</c> error); the session already disposed any half-started runtime
+    /// on a failed start (Task 7), so no runtime is leaked here.
+    /// </summary>
+    private async Task DriveInitializationAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await this.session!.InitializeAsync(cancellationToken).ConfigureAwait(false);
+            this.initializationGate.TrySetResult();
+        }
+        catch (OperationCanceledException)
+        {
+            this.initializationGate.TrySetCanceled(cancellationToken);
+        }
+        catch (Exception ex)
+        {
+            this.initializationGate.TrySetException(ex);
+        }
+    }
+
+    /// <summary>
+    /// Ensures a faulted initialization gate is always observed, so a start failure that no handler
+    /// happens to await never surfaces as an <see cref="TaskScheduler.UnobservedTaskException"/>.
+    /// Other awaiters still see the fault (observing here does not consume it).
+    /// </summary>
+    private static void ObserveGateFault(Task gate) =>
+        _ = gate.ContinueWith(
+            static t => { _ = t.Exception; },
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
 
     private void RegisterHandlers(CancellationToken hostCt)
     {
@@ -195,6 +265,14 @@ public sealed class ServeHost : IAsyncDisposable
                 sess.Resume(resumeId, messages);
             }
 
+            // Await the shared initialization (LSP + schedule runtime) the host drives after Start,
+            // so the InitializeResult is not returned until the session is actually ready — and a
+            // failed init surfaces here as an initialize error. This awaits the SAME gate the host
+            // completes from InitializeAsync (never a fresh, self-referential call), so it cannot
+            // deadlock on itself. Auth + resume above run first so the session id/history are
+            // correct before readiness is reported.
+            await this.initializationGate.Task.WaitAsync(ct).ConfigureAwait(false);
+
             // Report the telemetry log file so the orchestrator can surface/tail it.
             // Null when telemetry is off (no file is opened); omitted from the wire then.
             return ServeJson.ToNode(new InitializeResult(
@@ -208,6 +286,12 @@ public sealed class ServeHost : IAsyncDisposable
         conn.OnRequestAsync(ServeMethods.Prompt, async (paramsNode, ct) =>
         {
             this.EnsureAuthenticated();
+
+            // A turn must never run before initialization: await the shared gate (LSP + schedule
+            // runtime up) the host drives after Start. A failed init surfaces its fault here rather
+            // than running a turn against a half-initialized session. This enforces the one-turn
+            // guard below only once the session is ready.
+            await this.initializationGate.Task.WaitAsync(ct).ConfigureAwait(false);
 
             // Parse and validate BEFORE acquiring the turn guard so a bad image
             // doesn't leave the guard stuck.

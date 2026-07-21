@@ -431,6 +431,28 @@ public sealed class ServeRunnerTests
     }
 
     [Fact]
+    public void BuildSessionOptions_enables_schedule_runtime()
+    {
+        // Serve owns the schedule runtime (parity with interactive) so persisted, project-scoped
+        // schedules resume and fire as isolated agent runs. Headless one-shot keeps the default.
+        var options = ServeRunner.Parse(["--cwd", "C:\\x"]);
+
+        var so = ServeRunner.BuildSessionOptions(options);
+
+        Assert.True(so.EnableScheduleRuntime);
+
+        // A bare SessionOptions (the headless/default shape) must NOT enable the runtime — the serve
+        // builder is what flips it on, only where intended.
+        var headlessDefault = new SessionOptions
+        {
+            ProviderId = "claude",
+            Model = "m",
+            WorkingDirectory = "C:\\x",
+        };
+        Assert.False(headlessDefault.EnableScheduleRuntime);
+    }
+
+    [Fact]
     public void BuildSessionOptions_threads_extra_tools_through()
     {
         var options = ServeRunner.Parse(["--cwd", "C:\\x"]);
