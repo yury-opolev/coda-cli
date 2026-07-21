@@ -187,6 +187,22 @@ public sealed class PlainOutputRendererTests
     }
 
     [Fact]
+    public async Task Double_escaped_clear_screen_cannot_reform_a_live_sequence()
+    {
+        // Regression: stripping the inner ESC[2J must not leave the leading ESC glued to a literal
+        // "[2J" that reforms a live clear-screen once written to the terminal.
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer);
+
+        await renderer.ApplyEventAsync(new CommandOutputEvent("\u001B\u001B[2J[2J"), CancellationToken.None);
+        await renderer.ApplyEventAsync(new CommandOutputEvent("\u001B\u001BA[2J"), CancellationToken.None);
+
+        var output = writer.ToString();
+        Assert.DoesNotContain('\u001b', output);
+        Assert.DoesNotContain("\u001b[", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Frame_only_events_produce_no_plain_output()
     {
         var writer = new StringWriter();

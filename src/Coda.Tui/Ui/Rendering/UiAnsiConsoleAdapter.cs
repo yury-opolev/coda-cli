@@ -1,6 +1,5 @@
 using System.Text;
 using Coda.Tui.Ui.Events;
-using Coda.Tui.Ui.Tasks;
 using Spectre.Console;
 using Spectre.Console.Rendering;
 
@@ -93,7 +92,7 @@ public sealed class UiAnsiConsoleAdapter : IAnsiConsole
             return;
         }
 
-        var stripped = TaskTextSanitizer.StripAnsiEscapes(raw);
+        var stripped = TerminalTextSanitizer.StripAnsiEscapes(raw);
         var normalized = NormalizeNewlines(stripped);
         if (!HasVisibleContent(normalized))
         {

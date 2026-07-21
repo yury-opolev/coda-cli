@@ -20,6 +20,23 @@ public sealed class UiAnsiConsoleAdapterTests
     }
 
     [Fact]
+    public void Double_escaped_clear_screen_cannot_reform_a_live_sequence()
+    {
+        // Even if raw ESC bytes reach the adapter's drain path, the shared sanitizer must guarantee no
+        // ESC (and therefore no reformed CSI) is ever published.
+        var events = new List<UiEvent>();
+        var console = new UiAnsiConsoleAdapter(new CollectingPublisher(events), 80, 24);
+
+        console.Write(new Text("\u001B\u001B[2J[2J body"));
+
+        foreach (var e in events.OfType<CommandOutputEvent>())
+        {
+            Assert.DoesNotContain('\u001b', e.Text);
+            Assert.DoesNotContain("\u001b[", e.Text, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
     public void Clear_publishes_semantic_clear_instead_of_escape_sequences()
     {
         var events = new List<UiEvent>();

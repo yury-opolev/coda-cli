@@ -17,8 +17,8 @@ internal sealed record TaskLogTail(string Text, string? Error);
 /// retries once from the fresh length, then returns whatever remains. A missing file or directory is an
 /// empty (not error) result; only a genuine IO/permission failure sets <see cref="TaskLogTail.Error"/>.
 /// Sanitization is intentionally NOT performed here — the caller (TaskBrowserController / the plain and
-/// Spectre <c>/tasks</c> snapshots) runs <see cref="TaskTextSanitizer"/> so this reader stays a pure,
-/// byte-faithful tail. The method never throws except to honor cancellation.
+/// Spectre <c>/tasks</c> snapshots) runs <see cref="Rendering.TerminalTextSanitizer"/> so this reader
+/// stays a pure, byte-faithful tail. The method never throws except to honor cancellation.
 /// </summary>
 internal static class TaskLogTailReader
 {

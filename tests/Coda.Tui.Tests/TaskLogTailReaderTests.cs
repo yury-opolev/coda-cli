@@ -1,4 +1,5 @@
 using System.Text;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Tasks;
 using Xunit;
 
@@ -240,12 +241,12 @@ public sealed class TaskLogTailReaderTests : IDisposable
     [Fact]
     public async Task ReaderReturnsRawText_SanitizationIsTheControllersJob()
     {
-        // Per plan, TaskBrowserController sanitizes tail.Text via TaskTextSanitizer; the reader itself
+        // Per plan, TaskBrowserController sanitizes tail.Text via TerminalTextSanitizer; the reader itself
         // returns bytes decoded verbatim so this ownership boundary stays explicit.
         var path = Write("ansi.log", Encoding.UTF8.GetBytes("\x1B[31mred\x1B[0m"));
         var tail = await TaskLogTailReader.ReadTailAsync(path, maxBytes: 1024);
 
         Assert.Contains('\u001b', tail.Text);
-        Assert.Equal("red", TaskTextSanitizer.Sanitize(tail.Text));
+        Assert.Equal("red", TerminalTextSanitizer.Sanitize(tail.Text));
     }
 }

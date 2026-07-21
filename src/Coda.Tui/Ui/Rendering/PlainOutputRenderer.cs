@@ -1,7 +1,6 @@
 using System.Globalization;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.State;
-using Coda.Tui.Ui.Tasks;
 
 namespace Coda.Tui.Ui.Rendering;
 
@@ -107,5 +106,5 @@ public sealed class PlainOutputRenderer : IUiEventObserver
 
     private static string TrimTrailingNewlines(string value) => value.TrimEnd('\r', '\n');
 
-    private static string Sanitize(string value) => TaskTextSanitizer.StripAnsiEscapes(value);
+    private static string Sanitize(string value) => TerminalTextSanitizer.StripAnsiEscapes(value);
 }
