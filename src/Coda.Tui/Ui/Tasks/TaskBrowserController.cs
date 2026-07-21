@@ -900,14 +900,12 @@ internal sealed class TaskBrowserController
     public string HandleBackgroundChord()
     {
         bool composerLocked;
-        TaskBrowserProvider? p;
+        TaskBrowserProvider? bound;
         string? selectedId;
         lock (this._sync)
         {
             composerLocked = this._isAttaching || this._isAttached;
-            // The chord fires while the browser is closed (never Open'd), so fall back to the live provider
-            // when nothing is bound — Ctrl+B backgrounds a running foreground shell without opening the browser.
-            p = this._bound ?? this.provider();
+            bound = this._bound;
             selectedId = this._state.SelectedTaskId;
         }
 
@@ -916,6 +914,13 @@ internal sealed class TaskBrowserController
             this.ReleaseAttachment();
             return this.SetStatusAndReturn("Released the attached shell view; resuming the agent.");
         }
+
+        // The chord fires while the browser is closed (never Open'd), so fall back to the live provider when
+        // nothing is bound — Ctrl+B backgrounds a running foreground shell without opening the browser. The
+        // external provider delegate is invoked OUTSIDE _sync (the bound snapshot was captured under the lock
+        // above) so a caller's provider can never deadlock against, or re-enter under contention, the
+        // controller lock; the captured snapshot is then used safely.
+        var p = bound ?? this.provider();
 
         if (p is null || SelectDetachTarget(p, selectedId) is not { } target)
         {

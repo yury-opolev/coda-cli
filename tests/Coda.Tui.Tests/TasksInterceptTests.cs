@@ -485,6 +485,186 @@ public sealed class TasksInterceptTests
         }
     }
 
+    // ---- Task 7 review regressions ---------------------------------------------------------------
+
+    [Fact]
+    public void Auto_release_while_browser_open_keeps_focus_on_browser_not_composer()
+    {
+        using var mgr = NewManager(out var dir);
+        try
+        {
+            var gate = new AgentExecutionGate();
+            var provider = new TaskBrowserProvider(mgr, gate);
+            var bg = mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);
+
+            using var host = ProviderShellHost.Begin(() => provider);
+            var app = host.App;
+            var shell = host.Shell;
+
+            // Open the browser (auto-selects the only running background shell) and attach to it.
+            Submit(shell, "/tasks");
+            var controller = shell.TaskController!;
+
+            bool overlayVisibleAfterRelease = false;
+            bool overlayFocusedAfterRelease = false;
+            bool composerFocusedAfterRelease = false;
+            bool attachedBeforeRelease = false;
+            bool lockedBeforeRelease = false;
+            bool escClosed = false;
+            bool composerFocusedAfterEsc = false;
+            Exception? failure = null;
+
+            var work = Task.Run(async () =>
+            {
+                try
+                {
+                    await controller.AttachAsync(CancellationToken.None);
+
+                    (attachedBeforeRelease, lockedBeforeRelease) = await OnUi(app, () =>
+                        (controller.IsAttached, !shell.Composer.InputEnabled));
+
+                    // The attached shell finishes: complete it and run a Sync pass so the controller
+                    // auto-releases the attachment (resuming the agent) and fires its marshaled onChanged —
+                    // exactly the composer-unlock path that must NOT steal focus from the open browser.
+                    mgr.Complete(bg.Id, "done");
+                    await controller.SyncAsync(CancellationToken.None);
+
+                    (overlayVisibleAfterRelease, overlayFocusedAfterRelease, composerFocusedAfterRelease) =
+                        await OnUi(app, () => (
+                            shell.TaskOverlay!.Visible,
+                            shell.TaskOverlay.HasFocus,
+                            shell.Composer.HasFocus));
+
+                    // Keyboard navigation still works: Esc closes the browser and only then returns focus
+                    // to the (now-unlocked) composer.
+                    escClosed = await OnUi(app, () =>
+                    {
+                        shell.TaskOverlay!.NewKeyDownEvent(Key.Esc);
+                        return !shell.TaskOverlay.Visible;
+                    });
+                    composerFocusedAfterEsc = await OnUi(app, () => shell.Composer.HasFocus);
+                }
+                catch (Exception ex)
+                {
+                    failure = ex;
+                }
+                finally
+                {
+                    app.Invoke(() => app.RequestStop());
+                }
+            });
+
+            _ = Task.Run(async () =>
+            {
+                await Task.Delay(TimeSpan.FromSeconds(15));
+                app.Invoke(() => app.RequestStop());
+            });
+
+            app.Run(shell, null);
+            work.GetAwaiter().GetResult();
+
+            Assert.Null(failure);
+            Assert.True(attachedBeforeRelease, "the attach must succeed so the composer is genuinely locked");
+            Assert.True(lockedBeforeRelease, "the composer must be locked while the attachment is active");
+            Assert.True(overlayVisibleAfterRelease, "the browser must stay open after the attachment auto-releases");
+            Assert.True(overlayFocusedAfterRelease, "the browser must retain focus when the composer unlocks");
+            Assert.False(composerFocusedAfterRelease, "the composer must NOT steal focus while the browser is open");
+            Assert.True(escClosed, "keyboard navigation must still work: Esc closes the browser");
+            Assert.True(composerFocusedAfterEsc, "focus returns to the composer only after the browser closes");
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
+    [Fact]
+    public void Repeated_tasks_open_while_active_is_idempotent_and_keeps_one_subscription_and_pump()
+    {
+        using var mgr = NewManager(out var dir);
+        try
+        {
+            var providerCalls = 0;
+            var provider = new TaskBrowserProvider(mgr, new AgentExecutionGate());
+            Func<TaskBrowserProvider?> factory = () =>
+            {
+                providerCalls++;
+                return provider;
+            };
+            mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);
+
+            using var host = ProviderShellHost.Begin(factory);
+            var overlay = host.Shell.TaskOverlay!;
+            var controller = host.Shell.TaskController!;
+
+            Submit(host.Shell, "/tasks");
+            Assert.True(overlay.Visible);
+            Assert.True(overlay.HasFocus);
+            Assert.True(overlay.IsPumping);
+            Assert.Equal(1, mgr.SubscriptionCount);
+            var callsAfterFirstOpen = providerCalls;
+
+            // Re-invoking /tasks while the browser is already active must be a controller no-op: Show() owns
+            // Open() + the pump and is idempotent, so there is no re-Open (provider re-invocation), no
+            // subscription rebind/leak, and the live pump keeps running.
+            Submit(host.Shell, "/tasks");
+            Submit(host.Shell, "/tasks");
+
+            Assert.Equal(callsAfterFirstOpen, providerCalls);
+            Assert.Equal(1, mgr.SubscriptionCount);
+            Assert.Equal(1, controller.ChangedSubscriberCount);
+            Assert.True(overlay.IsPumping);
+            Assert.True(overlay.Visible);
+            Assert.True(overlay.HasFocus);
+
+            // Keyboard still works after the repeated opens.
+            overlay.NewKeyDownEvent(Key.Esc);
+            Assert.False(overlay.Visible);
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
+    [Fact]
+    public void HandleBackgroundChord_invokes_the_provider_outside_the_controller_lock()
+    {
+        using var mgr = NewManager(out var dir);
+        try
+        {
+            var fg = mgr.Register(TaskKind.Shell, "fg", parentTaskId: null, TaskExecutionMode.Foreground);
+            var provider = new TaskBrowserProvider(mgr, new AgentExecutionGate());
+
+            TaskBrowserController? controller = null;
+            var providerRanOffLock = false;
+            Func<TaskBrowserProvider?> factory = () =>
+            {
+                // Invoked by HandleBackgroundChord's fallback (the browser was never opened, so _bound is
+                // null). A concurrent read that takes the controller's _sync lock must complete while the
+                // provider runs; if the chord held _sync across this external call the probe would block
+                // until the timeout, proving the provider ran under the lock.
+                var probe = Task.Run(() => controller!.State);
+                providerRanOffLock = probe.Wait(TimeSpan.FromSeconds(2));
+                return provider;
+            };
+
+            using var fixture = RetainedShellFixture.Create(
+                activeWork: false,
+                taskBrowserProvider: factory);
+            controller = fixture.Shell.TaskController;
+
+            fixture.Shell.Composer.NewKeyDownEvent(Key.B.WithCtrl);
+
+            Assert.True(providerRanOffLock, "HandleBackgroundChord must invoke the external provider outside _sync");
+            Assert.Equal(TaskExecutionMode.Background, mgr.Get(fg.Id)!.Mode);
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
     // ---- Helpers ---------------------------------------------------------------------------------
 
     private static Task<T> OnUi<T>(IApplication app, Func<T> read)

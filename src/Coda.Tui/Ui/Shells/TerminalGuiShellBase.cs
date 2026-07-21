@@ -1038,9 +1038,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // forced hidden.
         this.SyncCompletion();
 
-        // Focus the editor on the transition back to ready, but never when a prompt is pending: the modal
-        // overlay stays topmost and keeps focus.
-        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible)
+        // Focus the editor on the transition back to ready, but never when a prompt is pending or the task
+        // browser is open: the modal prompt overlay stays topmost and keeps focus, and an open browser owns
+        // the keyboard — a composer unlock (e.g. an attachment auto-releasing on shell completion) must not
+        // steal focus out from under either.
+        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible && this.taskOverlay?.Visible != true)
         {
             this.Composer.SetFocus();
         }
@@ -1077,15 +1079,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     private void OpenTaskBrowser()
     {
-        if (this.taskOverlay is null)
-        {
-            return;
-        }
-
-        // Re-invoking the provider (inside Open) picks up the live TaskManager even though the overlay was
-        // built once; before the first turn the provider returns null and the browser opens empty.
-        this.taskController!.Open();
-        this.taskOverlay.Show();
+        // Show() owns controller.Open() + a fresh pump and is idempotent while already active, so a repeated
+        // /tasks never re-Opens (which would rebind the subscription and dispose the live pump under it).
+        // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
+        // was built once; before the first turn the provider returns null and the browser opens empty.
+        this.taskOverlay?.Show();
     }
 
     private void SetComposerAttachmentLock(bool locked)
@@ -1116,7 +1114,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         if (this.taskOverlay.Visible)
         {
-            // Still open: it keeps focus; never steal it back to the composer on a routine change.
+            // Still open: it must keep the keyboard. A composer unlock during an auto-release
+            // (Complete/Fail/Stop) must never steal focus, so reclaim it defensively — but a permission
+            // prompt (topmost) still wins.
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.taskOverlay.SetFocus();
+            }
+
             return;
         }
 
