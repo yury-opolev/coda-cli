@@ -3,7 +3,9 @@ using System.Linq;
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Lsp;
+using Coda.Sdk.Scheduling;
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Rendering;
 
 namespace Coda.Tui.Ui.State;
 
@@ -96,6 +98,7 @@ public static class UiReducer
                 e.Snapshot.LspServers.Count(s => s.State == LspServerState.Running),
                 e.Snapshot.LspServers.Count(s => s.State == LspServerState.Error)),
         },
+        ScheduleLifecycleChangedEvent e => ScheduleNotice(state, e.Lifecycle),
         McpRuntimeChangedEvent e => state with
         {
             McpRuntime = e.Snapshot,
@@ -138,6 +141,55 @@ public static class UiReducer
             Transcript = state.Transcript.Add(new NoticeTranscriptBlock(Guid.NewGuid(), text, level)),
             Notification = new UiNotification(text, level),
         };
+
+    // Longest summary appended to a Failed lifecycle notice before it is ellipsized. Keeps the notice
+    // compact and single-line; the full task result/output is never surfaced here.
+    private const int MaxScheduleSummaryLength = 200;
+
+    private static UiSessionSnapshot ScheduleNotice(UiSessionSnapshot state, ScheduleLifecycleEvent lifecycle)
+    {
+        var name = string.IsNullOrWhiteSpace(lifecycle.DefinitionName)
+            ? lifecycle.DefinitionId
+            : lifecycle.DefinitionName!;
+
+        var (text, level) = lifecycle.Kind switch
+        {
+            ScheduleLifecycleKind.Started => (
+                $"Scheduled task {name} started as {lifecycle.TaskId}",
+                UiNotificationLevel.Information),
+            ScheduleLifecycleKind.Completed => (
+                $"Scheduled task {name} completed",
+                UiNotificationLevel.Information),
+            ScheduleLifecycleKind.Failed => (
+                AppendSummary($"Scheduled task {name} failed", lifecycle.Summary),
+                UiNotificationLevel.Error),
+            ScheduleLifecycleKind.Stopped => (
+                $"Scheduled task {name} stopped",
+                UiNotificationLevel.Warning),
+            _ => ($"Scheduled task {name} changed", UiNotificationLevel.Information),
+        };
+
+        return Notice(state, text, level);
+    }
+
+    // Appends a sanitized, single-line, length-bounded summary to a failure headline. Sanitization is
+    // the same primitive the /tasks views use, so ANSI/control sequences and multi-line output can
+    // never spoof the terminal or break the notice onto extra lines.
+    private static string AppendSummary(string headline, string? summary)
+    {
+        var single = TerminalTextSanitizer.SanitizeSingleLine(summary);
+        if (single.Length == 0)
+        {
+            return headline;
+        }
+
+        if (single.Length > MaxScheduleSummaryLength)
+        {
+            single = single[..MaxScheduleSummaryLength] + "…";
+        }
+
+        return $"{headline}: {single}";
+    }
 
     private static UiSessionSnapshot AppendOrExtendAssistant(UiSessionSnapshot state, string delta)
     {

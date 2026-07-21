@@ -1,4 +1,5 @@
 using System.Runtime.CompilerServices;
+using System.Linq;
 using Coda.Agent;
 using Coda.Agent.Goals;
 using Coda.Sdk;
@@ -211,7 +212,7 @@ public sealed class AgentRunnerTests : IDisposable
         SessionOptions? captured = null;
         using var runner = new AgentRunner(
             extraToolsProvider: null,
-            sessionFactory: (ctx, options) =>
+            sessionFactory: (ctx, options, currentOptions) =>
             {
                 captured = options;
                 return new CodaSession(
@@ -221,13 +222,106 @@ public sealed class AgentRunnerTests : IDisposable
                     history: ctx.Session.History,
                     sessionId: ctx.Session.SessionId,
                     llmClientFactory: new StubClientFactory(new StubClient()),
-                    agentLoopFactory: new SingleLoopFactory(new ScriptedLoop()));
+                    agentLoopFactory: new SingleLoopFactory(new ScriptedLoop()),
+                    currentOptionsProvider: currentOptions);
             });
 
         await runner.RunAsync(context, "hi", CancellationToken.None);
 
         Assert.NotNull(captured);
         Assert.Same(session.PermissionModes, captured!.PermissionModeState);
+    }
+
+    // ── Eager session initialization (Task 8) ─────────────────────────────────
+
+    [Fact]
+    public async Task InitializeSessionAsync_creates_and_initializes_without_running_a_turn()
+    {
+        var events = new RecordingUiEvents();
+        var context = this.BuildContext(events, out var session);
+        var probe = new SessionProbe();
+        using var runner = this.ProbedRunner(new ScriptedLoop(), probe);
+
+        await runner.InitializeSessionAsync(context, CancellationToken.None);
+
+        // The session (and its live task registry + runtime snapshot) exists after eager init.
+        Assert.Equal(1, probe.Creations);
+        Assert.NotNull(runner.Tasks);
+        Assert.NotNull(runner.GetRuntimeSnapshot());
+
+        // No turn ran: history is untouched and no prompt/turn events were published.
+        Assert.Empty(session.History);
+        Assert.DoesNotContain(events.Events, e => e is UserPromptSubmittedEvent);
+        Assert.DoesNotContain(events.Events, e => e is TurnStartedEvent);
+        Assert.DoesNotContain(events.Events, e => e is TurnCompletedEvent);
+    }
+
+    [Fact]
+    public async Task Repeated_and_concurrent_InitializeSessionAsync_build_exactly_one_session()
+    {
+        var events = new RecordingUiEvents();
+        var context = this.BuildContext(events, out _);
+        var probe = new SessionProbe();
+        using var runner = this.ProbedRunner(new ScriptedLoop(), probe);
+
+        await Task.WhenAll(Enumerable.Range(0, 8).Select(_ => runner.InitializeSessionAsync(context)));
+        await runner.InitializeSessionAsync(context);
+
+        Assert.Equal(1, probe.Creations);
+    }
+
+    [Fact]
+    public async Task RunAsync_after_eager_init_reuses_the_same_session()
+    {
+        var events = new RecordingUiEvents();
+        var context = this.BuildContext(events, out _);
+        var probe = new SessionProbe();
+        using var runner = this.ProbedRunner(new ScriptedLoop(), probe);
+
+        await runner.InitializeSessionAsync(context, CancellationToken.None);
+        Assert.Equal(1, probe.Creations);
+
+        await runner.RunAsync(context, "hi", CancellationToken.None);
+
+        // The eagerly-created session is reused: no second session is constructed.
+        Assert.Equal(1, probe.Creations);
+        Assert.Contains(events.Events, e => e is TurnCompletedEvent);
+    }
+
+    [Fact]
+    public async Task BuildOptions_enables_schedule_runtime_and_the_live_provider_reflects_mutations()
+    {
+        var events = new RecordingUiEvents();
+        var context = this.BuildContext(events, out var session);
+        session.Model = "claude-sonnet-4-6";
+        session.Effort = "low";
+        session.OutputStyle = "concise";
+
+        var tools = new List<ITool>();
+        var probe = new SessionProbe();
+        using var runner = this.ProbedRunner(new ScriptedLoop(), probe, () => tools);
+
+        await runner.InitializeSessionAsync(context, CancellationToken.None);
+
+        // Interactive sessions opt into the schedule runtime.
+        Assert.True(probe.FirstOptions!.EnableScheduleRuntime);
+
+        // Mutate model/effort/output-style/permission/MCP-tools AFTER construction.
+        session.Model = "claude-opus-4-1";
+        session.Effort = "high";
+        session.OutputStyle = "explanatory";
+        session.PermissionMode = PermissionMode.BypassPermissions;
+        tools.Add(new FakeTool("mcp__server__do"));
+
+        var live = probe.LiveOptions!();
+
+        Assert.True(live.EnableScheduleRuntime);
+        Assert.Equal("claude-opus-4-1", live.Model);
+        Assert.Equal("high", live.Effort);
+        Assert.Equal("explanatory", live.OutputStyle);
+        Assert.Equal(PermissionMode.BypassPermissions, live.PermissionMode);
+        Assert.Same(session.PermissionModes, live.PermissionModeState);
+        Assert.Contains(live.ExtraTools, t => t.Name == "mcp__server__do");
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────
@@ -248,14 +342,56 @@ public sealed class AgentRunnerTests : IDisposable
 
     private AgentRunner NewRunner(IAgentLoop loop) => new(
         extraToolsProvider: null,
-        sessionFactory: (context, options) => new CodaSession(
+        sessionFactory: (context, options, currentOptions) => new CodaSession(
             context.Credentials,
             options,
             httpClient: this.http,
             history: context.Session.History,
             sessionId: context.Session.SessionId,
             llmClientFactory: new StubClientFactory(new StubClient()),
-            agentLoopFactory: new SingleLoopFactory(loop)));
+            agentLoopFactory: new SingleLoopFactory(loop),
+            currentOptionsProvider: currentOptions));
+
+    private AgentRunner ProbedRunner(IAgentLoop loop, SessionProbe probe, Func<IReadOnlyList<ITool>>? extraTools = null) => new(
+        extraToolsProvider: extraTools,
+        sessionFactory: (context, options, currentOptions) =>
+        {
+            Interlocked.Increment(ref probe.Creations);
+            probe.FirstOptions ??= options;
+            probe.LiveOptions ??= currentOptions;
+            return new CodaSession(
+                context.Credentials,
+                options,
+                httpClient: this.http,
+                history: context.Session.History,
+                sessionId: context.Session.SessionId,
+                llmClientFactory: new StubClientFactory(new StubClient()),
+                agentLoopFactory: new SingleLoopFactory(loop),
+                currentOptionsProvider: currentOptions);
+        });
+
+    /// <summary>Records session construction so tests can prove exactly-one and inspect built options.</summary>
+    private sealed class SessionProbe
+    {
+        public int Creations;
+        public SessionOptions? FirstOptions;
+        public Func<SessionOptions>? LiveOptions;
+    }
+
+    /// <summary>Minimal <see cref="ITool"/> used to prove the live options provider picks up new MCP tools.</summary>
+    private sealed class FakeTool(string name) : ITool
+    {
+        public string Name { get; } = name;
+
+        public string Description => "fake";
+
+        public string InputSchemaJson => "{}";
+
+        public bool IsReadOnly => false;
+
+        public Task<ToolResult> ExecuteAsync(System.Text.Json.JsonElement input, ToolContext context, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ToolResult(string.Empty));
+    }
 
     private CommandContext BuildContext(IUiEventPublisher events, out SessionState session)
     {

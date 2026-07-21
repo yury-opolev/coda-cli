@@ -5,6 +5,7 @@ using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Lsp;
 using Coda.Mcp;
 using Coda.Sdk;
+using Coda.Sdk.Scheduling;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.State;
 using LlmClient;
@@ -301,5 +302,94 @@ public sealed class UiReducerTests
     {
         Assert.Same(NullUiEventPublisher.Instance, NullUiEventPublisher.Instance);
         NullUiEventPublisher.Instance.Publish(new AssistantTextCompletedEvent());
+    }
+
+    // ── Scheduled task lifecycle notices (Task 8) ─────────────────────────────
+
+    [Fact]
+    public void Schedule_started_notice_uses_information_and_task_id()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Nightly started as task-9", text);
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_started_notice_falls_back_to_the_definition_id_when_unnamed()
+    {
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", null, "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task def-1 started as task-9", text);
+    }
+
+    [Fact]
+    public void Schedule_completed_notice_uses_information()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, "big result body"));
+
+        // Concise text only — the full task result/output is never inserted.
+        Assert.Equal("Scheduled task Nightly completed", text);
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_notice_uses_error_and_appends_a_short_summary()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, "boom happened"));
+
+        Assert.Equal("Scheduled task Nightly failed: boom happened", text);
+        Assert.Equal(UiNotificationLevel.Error, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_notice_without_summary_has_no_trailing_detail()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Nightly failed", text);
+        Assert.Equal(UiNotificationLevel.Error, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_summary_is_sanitized_single_line_and_bounded()
+    {
+        var noisy = "line one\nline two\twith tab\u001b[31mred" + new string('x', 400);
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, noisy));
+
+        Assert.StartsWith("Scheduled task Nightly failed: ", text);
+        Assert.DoesNotContain('\n', text);
+        Assert.DoesNotContain('\u001b', text);
+        // Bounded: the headline plus a capped, ellipsized summary — never the full 400+ char body.
+        Assert.True(text.Length < 260, $"summary not bounded: {text.Length}");
+    }
+
+    [Fact]
+    public void Schedule_stopped_notice_uses_warning()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Stopped, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Nightly stopped", text);
+        Assert.Equal(UiNotificationLevel.Warning, level);
+    }
+
+    private static (string Text, UiNotificationLevel Level) ReduceLifecycle(ScheduleLifecycleEvent lifecycle)
+    {
+        var state = UiReducer.Reduce(UiSessionSnapshot.Empty, new ScheduleLifecycleChangedEvent(lifecycle));
+
+        // Exactly one new notice block is appended, and the mirrored notification matches it.
+        var notice = Assert.IsType<NoticeTranscriptBlock>(Assert.Single(state.Transcript));
+        Assert.NotEqual(Guid.Empty, notice.Id);
+        Assert.NotNull(state.Notification);
+        Assert.Equal(notice.Text, state.Notification!.Message);
+        Assert.Equal(notice.Level, state.Notification.Level);
+        return (notice.Text, notice.Level);
     }
 }

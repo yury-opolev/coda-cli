@@ -21,9 +21,15 @@ namespace Coda.Tui.Agent;
 public sealed class AgentRunner : IDisposable
 {
     private readonly Func<IReadOnlyList<ITool>>? extraToolsProvider;
-    private readonly Func<CommandContext, SessionOptions, CodaSession> sessionFactory;
+    private readonly Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory;
     private readonly TimeProvider timeProvider;
     private readonly object turnGate = new();
+
+    // Serializes session creation so eager InitializeSessionAsync and the first RunAsync (or two
+    // concurrent InitializeSessionAsync callers) can never build two sessions. Never held across an
+    // await: only the synchronous create-and-publish is guarded; the session's own InitializeAsync is
+    // idempotent + concurrency-safe, so awaiting it outside the lock is correct.
+    private readonly object sessionGate = new();
 
     private CodaSession? session;
 
@@ -39,7 +45,7 @@ public sealed class AgentRunner : IDisposable
 
     internal AgentRunner(
         Func<IReadOnlyList<ITool>>? extraToolsProvider,
-        Func<CommandContext, SessionOptions, CodaSession> sessionFactory,
+        Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory,
         TimeProvider? timeProvider = null)
     {
         this.extraToolsProvider = extraToolsProvider;
@@ -156,12 +162,16 @@ public sealed class AgentRunner : IDisposable
         }
     }
 
-    private static CodaSession DefaultSessionFactory(CommandContext context, SessionOptions options) =>
+    private static CodaSession DefaultSessionFactory(
+        CommandContext context,
+        SessionOptions options,
+        Func<SessionOptions> currentOptionsProvider) =>
         new(
             context.Credentials,
             options,
             history: context.Session.History,
-            sessionId: context.Session.SessionId);
+            sessionId: context.Session.SessionId,
+            currentOptionsProvider: currentOptionsProvider);
 
     /// <summary>
     /// Register a fresh per-turn linked cancellation source. Overlapping turns are rejected rather
@@ -196,28 +206,62 @@ public sealed class AgentRunner : IDisposable
         cts.Dispose();
     }
 
+    /// <summary>
+    /// Eagerly create and initialize the session WITHOUT running a model turn or touching history:
+    /// starts configured LSP servers and (interactive) the schedule runtime so persisted schedules
+    /// resume before the first prompt. Idempotent and concurrency-safe — repeated/concurrent calls
+    /// build exactly one session and share its initialization (LSP + runtime start exactly once).
+    /// Publishes no <see cref="UserPromptSubmittedEvent"/>/<see cref="TurnStartedEvent"/>, so the
+    /// transcript is untouched.
+    /// </summary>
+    public Task InitializeSessionAsync(CommandContext context, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(context);
+        return this.EnsureSessionAsync(context, cancellationToken);
+    }
+
     private async Task EnsureSessionAsync(CommandContext context, CancellationToken cancellationToken)
     {
         // Created lazily and reused (so the HttpClient + conversation persist); the session shares
-        // the SessionState history list, so /clear resets both.
-        if (this.session is null)
+        // the SessionState history list, so /clear resets both. The gate makes creation atomic so an
+        // eager InitializeSessionAsync and the first RunAsync (or concurrent init callers) never build
+        // two sessions.
+        CodaSession session;
+        lock (this.sessionGate)
         {
-            this.session = this.sessionFactory(context, this.BuildOptions(context));
+            ObjectDisposedException.ThrowIf(this.disposed, this);
+            if (this.session is null)
+            {
+                // Live options provider evaluated per scheduled firing (never a construction snapshot),
+                // so a mid-session model/effort/output-style/MCP/permission change is observed by the
+                // next scheduled run.
+                var created = this.sessionFactory(context, this.BuildOptions(context), () => this.BuildOptions(context));
 
-            // If the session generated its own id (no resume seeded one), capture it back so /export,
-            // /resume, and later turns all reference the same id.
-            context.Session.SessionId ??= this.session.SessionId;
+                // If the session generated its own id (no resume seeded one), capture it back so /export,
+                // /resume, and later turns all reference the same id.
+                context.Session.SessionId ??= created.SessionId;
 
-            // Start configured LSP servers + diagnostics handlers (no-op when none are configured).
-            await this.session.InitializeAsync(cancellationToken).ConfigureAwait(false);
+                // Wire the lifecycle sink BEFORE InitializeAsync so runtime events reach the UI. It binds
+                // the CURRENT event sink + a fresh-snapshot provider; never a stale session capture.
+                created.ScheduleLifecycleSink = new TuiScheduleLifecycleSink(context.Events, created.GetRuntimeSnapshot);
+
+                this.session = created;
+            }
+
+            session = this.session;
         }
-        else if (context.Session.SessionId is { } id && this.session.SessionId != id)
+
+        // Idempotent + concurrency-safe inside CodaSession: repeated/concurrent callers await the same
+        // task, so LSP servers and the schedule runtime start exactly once (or observe the same fault).
+        await session.InitializeAsync(cancellationToken).ConfigureAwait(false);
+
+        if (context.Session.SessionId is { } id && session.SessionId != id)
         {
             // /resume changed the target id mid-session; adopt it so this turn appends to that transcript.
-            this.session.AdoptSessionId(id);
+            session.AdoptSessionId(id);
         }
 
-        this.session.Options = this.BuildOptions(context);
+        session.Options = this.BuildOptions(context);
     }
 
     private async Task<RunResult> RunTurnAsync(CommandContext context, string prompt, CancellationToken cancellationToken)
@@ -338,6 +382,9 @@ public sealed class AgentRunner : IDisposable
         Goal = context.Session.Goal,
         GoalMaxDuration = context.Session.GoalMaxDuration,
         GoalMaxContinuations = context.Session.GoalMaxContinuations,
+        // Interactive sessions own the schedule runtime so persisted schedules resume and fire as
+        // isolated agent runs. Headless/serve callers keep the default (false).
+        EnableScheduleRuntime = true,
     };
 
     private void RenderFailure(CommandContext context, string? error)

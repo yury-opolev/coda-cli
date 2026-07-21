@@ -97,6 +97,49 @@ public sealed class TasksInterceptTests
         Assert.Null(runner.ExecutionGate);
     }
 
+    [Fact]
+    public async Task Eager_init_exposes_a_populated_task_browser_before_the_first_prompt()
+    {
+        var dir = Path.Combine(Path.GetTempPath(), "coda-t8-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        using var http = new HttpClient(new FakeSessionRunner.BlockingHandler());
+        try
+        {
+            var context = FakeSessionRunner.CreateContext(dir, new RecordingUiEvents());
+            using var runner = FakeSessionRunner.Create(http);
+
+            // The provider InteractiveProgram wires off the live runner (Tasks + gate).
+            Func<TaskBrowserProvider?> providerFactory = () =>
+                runner.Tasks is { } tasks && runner.ExecutionGate is { } gate
+                    ? new TaskBrowserProvider(tasks, gate)
+                    : null;
+
+            // Before eager init there is no session: the provider is null and /tasks would open empty.
+            Assert.Null(providerFactory());
+
+            // Eager init creates + initializes the session BEFORE any prompt/turn.
+            await runner.InitializeSessionAsync(context, CancellationToken.None);
+
+            Assert.NotNull(runner.Tasks);
+            Assert.NotNull(runner.ExecutionGate);
+            Assert.NotNull(providerFactory());
+
+            // A resumed/registered scheduled task is visible immediately, before the first prompt.
+            runner.Tasks!.Register(TaskKind.Scheduled, "scheduled-run", parentTaskId: null, TaskExecutionMode.Background);
+
+            using var host = ProviderShellHost.Begin(providerFactory);
+            Submit(host.Shell, "/tasks");
+
+            Assert.NotNull(host.Shell.TaskOverlay);
+            Assert.True(host.Shell.TaskOverlay!.Visible);
+            Assert.Contains(providerFactory()!.Tasks.List(), t => t.Description == "scheduled-run");
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
     // ---- IsOpenRequest exact-match policy --------------------------------------------------------
 
     [Theory]
