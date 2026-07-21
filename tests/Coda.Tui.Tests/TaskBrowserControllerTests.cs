@@ -535,6 +535,125 @@ public sealed class TaskBrowserControllerTests : IDisposable
         Assert.True(_controller.State.HasNewOutput);
     }
 
+    [Fact]
+    public async Task Attach_TargetGoesTerminalDuringHandshake_ReleasesAtBoundary_WithoutFurtherSync()
+    {
+        // The exact terminal-during-attach-handshake race: while the pause lease is pending, the target
+        // shell completes and its terminal change is drained BEFORE AttachedTaskId is recorded — so the
+        // Sync-time auto-release cannot see it. The boundary finalize must re-check the live registry and
+        // release the lease/lock instead of pinning the pause to a dead shell (with no further Sync to
+        // rescue it).
+        var shell = _mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);
+        _controller.Open();
+        await _controller.SyncAsync(CancellationToken.None);
+        _controller.OpenDetail();
+
+        using var exec = _gate.BeginExecution(); // a turn is running: the attach parks at the pause boundary
+
+        var attach = _controller.AttachAsync(CancellationToken.None);
+        Assert.True(_controller.IsAttaching);
+        Assert.False(_controller.IsAttached);
+        Assert.Null(_controller.AttachedTaskId); // target is not recorded until the boundary is reached
+
+        // Target completes and the terminal event is drained while still only "attaching".
+        Assert.True(_mgr.Complete(shell.Id, "done"));
+        await _controller.SyncAsync(CancellationToken.None);
+        Assert.True(_controller.IsAttaching); // the drain did not (and could not) release it yet
+
+        exec.Dispose(); // reach the pause boundary -> AttachAsync finalizes
+        await attach;   // no further Sync happens after this point
+
+        AssertFullyReleased();
+        Assert.Contains(shell.Id, _controller.State.StatusMessage!);
+        Assert.Contains("resuming", _controller.State.StatusMessage!, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Pump_SurvivesThrowingChangedHandler_AndProcessesLaterEvents()
+    {
+        // A throwing Changed subscriber must not permanently kill the pump: the first change throws, but a
+        // later change is still applied to the projection and still fires Changed again.
+        _controller.Open();
+
+        var calls = 0;
+        _controller.Changed += () =>
+        {
+            if (Interlocked.Increment(ref calls) == 1)
+            {
+                throw new InvalidOperationException("boom on first change");
+            }
+        };
+
+        using var cts = new CancellationTokenSource();
+        var pump = _controller.PumpAsync(cts.Token);
+
+        _mgr.Register(TaskKind.Subagent, "a", parentTaskId: null);
+        await WaitUntilAsync(() => Volatile.Read(ref calls) >= 1);
+
+        var b = _mgr.Register(TaskKind.Subagent, "b", parentTaskId: null);
+        await WaitUntilAsync(() =>
+            _controller.State.Projection.AllRows.Any(r => r.Task.Id == b.Id) && Volatile.Read(ref calls) >= 2);
+
+        Assert.False(pump.IsCompleted, "the pump must survive a throwing Changed handler");
+
+        cts.Cancel();
+        await pump.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(pump.IsCompleted);
+    }
+
+    [Fact]
+    public async Task CloseDuringAttach_Race_NeverLeavesLeaseHeld()
+    {
+        // A cross-thread Close racing an Attach must never leave a pause lease held: Close atomically
+        // detaches (bumps the attach generation and captures the lease) under the same lock that nulls the
+        // binding, so a concurrent Attach either has its lease captured here or observes the closed binding
+        // and takes none.
+        for (var i = 0; i < 200; i++)
+        {
+            using var mgr = new TaskManager(sessionId: $"race-{i}", logRoot: _dir);
+            var gate = new AgentExecutionGate();
+            var provider = new TaskBrowserProvider(mgr, gate);
+            var controller = new TaskBrowserController(() => provider, _time);
+
+            mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);
+            controller.Open();
+            await controller.SyncAsync(CancellationToken.None);
+            controller.OpenDetail(); // the sole row is a running background shell -> attachable
+
+            var start = new Barrier(2);
+            var attach = Task.Run(async () =>
+            {
+                start.SignalAndWait();
+                await controller.AttachAsync(CancellationToken.None);
+            });
+            var close = Task.Run(() =>
+            {
+                start.SignalAndWait();
+                controller.Close();
+            });
+
+            await Task.WhenAll(attach, close);
+
+            controller.Close(); // idempotent belt-and-suspenders
+            Assert.False(controller.IsAttached, $"iteration {i}: attachment survived Close");
+            Assert.False(gate.IsPaused, $"iteration {i}: a pause lease survived Close");
+        }
+    }
+
+    private static async Task WaitUntilAsync(Func<bool> condition, int timeoutMs = 5000)
+    {
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        while (!condition())
+        {
+            if (sw.ElapsedMilliseconds > timeoutMs)
+            {
+                throw new TimeoutException("Condition was not met within the timeout.");
+            }
+
+            await Task.Delay(10);
+        }
+    }
+
     private async Task<string> AttachToRunningBackgroundShellAsync()
     {
         var shell = _mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);

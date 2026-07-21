@@ -127,6 +127,12 @@ internal sealed class TaskBrowserController
     /// Binds the provider/manager and seeds the projection from the manager's initial snapshot. Defensive:
     /// tears down any prior subscription/attachment/refresh first so a re-open never leaks a subscription.
     /// A null provider leaves the browser empty (and the pump exits at once).
+    /// <para><b>Pump ownership contract.</b> The pump is caller-owned: each <see cref="Open"/> supersedes the
+    /// previous binding by disposing its subscription (which completes and closes any in-flight
+    /// <see cref="PumpAsync"/>), so the caller MUST start a fresh <see cref="PumpAsync"/> after every
+    /// <see cref="Open"/>. A pump started against a prior binding will observe <c>IsClosed</c> and exit; it
+    /// does not automatically re-attach to the new subscription. The controller intentionally does not own or
+    /// restart the pump.</para>
     /// </summary>
     public void Open()
     {
@@ -157,7 +163,13 @@ internal sealed class TaskBrowserController
         this.RaiseChanged();
     }
 
-    /// <summary>Long-running pump: waits for changes, then applies one <see cref="SyncAsync"/> pass. Exits on cancel/close.</summary>
+    /// <summary>
+    /// Long-running pump: waits for changes, then applies one <see cref="SyncAsync"/> pass. Exits on
+    /// cancel/close. Caller-owned and single-flight: bind first with <see cref="Open"/>, then start exactly
+    /// one pump; each subsequent <see cref="Open"/> closes this pump's subscription (so it exits) and requires
+    /// a fresh pump. Resilient: a throwing <see cref="Changed"/> subscriber or a transient Sync fault is
+    /// isolated and the loop continues; only owner cancellation or manager/subscription closure exits.
+    /// </summary>
     public async Task PumpAsync(CancellationToken cancellationToken)
     {
         TaskSubscription? sub;
@@ -181,9 +193,17 @@ internal sealed class TaskBrowserController
                 await sub.WaitAsync(cancellationToken).ConfigureAwait(false);
                 await this.SyncAsync(cancellationToken).ConfigureAwait(false);
             }
-            catch (OperationCanceledException)
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
             {
+                // Owner-requested cancellation is a real exit — never swallowed.
                 return;
+            }
+            catch
+            {
+                // A transient Sync/manager fault (or a throwing Changed subscriber that escaped the per-handler
+                // isolation) must not permanently kill the pump. Swallow and continue: a real teardown
+                // (manager disposal -> subscription closed) is observed by the loop guard and exits cleanly, and
+                // the drained queue means the next WaitAsync parks rather than busy-spins.
             }
         }
     }
@@ -193,14 +213,31 @@ internal sealed class TaskBrowserController
 
     private void CloseCore()
     {
-        // Release the attachment first (drops the pause lease, resuming the agent) — this raises Changed
-        // itself if an attachment was active, and is done before we take _sync below.
-        this.ReleaseAttachment();
-
+        // Everything that could hand out or hold a pause lease is detached ATOMICALLY under _sync, then the
+        // captured disposables are cancelled/disposed OUTSIDE the lock (Changed is never raised under it).
+        // Bumping the attach generation under the same lock that nulls the binding closes the cross-thread
+        // Attach/Close race: a concurrent AttachAsync either (a) ran its lease-taking lock before this block,
+        // so its lease is captured here and its finalize observes the bumped generation and no-ops, or (b)
+        // runs after this block, observes the nulled binding, and takes no lease at all. Either way no lease
+        // can survive Close. Idempotent: a second call finds everything already null and does nothing.
         CancellationTokenSource? outputCts;
+        CancellationTokenSource? attachCts;
+        IDisposable? lease;
         TaskSubscription? sub;
+        bool wasActive;
         lock (this._sync)
         {
+            // Detach the attach operation: supersede any in-flight AttachAsync finalize and capture the lease.
+            this._attachGeneration++;
+            attachCts = this._attachCts;
+            this._attachCts = null;
+            lease = this._pauseLease;
+            this._pauseLease = null;
+            this._attachedTaskId = null;
+            wasActive = this._isAttaching || this._isAttached;
+            this._isAttaching = false;
+            this._isAttached = false;
+
             // Supersede any in-flight output read and invalidate stale async applies.
             this._outputGeneration++;
             this._openEpoch++;
@@ -216,9 +253,17 @@ internal sealed class TaskBrowserController
             this._selectedOutputError = null;
         }
 
+        attachCts?.Cancel();
+        attachCts?.Dispose();
+        lease?.Dispose(); // resume the main agent — no pause lease may outlive the controller binding
         outputCts?.Cancel();
         outputCts?.Dispose();
         sub?.Dispose(); // wakes any parked pump so it can observe IsClosed and exit
+
+        if (wasActive)
+        {
+            this.RaiseChanged();
+        }
     }
 
     // ---- Change pump ----
@@ -626,7 +671,10 @@ internal sealed class TaskBrowserController
     /// <para>The finalization is guarded by an operation-identity generation: after
     /// <see cref="AgentExecutionGate.WaitUntilPaused"/> completes, <see cref="IsAttached"/> is set only if
     /// this attach is still the current operation, so a concurrent <see cref="ReleaseAttachment"/> can never
-    /// leave the browser attached while the pause lease has already been dropped.</para>
+    /// leave the browser attached while the pause lease has already been dropped. Finalization also re-checks
+    /// the live registry: if the target completed/failed/stopped (or was pruned) while the pause was pending
+    /// — a transition whose event may have been drained before the target id was recorded — the lease is
+    /// released immediately instead of attaching to a dead shell.</para>
     /// </summary>
     public async Task AttachAsync(CancellationToken cancellationToken)
     {
@@ -684,17 +732,25 @@ internal sealed class TaskBrowserController
             // Esc (ReleaseAttachment) cancelled the pending wait, or the caller's token fired.
         }
 
+        // Re-check the live registry at the boundary. While the pause was pending the target may have
+        // completed/failed/stopped (or been pruned) and its terminal change may have already been drained by
+        // a Sync BEFORE AttachedTaskId was set — so the Sync-time auto-release never saw it. Attaching now
+        // would pin the pause lease to a dead shell with no further Sync to release it, so finalize must
+        // resume the main agent instead. The read is a cheap lock-free registry lookup done outside _sync.
+        var targetLive = reached && !token.IsCancellationRequested && IsTargetAttachable(p, targetId);
+
         var attached = false;
         var releaseInline = false;
+        string? goneStatus = null;
         lock (this._sync)
         {
             if (op != this._attachGeneration)
             {
-                // Superseded by ReleaseAttachment (which already dropped the lease): cleanup is owned there.
+                // Superseded by ReleaseAttachment/Close (which already dropped the lease): cleanup is owned there.
                 return;
             }
 
-            if (reached && !token.IsCancellationRequested)
+            if (reached && !token.IsCancellationRequested && targetLive)
             {
                 this._isAttaching = false;
                 this._isAttached = true;
@@ -704,18 +760,36 @@ internal sealed class TaskBrowserController
             else
             {
                 releaseInline = true;
+                if (reached && !token.IsCancellationRequested && !targetLive)
+                {
+                    // Reached the boundary but the target is no longer a running background shell.
+                    goneStatus = $"Attached shell '{targetId}' finished; resuming the agent.";
+                }
             }
         }
 
         if (releaseInline)
         {
-            this.ReleaseAttachment(); // wait cancelled/failed but still current: drop the lease + reset
+            if (goneStatus is not null)
+            {
+                lock (this._sync)
+                {
+                    this._state = this._state.WithStatus(goneStatus);
+                }
+            }
+
+            // Wait cancelled/failed, or the target went terminal during the handshake: drop the lease + reset.
+            this.ReleaseAttachment();
         }
         else if (attached)
         {
             this.RaiseChanged();
         }
     }
+
+    /// <summary>Live registry re-check: the id still resolves to a running background shell (attachable).</summary>
+    private static bool IsTargetAttachable(TaskBrowserProvider p, string id) =>
+        p.Tasks.Get(id) is { } live && IsAttachableShell(live);
 
     /// <summary>Releases the pause lease (resuming the main agent) and clears attachment. Idempotent.</summary>
     public void ReleaseAttachment()
@@ -870,5 +944,28 @@ internal sealed class TaskBrowserController
         }
     }
 
-    private void RaiseChanged() => this.Changed?.Invoke();
+    /// <summary>
+    /// Raises <see cref="Changed"/> with each subscriber isolated: a throwing handler can never break a
+    /// sibling subscriber, tear down the UI thread, or (via <see cref="SyncAsync"/>) kill the pump.
+    /// </summary>
+    private void RaiseChanged()
+    {
+        var handler = this.Changed;
+        if (handler is null)
+        {
+            return;
+        }
+
+        foreach (var subscriber in handler.GetInvocationList())
+        {
+            try
+            {
+                ((Action)subscriber).Invoke();
+            }
+            catch
+            {
+                // A subscriber's exception is isolated: it must not affect other subscribers or the caller.
+            }
+        }
+    }
 }
