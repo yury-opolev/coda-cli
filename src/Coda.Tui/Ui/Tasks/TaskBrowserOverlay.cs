@@ -312,7 +312,7 @@ internal sealed class TaskBrowserOverlay : View
             this.visibleOutput = [];
             this.header.Text = "Task detail";
             this.body.Text = "(no task selected)";
-            this.footer.Text = "Esc close";
+            this.footer.Text = "Esc back";
             return;
         }
 
@@ -350,7 +350,7 @@ internal sealed class TaskBrowserOverlay : View
 
         this.body.Text = sb.ToString();
         this.footer.Text =
-            "s steer · a attach · l source · ↑/↓ scroll · End newest · Ctrl+B back · x×2 stop · r dismiss · Esc close";
+            "s steer · a attach · l source · ↑/↓ scroll · End newest · Ctrl+B/Esc back · x×2 stop · r dismiss";
     }
 
     private void RenderSteering(TaskBrowserState state)

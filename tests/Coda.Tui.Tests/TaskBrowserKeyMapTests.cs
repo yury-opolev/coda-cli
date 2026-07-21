@@ -11,10 +11,10 @@ namespace Coda.Tui.Tests;
 public sealed class TaskBrowserKeyMapTests
 {
     [Fact]
-    public void Escape_Closes_InListAndDetail()
+    public void Escape_ClosesList_AndReturnsFromDetail()
     {
         Assert.Equal(TaskBrowserCommand.Close, TaskBrowserKeyMap.Map(Key.Esc, TaskBrowserView.List));
-        Assert.Equal(TaskBrowserCommand.Close, TaskBrowserKeyMap.Map(Key.Esc, TaskBrowserView.Detail));
+        Assert.Equal(TaskBrowserCommand.ReturnToList, TaskBrowserKeyMap.Map(Key.Esc, TaskBrowserView.Detail));
     }
 
     [Fact]
