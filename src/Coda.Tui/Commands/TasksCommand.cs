@@ -20,8 +20,9 @@ namespace Coda.Tui.Commands;
 /// </summary>
 public sealed class TasksCommand : ISlashCommand
 {
-    // Keep description columns readable and the row width stable in narrow terminals.
-    private const int MaxDescriptionColumns = 80;
+    // Keep description columns readable and the row width stable in narrow terminals. Measured in terminal
+    // display cells (not grapheme clusters), so wide CJK and emoji are truncated by the space they occupy.
+    private const int MaxDescriptionCells = 80;
 
     private readonly TimeProvider _time;
 
@@ -48,6 +49,16 @@ public sealed class TasksCommand : ISlashCommand
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
+        // /tasks takes no arguments. Rather than silently printing a snapshot (which would hide a typo or a
+        // misused flag), show a clear usage/unsupported-args message and stop. The bare command still prints
+        // the snapshot below.
+        if (args.Count > 0)
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup("/tasks does not take arguments."));
+            context.Console.MarkupLine(Theme.DimMarkup("Usage: /tasks — list the session's background tasks."));
+            return Task.FromResult(CommandResult.Continue);
+        }
+
         // Live provider (never a throwaway CodaSession). Null/before-first-turn renders the empty notice.
         var tasks = context.TaskManagerProvider?.Invoke()?.List() ?? [];
         foreach (var line in RenderLines(tasks, _time))
@@ -61,9 +72,12 @@ public sealed class TasksCommand : ISlashCommand
     /// <summary>
     /// Pure and separately testable. Projects the flat snapshot into the browser's active parent/child
     /// hierarchy and recent-terminal history, then renders one line per task. Every dynamic field is first
-    /// stripped of ANSI/OSC/control sequences (<see cref="TerminalTextSanitizer.Sanitize"/>) and then colored
-    /// through <see cref="Theme"/>, whose helpers run <c>Markup.Escape</c>, so a task can never inject raw ANSI
-    /// or Spectre markup. <paramref name="time"/> is the clock seam used for a running task's live duration.
+    /// stripped of ANSI/OSC/control sequences (<see cref="TerminalTextSanitizer.Sanitize"/>); the compact
+    /// description additionally collapses to a single line (<see cref="TerminalTextSanitizer.SanitizeSingleLine"/>)
+    /// and is truncated by terminal display cells so it can never split or spoof a hierarchy row. Fields are
+    /// then colored through <see cref="Theme"/>, whose helpers run <c>Markup.Escape</c>, so a task can never
+    /// inject raw ANSI or Spectre markup. <paramref name="time"/> is the clock seam for a running task's live
+    /// duration; sub-minute durations format with <see cref="CultureInfo.InvariantCulture"/> (a period decimal).
     /// </summary>
     internal static IReadOnlyList<string> RenderLines(IReadOnlyList<TaskSnapshot> tasks, TimeProvider time)
     {
@@ -112,7 +126,7 @@ public sealed class TasksCommand : ISlashCommand
         var id = TerminalTextSanitizer.Sanitize(t.Id);
         var kind = t.Kind.ToString().ToLowerInvariant();
         var mode = t.Mode.ToString().ToLowerInvariant();
-        var desc = TruncateGraphemes(TerminalTextSanitizer.Sanitize(t.Description), MaxDescriptionColumns);
+        var desc = TruncateToCells(TerminalTextSanitizer.SanitizeSingleLine(t.Description), MaxDescriptionCells);
         var duration = FormatDuration(t, time);
 
         return $"{indent}{marker} {Theme.DimMarkup(id)} {Theme.AccentMarkup(kind)} " +
@@ -130,29 +144,26 @@ public sealed class TasksCommand : ISlashCommand
         }
 
         return span.TotalMinutes >= 1
-            ? $"{(int)span.TotalMinutes}m{span.Seconds:00}s"
-            : $"{span.TotalSeconds:0.0}s";
+            ? string.Create(CultureInfo.InvariantCulture, $"{(int)span.TotalMinutes}m{span.Seconds:00}s")
+            : string.Create(CultureInfo.InvariantCulture, $"{span.TotalSeconds:0.0}s");
     }
 
     /// <summary>
-    /// Truncates to at most <paramref name="maxColumns"/> grapheme clusters, appending an ellipsis, so an
-    /// astral emoji or a combining sequence is never split across its boundary into an invalid surrogate.
+    /// Truncates <paramref name="text"/> to at most <paramref name="maxCells"/> terminal display cells
+    /// (measured with <see cref="TerminalCellText.Width"/>), appending an ellipsis when it overflows. The
+    /// kept prefix is sliced with <see cref="TerminalCellText.SliceByCells"/>, which keeps whole grapheme
+    /// clusters, so a wide CJK glyph or an astral/ZWJ emoji is never split into an invalid surrogate and a
+    /// double-width character counts as the two cells it occupies rather than one grapheme.
     /// </summary>
-    private static string TruncateGraphemes(string text, int maxColumns)
+    private static string TruncateToCells(string text, int maxCells)
     {
-        var enumerator = StringInfo.GetTextElementEnumerator(text);
-        var count = 0;
-        var cutIndex = -1;
-        while (enumerator.MoveNext())
+        if (TerminalCellText.Width(text) <= maxCells)
         {
-            count++;
-            if (count == maxColumns + 1)
-            {
-                cutIndex = enumerator.ElementIndex;
-                break;
-            }
+            return text;
         }
 
-        return cutIndex < 0 ? text : text[..cutIndex] + "…";
+        // Reserve one cell for the ellipsis; SliceByCells keeps every whole grapheme that intersects.
+        var head = TerminalCellText.SliceByCells(text, 0, Math.Max(0, maxCells - 1));
+        return head + "…";
     }
 }

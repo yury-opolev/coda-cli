@@ -1,3 +1,4 @@
+using System.Globalization;
 using System.Text;
 using Coda.Agent.Tasks;
 using Coda.Tui.Ui.Rendering;
@@ -298,7 +299,7 @@ internal sealed class TaskBrowserOverlay : View
         var indent = new string(' ', row.IndentDepth * 2);
         var glyph = row.IndentDepth == 0 ? "●" : "└";
         sb.Append(cursor).Append(' ').Append(indent).Append(glyph).Append(' ')
-            .Append(TerminalTextSanitizer.Sanitize(row.Task.Description))
+            .Append(TerminalTextSanitizer.SanitizeSingleLine(row.Task.Description))
             .Append("  [").Append(row.Task.Status).Append(']')
             .AppendLine();
     }
@@ -502,8 +503,8 @@ internal sealed class TaskBrowserOverlay : View
 
         var suffix = task.EndedAt is null ? " (running)" : string.Empty;
         return span.TotalMinutes >= 1
-            ? $"{(int)span.TotalMinutes}m {span.Seconds:00}s{suffix}"
-            : $"{span.TotalSeconds:0.0}s{suffix}";
+            ? string.Create(CultureInfo.InvariantCulture, $"{(int)span.TotalMinutes}m {span.Seconds:00}s{suffix}")
+            : string.Create(CultureInfo.InvariantCulture, $"{span.TotalSeconds:0.0}s{suffix}");
     }
 
     private void Observe(Task task) =>

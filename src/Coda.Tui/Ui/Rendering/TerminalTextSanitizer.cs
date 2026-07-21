@@ -22,6 +22,11 @@ internal static partial class TerminalTextSanitizer
     [GeneratedRegex(@"\x1B(?:[@-Z\\_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B]*(?:\x07|\x1B\\))", RegexOptions.Compiled)]
     private static partial Regex AnsiEscape();
 
+    // Any run of whitespace (spaces, the tabs/newlines Sanitize keeps, and Unicode separators) so a
+    // compact single-line row collapses every gap to exactly one space.
+    [GeneratedRegex(@"\s+", RegexOptions.Compiled)]
+    private static partial Regex WhitespaceRun();
+
     /// <summary>
     /// Removes ANSI/OSC escape sequences only, leaving carriage returns, tabs, and other control
     /// characters untouched for the caller to handle. After the single regex pass, any residual bare
@@ -115,6 +120,21 @@ internal static partial class TerminalTextSanitizer
 
     /// <summary>Sanitizes then escapes Spectre.Console markup (for the plain/Spectre <c>/tasks</c> snapshot).</summary>
     public static string SanitizeForMarkup(string? text) => Markup.Escape(Sanitize(text));
+
+    /// <summary>
+    /// Sanitizes then flattens the result to a single line for compact task list rows. Every run of
+    /// whitespace — the newlines and tabs <see cref="Sanitize"/> keeps, the carriage returns it normalizes
+    /// to newline, and repeated spaces — collapses to a single space and boundary whitespace is trimmed, so
+    /// a multi-line or tabbed task description can never split a row or spoof the hierarchy by introducing
+    /// its own line breaks. Printable Unicode and whole grapheme clusters (accents, box drawing, CJK, emoji,
+    /// and ZWJ sequences) are preserved untouched. Detail and output panes keep the multi-line
+    /// <see cref="Sanitize"/> instead.
+    /// </summary>
+    public static string SanitizeSingleLine(string? text)
+    {
+        var sanitized = Sanitize(text);
+        return sanitized.Length == 0 ? string.Empty : WhitespaceRun().Replace(sanitized, " ").Trim();
+    }
 
     // Unicode bidirectional formatting controls (category Cf) that can visually reorder rendered text:
     // the embeddings/overrides U+202A-202E, the isolates U+2066-2069, and the directional marks

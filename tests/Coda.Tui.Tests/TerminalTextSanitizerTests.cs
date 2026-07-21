@@ -228,4 +228,34 @@ public sealed class TerminalTextSanitizerTests
         Assert.Equal(family, result);
         Assert.Contains('\u200D', result);
     }
+
+    [Fact]
+    public void SanitizeSingleLine_CollapsesNewlinesTabsAndRepeatedWhitespace_ToSingleSpaces()
+    {
+        // Newlines (including CR/CRLF normalized by Sanitize), tabs, and runs of spaces all collapse to a
+        // single space so a multi-line task description can never split a compact list row.
+        var input = "line1\nline2\r\n\tindented   spaced";
+        Assert.Equal("line1 line2 indented spaced", TerminalTextSanitizer.SanitizeSingleLine(input));
+    }
+
+    [Fact]
+    public void SanitizeSingleLine_StripsAnsiAndTrimsBoundaryWhitespace()
+    {
+        // ANSI is stripped first, then boundary whitespace is trimmed and inner whitespace collapsed.
+        Assert.Equal("RED text", TerminalTextSanitizer.SanitizeSingleLine("  \x1B[31mRED\x1B[0m\n\ttext  "));
+    }
+
+    [Fact]
+    public void SanitizeSingleLine_PreservesUnicodeGraphemesAndEmoji()
+    {
+        // Printable Unicode (accents, CJK, emoji) survives the collapse; only whitespace is normalized.
+        Assert.Equal("café 🚀 界", TerminalTextSanitizer.SanitizeSingleLine("café\t🚀\n界"));
+    }
+
+    [Fact]
+    public void SanitizeSingleLine_NullOrEmpty_ReturnsEmpty()
+    {
+        Assert.Equal(string.Empty, TerminalTextSanitizer.SanitizeSingleLine(null));
+        Assert.Equal(string.Empty, TerminalTextSanitizer.SanitizeSingleLine(string.Empty));
+    }
 }

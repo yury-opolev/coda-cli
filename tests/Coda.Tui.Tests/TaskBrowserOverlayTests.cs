@@ -2,6 +2,7 @@ using Coda.Agent;
 using Coda.Agent.Tasks;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Tasks;
+using System.Globalization;
 using Xunit;
 
 namespace Coda.Tui.Tests;
@@ -150,6 +151,70 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             _app.End(token);
             overlay.Dispose();
             host.Dispose();
+        }
+    }
+
+    [Fact]
+    public void List_CollapsesMultilineDescription_ToSingleRow()
+    {
+        _mgr.Register(TaskKind.Subagent, "alpha\nbeta\tgamma", parentTaskId: null);
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host);
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+
+            // A multi-line/tabbed description must render on one list row so it cannot split/spoof the
+            // hierarchy; the newline/tab collapse to single spaces.
+            var row = LineContaining(overlay.BodyText, "alpha");
+            Assert.Contains("alpha beta gamma", row);
+            Assert.DoesNotContain('\t', row);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Theory]
+    [InlineData("de-DE")]
+    [InlineData("fr-FR")]
+    public void Detail_FormatsSubminuteDuration_WithInvariantDecimalPoint(string culture)
+    {
+        _mgr.Register(TaskKind.Shell, "dur-task", parentTaskId: null);
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var previous = CultureInfo.CurrentCulture;
+        CultureInfo.CurrentCulture = new CultureInfo(culture);
+        var token = _app.Begin(host);
+        try
+        {
+            overlay.Show();
+            controller.OpenDetail();
+            overlay.ForceRender();
+            _app.LayoutAndDraw();
+
+            // The sub-minute duration must use a period decimal regardless of the current culture.
+            var durationLine = LineContaining(overlay.BodyText, "Duration:");
+            Assert.Matches(@"\d\.\ds", durationLine);
+            Assert.DoesNotContain(",", durationLine);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+            CultureInfo.CurrentCulture = previous;
         }
     }
 
