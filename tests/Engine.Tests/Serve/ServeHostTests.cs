@@ -32,6 +32,9 @@ public sealed class ServeHostTests : IDisposable
 {
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
 
+    // A valid 64-hex API key for the auth-gated schedule tests below.
+    private const string ApiKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
     private readonly string workDir = Directory.CreateTempSubdirectory("serve_host_").FullName;
 
     // ── HTTP stub helpers ─────────────────────────────────────────────────────
@@ -1224,6 +1227,228 @@ public sealed class ServeHostTests : IDisposable
         Assert.Equal(1, probe.Handle!.DisposeCount);
     }
 
+    // ── Auth-gated schedule runtime over serve (Task 9 security finding) ─────────
+    //
+    // In API-key mode the shared initialization must NOT drive CodaSession.InitializeAsync (which
+    // starts the schedule runtime) until a valid `initialize` authenticates. An unauthenticated
+    // connected peer must never receive schedule lifecycle/stream/tool events, nor be asked to
+    // answer a server→client permission/question/plan request, before presenting the API key.
+
+    [Fact]
+    public async Task ApiKey_mode_emits_no_schedule_events_or_requests_before_initialize()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, permission: perm));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+        var sawPermission = false;
+        orchestrator.OnRequest(ServeMethods.RequestPermission, _ =>
+        {
+            sawPermission = true;
+            return ServeJson.ToNode(new PermissionResponse(true));
+        });
+
+        // No `initialize` is sent. Give the host ample time to (erroneously) drive initialization.
+        await Task.Delay(300);
+
+        Assert.Null(probe.Handle);            // schedule runtime never created / started.
+        Assert.Equal(0, lifecycle.Count);     // no schedule lifecycle notification reached the peer.
+        Assert.False(sawPermission);          // no server→client permission request was issued.
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Invalid_initialize_key_is_unauthorized_and_starts_no_runtime()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        var ex = await Assert.ThrowsAsync<JsonRpcResponseException>(() => orchestrator.SendRequestAsync(
+                ServeMethods.Initialize,
+                ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, "wrong-but-long-enough-0123456789abcdef0123456789abcdef0123456789")),
+                CancellationToken.None)
+            .WaitAsync(WaitTimeout));
+        Assert.Equal(-32001, ex.Code);
+
+        // An unauthorized initialize must not start the schedule runtime.
+        await Task.Delay(200);
+        Assert.Null(probe.Handle);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Valid_initialize_starts_runtime_once_then_lifecycle_and_permission_flow()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, permission: perm, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+        orchestrator.OnRequest(ServeMethods.RequestPermission, _ => ServeJson.ToNode(new PermissionResponse(true)));
+
+        // Before authentication the runtime must not have been created.
+        await Task.Delay(200);
+        Assert.Null(probe.Handle);
+
+        // A valid initialize authenticates and drives initialization exactly once.
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, ApiKey)),
+            CancellationToken.None);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+
+        var result = await initTask.WaitAsync(WaitTimeout);
+        Assert.NotNull(ServeJson.FromNode<InitializeResult>(result));
+
+        var started = await lifecycle.WaitForStateAsync("started", WaitTimeout);
+        Assert.Equal("def-serve", started["definitionId"]!.GetValue<string>());
+        Assert.True(probe.Handle!.PermissionGranted);
+        Assert.Equal(1, probe.Handle!.StartCount);
+        Assert.Equal(1, probe.Session!.ScheduleRuntimeCreationCountForTest);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Concurrent_valid_initialize_requests_start_the_runtime_once()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        // No runtime before authentication.
+        await Task.Delay(150);
+        Assert.Null(probe.Handle);
+
+        var init1 = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, ApiKey)),
+            CancellationToken.None);
+        var init2 = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, ApiKey)),
+            CancellationToken.None);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        await Task.Delay(100);       // give a would-be second drive a chance to race.
+        startGate.TrySetResult();
+
+        await Task.WhenAll(init1, init2).WaitAsync(WaitTimeout);
+
+        Assert.Equal(1, probe.Handle!.StartCount);
+        Assert.Equal(1, probe.Session!.ScheduleRuntimeCreationCountForTest);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Shutdown_before_authentication_completes_promptly_and_starts_no_runtime()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        // Never authenticate. The host must not have driven initialization.
+        await Task.Delay(150);
+        Assert.Null(probe.Handle);
+
+        // Shutdown must complete promptly and not hang awaiting an initialization that never started.
+        var sw = Stopwatch.StartNew();
+        cts.Cancel();
+        await hostTask.WaitAsync(WaitTimeout);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < WaitTimeout, $"shutdown took {sw.Elapsed}");
+        Assert.Null(probe.Handle);   // runtime never started.
+    }
+
+    [Fact]
+    public async Task Stdio_drives_initialization_immediately_after_start()
+    {
+        // Regression: with no expectedApiKey (stdio), the shared initialization is driven immediately
+        // after connection.Start — no `initialize` is required for an overdue schedule to run.
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory); // no key.
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+
+        // Without sending initialize, StartAsync is entered because stdio drives init at Start.
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+        await lifecycle.WaitForStateAsync("started", WaitTimeout);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
     /// <summary>Records every <c>event/scheduleLifecycle</c> notification and awaits a given state.</summary>
     private sealed class LifecycleCollector
     {
@@ -1243,6 +1468,9 @@ public sealed class ServeHostTests : IDisposable
                     this.events.Add(node);
                 }
             });
+
+        /// <summary>Number of schedule lifecycle notifications observed so far.</summary>
+        public int Count { get { lock (this.gate) { return this.events.Count; } } }
 
         public async Task<JsonNode> WaitForStateAsync(string state, TimeSpan timeout)
         {

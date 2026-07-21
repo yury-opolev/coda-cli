@@ -31,6 +31,12 @@ public sealed class ServeHost : IAsyncDisposable
     private readonly TaskCompletionSource initializationGate =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+    // Guards driving the shared initialization exactly once. Set to 1 by the first driver — either
+    // RunAsync (stdio/no-key: drive immediately) or a valid `initialize`/authenticated `prompt`
+    // (API-key mode: drive only after authentication). Interlocked so concurrent authenticated
+    // handlers can never double-start the runtime.
+    private int initializationDriven;
+
     // Built in RunAsync before handlers are registered.
     private JsonRpcConnection? connection;
     private CodaSession? session;
@@ -103,15 +109,22 @@ public sealed class ServeHost : IAsyncDisposable
         // server→client permission/question/plan request (and read its response) without deadlock.
         this.connection.Start();
 
-        // Drive initialization AFTER Start, off the read-loop thread. CodaSession.InitializeAsync is
-        // idempotent and concurrency-safe, so although `initialize`'s auth + session resume runs
-        // concurrently with this, the schedule runtime starts exactly once (never twice). Chosen
-        // ordering: the schedule store is project-scoped (it lives under the working directory, not
-        // the transcript id) and every scheduled run is isolated (its own history), so the runtime
-        // does not depend on the resumed session id/history — concurrent resume is safe. The
-        // `initialize` and `session/prompt` handlers await this same gate before reporting readiness
-        // / running a turn.
-        _ = this.DriveInitializationAsync(cancellationToken);
+        // Drive initialization AFTER Start, off the read-loop thread — but ONLY when the peer is
+        // already authenticated (stdio / no expectedApiKey). CodaSession.InitializeAsync starts the
+        // schedule runtime, which emits lifecycle/stream/tool events and can issue server→client
+        // permission/question/plan requests; an unauthenticated peer must never observe those before
+        // presenting the API key. In API-key mode the drive is deferred to the `initialize` handler,
+        // which triggers it (exactly once, via EnsureInitializationDriven) only after a valid key
+        // authenticates. Chosen ordering: the schedule store is project-scoped (it lives under the
+        // working directory, not the transcript id) and every scheduled run is isolated (its own
+        // history), so the runtime does not depend on the resumed session id/history — driving after
+        // auth + resume keeps the reported session id deterministic without constraining the runtime.
+        // The `initialize` and `session/prompt` handlers await this same gate before reporting
+        // readiness / running a turn.
+        if (this.authenticated)
+        {
+            this.EnsureInitializationDriven(cancellationToken);
+        }
 
         // Wait until shutdown is requested, the CT fires, or the connection closes.
         using var reg = cancellationToken.Register(() => this.shutdownTcs.TrySetResult());
@@ -122,6 +135,12 @@ public sealed class ServeHost : IAsyncDisposable
         }
         finally
         {
+            // If shutdown arrives before initialization was ever driven (e.g. an API-key peer that
+            // never authenticated), complete the shared gate by cancelling it so any handler awaiting
+            // it unblocks and teardown never hangs waiting for an initialization that never started.
+            // A no-op when the gate already completed/faulted from a real drive.
+            this.initializationGate.TrySetCanceled();
+
             // Cancel-first teardown. Cancel any running turn so its token reaches the
             // in-flight HttpClient.SendAsync and the turn unwinds, THEN await the session's
             // async disposal (no sync-over-async — that previously self-deadlocked/leaked a
@@ -166,6 +185,10 @@ public sealed class ServeHost : IAsyncDisposable
         // Same cancel-first order as RunAsync's finally: cancel the turn, await the session's async
         // disposal (bounded by the session's own SyncDisposeBudget so the schedule runtime + task
         // manager tear down within a consistent, non-shorter bound), then dispose the connection.
+        // Cancel the shared gate first so a never-driven initialization (unauthenticated peer) is
+        // completed cleanly and no awaiter hangs.
+        this.initializationGate.TrySetCanceled();
+
         this.CancelTurn();
 
         if (this.session is not null)
@@ -193,6 +216,21 @@ public sealed class ServeHost : IAsyncDisposable
             {
                 // Best-effort.
             }
+        }
+    }
+
+    /// <summary>
+    /// Drives the shared initialization exactly once. The first caller — RunAsync (stdio) or a valid
+    /// authenticated <c>initialize</c>/<c>prompt</c> handler (API-key mode) — wins the Interlocked
+    /// guard and starts <see cref="DriveInitializationAsync"/>; every later caller is a no-op. This
+    /// prevents an unauthenticated peer from triggering the runtime and prevents concurrent
+    /// authenticated handlers from double-starting it.
+    /// </summary>
+    private void EnsureInitializationDriven(CancellationToken cancellationToken)
+    {
+        if (Interlocked.CompareExchange(ref this.initializationDriven, 1, 0) == 0)
+        {
+            _ = this.DriveInitializationAsync(cancellationToken);
         }
     }
 
@@ -265,6 +303,15 @@ public sealed class ServeHost : IAsyncDisposable
                 sess.Resume(resumeId, messages);
             }
 
+            // Now that the peer is authenticated (and any resume applied), trigger the shared
+            // initialization the host owns. In stdio mode RunAsync already drove it, so this is a
+            // no-op; in API-key mode this is the first drive — deferred until exactly here so an
+            // unauthenticated peer never starts the schedule runtime. The read loop is already live
+            // (connection.Start ran in RunAsync before any handler could dispatch), so a scheduled
+            // permission/question/plan request issued during startup can round-trip to this
+            // authenticated peer without deadlock.
+            this.EnsureInitializationDriven(hostCt);
+
             // Await the shared initialization (LSP + schedule runtime) the host drives after Start,
             // so the InitializeResult is not returned until the session is actually ready — and a
             // failed init surfaces here as an initialize error. This awaits the SAME gate the host
@@ -286,6 +333,14 @@ public sealed class ServeHost : IAsyncDisposable
         conn.OnRequestAsync(ServeMethods.Prompt, async (paramsNode, ct) =>
         {
             this.EnsureAuthenticated();
+
+            // The peer is authenticated, so it is safe to ensure initialization is under way. In
+            // stdio mode RunAsync (or a prior initialize) already drove it; in API-key mode a valid
+            // initialize authenticated the peer and drove it. Calling here is a race-safe no-op via
+            // the once-guard and guarantees a prompt never awaits a gate that was never driven. A
+            // prompt that arrives BEFORE authentication is rejected by EnsureAuthenticated above and
+            // therefore can never trigger initialization.
+            this.EnsureInitializationDriven(hostCt);
 
             // A turn must never run before initialization: await the shared gate (LSP + schedule
             // runtime up) the host drives after Start. A failed init surfaces its fault here rather
