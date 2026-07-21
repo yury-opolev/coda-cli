@@ -35,6 +35,11 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
 
     private readonly CancellationTokenSource cts = new();
 
+    // Serializes the start/dispose lifecycle transitions (reading disposed, publishing the loop,
+    // capturing the CTS token, and disposing the CTS) so start and dispose can never interleave in
+    // a way that reads a disposed CTS or skips awaiting a live loop. Never held while awaiting.
+    private readonly object gate = new();
+
     // Owned exclusively by the loop thread; no lock is needed for the loop's own access.
     private readonly Dictionary<string, Entry> entries = new(StringComparer.Ordinal);
 
@@ -45,6 +50,14 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
     private Task? loop;
     private int started;
     private int disposed;
+
+    // Test-only seam: invoked by StartAsync after it has reserved the single start slot but before
+    // it commits the loop, to deterministically exercise the start/dispose interleaving. Never set
+    // in production; not part of the public API.
+    internal Action? StartCommitProbe { get; set; }
+
+    // Test-only accessor for the authoritative background loop, to assert disposal ownership.
+    internal Task? LoopForTest => this.loop;
 
     /// <summary>Creates a runtime driven by an explicit <paramref name="clock"/>.</summary>
     public ScheduleRuntime(
@@ -82,20 +95,44 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
     }
 
     /// <summary>
-    /// Starts the background loop. Idempotent and one-shot: subsequent calls (and calls after
-    /// disposal) are no-ops. Returns as soon as the loop is scheduled — it does not block until the
-    /// next due time. An external <paramref name="cancellationToken"/> stops the loop like disposal.
+    /// Starts the background loop. Idempotent and one-shot: repeated calls before disposal are
+    /// no-ops after the first. Any call after disposal throws <see cref="ObjectDisposedException"/>.
+    /// Returns as soon as the loop is scheduled — it does not block until the next due time. An
+    /// external <paramref name="cancellationToken"/> stops the loop like disposal.
     /// </summary>
     public Task StartAsync(CancellationToken cancellationToken = default)
     {
-        if (Volatile.Read(ref this.disposed) != 0)
+        // A start that observes disposal always surfaces the disposed contract, even if a prior
+        // start already reserved the slot.
+        lock (this.gate)
+        {
+            if (Volatile.Read(ref this.disposed) != 0)
+            {
+                throw new ObjectDisposedException(nameof(ScheduleRuntime));
+            }
+        }
+
+        // Reserve the single start slot; only the winner proceeds to publish a loop.
+        if (Interlocked.Exchange(ref this.started, 1) != 0)
         {
             return Task.CompletedTask;
         }
 
-        if (Interlocked.Exchange(ref this.started, 1) != 0)
+        this.StartCommitProbe?.Invoke();
+
+        lock (this.gate)
         {
-            return Task.CompletedTask;
+            if (Volatile.Read(ref this.disposed) != 0)
+            {
+                // Disposal won the race: never launch a loop, and surface the disposed contract.
+                // The CTS may already be disposed, but we never touch it on this path.
+                throw new ObjectDisposedException(nameof(ScheduleRuntime));
+            }
+
+            // Capture the token under the gate while the CTS is guaranteed alive: disposal cannot
+            // dispose the CTS until it has observed this loop (under the gate) and awaited it.
+            var token = this.cts.Token;
+            this.loop = Task.Run(() => this.RunLoopAsync(token));
         }
 
         if (cancellationToken.CanBeCanceled)
@@ -103,7 +140,6 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
             cancellationToken.Register(static s => ((ScheduleRuntime)s!).RequestStop(), this);
         }
 
-        this.loop = Task.Run(() => this.RunLoopAsync(this.cts.Token));
         return Task.CompletedTask;
     }
 
@@ -148,15 +184,25 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
-        if (Interlocked.Exchange(ref this.disposed, 1) != 0)
+        Task? pending;
+        lock (this.gate)
         {
-            return;
+            if (Volatile.Read(ref this.disposed) != 0)
+            {
+                return;
+            }
+
+            Volatile.Write(ref this.disposed, 1);
+
+            // Capture the authoritative loop under the gate. It is null only when no start has
+            // committed a loop yet; any start not yet past the gate will observe disposed and never
+            // launch, so this is the single loop we must own.
+            pending = this.loop;
         }
 
         this.RequestStop();
         this.commands.Writer.TryComplete();
 
-        var pending = this.loop;
         if (pending is not null)
         {
             try
@@ -173,6 +219,8 @@ public sealed class ScheduleRuntime : IScheduleRuntimeView, IAsyncDisposable
             }
         }
 
+        // Safe now: disposed was published under the gate, so no start can still be inside the gate
+        // reading the token, and the authoritative loop (if any) has completed.
         this.cts.Dispose();
     }
 

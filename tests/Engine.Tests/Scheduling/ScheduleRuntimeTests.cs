@@ -579,6 +579,129 @@ public sealed class ScheduleRuntimeTests
         Assert.False(h.Runtime.TryGetState(def.Id, out _));
     }
 
+    // ────────────────────────────────────────────────────────────────
+    // Start/dispose serialization (Task 6 code-quality blocker)
+    // ────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Dispose_racing_a_paused_start_wins_start_throws_and_launches_nothing()
+    {
+        // Deterministically force the lifecycle interleaving: a StartAsync caller has won the single
+        // start slot but is paused BEFORE it commits/publishes the loop; DisposeAsync then runs to
+        // completion (disposing the CTS); the start is released and resumes. A correctly serialized
+        // runtime must observe disposal, launch no loop, touch no disposed CTS (so no unobserved
+        // ObjectDisposedException fault), and surface the disposed contract synchronously.
+        await using var h = new Harness(Base);
+        h.Store.Add(Interval(TimeSpan.FromMinutes(1), Base), Base); // due now: would launch if it ran
+
+        var reachedPause = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        h.Runtime.StartCommitProbe = () =>
+        {
+            reachedPause.TrySetResult();
+            release.Task.GetAwaiter().GetResult();
+        };
+
+        var startTask = Task.Run(() => h.Runtime.StartAsync());
+        await reachedPause.Task.WaitAsync(Guard); // start has won the slot, paused before publishing
+
+        // Dispose completes fully while start is paused (start holds no lock at the pause point).
+        await h.Runtime.DisposeAsync();
+
+        release.TrySetResult(); // let the paused start resume into a disposed runtime
+
+        // Contract: a start that loses the race to disposal throws ObjectDisposedException — it does
+        // not silently launch a loop against a disposed CTS.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => startTask);
+
+        // No loop was published and no scheduled work was ever registered.
+        Assert.Null(h.Runtime.LoopForTest);
+        Assert.Equal(0, h.ScheduledCount);
+
+        // Disposal remains authoritative: a further start still throws.
+        await Assert.ThrowsAsync<ObjectDisposedException>(() => h.Runtime.StartAsync());
+    }
+
+    [Fact]
+    public async Task Dispose_owns_and_awaits_the_loop_published_by_a_winning_start()
+    {
+        // The complementary ordering: start commits/publishes the loop first; DisposeAsync must then
+        // cancel and await that authoritative loop exactly once (it must own it, not skip it).
+        await using var h = new Harness(Base);
+        h.Store.Add(Interval(TimeSpan.FromMinutes(5), Base + TimeSpan.FromMinutes(5)), Base);
+
+        await h.Runtime.StartAsync();
+        await h.Clock.WaitForRegistrationsAsync(1, Guard); // loop is running and parked
+
+        var loop = h.Runtime.LoopForTest;
+        Assert.NotNull(loop);
+        Assert.False(loop!.IsCompleted);
+
+        await h.Runtime.DisposeAsync();
+
+        Assert.True(loop.IsCompleted); // disposal cancelled and awaited the live loop
+        Assert.Equal(0, h.ScheduledCount);
+    }
+
+    [Fact]
+    public async Task Concurrent_start_and_dispose_end_disposed_with_no_late_work_or_faults()
+    {
+        // Barrier-synchronized start/dispose races repeated many times. Whichever side wins, the
+        // runtime must end disposed, must never leak a background fault, and must register no work
+        // (the schedule is not due, so a winning start only parks the loop).
+        var faults = new List<Exception>();
+        void OnUnobserved(object? _, UnobservedTaskExceptionEventArgs e)
+        {
+            lock (faults) faults.Add(e.Exception);
+            e.SetObserved();
+        }
+
+        TaskScheduler.UnobservedTaskException += OnUnobserved;
+        try
+        {
+            for (var i = 0; i < 200; i++)
+            {
+                var h = new Harness(Base);
+                h.Store.Add(Interval(TimeSpan.FromMinutes(5), Base + TimeSpan.FromMinutes(5)), Base);
+
+                using var barrier = new Barrier(2);
+                var startTask = Task.Run(() =>
+                {
+                    barrier.SignalAndWait();
+                    try { return h.Runtime.StartAsync(); }
+                    catch (ObjectDisposedException) { return Task.CompletedTask; }
+                });
+                var disposeTask = Task.Run(async () =>
+                {
+                    barrier.SignalAndWait();
+                    await h.Runtime.DisposeAsync();
+                });
+
+                await Task.WhenAll(startTask, disposeTask).WaitAsync(Guard);
+
+                // The runtime is authoritatively disposed regardless of who won the race.
+                await Assert.ThrowsAsync<ObjectDisposedException>(() => h.Runtime.StartAsync());
+                await h.Runtime.DisposeAsync(); // idempotent
+
+                Assert.Equal(0, h.ScheduledCount); // no late work escaped disposal
+                await h.DisposeAsync();
+            }
+        }
+        finally
+        {
+            TaskScheduler.UnobservedTaskException -= OnUnobserved;
+        }
+
+        GC.Collect();
+        GC.WaitForPendingFinalizers();
+        GC.Collect();
+
+        lock (faults)
+        {
+            Assert.True(faults.Count == 0, $"unobserved task faults: {string.Join("; ", faults.Select(f => f.Message))}");
+        }
+    }
+
     [Fact]
     public async Task No_real_delays_are_used_to_drive_scheduling()
     {
