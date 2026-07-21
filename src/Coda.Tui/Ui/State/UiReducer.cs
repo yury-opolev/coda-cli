@@ -18,7 +18,7 @@ public static class UiReducer
     /// <summary>Fold a single event onto <paramref name="state"/>, returning the next state.</summary>
     public static UiSessionSnapshot Reduce(UiSessionSnapshot state, UiEvent uiEvent) => uiEvent switch
     {
-        UserPromptSubmittedEvent e => Append(state, new UserTranscriptBlock(Guid.NewGuid(), e.Text)),
+        UserPromptSubmittedEvent e => Append(state, new UserTranscriptBlock(Guid.NewGuid(), e.Text, e.SentAt)),
         TranscriptSeededEvent e => state with { Transcript = e.Blocks },
 
         AssistantTextDeltaEvent e => AppendOrExtendAssistant(state, e.Delta),

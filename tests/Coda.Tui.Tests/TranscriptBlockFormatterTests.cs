@@ -34,6 +34,45 @@ public sealed class TranscriptBlockFormatterTests
         var line = Assert.Single(lines);
         Assert.Equal("hello world", line.Text);
         Assert.Equal(TranscriptRole.User, line.Role);
+        // A user message renders as a full-width background block.
+        Assert.True(line.FillWidth);
+        // Without a captured send time there is no right-aligned annotation.
+        Assert.Null(line.RightText);
+    }
+
+    [Fact]
+    public void User_block_with_sent_time_annotates_the_first_row_with_local_hhmm()
+    {
+        var sentAt = new DateTimeOffset(2026, 7, 21, 9, 5, 0, TimeSpan.Zero);
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "hello", sentAt);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 40);
+
+        var line = Assert.Single(lines);
+        Assert.Equal("hello", line.Text);
+        Assert.True(line.FillWidth);
+        // The sent time is attached to the block (HH:mm), drawn as a right annotation — never mixed into the
+        // copyable text.
+        Assert.Equal("09:05", line.RightText);
+        Assert.DoesNotContain(":", line.Text);
+    }
+
+    [Fact]
+    public void User_block_reserves_first_row_cells_so_text_never_overlaps_the_time()
+    {
+        var sentAt = new DateTimeOffset(2026, 7, 21, 9, 5, 0, TimeSpan.Zero);
+        // Twenty single-cell characters at width 20 would fill the row; with a reserved time zone the first
+        // row must wrap earlier so the "09:05" annotation cannot overlap the text.
+        var block = new UserTranscriptBlock(Guid.NewGuid(), new string('x', 20), sentAt);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 20);
+
+        Assert.True(lines.Count >= 2, "the reserved time zone must force the first row to wrap earlier");
+        Assert.Equal("09:05", lines[0].RightText);
+        // "09:05" is five cells plus a one-cell gap, so the first row keeps at most 14 cells of text.
+        Assert.True(TerminalCellText.Width(lines[0].Text) <= 14);
+        Assert.All(lines, line => Assert.True(line.FillWidth));
+        Assert.Null(lines[1].RightText);
     }
 
     [Fact]

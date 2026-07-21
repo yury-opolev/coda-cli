@@ -56,6 +56,30 @@ public sealed class ComposerViewTests
     }
 
     [Fact]
+    public void Single_visual_line_draft_desires_one_content_row()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 40, height: 5);
+
+        // An empty draft and a short single-line draft both fit on one visual row, so the composer wants a
+        // single content row (the chrome adds the two half-block edge rows around it).
+        Assert.Equal(1, view.DesiredHeight(width: 40, screenHeight: 24));
+
+        view.SetDraft("hello", 5);
+        Assert.Equal(1, view.DesiredHeight(width: 40, screenHeight: 24));
+    }
+
+    [Fact]
+    public void Explicit_newlines_expand_the_desired_height()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 40, height: 8);
+        view.SetDraft("one\ntwo\nthree", 13);
+
+        Assert.Equal(3, view.DesiredHeight(width: 40, screenHeight: 24));
+    }
+
+    [Fact]
     public void Text_beyond_cap_is_preserved_and_scroll_keeps_caret_visible()
     {
         var controller = CreateController();

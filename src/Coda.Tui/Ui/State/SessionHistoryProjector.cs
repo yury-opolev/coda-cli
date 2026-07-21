@@ -33,6 +33,8 @@ public static class SessionHistoryProjector
                 switch (block)
                 {
                     case TextBlock text when message.Role == ChatRole.User:
+                        // The persisted ChatMessage model carries no timestamp, so resumed user blocks keep a
+                        // stable null SentAt and the renderer omits the send-time indicator.
                         builder.Add(new UserTranscriptBlock(Guid.NewGuid(), text.Text));
                         break;
 

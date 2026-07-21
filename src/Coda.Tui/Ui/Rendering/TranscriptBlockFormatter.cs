@@ -41,6 +41,19 @@ public enum TranscriptRole
 /// </remarks>
 public readonly record struct TranscriptRenderLine(string Text, TranscriptRole Role)
 {
+    /// <summary>
+    /// Whether the row paints its background across the full viewport width (a block treatment used for
+    /// user messages), rather than only under the drawn text.
+    /// </summary>
+    public bool FillWidth { get; init; }
+
+    /// <summary>
+    /// An optional right-aligned annotation (e.g. a sent-time <c>HH:mm</c>) drawn at the row's right edge in
+    /// a dim attribute. It is never part of <see cref="Text"/>, so it does not wrap and is excluded from
+    /// selection/copy; the row's text is wrapped to reserve these cells so the two never overlap.
+    /// </summary>
+    public string? RightText { get; init; }
+
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
 }
@@ -73,7 +86,7 @@ public static class TranscriptBlockFormatter
                 break;
 
             case UserTranscriptBlock user:
-                AppendWrapped(lines, user.Text, safeWidth, TranscriptRole.User);
+                AppendUser(lines, user, safeWidth);
                 break;
 
             case ToolTranscriptBlock tool:
@@ -368,6 +381,54 @@ public static class TranscriptBlockFormatter
             foreach (var wrapped in WrapLine(line, contentWidth))
             {
                 lines.Add(new TranscriptRenderLine(indent + wrapped, role));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Projects a user message onto full-width background-block rows. When the block carries a send time it is
+    /// formatted as a local <c>HH:mm</c> annotation pinned to the top-right of the first row; the first source
+    /// line is wrapped into a narrower zone so the reserved time cells can never overlap the message text. The
+    /// time is carried as <see cref="TranscriptRenderLine.RightText"/> (never mixed into the copyable text) and
+    /// every row is marked <see cref="TranscriptRenderLine.FillWidth"/> so the whole block paints its distinct
+    /// background across the visible width.
+    /// </summary>
+    private static void AppendUser(List<TranscriptRenderLine> lines, UserTranscriptBlock user, int width)
+    {
+        var time = user.SentAt is { } sentAt
+            ? sentAt.ToString("HH:mm", CultureInfo.InvariantCulture)
+            : null;
+
+        // Reserve the time's cells (plus a one-cell gap) on the first row so the annotation and the text never
+        // collide. Only narrow the first row when the reservation still leaves a usable text zone.
+        var firstRowWidth = width;
+        if (time is not null)
+        {
+            var reserved = TerminalCellText.Width(time) + 1;
+            if (width - reserved >= 1)
+            {
+                firstRowWidth = width - reserved;
+            }
+            else
+            {
+                time = null; // too narrow to show a time without crowding the text
+            }
+        }
+
+        var annotationPending = time is not null;
+        var sourceLines = SplitLines(user.Text).ToList();
+        for (var i = 0; i < sourceLines.Count; i++)
+        {
+            var lineWidth = i == 0 && time is not null ? firstRowWidth : width;
+            foreach (var wrapped in WrapLine(sourceLines[i], lineWidth))
+            {
+                var right = annotationPending ? time : null;
+                annotationPending = false;
+                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.User)
+                {
+                    FillWidth = true,
+                    RightText = right,
+                });
             }
         }
     }

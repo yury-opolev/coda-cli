@@ -31,8 +31,10 @@ public sealed record ActiveOperation(string Kind, string Label, long? ElapsedMs)
 /// <summary>Base type for a rendered transcript entry. Every block carries a stable <see cref="Id"/>.</summary>
 public abstract record TranscriptBlock(Guid Id);
 
-/// <summary>A submitted user prompt.</summary>
-public sealed record UserTranscriptBlock(Guid Id, string Text) : TranscriptBlock(Id);
+/// <summary>A submitted user prompt. <see cref="SentAt"/> is the captured send time (local), or null when
+/// unknown (e.g. resumed history whose persisted model carries no timestamp), in which case the renderer
+/// omits the time rather than inventing a changing one.</summary>
+public sealed record UserTranscriptBlock(Guid Id, string Text, DateTimeOffset? SentAt = null) : TranscriptBlock(Id);
 
 /// <summary>Streamed assistant text; <see cref="Complete"/> flips true once the turn's text ends.</summary>
 public sealed record AssistantTranscriptBlock(Guid Id, string Text, bool Complete) : TranscriptBlock(Id);

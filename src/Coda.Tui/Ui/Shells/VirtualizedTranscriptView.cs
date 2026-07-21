@@ -202,6 +202,12 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>Number of selected row segments painted with the selection highlight; exposed for tests only.</summary>
     internal int SelectionDrawCount { get; private set; }
 
+    /// <summary>Number of full-width background-block rows painted (user message rows); exposed for tests only.</summary>
+    internal int UserRowFillCount { get; private set; }
+
+    /// <summary>Number of right-aligned annotations (e.g. sent-time HH:mm) painted; exposed for tests only.</summary>
+    internal int RightAnnotationDrawCount { get; private set; }
+
     /// <summary>Anchors a new selection at <paramref name="position"/> and begins tracking a drag.</summary>
     internal void BeginSelection(TranscriptCellPosition position)
     {
@@ -270,56 +276,87 @@ internal sealed class VirtualizedTranscriptView : View
     }
 
     /// <summary>
-    /// Paints one row at <paramref name="screenRow"/>. Rows with no selection intersection draw once in their
-    /// role color; where the selection covers part (or all) of the row, the row is drawn in three cell-sliced
+    /// Paints one row at <paramref name="screenRow"/>. A <see cref="TranscriptRow.FillWidth"/> row first paints
+    /// its role background across the whole visible width (the user-message block), then draws its text over it;
+    /// other rows keep the global background. Rows with no selection intersection draw their text once in their
+    /// role color; where the selection covers part (or all) of the row, the text is drawn in three cell-sliced
     /// segments — role-colored prefix, Warm Ember selection-highlighted middle, role-colored suffix — so the
-    /// highlight is segmented exactly over the selected cells and survives redraw/scroll.
+    /// highlight is segmented exactly over the selected cells and survives redraw/scroll. Finally, a
+    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute at
+    /// the row's right edge; the row text was wrapped to reserve those cells, so it never overlaps.
     /// </summary>
     private void DrawRow(TranscriptRow row, int screenRow)
     {
+        var viewWidth = Math.Max(0, this.Viewport.Width);
+        var rowAttribute = this.AttributeFor(row.Role);
+
+        if (row.FillWidth && viewWidth > 0)
+        {
+            // Fill the full visible width with the row's background so the block reads as its own surface.
+            // Selected cells and the text are painted over this fill below; non-user rows never fill.
+            this.SetAttribute(rowAttribute);
+            this.Move(0, screenRow);
+            this.AddStr(new string(' ', viewWidth));
+            this.UserRowFillCount++;
+        }
+
         var rowWidth = TerminalCellText.Width(row.Text);
         var range = this.selection.RangeForRow(row.GlobalRow, rowWidth);
         if (range is null)
         {
-            this.SetAttribute(this.AttributeFor(row.Role));
+            this.SetAttribute(rowAttribute);
             this.Move(0, screenRow);
             this.AddStr(row.Text);
-            return;
         }
-
-        var useTrueColor = TuiTheme.SupportsTrueColor(this.app.Driver);
-        var selectedAttribute = new TgAttribute(
-            TuiTheme.Resolve(this.theme.SelectionText, useTrueColor),
-            TuiTheme.Resolve(this.theme.SelectionBackground, useTrueColor));
-
-        // Snap the selection range out to whole grapheme boundaries first: a wide glyph (CJK/emoji) whose
-        // trailing cell the selection starts or ends on must not straddle a segment boundary, or it would be
-        // sliced into two adjacent segments and drawn twice. Snapping makes the prefix/selected/suffix
-        // slices partition the row's graphemes exactly once.
-        var (selectStart, selectEnd) = TerminalCellText.SnapRangeToGraphemes(
-            row.Text,
-            range.Value.StartCell,
-            range.Value.EndCellExclusive);
-        var prefix = TerminalCellText.SliceByCells(row.Text, 0, selectStart);
-        var selected = TerminalCellText.SliceByCells(row.Text, selectStart, selectEnd);
-        var suffix = TerminalCellText.SliceByCells(row.Text, selectEnd, rowWidth);
-
-        this.SetAttribute(this.AttributeFor(row.Role));
-        this.Move(0, screenRow);
-        this.AddStr(prefix);
-        var column = TerminalCellText.Width(prefix);
-        if (selected.Length > 0)
+        else
         {
-            this.SetAttribute(selectedAttribute);
+            var useTrueColor = TuiTheme.SupportsTrueColor(this.app.Driver);
+            var selectedAttribute = new TgAttribute(
+                TuiTheme.Resolve(this.theme.SelectionText, useTrueColor),
+                TuiTheme.Resolve(this.theme.SelectionBackground, useTrueColor));
+
+            // Snap the selection range out to whole grapheme boundaries first: a wide glyph (CJK/emoji) whose
+            // trailing cell the selection starts or ends on must not straddle a segment boundary, or it would be
+            // sliced into two adjacent segments and drawn twice. Snapping makes the prefix/selected/suffix
+            // slices partition the row's graphemes exactly once.
+            var (selectStart, selectEnd) = TerminalCellText.SnapRangeToGraphemes(
+                row.Text,
+                range.Value.StartCell,
+                range.Value.EndCellExclusive);
+            var prefix = TerminalCellText.SliceByCells(row.Text, 0, selectStart);
+            var selected = TerminalCellText.SliceByCells(row.Text, selectStart, selectEnd);
+            var suffix = TerminalCellText.SliceByCells(row.Text, selectEnd, rowWidth);
+
+            this.SetAttribute(rowAttribute);
+            this.Move(0, screenRow);
+            this.AddStr(prefix);
+            var column = TerminalCellText.Width(prefix);
+            if (selected.Length > 0)
+            {
+                this.SetAttribute(selectedAttribute);
+                this.Move(column, screenRow);
+                this.AddStr(selected);
+                column += TerminalCellText.Width(selected);
+                this.SelectionDrawCount++;
+            }
+
+            this.SetAttribute(rowAttribute);
             this.Move(column, screenRow);
-            this.AddStr(selected);
-            column += TerminalCellText.Width(selected);
-            this.SelectionDrawCount++;
+            this.AddStr(suffix);
         }
 
-        this.SetAttribute(this.AttributeFor(row.Role));
-        this.Move(column, screenRow);
-        this.AddStr(suffix);
+        if (row.RightText is { Length: > 0 } annotation && viewWidth > 0)
+        {
+            var annotationWidth = TerminalCellText.Width(annotation);
+            var column = viewWidth - annotationWidth;
+            if (column >= 0)
+            {
+                this.SetAttribute(this.AnnotationAttributeFor(row.Role));
+                this.Move(column, screenRow);
+                this.AddStr(annotation);
+                this.RightAnnotationDrawCount++;
+            }
+        }
     }
 
     /// <inheritdoc />
@@ -554,9 +591,24 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.ContextFreeSpace => this.theme.ContextFreeSpace,
             _ => this.theme.TranscriptAssistant,
         };
+
+        // User message rows sit on a subtly different full-width background block; every other role keeps the
+        // global shell background so non-user rows are unchanged.
+        var background = role == TranscriptRole.User ? this.theme.TranscriptUserBackground : this.theme.Background;
         var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
         return new TgAttribute(
             TuiTheme.Resolve(foreground, useTrueColor),
-            TuiTheme.Resolve(this.theme.Background, useTrueColor));
+            TuiTheme.Resolve(background, useTrueColor));
+    }
+
+    /// <summary>The dim attribute for a row's right-aligned annotation (e.g. a user block's sent-time HH:mm),
+    /// drawn over the same background as the row so it blends into the block.</summary>
+    private TgAttribute AnnotationAttributeFor(TranscriptRole role, bool? trueColor = null)
+    {
+        var background = role == TranscriptRole.User ? this.theme.TranscriptUserBackground : this.theme.Background;
+        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
+        return new TgAttribute(
+            TuiTheme.Resolve(this.theme.TranscriptUserTime, useTrueColor),
+            TuiTheme.Resolve(background, useTrueColor));
     }
 }

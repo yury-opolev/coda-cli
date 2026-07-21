@@ -66,7 +66,7 @@ public sealed class FullscreenTuiShellTests
         Assert.True(shell.Transcript.Frame.Height >= 3);
         Assert.Equal(width, shell.Transcript.Frame.Width);
         Assert.Equal(0, shell.Transcript.Frame.X);
-        Assert.True(shell.Composer.Frame.Height >= 3);
+        Assert.True(shell.Composer.Frame.Height >= 1);
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.DoesNotContain(shell.SubViews, view => view.Id?.Contains("sidebar", StringComparison.OrdinalIgnoreCase) == true);
 
@@ -294,7 +294,7 @@ public sealed class FullscreenTuiShellTests
         Assert.Equal(FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.X);
         Assert.Equal(60 - FullscreenTuiShell.ComposerGutterWidth, shell.Composer.Frame.Width);
         Assert.True(shell.Composer.Frame.Width >= 40, "composer should stay comfortably usable at 60 columns");
-        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(1, shell.Composer.Frame.Height);
         Assert.Equal(60, shell.Chrome.Frame.Width);
 
         if (token is not null)
@@ -802,7 +802,7 @@ public sealed class FullscreenTuiShellTests
         // is exactly two rows taller than the composer (its half-block edges).
         Assert.Equal(0, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
-        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(1, shell.Composer.Frame.Height);
         Assert.Equal(1, shell.Operational.Frame.Height);
         Assert.Equal(1, shell.Status.Frame.Height);
 
@@ -851,6 +851,65 @@ public sealed class FullscreenTuiShellTests
         var afterAppend = string.Join("\n", shell.Transcript.CollectVisibleRows().Select(row => row.Text));
         Assert.Contains("second reply", afterAppend);
         Assert.True(shell.Transcript.AutoFollow);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task User_message_paints_a_full_width_block_and_a_right_aligned_send_time()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var sentAt = new DateTimeOffset(2026, 7, 21, 8, 24, 0, TimeSpan.Zero);
+        var user = new UserTranscriptBlock(Guid.NewGuid(), "run the tests", sentAt);
+        var assistant = new AssistantTranscriptBlock(Guid.NewGuid(), "all green", Complete: true);
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = [user, assistant] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        // The user row paints its full-width background block and its right-aligned HH:mm send time; the time
+        // is a draw-time annotation and is never mixed into the row text (so selection/copy stay clean).
+        Assert.True(shell.Transcript.UserRowFillCount > 0, "user row must paint a full-width background block");
+        Assert.True(shell.Transcript.RightAnnotationDrawCount > 0, "user row must draw its send-time annotation");
+        var userRow = shell.Transcript.CollectVisibleRows().First(row => row.BlockId == user.Id);
+        Assert.Equal("08:24", userRow.RightText);
+        Assert.DoesNotContain("08:24", userRow.Text);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Resumed_user_message_without_a_timestamp_draws_no_send_time()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var user = new UserTranscriptBlock(Guid.NewGuid(), "resumed prompt");
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = [user] }, CancellationToken.None);
+        app.LayoutAndDraw();
+
+        // The block still paints (full-width fill) but omits the time when SentAt is null.
+        Assert.True(shell.Transcript.UserRowFillCount > 0);
+        Assert.Equal(0, shell.Transcript.RightAnnotationDrawCount);
+        Assert.Null(shell.Transcript.CollectVisibleRows().First(row => row.BlockId == user.Id).RightText);
 
         if (token is not null)
         {
@@ -1165,7 +1224,7 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Escape_clears_selection_before_arming_interrupt()
+    public void Escape_clears_selection_as_a_local_dismiss()
     {
         using var fixture = RetainedShellFixture.Create(activeWork: true);
         fixture.Shell.Transcript.ReplaceAll(Lines(3));
@@ -1176,6 +1235,37 @@ public sealed class FullscreenTuiShellTests
 
         Assert.False(fixture.Shell.Transcript.HasSelection);
         Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Idle_escape_is_consumed_and_raises_no_action()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+
+        // Escape is a local dismiss/cancel key. With nothing to dismiss it is still fully consumed so it can
+        // never bubble to Terminal.Gui's default Esc quit binding and close the application after, say, the
+        // /tasks overlay was dismissed with an earlier Esc.
+        Assert.True(fixture.Shell.Composer.NewKeyDownEvent(Key.Esc));
+        Assert.True(fixture.Shell.Composer.NewKeyDownEvent(Key.Esc));
+        Assert.Empty(fixture.Actions);
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+    }
+
+    [Fact]
+    public void Escape_never_arms_or_fires_an_interrupt_even_with_active_work()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        Assert.True(fixture.Shell.Composer.NewKeyDownEvent(Key.Esc));
+        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+
+        clock.Advance(TimeSpan.FromMilliseconds(100));
+        Assert.True(fixture.Shell.Composer.NewKeyDownEvent(Key.Esc));
+
+        // Escape is never a global interrupt chord: even a rapid second Esc while work is active fires no
+        // UiAction. Interrupting/terminating stays on the explicit Ctrl+C chord.
         Assert.Empty(fixture.Actions);
     }
 
@@ -1192,13 +1282,13 @@ public sealed class FullscreenTuiShellTests
                 timeout = callback;
                 return new object();
             });
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
 
-        clock.Advance(TimeSpan.FromMilliseconds(801));
+        clock.Advance(TimeSpan.FromMilliseconds(1501));
         Assert.False(timeout!());
 
-        Assert.NotEqual("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        Assert.NotEqual("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
         Assert.Equal(
             OperationalStatusProjector.Project(fixture.Shell.Snapshot),
             fixture.Shell.Operational.Status);
@@ -1215,7 +1305,7 @@ public sealed class FullscreenTuiShellTests
                 removed++;
                 return true;
             });
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
         await fixture.Shell.ApplyAsync(
             UiSessionSnapshot.Empty with
             {
@@ -1615,7 +1705,7 @@ public sealed class VirtualizedTranscriptViewTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        Assert.Equal(3, shell.Composer.Frame.Height);
+        Assert.Equal(1, shell.Composer.Frame.Height);
 
         // Enough wrapped words to exceed the cap at the full-width composer (screen width minus the prompt
         // gutter), so the composer grows to and stops at the approved maximum instead of the raw line count.
@@ -1662,7 +1752,7 @@ public sealed class VirtualizedTranscriptViewTests
     }
 
     [Fact]
-    public void First_escape_dismisses_completion_before_arming_interrupt()
+    public void First_escape_dismisses_completion_as_a_local_dismiss()
     {
         using var fixture = RetainedShellFixture.Create(
             activeWork: true,
@@ -1678,22 +1768,16 @@ public sealed class VirtualizedTranscriptViewTests
     }
 
     [Fact]
-    public void Escape_arms_then_interrupts_and_ctrl_c_arms_then_exits()
+    public void Ctrl_c_arms_then_exits()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
-
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
-        clock.Advance(TimeSpan.FromMilliseconds(200));
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-        Assert.Equal([UiAction.Interrupt], fixture.Actions);
 
         fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
         Assert.Equal("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
         clock.Advance(TimeSpan.FromSeconds(1));
         fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
-        Assert.Equal([UiAction.Interrupt, UiAction.Exit], fixture.Actions);
+        Assert.Equal([UiAction.Exit], fixture.Actions);
     }
 
     [Fact]
@@ -1701,21 +1785,22 @@ public sealed class VirtualizedTranscriptViewTests
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
 
         await fixture.Shell.ApplyAsync(
             UiSessionSnapshot.Empty with { PendingPrompt = UiPromptRequest.Confirm("Allow?", false) },
             CancellationToken.None);
-        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
 
         await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
         fixture.Shell.Composer.NewKeyDownEvent(Key.F2);
-        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
     }
 
     [Fact]
-    public void Armed_interrupt_hint_expiry_callback_restores_projected_status()
+    public void Armed_exit_hint_expiry_callback_restores_projected_status()
     {
         var clock = new ManualTimeProvider();
         Func<bool>? timeout = null;
@@ -1727,70 +1812,17 @@ public sealed class VirtualizedTranscriptViewTests
                 timeout = callback;
                 return new object();
             });
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
+        Assert.Equal("Press Ctrl+C again to exit", fixture.Shell.Operational.Status.Text);
 
-        clock.Advance(TimeSpan.FromMilliseconds(801));
+        clock.Advance(TimeSpan.FromMilliseconds(1501));
         Assert.NotNull(timeout);
         Assert.False(timeout!());
 
-        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        Assert.DoesNotContain("Press Ctrl+C again", fixture.Shell.Operational.Status.Text);
         Assert.Equal(
             OperationalStatusProjector.Project(fixture.Shell.Snapshot),
             fixture.Shell.Operational.Status);
-    }
-
-    [Fact]
-    public async Task Applying_idle_snapshot_disarms_stale_interrupt_hint()
-    {
-        var clock = new ManualTimeProvider();
-        using var fixture = RetainedShellFixture.Create(activeWork: false, timeProvider: clock);
-
-        await fixture.Shell.ApplyAsync(
-            UiSessionSnapshot.Empty with { RunningTasks = 1 },
-            CancellationToken.None);
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
-
-        await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty, CancellationToken.None);
-
-        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
-        Assert.Equal(
-            OperationalStatusProjector.Project(UiSessionSnapshot.Empty),
-            fixture.Shell.Operational.Status);
-        Assert.Empty(fixture.Actions);
-    }
-
-    [Fact]
-    public void Second_escape_after_work_ends_clears_stale_hint_and_timer_even_when_unconsumed()
-    {
-        var clock = new ManualTimeProvider();
-        var active = true;
-        var chordToken = new object();
-        var removed = new List<object>();
-        using var fixture = RetainedShellFixture.Create(
-            activeWork: false,
-            timeProvider: clock,
-            hasActiveWork: () => active,
-            addTimeout: (_, _) => chordToken,
-            removeTimeout: token =>
-            {
-                removed.Add(token);
-                return true;
-            });
-
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-        Assert.Equal("Press Esc again to interrupt", fixture.Shell.Operational.Status.Text);
-
-        // The interruptible work finishes without a snapshot apply, so the disarm-on-apply path never
-        // runs; the second Esc is declined by the chord state (not consumed) yet must still clear the
-        // stale hint and tear down the orphaned expiry timer immediately.
-        active = false;
-        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
-
-        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
-        Assert.Contains(chordToken, removed);
-        Assert.Empty(fixture.Actions);
     }
 
     [Fact]

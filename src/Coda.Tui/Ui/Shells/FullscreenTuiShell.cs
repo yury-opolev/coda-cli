@@ -54,8 +54,9 @@ internal class FullscreenTuiShell(
         statusProjection,
         taskBrowserProvider: taskBrowserProvider)
 {
-    /// <summary>The minimum number of composer input rows.</summary>
-    internal const int MinimumComposerHeight = 3;
+    /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
+    /// visual line (the chrome adds the two half-block edge rows around it).</summary>
+    internal const int MinimumComposerHeight = 1;
 
     /// <summary>
     /// Columns reserved at the composer's left edge for the borderless <c>&gt;</c> prompt glyph. The

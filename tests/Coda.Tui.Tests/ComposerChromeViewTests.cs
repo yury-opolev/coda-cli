@@ -45,6 +45,17 @@ public sealed class ComposerChromeViewTests
     }
 
     [Fact]
+    public void Ready_single_content_row_is_top_edge_prompt_row_bottom_edge()
+    {
+        using var chrome = new ComposerChromeView(TuiTheme.WarmEmber);
+
+        // A single-line draft yields a 1 content-row composer, so the chrome is exactly three rows: the
+        // upper-half-block top edge, the one content row carrying the prompt gutter, and the lower-half-block
+        // bottom edge.
+        Assert.Equal(["▀▀▀▀▀▀", ">     ", "▄▄▄▄▄▄"], chrome.RenderRows(width: 6, height: 3));
+    }
+
+    [Fact]
     public void Startup_state_keeps_the_dark_region_but_draws_no_chrome_text()
     {
         using var chrome = new ComposerChromeView(TuiTheme.WarmEmber);
