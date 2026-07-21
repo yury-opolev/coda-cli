@@ -429,12 +429,17 @@ and a nesting **depth** (main agent = 0, subagents at depth 1 and 2; `MaxSubagen
 = 2 is enforced at registration).
 
 - **Tools.** The manager backs `task`/`task_start` (start a subagent),
-  `task_output` (poll incremental output), `task_stop` (cancel), and the four
-  inspection/steering tools `task_list`, `task_get`, `task_peek`, and `task_send`
-  (steer a running subagent). `run_command` gained a `run_in_background` flag that
-  registers a managed shell and returns its id to poll with `task_output`. The tool
-  names and schemas are unchanged from the previous `background_task_*`
-  implementation — this migration is transparent to callers.
+  `task_output` (poll incremental output), `task_stop` (cancel), and the
+  inspection/steering/lifecycle tools `task_list`, `task_get`, `task_peek`,
+  `task_send` (steer a running subagent), `task_wait` (block until a task is
+  terminal — optional `timeout_seconds`, default 600, max 1800; a timeout reports
+  *still running* and never stops the task), `task_background` (promote a running
+  foreground shell to the background), and `task_remove` (drop a terminal task while
+  preserving its log). `run_command` gained a `run_in_background` flag that
+  registers a managed shell and returns its id to poll with `task_output`. These
+  model-facing tools live in `BuiltInTools.All()`, so **interactive and serve
+  pipelines register the identical set** — serve has every non-UI task capability;
+  only the `/tasks` overlay and its keyboard shortcuts are TUI-specific.
 - **Access scope.** The main agent (null caller task id) has authority over every
   task in the session; a subagent may only see and act on its own **strict
   descendants**, walking the trusted parent graph — never caller-supplied depth — so
@@ -454,21 +459,24 @@ and a nesting **depth** (main agent = 0, subagents at depth 1 and 2; `MaxSubagen
   pruned) with a contiguous `Removed` change, while their persistent log files are
   preserved on disk. Explicit `Remove` still works, and a foreground caller still
   returns its result safely even if its own task is auto-pruned on completion.
-- **Shell detach (API only).** A running foreground shell can be promoted to the
-  background via `TaskManager.TryDetach` (shells only; subagents are rejected). The
-  promotion is API-complete and publishes a `Mode` change; the interactive UI to
-  drive it lands later. On detach the foreground stdout/stderr capture
-  (`ShellOutputCapture`) is atomically snapshotted for the returned `ShellRunResult`
-  and disabled, so the background finalizer keeps streaming into the ring/log without
-  growing capture memory.
+- **Shell detach.** A running foreground shell can be promoted to the
+  background via `TaskManager.TryDetach` (shells only; subagents are rejected),
+  exposed to the model as `task_background` and, in the TUI, driven by `Ctrl+B`.
+  The promotion publishes a `Mode` change. On detach the foreground stdout/stderr
+  capture (`ShellOutputCapture`) is atomically snapshotted for the returned
+  `ShellRunResult` and disabled, so the background finalizer keeps streaming into
+  the ring/log without growing capture memory.
 - **Subscriptions.** `Subscribe()` returns a bounded, version-gap-resyncing
-  `TaskSubscription` seeded with the current task list — the substrate a future TUI
-  panel or serve API will consume; nothing renders it yet.
+  `TaskSubscription` seeded with the current task list. The interactive `/tasks`
+  browser (`Coda.Tui/Ui/Tasks/`) consumes it live; `coda serve` reaches the same
+  state through the `task_*` model tools rather than a rendered panel.
 - **Shutdown.** `ShutdownAsync` (wired into `CodaSession` disposal, so it runs when
   Coda exits) atomically stops accepting new tasks, cancels and tree-kills every
-  running task within a bounded budget, and flushes logs. Tasks are **in-process
-  only** — they do not survive across processes, and a visual `/tasks` manager and a
-  serve-side task API are explicitly future work (no `/tasks` command ships today).
+  running task within a bounded budget, and flushes logs. Tasks are **in-process /
+  process-local** — they do not survive across processes, and everything (including
+  a UI shell attachment) stops when Coda exits. The interactive `/tasks` browser is
+  a Terminal.Gui overlay only; `coda serve` has the equivalent non-UI task tools but
+  no slash command or TUI.
 
 The runtime state surfaced to the TUI still uses the legacy `BackgroundTasks` DTO
 naming: `SessionRuntimeSnapshot.BackgroundTasks` is a list of `BackgroundTaskSnapshot`

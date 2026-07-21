@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Tasks;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.State;
@@ -93,6 +94,13 @@ public sealed class CommandContext
 
     /// <summary>The agent's current extra tools (from <see cref="ExtraToolsProvider"/>; empty when unset).</summary>
     public IReadOnlyList<ITool> ExtraTools => this.ExtraToolsProvider?.Invoke() ?? [];
+
+    /// <summary>
+    /// Live source of the session's <see cref="TaskManager"/> (a provider, not a snapshot, so it reflects
+    /// the session that only exists after the first turn). Null in non-interactive/plain contexts that have
+    /// no running agent; the <c>/tasks</c> command then renders an empty list.
+    /// </summary>
+    public Func<TaskManager?>? TaskManagerProvider { get; set; }
 
     /// <summary>
     /// The live MCP client manager, so <c>/mcp</c> can report connection status and tools.

@@ -2,6 +2,7 @@ using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
+using Coda.Tui.Ui.Tasks; // for TaskBrowserProvider
 
 namespace Coda.Tui.Tests;
 
@@ -33,7 +34,8 @@ internal sealed class RetainedShellFixture : IDisposable
         Func<ClipboardReadResult>? clipboardReader = null,
         Func<TimeSpan, Func<bool>, object>? addTimeout = null,
         Func<object, bool>? removeTimeout = null,
-        Func<bool>? hasActiveWork = null)
+        Func<bool>? hasActiveWork = null,
+        Func<TaskBrowserProvider?>? taskBrowserProvider = null)
     {
         IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -52,7 +54,8 @@ internal sealed class RetainedShellFixture : IDisposable
             clipboardWriter: clipboardWriter,
             clipboardReader: clipboardReader,
             addTimeout: addTimeout,
-            removeTimeout: removeTimeout);
+            removeTimeout: removeTimeout,
+            taskBrowserProvider: taskBrowserProvider);
         var token = app.Begin(shell);
         app.LayoutAndDraw();
         return new RetainedShellFixture(app, shell, token);

@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Text.RegularExpressions;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.State;
 
@@ -11,7 +10,7 @@ namespace Coda.Tui.Ui.Rendering;
 /// terminals, and the explicit <c>--plain</c> mode. Externally supplied command/diff/diagnostic text
 /// is sanitized of control escapes while ordinary tabs and newlines are preserved.
 /// </summary>
-public sealed partial class PlainOutputRenderer : IUiEventObserver
+public sealed class PlainOutputRenderer : IUiEventObserver
 {
     private readonly TextWriter _writer;
 
@@ -107,8 +106,5 @@ public sealed partial class PlainOutputRenderer : IUiEventObserver
 
     private static string TrimTrailingNewlines(string value) => value.TrimEnd('\r', '\n');
 
-    private static string Sanitize(string value) => EscapeSequences().Replace(value, string.Empty);
-
-    [GeneratedRegex("\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\))")]
-    private static partial Regex EscapeSequences();
+    private static string Sanitize(string value) => TerminalTextSanitizer.StripAnsiEscapes(value);
 }

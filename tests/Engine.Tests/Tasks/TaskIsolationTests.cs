@@ -189,6 +189,9 @@ public sealed class TaskIsolationTests
         new BackgroundTaskStartTool(),
         new BackgroundTaskOutputTool(),
         new BackgroundTaskStopTool(),
+        new TaskWaitTool(),
+        new TaskBackgroundTool(),
+        new TaskRemoveTool(),
         new ReadFileTool(),
     ]);
 
@@ -205,6 +208,9 @@ public sealed class TaskIsolationTests
         Assert.DoesNotContain("task_start", names);
         Assert.DoesNotContain("task_output", names);
         Assert.DoesNotContain("task_stop", names);
+        Assert.DoesNotContain("task_wait", names);
+        Assert.DoesNotContain("task_background", names);
+        Assert.DoesNotContain("task_remove", names);
         Assert.Contains("read_file", names);
     }
 
@@ -221,6 +227,9 @@ public sealed class TaskIsolationTests
         Assert.DoesNotContain("task_start", names);
         Assert.DoesNotContain("task_output", names);
         Assert.DoesNotContain("task_stop", names);
+        Assert.DoesNotContain("task_wait", names);
+        Assert.DoesNotContain("task_background", names);
+        Assert.DoesNotContain("task_remove", names);
         Assert.Contains("read_file", names);
     }
 
@@ -233,11 +242,14 @@ public sealed class TaskIsolationTests
         var names = tools.All.Select(t => t.Name).ToList();
 
         // A depth-1 general-purpose child keeps the management tools so it can drive its own
-        // depth-2 descendants (create/read/stop).
+        // depth-2 descendants (create/read/stop), including the new parity tools.
         Assert.Contains("task", names);
         Assert.Contains("task_start", names);
         Assert.Contains("task_output", names);
         Assert.Contains("task_stop", names);
+        Assert.Contains("task_wait", names);
+        Assert.Contains("task_background", names);
+        Assert.Contains("task_remove", names);
     }
 
     [Fact]
@@ -248,6 +260,11 @@ public sealed class TaskIsolationTests
         Assert.True(SubagentHost.IsTaskManagementTool("task_output"));
         Assert.True(SubagentHost.IsTaskManagementTool("task_stop"));
         Assert.True(SubagentHost.IsTaskManagementTool("task_send")); // future task_* tool
+        // The new parity tools are task_*-prefixed, so read-only/max-depth subagent stripping
+        // catches them automatically — no per-tool change to the deny predicate is needed.
+        Assert.True(SubagentHost.IsTaskManagementTool("task_wait"));
+        Assert.True(SubagentHost.IsTaskManagementTool("task_background"));
+        Assert.True(SubagentHost.IsTaskManagementTool("task_remove"));
         Assert.False(SubagentHost.IsTaskManagementTool("read_file"));
         Assert.False(SubagentHost.IsTaskManagementTool("tool_search"));
     }

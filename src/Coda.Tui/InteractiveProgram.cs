@@ -12,6 +12,7 @@ using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
+using Coda.Tui.Ui.Tasks;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -254,6 +255,16 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         using var agentRunner = new AgentRunner(agentToolsProvider);
         using var app = new TuiApp(context, agentToolsProvider, agentRunner: agentRunner);
 
+        // The command context and the browser both read the live session through agentRunner (a provider,
+        // not a snapshot): before the first turn agentRunner.Tasks/ExecutionGate are null, so /tasks renders
+        // an empty list and the browser opens empty; afterwards they observe the running session's registry.
+        context.TaskManagerProvider = () => agentRunner.Tasks;
+
+        Func<TaskBrowserProvider?> taskBrowserProvider = () =>
+            agentRunner.Tasks is { } tasks && agentRunner.ExecutionGate is { } gate
+                ? new TaskBrowserProvider(tasks, gate)
+                : null;
+
         var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
 
         // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
@@ -380,9 +391,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
             TerminalGuiShellBase shell = shellMode == TuiRunMode.Fullscreen
                 ? new FullscreenTuiShell(
-                    tgApp, composerController, mailbox, controller.CurrentSnapshot, hasActiveWork: () => controller.HasActiveWork)
+                    tgApp, composerController, mailbox, controller.CurrentSnapshot,
+                    hasActiveWork: () => controller.HasActiveWork, taskBrowserProvider: taskBrowserProvider)
                 : new InlineTuiShell(
-                    tgApp, composerController, mailbox, controller.CurrentSnapshot, hasActiveWork: () => controller.HasActiveWork);
+                    tgApp, composerController, mailbox, controller.CurrentSnapshot,
+                    hasActiveWork: () => controller.HasActiveWork, taskBrowserProvider: taskBrowserProvider);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);

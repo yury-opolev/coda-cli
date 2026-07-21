@@ -1,5 +1,4 @@
 using System.Text;
-using System.Text.RegularExpressions;
 using Coda.Tui.Ui.Events;
 using Spectre.Console;
 using Spectre.Console.Rendering;
@@ -14,7 +13,7 @@ namespace Coda.Tui.Ui.Rendering;
 /// <see cref="CommandOutputEvent"/> when the render produced visible text. <see cref="Clear"/> is
 /// translated into a <see cref="ConsoleClearRequestedEvent"/> rather than an escape sequence.
 /// </summary>
-public sealed partial class UiAnsiConsoleAdapter : IAnsiConsole
+public sealed class UiAnsiConsoleAdapter : IAnsiConsole
 {
     private readonly IUiEventPublisher _publisher;
     private readonly StringBuilder _buffer;
@@ -93,7 +92,7 @@ public sealed partial class UiAnsiConsoleAdapter : IAnsiConsole
             return;
         }
 
-        var stripped = EscapeSequences().Replace(raw, string.Empty);
+        var stripped = TerminalTextSanitizer.StripAnsiEscapes(raw);
         var normalized = NormalizeNewlines(stripped);
         if (!HasVisibleContent(normalized))
         {
@@ -125,7 +124,4 @@ public sealed partial class UiAnsiConsoleAdapter : IAnsiConsole
 
         return false;
     }
-
-    [GeneratedRegex("\\x1B(?:\\[[0-?]*[ -/]*[@-~]|\\][^\\x07]*(?:\\x07|\\x1B\\\\))")]
-    private static partial Regex EscapeSequences();
 }

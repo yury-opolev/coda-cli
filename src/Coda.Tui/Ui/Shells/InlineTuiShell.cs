@@ -2,6 +2,7 @@ using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
+using Coda.Tui.Ui.Tasks;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -31,7 +32,8 @@ internal sealed class InlineTuiShell(
     Func<TimeSpan, Func<bool>, object>? addTimeout = null,
     Func<object, bool>? removeTimeout = null,
     TuiTheme? theme = null,
-    Func<UiSessionSnapshot, int, string>? statusProjection = null)
+    Func<UiSessionSnapshot, int, string>? statusProjection = null,
+    Func<TaskBrowserProvider?>? taskBrowserProvider = null)
     : FullscreenTuiShell(
         app,
         controller,
@@ -44,7 +46,8 @@ internal sealed class InlineTuiShell(
         addTimeout,
         removeTimeout,
         theme,
-        statusProjection)
+        statusProjection,
+        taskBrowserProvider: taskBrowserProvider)
 {
     /// <summary>
     /// The fewest rows the inline region can occupy: header (1), operational (1), the chrome region

@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Tasks;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -54,6 +55,12 @@ public sealed class AgentRunner : IDisposable
             }
         }
     }
+
+    /// <summary>The live task registry once the session exists (null before the first turn runs).</summary>
+    public TaskManager? Tasks => this.session?.Tasks;
+
+    /// <summary>The session's cooperative pause gate (null before the first turn runs).</summary>
+    public AgentExecutionGate? ExecutionGate => this.session?.ExecutionGate;
 
     /// <summary>For tests: whether <see cref="Dispose"/> has already run.</summary>
     internal bool IsDisposed

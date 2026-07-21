@@ -39,6 +39,8 @@ namespace Coda.Sdk;
 /// tool cycle so the transcript is recorded incrementally ("on the go") — a session killed
 /// mid-run then still leaves a record of everything up to the kill.</param>
 /// <param name="Tasks">Task manager owning subagent and shell tasks (parallel to the legacy runner during migration).</param>
+/// <param name="Gate">Optional cooperative execution gate letting an outside actor pause the main
+/// agent at an iteration boundary and resume it. Null in serve/headless runs where no pause is requested.</param>
 public sealed record AgentLoopSpec(
     ILlmClient Client,
     ToolRegistry Tools,
@@ -59,4 +61,5 @@ public sealed record AgentLoopSpec(
     ILogger Logger,
     SteeringInbox? Steering = null,
     Func<CancellationToken, Task>? PersistTurnAsync = null,
-    TaskManager? Tasks = null);
+    TaskManager? Tasks = null,
+    AgentExecutionGate? Gate = null);

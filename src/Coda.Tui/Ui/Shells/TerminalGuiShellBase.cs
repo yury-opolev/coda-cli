@@ -4,6 +4,7 @@ using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
+using Coda.Tui.Ui.Tasks;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -47,6 +48,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private string? statusText;
     private int statusUpdateCount;
     private bool composerDisabled;
+    private bool composerLockedByAttachment;
+    private readonly TaskBrowserController? taskController;
+    private readonly TaskBrowserOverlay? taskOverlay;
     private bool disposed;
 
     /// <summary>
@@ -69,7 +73,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<TimeSpan, Func<bool>, object>? addTimeout = null,
         Func<object, bool>? removeTimeout = null,
         TuiTheme? theme = null,
-        Func<UiSessionSnapshot, int, string>? statusProjection = null)
+        Func<UiSessionSnapshot, int, string>? statusProjection = null,
+        Func<TaskBrowserProvider?>? taskBrowserProvider = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -97,6 +102,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.PromptOverlay = new PromptOverlay(publisher, this.Theme);
         this.PromptOverlay.ApplyTheme(app.Driver);
         this.Completion = new CommandCompletionView(this.Theme);
+
+        // Build the browser controller + hidden overlay before BuildLayout so the concrete shell can add the
+        // overlay to its view tree. A null provider means no browser is hosted at all (e.g. non-interactive
+        // callers, or the pre-first-turn state where the live TaskManager does not yet exist).
+        if (taskBrowserProvider is not null)
+        {
+            this.taskController = new TaskBrowserController(taskBrowserProvider, this.TimeSource);
+            this.taskOverlay = new TaskBrowserOverlay(this.app, this.taskController, this.Theme, this.OnTaskBrowserChanged);
+        }
 
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
         // composer's own printable/action mapping regardless of which view currently holds focus.
@@ -159,6 +173,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>The keyboard-only prompt surface, hidden until a prompt is pending.</summary>
     internal PromptOverlay PromptOverlay { get; }
+
+    /// <summary>The hosted <c>/tasks</c> browser overlay, or null when no provider was wired.</summary>
+    internal TaskBrowserOverlay? TaskOverlay => this.taskOverlay;
+
+    /// <summary>The browser's headless controller (test/diagnostic seam), or null when no provider was wired.</summary>
+    internal TaskBrowserController? TaskController => this.taskController;
 
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
@@ -355,6 +375,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
             this.Composer.LayoutInvalidated -= this.OnComposerLayoutInvalidatedHandler;
             this.Initialized -= this.OnShellInitialized;
+
+            // Hide() cancels the pump, unsubscribes Changed, releases any pause lease (resuming the main
+            // agent), and closes the controller — so a mode switch or shutdown never leaves the agent paused.
+            // The overlay View itself is disposed by base.Dispose below.
+            this.taskOverlay?.Hide();
         }
 
         base.Dispose(disposing);
@@ -415,6 +440,13 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return false;
         }
 
+        if (this.taskOverlay?.Visible == true)
+        {
+            // While the browser is up it owns the keyboard (it holds focus); the shell chords stand down so
+            // Ctrl+B is consumed by the overlay, never re-interpreted as the background chord below.
+            return false;
+        }
+
         if (key == Key.Esc)
         {
             if (this.Completion.Visible)
@@ -455,6 +487,19 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             }
 
             return this.ApplyChord(this.chords.HandleCtrlC());
+        }
+
+        if (this.taskController is not null && key == Key.B.WithCtrl)
+        {
+            // Ctrl+B is an output/shell chord, never a browser opener (that is /tasks): the controller
+            // releases an active UI attachment, otherwise it sends the selected — or latest — running
+            // foreground shell to the background and returns the real TryDetach outcome to surface. It never
+            // interrupts the main agent.
+            var message = this.taskController.HandleBackgroundChord();
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(message, OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(2));
+            return true;
         }
 
         return false;
@@ -963,7 +1008,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private void UpdateComposerAvailability(UiSessionSnapshot snapshot)
     {
         var startingUp = snapshot.ActiveOperation?.Kind == StartupOperationKind;
-        if (startingUp)
+        if (startingUp || this.composerLockedByAttachment)
         {
             this.Chrome.SetReady(false);
             this.Composer.InputEnabled = false;
@@ -993,9 +1038,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // forced hidden.
         this.SyncCompletion();
 
-        // Focus the editor on the transition back to ready, but never when a prompt is pending: the modal
-        // overlay stays topmost and keeps focus.
-        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible)
+        // Focus the editor on the transition back to ready, but never when a prompt is pending or the task
+        // browser is open: the modal prompt overlay stays topmost and keeps focus, and an open browser owns
+        // the keyboard — a composer unlock (e.g. an attachment auto-releasing on shell completion) must not
+        // steal focus out from under either.
+        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible && this.taskOverlay?.Visible != true)
         {
             this.Composer.SetFocus();
         }
@@ -1019,7 +1066,74 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
 
         this.PromptOverlay.Update(null);
-        if (!this.composerDisabled)
+        if (this.taskOverlay?.Visible == true)
+        {
+            // The browser was open behind the prompt: return focus to it, not the composer.
+            this.taskOverlay.SetFocus();
+        }
+        else if (!this.composerDisabled)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
+    private void OpenTaskBrowser()
+    {
+        // Show() owns controller.Open() + a fresh pump and is idempotent while already active, so a repeated
+        // /tasks never re-Opens (which would rebind the subscription and dispose the live pump under it).
+        // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
+        // was built once; before the first turn the provider returns null and the browser opens empty.
+        this.taskOverlay?.Show();
+    }
+
+    private void SetComposerAttachmentLock(bool locked)
+    {
+        if (this.composerLockedByAttachment == locked)
+        {
+            return;
+        }
+
+        this.composerLockedByAttachment = locked;
+        this.UpdateComposerAvailability(this.Snapshot);
+    }
+
+    /// <summary>
+    /// Marshaled browser-change callback (the overlay hops <see cref="TaskBrowserController.Changed"/> onto
+    /// the UI thread, and <c>Hide()</c> invokes it synchronously on the UI thread): folds the attachment
+    /// pause lease into composer availability and, when the browser has just closed, restores focus — the
+    /// permission prompt wins, otherwise the composer if it is available and not attachment-locked.
+    /// </summary>
+    private void OnTaskBrowserChanged()
+    {
+        if (this.taskOverlay is null || this.disposed)
+        {
+            return;
+        }
+
+        this.SetComposerAttachmentLock(this.taskOverlay.IsComposerLocked);
+
+        if (this.taskOverlay.Visible)
+        {
+            // Still open: it must keep the keyboard. A composer unlock during an auto-release
+            // (Complete/Fail/Stop) must never steal focus, so reclaim it defensively — but a permission
+            // prompt (topmost) still wins.
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.taskOverlay.SetFocus();
+            }
+
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
         {
             this.Composer.SetFocus();
         }
@@ -1027,6 +1141,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     private void OnComposerSubmitted(object? sender, string text)
     {
+        // An exact `/tasks` submission is intercepted locally BEFORE PromptSubmitted fires (which is what
+        // feeds TuiController.OnSubmitted's dispatch guard), so it opens the browser even while the agent is
+        // busy and never dispatches a turn. The composer already cleared the draft/completion on submit.
+        if (this.taskOverlay is not null && TaskBrowserController.IsOpenRequest(text))
+        {
+            this.OpenTaskBrowser();
+            return;
+        }
+
         // Explicit submits (prompts, slash commands, bash) always resume auto-following: jump the transcript
         // back to the newest row before forwarding so the response the user just asked for is visible even
         // when they had scrolled up. Background output alone never forces this — only an explicit submit.

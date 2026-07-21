@@ -171,6 +171,38 @@ public sealed class PlainOutputRendererTests
     }
 
     [Fact]
+    public async Task External_osc_hyperlink_escapes_are_stripped_after_shared_sanitizer_extraction()
+    {
+        // Characterization: PlainOutputRenderer now delegates escape stripping to the shared
+        // TerminalTextSanitizer regex, which also removes OSC hyperlink sequences (previously untouched).
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer);
+
+        await renderer.ApplyEventAsync(
+            new CommandOutputEvent("\x1B]8;;https://example.com\x07link\x1B]8;;\x07"),
+            CancellationToken.None);
+
+        Assert.Equal("link" + Environment.NewLine, writer.ToString());
+        Assert.DoesNotContain('\u001b', writer.ToString());
+    }
+
+    [Fact]
+    public async Task Double_escaped_clear_screen_cannot_reform_a_live_sequence()
+    {
+        // Regression: stripping the inner ESC[2J must not leave the leading ESC glued to a literal
+        // "[2J" that reforms a live clear-screen once written to the terminal.
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer);
+
+        await renderer.ApplyEventAsync(new CommandOutputEvent("\u001B\u001B[2J[2J"), CancellationToken.None);
+        await renderer.ApplyEventAsync(new CommandOutputEvent("\u001B\u001BA[2J"), CancellationToken.None);
+
+        var output = writer.ToString();
+        Assert.DoesNotContain('\u001b', output);
+        Assert.DoesNotContain("\u001b[", output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Frame_only_events_produce_no_plain_output()
     {
         var writer = new StringWriter();
