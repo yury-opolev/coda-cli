@@ -383,7 +383,8 @@ public sealed class AgentRunner : IDisposable
         GoalMaxDuration = context.Session.GoalMaxDuration,
         GoalMaxContinuations = context.Session.GoalMaxContinuations,
         // Interactive sessions own the schedule runtime so persisted schedules resume and fire as
-        // isolated agent runs. Headless/serve callers keep the default (false).
+        // isolated agent runs. Serve sessions enable it separately in ServeRunner; one-shot
+        // headless `coda run` invocations keep the default (false).
         EnableScheduleRuntime = true,
     };
 

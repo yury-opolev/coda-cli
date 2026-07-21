@@ -692,6 +692,13 @@ startup**. On startup an **overdue** schedule runs **once immediately** (not onc
 per missed tick — missed ticks are **coalesced**), then advances to its next future
 boundary.
 
+> **One session per project.** The schedule runtime is **in-process**: each open
+> Coda session runs its own independent scheduler with no cross-process lease or
+> de-duplication. If multiple interactive or `coda serve` sessions are open for
+> the same project at the same time, **each session will fire the same persisted
+> schedules independently**. To avoid duplicate runs, keep at most one
+> scheduler-enabled session open per project.
+
 A single definition **never overlaps itself**: while one firing is running, at most
 **one** replacement run is held pending (further due ticks only advance the next
 time, they don't queue up), and it starts after the running one reaches a terminal
