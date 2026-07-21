@@ -15,4 +15,5 @@ public sealed record SessionRuntimeSnapshot(
     string SessionId, TokenUsage Usage, GoalStatus? Goal,
     IReadOnlyList<TodoItem> Todos, IReadOnlyList<ScheduledTask> ScheduledTasks,
     IReadOnlyList<BackgroundTaskSnapshot> BackgroundTasks,
-    IReadOnlyList<LspServerSnapshot> LspServers);
+    IReadOnlyList<LspServerSnapshot> LspServers,
+    IReadOnlyList<ScheduleRuntimeSnapshot> ScheduledExecutions);

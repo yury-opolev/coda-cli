@@ -46,6 +46,13 @@ public sealed record SessionOptions
     /// <summary>Run the SessionMemory watcher (a background notes file) after work-bearing turns.</summary>
     public bool EnableSessionMemory { get; init; }
 
+    /// <summary>
+    /// When set, <see cref="CodaSession.InitializeAsync"/> creates and starts the session-owned
+    /// schedule runtime so due scheduled definitions fire as isolated agent runs. Off by default:
+    /// headless and other SDK callers stay unchanged until an interactive/serve host opts in.
+    /// </summary>
+    public bool EnableScheduleRuntime { get; init; }
+
     /// <summary>In bypass mode, classify each tool action and escalate the risky ones instead of blanket-allowing.</summary>
     public bool EnableBypassClassifier { get; init; }
 

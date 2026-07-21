@@ -240,7 +240,8 @@ public sealed class UiReducerTests
             [
                 new LspServerSnapshot("csharp", LspServerState.Running, []),
                 new LspServerSnapshot("go", LspServerState.Error, []),
-            ]);
+            ],
+            []);
 
         var state = UiReducer.Reduce(UiSessionSnapshot.Empty, new SessionRuntimeChangedEvent(runtime));
 
