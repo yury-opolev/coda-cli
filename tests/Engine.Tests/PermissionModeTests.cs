@@ -337,7 +337,8 @@ public sealed class PermissionModeStateTests
         lspDiagnostics: null,
         toolSearchCoordinator: null,
         NullLoggerFactory.Instance,
-        (_, _, _) => Task.CompletedTask);
+        (_, _, _) => Task.CompletedTask,
+        () => null);
 
     private sealed class FakeClient : ILlmClient
     {

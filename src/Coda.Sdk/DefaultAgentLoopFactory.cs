@@ -23,6 +23,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             spec.Hooks,
             todos: spec.Todos,
             schedules: spec.Schedules,
+            scheduleRuntime: spec.ScheduleRuntime,
             userQuestion: spec.UserQuestion,
             userHooks: spec.UserHooks,
             planApprover: spec.PlanApprover,

@@ -3,13 +3,17 @@ using System.Text.Json;
 namespace Coda.Agent.Tools;
 
 /// <summary>
-/// Deletes a scheduled task by its Id. Bookkeeping-only; runs without a permission prompt.
+/// Deletes a scheduled task by its Id. Removes only the definition so no future execution starts;
+/// any in-progress run continues to completion (runtime stop handling is a later concern).
+/// Bookkeeping-only; runs without a permission prompt.
 /// </summary>
 public sealed class ScheduleDeleteTool : ITool
 {
     public string Name => "schedule_delete";
 
-    public string Description => "Delete a scheduled task by its id. Use schedule_list to discover task ids.";
+    public string Description => "Delete a scheduled task by its id so no future runs start. An " +
+                                 "already-running execution continues to completion. Use schedule_list " +
+                                 "to discover task ids.";
 
     public string InputSchemaJson => """
         {
@@ -41,7 +45,9 @@ public sealed class ScheduleDeleteTool : ITool
 
         var removed = context.Schedules.Remove(id);
         return removed
-            ? Task.FromResult(new ToolResult($"Scheduled task '{id}' deleted."))
+            ? Task.FromResult(new ToolResult(
+                $"Scheduled task '{id}' deleted. Any in-progress execution will continue to " +
+                "completion; no future runs will start."))
             : Task.FromResult(new ToolResult($"Scheduled task '{id}' not found."));
     }
 }

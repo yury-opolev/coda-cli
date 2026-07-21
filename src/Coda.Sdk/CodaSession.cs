@@ -182,7 +182,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lspDiagnostics,
             this.toolSearchCoordinator,
             this.loggerFactory,
-            this.CompactHistoryAsync);
+            this.CompactHistoryAsync,
+            // No schedule runtime yet; Task 7 wires the real runtime lifecycle. The provider is
+            // evaluated per turn, so returning null here keeps the tools' runtime state idle.
+            () => null);
 
         this.logger.LogInformation(
             "Session {sessionId} started: provider {provider}, model {model}",

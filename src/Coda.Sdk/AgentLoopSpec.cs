@@ -41,6 +41,8 @@ namespace Coda.Sdk;
 /// <param name="Tasks">Task manager owning subagent and shell tasks (parallel to the legacy runner during migration).</param>
 /// <param name="Gate">Optional cooperative execution gate letting an outside actor pause the main
 /// agent at an iteration boundary and resume it. Null in serve/headless runs where no pause is requested.</param>
+/// <param name="ScheduleRuntime">Optional host-neutral runtime-state view surfaced to the schedule
+/// tools so <c>schedule_list</c> can report idle/running/pending. Null before the runtime starts.</param>
 public sealed record AgentLoopSpec(
     ILlmClient Client,
     ToolRegistry Tools,
@@ -62,4 +64,5 @@ public sealed record AgentLoopSpec(
     SteeringInbox? Steering = null,
     Func<CancellationToken, Task>? PersistTurnAsync = null,
     TaskManager? Tasks = null,
-    AgentExecutionGate? Gate = null);
+    AgentExecutionGate? Gate = null,
+    IScheduleRuntimeView? ScheduleRuntime = null);

@@ -42,6 +42,7 @@ public sealed class TurnPipelineBuilder
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
     private readonly ILoggerFactory loggerFactory;
     private readonly Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync;
+    private readonly Func<IScheduleRuntimeView?> scheduleRuntimeProvider;
 
     /// <summary>
     /// Creates the builder with the session's stable per-session collaborators. These do not
@@ -58,6 +59,11 @@ public sealed class TurnPipelineBuilder
     /// Compaction delegate bound to the session's in-place history compaction
     /// (<c>CodaSession.CompactHistoryAsync</c>); invoked by the goal-run compact callback.
     /// </param>
+    /// <param name="scheduleRuntimeProvider">
+    /// Stable accessor for the session's schedule runtime-state view. Evaluated on every
+    /// <see cref="BuildSpec"/> call (not captured once) because the runtime is created after the
+    /// builder — it returns null until the runtime starts, then the live view.
+    /// </param>
     public TurnPipelineBuilder(
         TodoStore todos,
         ScheduledTaskStore schedules,
@@ -66,7 +72,8 @@ public sealed class TurnPipelineBuilder
         LspDiagnosticRegistry? lspDiagnostics,
         ToolSearchCoordinator? toolSearchCoordinator,
         ILoggerFactory loggerFactory,
-        Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync)
+        Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync,
+        Func<IScheduleRuntimeView?> scheduleRuntimeProvider)
     {
         this.todos = todos ?? throw new ArgumentNullException(nameof(todos));
         this.schedules = schedules ?? throw new ArgumentNullException(nameof(schedules));
@@ -76,6 +83,7 @@ public sealed class TurnPipelineBuilder
         this.toolSearchCoordinator = toolSearchCoordinator;
         this.loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         this.compactHistoryAsync = compactHistoryAsync ?? throw new ArgumentNullException(nameof(compactHistoryAsync));
+        this.scheduleRuntimeProvider = scheduleRuntimeProvider ?? throw new ArgumentNullException(nameof(scheduleRuntimeProvider));
     }
 
     /// <summary>
@@ -133,7 +141,10 @@ public sealed class TurnPipelineBuilder
             // The loop runs on the session history, which the compaction delegate compacts in
             // place, so the list argument is intentionally ignored.
             CompactAsync: goalSupervisor is null ? null : (_, ct) => this.compactHistoryAsync(client, options.Model, ct),
-            Logger: this.loggerFactory.CreateLogger("Coda.Tool"));
+            Logger: this.loggerFactory.CreateLogger("Coda.Tool"),
+            // Evaluated per turn so a runtime that starts after the builder was constructed is
+            // picked up on the next turn; returns null until then.
+            ScheduleRuntime: this.scheduleRuntimeProvider());
     }
 
     /// <summary>Builds the agent options: system prompt (with/without the anthropic prefix) + output style + base bounds.</summary>
