@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Coda.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Prompts;
@@ -168,6 +169,36 @@ public sealed class FullscreenTuiShellTests
         // The operational row (above the composer) owns the Initializing message; the chrome stays blank.
         Assert.Equal("Initializing…", shell.Operational.Status.Text);
         Assert.DoesNotContain("Initializing", string.Join('\n', shell.Chrome.RenderRows(80, 3)));
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Fullscreen_status_reflects_live_permission_mode_change()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var ask = UiSessionSnapshot.Empty with
+        {
+            Model = "gpt-5.6-sol",
+            Permission = new PermissionStatus(PermissionMode.Default, 0),
+        };
+        await shell.ApplyAsync(ask, CancellationToken.None);
+        Assert.Contains("perm ask", shell.Status.Text, StringComparison.Ordinal);
+
+        var yolo = ask with { Permission = new PermissionStatus(PermissionMode.BypassPermissions, 0) };
+        await shell.ApplyAsync(yolo, CancellationToken.None);
+        Assert.Contains("perm yolo", shell.Status.Text, StringComparison.Ordinal);
+        Assert.DoesNotContain("perm ask", shell.Status.Text, StringComparison.Ordinal);
 
         if (token is not null)
         {

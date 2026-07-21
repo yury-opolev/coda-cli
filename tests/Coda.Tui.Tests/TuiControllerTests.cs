@@ -1,3 +1,6 @@
+using System.Collections.Concurrent;
+using System.Text.Json;
+using Coda.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui;
 using Coda.Tui.Ui.Events;
@@ -405,6 +408,536 @@ public sealed class TuiControllerTests
 
         await dispatch!.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.Equal(TaskStatus.RanToCompletion, dispatch.Status);
+    }
+
+    [Fact]
+    public async Task Live_permission_command_runs_out_of_band_while_a_turn_is_active()
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                if (CommandParser.Parse(text).Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                }
+
+                dispatched.Enqueue(text);
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        var mainDispatch = controller.CurrentDispatch;
+        Assert.NotNull(mainDispatch);
+        Assert.True(controller.HasActiveWork);
+
+        // A safe live permission command executes out-of-band even though the main turn is busy.
+        controller.OnSubmitted("/yolo");
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Contains("/yolo", dispatched);
+
+        // The main turn is untouched: still active, and its dispatch task was never replaced.
+        Assert.True(controller.HasActiveWork);
+        Assert.Same(mainDispatch, controller.CurrentDispatch);
+
+        mainRelease.SetResult();
+        await mainDispatch!.WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    [Theory]
+    [InlineData("/permissions bypass")]
+    [InlineData("/permissions default")]
+    [InlineData("/mode plan")]
+    [InlineData("  /YOLO  ")]
+    [InlineData("/Permissions Default")]
+    public async Task Live_permission_commands_run_out_of_band_across_case_and_whitespace(string command)
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                if (CommandParser.Parse(text).Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                }
+
+                dispatched.Enqueue(text);
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        controller.OnSubmitted(command);
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(30));
+
+        // The raw text is handed to the injected dispatch unchanged, so the one command implementation
+        // parses it and remains the single source of truth for aliases, wording, and state mutation.
+        Assert.Contains(command, dispatched);
+
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task Side_band_permission_commands_execute_in_fifo_order()
+    {
+        var order = new ConcurrentQueue<string>();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                var parsed = CommandParser.Parse(text);
+                if (parsed.Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                    return CommandResult.Continue;
+                }
+
+                order.Enqueue($"{parsed.Name} {string.Join(' ', parsed.Args)}".Trim());
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // `/yolo` then `/permissions default` must deterministically leave the session in Default.
+        controller.OnSubmitted("/yolo");
+        controller.OnSubmitted("/permissions default");
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(30));
+
+        Assert.Equal(new[] { "yolo", "permissions default" }, order.ToArray());
+
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task Ordinary_prompt_is_rejected_while_a_turn_is_active()
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                if (text == "run the agent")
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                }
+
+                dispatched.Enqueue(text);
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        controller.OnSubmitted("another prompt");
+        await Task.Delay(100);
+        Assert.DoesNotContain("another prompt", dispatched);
+
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Theory]
+    [InlineData("/exit")]
+    [InlineData("/model gpt")]
+    [InlineData("!ls")]
+    [InlineData("/help")]
+    public async Task Non_permission_commands_are_rejected_while_a_turn_is_active(string command)
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                if (text == "run the agent")
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                }
+
+                dispatched.Enqueue(text);
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        controller.OnSubmitted(command);
+        await Task.Delay(100);
+        Assert.DoesNotContain(command, dispatched);
+
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task Idle_permission_command_uses_the_normal_single_dispatch_path()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        // When idle, a permission command flows through the normal single dispatch slot unchanged.
+        controller.OnSubmitted("/yolo");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.NotNull(controller.CurrentDispatch);
+        Assert.True(controller.HasActiveWork);
+
+        release.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+
+        Assert.False(controller.HasActiveWork);
+    }
+
+    [Fact]
+    public async Task Shutdown_drains_an_in_flight_side_band_permission_command()
+    {
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var yoloRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var yoloStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                if (CommandParser.Parse(text).Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                    return CommandResult.Continue;
+                }
+
+                yoloStarted.TrySetResult();
+                await yoloRelease.Task;
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        controller.OnSubmitted("/yolo");
+        await yoloStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var wait = controller.WaitForDispatchAsync(CancellationToken.None);
+        Assert.False(wait.IsCompleted);
+
+        // Draining the main dispatch alone must not complete the wait — the side-band command is pending.
+        mainRelease.SetResult();
+        await Task.Delay(100);
+        Assert.False(wait.IsCompleted);
+
+        yoloRelease.SetResult();
+        await wait.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(wait.IsCompletedSuccessfully);
+    }
+
+    [Fact]
+    public async Task Side_band_command_fault_publishes_a_diagnostic_and_the_chain_stays_usable()
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var events = new ThreadSafeUiEvents();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                var parsed = CommandParser.Parse(text);
+                if (parsed.Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                    return CommandResult.Continue;
+                }
+
+                if (parsed.Name == "yolo")
+                {
+                    throw new InvalidOperationException("sideband boom");
+                }
+
+                dispatched.Enqueue(text);
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: events,
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // A faulting side-band command is diagnosed, not swallowed silently and not left unobserved.
+        controller.OnSubmitted("/yolo");
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Contains(events.Snapshot().OfType<AgentErrorEvent>(), e => e.Message.Contains("sideband boom"));
+
+        // The chain survives the fault: a following permission command still runs.
+        controller.OnSubmitted("/permissions default");
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Contains("/permissions default", dispatched);
+
+        Assert.True(controller.HasActiveWork);
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task Startup_pending_still_rejects_a_live_permission_command()
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var controller = new TuiController(
+            dispatch: (text, _) =>
+            {
+                dispatched.Enqueue(text);
+                return Task.FromResult(CommandResult.Continue);
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.BeginStartup();
+        controller.OnSubmitted("/yolo");
+
+        Assert.Null(controller.CurrentDispatch);
+        await Task.Delay(50);
+        Assert.DoesNotContain("/yolo", dispatched);
+    }
+
+    [Fact]
+    public async Task Exit_requested_still_rejects_a_live_permission_command()
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var controller = new TuiController(
+            dispatch: (text, _) =>
+            {
+                dispatched.Enqueue(text);
+                return Task.FromResult(CommandResult.Continue);
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.RequestExit();
+        controller.OnSubmitted("/yolo");
+
+        await Task.Delay(50);
+        Assert.DoesNotContain("/yolo", dispatched);
+    }
+
+    [Fact]
+    public async Task Host_cancellation_prevents_queued_side_band_commands_from_executing()
+    {
+        using var hostCts = new CancellationTokenSource();
+        var dispatched = new ConcurrentQueue<string>();
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var firstStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                var parsed = CommandParser.Parse(text);
+                if (parsed.Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                    return CommandResult.Continue;
+                }
+
+                if (parsed.Name == "permissions")
+                {
+                    firstStarted.TrySetResult();
+                    await firstRelease.Task;
+                }
+
+                dispatched.Enqueue(text);
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty,
+            hostCancellationToken: hostCts.Token);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        controller.OnSubmitted("/permissions bypass");
+        await firstStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Queue a second command behind the first, then cancel the host before the first releases.
+        controller.OnSubmitted("/yolo");
+        var sideband = controller.CurrentSideband;
+        hostCts.Cancel();
+        firstRelease.SetResult();
+
+        await sideband.WaitAsync(TimeSpan.FromSeconds(30));
+
+        // The first command already started, so it completes; the queued command must not run once the
+        // host token is cancelled.
+        Assert.Contains("/permissions bypass", dispatched);
+        Assert.DoesNotContain("/yolo", dispatched);
+
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    [Fact]
+    public async Task Mid_turn_yolo_updates_the_shared_permission_state_before_the_next_decision()
+    {
+        var state = new PermissionModeState(PermissionMode.Default);
+        var inner = new CountingInnerPrompt();
+        var prompt = new ModePermissionPrompt(state, inner);
+        var mutating = new MutatingTool();
+
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                var parsed = CommandParser.Parse(text);
+                if (parsed.Kind == ParsedInputKind.Slash && parsed.Name == "yolo")
+                {
+                    // Mirrors YoloCommand: flip the shared, live permission state.
+                    state.Mode = PermissionMode.BypassPermissions;
+                    return CommandResult.Continue;
+                }
+
+                mainStarted.TrySetResult();
+                await mainRelease.Task;
+                return CommandResult.Continue;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run the agent");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(PermissionMode.Default, state.Mode);
+
+        controller.OnSubmitted("/yolo");
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(30));
+        Assert.Equal(PermissionMode.BypassPermissions, state.Mode);
+
+        // The mid-turn change is visible to the next permission decision made by the shared state:
+        // a mutating tool is now allowed without ever consulting the inner interactive prompt.
+        Assert.True(await prompt.RequestAsync(mutating, "x", CancellationToken.None));
+        Assert.Equal(0, inner.Calls);
+
+        // The main dispatch is still active throughout.
+        Assert.True(controller.HasActiveWork);
+
+        mainRelease.SetResult();
+        if (controller.CurrentDispatch is { } dispatch)
+        {
+            await dispatch.WaitAsync(TimeSpan.FromSeconds(5));
+        }
+    }
+
+    private sealed class ThreadSafeUiEvents : IUiEventPublisher
+    {
+        private readonly object gate = new();
+        private readonly List<UiEvent> events = new();
+
+        public IReadOnlyList<UiEvent> Snapshot()
+        {
+            lock (this.gate)
+            {
+                return this.events.ToArray();
+            }
+        }
+
+        public void Publish(UiEvent uiEvent)
+        {
+            lock (this.gate)
+            {
+                this.events.Add(uiEvent);
+            }
+        }
+    }
+
+    private sealed class CountingInnerPrompt : IPermissionPrompt
+    {
+        public int Calls { get; private set; }
+
+        public Task<bool> RequestAsync(ITool tool, string inputPreview, CancellationToken cancellationToken = default)
+        {
+            this.Calls++;
+            return Task.FromResult(true);
+        }
+    }
+
+    private sealed class MutatingTool : ITool
+    {
+        public string Name => "run_command";
+
+        public string Description => "run";
+
+        public string InputSchemaJson => "{}";
+
+        public bool IsReadOnly => false;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
+            => Task.FromResult(new ToolResult("ok"));
     }
 
     private sealed class LateThrowingPublisher : IUiEventPublisher

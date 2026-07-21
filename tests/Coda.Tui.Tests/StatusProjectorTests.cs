@@ -39,8 +39,78 @@ public sealed class StatusProjectorTests
         };
 
         Assert.Equal(
-            "gpt-5.6-sol | high | ctx 42%",
+            "gpt-5.6-sol | perm ask !1 | high | ctx 42%",
             StatusProjector.Project(snapshot, 44));
+    }
+
+    [Theory]
+    [InlineData(PermissionMode.Default, "perm ask")]
+    [InlineData(PermissionMode.AcceptEdits, "perm edits")]
+    [InlineData(PermissionMode.Plan, "perm plan")]
+    [InlineData(PermissionMode.BypassPermissions, "perm yolo")]
+    public void Permission_mode_maps_to_compact_label(PermissionMode mode, string expected)
+    {
+        var snapshot = Wide() with { Permission = new PermissionStatus(mode, 0) };
+
+        var line = StatusProjector.Project(snapshot, 200);
+
+        Assert.Contains(expected, line, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Status_field_order_is_model_permission_effort()
+    {
+        var line = StatusProjector.Project(Wide(), 200);
+
+        var model = line.IndexOf("gpt-5.6-sol", StringComparison.Ordinal);
+        var permission = line.IndexOf("perm ask", StringComparison.Ordinal);
+        var effort = line.IndexOf("high", StringComparison.Ordinal);
+
+        Assert.True(model >= 0 && permission >= 0 && effort >= 0);
+        Assert.True(model < permission, "model must precede permission");
+        Assert.True(permission < effort, "permission must precede effort");
+    }
+
+    [Fact]
+    public void Low_priority_fields_are_shed_before_permission()
+    {
+        var line = StatusProjector.Project(Wide(), 60);
+
+        Assert.Contains("perm ask", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("MCP", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("main", line, StringComparison.Ordinal);
+        Assert.True(line.Length <= 60);
+    }
+
+    [Fact]
+    public void Narrow_width_keeps_permission_and_sheds_effort_when_only_model_and_permission_fit()
+    {
+        var snapshot = Wide() with { Permission = new PermissionStatus(PermissionMode.Default, 0) };
+
+        var line = StatusProjector.Project(snapshot, 25);
+
+        Assert.Equal("gpt-5.6-sol | perm ask", line);
+    }
+
+    [Fact]
+    public void Pending_count_is_appended_after_current_mode()
+    {
+        var snapshot = Wide() with { Permission = new PermissionStatus(PermissionMode.Default, 3) };
+
+        var line = StatusProjector.Project(snapshot, 200);
+
+        Assert.Contains("perm ask !3", line, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Zero_pending_shows_only_current_mode()
+    {
+        var snapshot = Wide() with { Permission = new PermissionStatus(PermissionMode.BypassPermissions, 0) };
+
+        var line = StatusProjector.Project(snapshot, 200);
+
+        Assert.Contains("perm yolo", line, StringComparison.Ordinal);
+        Assert.DoesNotContain("!", line, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -75,14 +145,15 @@ public sealed class StatusProjectorTests
     }
 
     [Fact]
-    public void Medium_width_60_keeps_usage_but_drops_services_and_git()
+    public void Medium_width_66_keeps_usage_but_drops_services_and_git()
     {
-        var line = StatusProjector.Project(Wide(), 60);
+        var line = StatusProjector.Project(Wide(), 66);
 
+        Assert.Contains("perm ask", line, StringComparison.Ordinal);
         Assert.Contains("18.2k in / 2.4k out", line);
         Assert.DoesNotContain("MCP", line);
         Assert.DoesNotContain("main", line);
-        Assert.True(line.Length <= 60);
+        Assert.True(line.Length <= 66);
     }
 
     [Fact]
