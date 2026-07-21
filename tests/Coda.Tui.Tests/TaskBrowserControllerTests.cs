@@ -11,15 +11,20 @@ public sealed class TaskBrowserControllerTests : IDisposable
     private readonly TaskManager _mgr;
     private readonly AgentExecutionGate _gate = new();
     private readonly ManualTimeProvider _time = new();
+    private readonly TaskBrowserProvider _provider;
     private readonly TaskBrowserController _controller;
 
     public TaskBrowserControllerTests()
     {
         Directory.CreateDirectory(_dir);
         _mgr = new TaskManager(sessionId: "sess-ctl", logRoot: _dir);
-        var provider = new TaskBrowserProvider(_mgr, _gate);
-        _controller = new TaskBrowserController(() => provider, _time);
+        _provider = new TaskBrowserProvider(_mgr, _gate);
+        _controller = new TaskBrowserController(() => _provider, _time);
     }
+
+    /// <summary>Builds a controller bound to the shared manager/gate with an injected log-tail reader.</summary>
+    private TaskBrowserController NewController(Func<string, CancellationToken, Task<TaskLogTail>> logReader) =>
+        new(() => _provider, _time, logReader);
 
     public void Dispose()
     {
@@ -147,7 +152,8 @@ public sealed class TaskBrowserControllerTests : IDisposable
         using var exec = _gate.BeginExecution(); // a turn is running
 
         var attach = _controller.AttachAsync(CancellationToken.None);
-        await Task.Delay(50);
+        // AttachAsync sets IsAttaching synchronously (before its first await on WaitUntilPaused),
+        // so this is deterministic with no sleep: the pause boundary has not been reached yet.
         Assert.True(_controller.IsAttaching);
         Assert.False(_controller.IsAttached);
 
@@ -155,6 +161,7 @@ public sealed class TaskBrowserControllerTests : IDisposable
         Assert.False(_controller.IsComposerLocked);
         await attach;                     // AttachAsync completes via the finally cleanup (OCE swallowed)
         Assert.Null(_controller.AttachedTaskId);
+        Assert.False(_controller.IsAttached);
     }
 
     [Fact]
@@ -294,6 +301,238 @@ public sealed class TaskBrowserControllerTests : IDisposable
         _controller.Close();             // shutdown/Dispose path is idempotent
 
         AssertFullyReleased();
+    }
+
+    // ---- Threading / async serialization contract (Task 5) ----
+
+    [Fact]
+    public async Task PersistentLogToggle_LoadsContent_AndFiresChangedAfterAsyncCompletion()
+    {
+        // Distinct ring vs log content so a Changed observed with the log text can only come from the
+        // async persistent-log read completing (not from the synchronous toggle that still shows the ring).
+        var t = _mgr.Register(TaskKind.Subagent, "worker", parentTaskId: null);
+        _mgr.AppendOutput(t.Id, "RING-CONTENT");
+        var logGate = new TaskCompletionSource();
+        var controller = NewController(async (path, ct) =>
+        {
+            await logGate.Task.WaitAsync(ct).ConfigureAwait(false);
+            return new TaskLogTail("LOG-ONLY-CONTENT", null);
+        });
+
+        try
+        {
+            controller.Open();
+            await controller.SyncAsync(CancellationToken.None);
+            controller.OpenDetail();
+            await controller.WhenOutputSettledAsync(); // ring load
+            Assert.Contains("RING-CONTENT", controller.SelectedOutput);
+
+            var sawLogViaChanged = false;
+            controller.Changed += () =>
+            {
+                if (controller.SelectedOutput.Contains("LOG-ONLY-CONTENT")) sawLogViaChanged = true;
+            };
+
+            controller.ToggleOutputSource(); // -> PersistentLog, queues the async read
+            Assert.DoesNotContain("LOG-ONLY-CONTENT", controller.SelectedOutput); // not loaded yet
+            logGate.SetResult();
+            await controller.WhenOutputSettledAsync();
+
+            Assert.Equal(TaskOutputSource.PersistentLog, controller.State.OutputSource);
+            Assert.Contains("LOG-ONLY-CONTENT", controller.SelectedOutput);
+            Assert.True(sawLogViaChanged, "Changed must fire after the async persistent-log read applies.");
+        }
+        finally { controller.Close(); }
+    }
+
+    [Fact]
+    public async Task SlowFirstLogRead_ThenSelectionChange_DiscardsStaleResult()
+    {
+        var a = _mgr.Register(TaskKind.Subagent, "a", parentTaskId: null);
+        _mgr.Register(TaskKind.Subagent, "b", parentTaskId: null);
+
+        var gateA = new TaskCompletionSource();
+        var controller = NewController(async (path, ct) =>
+        {
+            if (path == a.LogPath) { await gateA.Task; return new TaskLogTail("A-LOG-STALE", null); }
+            return new TaskLogTail("B-LOG", null);
+        });
+
+        try
+        {
+            controller.Open();
+            await controller.SyncAsync(CancellationToken.None); // selection = a (first row)
+            controller.OpenDetail();
+            controller.ToggleOutputSource(); // a -> PersistentLog
+
+            var slowA = controller.RefreshOutputAsync(CancellationToken.None); // A's read blocks on gateA
+            Assert.False(slowA.IsCompleted);
+
+            controller.MoveSelection(1); // select b: supersedes A's read and queues B's read
+            await controller.WhenOutputSettledAsync();
+            Assert.Contains("B-LOG", controller.SelectedOutput);
+
+            gateA.SetResult(); // release the stale, now-superseded A read
+            await slowA;
+
+            // The stale A result must never overwrite the current B selection's output.
+            Assert.Contains("B-LOG", controller.SelectedOutput);
+            Assert.DoesNotContain("A-LOG-STALE", controller.SelectedOutput);
+        }
+        finally { controller.Close(); }
+    }
+
+    [Fact]
+    public async Task PumpAndRapidSelection_Concurrent_PreserveLatestSelectionAndProjection()
+    {
+        var first = _mgr.Register(TaskKind.Subagent, "first", parentTaskId: null);
+        _controller.Open();
+        await _controller.SyncAsync(CancellationToken.None);
+
+        const int produced = 40;
+        const int spins = 400;
+        var barrier = new Barrier(3);
+        var producerIds = new List<string>();
+
+        var producer = Task.Run(() =>
+        {
+            barrier.SignalAndWait();
+            for (var i = 0; i < produced; i++)
+            {
+                var id = _mgr.Register(TaskKind.Subagent, $"p{i}", parentTaskId: null).Id;
+                lock (producerIds) producerIds.Add(id);
+            }
+        });
+
+        var pump = Task.Run(async () =>
+        {
+            barrier.SignalAndWait();
+            for (var i = 0; i < spins; i++) await _controller.SyncAsync(CancellationToken.None);
+        });
+
+        var ui = Task.Run(() =>
+        {
+            barrier.SignalAndWait();
+            for (var i = 0; i < spins; i++) { _controller.MoveToEnd(); _controller.MoveToStart(); }
+        });
+
+        await Task.WhenAll(producer, pump, ui);
+        await _controller.SyncAsync(CancellationToken.None); // final authoritative drain
+
+        // The last UI mutation was MoveToStart, which selects the first row; concurrent pump
+        // re-projections keep the selection stable by id, so it must survive intact.
+        Assert.Equal(first.Id, _controller.State.SelectedTaskId);
+
+        var rows = _controller.State.Projection.AllRows.Select(r => r.Task.Id).ToHashSet();
+        List<string> expected;
+        lock (producerIds) expected = producerIds.ToList();
+        foreach (var id in expected) Assert.Contains(id, rows); // no lost registrations
+    }
+
+    [Fact]
+    public async Task AttachBoundaryVsRelease_Race_NeverAttachedWithoutPause()
+    {
+        _mgr.Register(TaskKind.Shell, "bg", parentTaskId: null, TaskExecutionMode.Background);
+        _controller.Open();
+        await _controller.SyncAsync(CancellationToken.None);
+        _controller.OpenDetail();
+
+        var stop = false;
+        var violation = false;
+        var observer = Task.Run(() =>
+        {
+            while (!Volatile.Read(ref stop))
+            {
+                // Atomic snapshot under the controller's own lock: IsAttached implies the pause lease
+                // is still held. A (true, false) reading would mean the agent is "attached" while the
+                // gate has already been released — the exact race this test guards against.
+                var s = _controller.SnapshotAttach();
+                if (s.Attached && !s.HasLease) violation = true;
+            }
+        });
+
+        for (var i = 0; i < 300; i++)
+        {
+            using var exec = _gate.BeginExecution(); // attach will park at the pause boundary
+            var attach = _controller.AttachAsync(CancellationToken.None);
+            Assert.True(_controller.IsAttaching);
+
+            var start = new Barrier(2);
+            var releaser = Task.Run(() => { start.SignalAndWait(); _controller.ReleaseAttachment(); });
+            var boundary = Task.Run(() => { start.SignalAndWait(); exec.Dispose(); }); // reach paused
+
+            await Task.WhenAll(releaser, boundary);
+            await attach;
+
+            _controller.ReleaseAttachment(); // guarantee a clean slate for the next iteration
+            Assert.False(_controller.IsAttached);
+            Assert.False(_gate.IsPaused);
+        }
+
+        Volatile.Write(ref stop, true);
+        await observer;
+        Assert.False(violation, "IsAttached must never be observed while the pause lease is gone.");
+    }
+
+    [Fact]
+    public async Task OpenTwice_LeavesSingleLiveSubscription_AndStaysFunctional()
+    {
+        _mgr.Register(TaskKind.Subagent, "x", parentTaskId: null);
+        _controller.Open();
+        _controller.Open(); // a defensive re-open must not leak the first subscription
+
+        Assert.Equal(1, _mgr.SubscriptionCount);
+
+        var added = _mgr.Register(TaskKind.Subagent, "y", parentTaskId: null);
+        await _controller.SyncAsync(CancellationToken.None);
+        Assert.Contains(added.Id, _controller.State.Projection.AllRows.Select(r => r.Task.Id));
+    }
+
+    [Fact]
+    public async Task Close_StopsPump_WithoutSpinning()
+    {
+        _mgr.Register(TaskKind.Subagent, "x", parentTaskId: null);
+        _controller.Open();
+        var pump = _controller.PumpAsync(CancellationToken.None);
+
+        _controller.Close(); // disposes the subscription, which wakes and exits the pump
+
+        await pump.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(pump.IsCompleted);
+    }
+
+    [Fact]
+    public async Task ProviderLossAtOpen_PumpExitsImmediately_WithoutSpinning()
+    {
+        var controller = new TaskBrowserController(() => null, _time);
+        controller.Open(); // null provider -> no subscription
+        var pump = controller.PumpAsync(CancellationToken.None);
+
+        await pump.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.True(pump.IsCompleted);
+    }
+
+    [Fact]
+    public async Task NavigationRefresh_DoesNotMarkNewOutput_ButRealOutputWhileScrolledDoes()
+    {
+        var t = _mgr.Register(TaskKind.Subagent, "worker", parentTaskId: null);
+        _mgr.AppendOutput(t.Id, "line-1");
+        _controller.Open();
+        await _controller.SyncAsync(CancellationToken.None);
+        _controller.OpenDetail();
+        await _controller.WhenOutputSettledAsync();
+
+        _controller.Scroll(-1); // scroll up: auto-follow turns off
+        Assert.False(_controller.State.AutoFollow);
+
+        // A navigation/toggle-style output refresh (not a real Output event) must NOT flag new output.
+        await _controller.RefreshOutputAsync(CancellationToken.None);
+        Assert.False(_controller.State.HasNewOutput);
+
+        // A real Output event on the selected task while scrolled DOES flag new output.
+        _mgr.AppendOutput(t.Id, "line-2");
+        await _controller.SyncAsync(CancellationToken.None);
+        Assert.True(_controller.State.HasNewOutput);
     }
 
     private async Task<string> AttachToRunningBackgroundShellAsync()

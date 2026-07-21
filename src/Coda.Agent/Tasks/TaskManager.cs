@@ -366,6 +366,12 @@ public sealed partial class TaskManager : IDisposable
     /// <summary>Returns the output tail for a task, or null if the id is unknown.</summary>
     public string? TryPeek(string id, int maxChars) => Find(id)?.Peek(maxChars);
 
+    /// <summary>The number of currently-registered live subscriptions (diagnostics/tests).</summary>
+    internal int SubscriptionCount
+    {
+        get { lock (_gate) { return _subs.Count; } }
+    }
+
     /// <summary>Creates a subscription seeded with the current task list.</summary>
     public TaskSubscription Subscribe(int capacity = TaskSubscription.DefaultCapacity)
     {

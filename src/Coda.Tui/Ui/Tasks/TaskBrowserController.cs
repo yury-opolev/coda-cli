@@ -10,9 +10,26 @@ internal sealed record TaskBrowserProvider(TaskManager Tasks, AgentExecutionGate
 /// <summary>
 /// Owns the browser's live data: a <see cref="TaskManager"/> subscription, the derived
 /// <see cref="TaskBrowserState"/>, the selected task's sanitized output (from the non-consuming recent ring
-/// or the persistent log tail), and the single attach pause lease. Every mutation raises
-/// <see cref="Changed"/>; the overlay marshals that to the UI thread. All actions run with full
-/// (main-agent) authority — the browser is the main agent's own surface.
+/// or the persistent log tail), and the single attach pause lease.
+///
+/// <para><b>Threading contract.</b> The controller is mutated from two threads: the background
+/// <see cref="PumpAsync"/>/<see cref="SyncAsync"/> loop and the UI thread. A single private lock
+/// (<c>_sync</c>) serializes every mutation of <see cref="State"/>, the selected output/error, and the
+/// attach flags; all public reads return coherent snapshots taken under that lock. <see cref="Changed"/>
+/// is never raised while the lock is held. Manager I/O and disk reads happen outside the lock; the
+/// projection/state is applied under the lock and the notification raised afterwards.</para>
+///
+/// <para><b>Generation contracts.</b> Output refresh and attachment each carry their own
+/// cancellation-source and monotonic generation counter. Every selection/source/structural output
+/// request supersedes the prior read (bumping the output generation and cancelling its CTS); an async
+/// read captures its generation and open epoch, awaits outside the lock, and applies only if it is still
+/// the current generation for the still-open controller — so a slow stale read can never overwrite a
+/// fresher one. Attachment finalization is guarded the same way: after
+/// <see cref="AgentExecutionGate.WaitUntilPaused"/> returns, <see cref="IsAttached"/> is set only if this
+/// attach is still the current operation, closing the attached-without-pause race with
+/// <see cref="ReleaseAttachment"/>.</para>
+///
+/// All actions run with full (main-agent) authority — the browser is the main agent's own surface.
 /// </summary>
 internal sealed class TaskBrowserController
 {
@@ -21,65 +38,147 @@ internal sealed class TaskBrowserController
 
     private readonly Func<TaskBrowserProvider?> provider;
     private readonly TimeProvider time;
+    private readonly Func<string, CancellationToken, Task<TaskLogTail>> logReader;
 
-    private TaskSubscription? sub;
-    private CancellationTokenSource? attachCts;
-    private IDisposable? pauseLease;
+    private readonly object _sync = new();
 
-    private string? pendingStopId;
-    private long pendingStopStamp;
+    // ---- Bound-once-per-Open services and lifecycle epoch (all under _sync) ----
+    private TaskBrowserProvider? _bound;
+    private TaskSubscription? _sub;
+    private long _openEpoch;
 
-    public TaskBrowserController(Func<TaskBrowserProvider?> provider, TimeProvider time)
+    // ---- Output refresh: separate CTS + generation from attach (all under _sync) ----
+    private CancellationTokenSource? _outputCts;
+    private long _outputGeneration;
+    private Task? _latestRefresh;
+
+    // ---- Attach: its own CTS + operation-identity generation + single pause lease (all under _sync) ----
+    private CancellationTokenSource? _attachCts;
+    private IDisposable? _pauseLease;
+    private long _attachGeneration;
+
+    // ---- Serialized mutable state (all under _sync) ----
+    private TaskBrowserState _state = TaskBrowserState.Empty;
+    private string _selectedOutput = string.Empty;
+    private string? _selectedOutputError;
+    private bool _isAttaching;
+    private bool _isAttached;
+    private string? _attachedTaskId;
+
+    private string? _pendingStopId;
+    private long _pendingStopStamp;
+
+    public TaskBrowserController(
+        Func<TaskBrowserProvider?> provider,
+        TimeProvider time,
+        Func<string, CancellationToken, Task<TaskLogTail>>? logReader = null)
     {
         this.provider = provider ?? throw new ArgumentNullException(nameof(provider));
         this.time = time ?? TimeProvider.System;
+        this.logReader = logReader
+            ?? ((path, ct) => TaskLogTailReader.ReadTailAsync(path, cancellationToken: ct));
     }
 
     /// <summary>Raised after any state, output, or attachment change (marshal to the UI thread in the overlay).</summary>
     public event Action? Changed;
 
-    public TaskBrowserState State { get; private set; } = TaskBrowserState.Empty;
+    public TaskBrowserState State
+    {
+        get { lock (this._sync) { return this._state; } }
+    }
 
     /// <summary>The selected task's sanitized output (recent ring or log tail).</summary>
-    public string SelectedOutput { get; private set; } = string.Empty;
+    public string SelectedOutput
+    {
+        get { lock (this._sync) { return this._selectedOutput; } }
+    }
 
     /// <summary>A non-null diagnostic when the selected task's persistent log could not be read.</summary>
-    public string? SelectedOutputError { get; private set; }
+    public string? SelectedOutputError
+    {
+        get { lock (this._sync) { return this._selectedOutputError; } }
+    }
 
-    public bool IsAttaching { get; private set; }
+    public bool IsAttaching
+    {
+        get { lock (this._sync) { return this._isAttaching; } }
+    }
 
-    public bool IsAttached { get; private set; }
+    public bool IsAttached
+    {
+        get { lock (this._sync) { return this._isAttached; } }
+    }
 
     /// <summary>The id of the running background shell whose output view is attached (null when detached).</summary>
-    public string? AttachedTaskId { get; private set; }
+    public string? AttachedTaskId
+    {
+        get { lock (this._sync) { return this._attachedTaskId; } }
+    }
 
     /// <summary>True while the foreground-shell attachment holds the composer (attaching or attached).</summary>
-    public bool IsComposerLocked => this.IsAttaching || this.IsAttached;
+    public bool IsComposerLocked
+    {
+        get { lock (this._sync) { return this._isAttaching || this._isAttached; } }
+    }
 
-    /// <summary>Subscribes and seeds the projection from the manager's initial snapshot. Null provider → empty.</summary>
+    // ---- Lifecycle: Open / Pump / Close ----
+
+    /// <summary>
+    /// Binds the provider/manager and seeds the projection from the manager's initial snapshot. Defensive:
+    /// tears down any prior subscription/attachment/refresh first so a re-open never leaks a subscription.
+    /// A null provider leaves the browser empty (and the pump exits at once).
+    /// </summary>
     public void Open()
     {
+        // Defensive teardown of any previous binding (cancels output+attach, closes sub, releases lease).
+        this.CloseCore();
+
         var p = this.provider();
-        if (p is null)
+        TaskSubscription? sub = null;
+        TaskBrowserState newState;
+        if (p is not null)
         {
-            this.State = TaskBrowserState.Empty;
-            this.RaiseChanged();
-            return;
+            sub = p.Tasks.Subscribe();
+            newState = TaskBrowserState.Empty.WithProjection(TaskListProjector.Project(sub.InitialSnapshot));
+        }
+        else
+        {
+            newState = TaskBrowserState.Empty;
         }
 
-        this.sub = p.Tasks.Subscribe();
-        this.State = TaskBrowserState.Empty.WithProjection(TaskListProjector.Project(this.sub.InitialSnapshot));
+        lock (this._sync)
+        {
+            this._bound = p;
+            this._sub = sub;
+            this._openEpoch++;
+            this._state = newState;
+        }
+
         this.RaiseChanged();
     }
 
     /// <summary>Long-running pump: waits for changes, then applies one <see cref="SyncAsync"/> pass. Exits on cancel/close.</summary>
     public async Task PumpAsync(CancellationToken cancellationToken)
     {
-        while (!cancellationToken.IsCancellationRequested && this.sub is { IsClosed: false })
+        TaskSubscription? sub;
+        lock (this._sync)
+        {
+            sub = this._sub;
+        }
+
+        // Null provider at Open: nothing to pump, exit immediately (no busy-spin).
+        if (sub is null)
+        {
+            return;
+        }
+
+        while (!cancellationToken.IsCancellationRequested && !sub.IsClosed)
         {
             try
             {
-                await this.sub.WaitAsync(cancellationToken).ConfigureAwait(false);
+                // WaitAsync parks until a change is pending OR the subscription closes; Close disposes the
+                // subscription, which completes this wait and flips IsClosed, so the loop exits — never spins.
+                await sub.WaitAsync(cancellationToken).ConfigureAwait(false);
                 await this.SyncAsync(cancellationToken).ConfigureAwait(false);
             }
             catch (OperationCanceledException)
@@ -89,109 +188,279 @@ internal sealed class TaskBrowserController
         }
     }
 
+    /// <summary>Releases the attachment, cancels output, disposes the subscription, and clears output. Idempotent.</summary>
+    public void Close() => this.CloseCore();
+
+    private void CloseCore()
+    {
+        // Release the attachment first (drops the pause lease, resuming the agent) — this raises Changed
+        // itself if an attachment was active, and is done before we take _sync below.
+        this.ReleaseAttachment();
+
+        CancellationTokenSource? outputCts;
+        TaskSubscription? sub;
+        lock (this._sync)
+        {
+            // Supersede any in-flight output read and invalidate stale async applies.
+            this._outputGeneration++;
+            this._openEpoch++;
+            outputCts = this._outputCts;
+            this._outputCts = null;
+            this._latestRefresh = null;
+
+            sub = this._sub;
+            this._sub = null;
+            this._bound = null;
+
+            this._selectedOutput = string.Empty;
+            this._selectedOutputError = null;
+        }
+
+        outputCts?.Cancel();
+        outputCts?.Dispose();
+        sub?.Dispose(); // wakes any parked pump so it can observe IsClosed and exit
+    }
+
+    // ---- Change pump ----
+
     /// <summary>Drains pending changes, re-projects on any structural change, and refreshes the selected output once.</summary>
     public async Task SyncAsync(CancellationToken cancellationToken)
     {
-        if (this.sub is null || this.provider() is not { } p)
+        TaskSubscription? sub;
+        TaskBrowserProvider? p;
+        string? selectedBefore;
+        lock (this._sync)
+        {
+            sub = this._sub;
+            p = this._bound;
+            selectedBefore = this._state.SelectedTaskId;
+        }
+
+        if (sub is null || p is null)
         {
             return;
         }
 
-        var (changes, resync) = this.sub.Drain();
-        var selectedId = this.State.SelectedTaskId;
-        var structural = resync;
-        var refreshOutput = resync;
+        var (changes, resync) = sub.Drain(); // outside the lock
 
+        var outputIds = new HashSet<string>(StringComparer.Ordinal);
+        var structural = resync;
         foreach (var c in changes)
         {
             if (c.Kind == TaskChangeKind.Output)
             {
-                if (c.TaskId == selectedId) refreshOutput = true; // coalesced: one refresh per drain
+                outputIds.Add(c.TaskId);
             }
             else
             {
                 structural = true;
-                if (c.TaskId == selectedId) refreshOutput = true;
             }
         }
 
-        if (structural)
+        // Manager list read happens outside the lock; projection is applied under it.
+        IReadOnlyList<TaskSnapshot>? list = structural ? p.Tasks.List() : null;
+
+        string? selectedAfter;
+        lock (this._sync)
         {
-            this.State = this.State.WithProjection(TaskListProjector.Project(p.Tasks.List()));
-            refreshOutput = true; // selection may have moved
+            if (this._bound != p)
+            {
+                return; // rebound or closed while we drained
+            }
+
+            if (structural && list is not null)
+            {
+                this._state = this._state.WithProjection(TaskListProjector.Project(list));
+            }
+
+            selectedAfter = this._state.SelectedTaskId;
         }
 
         // A terminal or auto-pruned attached shell must resume the main agent even without an explicit
         // Esc/Ctrl+B, so re-check the attachment against the freshly-drained registry on every pass.
         this.ReleaseAttachmentIfTargetGone(p);
 
+        var refreshOutput = structural
+            || (selectedAfter is not null && outputIds.Contains(selectedAfter));
+
         if (refreshOutput)
         {
-            await this.RefreshOutputAsync(cancellationToken).ConfigureAwait(false);
+            // Only a real Output event on the *unchanged* current selection may flag "new output"; a
+            // structural re-selection or navigation refresh must not.
+            var fromOutputEvent = selectedAfter is not null
+                && selectedAfter == selectedBefore
+                && outputIds.Contains(selectedAfter);
+
+            await this.RefreshOutputCoreAsync(fromOutputEvent, raiseOnApply: false, cancellationToken)
+                .ConfigureAwait(false);
         }
 
         this.RaiseChanged();
     }
 
-    /// <summary>Refreshes <see cref="SelectedOutput"/> from the recent ring (non-consuming) or the log tail.</summary>
-    public async Task RefreshOutputAsync(CancellationToken cancellationToken)
+    /// <summary>
+    /// Refreshes <see cref="SelectedOutput"/> from the recent ring (non-consuming) or the log tail. This is
+    /// a navigation-style refresh: it supersedes any prior read and never flags new output.
+    /// </summary>
+    public Task RefreshOutputAsync(CancellationToken cancellationToken) =>
+        this.QueueOutputRefresh(fromOutputEvent: false, cancellationToken);
+
+    /// <summary>Awaits the most recently queued output refresh (test/diagnostic seam).</summary>
+    internal Task WhenOutputSettledAsync()
     {
-        if (this.provider() is not { } p || this.State.Selected is not { } row)
+        lock (this._sync)
         {
-            this.SelectedOutput = string.Empty;
-            this.SelectedOutputError = null;
+            return this._latestRefresh ?? Task.CompletedTask;
+        }
+    }
+
+    private Task QueueOutputRefresh(bool fromOutputEvent, CancellationToken cancellationToken)
+    {
+        var task = this.RefreshOutputCoreAsync(fromOutputEvent, raiseOnApply: true, cancellationToken);
+        lock (this._sync)
+        {
+            this._latestRefresh = task;
+        }
+
+        return task;
+    }
+
+    private async Task RefreshOutputCoreAsync(bool fromOutputEvent, bool raiseOnApply, CancellationToken external)
+    {
+        long generation;
+        long epoch;
+        TaskBrowserProvider? p;
+        TaskListRow? row;
+        TaskOutputSource source;
+        CancellationToken token;
+        lock (this._sync)
+        {
+            p = this._bound;
+            row = this._state.Selected;
+            source = this._state.OutputSource;
+            epoch = this._openEpoch;
+
+            // Supersede any prior in-flight read: bump the generation and cancel the old CTS.
+            this._outputCts?.Cancel();
+            this._outputCts?.Dispose();
+            this._outputCts = CancellationTokenSource.CreateLinkedTokenSource(external);
+            token = this._outputCts.Token;
+            generation = ++this._outputGeneration;
+        }
+
+        if (p is null || row is null)
+        {
+            this.ApplyOutput(generation, epoch, string.Empty, error: null, fromOutputEvent, raiseOnApply);
             return;
         }
 
-        if (this.State.OutputSource == TaskOutputSource.RecentRing)
+        try
         {
-            var raw = p.Tasks.TryPeek(row.Task.Id, MaxRingChars) ?? string.Empty;
-            this.SelectedOutput = TerminalTextSanitizer.Sanitize(raw);
-            this.SelectedOutputError = null;
+            if (source == TaskOutputSource.RecentRing)
+            {
+                // Synchronous read, but still generation-guarded on apply.
+                var raw = p.Tasks.TryPeek(row.Task.Id, MaxRingChars) ?? string.Empty;
+                this.ApplyOutput(
+                    generation, epoch, TerminalTextSanitizer.Sanitize(raw), error: null, fromOutputEvent, raiseOnApply);
+            }
+            else
+            {
+                var tail = await this.logReader(row.Task.LogPath, token).ConfigureAwait(false);
+                this.ApplyOutput(
+                    generation, epoch, TerminalTextSanitizer.Sanitize(tail.Text), tail.Error, fromOutputEvent, raiseOnApply);
+            }
         }
-        else
+        catch (OperationCanceledException)
         {
-            var tail = await TaskLogTailReader
-                .ReadTailAsync(row.Task.LogPath, cancellationToken: cancellationToken)
-                .ConfigureAwait(false);
-            this.SelectedOutput = TerminalTextSanitizer.Sanitize(tail.Text);
-            this.SelectedOutputError = tail.Error;
+            // Superseded/cancelled read: never apply.
+        }
+        catch
+        {
+            // A read failure must not tear down the pump or the UI thread; leave the last good output in place.
+        }
+    }
+
+    private void ApplyOutput(
+        long generation, long epoch, string output, string? error, bool fromOutputEvent, bool raiseOnApply)
+    {
+        var raise = false;
+        lock (this._sync)
+        {
+            // Apply only if still the current read for the still-open controller — no stale overwrite.
+            if (generation != this._outputGeneration || epoch != this._openEpoch)
+            {
+                return;
+            }
+
+            this._selectedOutput = output;
+            this._selectedOutputError = error;
+
+            if (fromOutputEvent && output.Length > 0)
+            {
+                this._state = this._state.MarkNewOutput();
+            }
+
+            raise = raiseOnApply;
         }
 
-        if (this.SelectedOutput.Length > 0)
+        if (raise)
         {
-            this.State = this.State.MarkNewOutput();
+            this.RaiseChanged();
         }
     }
 
     // ---- Navigation / view actions (synchronous state mutations; output refresh is queued) ----
 
-    public void MoveSelection(int delta) => this.MutateThenQueueOutput(this.State.MoveSelection(delta));
+    public void MoveSelection(int delta) => this.MutateThenQueueOutput(s => s.MoveSelection(delta));
 
-    public void MoveToStart() => this.MutateThenQueueOutput(this.State.MoveToStart());
+    public void MoveToStart() => this.MutateThenQueueOutput(s => s.MoveToStart());
 
-    public void MoveToEnd() => this.MutateThenQueueOutput(this.State.MoveToEnd());
+    public void MoveToEnd() => this.MutateThenQueueOutput(s => s.MoveToEnd());
 
-    public void OpenDetail() => this.MutateThenQueueOutput(this.State.OpenDetail());
+    public void OpenDetail() => this.MutateThenQueueOutput(s => s.OpenDetail());
 
     public void ReturnToList()
     {
         this.ReleaseAttachment(); // returning to the list drops any attachment
-        this.State = this.State.ReturnToList();
+        lock (this._sync)
+        {
+            this._state = this._state.ReturnToList();
+        }
+
         this.RaiseChanged();
     }
 
-    public void ToggleOutputSource() => this.MutateThenQueueOutput(this.State.ToggleOutputSource());
+    public void ToggleOutputSource() => this.MutateThenQueueOutput(s => s.ToggleOutputSource());
 
     public void Scroll(int delta)
     {
-        this.State = this.State.Scroll(delta);
+        lock (this._sync)
+        {
+            this._state = this._state.Scroll(delta);
+        }
+
         this.RaiseChanged();
     }
 
     public void JumpToNewest()
     {
-        this.State = this.State.JumpToNewest();
+        lock (this._sync)
+        {
+            this._state = this._state.JumpToNewest();
+        }
+
+        this.RaiseChanged();
+    }
+
+    private void MutateThenQueueOutput(Func<TaskBrowserState, TaskBrowserState> transform)
+    {
+        lock (this._sync)
+        {
+            this._state = transform(this._state);
+        }
+
+        // Fire-and-forget output refresh (ring is cheap; log is IO). Navigation refresh never flags new output.
+        _ = this.QueueOutputRefresh(fromOutputEvent: false, CancellationToken.None);
         this.RaiseChanged();
     }
 
@@ -200,30 +469,50 @@ internal sealed class TaskBrowserController
     /// <summary>Double-press stop: arms on the first press, requests a cooperative stop on a second within 1.5s.</summary>
     public void RequestStop()
     {
-        if (this.provider() is not { } p || this.State.Selected is not { } row)
+        TaskBrowserProvider? p;
+        string? id;
+        lock (this._sync)
+        {
+            p = this._bound;
+            id = this._state.Selected?.Task.Id;
+        }
+
+        if (p is null || id is null)
         {
             return;
         }
 
-        var id = row.Task.Id;
         var now = this.time.GetTimestamp();
+        bool confirmStop;
+        lock (this._sync)
+        {
+            confirmStop = this._pendingStopId == id
+                && this.time.GetElapsedTime(this._pendingStopStamp) <= StopConfirmWindow;
 
-        if (this.pendingStopId == id && this.time.GetElapsedTime(this.pendingStopStamp) <= StopConfirmWindow)
-        {
-            this.pendingStopId = null;
-            var result = p.Tasks.RequestStop(id); // full authority; cooperative Cancel (parity with task_stop)
-            this.State = this.State.WithStatus(result switch
+            if (confirmStop)
             {
-                TaskActionResult.Ok => $"Stopping '{id}'…",
-                TaskActionResult.InvalidState => $"Task '{id}' is already finished.",
-                _ => $"Task '{id}' cannot be stopped.",
-            });
+                this._pendingStopId = null;
+            }
+            else
+            {
+                this._pendingStopId = id;
+                this._pendingStopStamp = now;
+                this._state = this._state.WithStatus("Press x again to stop this task.");
+            }
         }
-        else
+
+        if (confirmStop)
         {
-            this.pendingStopId = id;
-            this.pendingStopStamp = now;
-            this.State = this.State.WithStatus("Press x again to stop this task.");
+            var result = p.Tasks.RequestStop(id); // outside the lock; cooperative Cancel (parity with task_stop)
+            lock (this._sync)
+            {
+                this._state = this._state.WithStatus(result switch
+                {
+                    TaskActionResult.Ok => $"Stopping '{id}'…",
+                    TaskActionResult.InvalidState => $"Task '{id}' is already finished.",
+                    _ => $"Task '{id}' cannot be stopped.",
+                });
+            }
         }
 
         this.RaiseChanged();
@@ -232,59 +521,98 @@ internal sealed class TaskBrowserController
     /// <summary>Dismisses a terminal selected task from the registry (its log is preserved on disk).</summary>
     public void DismissSelected()
     {
-        if (this.provider() is not { } p || this.State.Selected is not { } row)
+        TaskBrowserProvider? p;
+        string? id;
+        lock (this._sync)
+        {
+            p = this._bound;
+            id = this._state.Selected?.Task.Id;
+        }
+
+        if (p is null || id is null)
         {
             return;
         }
 
-        var result = p.Tasks.Remove(row.Task.Id); // full authority
-        this.State = this.State.WithStatus(result switch
+        var result = p.Tasks.Remove(id); // outside the lock; full authority
+        lock (this._sync)
         {
-            TaskActionResult.Ok => $"Removed '{row.Task.Id}'.",
-            TaskActionResult.Rejected => $"Task '{row.Task.Id}' is still running.",
-            _ => $"Task '{row.Task.Id}' could not be removed.",
-        });
+            this._state = this._state.WithStatus(result switch
+            {
+                TaskActionResult.Ok => $"Removed '{id}'.",
+                TaskActionResult.Rejected => $"Task '{id}' is still running.",
+                _ => $"Task '{id}' could not be removed.",
+            });
+        }
+
         this.RaiseChanged();
     }
 
     // ---- Steering ----
 
-    public void BeginSteering() { this.State = this.State.BeginSteering(); this.RaiseChanged(); }
+    public void BeginSteering() => this.MutateState(s => s.BeginSteering());
 
-    public void AppendSteering(string text) { this.State = this.State.AppendSteering(text); this.RaiseChanged(); }
+    public void AppendSteering(string text) => this.MutateState(s => s.AppendSteering(text));
 
-    public void NewlineSteering() { this.State = this.State.NewlineSteering(); this.RaiseChanged(); }
+    public void NewlineSteering() => this.MutateState(s => s.NewlineSteering());
 
-    public void BackspaceSteering() { this.State = this.State.BackspaceSteering(); this.RaiseChanged(); }
+    public void BackspaceSteering() => this.MutateState(s => s.BackspaceSteering());
 
-    public void CancelSteering() { this.State = this.State.CancelSteering(); this.RaiseChanged(); }
+    public void CancelSteering() => this.MutateState(s => s.CancelSteering());
 
     /// <summary>Delivers the steering draft to the selected task and returns the actual manager result.</summary>
     public TaskActionResult SubmitSteering()
     {
-        if (this.provider() is not { } p || this.State.Selected is not { } row)
+        TaskBrowserProvider? p;
+        string? id;
+        string message;
+        lock (this._sync)
+        {
+            p = this._bound;
+            id = this._state.Selected?.Task.Id;
+            message = this._state.SteeringDraft;
+        }
+
+        if (p is null || id is null)
         {
             return TaskActionResult.NotFound;
         }
 
-        var message = this.State.SteeringDraft;
         if (string.IsNullOrWhiteSpace(message))
         {
-            this.State = this.State.CloseSteering();
+            lock (this._sync)
+            {
+                this._state = this._state.CloseSteering();
+            }
+
             this.RaiseChanged();
             return TaskActionResult.InvalidState;
         }
 
-        var result = p.Tasks.Steer(row.Task.Id, message); // full authority
-        this.State = this.State.CloseSteering().WithStatus(result switch
+        var result = p.Tasks.Steer(id, message); // outside the lock; full authority
+        lock (this._sync)
         {
-            TaskActionResult.Ok => "Steering message delivered.",
-            TaskActionResult.Rejected => "This task cannot be steered.",
-            TaskActionResult.InvalidState => "Task is not running; cannot steer.",
-            _ => "Steering message not delivered.",
-        });
+            this._state = this._state.CloseSteering().WithStatus(result switch
+            {
+                TaskActionResult.Ok => "Steering message delivered.",
+                TaskActionResult.Rejected => "This task cannot be steered.",
+                TaskActionResult.InvalidState => "Task is not running; cannot steer.",
+                _ => "Steering message not delivered.",
+            });
+        }
+
         this.RaiseChanged();
         return result;
+    }
+
+    private void MutateState(Func<TaskBrowserState, TaskBrowserState> transform)
+    {
+        lock (this._sync)
+        {
+            this._state = transform(this._state);
+        }
+
+        this.RaiseChanged();
     }
 
     // ---- Background-shell attachment + Ctrl+B chord (controller-local; pauses the main agent via the gate) ----
@@ -294,73 +622,130 @@ internal sealed class TaskBrowserController
     /// waits for the main agent to reach a safe boundary, then records the target id. Only a running
     /// background shell is attachable — subagents, foreground shells (background one with Ctrl+B first), and
     /// terminal tasks are rejected without taking a lease. Cancellable via <see cref="ReleaseAttachment"/>
-    /// (Esc) while pausing; the lease is always released in <c>finally</c> on cancellation or failure.
-    /// Idempotent.
+    /// (Esc) while pausing; the lease is always released on cancellation or failure. Idempotent.
+    /// <para>The finalization is guarded by an operation-identity generation: after
+    /// <see cref="AgentExecutionGate.WaitUntilPaused"/> completes, <see cref="IsAttached"/> is set only if
+    /// this attach is still the current operation, so a concurrent <see cref="ReleaseAttachment"/> can never
+    /// leave the browser attached while the pause lease has already been dropped.</para>
     /// </summary>
     public async Task AttachAsync(CancellationToken cancellationToken)
     {
-        if (this.IsAttaching || this.IsAttached || this.provider() is not { } p)
+        TaskBrowserProvider p;
+        string targetId;
+        long op;
+        CancellationToken token;
+        var rejected = false;
+
+        lock (this._sync)
         {
-            return;
+            if (this._isAttaching || this._isAttached || this._bound is null)
+            {
+                return;
+            }
+
+            p = this._bound;
+            var row = this._state.Selected;
+            if (row is null || !IsAttachableShell(row.Task))
+            {
+                this._state = this._state.WithStatus("Attach is only available for a running background shell.");
+                rejected = true;
+                targetId = string.Empty;
+                op = 0;
+                token = default;
+            }
+            else
+            {
+                targetId = row.Task.Id;
+                op = ++this._attachGeneration;
+                this._attachCts?.Cancel();
+                this._attachCts?.Dispose();
+                this._attachCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+                token = this._attachCts.Token;
+                this._pauseLease = p.Gate.RequestPause();
+                this._isAttaching = true;
+                this._attachedTaskId = null;
+            }
         }
 
-        // Attach binds an output view to a shell the main agent keeps driving; only a running *background*
-        // shell qualifies. Reject anything else (no lease is taken) and report why.
-        if (this.State.Selected is not { } row || !IsAttachableShell(row.Task))
-        {
-            this.State = this.State.WithStatus("Attach is only available for a running background shell.");
-            this.RaiseChanged();
-            return;
-        }
-
-        var targetId = row.Task.Id;
-        this.IsAttaching = true;
         this.RaiseChanged();
-
-        this.attachCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        this.pauseLease = p.Gate.RequestPause();
+        if (rejected)
+        {
+            return;
+        }
 
         var reached = false;
         try
         {
-            await p.Gate.WaitUntilPaused(this.attachCts.Token).ConfigureAwait(false);
+            await p.Gate.WaitUntilPaused(token).ConfigureAwait(false);
             reached = true;
         }
         catch (OperationCanceledException)
         {
-            // Esc (ReleaseAttachment) cancelled the pending wait, or the caller's token fired: fall through
-            // to finally, which drops the lease and resets the flags.
+            // Esc (ReleaseAttachment) cancelled the pending wait, or the caller's token fired.
         }
-        finally
+
+        var attached = false;
+        var releaseInline = false;
+        lock (this._sync)
         {
-            if (reached)
+            if (op != this._attachGeneration)
             {
-                this.AttachedTaskId = targetId;
-                this.IsAttaching = false;
-                this.IsAttached = true;
-                this.RaiseChanged();
+                // Superseded by ReleaseAttachment (which already dropped the lease): cleanup is owned there.
+                return;
+            }
+
+            if (reached && !token.IsCancellationRequested)
+            {
+                this._isAttaching = false;
+                this._isAttached = true;
+                this._attachedTaskId = targetId;
+                attached = true;
             }
             else
             {
-                this.ReleaseAttachment(); // cancellation OR any wait failure: release the lease + reset flags
+                releaseInline = true;
             }
+        }
+
+        if (releaseInline)
+        {
+            this.ReleaseAttachment(); // wait cancelled/failed but still current: drop the lease + reset
+        }
+        else if (attached)
+        {
+            this.RaiseChanged();
         }
     }
 
     /// <summary>Releases the pause lease (resuming the main agent) and clears attachment. Idempotent.</summary>
     public void ReleaseAttachment()
     {
-        this.attachCts?.Cancel();
-        this.attachCts?.Dispose();
-        this.attachCts = null;
-        this.pauseLease?.Dispose();
-        this.pauseLease = null;
-        this.AttachedTaskId = null;
-
-        if (this.IsAttaching || this.IsAttached)
+        CancellationTokenSource? cts;
+        IDisposable? lease;
+        bool wasActive;
+        lock (this._sync)
         {
-            this.IsAttaching = false;
-            this.IsAttached = false;
+            // Bump the operation generation so any in-flight AttachAsync finalize observes the supersede and
+            // no-ops (this method owns the lease cleanup below), closing the attached-without-pause race.
+            this._attachGeneration++;
+
+            cts = this._attachCts;
+            this._attachCts = null;
+            lease = this._pauseLease;
+            this._pauseLease = null;
+            this._attachedTaskId = null;
+
+            wasActive = this._isAttaching || this._isAttached;
+            this._isAttaching = false;
+            this._isAttached = false;
+        }
+
+        cts?.Cancel();
+        cts?.Dispose();
+        lease?.Dispose();
+
+        if (wasActive)
+        {
             this.RaiseChanged();
         }
     }
@@ -372,39 +757,64 @@ internal sealed class TaskBrowserController
     /// </summary>
     private void ReleaseAttachmentIfTargetGone(TaskBrowserProvider p)
     {
-        if (this.AttachedTaskId is not { } id)
+        string? id;
+        lock (this._sync)
+        {
+            id = this._attachedTaskId;
+        }
+
+        if (id is null)
         {
             return;
         }
 
-        if (p.Tasks.Get(id) is not { } snapshot)
+        var snapshot = p.Tasks.Get(id); // manager I/O outside the lock
+        string status;
+        if (snapshot is null)
         {
-            this.ReleaseAttachment();
-            this.State = this.State.WithStatus($"Attached shell '{id}' was removed; resuming the agent.");
+            status = $"Attached shell '{id}' was removed; resuming the agent.";
         }
         else if (snapshot.Status != TaskRunStatus.Running)
         {
-            this.ReleaseAttachment();
-            this.State = this.State.WithStatus($"Attached shell '{id}' finished; resuming the agent.");
+            status = $"Attached shell '{id}' finished; resuming the agent.";
+        }
+        else
+        {
+            return;
+        }
+
+        this.ReleaseAttachment();
+        lock (this._sync)
+        {
+            this._state = this._state.WithStatus(status);
         }
     }
 
     /// <summary>
     /// The Ctrl+B chord: if a UI attachment is active, release it (resuming the agent); otherwise send the
     /// selected — or, failing that, the most recently started — running <b>foreground</b> shell to the
-    /// background via <see cref="TaskManager.TryDetach"/>, surfacing the real result. This is a shell/output
-    /// concern only: it never opens the browser (that is <c>/tasks</c>) and never overloads attachment onto
-    /// <see cref="TaskExecutionMode"/>. Returns the human-readable outcome for the shell to display.
+    /// background via <see cref="TaskManager.TryDetach"/>, surfacing the real result. Returns the
+    /// human-readable outcome for the shell to display.
     /// </summary>
     public string HandleBackgroundChord()
     {
-        if (this.IsAttaching || this.IsAttached)
+        bool composerLocked;
+        TaskBrowserProvider? p;
+        string? selectedId;
+        lock (this._sync)
+        {
+            composerLocked = this._isAttaching || this._isAttached;
+            p = this._bound;
+            selectedId = this._state.SelectedTaskId;
+        }
+
+        if (composerLocked)
         {
             this.ReleaseAttachment();
             return this.SetStatusAndReturn("Released the attached shell view; resuming the agent.");
         }
 
-        if (this.provider() is not { } p || SelectDetachTarget(p, this.State.SelectedTaskId) is not { } target)
+        if (p is null || SelectDetachTarget(p, selectedId) is not { } target)
         {
             return this.SetStatusAndReturn("No running foreground shell to send to the background.");
         }
@@ -421,7 +831,11 @@ internal sealed class TaskBrowserController
 
     private string SetStatusAndReturn(string message)
     {
-        this.State = this.State.WithStatus(message);
+        lock (this._sync)
+        {
+            this._state = this._state.WithStatus(message);
+        }
+
         this.RaiseChanged();
         return message;
     }
@@ -447,22 +861,13 @@ internal sealed class TaskBrowserController
     private static bool IsRunningForegroundShell(TaskSnapshot t) =>
         t.Kind == TaskKind.Shell && t.Mode == TaskExecutionMode.Foreground && t.Status == TaskRunStatus.Running;
 
-    /// <summary>Releases the attachment, disposes the subscription, and clears output. Idempotent.</summary>
-    public void Close()
+    /// <summary>Atomic snapshot of the attach flags (test/diagnostic seam): IsAttached implies the lease is held.</summary>
+    internal (bool Attached, bool HasLease) SnapshotAttach()
     {
-        this.ReleaseAttachment();
-        this.sub?.Dispose();
-        this.sub = null;
-        this.SelectedOutput = string.Empty;
-        this.SelectedOutputError = null;
-    }
-
-    private void MutateThenQueueOutput(TaskBrowserState next)
-    {
-        this.State = next;
-        // Fire-and-forget output refresh (ring is cheap; log is IO). Tests call RefreshOutputAsync directly.
-        _ = this.RefreshOutputAsync(this.attachCts?.Token ?? CancellationToken.None);
-        this.RaiseChanged();
+        lock (this._sync)
+        {
+            return (this._isAttached, this._pauseLease is not null);
+        }
     }
 
     private void RaiseChanged() => this.Changed?.Invoke();
