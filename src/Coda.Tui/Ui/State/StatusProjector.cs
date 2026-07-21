@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text;
+using Coda.Agent;
 using LlmClient;
 
 namespace Coda.Tui.Ui.State;
@@ -9,6 +10,12 @@ namespace Coda.Tui.Ui.State;
 /// rendered in a fixed priority order and joined with <c>" | "</c>; lower-priority fields are shed
 /// from the end until the line fits the target width (measured in display cells). When even the
 /// model alone is too wide it is truncated with an ellipsis. Frontend-agnostic — no Terminal.Gui types.
+///
+/// <para>Priority order (highest first): model, permission mode, effective effort, context window,
+/// token usage, cost, MCP services, LSP services, git branch, working directory. Permission is placed
+/// immediately after the model and before effort so the current permission mode survives when
+/// lower-priority fields (cwd, git, services, usage, cost, context, then effort) are shed under
+/// narrow widths.</para>
 /// </summary>
 public static class StatusProjector
 {
@@ -45,46 +52,67 @@ public static class StatusProjector
     {
         var fields = new List<string>
         {
-            snapshot.Model,          // 1 — model
-            snapshot.EffectiveEffort, // 2 — effective effort
+            snapshot.Model,                            // 1 — model
+            FormatPermission(snapshot.Permission),     // 2 — permission mode (survives before effort)
+            snapshot.EffectiveEffort,                  // 3 — effective effort
         };
 
         if (snapshot.Context is { } context)
         {
-            fields.Add(FormatContext(context, width)); // 3 — context window
+            fields.Add(FormatContext(context, width)); // 4 — context window
         }
 
         if (HasUsage(snapshot.SessionUsage))
         {
-            fields.Add(FormatUsage(snapshot.SessionUsage)); // 4 — token usage
+            fields.Add(FormatUsage(snapshot.SessionUsage)); // 5 — token usage
         }
 
         if (snapshot.EstimatedCost is { } cost)
         {
-            fields.Add(FormatCost(cost)); // 5 — cost
+            fields.Add(FormatCost(cost)); // 6 — cost
         }
 
         if (HasService(snapshot.Mcp))
         {
-            fields.Add(FormatService("MCP", snapshot.Mcp)); // 6 — MCP services
+            fields.Add(FormatService("MCP", snapshot.Mcp)); // 7 — MCP services
         }
 
         if (HasService(snapshot.Lsp))
         {
-            fields.Add(FormatService("LSP", snapshot.Lsp)); // 7 — LSP services
+            fields.Add(FormatService("LSP", snapshot.Lsp)); // 8 — LSP services
         }
 
         if (snapshot.Git is { Branch: { } branch })
         {
-            fields.Add(branch + (snapshot.Git.Dirty ? "*" : string.Empty)); // 8 — git branch
+            fields.Add(branch + (snapshot.Git.Dirty ? "*" : string.Empty)); // 9 — git branch
         }
 
         if (!string.IsNullOrEmpty(snapshot.WorkingDirectory))
         {
-            fields.Add(snapshot.WorkingDirectory); // 9 — working directory
+            fields.Add(snapshot.WorkingDirectory); // 10 — working directory
         }
 
         return fields;
+    }
+
+    /// <summary>
+    /// Formats the current permission mode as a compact, always-present label (mandatory even with zero
+    /// pending). A pending count is appended as <c>!N</c> when prompts await a decision.
+    /// </summary>
+    private static string FormatPermission(PermissionStatus permission)
+    {
+        var label = permission.Mode switch
+        {
+            PermissionMode.Default => "perm ask",
+            PermissionMode.AcceptEdits => "perm edits",
+            PermissionMode.Plan => "perm plan",
+            PermissionMode.BypassPermissions => "perm yolo",
+            _ => "perm ask",
+        };
+
+        return permission.PendingCount > 0
+            ? $"{label} !{permission.PendingCount}"
+            : label;
     }
 
     private static string FormatContext(ContextStatus context, int width)
