@@ -40,9 +40,27 @@ internal sealed class ComposerView : TextView
     /// </summary>
     internal int FullTextReplacementCount { get; private set; }
 
+    static ComposerView()
+    {
+        // Terminal.Gui's base TextView constructor seeds every instance's Cursor.Style from the
+        // process-global static TextView.DefaultCursorStyle (BlinkingBar in 2.4.17). Because ComposerView
+        // is Coda's only TextView, overriding that global default to an always-visible block cursor is safe
+        // and affects nothing else. Running it in the static constructor guarantees the block style is in
+        // place before the first composer's base constructor reads it, and it is never touched per edit/frame.
+        TextView.DefaultCursorStyle = CursorStyle.SteadyBlock;
+    }
+
     public ComposerView(ComposerController controller)
     {
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
+
+        // Re-assert the block default once per composer (never per edit/frame) so a composer built after some
+        // other code changed the process-global default still uses it, and align this instance's cursor —
+        // which the base constructor already seeded from whatever the default happened to be — without
+        // touching the caret position or focus-driven visibility.
+        TextView.DefaultCursorStyle = CursorStyle.SteadyBlock;
+        this.Cursor = this.Cursor with { Style = CursorStyle.SteadyBlock };
+
         this.Multiline = true;
         this.WordWrap = true;
         this.TabKeyAddsTab = false;
