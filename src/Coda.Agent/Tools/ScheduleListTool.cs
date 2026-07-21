@@ -1,5 +1,6 @@
 using System.Text;
 using System.Text.Json;
+using Coda.Agent.Scheduling;
 
 namespace Coda.Agent.Tools;
 
@@ -37,7 +38,7 @@ public sealed class ScheduleListTool : ITool
         sb.AppendLine($"Scheduled tasks ({items.Count}):");
         foreach (var task in items)
         {
-            var recurringLabel = task.Recurring ? "recurring" : "one-shot";
+            var recurringLabel = task.Kind == ScheduleKind.Cron ? "recurring" : "one-shot";
             var promptPreview = task.Prompt.Length > 60
                 ? task.Prompt[..57] + "..."
                 : task.Prompt;

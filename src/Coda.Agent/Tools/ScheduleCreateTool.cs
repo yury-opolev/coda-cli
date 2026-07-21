@@ -72,7 +72,7 @@ public sealed class ScheduleCreateTool : ITool
         var now = this.nowUtcFactory();
         var task = context.Schedules.Add(cron, prompt, recurring, now);
 
-        var recurringLabel = task.Recurring ? "recurring" : "one-shot";
+        var recurringLabel = task.Kind == ScheduleKind.Cron ? "recurring" : "one-shot";
         var content = $"Scheduled task created.\n" +
                       $"  Id:       {task.Id}\n" +
                       $"  Cron:     {task.Cron}\n" +

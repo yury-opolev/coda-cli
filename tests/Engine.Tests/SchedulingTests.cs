@@ -131,9 +131,9 @@ public sealed class SchedulingTests
         Assert.NotEmpty(task.Id);
         Assert.Equal("*/5 * * * *", task.Cron);
         Assert.Equal("do something", task.Prompt);
-        Assert.True(task.Recurring);
+        Assert.Equal(ScheduleKind.Cron, task.Kind);
         // Next run should be 12:05
-        Assert.Equal(new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc), task.NextRunUtc);
+        Assert.Equal(new DateTimeOffset(new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc)), task.NextRunUtc);
         Assert.Single(store.Items);
     }
 
@@ -252,11 +252,11 @@ public sealed class SchedulingTests
         var now = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
         var task = store.Add("*/5 * * * *", "work", true, now);
 
-        var updated = task with { NextRunUtc = new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc) };
+        var updated = task with { NextRunUtc = new DateTimeOffset(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc)) };
         store.Replace(updated);
 
         Assert.Single(store.Items);
-        Assert.Equal(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc), store.Items[0].NextRunUtc);
+        Assert.Equal(new DateTimeOffset(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc)), store.Items[0].NextRunUtc);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -432,7 +432,7 @@ public sealed class SchedulingTests
         // Should be rescheduled, not removed
         Assert.Single(store.Items);
         // Next run should be strictly after 12:05 (i.e., 12:10)
-        Assert.Equal(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc), store.Items[0].NextRunUtc);
+        Assert.Equal(new DateTimeOffset(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc)), store.Items[0].NextRunUtc);
     }
 
     [Fact]

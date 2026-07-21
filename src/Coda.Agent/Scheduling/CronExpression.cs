@@ -1,12 +1,13 @@
 namespace Coda.Agent.Scheduling;
 
 /// <summary>
-/// Parses and evaluates a 5-field cron expression (minute hour dom month dow).
+/// Parses and evaluates a five-field cron expression (minute hour dom month dow).
 ///
-/// Semantics: a minute matches when ALL five fields match the candidate time.
-/// When both dom and dow are restricted (non-wildcard), BOTH must match (AND semantics).
-/// This is the simplest correct interpretation and is well-defined; cron's traditional
-/// OR-when-both-restricted behavior is an edge case that the tooling does not require.
+/// A candidate minute matches when the minute, hour, and month fields all match and the day
+/// fields match using standard cron day semantics:
+///   - if both day-of-month and day-of-week are restricted (not <c>*</c>), either may match;
+///   - if exactly one is restricted, that field controls;
+///   - if neither is restricted, every day matches.
 ///
 /// Supported per field:
 ///   *        — wildcard (match every value)
@@ -16,6 +17,9 @@ namespace Coda.Agent.Scheduling;
 ///   n        — single number
 ///
 /// Ranges: minute 0-59, hour 0-23, dom 1-31, month 1-12, dow 0-6 (0 = Sunday).
+///
+/// Evaluation is timezone-neutral: <see cref="Matches"/> tests a wall-clock minute. Timezone
+/// conversion and DST handling live in <see cref="ScheduleRecurrence"/>.
 /// </summary>
 public sealed partial class CronExpression
 {
@@ -24,6 +28,8 @@ public sealed partial class CronExpression
     private readonly IReadOnlyList<int> daysOfMonth;
     private readonly IReadOnlyList<int> months;
     private readonly IReadOnlyList<int> daysOfWeek;
+    private readonly bool dayOfMonthRestricted;
+    private readonly bool dayOfWeekRestricted;
 
     private CronExpression(
         string expression,
@@ -31,7 +37,9 @@ public sealed partial class CronExpression
         IReadOnlyList<int> hours,
         IReadOnlyList<int> daysOfMonth,
         IReadOnlyList<int> months,
-        IReadOnlyList<int> daysOfWeek)
+        IReadOnlyList<int> daysOfWeek,
+        bool dayOfMonthRestricted,
+        bool dayOfWeekRestricted)
     {
         this.Expression = expression;
         this.minutes = minutes;
@@ -39,15 +47,18 @@ public sealed partial class CronExpression
         this.daysOfMonth = daysOfMonth;
         this.months = months;
         this.daysOfWeek = daysOfWeek;
+        this.dayOfMonthRestricted = dayOfMonthRestricted;
+        this.dayOfWeekRestricted = dayOfWeekRestricted;
     }
 
-    /// <summary>The original expression text.</summary>
+    /// <summary>The normalized expression text (fields joined by single spaces).</summary>
     public string Expression { get; }
 
     /// <summary>
-    /// Parses a 5-field cron expression. Returns <c>true</c> on success; on failure
-    /// returns <c>false</c> with a human-readable <paramref name="error"/> message and
-    /// <paramref name="cron"/> set to <c>null</c>.
+    /// Parses a five-field cron expression. Returns <c>true</c> on success; on failure returns
+    /// <c>false</c> with a human-readable <paramref name="error"/> message and
+    /// <paramref name="cron"/> set to <c>null</c>. Surrounding and interior whitespace is
+    /// normalized; <see cref="Expression"/> exposes the single-spaced form.
     /// </summary>
     public static bool TryParse(string expr, out CronExpression? cron, out string? error)
     {
@@ -58,7 +69,7 @@ public sealed partial class CronExpression
             return false;
         }
 
-        var parts = expr.Trim().Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        var parts = expr.Trim().Split((char[]?)null, StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length != 5)
         {
             error = $"Expected 5 fields (min hour dom month dow) but got {parts.Length}.";
@@ -71,48 +82,69 @@ public sealed partial class CronExpression
         if (!TryParseField(parts[3], 1, 12, out var months, out error)) { return false; }
         if (!TryParseField(parts[4], 0, 6, out var daysOfWeek, out error)) { return false; }
 
-        cron = new CronExpression(expr, minutes!, hours!, daysOfMonth!, months!, daysOfWeek!);
+        var normalized = string.Join(' ', parts);
+        var domRestricted = parts[2].Trim() != "*";
+        var dowRestricted = parts[4].Trim() != "*";
+
+        cron = new CronExpression(
+            normalized, minutes!, hours!, daysOfMonth!, months!, daysOfWeek!,
+            domRestricted, dowRestricted);
         error = null;
         return true;
     }
 
     /// <summary>
-    /// Returns the next UTC time strictly after <paramref name="afterUtc"/> that matches
-    /// this expression. Iterates minute-by-minute up to 366 days. Throws
-    /// <see cref="InvalidOperationException"/> if no match is found within that window
-    /// (practical only for very restricted expressions with long intervals).
+    /// Returns the next UTC time strictly after <paramref name="afterUtc"/> that matches this
+    /// expression, treating the expression as UTC wall-clock. Retained for the legacy scheduler;
+    /// timezone-aware evaluation lives in <see cref="ScheduleRecurrence.GetNextCronOccurrence"/>.
+    /// Throws <see cref="InvalidOperationException"/> when no occurrence exists within the search
+    /// horizon (e.g. "0 0 30 2 *").
     /// </summary>
     public DateTime NextOccurrence(DateTime afterUtc)
     {
-        // Truncate to minute precision, then advance by 1 minute for strict-after semantics.
-        var candidate = new DateTime(
-            afterUtc.Year, afterUtc.Month, afterUtc.Day,
-            afterUtc.Hour, afterUtc.Minute, 0, DateTimeKind.Utc)
-            .AddMinutes(1);
+        var start = new DateTimeOffset(DateTime.SpecifyKind(afterUtc, DateTimeKind.Utc));
+        return ScheduleRecurrence.GetNextCronOccurrence(this, start, TimeZoneInfo.Utc).UtcDateTime;
+    }
 
-        var limit = afterUtc.AddDays(366);
-        while (candidate <= limit)
+    /// <summary>
+    /// Returns <c>true</c> when the wall-clock minute <paramref name="localMinute"/> matches this
+    /// expression under standard cron day semantics.
+    /// </summary>
+    public bool Matches(DateTime localMinute) =>
+        this.MatchesDate(localMinute) && this.MatchesTime(localMinute);
+
+    /// <summary>Tests only the month and day fields of <paramref name="localMinute"/>.</summary>
+    internal bool MatchesDate(DateTime localMinute)
+    {
+        if (!this.months.Contains(localMinute.Month))
         {
-            if (this.Matches(candidate))
-            {
-                return candidate;
-            }
-
-            candidate = candidate.AddMinutes(1);
+            return false;
         }
 
-        throw new InvalidOperationException(
-            $"No occurrence found for expression '{this.Expression}' within 366 days of {afterUtc:O}.");
+        var domMatch = this.daysOfMonth.Contains(localMinute.Day);
+        var dowMatch = this.daysOfWeek.Contains((int)localMinute.DayOfWeek);
+
+        if (this.dayOfMonthRestricted && this.dayOfWeekRestricted)
+        {
+            return domMatch || dowMatch;
+        }
+
+        if (this.dayOfMonthRestricted)
+        {
+            return domMatch;
+        }
+
+        if (this.dayOfWeekRestricted)
+        {
+            return dowMatch;
+        }
+
+        return true;
     }
 
-    private bool Matches(DateTime dt)
-    {
-        return this.months.Contains(dt.Month)
-            && this.daysOfMonth.Contains(dt.Day)
-            && this.daysOfWeek.Contains((int)dt.DayOfWeek)
-            && this.hours.Contains(dt.Hour)
-            && this.minutes.Contains(dt.Minute);
-    }
+    /// <summary>Tests only the hour and minute fields of <paramref name="localMinute"/>.</summary>
+    internal bool MatchesTime(DateTime localMinute) =>
+        this.hours.Contains(localMinute.Hour) && this.minutes.Contains(localMinute.Minute);
 
     private static bool TryParseField(
         string field,

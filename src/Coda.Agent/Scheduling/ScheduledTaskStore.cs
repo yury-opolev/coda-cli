@@ -74,9 +74,27 @@ public sealed partial class ScheduledTaskStore
             throw new ArgumentException($"Invalid cron expression: {error}", nameof(cron));
         }
 
-        var nextRun = cronExpr!.NextOccurrence(nowUtc);
+        var nextRun = new DateTimeOffset(cronExpr!.NextOccurrence(nowUtc));
         var id = Guid.NewGuid().ToString("N")[..12];
-        var task = new ScheduledTask(id, cron, prompt, recurring, nextRun);
+        var createdAt = new DateTimeOffset(DateTime.SpecifyKind(nowUtc, DateTimeKind.Utc));
+
+        // TEMPORARY Task-1 compatibility shim: this legacy Add still speaks the old
+        // cron/recurring input. Map it onto the new versioned record so the rest of the code
+        // compiles. Task 2 replaces this with the definition-aware store and legacy migration.
+        var task = new ScheduledTask(
+            ScheduledTask.CurrentSchemaVersion,
+            id,
+            Name: null,
+            Kind: recurring ? ScheduleKind.Cron : ScheduleKind.At,
+            Prompt: prompt,
+            Interval: null,
+            AtUtc: recurring ? null : nextRun,
+            Cron: cron,
+            TimeZoneId: ScheduleTimeZones.FixedOffsetId(TimeSpan.Zero),
+            NextRunUtc: nextRun,
+            CreatedAtUtc: createdAt,
+            UpdatedAtUtc: createdAt,
+            LastTerminalOutcome: null);
 
         lock (this.gate)
         {

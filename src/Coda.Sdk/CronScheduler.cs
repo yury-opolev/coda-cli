@@ -28,7 +28,7 @@ public sealed class CronScheduler
     /// </summary>
     public IReadOnlyList<ScheduledTask> DueTasks(DateTime nowUtc)
     {
-        return [.. this.store.Items.Where(t => t.NextRunUtc <= nowUtc)];
+        return [.. this.store.Items.Where(t => t.NextRunUtc.UtcDateTime <= nowUtc)];
     }
 
     /// <summary>
@@ -42,13 +42,16 @@ public sealed class CronScheduler
     {
         ArgumentNullException.ThrowIfNull(task);
 
-        if (!task.Recurring)
+        // TEMPORARY Task-1 compatibility: the legacy scheduler treated Kind==Cron definitions as
+        // recurring and everything else as one-shot. Task 6 replaces this with the definition-aware
+        // ScheduleRuntime state machine.
+        if (task.Kind != ScheduleKind.Cron)
         {
             this.store.Remove(task.Id);
             return;
         }
 
-        if (!Coda.Agent.Scheduling.CronExpression.TryParse(task.Cron, out var cronExpr, out _)
+        if (!Coda.Agent.Scheduling.CronExpression.TryParse(task.Cron ?? string.Empty, out var cronExpr, out _)
             || cronExpr is null)
         {
             // If the expression somehow became invalid, remove the task to avoid a stuck entry.
@@ -58,7 +61,7 @@ public sealed class CronScheduler
 
         try
         {
-            var nextRun = cronExpr.NextOccurrence(nowUtc);
+            var nextRun = new DateTimeOffset(cronExpr.NextOccurrence(nowUtc));
             this.store.Replace(task with { NextRunUtc = nextRun });
         }
         catch (InvalidOperationException)
