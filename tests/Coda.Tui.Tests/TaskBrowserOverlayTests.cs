@@ -62,7 +62,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             controller.Open();
@@ -90,7 +90,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -126,7 +126,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -163,7 +163,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -196,7 +196,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
 
         var previous = CultureInfo.CurrentCulture;
         CultureInfo.CurrentCulture = new CultureInfo(culture);
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -227,7 +227,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -265,7 +265,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -295,7 +295,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -327,7 +327,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -371,7 +371,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -427,7 +427,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             });
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -470,7 +470,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -507,7 +507,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -544,7 +544,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber, onChanged: () => hides++);
         host.Add(overlay);
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();
@@ -604,7 +604,7 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             _ => Key.F5,
         };
 
-        var token = _app.Begin(host);
+        var token = _app.Begin(host)!;
         try
         {
             overlay.Show();

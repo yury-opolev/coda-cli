@@ -66,14 +66,20 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
     `todo_write` (a live checklist), plan mode, cron-style `schedule`, and the
     unified task tools (`task_start` / `task_output` / `task_stop` plus
-    `task_list` / `task_get` / `task_peek` / `task_send`) for long-running jobs.
+    `task_list` / `task_get` / `task_peek` / `task_send` / `task_wait` /
+    `task_background` / `task_remove`) for long-running jobs.
 - **Unified task runtime** — one in-process `TaskManager` owns every long-running
   job in the session (background **subagents** and shell commands alike). It gives
   each task a shared id/status/depth model, a bounded ring of recent output, and a
   persistent, secret-redacted log under `~/.coda/task-logs`. `run_command` accepts
-  `run_in_background` (then poll with `task_output`); the manager stops all tasks
-  when Coda exits. Tasks are in-process only — they do **not** survive across
-  processes, and a visual `/tasks` manager / serve API is future work.
+  `run_in_background` (then poll with `task_output`). Beyond inspection, the agent
+  can `task_wait` for a task to finish (optional `timeout_seconds`, default **600**,
+  maximum **1800** — a timeout reports *still running* and never stops the task),
+  `task_background` a running foreground shell so it stops awaiting it, and
+  `task_remove` a finished task from the list (its log file is preserved). The
+  interactive TUI adds a live `/tasks` browser over the same manager. Tasks are
+  **process-local** — they do **not** survive across processes, and the manager
+  stops every task when Coda exits.
 - **Subagents** — delegate a self-contained subtask with `task`, which runs a nested
   agent loop in its own context with a scoped toolset. Nesting is bounded (main
   agent at depth 0, subagents at depth 1 and 2); the main agent can inspect and
@@ -135,7 +141,9 @@ cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step th
 press `Esc` **twice** to interrupt the active turn (a single `Esc` only dismisses the slash-command menu
 or clears a selection) · `Ctrl+C` copies the current transcript selection and, with nothing selected,
 exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `F2`
-switches between full-screen and inline. Typing a `/` shows a slash-command completion menu directly
+switches between full-screen and inline · `Ctrl+B` sends the selected (or latest) running **foreground
+shell** to the background — and, inside the `/tasks` browser, releases an output attachment — without ever
+opening the browser. Typing a `/` shows a slash-command completion menu directly
 above the composer (Up/Down select, Tab completes, a single Esc dismisses).
 
 **Mouse:** in the **transcript**, **left-drag** selects text and `Ctrl+C` copies it. In the **composer**,
@@ -157,6 +165,7 @@ Inside the REPL:
 ```
 /login [claude|copilot]   sign in (Claude.ai browser / Copilot device code)
 /status                   sign-in state for every provider
+/tasks                    open the live task browser (prints a textual snapshot in plain/Spectre)
 /provider [id]            show or switch the active provider
 /model [id]               show or set the chat model
 /effort [low|medium|high|max|auto]  show or set reasoning effort (Claude only)
@@ -170,6 +179,43 @@ Inside the REPL:
 ```
 
 > **Tip:** append `--help` (or `-h`) to any command for its usage and examples, e.g. `/model --help`.
+
+### `/tasks` — the live task browser
+
+In the full-screen and inline Terminal.Gui shells, `/tasks` opens a **focused, full-overlay
+live browser** over the session's in-process `TaskManager`. The bare `/tasks` submission is
+intercepted **before** the dispatch/startup guard, so the browser opens even while an agent
+turn is running. Plain and Spectre modes instead print a **read-only textual snapshot** of the
+same tasks (no interactive actions). Before the first turn there is no session yet, so the
+browser/snapshot shows an empty list.
+
+The list shows **active tasks first as a parent/child hierarchy**, then **recent completed,
+failed, and stopped** tasks, each with a status glyph, description, kind (subagent/shell),
+foreground/background mode, and duration. Selection is stable by task id.
+
+- **List:** `Up`/`Down`, `PageUp`/`PageDown`, `Home`/`End` navigate · `Enter` opens the detail
+  page · `x` twice within ~1.5 s stops a running task · `r` dismisses a **terminal** task from the
+  in-memory list (its **persistent log is preserved**) · `Esc` closes.
+- **Detail:** `s` steers a running **subagent** (modal editor: `Enter` queues, `Shift+Enter` /
+  `Ctrl+Enter` / `Ctrl+J` insert a newline, `Esc` cancels; messages are delivered FIFO at the
+  subagent's next safe loop boundary) · `a` **attaches** a running **background shell**'s output
+  and pauses the main agent · `Ctrl+B` releases a UI attachment (or backgrounds an originally
+  foreground shell) · `x` twice stops · `r` dismisses a terminal task · `l` toggles between recent
+  live output and the persistent **log** tail · `End` jumps to newest and restores **auto-follow**
+  · `Esc` returns to the list (releasing any attachment first).
+
+**Attachment is output-only** — there is **no shell stdin** in this phase. Attaching requests a
+pause through a reference-counted execution gate: if the main agent is idle the pause is immediate,
+otherwise it waits for the next **safe loop boundary** or turn completion (the page shows
+`pausing main agent…`). The pause lease is released on `Esc`, `Ctrl+B`, shell completion, stop,
+mode switch, or shutdown, and the main agent resumes. UI attachment is presentation-only and never
+leaks into the model-facing `task_list`/`task_get`. Everything here is **process-local** and
+**stops when Coda exits**.
+
+`coda serve` has the **same non-UI task capabilities** — the `task_*` model tools, including
+`task_wait` / `task_background` / `task_remove`, are registered identically for interactive and
+serve pipelines — but serve has **no slash commands and no TUI**, so there is no `/tasks` browser
+in serve.
 
 ### Model, effort & context
 

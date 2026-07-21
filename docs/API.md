@@ -257,6 +257,7 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `schedule_create`, `schedule_list`, `schedule_delete` | mixed | cron-style scheduled tasks |
 | `task_start`, `task_output`, `task_stop`, `sleep` | mixed | long-running background jobs + polling |
 | `task_list`, `task_get`, `task_peek`, `task_send` | yes | list all tasks, read one task, peek recent output, steer a running subagent |
+| `task_wait`, `task_background`, `task_remove` | yes | wait for a task to finish (optional `timeout_seconds`, default 600, max 1800; timeout leaves it running), move a running foreground shell to the background, remove a finished task (log preserved) |
 | `notebook_edit` | no (gated) | edit Jupyter notebook cells |
 | `git_worktree` | no (gated) | list/add/remove git worktrees |
 | `task` | — | delegate a self-contained subtask to a subagent |

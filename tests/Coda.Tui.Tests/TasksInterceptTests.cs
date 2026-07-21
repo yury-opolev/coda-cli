@@ -320,7 +320,7 @@ public sealed class TasksInterceptTests
     // ---- Composer attachment lock ----------------------------------------------------------------
 
     [Fact]
-    public void Composer_is_locked_while_attached_stays_disabled_across_snapshots_and_unlock_restores()
+    public async Task Composer_is_locked_while_attached_stays_disabled_across_snapshots_and_unlock_restores()
     {
         using var mgr = NewManager(out var dir);
         try
@@ -380,7 +380,7 @@ public sealed class TasksInterceptTests
             });
 
             app.Run(shell, null);
-            work.GetAwaiter().GetResult();
+            await work;
 
             Assert.Null(failure);
             Assert.True(lockedWhileAttached, "the composer must be disabled while a shell attachment is active");
@@ -488,7 +488,7 @@ public sealed class TasksInterceptTests
     // ---- Task 7 review regressions ---------------------------------------------------------------
 
     [Fact]
-    public void Auto_release_while_browser_open_keeps_focus_on_browser_not_composer()
+    public async Task Auto_release_while_browser_open_keeps_focus_on_browser_not_composer()
     {
         using var mgr = NewManager(out var dir);
         try
@@ -561,7 +561,7 @@ public sealed class TasksInterceptTests
             });
 
             app.Run(shell, null);
-            work.GetAwaiter().GetResult();
+            await work;
 
             Assert.Null(failure);
             Assert.True(attachedBeforeRelease, "the attach must succeed so the composer is genuinely locked");
