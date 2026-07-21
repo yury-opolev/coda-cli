@@ -1,11 +1,15 @@
+using System.Diagnostics;
 using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Agent;
+using Coda.Agent.Scheduling;
+using Coda.Agent.Tasks;
 using Coda.JsonRpc;
 using Coda.Agent.Settings;
 using Coda.Sdk;
+using Coda.Sdk.Scheduling;
 using Coda.Sdk.Serve;
 using Coda.Sdk.Serve.Messages;
 using LlmAuth;
@@ -13,6 +17,7 @@ using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
 using Microsoft.Extensions.Logging;
+using DomainScheduleLifecycleEvent = Coda.Sdk.Scheduling.ScheduleLifecycleEvent;
 
 namespace Engine.Tests.Serve;
 
@@ -26,6 +31,9 @@ namespace Engine.Tests.Serve;
 public sealed class ServeHostTests : IDisposable
 {
     private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+
+    // A valid 64-hex API key for the auth-gated schedule tests below.
+    private const string ApiKey = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     private readonly string workDir = Directory.CreateTempSubdirectory("serve_host_").FullName;
 
@@ -55,10 +63,14 @@ public sealed class ServeHostTests : IDisposable
     {
         private readonly TaskCompletionSource<bool> gate = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        /// <summary>Completes when <see cref="SendAsync"/> is entered (the turn reached the LLM call).</summary>
+        public TaskCompletionSource<bool> Entered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
         public void Release() => this.gate.TrySetResult(true);
 
         protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            this.Entered.TrySetResult(true);
             await this.gate.Task.WaitAsync(cancellationToken);
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
@@ -901,6 +913,686 @@ public sealed class ServeHostTests : IDisposable
 
         cts.Cancel();
         try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    // ── Schedule runtime lifecycle over serve (Task 9) ──────────────────────────
+    //
+    // These exercise the serve enablement path: ServeHost sets the schedule-lifecycle sink,
+    // starts the JSON-RPC read loop BEFORE driving CodaSession.InitializeAsync (so a scheduled
+    // firing can round-trip a server→client request), and gates initialize/prompt on a shared
+    // initialization task. A fake IScheduleRuntimeHandle (ProbeHandle) stands in for the real
+    // ScheduleRuntime so the wiring can be asserted deterministically without real schedules.
+
+    /// <summary>Captures the CodaSession and its injected fake runtime handle from the factory closure.</summary>
+    private sealed class ScheduleProbe
+    {
+        public CodaSession? Session;
+        public ProbeHandle? Handle;
+    }
+
+    /// <summary>
+    /// Factory whose CodaSession enables the schedule runtime and injects a <see cref="ProbeHandle"/>
+    /// via <c>ScheduleRuntimeFactoryForTest</c>. The handle is built by <paramref name="configure"/>,
+    /// which receives the runtime's wired lifecycle sink (a session forwarder that ends at the
+    /// ServeHost's <see cref="WireScheduleLifecycleSink"/>) and the serve permission prompt.
+    /// </summary>
+    private Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> MakeScheduleFactory(
+        ScheduleProbe probe,
+        HttpMessageHandler httpHandler,
+        Func<IScheduleLifecycleSink, IPermissionPrompt, ProbeHandle> configure)
+    {
+        return (perm, question, plan) =>
+        {
+            var options = this.BaseOptions() with
+            {
+                InteractivePrompt = perm,
+                UserQuestionPrompt = question,
+                PlanApprover = plan,
+                EnableScheduleRuntime = true,
+            };
+            var session = new CodaSession(
+                SignedInClaude(),
+                options,
+                httpClient: new HttpClient(httpHandler));
+
+            session.ScheduleRuntimeFactoryForTest = (schedules, tasks, host, lifecycle, tp, logger) =>
+            {
+                var handle = configure(lifecycle, perm);
+                probe.Handle = handle;
+                return handle;
+            };
+
+            probe.Session = session;
+            return session;
+        };
+    }
+
+    private static async Task WaitForStartEnteredAsync(ScheduleProbe probe, TimeSpan timeout)
+    {
+        var sw = Stopwatch.StartNew();
+        while (probe.Handle is null || !probe.Handle.StartEntered.Task.IsCompleted)
+        {
+            if (sw.Elapsed > timeout)
+            {
+                throw new TimeoutException("schedule runtime StartAsync was never entered");
+            }
+
+            await Task.Delay(20);
+        }
+    }
+
+    [Fact]
+    public async Task Read_loop_is_live_during_init_so_a_scheduled_permission_request_round_trips()
+    {
+        // Proves ServeHost starts the connection's read loop BEFORE driving InitializeAsync: the
+        // fake runtime's StartAsync (invoked from InitializeAsync) issues a server→client
+        // permission request and requires its response. It also emits a "started" lifecycle
+        // notification while the host is otherwise idle (no prompt in flight).
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, permission: perm, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+        orchestrator.OnRequest(ServeMethods.RequestPermission, _ => ServeJson.ToNode(new PermissionResponse(true)));
+
+        // Wait until the runtime start is entered (and blocked), so the orchestrator handlers are
+        // registered before the permission request is issued, then release the start.
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+
+        var started = await lifecycle.WaitForStateAsync("started", WaitTimeout);
+        Assert.Equal("def-serve", started["definitionId"]!.GetValue<string>());
+        Assert.True(probe.Handle!.PermissionGranted);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Initialize_waits_for_shared_initialization_before_returning()
+    {
+        // initialize must await the SAME shared initialization task the host drives after Start —
+        // not return before the schedule runtime (and LSP) are up.
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
+            CancellationToken.None);
+
+        // Initialization is still blocked → initialize must not have returned yet.
+        await Task.Delay(150);
+        Assert.False(initTask.IsCompleted, "initialize returned before initialization completed");
+
+        startGate.TrySetResult();
+        var result = await initTask.WaitAsync(WaitTimeout);
+        var init = ServeJson.FromNode<InitializeResult>(result);
+        Assert.NotNull(init);
+        Assert.Equal(ServeMethods.ProtocolVersion, init!.ProtocolVersion);
+        Assert.NotEmpty(init.SessionId);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Concurrent_initialize_and_prompt_start_the_runtime_exactly_once()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("done")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+
+        // Both handlers arrive while init is blocked; both await the SAME shared task. Neither drives
+        // a second InitializeAsync.
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
+            CancellationToken.None);
+        var promptTask = orchestrator.SendRequestAsync(
+            ServeMethods.Prompt,
+            ServeJson.ToNode(new PromptParams { Text = "hi" }),
+            CancellationToken.None);
+
+        await Task.Delay(150);
+
+        // Both await the shared gate: neither returns while initialization is still blocked.
+        Assert.False(initTask.IsCompleted, "initialize returned before initialization completed");
+        Assert.False(promptTask.IsCompleted, "prompt ran before initialization completed");
+
+        startGate.TrySetResult();
+
+        await Task.WhenAll(initTask, promptTask).WaitAsync(WaitTimeout);
+
+        Assert.Equal(1, probe.Handle!.StartCount);
+        Assert.Equal(1, probe.Session!.ScheduleRuntimeCreationCountForTest);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Initialization_failure_is_reported_to_initialize_and_leaves_no_running_runtime()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startError: new InvalidOperationException("start boom")));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        // The shared gate faults with the runtime start failure → initialize gets a JSON-RPC error.
+        await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.SendRequestAsync(
+                ServeMethods.Initialize,
+                ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
+                CancellationToken.None)
+            .WaitAsync(WaitTimeout));
+
+        // The half-started runtime was disposed and ownership cleared (CodaSession Task 7 cleanup);
+        // no leaked runtime remains.
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        Assert.Equal(1, probe.Handle!.DisposeCount);
+        Assert.Null(probe.Session!.ScheduleRuntimeForTest);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Schedule_lifecycle_event_is_delivered_while_a_prompt_turn_is_running()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var blocking = new BlockingHandler(SseText("done"));
+        var factory = this.MakeScheduleFactory(
+            probe,
+            blocking,
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+
+        // Bring the runtime up deterministically (orchestrator ready before the "started" publish).
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+        await lifecycle.WaitForStateAsync("started", WaitTimeout);
+
+        // Start a prompt; the blocking HTTP handler keeps the turn in-flight.
+        var promptTask = orchestrator.SendRequestAsync(
+            ServeMethods.Prompt,
+            ServeJson.ToNode(new PromptParams { Text = "hi" }),
+            CancellationToken.None);
+
+        await blocking.Entered.Task.WaitAsync(WaitTimeout);
+        Assert.False(promptTask.IsCompleted);
+
+        // Emit a lifecycle event WHILE the turn runs; it must still reach the orchestrator (the
+        // connection's write lock serializes it against the streaming turn).
+        await probe.Handle!.Lifecycle.PublishAsync(new DomainScheduleLifecycleEvent(
+                "def-serve", "nightly", "task-serve", ScheduleLifecycleKind.Completed, DateTimeOffset.UtcNow, "ok"))
+            .AsTask().WaitAsync(WaitTimeout);
+
+        var completed = await lifecycle.WaitForStateAsync("completed", WaitTimeout);
+        Assert.Equal("ok", completed["summary"]!.GetValue<string>());
+
+        blocking.Release();
+        await promptTask.WaitAsync(WaitTimeout);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Shutdown_disposes_runtime_and_session_before_the_connection()
+    {
+        // On shutdown the host cancels the turn, awaits CodaSession.DisposeAsync (which stops the
+        // runtime strictly before the task manager), THEN disposes the connection. A lifecycle event
+        // published from the runtime's disposal therefore still reaches the orchestrator — proving
+        // the connection outlives the runtime/session teardown (no event write after connection
+        // disposal).
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate) { PublishStoppedOnDispose = true });
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+        await lifecycle.WaitForStateAsync("started", WaitTimeout);
+
+        cts.Cancel();
+
+        // The disposal-time "stopped" event flushed to the orchestrator before the connection closed.
+        var stopped = await lifecycle.WaitForStateAsync("stopped", WaitTimeout);
+        Assert.Equal("def-serve", stopped["definitionId"]!.GetValue<string>());
+
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+        Assert.Equal(1, probe.Handle!.DisposeCount);
+    }
+
+    // ── Auth-gated schedule runtime over serve (Task 9 security finding) ─────────
+    //
+    // In API-key mode the shared initialization must NOT drive CodaSession.InitializeAsync (which
+    // starts the schedule runtime) until a valid `initialize` authenticates. An unauthenticated
+    // connected peer must never receive schedule lifecycle/stream/tool events, nor be asked to
+    // answer a server→client permission/question/plan request, before presenting the API key.
+
+    [Fact]
+    public async Task ApiKey_mode_emits_no_schedule_events_or_requests_before_initialize()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, permission: perm));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+        var sawPermission = false;
+        orchestrator.OnRequest(ServeMethods.RequestPermission, _ =>
+        {
+            sawPermission = true;
+            return ServeJson.ToNode(new PermissionResponse(true));
+        });
+
+        // No `initialize` is sent. Give the host ample time to (erroneously) drive initialization.
+        await Task.Delay(300);
+
+        Assert.Null(probe.Handle);            // schedule runtime never created / started.
+        Assert.Equal(0, lifecycle.Count);     // no schedule lifecycle notification reached the peer.
+        Assert.False(sawPermission);          // no server→client permission request was issued.
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Invalid_initialize_key_is_unauthorized_and_starts_no_runtime()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        var ex = await Assert.ThrowsAsync<JsonRpcResponseException>(() => orchestrator.SendRequestAsync(
+                ServeMethods.Initialize,
+                ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, "wrong-but-long-enough-0123456789abcdef0123456789abcdef0123456789")),
+                CancellationToken.None)
+            .WaitAsync(WaitTimeout));
+        Assert.Equal(-32001, ex.Code);
+
+        // An unauthorized initialize must not start the schedule runtime.
+        await Task.Delay(200);
+        Assert.Null(probe.Handle);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Valid_initialize_starts_runtime_once_then_lifecycle_and_permission_flow()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, permission: perm, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+        orchestrator.OnRequest(ServeMethods.RequestPermission, _ => ServeJson.ToNode(new PermissionResponse(true)));
+
+        // Before authentication the runtime must not have been created.
+        await Task.Delay(200);
+        Assert.Null(probe.Handle);
+
+        // A valid initialize authenticates and drives initialization exactly once.
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, ApiKey)),
+            CancellationToken.None);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+
+        var result = await initTask.WaitAsync(WaitTimeout);
+        Assert.NotNull(ServeJson.FromNode<InitializeResult>(result));
+
+        var started = await lifecycle.WaitForStateAsync("started", WaitTimeout);
+        Assert.Equal("def-serve", started["definitionId"]!.GetValue<string>());
+        Assert.True(probe.Handle!.PermissionGranted);
+        Assert.Equal(1, probe.Handle!.StartCount);
+        Assert.Equal(1, probe.Session!.ScheduleRuntimeCreationCountForTest);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Concurrent_valid_initialize_requests_start_the_runtime_once()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        // No runtime before authentication.
+        await Task.Delay(150);
+        Assert.Null(probe.Handle);
+
+        var init1 = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, ApiKey)),
+            CancellationToken.None);
+        var init2 = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, ApiKey)),
+            CancellationToken.None);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        await Task.Delay(100);       // give a would-be second drive a chance to race.
+        startGate.TrySetResult();
+
+        await Task.WhenAll(init1, init2).WaitAsync(WaitTimeout);
+
+        Assert.Equal(1, probe.Handle!.StartCount);
+        Assert.Equal(1, probe.Session!.ScheduleRuntimeCreationCountForTest);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Shutdown_before_authentication_completes_promptly_and_starts_no_runtime()
+    {
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory, ApiKey);
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        // Never authenticate. The host must not have driven initialization.
+        await Task.Delay(150);
+        Assert.Null(probe.Handle);
+
+        // Shutdown must complete promptly and not hang awaiting an initialization that never started.
+        var sw = Stopwatch.StartNew();
+        cts.Cancel();
+        await hostTask.WaitAsync(WaitTimeout);
+        sw.Stop();
+
+        Assert.True(sw.Elapsed < WaitTimeout, $"shutdown took {sw.Elapsed}");
+        Assert.Null(probe.Handle);   // runtime never started.
+    }
+
+    [Fact]
+    public async Task Stdio_drives_initialization_immediately_after_start()
+    {
+        // Regression: with no expectedApiKey (stdio), the shared initialization is driven immediately
+        // after connection.Start — no `initialize` is required for an overdue schedule to run.
+        using var pair = new DuplexStreamPair();
+        var probe = new ScheduleProbe();
+        var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var factory = this.MakeScheduleFactory(
+            probe,
+            new SeqHandler(SseText("hi")),
+            (lifecycle, perm) => new ProbeHandle(lifecycle, startGate: startGate));
+
+        await using var host = new ServeHost(pair.ServerReads, pair.ServerWrites, factory); // no key.
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var lifecycle = new LifecycleCollector();
+        lifecycle.Register(orchestrator);
+
+        // Without sending initialize, StartAsync is entered because stdio drives init at Start.
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
+        startGate.TrySetResult();
+        await lifecycle.WaitForStateAsync("started", WaitTimeout);
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    /// <summary>Records every <c>event/scheduleLifecycle</c> notification and awaits a given state.</summary>
+    private sealed class LifecycleCollector
+    {
+        private readonly object gate = new();
+        private readonly List<JsonNode> events = [];
+
+        public void Register(JsonRpcConnection conn) =>
+            conn.OnNotification(ServeMethods.EventScheduleLifecycle, node =>
+            {
+                if (node is null)
+                {
+                    return;
+                }
+
+                lock (this.gate)
+                {
+                    this.events.Add(node);
+                }
+            });
+
+        /// <summary>Number of schedule lifecycle notifications observed so far.</summary>
+        public int Count { get { lock (this.gate) { return this.events.Count; } } }
+
+        public async Task<JsonNode> WaitForStateAsync(string state, TimeSpan timeout)
+        {
+            var sw = Stopwatch.StartNew();
+            while (true)
+            {
+                lock (this.gate)
+                {
+                    var match = this.events.FirstOrDefault(e => e["state"]!.GetValue<string>() == state);
+                    if (match is not null)
+                    {
+                        return match;
+                    }
+                }
+
+                if (sw.Elapsed > timeout)
+                {
+                    throw new TimeoutException($"no schedule lifecycle event with state '{state}'");
+                }
+
+                await Task.Delay(20);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A fake <see cref="IScheduleRuntimeHandle"/> substituted for the real ScheduleRuntime. Its
+    /// <see cref="StartAsync"/> runs on the InitializeAsync path, so it can (optionally) block on a
+    /// gate, round-trip a permission request through the live connection, publish a "started"
+    /// lifecycle event, or fault the start.
+    /// </summary>
+    private sealed class ProbeHandle : IScheduleRuntimeHandle
+    {
+        private readonly IScheduleLifecycleSink lifecycle;
+        private readonly IPermissionPrompt? permission;
+        private int startCount;
+        private int disposeCount;
+
+        public ProbeHandle(
+            IScheduleLifecycleSink lifecycle,
+            IPermissionPrompt? permission = null,
+            TaskCompletionSource? startGate = null,
+            Exception? startError = null)
+        {
+            this.lifecycle = lifecycle;
+            this.permission = permission;
+            this.StartGate = startGate;
+            this.StartError = startError;
+        }
+
+        public IScheduleLifecycleSink Lifecycle => this.lifecycle;
+
+        public TaskCompletionSource? StartGate { get; }
+
+        public Exception? StartError { get; }
+
+        public bool PublishStoppedOnDispose { get; init; }
+
+        public TaskCompletionSource StartEntered { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public int StartCount => Volatile.Read(ref this.startCount);
+
+        public int DisposeCount => Volatile.Read(ref this.disposeCount);
+
+        public bool PermissionGranted { get; private set; }
+
+        public async Task StartAsync(CancellationToken cancellationToken = default)
+        {
+            Interlocked.Increment(ref this.startCount);
+            this.StartEntered.TrySetResult();
+
+            if (this.StartGate is not null)
+            {
+                await this.StartGate.Task.WaitAsync(cancellationToken);
+            }
+
+            if (this.StartError is not null)
+            {
+                throw this.StartError;
+            }
+
+            if (this.permission is not null)
+            {
+                this.PermissionGranted = await this.permission.RequestAsync(new ProbeTool(), "scheduled preview", cancellationToken);
+            }
+
+            await this.lifecycle.PublishAsync(
+                new DomainScheduleLifecycleEvent("def-serve", "nightly", "task-serve", ScheduleLifecycleKind.Started, DateTimeOffset.UtcNow, null),
+                cancellationToken);
+        }
+
+        public bool TryGetState(string scheduleId, out ScheduleRuntimeState state)
+        {
+            state = new ScheduleRuntimeState(ScheduleRuntimeStatus.Idle, null);
+            return false;
+        }
+
+        public IReadOnlyList<ScheduleRuntimeSnapshot> GetSnapshot() => [];
+
+        public async ValueTask DisposeAsync()
+        {
+            Interlocked.Increment(ref this.disposeCount);
+            if (this.PublishStoppedOnDispose)
+            {
+                await this.lifecycle.PublishAsync(new DomainScheduleLifecycleEvent(
+                    "def-serve", "nightly", "task-serve", ScheduleLifecycleKind.Stopped, DateTimeOffset.UtcNow, null));
+            }
+        }
+    }
+
+    private sealed class ProbeTool : ITool
+    {
+        public string Name => "scheduled_probe";
+
+        public string Description => string.Empty;
+
+        public string InputSchemaJson => "{}";
+
+        public bool IsReadOnly => false;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default) =>
+            throw new NotImplementedException();
     }
 
     public void Dispose()

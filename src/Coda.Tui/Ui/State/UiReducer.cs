@@ -3,7 +3,9 @@ using System.Linq;
 using Coda.Agent;
 using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Lsp;
+using Coda.Sdk.Scheduling;
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Rendering;
 
 namespace Coda.Tui.Ui.State;
 
@@ -96,6 +98,7 @@ public static class UiReducer
                 e.Snapshot.LspServers.Count(s => s.State == LspServerState.Running),
                 e.Snapshot.LspServers.Count(s => s.State == LspServerState.Error)),
         },
+        ScheduleLifecycleChangedEvent e => ScheduleNotice(state, e.Lifecycle),
         McpRuntimeChangedEvent e => state with
         {
             McpRuntime = e.Snapshot,
@@ -138,6 +141,85 @@ public static class UiReducer
             Transcript = state.Transcript.Add(new NoticeTranscriptBlock(Guid.NewGuid(), text, level)),
             Notification = new UiNotification(text, level),
         };
+
+    // Longest summary appended to a Failed lifecycle notice before it is ellipsized. Keeps the notice
+    // compact and single-line; the full task result/output is never surfaced here.
+    private const int MaxScheduleSummaryLength = 200;
+
+    // Longest sanitized schedule label (definition name or managed task id) surfaced in a lifecycle
+    // notice before it is ellipsized. Keeps the single-line notice compact; ordinary short names and
+    // task ids are well under this bound and are never truncated.
+    private const int MaxScheduleLabelLength = 80;
+
+    private static UiSessionSnapshot ScheduleNotice(UiSessionSnapshot state, ScheduleLifecycleEvent lifecycle)
+    {
+        // Definition name and task id are model-controlled and may carry newlines, ANSI/OSC escapes,
+        // C0/C1 controls, or bidi overrides that would otherwise spoof extra transcript rows or the
+        // terminal. Flatten them to a single safe line before interpolation, falling back to the
+        // sanitized definition id (then a neutral label) when nothing printable survives.
+        var name = SanitizeScheduleLabel(lifecycle.DefinitionName);
+        if (name.Length == 0)
+        {
+            name = SanitizeScheduleLabel(lifecycle.DefinitionId);
+        }
+
+        if (name.Length == 0)
+        {
+            name = "schedule";
+        }
+
+        var taskId = SanitizeScheduleLabel(lifecycle.TaskId);
+
+        var (text, level) = lifecycle.Kind switch
+        {
+            ScheduleLifecycleKind.Started => (
+                $"Scheduled task {name} started as {taskId}",
+                UiNotificationLevel.Information),
+            ScheduleLifecycleKind.Completed => (
+                $"Scheduled task {name} completed",
+                UiNotificationLevel.Information),
+            ScheduleLifecycleKind.Failed => (
+                AppendSummary($"Scheduled task {name} failed", lifecycle.Summary),
+                UiNotificationLevel.Error),
+            ScheduleLifecycleKind.Stopped => (
+                $"Scheduled task {name} stopped",
+                UiNotificationLevel.Warning),
+            _ => ($"Scheduled task {name} changed", UiNotificationLevel.Information),
+        };
+
+        return Notice(state, text, level);
+    }
+
+    // Flattens a model-controlled schedule label (definition name or managed task id) to a single safe,
+    // length-bounded line via the same primitive the /tasks views use, so ANSI/control/bidi sequences
+    // and embedded newlines can never spoof the terminal or split the notice across rows. Printable
+    // Unicode and emoji are preserved untouched. Returns empty when nothing printable survives.
+    private static string SanitizeScheduleLabel(string? value)
+    {
+        var single = TerminalTextSanitizer.SanitizeSingleLine(value);
+        return single.Length > MaxScheduleLabelLength
+            ? single[..MaxScheduleLabelLength] + "…"
+            : single;
+    }
+
+    // Appends a sanitized, single-line, length-bounded summary to a failure headline. Sanitization is
+    // the same primitive the /tasks views use, so ANSI/control sequences and multi-line output can
+    // never spoof the terminal or break the notice onto extra lines.
+    private static string AppendSummary(string headline, string? summary)
+    {
+        var single = TerminalTextSanitizer.SanitizeSingleLine(summary);
+        if (single.Length == 0)
+        {
+            return headline;
+        }
+
+        if (single.Length > MaxScheduleSummaryLength)
+        {
+            single = single[..MaxScheduleSummaryLength] + "…";
+        }
+
+        return $"{headline}: {single}";
+    }
 
     private static UiSessionSnapshot AppendOrExtendAssistant(UiSessionSnapshot state, string delta)
     {

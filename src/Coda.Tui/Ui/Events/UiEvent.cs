@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using Coda.Agent;
 using Coda.Mcp;
 using Coda.Sdk;
+using Coda.Sdk.Scheduling;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.State;
 using LlmClient;
@@ -106,6 +107,12 @@ public sealed record PlanApprovalResolvedEvent(bool Approved) : UiEvent;
 
 /// <summary>The session runtime snapshot changed.</summary>
 public sealed record SessionRuntimeChangedEvent(SessionRuntimeSnapshot Snapshot) : UiEvent;
+
+/// <summary>
+/// A scheduled task's execution lifecycle changed (started/completed/failed/stopped). Rendered as a
+/// concise transcript notice + notification; the full task result/output is never inserted here.
+/// </summary>
+public sealed record ScheduleLifecycleChangedEvent(ScheduleLifecycleEvent Lifecycle) : UiEvent;
 
 /// <summary>The MCP runtime snapshot changed.</summary>
 public sealed record McpRuntimeChangedEvent(McpRuntimeSnapshot Snapshot) : UiEvent;

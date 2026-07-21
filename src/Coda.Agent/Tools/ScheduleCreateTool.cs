@@ -4,35 +4,50 @@ using Coda.Agent.Scheduling;
 namespace Coda.Agent.Tools;
 
 /// <summary>
-/// Creates a new scheduled task. Validates the cron expression and adds the task
-/// to the session's <see cref="ScheduledTaskStore"/>. Bookkeeping-only (no file/system
-/// side effects), so it runs without a user permission prompt.
+/// Creates a new scheduled task from an <c>every</c>/<c>at</c>/<c>cron</c> selector. Validates and
+/// normalizes the request via <see cref="ScheduleDefinitionParser"/> and adds the resulting
+/// definition to the session's <see cref="ScheduledTaskStore"/>. The tool itself only mutates the
+/// schedule store (no file/system side effects), so it runs without a user permission prompt; the
+/// session's schedule runtime is what later executes each due definition as a background agent.
 /// </summary>
 public sealed class ScheduleCreateTool : ITool
 {
-    private readonly Func<DateTime> nowUtcFactory;
+    private readonly TimeProvider timeProvider;
+    private readonly Func<TimeZoneInfo> localTimeZone;
 
-    public ScheduleCreateTool(Func<DateTime> nowUtcFactory)
+    /// <summary>
+    /// Creates the tool. <paramref name="timeProvider"/> defaults to <see cref="TimeProvider.System"/>
+    /// and <paramref name="localTimeZone"/> defaults to the machine-local zone; both are injectable
+    /// so tests get deterministic, zone-independent results.
+    /// </summary>
+    public ScheduleCreateTool(TimeProvider? timeProvider = null, Func<TimeZoneInfo>? localTimeZone = null)
     {
-        this.nowUtcFactory = nowUtcFactory ?? throw new ArgumentNullException(nameof(nowUtcFactory));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.localTimeZone = localTimeZone ?? (() => TimeZoneInfo.Local);
     }
 
     public string Name => "schedule_create";
 
     public string Description =>
-        "Create a scheduled task that runs a prompt on a recurring or one-shot cron schedule. " +
-        "Provide a standard 5-field cron expression (min hour dom month dow), the prompt to run, " +
-        "and whether the task should recur (default true). Returns the task id and next run time.";
+        "Create a scheduled task that runs a prompt. Provide the 'prompt' plus exactly one schedule " +
+        "selector: 'every' for a repeating interval (e.g. \"3m\", \"2h\", \"1d\"; minimum one minute), " +
+        "'at' for a one-shot ISO-8601 time (with or without an offset), or 'cron' for a repeating " +
+        "five-field cron rule. Use optional 'timeZone' (e.g. \"America/New_York\") to interpret a cron " +
+        "rule, and optional 'name' as a label. Returns the task id and its next run time.";
 
     public string InputSchemaJson => """
         {
           "type": "object",
           "properties": {
-            "cron":      { "type": "string",  "description": "5-field cron expression, e.g. \"*/5 * * * *\"" },
-            "prompt":    { "type": "string",  "description": "Prompt to execute when the task fires" },
-            "recurring": { "type": "boolean", "description": "If true (default), reschedule after each firing; if false, run once" }
+            "name":     { "type": "string", "description": "Optional human-readable label" },
+            "prompt":   { "type": "string", "description": "Prompt to execute when the task fires" },
+            "every":    { "type": "string", "description": "Recurring interval such as \"3m\", \"2h\", or \"1d\" (minimum one minute)" },
+            "at":       { "type": "string", "description": "One-shot ISO-8601 date-time, with or without an explicit offset" },
+            "cron":     { "type": "string", "description": "Recurring five-field cron expression, e.g. \"*/5 * * * *\"" },
+            "timeZone": { "type": "string", "description": "Optional IANA/Windows timezone id used to interpret a cron rule" }
           },
-          "required": ["cron", "prompt"]
+          "required": ["prompt"],
+          "description": "Supply the prompt and exactly one of 'every', 'at', or 'cron'."
         }
         """;
 
@@ -43,43 +58,70 @@ public sealed class ScheduleCreateTool : ITool
         ToolContext context,
         CancellationToken cancellationToken = default)
     {
-        var cron = input.TryGetProperty("cron", out var c) ? c.GetString() : null;
-        var prompt = input.TryGetProperty("prompt", out var p) ? p.GetString() : null;
-        var recurring = !input.TryGetProperty("recurring", out var r) || r.ValueKind != JsonValueKind.False;
+        var request = new ScheduleCreateRequest(
+            Name: GetString(input, "name"),
+            Prompt: GetString(input, "prompt") ?? string.Empty,
+            Every: GetString(input, "every"),
+            At: GetString(input, "at"),
+            Cron: GetString(input, "cron"),
+            TimeZoneId: GetString(input, "timeZone"));
 
-        if (string.IsNullOrWhiteSpace(cron))
-        {
-            return Task.FromResult(new ToolResult("schedule_create requires a 'cron' field.", IsError: true));
-        }
+        var nowUtc = this.timeProvider.GetUtcNow();
+        var zone = this.localTimeZone();
 
-        if (string.IsNullOrWhiteSpace(prompt))
+        if (!ScheduleDefinitionParser.TryParse(request, nowUtc, zone, out var draft, out var error))
         {
-            return Task.FromResult(new ToolResult("schedule_create requires a 'prompt' field.", IsError: true));
-        }
-
-        if (!CronExpression.TryParse(cron, out _, out var error))
-        {
-            return Task.FromResult(new ToolResult($"Invalid cron expression: {error}", IsError: true));
+            return Task.FromResult(new ToolResult(error ?? "Invalid schedule request.", IsError: true));
         }
 
         if (context.Schedules is null)
         {
             return Task.FromResult(new ToolResult(
-                "No schedule store is available in this context (e.g. running as a subagent). " +
-                "Task was not persisted."));
+                "No schedule store is available in this context (e.g. running as a subagent); the " +
+                "task was not persisted.",
+                IsError: true));
         }
 
-        var now = this.nowUtcFactory();
-        var task = context.Schedules.Add(cron, prompt, recurring, now);
+        var task = context.Schedules.Add(draft!, nowUtc);
 
-        var recurringLabel = task.Recurring ? "recurring" : "one-shot";
-        var content = $"Scheduled task created.\n" +
-                      $"  Id:       {task.Id}\n" +
-                      $"  Cron:     {task.Cron}\n" +
-                      $"  Type:     {recurringLabel}\n" +
-                      $"  Next run: {task.NextRunUtc:yyyy-MM-dd HH:mm} UTC\n" +
-                      $"  Prompt:   {task.Prompt}";
+        // Prefer the injected zone for the local display when the definition was stored in it (the
+        // offset-less 'at' path); otherwise resolve from the stored id, which handles fixed offsets
+        // and system zones and falls back to UTC safely.
+        string localDisplay;
+        string zoneLabel;
+        if (string.Equals(task.TimeZoneId, zone.Id, StringComparison.Ordinal))
+        {
+            localDisplay = TimeZoneInfo.ConvertTime(task.NextRunUtc, zone).ToString("yyyy-MM-dd HH:mm");
+            zoneLabel = task.TimeZoneId;
+        }
+        else
+        {
+            localDisplay = ScheduleDisplay.FormatLocal(task.NextRunUtc, task.TimeZoneId, out zoneLabel);
+        }
 
-        return Task.FromResult(new ToolResult(content));
+        var lines = new List<string>
+        {
+            "Scheduled task created.",
+            $"  Id:        {task.Id}",
+        };
+        if (!string.IsNullOrWhiteSpace(task.Name))
+        {
+            lines.Add($"  Name:      {task.Name}");
+        }
+
+        lines.Add($"  Schedule:  {ScheduleDisplay.DescribeRule(task)}");
+        lines.Add($"  Timezone:  {task.TimeZoneId}");
+        lines.Add($"  Next run:  {localDisplay} ({zoneLabel})");
+        lines.Add($"  Next UTC:  {task.NextRunUtc.UtcDateTime:yyyy-MM-dd HH:mm} UTC");
+        lines.Add($"  Prompt:    {task.Prompt}");
+
+        return Task.FromResult(new ToolResult(string.Join('\n', lines)));
     }
+
+    private static string? GetString(JsonElement input, string name) =>
+        input.ValueKind == JsonValueKind.Object
+        && input.TryGetProperty(name, out var value)
+        && value.ValueKind == JsonValueKind.String
+            ? value.GetString()
+            : null;
 }

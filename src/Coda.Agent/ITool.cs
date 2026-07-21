@@ -31,6 +31,13 @@ public sealed record ToolContext(string WorkingDirectory)
     /// <summary>Scheduled-task store, when available (null for subagents).</summary>
     public ScheduledTaskStore? Schedules { get; init; }
 
+    /// <summary>
+    /// Host-neutral, read-only projection of the schedule runtime, when a runtime is active.
+    /// Lets <c>schedule_list</c> report idle/running/pending state; null before the runtime
+    /// starts or in subagent contexts.
+    /// </summary>
+    public IScheduleRuntimeView? ScheduleRuntime { get; init; }
+
     /// <summary>Interactive question prompt, when an interactive user is available (null for headless/subagents).</summary>
     public IUserQuestionPrompt? UserQuestion { get; init; }
 

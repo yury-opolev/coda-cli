@@ -23,6 +23,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             spec.Hooks,
             todos: spec.Todos,
             schedules: spec.Schedules,
+            scheduleRuntime: spec.ScheduleRuntime,
             userQuestion: spec.UserQuestion,
             userHooks: spec.UserHooks,
             planApprover: spec.PlanApprover,
@@ -35,6 +36,8 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             steering: spec.Steering,
             logger: spec.Logger,
             persistTurnAsync: spec.PersistTurnAsync,
-            gate: spec.Gate);
+            gate: spec.Gate,
+            currentTaskId: spec.CurrentTaskId,
+            currentDepth: spec.CurrentDepth);
     }
 }

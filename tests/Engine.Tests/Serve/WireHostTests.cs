@@ -2,9 +2,11 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Agent;
 using Coda.JsonRpc;
+using Coda.Sdk.Scheduling;
 using Coda.Sdk.Serve;
 using Coda.Sdk.Serve.Messages;
 using LlmClient;
+using DomainScheduleLifecycleEvent = Coda.Sdk.Scheduling.ScheduleLifecycleEvent;
 
 namespace Engine.Tests.Serve;
 
@@ -257,8 +259,126 @@ public sealed class WireHostTests
     }
 
     // ---------------------------------------------------------------------------
+    // WireScheduleLifecycleSink tests
+    // ---------------------------------------------------------------------------
+
+    [Theory]
+    [InlineData(ScheduleLifecycleKind.Started, "started")]
+    [InlineData(ScheduleLifecycleKind.Completed, "completed")]
+    [InlineData(ScheduleLifecycleKind.Failed, "failed")]
+    [InlineData(ScheduleLifecycleKind.Stopped, "stopped")]
+    public async Task WireScheduleLifecycleSink_maps_each_kind_to_lower_case_state(
+        ScheduleLifecycleKind kind, string expectedState)
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConn.OnNotification(ServeMethods.EventScheduleLifecycle, node => tcs.TrySetResult(node));
+
+        var sink = new WireScheduleLifecycleSink(clientConn);
+        await sink.PublishAsync(
+            new DomainScheduleLifecycleEvent("def-1", "nightly", "task-9", kind, DateTimeOffset.UtcNow, null))
+            .AsTask().WaitAsync(WaitTimeout);
+
+        var received = await tcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(received);
+        Assert.Equal(expectedState, received!["state"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public async Task WireScheduleLifecycleSink_sends_method_and_all_payload_fields()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConn.OnNotification(ServeMethods.EventScheduleLifecycle, node => tcs.TrySetResult(node));
+
+        var sink = new WireScheduleLifecycleSink(clientConn);
+        await sink.PublishAsync(
+            new DomainScheduleLifecycleEvent("def-1", "nightly", "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UtcNow, "spawned"))
+            .AsTask().WaitAsync(WaitTimeout);
+
+        var received = await tcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(received);
+        Assert.Equal("def-1", received!["definitionId"]!.GetValue<string>());
+        Assert.Equal("nightly", received!["definitionName"]!.GetValue<string>());
+        Assert.Equal("task-9", received!["taskId"]!.GetValue<string>());
+        Assert.Equal("started", received!["state"]!.GetValue<string>());
+        Assert.Equal("spawned", received!["summary"]!.GetValue<string>());
+        Assert.NotNull(received!["timestamp"]);
+    }
+
+    [Fact]
+    public async Task WireScheduleLifecycleSink_preserves_publish_order()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        var received = new List<string>();
+        var bothArrived = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConn.OnNotification(ServeMethods.EventScheduleLifecycle, node =>
+        {
+            lock (received)
+            {
+                received.Add(node!["state"]!.GetValue<string>());
+                if (received.Count == 2)
+                {
+                    bothArrived.TrySetResult();
+                }
+            }
+        });
+
+        var sink = new WireScheduleLifecycleSink(clientConn);
+        await sink.PublishAsync(
+            new DomainScheduleLifecycleEvent("d", null, null, ScheduleLifecycleKind.Started, DateTimeOffset.UtcNow, null))
+            .AsTask().WaitAsync(WaitTimeout);
+        await sink.PublishAsync(
+            new DomainScheduleLifecycleEvent("d", null, null, ScheduleLifecycleKind.Completed, DateTimeOffset.UtcNow, null))
+            .AsTask().WaitAsync(WaitTimeout);
+
+        await bothArrived.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(new[] { "started", "completed" }, received);
+    }
+
+    [Fact]
+    public async Task WireScheduleLifecycleSink_propagates_connection_fault()
+    {
+        // Unlike the fire-and-forget liveness sinks, this sink must NOT swallow a transport fault:
+        // the schedule runtime owns sink isolation (it logs a faulting publish and keeps scheduling),
+        // so surfacing the fault here keeps that ownership in exactly one place.
+        var sink = new WireScheduleLifecycleSink(new FaultingConnection());
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            sink.PublishAsync(
+                new DomainScheduleLifecycleEvent("d", null, null, ScheduleLifecycleKind.Started, DateTimeOffset.UtcNow, null))
+            .AsTask());
+    }
+
+    // ---------------------------------------------------------------------------
     // Helpers
     // ---------------------------------------------------------------------------
+
+    private sealed class FaultingConnection : IJsonRpcConnection
+    {
+        public Task<JsonNode?> SendRequestAsync(string method, JsonNode? @params, CancellationToken ct) =>
+            throw new InvalidOperationException("simulated transport fault");
+
+        public Task SendNotificationAsync(string method, JsonNode? @params, CancellationToken ct) =>
+            throw new InvalidOperationException("simulated transport fault");
+
+        public void OnNotification(string method, Action<JsonNode?> handler) { }
+
+        public void OnRequest(string method, Func<JsonNode?, JsonNode?> handler) { }
+
+        public void OnRequestAsync(string method, Func<JsonNode?, CancellationToken, Task<JsonNode?>> handler) { }
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+    }
 
     private sealed class FakeTool : ITool
     {

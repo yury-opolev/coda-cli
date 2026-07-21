@@ -298,6 +298,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 await ConnectMcpAsync(context, mcp, store, mailbox, hostToken).ConfigureAwait(false);
                 await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
 
+                // Eagerly create + initialize the session BEFORE ready metadata/banner/composer
+                // enablement: this starts the schedule runtime so persisted schedules resume before the
+                // first prompt, sees the just-connected MCP tools, and makes the /tasks provider non-null
+                // (context.TaskManagerProvider / the TaskBrowserProvider). No model turn runs and history
+                // is untouched. A failure here is caught below and surfaced as a startup diagnostic; the
+                // session simply stays degraded, exactly as MCP-connect faults already do.
+                await agentRunner.InitializeSessionAsync(context, hostToken).ConfigureAwait(false);
+
                 var currentConnectedProviderId = await credentials
                     .GetConnectedProviderIdAsync(hostToken)
                     .ConfigureAwait(false);

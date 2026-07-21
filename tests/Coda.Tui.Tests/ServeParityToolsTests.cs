@@ -38,7 +38,8 @@ public sealed class ServeParityToolsTests : IDisposable
         lspDiagnostics: null,
         toolSearchCoordinator: null,
         NullLoggerFactory.Instance,
-        (_, _, _) => Task.CompletedTask);
+        (_, _, _) => Task.CompletedTask,
+        () => null);
 
     private static ILlmClient Client() => new StubClient();
 
@@ -47,6 +48,14 @@ public sealed class ServeParityToolsTests : IDisposable
         spec.Tools.All
             .Select(t => t.Name)
             .Where(n => n == "task" || n.StartsWith("task_", StringComparison.Ordinal))
+            .OrderBy(n => n, StringComparer.Ordinal)
+            .ToList();
+
+    /// <summary>Schedule tool names in the registry (every schedule_* tool).</summary>
+    private static IReadOnlyList<string> ScheduleToolNames(AgentLoopSpec spec) =>
+        spec.Tools.All
+            .Select(t => t.Name)
+            .Where(n => n.StartsWith("schedule_", StringComparison.Ordinal))
             .OrderBy(n => n, StringComparer.Ordinal)
             .ToList();
 
@@ -65,6 +74,30 @@ public sealed class ServeParityToolsTests : IDisposable
             ["--provider", Provider, "--model", Model, "--cwd", this.root],
             userSettingsDir: this.userSettingsDir);
         return ServeRunner.BuildSessionOptions(options);
+    }
+
+    [Fact]
+    public void Serve_and_interactive_expose_identical_schedule_tools()
+    {
+        var interactive = ScheduleToolNames(this.NewBuilder().BuildSpec(this.InteractiveOptions(), Client(), CodaSettings.Empty));
+        var serve = ScheduleToolNames(this.NewBuilder().BuildSpec(this.ServeOptions(), Client(), CodaSettings.Empty));
+
+        // Byte-for-byte identical schedule tool surface: serve parity.
+        Assert.Equal(interactive, serve);
+
+        // The full create/list/delete set is present in both.
+        Assert.Contains("schedule_create", serve);
+        Assert.Contains("schedule_list", serve);
+        Assert.Contains("schedule_delete", serve);
+    }
+
+    [Fact]
+    public void Serve_enables_the_schedule_runtime_but_default_options_do_not()
+    {
+        // The runtime option is enabled only where intended: the serve builder turns it on so
+        // persisted schedules resume; a bare/default (headless one-shot) SessionOptions leaves it off.
+        Assert.True(this.ServeOptions().EnableScheduleRuntime);
+        Assert.False(this.InteractiveOptions().EnableScheduleRuntime);
     }
 
     [Fact]

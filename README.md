@@ -64,7 +64,8 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   - permission-gated: `edit_file`, `write_file`, `run_command` (all file tools are
     sandboxed to the working directory, symlink-aware)
   - `web_fetch` / `web_search` (DuckDuckGo), `notebook_edit`, `git_worktree`,
-    `todo_write` (a live checklist), plan mode, cron-style `schedule`, and the
+    `todo_write` (a live checklist), plan mode, `schedule_*` **scheduled tasks**
+    (see [Scheduled tasks](#scheduled-tasks)), and the
     unified task tools (`task_start` / `task_output` / `task_stop` plus
     `task_list` / `task_get` / `task_peek` / `task_send` / `task_wait` /
     `task_background` / `task_remove`) for long-running jobs.
@@ -640,6 +641,103 @@ Driven over `coda serve`, the goal is set on session create or dynamically with
 the at-bound escalation reaches the orchestrator via `request/question`. See
 [`docs/serve-protocol.md`](docs/serve-protocol.md).
 
+## Scheduled tasks
+
+Coda can run a prompt on a schedule. The agent creates a schedule with
+`schedule_create`, inspects them with `schedule_list`, and removes them with
+`schedule_delete`. Each firing runs as an **isolated background agent** — its own
+one-message conversation, never the interactive history.
+
+### Creating a schedule
+
+`schedule_create` takes a `prompt` plus **exactly one** selector, and optional
+`name` and `timeZone`:
+
+- **`every`** — a repeating interval: `"3m"`, `"2h"`, `"1d"` (`m`inutes / `h`ours /
+  `d`ays). The **minimum interval is one minute**.
+- **`at`** — a one-shot ISO-8601 date-time, with or without an explicit offset
+  (e.g. `"2026-07-21T09:00:00"` or `"2026-07-21T09:00:00-04:00"`).
+- **`cron`** — a repeating **standard five-field cron** rule
+  (`minute hour day-of-month month day-of-week`, e.g. `"0 9 * * 1-5"`).
+
+```jsonc
+// every 30 minutes
+{ "prompt": "check the build queue and summarize failures", "every": "30m" }
+
+// one-shot at a local wall-clock time
+{ "prompt": "post the standup reminder", "at": "2026-07-21T09:00:00", "name": "standup" }
+
+// weekdays at 09:00 in a named zone
+{ "prompt": "email me the overnight error report", "cron": "0 9 * * 1-5", "timeZone": "America/New_York" }
+```
+
+### Timezones and DST
+
+Offset-less `at` values and `cron` rules are interpreted in the **machine-local
+timezone** by default. Provide `timeZone` (an IANA id like `"America/New_York"`, a
+Windows id, or a fixed offset like `"UTC-05:00"`) to override it; an `at` value with
+an explicit offset is honored as written. Across DST transitions the two schedule
+kinds treat a nonexistent spring-forward local time differently: an offset-less
+one-shot `at` value that lands in the gap is **rejected with an error** (there is
+no such instant to resolve), while `cron` **skips** the nonexistent local minutes
+and fires at the next valid occurrence. An ambiguous fall-back local time resolves
+to the **earlier** UTC instant for both kinds (it is not run twice).
+
+### When schedules run
+
+Schedules execute **only while an interactive Coda session or `coda serve` is
+open** — there is **no background daemon and no OS scheduler**. Definitions are
+persisted in `<project>/.coda/scheduled_tasks.json` and **resume on the next
+startup**. On startup an **overdue** schedule runs **once immediately** (not once
+per missed tick — missed ticks are **coalesced**), then advances to its next future
+boundary.
+
+> **One session per project.** The schedule runtime is **in-process**: each open
+> Coda session runs its own independent scheduler with no cross-process lease or
+> de-duplication. If multiple interactive or `coda serve` sessions are open for
+> the same project at the same time, **each session will fire the same persisted
+> schedules independently**. To avoid duplicate runs, keep at most one
+> scheduler-enabled session open per project.
+
+A single definition **never overlaps itself**: while one firing is running, at most
+**one** replacement run is held pending (further due ticks only advance the next
+time, they don't queue up), and it starts after the running one reaches a terminal
+state. **Different** definitions may run **concurrently**.
+
+### Observing and steering runs
+
+Each firing is a `TaskKind.Scheduled` background agent in the unified task runtime,
+so it is visible in the interactive **`/tasks`** browser and to the `task_*` tools
+(`task_list`, `task_get`, `task_peek`, `task_send`, `task_stop`) and its
+secret-redacted log. The interactive TUI also shows concise **notices** as a run
+starts, completes, fails, or is stopped; `coda serve` forwards the same transitions
+as `event/scheduleLifecycle` JSON-RPC notifications (see
+[`docs/serve-protocol.md`](docs/serve-protocol.md)).
+
+`schedule_delete` prevents any **future** and **pending** run of a definition, but
+does **not** stop a firing that is already executing (stop that with `task_stop`).
+
+Every scheduled run uses the session's **live** permission mode, current model, and
+MCP / LSP / tool configuration at the moment it fires — a mid-session change is
+observed by the next run. Scheduled agents run isolated at depth 1: they **cannot**
+create, list, or delete schedules (`schedule_*` is unavailable to them) and can only
+inspect and steer their **own** descendant tasks.
+
+### Failure and crash semantics
+
+A run that throws is recorded as **Failed**, a cancelled/stopped run as **Stopped**,
+and the outcome (with a short summary) is surfaced in `schedule_list` and the
+lifecycle notice/event; recurring definitions keep their next boundary and run
+again. One-shot `at` schedules are **at-least-once**: if the process crashes mid-run
+the record survives and reruns on the next startup, and it is **removed only after**
+it reaches a terminal state. Failures are also written to the telemetry log when
+logging is enabled.
+
+In `coda serve`, a stdio peer is authenticated immediately so the runtime starts at
+startup; an **API-key** peer's runtime does **not** start until a valid key
+completes an authenticated `initialize`. Headless `coda run` does **not** keep the
+scheduler alive — the runtime is disabled outside interactive and serve sessions.
+
 ## Configuration & storage
 
 Coda keeps **all of its own state under `~/.coda/`**, kept deliberately separate
@@ -652,7 +750,7 @@ project files if they exist (it never writes to them).
 | Project settings | `<project>/.coda/settings.json` | overrides user settings |
 | Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
 | Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |
-| Scheduled tasks | `<project>/.coda/scheduled_tasks.json` | |
+| Scheduled tasks | `<project>/.coda/scheduled_tasks.json` | persisted definitions; resume on next startup |
 | Plugins | `~/.coda/`, `<project>/.coda/plugins/` | |
 | Skills | `~/.coda/skills/`, `<project>/.coda/skills/` (+ read-only `~/.claude/skills/`) | `SKILL.md` per skill |
 | MCP servers | `~/.coda/.mcp.json`, `<project>/.mcp.json` | stdio + HTTP; project overrides user |

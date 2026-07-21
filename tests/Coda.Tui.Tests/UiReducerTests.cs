@@ -5,6 +5,7 @@ using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Lsp;
 using Coda.Mcp;
 using Coda.Sdk;
+using Coda.Sdk.Scheduling;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.State;
 using LlmClient;
@@ -240,7 +241,8 @@ public sealed class UiReducerTests
             [
                 new LspServerSnapshot("csharp", LspServerState.Running, []),
                 new LspServerSnapshot("go", LspServerState.Error, []),
-            ]);
+            ],
+            []);
 
         var state = UiReducer.Reduce(UiSessionSnapshot.Empty, new SessionRuntimeChangedEvent(runtime));
 
@@ -300,5 +302,224 @@ public sealed class UiReducerTests
     {
         Assert.Same(NullUiEventPublisher.Instance, NullUiEventPublisher.Instance);
         NullUiEventPublisher.Instance.Publish(new AssistantTextCompletedEvent());
+    }
+
+    // ── Scheduled task lifecycle notices (Task 8) ─────────────────────────────
+
+    [Fact]
+    public void Schedule_started_notice_uses_information_and_task_id()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Nightly started as task-9", text);
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_started_notice_falls_back_to_the_definition_id_when_unnamed()
+    {
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", null, "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task def-1 started as task-9", text);
+    }
+
+    [Fact]
+    public void Schedule_completed_notice_uses_information()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, "big result body"));
+
+        // Concise text only — the full task result/output is never inserted.
+        Assert.Equal("Scheduled task Nightly completed", text);
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_notice_uses_error_and_appends_a_short_summary()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, "boom happened"));
+
+        Assert.Equal("Scheduled task Nightly failed: boom happened", text);
+        Assert.Equal(UiNotificationLevel.Error, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_notice_without_summary_has_no_trailing_detail()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Nightly failed", text);
+        Assert.Equal(UiNotificationLevel.Error, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_summary_is_sanitized_single_line_and_bounded()
+    {
+        var noisy = "line one\nline two\twith tab\u001b[31mred" + new string('x', 400);
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, noisy));
+
+        Assert.StartsWith("Scheduled task Nightly failed: ", text);
+        Assert.DoesNotContain('\n', text);
+        Assert.DoesNotContain('\u001b', text);
+        // Bounded: the headline plus a capped, ellipsized summary — never the full 400+ char body.
+        Assert.True(text.Length < 260, $"summary not bounded: {text.Length}");
+    }
+
+    [Fact]
+    public void Schedule_stopped_notice_uses_warning()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Nightly", "task-9", ScheduleLifecycleKind.Stopped, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Nightly stopped", text);
+        Assert.Equal(UiNotificationLevel.Warning, level);
+    }
+
+    // ── Task 8 quality: model-controlled name/task id are sanitized (spoof-proof) ─
+
+    // A hostile schedule name that tries to spoof extra transcript rows: an embedded newline, an ANSI
+    // colour + screen-clear escape, a C0 BEL/NUL control, and bidi override/mark formatting controls.
+    private const string SpoofName =
+        "Deploy\n\u001b[31mFAKE ROW\u001b[0m\u202Espoofed\u0007\u0000\u200Etail";
+
+    // A hostile managed task id carrying CR/LF, a clear-screen escape, and bidi controls.
+    private const string SpoofTaskId = "job-7\r\n\u001b[2Jcleared\u202D\u0001end";
+
+    [Fact]
+    public void Schedule_started_notice_sanitizes_malicious_name_and_task_id()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.Contains(" started as ", text);
+        Assert.Contains("Deploy", text); // safe leading name text preserved
+        Assert.Contains("job-7", text);  // safe leading task id text preserved
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_completed_notice_sanitizes_malicious_name()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, "big result body"));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.EndsWith(" completed", text);
+        Assert.Contains("Deploy", text);
+        Assert.DoesNotContain("big result body", text); // result never surfaced on completion
+        Assert.Equal(UiNotificationLevel.Information, level);
+    }
+
+    [Fact]
+    public void Schedule_failed_notice_sanitizes_malicious_name_and_stays_bounded()
+    {
+        var noisy = "line one\nline two\u001b[31mred" + new string('x', 400);
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Failed, DateTimeOffset.UnixEpoch, noisy));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.Contains(" failed", text);
+        Assert.Contains("Deploy", text);
+        // Bounded even with a hostile name AND a 400+ char summary body.
+        Assert.True(text.Length < 320, $"notice not bounded: {text.Length}");
+        Assert.Equal(UiNotificationLevel.Error, level);
+    }
+
+    [Fact]
+    public void Schedule_stopped_notice_sanitizes_malicious_name()
+    {
+        var (text, level) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", SpoofName, SpoofTaskId, ScheduleLifecycleKind.Stopped, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.StartsWith("Scheduled task ", text);
+        Assert.EndsWith(" stopped", text);
+        Assert.Contains("Deploy", text);
+        Assert.Equal(UiNotificationLevel.Warning, level);
+    }
+
+    [Fact]
+    public void Schedule_notice_bounds_an_absurdly_long_name()
+    {
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", new string('n', 500), "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.True(text.Length < 160, $"name not bounded: {text.Length}");
+    }
+
+    [Fact]
+    public void Schedule_notice_falls_back_to_definition_id_when_name_sanitizes_to_blank()
+    {
+        // A name made entirely of escape/control/bidi flattens to empty after sanitization.
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "\u001b[2J\u0007\u202E\n\t", "task-9", ScheduleLifecycleKind.Started, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.Equal("Scheduled task def-1 started as task-9", text);
+    }
+
+    [Fact]
+    public void Schedule_notice_falls_back_to_neutral_label_when_name_and_id_blank()
+    {
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "\u0007\u202E", "\n\t\u001b[0m", "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, null));
+
+        AssertSingleSanitizedLine(text);
+        Assert.Equal("Scheduled task schedule completed", text);
+    }
+
+    [Fact]
+    public void Schedule_notice_preserves_printable_unicode_and_emoji_in_name()
+    {
+        // Sanitization must not double-escape or strip printable Unicode / emoji.
+        var (text, _) = ReduceLifecycle(new ScheduleLifecycleEvent(
+            "def-1", "Café 🚀 build", "task-9", ScheduleLifecycleKind.Completed, DateTimeOffset.UnixEpoch, null));
+
+        Assert.Equal("Scheduled task Café 🚀 build completed", text);
+    }
+
+    private static void AssertSingleSanitizedLine(string text)
+    {
+        Assert.DoesNotContain('\n', text);
+        Assert.DoesNotContain('\r', text);
+        Assert.DoesNotContain('\t', text);
+        Assert.DoesNotContain('\u001b', text);
+
+        foreach (var ch in text)
+        {
+            Assert.False(char.IsControl(ch), $"control char U+{(int)ch:X4} survived: {text}");
+        }
+
+        foreach (var bidi in new[]
+                 {
+                     '\u061C', '\u202A', '\u202B', '\u202C', '\u202D', '\u202E',
+                     '\u2066', '\u2067', '\u2068', '\u2069', '\u200E', '\u200F',
+                 })
+        {
+            Assert.DoesNotContain(bidi, text);
+        }
+    }
+
+    private static (string Text, UiNotificationLevel Level) ReduceLifecycle(ScheduleLifecycleEvent lifecycle)
+    {
+        var state = UiReducer.Reduce(UiSessionSnapshot.Empty, new ScheduleLifecycleChangedEvent(lifecycle));
+
+        // Exactly one new notice block is appended, and the mirrored notification matches it.
+        var notice = Assert.IsType<NoticeTranscriptBlock>(Assert.Single(state.Transcript));
+        Assert.NotEqual(Guid.Empty, notice.Id);
+        Assert.NotNull(state.Notification);
+        Assert.Equal(notice.Text, state.Notification!.Message);
+        Assert.Equal(notice.Level, state.Notification.Level);
+        return (notice.Text, notice.Level);
     }
 }

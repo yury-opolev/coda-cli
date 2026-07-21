@@ -32,6 +32,7 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly AgentHooks? hooks;
     private readonly TodoStore? todos;
     private readonly ScheduledTaskStore? schedules;
+    private readonly IScheduleRuntimeView? scheduleRuntime;
     private readonly IUserQuestionPrompt? userQuestion;
     private readonly UserHookRunner? userHooks;
     private readonly IPlanApprover? planApprover;
@@ -96,6 +97,7 @@ public sealed partial class AgentLoop : IAgentLoop
         AgentHooks? hooks = null,
         TodoStore? todos = null,
         ScheduledTaskStore? schedules = null,
+        IScheduleRuntimeView? scheduleRuntime = null,
         IUserQuestionPrompt? userQuestion = null,
         UserHookRunner? userHooks = null,
         IPlanApprover? planApprover = null,
@@ -123,6 +125,7 @@ public sealed partial class AgentLoop : IAgentLoop
         this.hooks = hooks;
         this.todos = todos;
         this.schedules = schedules;
+        this.scheduleRuntime = scheduleRuntime;
         this.userQuestion = userQuestion;
         this.userHooks = userHooks;
         this.planApprover = planApprover;
@@ -597,6 +600,7 @@ public sealed partial class AgentLoop : IAgentLoop
             Subagents = this.subagents,
             Todos = this.todos,
             Schedules = this.schedules,
+            ScheduleRuntime = this.scheduleRuntime,
             UserQuestion = this.userQuestion,
             PlanApprover = this.planApprover,
             Tasks = this.tasks,

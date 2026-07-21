@@ -151,6 +151,35 @@ inputJson}` · `event/toolResult {toolName, content, isError}` · `event/error {
 
 Assistant-text deltas arrive in order.
 
+## Coda → Orchestrator (schedule lifecycle — out of band)
+
+When the session is started with the schedule runtime enabled (`coda serve` sets
+`EnableScheduleRuntime`), each scheduled definition that fires emits an
+`event/scheduleLifecycle` notification. Unlike the `event/*` turn events above, these
+are **not** tied to a `session/prompt` turn — a schedule can fire between turns — so
+the orchestrator may receive them at any time while the connection is open.
+
+```jsonc
+event/scheduleLifecycle {
+  "definitionId":   "a1b2c3",           // persisted schedule id
+  "definitionName": "nightly backup",   // optional label, omitted when null
+  "taskId":         "task-9",           // the TaskKind.Scheduled task id, omitted for a pre-launch failure
+  "state":          "started",          // "started" | "completed" | "failed" | "stopped"
+  "timestamp":      "2026-07-21T09:00:00Z",
+  "summary":        "…"                 // optional short detail (result or error), omitted when null
+}
+```
+
+`state` is the lower-case transition: `started` when a firing registers and begins,
+then exactly one terminal of `completed` / `failed` / `stopped`. Optional fields are
+omitted from the wire when null. The underlying `TaskKind.Scheduled` task is also
+visible through the normal `task_*` tools and logs.
+
+The runtime is authentication-gated: over **stdio** (no expected API key) it starts
+at session startup, so schedule events may arrive immediately; in **API-key** mode it
+does not start — and therefore emits nothing — until a valid key completes an
+authenticated `initialize`.
+
 ## Coda → Orchestrator (server-initiated requests — you MUST answer; the agent blocks)
 | Method | Params | Reply |
 |---|---|---|

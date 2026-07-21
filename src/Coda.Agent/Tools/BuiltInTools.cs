@@ -17,7 +17,7 @@ public static class BuiltInTools
         new TodoWriteTool(),
         new AskUserQuestionTool(),
         new ExitPlanModeTool(),
-        new ScheduleCreateTool(() => DateTime.UtcNow),
+        new ScheduleCreateTool(),
         new ScheduleListTool(),
         new ScheduleDeleteTool(),
         new BackgroundTaskStartTool(),

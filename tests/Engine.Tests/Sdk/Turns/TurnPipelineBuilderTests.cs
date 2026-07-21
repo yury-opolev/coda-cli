@@ -47,7 +47,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     private TurnPipelineBuilder NewBuilder(
         LspServerManager? lspManager = null,
         LspDiagnosticRegistry? lspDiagnostics = null,
-        ToolSearchCoordinator? toolSearch = null)
+        ToolSearchCoordinator? toolSearch = null,
+        Func<IScheduleRuntimeView?>? scheduleRuntimeProvider = null)
     {
         return new TurnPipelineBuilder(
             new TodoStore(),
@@ -61,7 +62,19 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             {
                 Interlocked.Increment(ref this.compactCalls);
                 return Task.CompletedTask;
-            });
+            },
+            scheduleRuntimeProvider ?? (() => null));
+    }
+
+    private sealed class StubRuntimeView : IScheduleRuntimeView
+    {
+        public bool TryGetState(string scheduleId, out ScheduleRuntimeState state)
+        {
+            state = new ScheduleRuntimeState(ScheduleRuntimeStatus.Idle, null);
+            return false;
+        }
+
+        public IReadOnlyList<ScheduleRuntimeSnapshot> GetSnapshot() => [];
     }
 
     private SessionOptions Options(
@@ -391,19 +404,49 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     {
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             null!, new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
+            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), null!, new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
+            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), null!, null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask));
+            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            null!, (_, _, _) => Task.CompletedTask));
+            null!, (_, _, _) => Task.CompletedTask, () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, null!));
+            NullLoggerFactory.Instance, null!, () => null));
+        Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
+            new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
+            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, null!));
+    }
+
+    [Fact]
+    public void Schedule_runtime_provider_is_evaluated_per_BuildSpec()
+    {
+        IScheduleRuntimeView? current = null;
+        var builder = this.NewBuilder(scheduleRuntimeProvider: () => current);
+
+        var first = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
+        Assert.Null(first.ScheduleRuntime);
+
+        var view = new StubRuntimeView();
+        current = view;
+        var second = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
+        Assert.Same(view, second.ScheduleRuntime);
+    }
+
+    [Fact]
+    public void BuildSpec_leaves_the_scheduled_identity_unset_for_main_turns()
+    {
+        // Main turns are the leader agent (depth 0) with no scheduled task id; only the isolated
+        // BuildScheduledSpec path sets these. This locks the default so a future change cannot
+        // accidentally start tagging main turns with a scheduled identity.
+        var builder = this.NewBuilder();
+        var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
+        Assert.Null(spec.CurrentTaskId);
+        Assert.Equal(0, spec.CurrentDepth);
     }
 
     public void Dispose()

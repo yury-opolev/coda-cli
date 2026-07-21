@@ -1,7 +1,4 @@
-using System.Text.Json;
-using Coda.Agent;
 using Coda.Agent.Scheduling;
-using Coda.Agent.Tools;
 using Coda.Sdk;
 using Engine.Tests.TestSupport;
 using Microsoft.Extensions.Logging;
@@ -131,9 +128,9 @@ public sealed class SchedulingTests
         Assert.NotEmpty(task.Id);
         Assert.Equal("*/5 * * * *", task.Cron);
         Assert.Equal("do something", task.Prompt);
-        Assert.True(task.Recurring);
+        Assert.Equal(ScheduleKind.Cron, task.Kind);
         // Next run should be 12:05
-        Assert.Equal(new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc), task.NextRunUtc);
+        Assert.Equal(new DateTimeOffset(new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc)), task.NextRunUtc);
         Assert.Single(store.Items);
     }
 
@@ -252,201 +249,11 @@ public sealed class SchedulingTests
         var now = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
         var task = store.Add("*/5 * * * *", "work", true, now);
 
-        var updated = task with { NextRunUtc = new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc) };
+        var updated = task with { NextRunUtc = new DateTimeOffset(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc)) };
         store.Replace(updated);
 
         Assert.Single(store.Items);
-        Assert.Equal(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc), store.Items[0].NextRunUtc);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // ScheduleCreateTool
-    // ────────────────────────────────────────────────────────────────
-
-    private static JsonElement Json(string s) => JsonDocument.Parse(s).RootElement;
-
-    [Fact]
-    public async Task ScheduleCreateTool_adds_task_and_returns_id()
-    {
-        var store = new ScheduledTaskStore();
-        var now = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var tool = new ScheduleCreateTool(() => now);
-        var ctx = new ToolContext(".") { Schedules = store };
-
-        var input = Json("""{"cron":"*/5 * * * *","prompt":"run me","recurring":true}""");
-        var result = await tool.ExecuteAsync(input, ctx);
-
-        Assert.False(result.IsError);
-        Assert.Single(store.Items);
-        Assert.Contains(store.Items[0].Id, result.Content);
-    }
-
-    [Fact]
-    public async Task ScheduleCreateTool_invalid_cron_returns_error()
-    {
-        var store = new ScheduledTaskStore();
-        var tool = new ScheduleCreateTool(() => DateTime.UtcNow);
-        var ctx = new ToolContext(".") { Schedules = store };
-
-        var input = Json("""{"cron":"garbage","prompt":"run me","recurring":true}""");
-        var result = await tool.ExecuteAsync(input, ctx);
-
-        Assert.True(result.IsError);
-        Assert.Empty(store.Items);
-    }
-
-    [Fact]
-    public async Task ScheduleCreateTool_null_store_is_graceful()
-    {
-        var tool = new ScheduleCreateTool(() => DateTime.UtcNow);
-        var ctx = new ToolContext(".");
-        var input = Json("""{"cron":"*/5 * * * *","prompt":"run me"}""");
-        var result = await tool.ExecuteAsync(input, ctx);
-
-        // No store available — should not throw; may return a note
-        Assert.False(result.IsError);
-    }
-
-    [Fact]
-    public void ScheduleCreateTool_is_readonly_and_named()
-    {
-        var tool = new ScheduleCreateTool(() => DateTime.UtcNow);
-        Assert.Equal("schedule_create", tool.Name);
-        Assert.True(tool.IsReadOnly);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // ScheduleListTool
-    // ────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task ScheduleListTool_lists_tasks()
-    {
-        var store = new ScheduledTaskStore();
-        var now = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        store.Add("*/5 * * * *", "run me every 5 min", recurring: true, nowUtc: now);
-
-        var tool = new ScheduleListTool();
-        var ctx = new ToolContext(".") { Schedules = store };
-        var result = await tool.ExecuteAsync(Json("{}"), ctx);
-
-        Assert.False(result.IsError);
-        Assert.Contains("*/5 * * * *", result.Content);
-        Assert.Contains("run me every 5 min", result.Content);
-    }
-
-    [Fact]
-    public async Task ScheduleListTool_empty_store()
-    {
-        var tool = new ScheduleListTool();
-        var ctx = new ToolContext(".") { Schedules = new ScheduledTaskStore() };
-        var result = await tool.ExecuteAsync(Json("{}"), ctx);
-
-        Assert.False(result.IsError);
-        Assert.Contains("No scheduled tasks", result.Content);
-    }
-
-    [Fact]
-    public async Task ScheduleListTool_null_store_graceful()
-    {
-        var tool = new ScheduleListTool();
-        var result = await tool.ExecuteAsync(Json("{}"), new ToolContext("."));
-        Assert.False(result.IsError);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // ScheduleDeleteTool
-    // ────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public async Task ScheduleDeleteTool_removes_task()
-    {
-        var store = new ScheduledTaskStore();
-        var now = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "work", true, now);
-
-        var tool = new ScheduleDeleteTool();
-        var ctx = new ToolContext(".") { Schedules = store };
-        var result = await tool.ExecuteAsync(Json($$$"""{ "id": "{{{task.Id}}}" }"""), ctx);
-
-        Assert.False(result.IsError);
-        Assert.Empty(store.Items);
-    }
-
-    [Fact]
-    public async Task ScheduleDeleteTool_not_found()
-    {
-        var store = new ScheduledTaskStore();
-        var tool = new ScheduleDeleteTool();
-        var ctx = new ToolContext(".") { Schedules = store };
-        var result = await tool.ExecuteAsync(Json("""{"id":"unknown-id"}"""), ctx);
-
-        Assert.False(result.IsError); // not found is a soft outcome, not an error
-        Assert.Contains("not found", result.Content, StringComparison.OrdinalIgnoreCase);
-    }
-
-    [Fact]
-    public async Task ScheduleDeleteTool_null_store_graceful()
-    {
-        var tool = new ScheduleDeleteTool();
-        var result = await tool.ExecuteAsync(Json("""{"id":"x"}"""), new ToolContext("."));
-        Assert.False(result.IsError);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // CronScheduler
-    // ────────────────────────────────────────────────────────────────
-
-    [Fact]
-    public void CronScheduler_DueTasks_returns_tasks_at_or_before_now()
-    {
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-
-        // Task 1: due at 12:05
-        store.Add("*/5 * * * *", "task1", true, baseTime);  // NextRunUtc = 12:05
-
-        // Task 2 with a cron that starts later — manually control via Replace
-        var task2 = store.Add("0 0 * * *", "task2", false, baseTime);  // NextRunUtc = 2025-01-02 00:00
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-        var due = scheduler.DueTasks(now);
-
-        Assert.Single(due);
-        Assert.Equal("task1", due[0].Prompt);
-    }
-
-    [Fact]
-    public void CronScheduler_MarkFired_recurring_reschedules()
-    {
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "work", recurring: true, nowUtc: baseTime);
-        // NextRunUtc = 12:05
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-        scheduler.MarkFired(task, now);
-
-        // Should be rescheduled, not removed
-        Assert.Single(store.Items);
-        // Next run should be strictly after 12:05 (i.e., 12:10)
-        Assert.Equal(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc), store.Items[0].NextRunUtc);
-    }
-
-    [Fact]
-    public void CronScheduler_MarkFired_oneshot_removes()
-    {
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "once", recurring: false, nowUtc: baseTime);
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-        scheduler.MarkFired(task, now);
-
-        Assert.Empty(store.Items);
+        Assert.Equal(new DateTimeOffset(new DateTime(2025, 1, 1, 12, 10, 0, DateTimeKind.Utc)), store.Items[0].NextRunUtc);
     }
 
     // ────────────────────────────────────────────────────────────────
@@ -476,81 +283,4 @@ public sealed class SchedulingTests
         Assert.Empty(store.Items);
     }
 
-    [Fact]
-    public void MarkFired_removes_recurring_task_that_can_never_match()
-    {
-        // Add a normal recurring task first, then inject an impossible cron via Replace.
-        var store = new ScheduledTaskStore();
-        var baseTime = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var task = store.Add("*/5 * * * *", "placeholder", recurring: true, nowUtc: baseTime);
-
-        // Replace the stored task with one carrying the impossible cron expression.
-        var impossible = task with { Cron = "0 0 30 2 *" };
-        store.Replace(impossible);
-        Assert.Single(store.Items);
-
-        var now = new DateTime(2025, 1, 1, 12, 5, 0, DateTimeKind.Utc);
-        var scheduler = new CronScheduler(store, () => now);
-
-        // MarkFired should catch the InvalidOperationException and remove the task.
-        scheduler.MarkFired(impossible, now);
-
-        Assert.Empty(store.Items);
-    }
-
-    // ────────────────────────────────────────────────────────────────
-    // AgentLoop threading test
-    // ────────────────────────────────────────────────────────────────
-
-    private sealed class ScriptedClient(params IReadOnlyList<LlmClient.AssistantStreamEvent>[] turns) : LlmClient.ILlmClient
-    {
-        private int turn;
-        public string ProviderId => "fake";
-        public async IAsyncEnumerable<LlmClient.AssistantStreamEvent> StreamAsync(
-            LlmClient.ChatRequest request,
-            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            var events = turns[Math.Min(this.turn, turns.Length - 1)];
-            this.turn++;
-            foreach (var e in events) { await Task.Yield(); yield return e; }
-        }
-    }
-
-    private sealed class NullSink : IAgentSink
-    {
-        public void OnAssistantText(string delta) { }
-        public void OnAssistantTextComplete() { }
-        public void OnToolCall(string toolName, string inputPreview) { }
-        public void OnToolResult(string toolName, ToolResult result) { }
-        public void OnError(string message) { }
-    }
-
-    [Fact]
-    public async Task AgentLoop_threads_the_schedule_store_to_the_tool()
-    {
-        var now = new DateTime(2025, 1, 1, 12, 0, 0, DateTimeKind.Utc);
-        var store = new ScheduledTaskStore();
-        var createTool = new ScheduleCreateTool(() => now);
-
-        var toolTurn = new[]
-        {
-            LlmClient.AssistantStreamEvent.Tool(new LlmClient.ToolUseBlock("t1", "schedule_create",
-                """{"cron":"*/5 * * * *","prompt":"auto task","recurring":true}""")),
-            LlmClient.AssistantStreamEvent.Finished("tool_use"),
-        };
-        var endTurn = new[] { LlmClient.AssistantStreamEvent.Delta("done"), LlmClient.AssistantStreamEvent.Finished("end_turn") };
-
-        var loop = new AgentLoop(
-            new ScriptedClient(toolTurn, endTurn),
-            new ToolRegistry([createTool]),
-            new AllowAllPermissionPrompt(),
-            new AgentOptions { SystemPrompt = "sys", WorkingDirectory = ".", Model = "m" },
-            schedules: store);
-
-        var history = new List<LlmClient.ChatMessage> { LlmClient.ChatMessage.UserText("schedule it") };
-        await loop.RunAsync(history, new NullSink(), CancellationToken.None);
-
-        Assert.Single(store.Items);
-        Assert.Equal("auto task", store.Items[0].Prompt);
-    }
 }

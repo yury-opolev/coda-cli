@@ -33,9 +33,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// <summary>
     /// Budget for the synchronous <see cref="Dispose"/>, which drives the whole async teardown on a
     /// worker thread. It sums the TaskManager shutdown budget (running work + shell tree-kills) and
-    /// <see cref="LspDisposeTimeout"/> so HTTP/logger/LSP disposal completes before the sync call
-    /// returns — bounded (never unbounded), yet large enough not to sever a still-progressing
-    /// teardown at the shorter LSP-only timeout.
+    /// <see cref="LspDisposeTimeout"/> so schedule-runtime/HTTP/logger/LSP disposal completes before
+    /// the sync call returns — bounded (never unbounded), yet large enough not to sever a
+    /// still-progressing teardown at the shorter LSP-only timeout. The schedule runtime is disposed
+    /// first and only cancels its loop (it never waits on running scheduled tasks — the TaskManager
+    /// owns those), so it adds no measurable time and needs no separate budget line.
     /// </summary>
     internal static readonly TimeSpan SyncDisposeBudget =
         TaskManager.DefaultShutdownBudget + LspDisposeTimeout;
@@ -57,7 +59,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly ILogger logger;
     private readonly TurnPipelineBuilder turnPipelineBuilder;
     private readonly SteeringInbox steeringInbox = new();
-    private bool lspInitialized;
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
 
@@ -84,13 +85,19 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         List<ChatMessage>? history = null,
         string? sessionId = null,
         ILlmClientFactory? llmClientFactory = null,
-        IAgentLoopFactory? agentLoopFactory = null)
+        IAgentLoopFactory? agentLoopFactory = null,
+        Func<SessionOptions>? currentOptionsProvider = null,
+        TimeProvider? timeProvider = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
         this.fingerprint = fingerprint ?? new ClientFingerprint();
         this.llmClientFactory = llmClientFactory ?? new DefaultLlmClientFactory();
         this.agentLoopFactory = agentLoopFactory ?? new DefaultAgentLoopFactory();
+        // Live options accessor for scheduled firings. Defaults to the current volatile Options (not a
+        // construction snapshot), so a mid-session model/effort/tool/permission change is picked up.
+        this.currentOptionsProvider = currentOptionsProvider ?? (() => this.Options);
+        this.timeProvider = timeProvider ?? TimeProvider.System;
         this.history = history ?? [];
         this.SessionId = sessionId ?? SessionIds.NewId();
         // The manager groups persistent task logs under the session id captured HERE. If the id
@@ -182,7 +189,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lspDiagnostics,
             this.toolSearchCoordinator,
             this.loggerFactory,
-            this.CompactHistoryAsync);
+            this.CompactHistoryAsync,
+            // Evaluated per turn, so once InitializeAsync starts the runtime the main schedule_list
+            // sees the live view; it returns null before initialization and when scheduling is off.
+            () => this.scheduleRuntime);
 
         this.logger.LogInformation(
             "Session {sessionId} started: provider {provider}, model {model}",
@@ -203,26 +213,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "synchronous dispose worker failed (best-effort): session={sessionId}")]
     private partial void LogSyncDisposeFailed(string sessionId, Exception ex);
-
-    /// <summary>
-    /// Completes async initialization (LSP server startup + notification handlers).
-    /// Must be called after construction when LSP servers are configured.
-    /// Safe to call even when no LSP servers are configured (no-op).
-    /// </summary>
-    public async Task InitializeAsync(CancellationToken cancellationToken = default)
-    {
-        if (this.lspManager is null || this.lspInitialized)
-        {
-            return;
-        }
-
-        this.lspInitialized = true;
-        await this.lspManager.InitializeAsync(cancellationToken).ConfigureAwait(false);
-        LspPassiveFeedback.RegisterNotificationHandlers(
-            this.lspManager,
-            this.lspDiagnostics!,
-            this.loggerFactory.CreateLogger("Coda.Lsp.PassiveFeedback"));
-    }
 
     /// <summary>Stable identifier for this session, used to persist/resume conversation transcripts.</summary>
     public string SessionId { get; private set; }
@@ -282,7 +272,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             [.. this.todos.Items],
             [.. this.schedules.Items],
             MapTaskSnapshots(this.tasks.List()),
-            this.lspManager?.GetSnapshot() ?? []);
+            this.lspManager?.GetSnapshot() ?? [],
+            // A fresh, copied projection of live schedule execution states; no mutable runtime leaks.
+            this.scheduleRuntime?.GetSnapshot() ?? []);
     }
 
     private static IReadOnlyList<BackgroundTaskSnapshot> MapTaskSnapshots(IReadOnlyList<TaskSnapshot> tasks)
@@ -789,6 +781,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
+        // Prevent/await the initialization race and dispose the schedule runtime FIRST: a due firing
+        // can then never register work after the task-manager shutdown below has begun. The runtime's
+        // own disposal cancels its loop and returns promptly, so this stays bounded.
+        await this.ShutdownScheduleRuntimeAsync().ConfigureAwait(false);
+
         // Graceful, bounded shutdown of all subagent/shell tasks: cancels running work, kills shell
         // process trees, waits the dispose budget, then force-stops stragglers. Idempotent.
         await this.tasks.DisposeAsync().ConfigureAwait(false);
