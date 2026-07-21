@@ -11,10 +11,12 @@ namespace Coda.Tui.Commands;
 /// <summary>
 /// Prints a read-only, sanitized textual snapshot of the session's background tasks. Shares the same
 /// live <see cref="TaskManager"/> as the interactive TUI (via <see cref="CommandContext.TaskManagerProvider"/>),
-/// so plain, Spectre, legacy, and serve semantic contexts all report the exact same tasks the browser shows.
+/// so the plain, Spectre, and legacy console contexts all print the exact same tasks the browser shows.
 /// In the interactive Terminal.Gui shell the bare <c>/tasks</c> submission is intercepted before dispatch and
-/// opens the live browser instead; this command runs everywhere else. It never mutates task state — steering,
-/// backgrounding, and stopping are done through the <c>task_*</c> model tools.
+/// opens the live browser instead; this command prints the snapshot in the other console contexts.
+/// <c>coda serve</c> does not run this slash command and prints no snapshot; it instead exposes equivalent
+/// non-UI task inspection and control through the <c>task_*</c> model tools. This command never mutates task
+/// state — steering, backgrounding, and stopping are done through the <c>task_*</c> model tools.
 /// </summary>
 public sealed class TasksCommand : ISlashCommand
 {
@@ -40,8 +42,9 @@ public sealed class TasksCommand : ISlashCommand
         "/tasks",
         Description: "List the session's background tasks and their status as a read-only textual snapshot. " +
             "In the interactive TUI, /tasks opens the live task browser to attach to, steer, and stop tasks, and " +
-            "Ctrl+B sends a running foreground shell to the background. In plain, Spectre, and serve contexts this " +
-            "prints the same snapshot; manage tasks through the task_* tools.");
+            "Ctrl+B sends a running foreground shell to the background. The plain, Spectre, and legacy contexts " +
+            "print the same snapshot. coda serve does not run /tasks and prints no snapshot; it offers equivalent " +
+            "non-UI task inspection and control through the task_* tools. Manage tasks through the task_* tools.");
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {

@@ -193,6 +193,25 @@ public sealed class TasksCommandTests : IDisposable
         Assert.Contains("desc", console.Output);
     }
 
+    [Fact]
+    public void Help_does_not_claim_slash_tasks_prints_a_snapshot_in_serve()
+    {
+        var help = new TasksCommand().Help;
+        var desc = help.Description!;
+
+        // The print contexts are named explicitly and do NOT include serve.
+        Assert.Contains("plain, Spectre, and legacy", desc);
+        Assert.Contains("snapshot", desc);
+
+        // serve is described as having equivalent non-UI capabilities via task_* tools, not a printed snapshot.
+        Assert.Contains("coda serve does not run /tasks", desc);
+        Assert.Contains("task_* tools", desc);
+
+        // No overclaim that /tasks prints/renders its snapshot inside coda serve.
+        Assert.DoesNotContain("serve contexts this", desc);
+        Assert.DoesNotContain("and serve", desc);
+    }
+
     private static int LeadingSpaces(string line) => line.Length - line.TrimStart(' ').Length;
 
     private static TaskSnapshot Snapshot(
