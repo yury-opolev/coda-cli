@@ -29,12 +29,13 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
     public async Task<SessionBundle?> ExportAsync(string sessionId, DateTime exportedUtc, CancellationToken ct = default)
     {
         var transcriptStore = new SessionTranscriptStore(workingDirectory);
-        var messages = await transcriptStore.LoadAsync(sessionId, ct).ConfigureAwait(false);
-        if (messages is null)
+        var storedSession = await transcriptStore.LoadSessionAsync(sessionId, ct).ConfigureAwait(false);
+        if (storedSession is null)
         {
             return null;
         }
 
+        var messages = storedSession.Messages;
         var createdUtc = exportedUtc;
         var summaries = await transcriptStore.ListAsync(ct).ConfigureAwait(false);
         foreach (var summary in summaries)
@@ -84,6 +85,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             Model = model,
             AuditAvailable = auditAvailable,
             SystemPrompt = systemPrompt,
+            SystemPromptOverride = storedSession.Metadata.SystemPromptOverride,
             ToolDefs = toolDefs,
             Turns = turns,
             AuditTurns = auditTurns,
@@ -146,7 +148,11 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             messages.Add(new ChatMessage(role, turn.Blocks));
         }
 
-        await transcriptStore.SaveAsync(targetId, messages, ct).ConfigureAwait(false);
+        await transcriptStore.SaveAsync(
+            targetId,
+            messages,
+            new SessionMetadata { SystemPromptOverride = bundle.SystemPromptOverride },
+            ct).ConfigureAwait(false);
 
         // Replay the audit turns verbatim. Each turn already carries its effective per-turn system
         // prompt / tool defs, so AppendTurnAsync's change-only emission re-derives the exact on-disk
@@ -185,21 +191,30 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
 
     // ── Serialization ──────────────────────────────────────────────────────────
 
-    private static JsonObject SerializeBundle(SessionBundle bundle) => new()
+    private static JsonObject SerializeBundle(SessionBundle bundle)
     {
-        ["schema"] = bundle.Schema,
-        ["codaVersion"] = bundle.CodaVersion,
-        ["exportedUtc"] = bundle.ExportedUtc.ToString("O"),
-        ["id"] = bundle.Id,
-        ["createdUtc"] = bundle.CreatedUtc.ToString("O"),
-        ["provider"] = bundle.Provider,
-        ["model"] = bundle.Model,
-        ["auditAvailable"] = bundle.AuditAvailable,
-        ["systemPrompt"] = bundle.SystemPrompt,
-        ["toolDefs"] = AuditJson.SerializeToolDefs(bundle.ToolDefs),
-        ["turns"] = SerializeTurns(bundle.Turns),
-        ["auditTurns"] = SerializeAuditTurns(bundle.AuditTurns),
-    };
+        var root = new JsonObject
+        {
+            ["schema"] = bundle.Schema,
+            ["codaVersion"] = bundle.CodaVersion,
+            ["exportedUtc"] = bundle.ExportedUtc.ToString("O"),
+            ["id"] = bundle.Id,
+            ["createdUtc"] = bundle.CreatedUtc.ToString("O"),
+            ["provider"] = bundle.Provider,
+            ["model"] = bundle.Model,
+            ["auditAvailable"] = bundle.AuditAvailable,
+            ["systemPrompt"] = bundle.SystemPrompt,
+        };
+        if (bundle.SystemPromptOverride is not null)
+        {
+            root["systemPromptOverride"] = bundle.SystemPromptOverride;
+        }
+
+        root["toolDefs"] = AuditJson.SerializeToolDefs(bundle.ToolDefs);
+        root["turns"] = SerializeTurns(bundle.Turns);
+        root["auditTurns"] = SerializeAuditTurns(bundle.AuditTurns);
+        return root;
+    }
 
     private static JsonArray SerializeTurns(IReadOnlyList<SessionBundleTurn> turns)
     {
@@ -257,6 +272,10 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
         var model = root["model"]?.GetValue<string>();
         var auditAvailable = root["auditAvailable"]?.GetValue<bool>() ?? false;
         var systemPrompt = root["systemPrompt"]?.GetValue<string>();
+        var systemPromptOverride = root["systemPromptOverride"] is JsonValue systemPromptOverrideValue
+            && systemPromptOverrideValue.TryGetValue<string>(out var overrideValue)
+            ? overrideValue
+            : null;
         var toolDefsArray = root["toolDefs"]?.AsArray();
         var toolDefs = toolDefsArray is not null ? AuditJson.DeserializeToolDefs(toolDefsArray) : (IReadOnlyList<ToolDefinition>)[];
         var turnsArray = root["turns"]?.AsArray() ?? new JsonArray();
@@ -275,6 +294,7 @@ public sealed class SessionBundleService(string workingDirectory, string codaVer
             Model = model,
             AuditAvailable = auditAvailable,
             SystemPrompt = systemPrompt,
+            SystemPromptOverride = systemPromptOverride,
             ToolDefs = toolDefs,
             Turns = turns,
             AuditTurns = auditTurns,
