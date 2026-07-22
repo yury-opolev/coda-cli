@@ -97,8 +97,11 @@ When an override is present, Coda does not add:
 - output-style instructions;
 - provider-specific system prefixes.
 
-The exact supplied text is sent to every provider. If a provider rejects it, Coda surfaces the provider error rather
-than silently modifying the prompt.
+An explicit empty override is valid and suppresses every listed normal layer just as a non-empty override does.
+Non-empty exact text, including whitespace-only text, is sent unchanged to every provider. Anthropic rejects empty
+text blocks, so its optional `system` field is omitted when the exact override is empty; this serialization mapping
+does not restore any Coda prompt layer. OpenAI chat and Responses shapes serialize explicit empty values. If a
+provider rejects a non-empty supplied value, Coda surfaces the provider error rather than silently modifying it.
 
 When the selected provider is Claude.ai OAuth, show a non-blocking startup warning that the provider may require its
 compatibility prefix. The warning does not alter the prompt or prevent startup.

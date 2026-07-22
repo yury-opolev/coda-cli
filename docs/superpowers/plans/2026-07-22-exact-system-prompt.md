@@ -39,20 +39,21 @@
 - `src/Coda.Sdk/Serve/ServeHost.cs` — restore metadata before initialization can start scheduled roots.
 - `src/Coda.Sdk/SessionForking.cs` — copy resolved session metadata to new session IDs.
 - `src/Coda.Sdk/SessionBundle.cs` and `src/Coda.Sdk/SessionBundleService.cs` — round-trip `systemPromptOverride` separately from audited `systemPrompt` without changing `coda.session/1`.
-- `src/LlmClient/AnthropicMessagesClient.cs`, `src/LlmClient/OpenAiRequest.cs`, `src/LlmClient/OpenAiResponsesRequest.cs` — serialize an explicitly empty system prompt instead of treating it as absent.
+- `src/LlmClient/AnthropicMessagesClient.cs`, `src/LlmClient/OpenAiRequest.cs`, `src/LlmClient/OpenAiResponsesRequest.cs` — preserve explicit-empty override semantics while using valid provider wire shapes: Anthropic omits its optional `system` field because empty text blocks are invalid; OpenAI serializes explicit empty values.
 - `src/Coda.Tui/ImmediateCli.cs`, `README.md`, `docs/API.md`, `docs/serve-protocol.md` — document flags, exact semantics, encoding/path behavior, warnings, and persistence.
 
 ### Test files
 
 - `tests/Coda.Tui.Tests/SystemPromptSourceResolverTests.cs` — exact source parsing and file-decoding contract.
 - `tests/Engine.Tests/EffectiveSystemPromptTests.cs` — replacement/fallback semantics.
-- `tests/Engine.Tests/ExactSystemPromptWireTests.cs` — explicit empty-system serialization for all provider request shapes.
+- `tests/Engine.Tests/ExactSystemPromptWireTests.cs` — explicit-empty system wire behavior: Anthropic omits its invalid empty block, while OpenAI request shapes serialize empty values.
 - Existing parser, runner, context, setup, resume, fork, transcript, bundle, audit, scheduled-root, and serve-host test files listed in the tasks below.
 
 ## Invariants used by every task
 
 - `SystemPromptOverride == null` means “construct the normal Coda prompt.”
 - `SystemPromptOverride == ""` and whitespace-only values are present exact overrides.
+- An explicit empty override suppresses every normal prompt layer; Anthropic omits its optional `system` field for that invalid-empty-block wire case, while OpenAI shapes serialize explicit empty values.
 - A source file is resolved from the process startup working directory, never from `--cwd`.
 - The source file is read once; only a leading UTF-8 BOM is removed.
 - The exact override replaces built-in, project, output-style, and provider-prefix layers for root turns only.
@@ -613,7 +614,7 @@ git add src\Coda.Tui\Ui\Mode\TuiLaunchOptions.cs src\Coda.Tui\InteractiveProgram
 git commit -m "feat(cli): parse exact prompts for interactive and serve startup" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
 ```
 
-### Task 3: Centralize effective root prompt selection and preserve explicit emptiness on the wire
+### Task 3: Centralize effective root prompt selection and preserve exact override semantics on valid provider wires
 
 **Files:**
 - Create: `src/Coda.Sdk/EffectiveSystemPrompt.cs`
@@ -702,7 +703,7 @@ public sealed class EffectiveSystemPromptTests
 public sealed class ExactSystemPromptWireTests
 {
     [Fact]
-    public void Anthropic_request_serializes_an_explicit_empty_system_text_block()
+    public void Anthropic_request_omits_an_explicit_empty_system_field()
     {
         var body = AnthropicMessagesClient.BuildBody(new ChatRequest
         {
@@ -711,9 +712,22 @@ public sealed class ExactSystemPromptWireTests
             Messages = [ChatMessage.UserText("hello")],
         });
 
-        Assert.Equal(
-            string.Empty,
-            body["system"]!.AsArray()[0]!["text"]!.GetValue<string>());
+        Assert.False(body.ContainsKey("system"));
+    }
+
+    [Fact]
+    public void Anthropic_request_preserves_a_non_empty_cache_controlled_system_text_block()
+    {
+        var body = AnthropicMessagesClient.BuildBody(new ChatRequest
+        {
+            Model = "model",
+            System = "exact system prompt",
+            Messages = [ChatMessage.UserText("hello")],
+        });
+
+        Assert.Equal("text", body["system"]!.AsArray()[0]!["type"]!.GetValue<string>());
+        Assert.Equal("exact system prompt", body["system"]!.AsArray()[0]!["text"]!.GetValue<string>());
+        Assert.Equal("ephemeral", body["system"]!.AsArray()[0]!["cache_control"]!["type"]!.GetValue<string>());
     }
 
     [Fact]
@@ -750,9 +764,9 @@ public sealed class ExactSystemPromptWireTests
 
 Run: `dotnet test tests\Engine.Tests\Engine.Tests.csproj --filter "FullyQualifiedName~EffectiveSystemPromptTests|FullyQualifiedName~ExactSystemPromptWireTests|FullyQualifiedName~TurnPipelineBuilderTests|FullyQualifiedName~EffortAndContextTests|FullyQualifiedName~SubagentTypeTests|FullyQualifiedName~CodaSessionAuditIntegrationTests"`
 
-Expected: FAIL because `SessionOptions.SystemPromptOverride` and `EffectiveSystemPrompt` do not exist, and empty system strings are omitted.
+Expected: FAIL because `SessionOptions.SystemPromptOverride` and `EffectiveSystemPrompt` do not exist, Anthropic emits an invalid empty text block, and OpenAI shapes omit explicit empty values.
 
-- [ ] **Step 3: Implement one effective-prompt authority and use null-only wire checks**
+- [ ] **Step 3: Implement one effective-prompt authority and use provider-valid wire checks**
 
 Add to `SessionOptions`:
 
@@ -797,7 +811,7 @@ Replace prompt construction in `TurnPipelineBuilder.BuildAgentOptions` and `Coda
 In `AnthropicMessagesClient.BuildBody`, use:
 
 ```csharp
-if (request.System is not null)
+if (!string.IsNullOrEmpty(request.System))
 {
     body["system"] = new JsonArray
     {
@@ -810,6 +824,10 @@ if (request.System is not null)
     };
 }
 ```
+
+This intentionally maps null and an explicit empty exact override to the same valid Anthropic wire shape. The SDK
+retains `SystemPromptOverride == ""` before serialization, so the empty override still suppresses all normal Coda
+prompt layers. Non-empty values, including whitespace-only values, retain the cache-controlled text block unchanged.
 
 In `OpenAiRequest.Build`, use:
 

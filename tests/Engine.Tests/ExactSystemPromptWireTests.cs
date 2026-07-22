@@ -5,7 +5,7 @@ namespace Engine.Tests;
 public sealed class ExactSystemPromptWireTests
 {
     [Fact]
-    public void Request_builders_preserve_an_explicit_empty_system_value_and_omit_null()
+    public void Request_builders_omit_an_empty_Anthropic_system_field_but_preserve_empty_OpenAI_values()
     {
         var empty = new ChatRequest
         {
@@ -17,7 +17,7 @@ public sealed class ExactSystemPromptWireTests
 
         var anthropicEmpty = AnthropicMessagesClient.BuildBody(empty);
         var anthropicAbsent = AnthropicMessagesClient.BuildBody(absent);
-        Assert.Equal(string.Empty, (string?)anthropicEmpty["system"]![0]!["text"]);
+        Assert.False(anthropicEmpty.ContainsKey("system"));
         Assert.False(anthropicAbsent.ContainsKey("system"));
 
         var chatEmpty = OpenAiRequest.Build(empty);
@@ -30,5 +30,20 @@ public sealed class ExactSystemPromptWireTests
         var responsesAbsent = OpenAiResponsesRequest.Build(absent);
         Assert.Equal(string.Empty, (string?)responsesEmpty["instructions"]);
         Assert.False(responsesAbsent.ContainsKey("instructions"));
+    }
+
+    [Fact]
+    public void Anthropic_request_preserves_a_non_empty_cache_controlled_system_text_block()
+    {
+        var body = AnthropicMessagesClient.BuildBody(new ChatRequest
+        {
+            Model = "test-model",
+            System = "system prompt",
+            Messages = [ChatMessage.UserText("hello")],
+        });
+
+        Assert.Equal("text", (string?)body["system"]![0]!["type"]);
+        Assert.Equal("system prompt", (string?)body["system"]![0]!["text"]);
+        Assert.Equal("ephemeral", (string?)body["system"]![0]!["cache_control"]!["type"]);
     }
 }
