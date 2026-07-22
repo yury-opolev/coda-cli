@@ -91,6 +91,50 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
+    public void Compact_tool_block_shows_sanitized_capped_preview_and_status_without_result()
+    {
+        var input = "\u001b[31mline one\nline two\u001b[0m " + new string('x', 140);
+        var block = new ToolTranscriptBlock(
+            Guid.NewGuid(), "grep", input, 12, "secret result", IsError: false, Complete: true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 200, ToolDisplayMode.Compact);
+        var text = string.Join('\n', lines.Select(line => line.Text));
+
+        Assert.Single(lines);
+        Assert.Contains("grep", text, StringComparison.Ordinal);
+        Assert.Contains("[success]", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret result", text, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u001b', text);
+        Assert.DoesNotContain('\n', text);
+        Assert.True(text.Length <= 128 + "grep  [success]".Length);
+        Assert.Equal(input, block.InputJson);
+    }
+
+    [Fact]
+    public void Tiny_tool_block_is_hidden_without_mutating_the_block()
+    {
+        var block = new ToolTranscriptBlock(
+            Guid.NewGuid(), "grep", "{\"pattern\":\"x\"}", 12, "result", IsError: false, Complete: true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Tiny);
+
+        Assert.Empty(lines);
+        Assert.Equal("{\"pattern\":\"x\"}", block.InputJson);
+        Assert.Equal("result", block.Result);
+    }
+
+    [Fact]
+    public void Compact_failed_tool_block_reports_error_once()
+    {
+        var block = new ToolTranscriptBlock(
+            Guid.NewGuid(), "write_file", "{}", null, "denied", IsError: true, Complete: true);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Compact);
+
+        Assert.Equal("write_file {} [error]", Assert.Single(lines).Text);
+    }
+
+    [Fact]
     public void Failed_tool_block_uses_error_role()
     {
         var block = new ToolTranscriptBlock(

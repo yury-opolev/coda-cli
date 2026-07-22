@@ -72,7 +72,14 @@ public static class TranscriptBlockFormatter
     private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder().Build();
 
     /// <summary>Projects <paramref name="block"/> onto wrapped, attributed lines for the given cell width.</summary>
-    public static IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block, int width)
+    public static IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block, int width) =>
+        Format(block, width, ToolDisplayMode.Verbose);
+
+    /// <summary>Projects <paramref name="block"/> using the requested tool display mode.</summary>
+    public static IReadOnlyList<TranscriptRenderLine> Format(
+        TranscriptBlock block,
+        int width,
+        ToolDisplayMode toolDisplayMode)
     {
         ArgumentNullException.ThrowIfNull(block);
 
@@ -90,7 +97,10 @@ public static class TranscriptBlockFormatter
                 break;
 
             case ToolTranscriptBlock tool:
-                AppendTool(lines, tool, safeWidth);
+                if (toolDisplayMode != ToolDisplayMode.Tiny)
+                {
+                    AppendTool(lines, tool, safeWidth, toolDisplayMode);
+                }
                 break;
 
             case CommandOutputTranscriptBlock command:
@@ -126,8 +136,11 @@ public static class TranscriptBlockFormatter
     }
 
     /// <summary>Joins the formatted lines with newlines, for a plain-text projection of a block.</summary>
-    public static string FormatPlainText(TranscriptBlock block, int width) =>
-        string.Join('\n', Format(block, width).Select(line => line.Text));
+    public static string FormatPlainText(
+        TranscriptBlock block,
+        int width,
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose) =>
+        string.Join('\n', Format(block, width, toolDisplayMode).Select(line => line.Text));
 
     /// <summary>
     /// The canonical semantic style for each <c>/context</c> category: a distinct, shape-legible glyph and
@@ -325,16 +338,29 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendTool(List<TranscriptRenderLine> lines, ToolTranscriptBlock tool, int width)
+    private static void AppendTool(
+        List<TranscriptRenderLine> lines,
+        ToolTranscriptBlock tool,
+        int width,
+        ToolDisplayMode toolDisplayMode)
     {
         var role = tool.IsError ? TranscriptRole.Error : TranscriptRole.Tool;
         var header = new StringBuilder(tool.ToolName);
-        if (!string.IsNullOrWhiteSpace(tool.InputJson))
+        var input = toolDisplayMode == ToolDisplayMode.Compact
+            ? ToolDisplayModeText.ArgumentPreview(tool.InputJson)
+            : tool.InputJson.Trim();
+        if (!string.IsNullOrWhiteSpace(input))
         {
-            header.Append(' ').Append(tool.InputJson.Trim());
+            header.Append(' ').Append(input);
         }
 
-        if (tool.ElapsedMs is { } ms)
+        if (toolDisplayMode == ToolDisplayMode.Compact)
+        {
+            header.Append(tool.Complete
+                ? tool.IsError ? " [error]" : " [success]"
+                : " [running]");
+        }
+        else if (tool.ElapsedMs is { } ms)
         {
             header.Append(" (").Append(ms.ToString(CultureInfo.InvariantCulture)).Append("ms)");
         }
@@ -343,14 +369,14 @@ public static class TranscriptBlockFormatter
             header.Append(" (running)");
         }
 
-        if (tool.IsError)
+        if (toolDisplayMode != ToolDisplayMode.Compact && tool.IsError)
         {
             header.Append(" [error]");
         }
 
         AppendPreformatted(lines, header.ToString(), width, role);
 
-        if (tool.Result is { Length: > 0 } result)
+        if (toolDisplayMode == ToolDisplayMode.Verbose && tool.Result is { Length: > 0 } result)
         {
             foreach (var line in SplitLines(result))
             {

@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Tests;
@@ -71,6 +72,24 @@ public sealed class OperationalStatusProjectorTests
         Assert.Equal(
             new OperationalStatus("Working · dotnet test", OperationalTone.Working, Animated: true),
             OperationalStatusProjector.Project(snapshot));
+    }
+
+    [Fact]
+    public void Tiny_mode_hides_incomplete_tool_name()
+    {
+        var snapshot = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("turn", "answer", null),
+            Transcript =
+            [
+                new ToolTranscriptBlock(
+                    Guid.NewGuid(), "dotnet test", "{}", null, null, IsError: false, Complete: false),
+            ],
+        };
+
+        Assert.Equal(
+            new OperationalStatus("Working", OperationalTone.Working, Animated: true),
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Tiny));
     }
 
     [Theory]

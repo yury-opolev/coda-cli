@@ -13,12 +13,14 @@ namespace Coda.Tui.Ui.Rendering;
 public sealed class PlainOutputRenderer : IUiEventObserver
 {
     private readonly TextWriter _writer;
+    private readonly ToolDisplayMode _toolDisplayMode;
 
     /// <summary>Create a renderer that writes plain output to <paramref name="writer"/>.</summary>
     /// <param name="writer">The destination writer (e.g. redirected stdout).</param>
-    public PlainOutputRenderer(TextWriter writer)
+    public PlainOutputRenderer(TextWriter writer, ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose)
     {
         this._writer = writer ?? throw new ArgumentNullException(nameof(writer));
+        this._toolDisplayMode = toolDisplayMode;
     }
 
     /// <inheritdoc />
@@ -37,16 +39,37 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolStartedEvent e:
-                this.WriteLine($"[tool] {e.ToolName} {e.InputJson}");
+                if (this._toolDisplayMode != ToolDisplayMode.Tiny)
+                {
+                    var input = this._toolDisplayMode == ToolDisplayMode.Compact
+                        ? ToolDisplayModeText.ArgumentPreview(e.InputJson)
+                        : e.InputJson;
+                    var suffix = this._toolDisplayMode == ToolDisplayMode.Compact ? " [running]" : string.Empty;
+                    this.WriteLine($"[tool] {e.ToolName} {input}{suffix}".TrimEnd());
+                }
                 break;
 
             case ToolProgressEvent e:
-                var seconds = (e.ElapsedMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture);
-                this.WriteLine($"[tool-progress] {e.ToolName} {seconds}s");
+                if (this._toolDisplayMode != ToolDisplayMode.Tiny)
+                {
+                    var seconds = (e.ElapsedMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture);
+                    this.WriteLine($"[tool-progress] {e.ToolName} {seconds}s");
+                }
                 break;
 
             case ToolCompletedEvent e:
-                this.WriteLine($"[tool-result] {e.ToolName}: {e.Result.Content}");
+                if (this._toolDisplayMode != ToolDisplayMode.Tiny)
+                {
+                    if (this._toolDisplayMode == ToolDisplayMode.Compact)
+                    {
+                        var status = e.Result.IsError ? "error" : "success";
+                        this.WriteLine($"[tool-result] {e.ToolName} [{status}]");
+                    }
+                    else
+                    {
+                        this.WriteLine($"[tool-result] {e.ToolName}: {e.Result.Content}");
+                    }
+                }
                 break;
 
             case WarningEvent e:

@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.Json.Serialization;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
 using Microsoft.Extensions.Logging;
@@ -35,6 +36,7 @@ namespace Coda.Agent.Settings;
 /// (defaults to <c>~/.coda/settings.json</c>).
 /// Project settings are read from <c>&lt;workingDirectory&gt;/.coda/settings.json</c>.
 /// The merged result concatenates user lists first, then project lists.
+/// <c>toolDisplayMode</c> is read only from the user-level file and is never overridden by project settings.
 /// Missing or corrupt files are silently treated as empty.
 /// </remarks>
 public static class SettingsLoader
@@ -85,7 +87,8 @@ public static class SettingsLoader
             && modelByProvider.Count == 0
             && githubEnterpriseDomain is null
             && goalMerged is null
-            && telemetry is null)
+            && telemetry is null
+            && userSettings.ToolDisplayMode is null)
         {
             return CodaSettings.Empty;
         }
@@ -109,6 +112,7 @@ public static class SettingsLoader
             GitHubEnterpriseDomain = githubEnterpriseDomain,
             Goal = goalMerged,
             Telemetry = telemetry,
+            ToolDisplayMode = userSettings.ToolDisplayMode,
         };
     }
 
@@ -139,6 +143,7 @@ public static class SettingsLoader
                 GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
                 Telemetry = ParseTelemetry(doc?.Telemetry),
+                ToolDisplayMode = doc?.ToolDisplayMode,
             };
         }
         catch (Exception ex) when (ex is JsonException or IOException)
@@ -296,6 +301,8 @@ public static class SettingsLoader
         public string? GithubEnterpriseDomain { get; set; }
         public GoalSection? Goal { get; set; }
         public TelemetrySection? Telemetry { get; set; }
+        [JsonPropertyName("toolDisplayMode")]
+        public string? ToolDisplayMode { get; set; }
     }
 
     private sealed class GoalSection
