@@ -136,7 +136,8 @@ internal static class FakeSession
     public static CodaSession New(
         string workingDirectory,
         string? sessionId = null,
-        List<ChatMessage>? history = null)
+        List<ChatMessage>? history = null,
+        string? systemPromptOverride = null)
     {
         var options = new SessionOptions
         {
@@ -144,6 +145,7 @@ internal static class FakeSession
             Model = "claude-sonnet-4-6",
             WorkingDirectory = workingDirectory,
             PermissionMode = PermissionMode.BypassPermissions,
+            SystemPromptOverride = systemPromptOverride,
         };
         var loop = new ConfigurableLoop();
         return new CodaSession(

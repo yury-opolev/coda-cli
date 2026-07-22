@@ -268,6 +268,23 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         Assert.DoesNotContain(AnthropicModels.AnthropicSystemPrefix, spec.Options.SystemPrompt);
     }
 
+    [Fact]
+    public void Root_and_scheduled_specs_share_the_exact_system_prompt_override()
+    {
+        File.WriteAllText(Path.Combine(this.root, "CLAUDE.md"), "PROJECT-CONTEXT-MARKER");
+        const string exact = "ROOT-EXACT-OVERRIDE";
+        var builder = this.NewBuilder();
+        var options = this.Options() with { SystemPromptOverride = exact };
+
+        var root = builder.BuildSpec(options, this.Client(), CodaSettings.Empty);
+        var scheduled = builder.BuildScheduledSpec(options, this.Client(), CodaSettings.Empty, "task-1", depth: 1);
+
+        Assert.Equal(exact, root.Options.SystemPrompt);
+        Assert.Equal(exact, scheduled.Options.SystemPrompt);
+        Assert.DoesNotContain("PROJECT-CONTEXT-MARKER", root.Options.SystemPrompt);
+        Assert.DoesNotContain("PROJECT-CONTEXT-MARKER", scheduled.Options.SystemPrompt);
+    }
+
     // ---- Hooks: session memory on/off ----
 
     [Fact]

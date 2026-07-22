@@ -226,7 +226,7 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
             ["stream"] = true,
         };
 
-        if (!string.IsNullOrEmpty(request.System))
+        if (request.System is not null)
         {
             // System as a text block with cache_control (matches the real client and
             // enables prompt caching of the long, stable system prompt).

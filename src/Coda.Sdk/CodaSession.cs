@@ -4,7 +4,6 @@ using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
-using Coda.Agent.OutputStyles;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
 using Coda.Agent.ToolSearch;
@@ -14,7 +13,6 @@ using Coda.Common;
 using Coda.Sdk.Telemetry;
 using Coda.Sdk.Turns;
 using LlmAuth;
-using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
 using Microsoft.Extensions.Logging;
 
@@ -511,13 +509,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         var options = this.ResolveEffectiveOptions();
         var client = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
 
-        var includeAnthropicSystemPrefix = options.ProviderId != GitHubCopilotProvider.Id;
-        var outputStyle = BuiltInOutputStyles.Resolve(options.OutputStyle);
-        var systemPrompt = AgentSystemPrompt.Build(
-            options.WorkingDirectory,
-            includeAnthropicSystemPrefix,
-            ProjectContext.Load(options.WorkingDirectory),
-            outputStyle.SystemPromptSuffix);
+        var systemPrompt = EffectiveSystemPrompt.Resolve(options);
 
         var allDefs = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]).Definitions;
         // MCP tools are namespaced "mcp__<server>__<tool>"; everything else is built-in.

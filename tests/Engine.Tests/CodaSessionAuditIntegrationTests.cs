@@ -48,6 +48,18 @@ public sealed class CodaSessionAuditIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task RunAsync_audits_the_exact_system_prompt_override()
+    {
+        const string exact = "AUDIT-EXACT-OVERRIDE";
+        using var session = FakeSession.New(this.tempDir, systemPromptOverride: exact);
+
+        await session.RunAsync("hello");
+
+        var audit = await new SessionAuditStore(this.tempDir).LoadAsync(session.SessionId);
+        Assert.Equal(exact, Assert.Single(audit).SystemPrompt);
+    }
+
+    [Fact]
     public async Task Resumed_session_continues_the_turn_index_from_the_existing_sidecar()
     {
         // Pre-seed a sidecar for id "resumed" with two turns.

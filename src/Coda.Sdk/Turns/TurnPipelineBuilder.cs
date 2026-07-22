@@ -4,7 +4,6 @@ using Coda.Agent.Classifier;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
-using Coda.Agent.OutputStyles;
 using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
@@ -102,7 +101,7 @@ public sealed class TurnPipelineBuilder
 
         var includeAnthropicSystemPrefix = options.ProviderId != GitHubCopilotProvider.Id;
 
-        var agentOptions = this.BuildAgentOptions(options, includeAnthropicSystemPrefix);
+        var agentOptions = this.BuildAgentOptions(options);
 
         var permissions = BuildPermissions(options, client, settings);
 
@@ -186,7 +185,7 @@ public sealed class TurnPipelineBuilder
 
         var includeAnthropicSystemPrefix = options.ProviderId != GitHubCopilotProvider.Id;
 
-        var agentOptions = this.BuildAgentOptions(options, includeAnthropicSystemPrefix);
+        var agentOptions = this.BuildAgentOptions(options);
 
         var permissions = BuildPermissions(options, client, settings);
 
@@ -255,18 +254,13 @@ public sealed class TurnPipelineBuilder
     private static ToolRegistry StripScheduleTools(IEnumerable<ITool> tools) =>
         new(tools.Where(t => !t.Name.StartsWith("schedule_", StringComparison.Ordinal)));
 
-    /// <summary>Builds the agent options: system prompt (with/without the anthropic prefix) + output style + base bounds.</summary>
-    private AgentOptions BuildAgentOptions(SessionOptions options, bool includeAnthropicSystemPrefix)
+    /// <summary>Builds the agent options: effective root system prompt + base bounds.</summary>
+    private AgentOptions BuildAgentOptions(SessionOptions options)
     {
-        var outputStyle = BuiltInOutputStyles.Resolve(options.OutputStyle);
         return new AgentOptions
         {
             Model = options.Model,
-            SystemPrompt = AgentSystemPrompt.Build(
-                options.WorkingDirectory,
-                includeAnthropicSystemPrefix,
-                ProjectContext.Load(options.WorkingDirectory),
-                outputStyle.SystemPromptSuffix),
+            SystemPrompt = EffectiveSystemPrompt.Resolve(options),
             WorkingDirectory = options.WorkingDirectory,
             PermissionMode = options.PermissionMode,
             PermissionModeState = options.PermissionModeState,
