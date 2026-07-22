@@ -478,6 +478,7 @@ public static class ServeRunner
             InteractivePrompt = null,
             Goal = options.Goal,
             EnableSessionMemory = options.EnableSessionMemory,
+            SystemPromptOverride = options.SystemPromptOverride,
             MaxStopContinuations = options.MaxStopContinuations,
             GoalMaxDuration = options.GoalMaxDuration,
             GoalMaxContinuations = options.GoalMaxContinuations,

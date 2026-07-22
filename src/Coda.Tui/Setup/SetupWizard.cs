@@ -1,5 +1,6 @@
 using System.Text;
 using Coda.Agent;
+using Coda.Agent.OutputStyles;
 using Coda.Sdk;
 using Coda.Tui.Agent;
 using Coda.Tui.Commands;
@@ -7,6 +8,7 @@ using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Prompts;
 using LlmClient;
+using LlmAuth.Providers.GitHubCopilot;
 using Spectre.Console;
 
 namespace Coda.Tui.Setup;
@@ -46,6 +48,7 @@ public sealed class SetupWizard
 
         // Reuse the real login flow (browser-loopback / device-code / api-key).
         await new LoginCommand().ExecuteAsync(context, [provider.Id], cancellationToken).ConfigureAwait(false);
+        SystemPromptCompatibilityWarning.Publish(context);
 
         await this.VerifyAsync(context, provider, cancellationToken).ConfigureAwait(false);
 
@@ -99,7 +102,7 @@ public sealed class SetupWizard
             {
                 Model = context.Session.Model,
                 MaxTokens = 16,
-                System = AgentSystemPrompt.Build(context.Session.WorkingDirectory),
+                System = ResolveVerificationSystemPrompt(context.Session),
                 Messages = [ChatMessage.UserText("Reply with the single word: OK")],
             };
 
@@ -123,4 +126,12 @@ public sealed class SetupWizard
             console.MarkupLine(Theme.WarnMarkup($"Couldn't verify the connection: {ex.Message}"));
         }
     }
+
+    internal static string ResolveVerificationSystemPrompt(SessionState session) =>
+        session.SystemPromptOverride
+        ?? AgentSystemPrompt.Build(
+            session.WorkingDirectory,
+            includeAnthropicSystemPrefix: session.ActiveProviderId != GitHubCopilotProvider.Id,
+            ProjectContext.Load(session.WorkingDirectory),
+            BuiltInOutputStyles.Resolve(session.OutputStyle).SystemPromptSuffix);
 }

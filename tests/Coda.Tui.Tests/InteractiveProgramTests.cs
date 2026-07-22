@@ -172,6 +172,49 @@ public sealed class InteractiveProgramTests
     }
 
     [Fact]
+    public void Startup_initialization_copies_the_exact_override_to_both_session_authorities()
+    {
+        var options = new TuiLaunchOptions(TuiPreference.Auto, false, [], null)
+        {
+            SystemPromptOverride = " \r\nexact\n",
+        };
+
+        var session = DefaultInteractiveSessionRunner.CreateSessionState("claude-ai", options);
+
+        Assert.Equal(" \r\nexact\n", session.StartupSystemPromptOverride);
+        Assert.Equal(" \r\nexact\n", session.SystemPromptOverride);
+    }
+
+    [Fact]
+    public void Claude_ai_compatibility_warning_is_non_blocking_and_never_rewrites_the_override()
+    {
+        const string prompt = " \r\nexact\n";
+
+        var warning = SystemPromptCompatibilityWarning.For("claude-ai", prompt);
+
+        Assert.Contains("exact supplied prompt", warning!);
+        Assert.Equal(prompt, " \r\nexact\n");
+        Assert.Null(SystemPromptCompatibilityWarning.For("github-copilot", prompt));
+        Assert.Null(SystemPromptCompatibilityWarning.For("api-key", prompt));
+        Assert.Null(SystemPromptCompatibilityWarning.For("claude-ai", null));
+    }
+
+    [Fact]
+    public void Claude_ai_compatibility_warning_publishes_through_the_diagnostic_ui_path()
+    {
+        var events = new RecordingUiEvents();
+        var built = TestAppBuilder.BuildApp(events: events);
+        built.Context.Session.SystemPromptOverride = "";
+
+        SystemPromptCompatibilityWarning.Publish(built.Context);
+
+        var diagnostic = Assert.Single(events.Events.OfType<DiagnosticEvent>());
+        Assert.Equal("system prompt", diagnostic.Source);
+        Assert.Equal(UiNotificationLevel.Warning, diagnostic.Level);
+        Assert.Contains("sent unchanged", diagnostic.Message);
+    }
+
+    [Fact]
     public async Task Missing_system_prompt_file_returns_usage_error_without_invoking_runner()
     {
         var error = new StringWriter();

@@ -485,6 +485,16 @@ public sealed class ServeRunnerTests
     }
 
     [Fact]
+    public void BuildSessionOptions_preserves_an_explicit_empty_system_prompt_override()
+    {
+        var options = new ServeOptions { SystemPromptOverride = "" };
+
+        var sessionOptions = ServeRunner.BuildSessionOptions(options);
+
+        Assert.Equal("", sessionOptions.SystemPromptOverride);
+    }
+
+    [Fact]
     public void BuildSessionOptions_enables_schedule_runtime()
     {
         // Serve owns the schedule runtime (parity with interactive) so persisted, project-scoped

@@ -219,7 +219,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var startupProvider = StartupProviderResolver.Resolve(
             Environment.GetEnvironmentVariable("CODA_PROVIDER"), connectedProviderId, providers);
 
-        var session = new SessionState(startupProvider.Id);
+        var session = CreateSessionState(startupProvider.Id, options);
         var (_, resolvedStartupModel) = Coda.Sdk.Providers.ProviderModelResolver.Resolve(
             startupProvider.Id,
             Environment.GetEnvironmentVariable("CODA_MODEL"),
@@ -328,7 +328,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             {
                 await SeedSessionAsync(context, options, mailbox, hostToken).ConfigureAwait(false);
                 await ConnectMcpAsync(context, mcp, store, mailbox, hostToken).ConfigureAwait(false);
-                await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
+                var ranSetup = await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
+                if (!ranSetup)
+                {
+                    SystemPromptCompatibilityWarning.Publish(context);
+                }
 
                 // Eagerly create + initialize the session BEFORE ready metadata/banner/composer
                 // enablement: this starts the schedule runtime so persisted schedules resume before the
@@ -499,6 +503,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             hostToken,
             cancellationToken).ConfigureAwait(false);
     }
+
+    internal static SessionState CreateSessionState(string providerId, TuiLaunchOptions options) =>
+        new(providerId)
+        {
+            StartupSystemPromptOverride = options.SystemPromptOverride,
+            SystemPromptOverride = options.SystemPromptOverride,
+        };
 
     /// <summary>
     /// Drive the host to a clean exit, then — once and only after the terminal is restored and the UI
@@ -680,12 +691,15 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
     }
 
     /// <summary>First run with no credentials → guide the user through connecting, in the mode's environment.</summary>
-    private static async Task MaybeRunFirstRunSetupAsync(CommandContext context, CancellationToken ct)
+    private static async Task<bool> MaybeRunFirstRunSetupAsync(CommandContext context, CancellationToken ct)
     {
-        if (await FirstRunDetector.IsFirstRunAsync(context, ct).ConfigureAwait(false))
+        if (!await FirstRunDetector.IsFirstRunAsync(context, ct).ConfigureAwait(false))
         {
-            await new SetupWizard().RunAsync(context, ct).ConfigureAwait(false);
+            return false;
         }
+
+        await new SetupWizard().RunAsync(context, ct).ConfigureAwait(false);
+        return true;
     }
 
     private static void RequestStopSafely(IApplication app, TerminalGuiShellBase shell, Exception error)

@@ -76,18 +76,21 @@ public sealed class ContextCommand : ISlashCommand
 
     internal static async Task<ContextReport> AnalyzeOnceAsync(CommandContext context, CancellationToken cancellationToken)
     {
-        var options = new SessionOptions
-        {
-            ProviderId = context.Session.ActiveProviderId,
-            Model = context.Session.Model,
-            WorkingDirectory = context.Session.WorkingDirectory,
-            OutputStyle = context.Session.OutputStyle,
-            ExtraTools = context.ExtraTools,
-        };
+        var options = BuildSessionOptions(context);
 
         using var session = new CodaSession(context.Credentials, options, history: context.Session.History);
         return await session.AnalyzeContextAsync(cancellationToken).ConfigureAwait(false);
     }
+
+    internal static SessionOptions BuildSessionOptions(CommandContext context) => new()
+    {
+        ProviderId = context.Session.ActiveProviderId,
+        Model = context.Session.Model,
+        WorkingDirectory = context.Session.WorkingDirectory,
+        OutputStyle = context.Session.OutputStyle,
+        ExtraTools = context.ExtraTools,
+        SystemPromptOverride = context.Session.SystemPromptOverride,
+    };
 
     private void Render(CommandContext context, ContextReport report)
     {
