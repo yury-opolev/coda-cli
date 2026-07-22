@@ -1,4 +1,5 @@
 using Coda.Sdk;
+using LlmClient;
 
 namespace Engine.Tests;
 
@@ -62,5 +63,52 @@ public sealed class HeadlessOptionsResumeTests
     {
         Assert.False(HeadlessOptions.TryParse(["-p", "go", "--fork", "x", "--resume", "y"], out _, out var err));
         Assert.NotNull(err);
+    }
+
+    [Fact]
+    public async Task Fork_option_persists_source_system_prompt_override_in_new_session()
+    {
+        var workingDirectory = Path.Combine(
+            Directory.GetCurrentDirectory(),
+            ".headless-options-resume-tests",
+            Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(workingDirectory);
+
+        try
+        {
+            const string sourceId = "source-aaaa";
+            const string systemPromptOverride = "headless source prompt";
+            var messages = new[] { new ChatMessage(ChatRole.User, [new TextBlock("go")]) };
+            var store = new SessionTranscriptStore(workingDirectory);
+            await store.SaveAsync(
+                sourceId,
+                messages,
+                new SessionMetadata { SystemPromptOverride = systemPromptOverride });
+
+            Assert.True(HeadlessOptions.TryParse(
+                ["-p", "go", "--fork", sourceId],
+                out var options,
+                out var error),
+                error);
+            Assert.True(options.Fork);
+
+            var source = await store.LoadSessionAsync(options.ForkSessionId!);
+            Assert.NotNull(source);
+
+            var forkId = await SessionForking.ForkAsync(
+                workingDirectory,
+                options.ForkSessionId,
+                source!.Messages,
+                source.Metadata);
+
+            Assert.NotEqual(sourceId, forkId);
+            var fork = await store.LoadSessionAsync(forkId);
+            Assert.NotNull(fork);
+            Assert.Equal(systemPromptOverride, fork!.Metadata.SystemPromptOverride);
+        }
+        finally
+        {
+            try { Directory.Delete(workingDirectory, recursive: true); } catch { /* ignore */ }
+        }
     }
 }
