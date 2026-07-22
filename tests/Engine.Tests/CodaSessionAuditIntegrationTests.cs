@@ -60,6 +60,20 @@ public sealed class CodaSessionAuditIntegrationTests : IDisposable
     }
 
     [Fact]
+    public async Task Audit_system_prompt_is_not_inferred_as_transcript_resume_metadata()
+    {
+        using var session = FakeSession.New(this.tempDir);
+        await session.RunAsync("hello");
+
+        var audit = await new SessionAuditStore(this.tempDir).LoadAsync(session.SessionId);
+        var transcript = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(session.SessionId);
+
+        Assert.False(string.IsNullOrEmpty(Assert.Single(audit).SystemPrompt));
+        Assert.NotNull(transcript);
+        Assert.Null(transcript.Metadata.SystemPromptOverride);
+    }
+
+    [Fact]
     public async Task Resumed_session_continues_the_turn_index_from_the_existing_sidecar()
     {
         // Pre-seed a sidecar for id "resumed" with two turns.

@@ -363,6 +363,110 @@ public sealed class SessionTranscriptTests : IDisposable
         Assert.Equal(firstCreated, secondCreated);
     }
 
+    // ── Optional live-session metadata ───────────────────────────────────────────
+
+    [Fact]
+    public async Task SaveSessionAsync_then_LoadSessionAsync_round_trips_exact_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var messages = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("hello")]) };
+
+        await store.SaveAsync("metadata-exact", messages, new SessionMetadata { SystemPromptOverride = "exact\n" });
+
+        var stored = await store.LoadSessionAsync("metadata-exact");
+
+        Assert.NotNull(stored);
+        Assert.Equal("exact\n", stored.Metadata.SystemPromptOverride);
+        Assert.Single(stored.Messages);
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_with_empty_metadata_omits_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var messages = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("hello")]) };
+
+        await store.SaveAsync("metadata-default", messages, SessionMetadata.Empty);
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", "metadata-default.json");
+        var json = JsonNode.Parse(await File.ReadAllTextAsync(path))!;
+        Assert.Null(json["systemPromptOverride"]);
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_with_empty_override_serializes_and_round_trips_it()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var messages = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("hello")]) };
+
+        await store.SaveAsync("metadata-empty", messages, new SessionMetadata { SystemPromptOverride = string.Empty });
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", "metadata-empty.json");
+        var json = JsonNode.Parse(await File.ReadAllTextAsync(path))!;
+        Assert.Equal(string.Empty, json["systemPromptOverride"]!.GetValue<string>());
+        var stored = await store.LoadSessionAsync("metadata-empty");
+        Assert.Equal(string.Empty, stored!.Metadata.SystemPromptOverride);
+    }
+
+    [Fact]
+    public async Task Legacy_SaveAsync_preserves_existing_empty_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var initial = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("first")]) };
+        await store.SaveAsync("metadata-legacy", initial, new SessionMetadata { SystemPromptOverride = string.Empty });
+
+        await store.SaveAsync("metadata-legacy", [new(ChatRole.User, [new TextBlock("second")])]);
+
+        var stored = await store.LoadSessionAsync("metadata-legacy");
+        Assert.Equal(string.Empty, stored!.Metadata.SystemPromptOverride);
+        Assert.Equal("second", Assert.IsType<TextBlock>(stored.Messages[0].Content[0]).Text);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LoadSessionAsync_accepts_legacy_or_non_string_metadata_and_unknown_fields(bool nonStringMetadata)
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var sessionId = nonStringMetadata ? "metadata-non-string" : "metadata-legacy-json";
+        await store.SaveAsync(sessionId, [new(ChatRole.User, [new TextBlock("hello")])]);
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", $"{sessionId}.json");
+        var json = JsonNode.Parse(await File.ReadAllTextAsync(path))!.AsObject();
+        json["unknownFutureField"] = new JsonObject { ["ignored"] = true };
+        if (nonStringMetadata)
+        {
+            json["systemPromptOverride"] = new JsonObject { ["invalid"] = true };
+        }
+
+        await File.WriteAllTextAsync(path, json.ToJsonString());
+
+        var stored = await store.LoadSessionAsync(sessionId);
+
+        Assert.NotNull(stored);
+        Assert.Null(stored.Metadata.SystemPromptOverride);
+        Assert.Single(stored.Messages);
+        Assert.Equal("hello", Assert.IsType<TextBlock>(stored.Messages[0].Content[0]).Text);
+    }
+
+    [Fact]
+    public async Task Metadata_aware_and_legacy_saves_preserve_original_createdUtc()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        const string sessionId = "metadata-created-utc";
+        var first = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("first")]) };
+        await store.SaveAsync(sessionId, first, new SessionMetadata { SystemPromptOverride = "override" });
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", $"{sessionId}.json");
+        var firstCreated = JsonNode.Parse(await File.ReadAllTextAsync(path))!["createdUtc"]!.GetValue<string>();
+        await Task.Delay(50);
+
+        await store.SaveAsync(sessionId, [new(ChatRole.User, [new TextBlock("second")])]);
+
+        var secondCreated = JsonNode.Parse(await File.ReadAllTextAsync(path))!["createdUtc"]!.GetValue<string>();
+        Assert.Equal(firstCreated, secondCreated);
+    }
+
     // ── Freeze invariant: minting/adopting a fresh id never touches the original transcript ─────
 
     [Fact]

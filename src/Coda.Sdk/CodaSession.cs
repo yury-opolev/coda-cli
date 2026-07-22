@@ -716,10 +716,15 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     {
         try
         {
+            var options = this.Options;
             this.transcriptStore ??= new SessionTranscriptStore(
-                this.Options.WorkingDirectory,
+                options.WorkingDirectory,
                 this.loggerFactory.CreateLogger<SessionTranscriptStore>());
-            await this.transcriptStore.SaveAsync(this.SessionId, this.history, cancellationToken).ConfigureAwait(false);
+            await this.transcriptStore.SaveAsync(
+                this.SessionId,
+                this.history,
+                new SessionMetadata { SystemPromptOverride = options.SystemPromptOverride },
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

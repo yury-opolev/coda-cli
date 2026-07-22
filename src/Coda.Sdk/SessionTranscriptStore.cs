@@ -44,6 +44,24 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
             return;
         }
 
+        var existing = await this.LoadSessionAsync(sessionId, ct).ConfigureAwait(false);
+        await this.SaveAsync(sessionId, messages, existing?.Metadata ?? SessionMetadata.Empty, ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Persists <paramref name="messages"/> and optional live-session metadata to disk.
+    /// </summary>
+    public async Task SaveAsync(
+        string sessionId,
+        IReadOnlyList<ChatMessage> messages,
+        SessionMetadata metadata,
+        CancellationToken ct = default)
+    {
+        if (messages.Count == 0 || !SessionIds.IsValid(sessionId))
+        {
+            return;
+        }
+
         Directory.CreateDirectory(this.SessionsDir);
 
         var filePath = this.FilePath(sessionId);
@@ -68,6 +86,10 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
             ["createdUtc"] = createdUtc.ToString("O"),
             ["messages"] = ChatMessageJson.SerializeMessages(messages),
         };
+        if (metadata.SystemPromptOverride is not null)
+        {
+            root["systemPromptOverride"] = metadata.SystemPromptOverride;
+        }
 
         // Atomic write: serialize to a temp file, then rename over the target. A hard kill mid-write
         // (exactly what the Bridge watchdog does) then leaves the previous transcript intact instead
@@ -111,6 +133,18 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         string sessionId,
         CancellationToken ct = default)
     {
+        var stored = await this.LoadSessionAsync(sessionId, ct).ConfigureAwait(false);
+        return stored?.Messages;
+    }
+
+    /// <summary>
+    /// Loads a persisted session and its optional live-session metadata. Returns <c>null</c> if
+    /// <paramref name="sessionId"/> is invalid, the file does not exist, or the file is corrupt.
+    /// </summary>
+    public async Task<StoredSession?> LoadSessionAsync(
+        string sessionId,
+        CancellationToken ct = default)
+    {
         if (!SessionIds.IsValid(sessionId))
         {
             return null;
@@ -125,8 +159,7 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         try
         {
             var json = await File.ReadAllTextAsync(path, ct).ConfigureAwait(false);
-            var root = JsonNode.Parse(json);
-            if (root is null)
+            if (JsonNode.Parse(json) is not JsonObject root)
             {
                 return null;
             }
@@ -137,7 +170,14 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
                 return null;
             }
 
-            return ChatMessageJson.DeserializeMessages(messagesArray);
+            var systemPromptOverride = root["systemPromptOverride"] is JsonValue value
+                && value.TryGetValue<string>(out var prompt)
+                ? prompt
+                : null;
+
+            return new StoredSession(
+                ChatMessageJson.DeserializeMessages(messagesArray),
+                new SessionMetadata { SystemPromptOverride = systemPromptOverride });
         }
         catch
         {
