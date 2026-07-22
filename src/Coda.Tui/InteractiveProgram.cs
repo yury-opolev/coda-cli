@@ -658,11 +658,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         if (startupIntent.Fork)
         {
             context.Session.History.AddRange(target.Messages);
+            var systemPromptOverride = context.Session.StartupSystemPromptOverride ?? target.Metadata.SystemPromptOverride;
+            context.Session.SystemPromptOverride = systemPromptOverride;
             context.Session.SessionId = await Coda.Sdk.SessionForking.ForkAsync(
                 context.Session.WorkingDirectory,
                 target.Id,
                 target.Messages,
-                new Coda.Sdk.SessionMetadata { SystemPromptOverride = context.Session.SystemPromptOverride },
+                new Coda.Sdk.SessionMetadata { SystemPromptOverride = systemPromptOverride },
                 ct).ConfigureAwait(false);
             Publish(mailbox, new DiagnosticEvent(
                 "session", $"Forked from {target.Id} into a new session ({target.Messages.Count} messages).", UiNotificationLevel.Information));

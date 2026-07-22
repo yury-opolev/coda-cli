@@ -78,16 +78,21 @@ public sealed class ForkCommandTests : IDisposable
         Assert.Equal(systemPromptOverride, stored!.Metadata.SystemPromptOverride);
     }
 
-    [Fact]
-    public async Task Interactive_startup_fork_persists_the_current_precedence_resolved_override()
+    [Theory]
+    [InlineData(null, "source exact", "source exact")]
+    [InlineData("", "source exact", "")]
+    [InlineData("startup exact", "source other", "startup exact")]
+    public async Task Interactive_startup_fork_uses_the_resolved_system_prompt_override(
+        string? startupSystemPromptOverride,
+        string sourceSystemPromptOverride,
+        string expectedSystemPromptOverride)
     {
-        var (_, context, _, _) = TestAppBuilder.BuildApp(workingDirectory: this.tempDir);
-        context.Session.SystemPromptOverride = string.Empty;
+        var (_, context) = this.BuildContext(startupSystemPromptOverride);
         var messages = new[] { new ChatMessage(ChatRole.User, [new TextBlock("q")]) };
         await new SessionTranscriptStore(this.tempDir).SaveAsync(
             "aaaaaaaaaaaa",
             messages,
-            new SessionMetadata { SystemPromptOverride = "source override" });
+            new SessionMetadata { SystemPromptOverride = sourceSystemPromptOverride });
 
         using var mailbox = new UiEventMailbox(8);
         var seed = typeof(DefaultInteractiveSessionRunner).GetMethod(
@@ -101,9 +106,10 @@ public sealed class ForkCommandTests : IDisposable
         await task;
 
         Assert.NotEqual("aaaaaaaaaaaa", context.Session.SessionId);
+        Assert.Equal(expectedSystemPromptOverride, context.Session.SystemPromptOverride);
         var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(context.Session.SessionId!);
         Assert.NotNull(stored);
-        Assert.Equal(string.Empty, stored!.Metadata.SystemPromptOverride);
+        Assert.Equal(expectedSystemPromptOverride, stored!.Metadata.SystemPromptOverride);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -121,7 +127,7 @@ public sealed class ForkCommandTests : IDisposable
         ToolDefs = [],
     };
 
-    private (TestConsole Console, CommandContext Context) BuildContext()
+    private (TestConsole Console, CommandContext Context) BuildContext(string? startupSystemPromptOverride = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -135,7 +141,11 @@ public sealed class ForkCommandTests : IDisposable
             new("claude-ai", "Claude.ai", LoginKind.OAuthLoopback, "claude-sonnet-4-6"),
         };
 
-        var session = new SessionState("claude-ai", this.tempDir);
+        var session = new SessionState("claude-ai", this.tempDir)
+        {
+            StartupSystemPromptOverride = startupSystemPromptOverride,
+            SystemPromptOverride = startupSystemPromptOverride,
+        };
         var registry = new SlashCommandRegistry(new ISlashCommand[]
         {
             new HelpCommand(), new ForkCommand(), new ExitCommand(),
