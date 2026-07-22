@@ -34,6 +34,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly ComposerController controller;
     private readonly IUiEventPublisher publisher;
     private readonly Func<UiSessionSnapshot, int, string> statusProjection;
+    private readonly ToolDisplayMode toolDisplayMode;
     private readonly Func<bool> hasActiveWork;
     private readonly ShellCommandChordState chords;
     private readonly Func<TimeSpan, Func<bool>, object> addTimeout;
@@ -74,13 +75,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<object, bool>? removeTimeout = null,
         TuiTheme? theme = null,
         Func<UiSessionSnapshot, int, string>? statusProjection = null,
-        Func<TaskBrowserProvider?>? taskBrowserProvider = null)
+        Func<TaskBrowserProvider?>? taskBrowserProvider = null,
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Tiny)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
         this.Snapshot = initialSnapshot ?? throw new ArgumentNullException(nameof(initialSnapshot));
         this.statusProjection = statusProjection ?? StatusProjector.Project;
+        this.toolDisplayMode = toolDisplayMode;
         this.hasActiveWork = hasActiveWork ?? (() => false);
         this.TimeSource = timeProvider ?? TimeProvider.System;
         this.clipboardWriter = clipboardWriter ??
@@ -138,6 +141,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>The multiline composer that owns draft/caret/history state.</summary>
     internal ComposerView Composer { get; }
+
+    /// <summary>Controller seam for recalling pending steering from the composer Up-key precedence rule.</summary>
+    internal Func<string?>? RecallPendingSteering
+    {
+        set => this.Composer.RecallPendingSteering = value;
+    }
 
     /// <summary>
     /// The borderless chrome that frames the composer region: a subtle dark background, full-width
@@ -895,7 +904,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         var status = this.transientOperationalOverride ??
             this.chords.CurrentHint ??
-            OperationalStatusProjector.Project(this.Snapshot);
+            OperationalStatusProjector.Project(this.Snapshot, this.toolDisplayMode);
         this.Operational.SetStatus(status);
     }
 
@@ -1007,7 +1016,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return;
         }
 
-        this.Operational.SetStatus(OperationalStatusProjector.Project(snapshot));
+        this.Operational.SetStatus(OperationalStatusProjector.Project(snapshot, this.toolDisplayMode));
     }
 
     /// <summary>

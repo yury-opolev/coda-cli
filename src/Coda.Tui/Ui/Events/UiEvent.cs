@@ -16,6 +16,19 @@ public abstract record UiEvent;
 /// TimeProvider seam (local time), so the rendered send-time indicator is stable across redraws.</summary>
 public sealed record UserPromptSubmittedEvent(string Text, DateTimeOffset? SentAt = null) : UiEvent;
 
+/// <summary>A busy user submission accepted into the active turn's steering queue.</summary>
+public sealed record UserPromptEnqueuedEvent(
+    Guid BlockId,
+    string Text,
+    string QueueEntryId,
+    DateTimeOffset EnqueuedAt) : UiEvent;
+
+/// <summary>One or more queued steering entries were incorporated into the live turn.</summary>
+public sealed record SteeringDeliveredEvent(IReadOnlyList<string> QueueEntryIds) : UiEvent;
+
+/// <summary>Still-pending steering entries were atomically recalled from the active turn.</summary>
+public sealed record PendingSteeringRecalledEvent(IReadOnlyList<string> QueueEntryIds) : UiEvent;
+
 /// <summary>Replace the transcript with a projected history (e.g. on resume).</summary>
 public sealed record TranscriptSeededEvent(ImmutableArray<TranscriptBlock> Blocks) : UiEvent;
 

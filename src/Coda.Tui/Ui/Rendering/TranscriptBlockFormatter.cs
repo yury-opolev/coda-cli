@@ -96,6 +96,10 @@ public static class TranscriptBlockFormatter
                 AppendUser(lines, user, safeWidth);
                 break;
 
+            case PendingUserTranscriptBlock pending:
+                AppendPendingUser(lines, pending, safeWidth);
+                break;
+
             case ToolTranscriptBlock tool:
                 if (toolDisplayMode != ToolDisplayMode.Tiny)
                 {
@@ -435,6 +439,7 @@ public static class TranscriptBlockFormatter
             {
                 firstRowWidth = width - reserved;
             }
+
             else
             {
                 time = null; // too narrow to show a time without crowding the text
@@ -455,6 +460,23 @@ public static class TranscriptBlockFormatter
                     FillWidth = true,
                     RightText = right,
                 });
+            }
+        }
+    }
+
+    private static void AppendPendingUser(List<TranscriptRenderLine> lines, PendingUserTranscriptBlock pending, int width)
+    {
+        var annotationPending = true;
+        foreach (var sourceLine in SplitLines(pending.Text))
+        {
+            foreach (var wrapped in WrapLine(sourceLine, width))
+            {
+                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.User)
+                {
+                    FillWidth = true,
+                    RightText = annotationPending ? "pending" : null,
+                });
+                annotationPending = false;
             }
         }
     }

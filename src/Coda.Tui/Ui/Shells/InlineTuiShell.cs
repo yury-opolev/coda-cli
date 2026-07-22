@@ -33,7 +33,9 @@ internal sealed class InlineTuiShell(
     Func<object, bool>? removeTimeout = null,
     TuiTheme? theme = null,
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
-    Func<TaskBrowserProvider?>? taskBrowserProvider = null)
+    Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
+    Func<TaskBrowserProvider?>? taskBrowserProvider = null,
+    ToolDisplayMode toolDisplayMode = ToolDisplayMode.Tiny)
     : FullscreenTuiShell(
         app,
         controller,
@@ -47,7 +49,9 @@ internal sealed class InlineTuiShell(
         removeTimeout,
         theme,
         statusProjection,
-        taskBrowserProvider: taskBrowserProvider)
+        transcriptFormatter,
+        taskBrowserProvider: taskBrowserProvider,
+        toolDisplayMode: toolDisplayMode)
 {
     /// <summary>
     /// The fewest rows the inline region can occupy: header (1), operational (1), the chrome region

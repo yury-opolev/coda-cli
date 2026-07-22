@@ -137,14 +137,15 @@ dotnet run --project src/Coda.Tui -- --plain            # plain output (screen r
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
 
-**Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · `Up`/`Down` move the composer
+**Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda ·
 `Ctrl+C` copies the current transcript selection and, with nothing selected,
 exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `F2`
 switches between full-screen and inline · `Ctrl+B` sends the selected (or latest) running **foreground
 shell** to the background — and, inside the `/tasks` browser, releases an output attachment — without ever
-opening the browser. Typing a `/` shows a slash-command completion menu directly
+opening the browser · `Ctrl+End` jumps to the newest transcript output (the scrollbar shows position).
+Typing a `/` shows a slash-command completion menu directly
 above the composer (Up/Down select, Tab completes, a single Esc dismisses).
 
 **Mouse:** in the **transcript**, **left-drag** selects text and `Ctrl+C` copies it. In the **composer**,
@@ -756,6 +757,18 @@ project files if they exist (it never writes to them).
 | MCP servers | `~/.coda/.mcp.json`, `<project>/.mcp.json` | stdio + HTTP; project overrides user |
 | Session memory | `<project>/.coda/SESSION_MEMORY.md` | when enabled |
 | Telemetry logs | `~/.coda/logs/coda-<timestamp>-<pid>.log` | JSON-lines; opt-in; secrets redacted |
+
+### Tool display mode
+
+Set `toolDisplayMode` only in the user settings file (`~/.coda/settings.json`); project settings cannot
+override it. The default is `"tiny"` (tool details are hidden), `"compact"` shows concise activity, and
+`"verbose"` shows tool inputs and results:
+
+```json
+{ "toolDisplayMode": "compact" }
+```
+
+An invalid nonblank value is reported safely at startup and falls back to `"tiny"`.
 
 **Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
 (including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and

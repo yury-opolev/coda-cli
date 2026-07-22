@@ -174,6 +174,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
         // Settings first so provider construction honors the configured GitHub Copilot enterprise domain.
         var startupSettings = Coda.Agent.Settings.SettingsLoader.Load(cwd);
+        var toolDisplayResolution = ToolDisplayModeResolver.Resolve(startupSettings.ToolDisplayMode);
+        var toolDisplayMode = toolDisplayResolution.Mode;
         CopilotEnvironment.ApplyEnterpriseDomain(startupSettings.GitHubEnterpriseDomain);
 
         using var claude = new ClaudeAiProvider();
@@ -208,6 +210,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // switch never rebuilds them; only the actor's frame/observer sink and the command environment swap.
         using var mailbox = new UiEventMailbox(capacity: 512, hostToken);
         var actorPrompts = new ActorUiPromptService(mailbox);
+        if (!toolDisplayResolution.IsValid)
+        {
+            Publish(mailbox, new DiagnosticEvent(
+                "settings",
+                $"Invalid toolDisplayMode '{toolDisplayResolution.RawValue}'; using tiny.",
+                UiNotificationLevel.Warning));
+        }
 
         var realConsole = AnsiConsole.Console;
 
@@ -336,7 +345,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             var plainConsole = new UiAnsiConsoleAdapter(mailbox, this.OffscreenWidth(), this.OffscreenHeight());
             context.SetModeEnvironment(plainConsole, PlainUiPromptService.Instance, mailbox, semanticUiEnabled: true);
             frameSink.Set(null, null);
-            observer.Set(new PlainOutputRenderer(this.output));
+            observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
             controller.BeginStartup();
             await EnsureStartupAsync().ConfigureAwait(false);
@@ -366,7 +375,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             // write straight to the real console rather than through the adapter.
             context.SetModeEnvironment(realConsole, new SpectreUiPromptService(realConsole), mailbox, semanticUiEnabled: false);
             frameSink.Set(null, null);
-            observer.Set(new PlainOutputRenderer(this.output));
+            observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
             controller.BeginStartup();
             await EnsureStartupAsync().ConfigureAwait(false);
@@ -400,13 +409,19 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             TerminalGuiShellBase shell = shellMode == TuiRunMode.Fullscreen
                 ? new FullscreenTuiShell(
                     tgApp, composerController, mailbox, controller.CurrentSnapshot,
-                    hasActiveWork: () => controller.HasActiveWork, taskBrowserProvider: taskBrowserProvider)
+                    hasActiveWork: () => controller.HasActiveWork,
+                    transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
+                    taskBrowserProvider: taskBrowserProvider,
+                    toolDisplayMode: toolDisplayMode)
                 : new InlineTuiShell(
                     tgApp, composerController, mailbox, controller.CurrentSnapshot,
-                    hasActiveWork: () => controller.HasActiveWork, taskBrowserProvider: taskBrowserProvider);
+                    hasActiveWork: () => controller.HasActiveWork,
+                    transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
+                    toolDisplayMode: toolDisplayMode);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);
+            shell.RecallPendingSteering = controller.RecallSteering;
             controller.AttachShell(shell, shellMode);
 
             // Route a frame-sink/actor fault into an ordered failure: disable submit, interrupt the active

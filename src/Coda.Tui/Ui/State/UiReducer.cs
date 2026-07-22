@@ -21,6 +21,11 @@ public static class UiReducer
     public static UiSessionSnapshot Reduce(UiSessionSnapshot state, UiEvent uiEvent) => uiEvent switch
     {
         UserPromptSubmittedEvent e => Append(state, new UserTranscriptBlock(Guid.NewGuid(), e.Text, e.SentAt)),
+        UserPromptEnqueuedEvent e => Append(
+            state,
+            new PendingUserTranscriptBlock(e.BlockId, e.Text, e.QueueEntryId, e.EnqueuedAt)),
+        SteeringDeliveredEvent e => DeliverPendingSteering(state, e.QueueEntryIds),
+        PendingSteeringRecalledEvent e => RemovePendingSteering(state, e.QueueEntryIds),
         TranscriptSeededEvent e => state with { Transcript = e.Blocks },
 
         AssistantTextDeltaEvent e => AppendOrExtendAssistant(state, e.Delta),
@@ -109,17 +114,19 @@ public static class UiReducer
 
         TurnStartedEvent e => state with { ActiveOperation = new ActiveOperation("turn", e.Prompt, null) },
         TurnCompletedEvent e => e.Success
-            ? state with { ActiveOperation = null }
+            ? RemoveAllPendingSteering(state) with { ActiveOperation = null }
             : state with
             {
                 ActiveOperation = null,
                 Notification = new UiNotification("Turn failed", UiNotificationLevel.Error),
+                Transcript = RemoveAllPendingSteering(state).Transcript,
             },
         TurnInterruptedEvent => state with
         {
             ActiveOperation = null,
             Notification = new UiNotification("Turn interrupted", UiNotificationLevel.Warning),
             PendingPrompt = null,
+            Transcript = RemoveAllPendingSteering(state).Transcript,
         },
 
         UiPromptRequestedEvent e => state with { PendingPrompt = e.Request },
@@ -134,6 +141,47 @@ public static class UiReducer
 
     private static UiSessionSnapshot Append(UiSessionSnapshot state, TranscriptBlock block) =>
         state with { Transcript = state.Transcript.Add(block) };
+
+    private static UiSessionSnapshot DeliverPendingSteering(UiSessionSnapshot state, IReadOnlyList<string> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return state;
+        }
+
+        var delivered = new HashSet<string>(ids, StringComparer.Ordinal);
+        var transcript = state.Transcript;
+        for (var i = 0; i < transcript.Length; i++)
+        {
+            if (transcript[i] is PendingUserTranscriptBlock pending && delivered.Contains(pending.QueueEntryId))
+            {
+                transcript = transcript.SetItem(
+                    i,
+                    new UserTranscriptBlock(pending.Id, pending.Text, pending.EnqueuedAt));
+            }
+        }
+
+        return state with { Transcript = transcript };
+    }
+
+    private static UiSessionSnapshot RemovePendingSteering(UiSessionSnapshot state, IReadOnlyList<string> ids)
+    {
+        if (ids.Count == 0)
+        {
+            return state;
+        }
+
+        var recalled = new HashSet<string>(ids, StringComparer.Ordinal);
+        return state with
+        {
+            Transcript = state.Transcript.Where(
+                block => block is not PendingUserTranscriptBlock pending || !recalled.Contains(pending.QueueEntryId))
+                .ToImmutableArray(),
+        };
+    }
+
+    private static UiSessionSnapshot RemoveAllPendingSteering(UiSessionSnapshot state) =>
+        state with { Transcript = state.Transcript.Where(block => block is not PendingUserTranscriptBlock).ToImmutableArray() };
 
     private static UiSessionSnapshot Notice(UiSessionSnapshot state, string text, UiNotificationLevel level) =>
         state with

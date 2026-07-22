@@ -38,7 +38,8 @@ internal class FullscreenTuiShell(
     TuiTheme? theme = null,
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
-    Func<TaskBrowserProvider?>? taskBrowserProvider = null)
+    Func<TaskBrowserProvider?>? taskBrowserProvider = null,
+    ToolDisplayMode toolDisplayMode = ToolDisplayMode.Tiny)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -52,7 +53,8 @@ internal class FullscreenTuiShell(
         removeTimeout,
         theme,
         statusProjection,
-        taskBrowserProvider: taskBrowserProvider)
+        taskBrowserProvider: taskBrowserProvider,
+        toolDisplayMode: toolDisplayMode)
 {
     /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
     /// visual line (the chrome adds the two half-block edge rows around it).</summary>

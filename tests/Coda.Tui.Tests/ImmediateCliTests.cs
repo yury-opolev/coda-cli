@@ -98,6 +98,18 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
+    public void Help_documents_queued_busy_submissions_recall_and_tool_display_mode()
+    {
+        var (_, output) = Run("--help");
+
+        Assert.Contains("queued", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("recalls queued", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Ctrl+End", output);
+        Assert.Contains("toolDisplayMode", output);
+        Assert.Contains("tiny (default)", output);
+    }
+
+    [Fact]
     public void Help_does_not_bind_ctrl_d()
     {
         var (_, output) = Run("--help");
