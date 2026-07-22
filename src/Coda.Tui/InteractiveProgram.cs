@@ -103,7 +103,30 @@ public static class InteractiveProgram
         ArgumentNullException.ThrowIfNull(error);
         ArgumentNullException.ThrowIfNull(capabilities);
 
+        var startupWorkingDirectory = Directory.GetCurrentDirectory();
         var options = TuiLaunchOptions.Parse(args);
+        if (options.Error is not null)
+        {
+            error.WriteLine(options.Error);
+            return 2;
+        }
+
+        try
+        {
+            options = options with
+            {
+                SystemPromptOverride = await SystemPromptSourceResolver.ResolveAsync(
+                    options.SystemPromptSource,
+                    startupWorkingDirectory,
+                    cancellationToken).ConfigureAwait(false),
+            };
+        }
+        catch (SystemPromptSourceException ex)
+        {
+            error.WriteLine(ex.Message);
+            return 2;
+        }
+
         var caps = capabilities.Get();
         var decision = TuiModePolicy.SelectInitial(options, caps);
         if (decision.Error is not null || decision.Mode is not { } mode)

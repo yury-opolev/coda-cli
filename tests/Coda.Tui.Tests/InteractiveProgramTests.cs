@@ -152,6 +152,47 @@ public sealed class InteractiveProgramTests
     }
 
     [Fact]
+    public async Task Startup_resolves_exact_system_prompt_before_invoking_runner()
+    {
+        var error = new StringWriter();
+        var runner = new RecordingInteractiveSessionRunner(TextWriter.Null);
+
+        var exitCode = await InteractiveProgram.RunAsync(
+            ["--system-prompt", " \r\nexact\n", "--resume", "abc", "--plain"],
+            TextReader.Null,
+            TextWriter.Null,
+            error,
+            new FixedCapabilitiesProvider(new TerminalCapabilities(false, true, 120, 40, true)),
+            CancellationToken.None,
+            runner);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(" \r\nexact\n", runner.Options!.SystemPromptOverride);
+        Assert.Equal(["--resume", "abc"], runner.Options.RemainingArgs);
+    }
+
+    [Fact]
+    public async Task Missing_system_prompt_file_returns_usage_error_without_invoking_runner()
+    {
+        var error = new StringWriter();
+        var runner = new RecordingInteractiveSessionRunner(TextWriter.Null);
+        const string missingFile = "does-not-exist-system-prompt.txt";
+
+        var exitCode = await InteractiveProgram.RunAsync(
+            ["--system-prompt-file", missingFile, "--plain"],
+            TextReader.Null,
+            TextWriter.Null,
+            error,
+            new FixedCapabilitiesProvider(new TerminalCapabilities(false, true, 120, 40, true)),
+            CancellationToken.None,
+            runner);
+
+        Assert.Equal(2, exitCode);
+        Assert.Contains(missingFile, error.ToString());
+        Assert.Null(runner.Options);
+    }
+
+    [Fact]
     public async Task Plain_composition_serializes_dispatched_command_output_without_escapes()
     {
         // Exercises the real plain-mode composition wiring: the command console publishes into the
@@ -258,6 +299,7 @@ public sealed class InteractiveProgramTests
         : IInteractiveSessionRunner
     {
         public TuiRunMode? Mode { get; private set; }
+        public TuiLaunchOptions? Options { get; private set; }
 
         public async Task<int> RunAsync(
             TuiRunMode mode,
@@ -267,6 +309,7 @@ public sealed class InteractiveProgramTests
             CancellationToken cancellationToken)
         {
             this.Mode = mode;
+            this.Options = options;
             var line = await input.ReadLineAsync(cancellationToken);
             output.WriteLine($"{mode.ToString().ToLowerInvariant()} {line}");
             return 0;
