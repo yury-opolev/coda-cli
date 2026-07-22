@@ -190,6 +190,8 @@ public sealed class SubagentHost : ISubagentHost
 
         public void OnLimitReached(string kind, string message) => this.parent.OnLimitReached(kind, message);
 
+        public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.parent.OnSteeringDelivered(ids);
+
         public void OnStopReason(string? stopReason) => this.parent.OnStopReason(stopReason);
 
         public void OnUsage(TokenUsage usage) => this.parent.OnUsage(usage);

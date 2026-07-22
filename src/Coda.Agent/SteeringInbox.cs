@@ -1,47 +1,109 @@
-using System.Collections.Concurrent;
-
 namespace Coda.Agent;
 
+/// <summary>An operator message queued for delivery into an active agent turn.</summary>
+public sealed record SteeringEntry(string Id, string Text, DateTimeOffset EnqueuedAt);
+
 /// <summary>
-/// A thread-safe inbox of steering comments the orchestrator can post WHILE a turn is running.
-/// The running <see cref="AgentLoop"/> drains it at the top of each iteration and injects the
-/// comments as a synthetic user message before the next model call, so a turn already in flight
-/// can be redirected. In-memory and per-session — comments are delivered to the live turn, not
-/// persisted across process restarts.
+/// Thread-safe FIFO queue for operator steering. The queue is open for an active turn and is
+/// atomically sealed at its natural completion, preventing a racing message from being accepted
+/// after the last delivery boundary.
 /// </summary>
 public sealed class SteeringInbox
 {
-    private readonly ConcurrentQueue<string> queue = new();
+    private readonly object gate = new();
+    private readonly List<SteeringEntry> pending = [];
+    private bool sealedEmpty;
 
-    /// <summary>Posts a steering comment to be delivered before the next model call.</summary>
-    public void Enqueue(string comment)
+    /// <summary>Gets whether the queue currently contains undelivered messages.</summary>
+    public bool HasPending
     {
-        ArgumentException.ThrowIfNullOrWhiteSpace(comment);
-        this.queue.Enqueue(comment);
+        get
+        {
+            lock (this.gate)
+            {
+                return this.pending.Count != 0;
+            }
+        }
     }
 
-    /// <summary>Discards all pending comments — used at a turn boundary so a stale steer cannot leak into the next turn.</summary>
+    /// <summary>
+    /// Queues a message, returning its accepted entry, or <see langword="null"/> if the owning
+    /// turn has already sealed its queue.
+    /// </summary>
+    public SteeringEntry? Enqueue(string text)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        lock (this.gate)
+        {
+            if (this.sealedEmpty)
+            {
+                return null;
+            }
+
+            var entry = new SteeringEntry(Guid.NewGuid().ToString("N"), text, DateTimeOffset.UtcNow);
+            this.pending.Add(entry);
+            return entry;
+        }
+    }
+
+    /// <summary>Atomically removes pending entries for delivery, preserving FIFO order.</summary>
+    public IReadOnlyList<SteeringEntry> TakeAllForDelivery() => this.TakeAll();
+
+    /// <summary>Atomically removes pending entries for recall, preserving FIFO order.</summary>
+    public IReadOnlyList<SteeringEntry> RecallAll() => this.TakeAll();
+
+    /// <summary>Legacy text-only delivery API. New consumers should use <see cref="TakeAllForDelivery"/>.</summary>
+    public IReadOnlyList<string> DrainAll() => this.TakeAll().Select(entry => entry.Text).ToArray();
+
+    /// <summary>Reopens the queue for a newly-started turn without discarding queued entries.</summary>
+    public void OpenForTurn()
+    {
+        lock (this.gate)
+        {
+            this.sealedEmpty = false;
+        }
+    }
+
+    /// <summary>Clears pending entries and reopens the queue.</summary>
     public void Clear()
     {
-        while (this.queue.TryDequeue(out _))
+        lock (this.gate)
         {
+            this.pending.Clear();
+            this.sealedEmpty = false;
         }
     }
 
-    /// <summary>Removes and returns all queued comments in FIFO order (empty when none are pending).</summary>
-    public IReadOnlyList<string> DrainAll()
+    /// <summary>
+    /// Atomically seals the queue only if it is empty. A false result leaves the queue open so
+    /// the caller can deliver the raced message at another safe boundary.
+    /// </summary>
+    public bool TrySealEmpty()
     {
-        if (this.queue.IsEmpty)
+        lock (this.gate)
         {
-            return [];
-        }
+            if (this.pending.Count != 0)
+            {
+                return false;
+            }
 
-        var drained = new List<string>();
-        while (this.queue.TryDequeue(out var comment))
+            this.sealedEmpty = true;
+            return true;
+        }
+    }
+
+    private IReadOnlyList<SteeringEntry> TakeAll()
+    {
+        lock (this.gate)
         {
-            drained.Add(comment);
-        }
+            if (this.pending.Count == 0)
+            {
+                return [];
+            }
 
-        return drained;
+            var entries = this.pending.ToArray();
+            this.pending.Clear();
+            return entries;
+        }
     }
 }

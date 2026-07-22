@@ -87,6 +87,12 @@ public sealed class DeferralTests
         Assert.False(DeferredTools.IsDeferred(tool));
     }
 
+    [Fact]
+    public void Task_recall_is_deferred()
+    {
+        Assert.True(DeferredTools.IsDeferred(new Coda.Agent.Tools.TaskRecallTool()));
+    }
+
     // ── Test helpers ────────────────────────────────────────────────────────
 
     private sealed class StubTool : ITool
@@ -110,4 +116,3 @@ public sealed class DeferralTests
     }
 
 }
-

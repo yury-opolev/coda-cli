@@ -61,6 +61,12 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventLimitReached, node);
     }
 
+    public void OnSteeringDelivered(IReadOnlyList<string> ids)
+    {
+        var node = ServeJson.ToNode(new SteeringDeliveredEvent(ids));
+        _ = this.SendAsync(ServeMethods.EventSteeringDelivered, node);
+    }
+
     public void OnStopReason(string? stopReason)
     {
         var node = ServeJson.ToNode(new StopEvent(stopReason));

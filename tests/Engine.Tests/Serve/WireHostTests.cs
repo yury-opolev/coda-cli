@@ -111,6 +111,21 @@ public sealed class WireHostTests
         Assert.Equal("Reached the maximum of 500 tool iterations.", received!["message"]!.GetValue<string>());
     }
 
+    [Fact]
+    public async Task WireAgentSink_OnSteeringDelivered_sends_message_ids()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+        var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConn.OnNotification(ServeMethods.EventSteeringDelivered, node => tcs.TrySetResult(node));
+
+        new WireAgentSink(clientConn).OnSteeringDelivered(["one", "two"]);
+
+        var received = await tcs.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(["one", "two"], received!["messageIds"]!.AsArray().Select(node => node!.GetValue<string>()));
+    }
+
     // ---------------------------------------------------------------------------
     // WirePermissionPrompt tests
     // ---------------------------------------------------------------------------

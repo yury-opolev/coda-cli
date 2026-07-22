@@ -68,7 +68,7 @@ public sealed class CodaSessionTests : IDisposable
         Assert.True(result.Success);
         Assert.Equal("hello world", result.FinalText);
         Assert.Equal("end_turn", result.StopReason);
-        Assert.Equal(2, session.History.Count); // user + assistant
+        Assert.Equal(3, session.History.Count); // user + deferred-tool reminder + assistant
     }
 
     [Fact]
@@ -80,7 +80,7 @@ public sealed class CodaSessionTests : IDisposable
         await session.RunAsync("first");
         await session.RunAsync("second");
 
-        Assert.Equal(4, session.History.Count);
+        Assert.Equal(6, session.History.Count);
     }
 
     [Fact]
@@ -168,7 +168,7 @@ public sealed class CodaSessionTests : IDisposable
 
         Assert.True(result.Success);
         Assert.Equal("hello world", result.FinalText);
-        Assert.Equal(2, session.History.Count); // user + assistant, no injected turns
+        Assert.Equal(3, session.History.Count); // user + deferred-tool reminder + assistant, no injected turns
     }
 
     public void Dispose()

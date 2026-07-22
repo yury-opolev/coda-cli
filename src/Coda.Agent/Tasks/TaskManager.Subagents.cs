@@ -199,12 +199,30 @@ public sealed partial class TaskManager
         if (t.Kind is not (TaskKind.Subagent or TaskKind.Scheduled)) return TaskActionResult.Rejected;
         if (t.Status != TaskRunStatus.Running) return TaskActionResult.InvalidState;
         if (t.Steering is null) return TaskActionResult.Rejected;
-        t.Steering.Enqueue(message);
-        return TaskActionResult.Ok;
+        return t.Steering.Enqueue(message) is null ? TaskActionResult.Rejected : TaskActionResult.Ok;
     }
 
     /// <summary>Compatibility overload for the main agent (full authority over every task).</summary>
     public TaskActionResult Steer(string id, string message) => Steer(id, message, callerTaskId: null);
+
+    /// <summary>
+    /// Recalls pending steering from a running steerable task. Authorization is checked before its
+    /// kind or state so an unauthorized caller cannot distinguish targets it does not own.
+    /// </summary>
+    public (TaskActionResult Status, IReadOnlyList<SteeringEntry> Messages) RecallSteering(string id, string? callerTaskId)
+    {
+        var task = Find(id);
+        if (task is null) return (TaskActionResult.NotFound, []);
+        if (!IsAuthorizedCaller(id, callerTaskId)) return (TaskActionResult.Denied, []);
+        if (task.Kind is not (TaskKind.Subagent or TaskKind.Scheduled)) return (TaskActionResult.Rejected, []);
+        if (task.Status != TaskRunStatus.Running) return (TaskActionResult.InvalidState, []);
+        if (task.Steering is null) return (TaskActionResult.Rejected, []);
+        return (TaskActionResult.Ok, task.Steering.RecallAll());
+    }
+
+    /// <summary>Compatibility overload for the main agent.</summary>
+    public (TaskActionResult Status, IReadOnlyList<SteeringEntry> Messages) RecallSteering(string id) =>
+        RecallSteering(id, callerTaskId: null);
 
     /// <summary>
     /// Reads incremental output for a caller's own server-side cursor (backs <c>task_output</c>).
@@ -295,6 +313,8 @@ public sealed partial class TaskManager
             _manager.AppendOutput(_taskId, $"[limit: {kind}: {message}]\n");
             _parent.OnLimitReached(kind, message);
         }
+
+        public void OnSteeringDelivered(IReadOnlyList<string> ids) => _parent.OnSteeringDelivered(ids);
 
         // The turn's stop reason — appended as a concise marker so it stays visible.
         public void OnStopReason(string? stopReason)

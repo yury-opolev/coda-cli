@@ -75,6 +75,8 @@ internal sealed class RecordingSink : IAgentSink
 
     public void OnLimitReached(string kind, string message) => this.inner?.OnLimitReached(kind, message);
 
+    public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.inner?.OnSteeringDelivered(ids);
+
     public void OnUsage(TokenUsage usage)
     {
         this.Usage = this.Usage.Add(usage);

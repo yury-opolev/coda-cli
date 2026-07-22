@@ -502,20 +502,39 @@ public sealed class ServeHost : IAsyncDisposable
         {
             this.EnsureAuthenticated();
             var sp = ServeJson.FromNode<SteerParams>(p);
-            var accepted = false;
+            string? messageId = null;
             if (!string.IsNullOrWhiteSpace(sp?.Text))
             {
                 lock (this.turnLock)
                 {
                     if (this.turnRunning == 1)
                     {
-                        sess.Steer(sp!.Text);
-                        accepted = true;
+                        messageId = sess.Steer(sp!.Text);
                     }
                 }
             }
 
-            return ServeJson.ToNode(new SteerResult(accepted));
+            return ServeJson.ToNode(new SteerResult(messageId is not null, messageId));
+        });
+
+        // session/recallSteering → atomically remove still-pending steering for the active turn.
+        // The same running-turn guard as session/steer prevents stale recalled entries from leaking
+        // into a future turn.
+        conn.OnRequest(ServeMethods.RecallSteering, _ =>
+        {
+            this.EnsureAuthenticated();
+            IReadOnlyList<SteeringEntry> entries = [];
+            lock (this.turnLock)
+            {
+                if (this.turnRunning == 1)
+                {
+                    entries = sess.RecallSteering();
+                }
+            }
+
+            return ServeJson.ToNode(new RecallSteeringResult(entries
+                .Select(entry => new RecalledSteeringMessage(entry.Id, entry.Text, entry.EnqueuedAt))
+                .ToArray()));
         });
 
         // session/history → all messages.

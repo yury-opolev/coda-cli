@@ -27,6 +27,7 @@ public static class BuiltInTools
         new TaskGetTool(),
         new TaskPeekTool(),
         new TaskSendTool(),
+        new TaskRecallTool(),
         new TaskBackgroundTool(),
         new TaskWaitTool(),
         new TaskRemoveTool(),
