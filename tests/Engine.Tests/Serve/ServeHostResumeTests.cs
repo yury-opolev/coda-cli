@@ -35,7 +35,8 @@ public sealed class ServeHostResumeTests : IDisposable
         return creds;
     }
 
-    private Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> MakeFactory()
+    private Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> MakeFactory(
+        string? systemPromptOverride = null)
     {
         return (perm, question, plan) =>
         {
@@ -48,6 +49,7 @@ public sealed class ServeHostResumeTests : IDisposable
                 InteractivePrompt = perm,
                 UserQuestionPrompt = question,
                 PlanApprover = plan,
+                SystemPromptOverride = systemPromptOverride,
             };
             return new CodaSession(SignedInClaude(), options, httpClient: new HttpClient());
         };
@@ -94,6 +96,106 @@ public sealed class ServeHostResumeTests : IDisposable
 
         cts.Cancel();
         try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Initialize_with_sessionId_applies_metadata_before_initialization_delegate()
+    {
+        var store = new SessionTranscriptStore(this.workDir);
+        await store.SaveAsync(
+            "resume-me",
+            [new ChatMessage(ChatRole.User, [new TextBlock("first question")])],
+            new SessionMetadata { SystemPromptOverride = "persisted prompt" });
+
+        var initializationCalls = 0;
+        string? capturedSessionId = null;
+        string? capturedPrompt = null;
+
+        using var pair = new DuplexStreamPair();
+        await using var host = new ServeHost(
+            pair.ServerReads,
+            pair.ServerWrites,
+            this.MakeFactory(),
+            expectedApiKey: null,
+            initializeSession: (session, _) =>
+            {
+                Interlocked.Increment(ref initializationCalls);
+                capturedSessionId = session.SessionId;
+                capturedPrompt = session.Options.SystemPromptOverride;
+                return Task.CompletedTask;
+            });
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var initNode = await orchestrator
+            .SendRequestAsync(
+                ServeMethods.Initialize,
+                ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, SessionId: "resume-me")),
+                CancellationToken.None)
+            .WaitAsync(WaitTimeout);
+
+        var init = ServeJson.FromNode<InitializeResult>(initNode);
+        Assert.NotNull(init);
+        Assert.Equal("resume-me", capturedSessionId);
+        Assert.Equal("persisted prompt", capturedPrompt);
+        Assert.Equal(1, Volatile.Read(ref initializationCalls));
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+    }
+
+    [Fact]
+    public async Task Concurrent_initialize_with_sessionId_and_prompt_applies_metadata_before_initialization()
+    {
+        var store = new SessionTranscriptStore(this.workDir);
+        await store.SaveAsync(
+            "resume-me",
+            [new ChatMessage(ChatRole.User, [new TextBlock("first question")])],
+            new SessionMetadata { SystemPromptOverride = "persisted prompt" });
+
+        var initializationCalls = 0;
+        string? capturedSessionId = null;
+        string? capturedPrompt = null;
+        var initializationEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        using var pair = new DuplexStreamPair();
+        await using var host = new ServeHost(
+            pair.ServerReads,
+            pair.ServerWrites,
+            this.MakeFactory(),
+            expectedApiKey: null,
+            initializeSession: (session, _) =>
+            {
+                Interlocked.Increment(ref initializationCalls);
+                capturedSessionId = session.SessionId;
+                capturedPrompt = session.Options.SystemPromptOverride;
+                initializationEntered.TrySetResult();
+                return Task.Delay(Timeout.InfiniteTimeSpan, _);
+            });
+        using var cts = new CancellationTokenSource();
+        var hostTask = host.RunAsync(cts.Token);
+
+        await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        var initializeTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, SessionId: "resume-me")),
+            CancellationToken.None);
+        var promptTask = orchestrator.SendRequestAsync(
+            ServeMethods.Prompt,
+            ServeJson.ToNode(new PromptParams { Text = "follow up" }),
+            CancellationToken.None);
+
+        await initializationEntered.Task.WaitAsync(WaitTimeout);
+
+        Assert.Equal("resume-me", capturedSessionId);
+        Assert.Equal("persisted prompt", capturedPrompt);
+        Assert.Equal(1, Volatile.Read(ref initializationCalls));
+
+        cts.Cancel();
+        try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
+        await Assert.ThrowsAnyAsync<Exception>(() => initializeTask.WaitAsync(WaitTimeout));
+        await Assert.ThrowsAnyAsync<Exception>(() => promptTask.WaitAsync(WaitTimeout));
     }
 
     [Fact]

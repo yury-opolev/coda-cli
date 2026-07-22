@@ -118,6 +118,7 @@ public static class HeadlessRunner
 
         List<ChatMessage>? seedHistory = null;
         string? seedSessionId = null;
+        SessionCli.ResumeTarget? rootResumeTarget = null;
         if (options.Continue || options.ResumeSessionId is not null || options.Fork)
         {
             var continueLatest = options.Continue || (options.Fork && options.ForkSessionId is null);
@@ -137,10 +138,20 @@ public static class HeadlessRunner
             seedSessionId = options.Fork
                 ? await SessionForking.ForkAsync(workingDirectory, target.Id, target.Messages, cancellationToken).ConfigureAwait(false)
                 : target.Id;
+            if (!options.Fork)
+            {
+                rootResumeTarget = target;
+            }
+
             if (options.Fork) { Console.Error.WriteLine($"[fork] from {target.Id} -> {seedSessionId} ({target.Messages.Count} messages)"); }
         }
 
         using var session = new CodaSession(credentials, sessionOptions, history: seedHistory, sessionId: seedSessionId);
+        if (rootResumeTarget is not null)
+        {
+            // Apply persisted root metadata against CodaSession's constructor-captured startup authority.
+            session.Resume(rootResumeTarget.Id, rootResumeTarget.Messages, rootResumeTarget.Metadata);
+        }
 
         // Start configured LSP servers + diagnostics handlers (no-op when none configured).
         await session.InitializeAsync(cancellationToken).ConfigureAwait(false);

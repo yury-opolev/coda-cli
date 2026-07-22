@@ -7,7 +7,7 @@ namespace Coda.Tui.Tests;
 
 public sealed class CodaSessionResumeTests
 {
-    private static CodaSession NewSession(string workingDir)
+    private static CodaSession NewSession(string workingDir, string? systemPromptOverride = null)
     {
         var credentials = new CredentialManager(
             new InMemoryTokenStore(),
@@ -18,6 +18,7 @@ public sealed class CodaSessionResumeTests
             ProviderId = ApiKeyProvider.Id,
             Model = "claude-sonnet-4-6",
             WorkingDirectory = workingDir,
+            SystemPromptOverride = systemPromptOverride,
         });
     }
 
@@ -39,6 +40,53 @@ public sealed class CodaSessionResumeTests
             Assert.Equal("session-42", session.SessionId);
             Assert.Equal(2, session.History.Count);
             Assert.Equal("hello", ((TextBlock)session.History[0].Content[0]).Text);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(null, "persisted prompt", "persisted prompt")]
+    [InlineData("cli prompt", "persisted prompt", "cli prompt")]
+    [InlineData("", "persisted prompt", "")]
+    [InlineData(null, null, null)]
+    public void Resume_resolves_system_prompt_override_by_startup_then_metadata(
+        string? startupOverride,
+        string? persistedOverride,
+        string? expectedOverride)
+    {
+        var dir = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            using var session = NewSession(dir, startupOverride);
+
+            session.Resume(
+                "session-42",
+                [new ChatMessage(ChatRole.User, [new TextBlock("hello")])],
+                new SessionMetadata { SystemPromptOverride = persistedOverride });
+
+            Assert.Equal(expectedOverride, session.Options.SystemPromptOverride);
+        }
+        finally
+        {
+            Directory.Delete(dir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Resume_two_argument_overload_preserves_empty_metadata_behavior()
+    {
+        var dir = Directory.CreateTempSubdirectory().FullName;
+        try
+        {
+            using var session = NewSession(dir);
+
+            session.Resume("session-42", [new ChatMessage(ChatRole.User, [new TextBlock("hello")])]);
+
+            Assert.Equal("session-42", session.SessionId);
+            Assert.Null(session.Options.SystemPromptOverride);
         }
         finally
         {

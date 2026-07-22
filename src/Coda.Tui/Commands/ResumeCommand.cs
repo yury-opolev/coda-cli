@@ -136,19 +136,19 @@ public sealed class ResumeCommand : ISlashCommand
         string sessionId,
         CancellationToken cancellationToken)
     {
-        var messages = await store.LoadAsync(sessionId, cancellationToken).ConfigureAwait(false);
-        if (messages is null)
+        var stored = await store.LoadSessionAsync(sessionId, cancellationToken).ConfigureAwait(false);
+        if (stored is null)
         {
             context.Console.MarkupLine($"[red]Session '{Markup.Escape(sessionId)}' not found.[/]");
             return CommandResult.Continue;
         }
 
-        context.Session.History.Clear();
-        context.Session.History.AddRange(messages);
-        context.Session.SessionId = sessionId;   // adopt: subsequent turns append to this transcript (true continue)
+        SessionCli.ApplyResumeTarget(
+            context.Session,
+            new SessionCli.ResumeTarget(sessionId, stored.Messages, stored.Metadata));
 
         var escapedId = Markup.Escape(sessionId);
-        context.Console.MarkupLine($"[grey50]Resumed session {escapedId} ({messages.Count} messages).[/]");
+        context.Console.MarkupLine($"[grey50]Resumed session {escapedId} ({stored.Messages.Count} messages).[/]");
         SessionMetadataEvents.Publish(context);
         return CommandResult.Continue;
     }

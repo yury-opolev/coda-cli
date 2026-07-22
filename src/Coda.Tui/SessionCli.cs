@@ -1,4 +1,5 @@
 using Coda.Sdk;
+using Coda.Tui.Repl;
 using LlmClient;
 
 namespace Coda.Tui;
@@ -7,7 +8,22 @@ namespace Coda.Tui;
 public static class SessionCli
 {
     /// <summary>A resolved resume target: the session id to adopt and its persisted messages.</summary>
-    public sealed record ResumeTarget(string Id, IReadOnlyList<ChatMessage> Messages);
+    public sealed record ResumeTarget(
+        string Id,
+        IReadOnlyList<ChatMessage> Messages,
+        SessionMetadata Metadata)
+    {
+        public ResumeTarget(string id, IReadOnlyList<ChatMessage> messages)
+            : this(id, messages, SessionMetadata.Empty)
+        {
+        }
+
+        public void Deconstruct(out string id, out IReadOnlyList<ChatMessage> messages)
+        {
+            id = this.Id;
+            messages = this.Messages;
+        }
+    }
 
     /// <summary>
     /// Resolve a continue/resume request over <paramref name="workingDirectory"/>'s sessions.
@@ -31,8 +47,22 @@ public static class SessionCli
             return null;
         }
 
-        var messages = await store.LoadAsync(id, ct).ConfigureAwait(false);
-        return messages is null ? null : new ResumeTarget(id, messages);
+        var stored = await store.LoadSessionAsync(id, ct).ConfigureAwait(false);
+        return stored is null ? null : new ResumeTarget(id, stored.Messages, stored.Metadata);
+    }
+
+    /// <summary>Apply a resumed root session to the mutable TUI state.</summary>
+    public static void ApplyResumeTarget(SessionState session, ResumeTarget target)
+    {
+        ArgumentNullException.ThrowIfNull(session);
+        ArgumentNullException.ThrowIfNull(target);
+
+        session.History.Clear();
+        session.History.AddRange(target.Messages);
+        session.SessionId = target.Id;
+        session.SystemPromptOverride =
+            session.StartupSystemPromptOverride
+            ?? target.Metadata.SystemPromptOverride;
     }
 
     /// <summary>

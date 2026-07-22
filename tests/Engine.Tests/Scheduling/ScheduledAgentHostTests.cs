@@ -41,12 +41,15 @@ public sealed class ScheduledAgentHostTests : IDisposable
 
         public bool Disposed { get; private set; }
 
+        public List<ChatRequest> Requests { get; } = [];
+
         public void Dispose() => this.Disposed = true;
 
         public async IAsyncEnumerable<AssistantStreamEvent> StreamAsync(
             ChatRequest request,
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
+            this.Requests.Add(request);
             var events = turns[this.turn++];
             foreach (var e in events)
             {
@@ -541,6 +544,41 @@ public sealed class ScheduledAgentHostTests : IDisposable
         Assert.NotEqual(first.Options.SystemPrompt, second.Options.SystemPrompt); // output style changed
         Assert.DoesNotContain(FakeMcpTool.ToolName, first.Tools.All.Select(t => t.Name));
         Assert.Contains(FakeMcpTool.ToolName, second.Tools.All.Select(t => t.Name));
+    }
+
+    [Fact]
+    public async Task Scheduled_root_after_resume_uses_persisted_override_while_subagent_stays_isolated()
+    {
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        using var http = new HttpClient();
+        var client = new ScriptedClient(
+            [AssistantStreamEvent.Tool(new ToolUseBlock(
+                "root-task",
+                "task",
+                """{"description":"child","prompt":"work"}""")), AssistantStreamEvent.Finished("tool_use")],
+            [AssistantStreamEvent.Delta("child done"), AssistantStreamEvent.Finished("end_turn")],
+            [AssistantStreamEvent.Delta("root done"), AssistantStreamEvent.Finished("end_turn")]);
+
+        using var session = new CodaSession(SignedInClaude(), this.Options(mode: PermissionMode.BypassPermissions));
+        session.Resume(
+            "resumed-session",
+            [],
+            new SessionMetadata { SystemPromptOverride = "persisted root prompt" });
+
+        var host = this.NewHost(
+            () => session.Options,
+            new FakeClientFactory(client),
+            new DefaultAgentLoopFactory(),
+            builder,
+            http);
+
+        var snapshot = await RunScheduledToTerminalAsync(tasks, host);
+
+        Assert.Equal(TaskRunStatus.Completed, snapshot.Status);
+        Assert.True(client.Requests.Count >= 2);
+        Assert.Equal("persisted root prompt", client.Requests[0].System);
+        Assert.NotEqual("persisted root prompt", client.Requests[1].System);
     }
 
     [Fact]

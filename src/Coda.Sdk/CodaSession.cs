@@ -53,6 +53,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
+    private readonly string? startupSystemPromptOverride;
     private readonly ILoggerFactory loggerFactory;
     private readonly ILogger logger;
     private readonly TurnPipelineBuilder turnPipelineBuilder;
@@ -89,6 +90,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
+        this.startupSystemPromptOverride = options.SystemPromptOverride;
         this.fingerprint = fingerprint ?? new ClientFingerprint();
         this.llmClientFactory = llmClientFactory ?? new DefaultLlmClientFactory();
         this.agentLoopFactory = agentLoopFactory ?? new DefaultAgentLoopFactory();
@@ -302,14 +304,26 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// Replace the conversation with a persisted transcript and adopt its id, so subsequent
     /// transcript saves target the same file. Used to resume a session in a fresh process.
     /// </summary>
-    public void Resume(string sessionId, IReadOnlyList<ChatMessage> messages)
+    public void Resume(string sessionId, IReadOnlyList<ChatMessage> messages) =>
+        this.Resume(sessionId, messages, SessionMetadata.Empty);
+
+    /// <summary>
+    /// Replace the conversation with a persisted transcript and its metadata, preserving an explicit
+    /// startup system-prompt override over the stored one.
+    /// </summary>
+    public void Resume(string sessionId, IReadOnlyList<ChatMessage> messages, SessionMetadata metadata)
     {
         ArgumentException.ThrowIfNullOrEmpty(sessionId);
         ArgumentNullException.ThrowIfNull(messages);
+        ArgumentNullException.ThrowIfNull(metadata);
 
         this.SessionId = sessionId;
         this.history.Clear();
         this.history.AddRange(messages);
+        this.Options = this.Options with
+        {
+            SystemPromptOverride = this.startupSystemPromptOverride ?? metadata.SystemPromptOverride,
+        };
     }
 
     /// <summary>

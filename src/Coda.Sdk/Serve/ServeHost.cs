@@ -21,21 +21,26 @@ public sealed class ServeHost : IAsyncDisposable
     private readonly Stream output;
     private readonly Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory;
     private readonly string? expectedApiKey;
+    private readonly Func<CodaSession, CancellationToken, Task> initializeSession;
     private volatile bool authenticated;
     private readonly TaskCompletionSource shutdownTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     // The shared initialization gate. Created BEFORE the read loop starts so a handler dispatched the
     // instant the loop goes live (initialize/prompt) can await the SAME readiness signal instead of
-    // racing a not-yet-created task. RunAsync — never a handler — drives CodaSession.InitializeAsync
-    // and completes/faults/cancels this gate, so `initialize` awaiting it can never deadlock on itself.
+    // racing a not-yet-created task. The first initialization-driving handler completes/faults/cancels
+    // this gate, so initialize and prompt always observe the same readiness result.
     private readonly TaskCompletionSource initializationGate =
         new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-    // Guards driving the shared initialization exactly once. Set to 1 by the first driver — either
-    // RunAsync (stdio/no-key: drive immediately) or a valid `initialize`/authenticated `prompt`
-    // (API-key mode: drive only after authentication). Interlocked so concurrent authenticated
-    // handlers can never double-start the runtime.
+    // Guards driving the shared initialization exactly once. Set to 1 by the first valid
+    // `initialize` or authenticated `prompt` handler. Interlocked so concurrent handlers can never
+    // double-start the runtime.
     private int initializationDriven;
+
+    // Serializes the resume-before-initialize handoff. An initialize handler holds this while it
+    // loads and applies a stored session, so a concurrent prompt cannot start the runtime against
+    // pre-resume options/history.
+    private readonly SemaphoreSlim initializationStartGate = new(1, 1);
 
     // Built in RunAsync before handlers are registered.
     private JsonRpcConnection? connection;
@@ -63,11 +68,23 @@ public sealed class ServeHost : IAsyncDisposable
         Stream output,
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
         string? expectedApiKey = null)
+        : this(input, output, sessionFactory, expectedApiKey, initializeSession: null)
+    {
+    }
+
+    internal ServeHost(
+        Stream input,
+        Stream output,
+        Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
+        string? expectedApiKey,
+        Func<CodaSession, CancellationToken, Task>? initializeSession = null)
     {
         this.input = input ?? throw new ArgumentNullException(nameof(input));
         this.output = output ?? throw new ArgumentNullException(nameof(output));
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.expectedApiKey = expectedApiKey;
+        this.initializeSession = initializeSession ?? (static (session, cancellationToken) =>
+            session.InitializeAsync(cancellationToken));
         this.authenticated = expectedApiKey is null; // stdio: no auth required.
     }
 
@@ -108,23 +125,6 @@ public sealed class ServeHost : IAsyncDisposable
         // live BEFORE InitializeAsync so a schedule that fires during startup can issue a
         // server→client permission/question/plan request (and read its response) without deadlock.
         this.connection.Start();
-
-        // Drive initialization AFTER Start, off the read-loop thread — but ONLY when the peer is
-        // already authenticated (stdio / no expectedApiKey). CodaSession.InitializeAsync starts the
-        // schedule runtime, which emits lifecycle/stream/tool events and can issue server→client
-        // permission/question/plan requests; an unauthenticated peer must never observe those before
-        // presenting the API key. In API-key mode the drive is deferred to the `initialize` handler,
-        // which triggers it (exactly once, via EnsureInitializationDriven) only after a valid key
-        // authenticates. Chosen ordering: the schedule store is project-scoped (it lives under the
-        // working directory, not the transcript id) and every scheduled run is isolated (its own
-        // history), so the runtime does not depend on the resumed session id/history — driving after
-        // auth + resume keeps the reported session id deterministic without constraining the runtime.
-        // The `initialize` and `session/prompt` handlers await this same gate before reporting
-        // readiness / running a turn.
-        if (this.authenticated)
-        {
-            this.EnsureInitializationDriven(cancellationToken);
-        }
 
         // Wait until shutdown is requested, the CT fires, or the connection closes.
         using var reg = cancellationToken.Register(() => this.shutdownTcs.TrySetResult());
@@ -220,11 +220,11 @@ public sealed class ServeHost : IAsyncDisposable
     }
 
     /// <summary>
-    /// Drives the shared initialization exactly once. The first caller — RunAsync (stdio) or a valid
-    /// authenticated <c>initialize</c>/<c>prompt</c> handler (API-key mode) — wins the Interlocked
-    /// guard and starts <see cref="DriveInitializationAsync"/>; every later caller is a no-op. This
-    /// prevents an unauthenticated peer from triggering the runtime and prevents concurrent
-    /// authenticated handlers from double-starting it.
+    /// Drives the shared initialization exactly once. The first valid authenticated
+    /// <c>initialize</c>/<c>prompt</c> handler wins the Interlocked guard and starts
+    /// <see cref="DriveInitializationAsync"/>; every later caller is a no-op. This prevents an
+    /// unauthenticated peer from triggering the runtime and prevents concurrent authenticated handlers
+    /// from double-starting it.
     /// </summary>
     private void EnsureInitializationDriven(CancellationToken cancellationToken)
     {
@@ -245,7 +245,7 @@ public sealed class ServeHost : IAsyncDisposable
     {
         try
         {
-            await this.session!.InitializeAsync(cancellationToken).ConfigureAwait(false);
+            await this.initializeSession(this.session!, cancellationToken).ConfigureAwait(false);
             this.initializationGate.TrySetResult();
         }
         catch (OperationCanceledException)
@@ -279,38 +279,43 @@ public sealed class ServeHost : IAsyncDisposable
         // session, then return protocol version + session id.
         conn.OnRequestAsync(ServeMethods.Initialize, async (p, ct) =>
         {
-            var ip = ServeJson.FromNode<InitializeParams>(p);
-
-            if (this.expectedApiKey is not null && !this.authenticated)
+            await this.initializationStartGate.WaitAsync(ct).ConfigureAwait(false);
+            try
             {
-                if (!IsKeyValid(ip?.ApiKey, this.expectedApiKey))
+                var ip = ServeJson.FromNode<InitializeParams>(p);
+
+                if (this.expectedApiKey is not null && !this.authenticated)
                 {
-                    throw new JsonRpcRequestException(-32001, "unauthorized");
+                    if (!IsKeyValid(ip?.ApiKey, this.expectedApiKey))
+                    {
+                        throw new JsonRpcRequestException(-32001, "unauthorized");
+                    }
+
+                    this.authenticated = true;
                 }
 
-                this.authenticated = true;
-            }
-
-            if (ip?.SessionId is { Length: > 0 } resumeId)
-            {
-                var transcripts = new SessionTranscriptStore(sess.Options.WorkingDirectory);
-                var messages = await transcripts.LoadAsync(resumeId, ct).ConfigureAwait(false);
-                if (messages is null)
+                if (ip?.SessionId is { Length: > 0 } resumeId)
                 {
-                    throw new JsonRpcRequestException(-32002, "session not found");
+                    var transcripts = new SessionTranscriptStore(sess.Options.WorkingDirectory);
+                    var stored = await transcripts.LoadSessionAsync(resumeId, ct).ConfigureAwait(false);
+                    if (stored is null)
+                    {
+                        throw new JsonRpcRequestException(-32002, "session not found");
+                    }
+
+                    sess.Resume(resumeId, stored.Messages, stored.Metadata);
                 }
 
-                sess.Resume(resumeId, messages);
+                // Now that the peer is authenticated (and any resume applied), trigger the shared
+                // initialization. The read loop is already live (connection.Start ran in RunAsync before
+                // any handler could dispatch), so a scheduled permission/question/plan request issued
+                // during startup can round-trip to this authenticated peer without deadlock.
+                this.EnsureInitializationDriven(hostCt);
             }
-
-            // Now that the peer is authenticated (and any resume applied), trigger the shared
-            // initialization the host owns. In stdio mode RunAsync already drove it, so this is a
-            // no-op; in API-key mode this is the first drive — deferred until exactly here so an
-            // unauthenticated peer never starts the schedule runtime. The read loop is already live
-            // (connection.Start ran in RunAsync before any handler could dispatch), so a scheduled
-            // permission/question/plan request issued during startup can round-trip to this
-            // authenticated peer without deadlock.
-            this.EnsureInitializationDriven(hostCt);
+            finally
+            {
+                this.initializationStartGate.Release();
+            }
 
             // Await the shared initialization (LSP + schedule runtime) the host drives after Start,
             // so the InitializeResult is not returned until the session is actually ready — and a
@@ -334,13 +339,27 @@ public sealed class ServeHost : IAsyncDisposable
         {
             this.EnsureAuthenticated();
 
-            // The peer is authenticated, so it is safe to ensure initialization is under way. In
-            // stdio mode RunAsync (or a prior initialize) already drove it; in API-key mode a valid
-            // initialize authenticated the peer and drove it. Calling here is a race-safe no-op via
-            // the once-guard and guarantees a prompt never awaits a gate that was never driven. A
-            // prompt that arrives BEFORE authentication is rejected by EnsureAuthenticated above and
-            // therefore can never trigger initialization.
-            this.EnsureInitializationDriven(hostCt);
+            // The peer is authenticated, so it is safe to ensure initialization is under way.
+            // Calling here is a race-safe no-op after initialize via the once-guard and guarantees a
+            // prompt never awaits a gate that was never driven. A prompt that arrives BEFORE
+            // authentication is rejected by EnsureAuthenticated above and therefore can never trigger
+            // initialization.
+            if (Volatile.Read(ref this.initializationDriven) == 0)
+            {
+                // Async JSON-RPC handlers are dispatched independently. Yield before a prompt claims
+                // first startup so an earlier received initialize request can reserve the handoff gate.
+                await Task.Yield();
+            }
+
+            await this.initializationStartGate.WaitAsync(ct).ConfigureAwait(false);
+            try
+            {
+                this.EnsureInitializationDriven(hostCt);
+            }
+            finally
+            {
+                this.initializationStartGate.Release();
+            }
 
             // A turn must never run before initialization: await the shared gate (LSP + schedule
             // runtime up) the host drives after Start. A failed init surfaces its fault here rather

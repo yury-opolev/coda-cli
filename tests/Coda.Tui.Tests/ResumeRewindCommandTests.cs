@@ -193,6 +193,42 @@ public sealed class ResumeRewindCommandTests : IDisposable
     }
 
     [Fact]
+    public async Task Resume_applies_persisted_system_prompt_when_no_startup_override_exists()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        await store.SaveAsync(
+            "prompt-session",
+            [new ChatMessage(ChatRole.User, [new TextBlock("hi")])],
+            new SessionMetadata { SystemPromptOverride = "persisted prompt" });
+
+        var (_, context) = this.BuildContext();
+        context.Session.SystemPromptOverride = "stale prompt";
+
+        await new ResumeCommand().ExecuteAsync(context, ["prompt-session"]);
+
+        Assert.Equal("persisted prompt", context.Session.SystemPromptOverride);
+        Assert.Null(context.Session.StartupSystemPromptOverride);
+    }
+
+    [Fact]
+    public async Task Resume_preserves_explicit_empty_startup_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        await store.SaveAsync(
+            "prompt-session",
+            [new ChatMessage(ChatRole.User, [new TextBlock("hi")])],
+            new SessionMetadata { SystemPromptOverride = "persisted prompt" });
+
+        var (_, context) = this.BuildContext(startupSystemPromptOverride: "");
+        context.Session.SystemPromptOverride = "stale prompt";
+
+        await new ResumeCommand().ExecuteAsync(context, ["prompt-session"]);
+
+        Assert.Equal("", context.Session.SystemPromptOverride);
+        Assert.Equal("", context.Session.StartupSystemPromptOverride);
+    }
+
+    [Fact]
     public async Task Resume_by_index_selects_the_newest_and_adopts_its_id()
     {
         var store = new SessionTranscriptStore(this.tempDir);
@@ -210,7 +246,7 @@ public sealed class ResumeRewindCommandTests : IDisposable
 
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
-    private (TestConsole Console, CommandContext Context) BuildContext()
+    private (TestConsole Console, CommandContext Context) BuildContext(string? startupSystemPromptOverride = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -224,7 +260,11 @@ public sealed class ResumeRewindCommandTests : IDisposable
             new("claude-ai", "Claude.ai", LoginKind.OAuthLoopback, "claude-sonnet-4-6"),
         };
 
-        var session = new SessionState("claude-ai", this.tempDir);
+        var session = new SessionState("claude-ai", this.tempDir)
+        {
+            StartupSystemPromptOverride = startupSystemPromptOverride,
+            SystemPromptOverride = startupSystemPromptOverride,
+        };
         var registry = new SlashCommandRegistry(new ISlashCommand[]
         {
             new HelpCommand(), new ResumeCommand(), new RewindCommand(), new ExitCommand(),

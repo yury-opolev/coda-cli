@@ -655,9 +655,9 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             return;
         }
 
-        context.Session.History.AddRange(target.Messages);
         if (startupIntent.Fork)
         {
+            context.Session.History.AddRange(target.Messages);
             context.Session.SessionId = await Coda.Sdk.SessionForking.ForkAsync(
                 context.Session.WorkingDirectory, target.Id, target.Messages, ct).ConfigureAwait(false);
             Publish(mailbox, new DiagnosticEvent(
@@ -665,7 +665,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         }
         else
         {
-            context.Session.SessionId = target.Id;
+            SessionCli.ApplyResumeTarget(context.Session, target);
             Publish(mailbox, new DiagnosticEvent(
                 "session", $"Resumed session {target.Id} ({target.Messages.Count} messages).", UiNotificationLevel.Information));
         }
