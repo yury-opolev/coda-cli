@@ -13,6 +13,9 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
 
     /// <summary>An optional right-aligned annotation (e.g. a sent-time HH:mm) drawn at the row's right edge.</summary>
     public string? RightText { get; init; }
+
+    /// <summary>Whether this is the synthetic, inert blank row after a visible semantic block.</summary>
+    public bool IsSeparator { get; init; }
 }
 
 /// <summary>
@@ -89,8 +92,9 @@ internal sealed class TranscriptLayoutIndex
 
         var lines = this.Format(block);
         this.blocks = this.blocks.Add(block);
-        this.rowCounts.Add(lines.Count);
-        this.prefix.Add(this.prefix[^1] + lines.Count);
+        var count = EffectiveRowCount(lines.Count);
+        this.rowCounts.Add(count);
+        this.prefix.Add(this.prefix[^1] + count);
         this.Cache(block.Id, lines);
     }
 
@@ -126,9 +130,10 @@ internal sealed class TranscriptLayoutIndex
 
         this.Evict(this.blocks[position].Id);
         var lines = this.Format(block);
-        var delta = lines.Count - this.rowCounts[position];
+        var count = EffectiveRowCount(lines.Count);
+        var delta = count - this.rowCounts[position];
         this.blocks = this.blocks.SetItem(position, block);
-        this.rowCounts[position] = lines.Count;
+        this.rowCounts[position] = count;
         if (delta != 0)
         {
             for (var j = position + 1; j < this.prefix.Count; j++)
@@ -224,7 +229,16 @@ internal sealed class TranscriptLayoutIndex
                     break;
                 }
 
-                var line = local < lines.Count ? lines[local] : default;
+                if (local == count - 1)
+                {
+                    rows.Add(new TranscriptRow(block.Id, local, global, string.Empty, default)
+                    {
+                        IsSeparator = true,
+                    });
+                    continue;
+                }
+
+                var line = lines[local];
                 rows.Add(new TranscriptRow(block.Id, local, global, line.Text ?? string.Empty, line.Role)
                 {
                     FillWidth = line.FillWidth,
@@ -257,7 +271,7 @@ internal sealed class TranscriptLayoutIndex
         this.prefix.Add(0);
         foreach (var block in this.blocks)
         {
-            var count = this.formatter(block, this.width).Count;
+            var count = EffectiveRowCount(this.formatter(block, this.width).Count);
             this.rowCounts.Add(count);
             this.prefix.Add(this.prefix[^1] + count);
         }
@@ -301,6 +315,9 @@ internal sealed class TranscriptLayoutIndex
     }
 
     private IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block) => this.formatter(block, this.width);
+
+    private static int EffectiveRowCount(int formattedRowCount) =>
+        formattedRowCount > 0 ? formattedRowCount + 1 : 0;
 
     private void Cache(Guid id, IReadOnlyList<TranscriptRenderLine> lines)
     {

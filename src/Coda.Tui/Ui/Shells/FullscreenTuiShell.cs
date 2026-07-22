@@ -21,8 +21,8 @@ namespace Coda.Tui.Ui.Shells;
 /// transcript incrementally — <see cref="VirtualizedTranscriptView.Append"/> for a new completed block,
 /// <see cref="VirtualizedTranscriptView.ReplaceLast"/> for streaming tail updates, and a full
 /// <see cref="VirtualizedTranscriptView.ReplaceAll"/> only for the initial load or a reseed. New rows
-/// auto-follow only when the viewport is already at the bottom; otherwise the header shows an
-/// <c>"{n} new — Ctrl+End"</c> indicator.
+/// auto-follow only when the viewport is already at the bottom; otherwise a floating hint offers a return
+/// to the newest content.
 /// </remarks>
 internal class FullscreenTuiShell(
     IApplication app,
@@ -68,12 +68,15 @@ internal class FullscreenTuiShell(
     private bool applyingComposerLayout;
     private Label header = null!;
     private VirtualizedTranscriptView transcript = null!;
+    private JumpToBottomHint jumpHint = null!;
 
-    /// <summary>The one-row session header (session/model and the unseen-rows indicator).</summary>
+    /// <summary>The one-row session header (session/model).</summary>
     internal Label Header => this.header;
 
     /// <summary>The virtualized transcript surface filling the space between header and composer.</summary>
     internal VirtualizedTranscriptView Transcript => this.transcript;
+
+    internal JumpToBottomHint JumpHint => this.jumpHint;
 
     /// <inheritdoc />
     protected override VirtualizedTranscriptView TranscriptView => this.transcript;
@@ -108,6 +111,14 @@ internal class FullscreenTuiShell(
         this.transcript.X = 0;
         this.transcript.Y = Pos.Bottom(this.header);
         this.transcript.Width = Dim.Fill();
+
+        this.jumpHint = new JumpToBottomHint(this.Theme, this.HostApp.Driver)
+        {
+            X = 0,
+            Y = Pos.AnchorEnd(1),
+            Width = Dim.Fill(),
+        };
+        this.jumpHint.Jump += this.OnJumpHint;
 
         // The always-visible operational status row sits directly above the chrome region, between the
         // transcript and the composer chrome.
@@ -147,6 +158,7 @@ internal class FullscreenTuiShell(
 
         this.Add(this.header);
         this.Add(this.transcript);
+        this.Add(this.jumpHint);
         this.Add(this.Chrome);
         this.Add(this.Composer);
         this.Add(this.Operational);
@@ -302,7 +314,7 @@ internal class FullscreenTuiShell(
         {
             // Initial load, clear/reseed, or a wholesale change of the first block: a full rebuild.
             this.transcript.ReplaceAll(after);
-            this.UpdateHeader(next);
+            this.RefreshHeaderForViewport();
             return;
         }
 
@@ -331,7 +343,7 @@ internal class FullscreenTuiShell(
             this.transcript.ReplaceAll(after);
         }
 
-        this.UpdateHeader(next);
+        this.RefreshHeaderForViewport();
     }
 
     /// <summary>
@@ -366,17 +378,19 @@ internal class FullscreenTuiShell(
         var session = string.IsNullOrEmpty(snapshot.SessionId) ? "no session" : snapshot.SessionId;
         var left = string.IsNullOrEmpty(snapshot.Model) ? session : $"{session} · {snapshot.Model}";
 
-        var unseen = this.transcript.UnseenRows;
-        this.header.Text = !this.transcript.AutoFollow && unseen > 0
-            ? $"{left}    {unseen} new — Ctrl+End"
-            : left;
+        this.header.Text = left;
     }
 
     /// <summary>
-    /// Refresh the header immediately after a user scroll/jump so the "{n} new — Ctrl+End" indicator
-    /// appears or clears without waiting for the next snapshot (e.g. Ctrl+End clears it at once).
+    /// Refreshes header and floating navigation chrome immediately after a user scroll or jump.
     /// </summary>
-    private void RefreshHeaderForViewport() => this.UpdateHeader(this.Snapshot);
+    private void RefreshHeaderForViewport()
+    {
+        this.UpdateHeader(this.Snapshot);
+        this.jumpHint.Update(this.transcript.AutoFollow, this.transcript.UnseenBlocks);
+    }
+
+    private void OnJumpHint() => this.TranscriptView.JumpToNewest();
 
     protected override void Dispose(bool disposing)
     {
@@ -384,6 +398,11 @@ internal class FullscreenTuiShell(
         {
             this.transcript.TranscriptScrolled -= this.RefreshHeaderForViewport;
             this.UnbindTranscriptInput(this.transcript);
+        }
+
+        if (disposing && this.jumpHint is not null)
+        {
+            this.jumpHint.Jump -= this.OnJumpHint;
         }
 
         base.Dispose(disposing);

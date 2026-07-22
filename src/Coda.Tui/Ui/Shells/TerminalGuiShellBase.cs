@@ -496,6 +496,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return this.ApplyChord(this.chords.HandleCtrlC());
         }
 
+        if (key == Key.End.WithCtrl)
+        {
+            this.TranscriptView.JumpToNewest();
+            return true;
+        }
+
         if (this.taskController is not null && key == Key.B.WithCtrl)
         {
             // Ctrl+B is an output/shell chord, never a browser opener (that is /tasks): the controller

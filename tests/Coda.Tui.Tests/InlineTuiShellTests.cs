@@ -262,7 +262,7 @@ public sealed class InlineTuiShellTests
     }
 
     [Fact]
-    public async Task Inline_scrolled_away_header_shows_the_unseen_indicator()
+    public async Task Inline_scrolled_away_transcript_shows_the_jump_hint()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.Inline;
@@ -282,8 +282,9 @@ public sealed class InlineTuiShellTests
         var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new tail"));
         await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
 
-        Assert.True(shell.Transcript.UnseenRows > 0);
-        Assert.Contains("Ctrl+End", shell.Header.Text, StringComparison.Ordinal);
+        Assert.True(shell.Transcript.UnseenBlocks > 0);
+        Assert.True(shell.JumpHint.Visible);
+        Assert.DoesNotContain("Ctrl+End", shell.Header.Text, StringComparison.Ordinal);
 
         if (token is not null)
         {

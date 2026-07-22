@@ -45,7 +45,7 @@ public sealed class FullscreenTuiShellTests
         var visible = indexer.GetVisibleRows(firstRow: 9_990, height: 20, overscan: 2);
 
         Assert.InRange(visible.Count, 20, 24);
-        Assert.InRange(calls, 20, 26);
+        Assert.InRange(calls, 10, 14);
     }
 
     [Theory]
@@ -419,7 +419,7 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public async Task Scrolled_away_header_shows_the_unseen_indicator()
+    public async Task Scrolled_away_transcript_shows_the_jump_hint()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -437,9 +437,9 @@ public sealed class FullscreenTuiShellTests
         var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new tail"));
         await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
 
-        Assert.True(shell.Transcript.UnseenRows > 0);
-        Assert.Contains("new", shell.Header.Text, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("Ctrl+End", shell.Header.Text, StringComparison.Ordinal);
+        Assert.True(shell.Transcript.UnseenBlocks > 0);
+        Assert.True(shell.JumpHint.Visible);
+        Assert.DoesNotContain("Ctrl+End", shell.Header.Text, StringComparison.Ordinal);
 
         if (token is not null)
         {
@@ -581,7 +581,7 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public async Task Ctrl_end_clears_the_unseen_header_indicator_without_a_new_snapshot()
+    public async Task Ctrl_end_hides_the_jump_hint_without_a_new_snapshot()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -598,14 +598,13 @@ public sealed class FullscreenTuiShellTests
 
         var appended = seed.Add(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new tail"));
         await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = appended }, CancellationToken.None);
-        Assert.Contains("Ctrl+End", shell.Header.Text);
+        Assert.True(shell.JumpHint.Visible);
 
-        // Ctrl+End jumps to newest; the header must clear the indicator immediately, with no new snapshot
-        // arriving to trigger UpdateHeader.
+        // Ctrl+End jumps to newest and hides the floating hint without a new snapshot.
         shell.Transcript.NewKeyDownEvent(Key.End.WithCtrl);
 
         Assert.True(shell.Transcript.AutoFollow);
-        Assert.DoesNotContain("Ctrl+End", shell.Header.Text);
+        Assert.False(shell.JumpHint.Visible);
 
         if (token is not null)
         {
@@ -1225,7 +1224,7 @@ public sealed class FullscreenTuiShellTests
             new CommandOutputTranscriptBlock(Guid.NewGuid(), "cd"),
         ]);
         fixture.Shell.Transcript.BeginSelection(new TranscriptCellPosition(0, 0));
-        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(1, 10));
+        fixture.Shell.Transcript.UpdateSelection(new TranscriptCellPosition(2, 10));
 
         fixture.Shell.Composer.NewKeyDownEvent(Key.C.WithCtrl);
 
@@ -1373,7 +1372,7 @@ public sealed class TranscriptLayoutIndexTests
         index.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "tail"), width: 80);
 
         Assert.Equal(1, calls);
-        Assert.Equal(101, index.TotalRows);
+        Assert.Equal(202, index.TotalRows);
     }
 
     [Fact]
@@ -1392,7 +1391,7 @@ public sealed class TranscriptLayoutIndexTests
         index.ReplaceLast(new CommandOutputTranscriptBlock(Guid.NewGuid(), "updated"), width: 80);
 
         Assert.Equal(1, calls);
-        Assert.Equal(10, index.TotalRows);
+        Assert.Equal(20, index.TotalRows);
     }
 
     [Fact]
@@ -1409,14 +1408,14 @@ public sealed class TranscriptLayoutIndexTests
         index.ReplaceAll(Blocks(30), width: 80);
         _ = index.GetVisibleRows(firstRow: 0, height: 10, overscan: 2);
         Assert.True(index.CachedBlockCount > 0);
-        Assert.Equal(30, index.TotalRows);
+        Assert.Equal(60, index.TotalRows);
         calls = 0;
 
         index.Reflow(width: 40);
 
         Assert.Equal(30, calls);
         Assert.Equal(0, index.CachedBlockCount);
-        Assert.Equal(60, index.TotalRows);
+        Assert.Equal(90, index.TotalRows);
     }
 
     [Fact]
@@ -1431,7 +1430,7 @@ public sealed class TranscriptLayoutIndexTests
         }
 
         Assert.True(index.CachedBlockCount <= 256);
-        Assert.Equal(300, index.TotalRows);
+        Assert.Equal(600, index.TotalRows);
     }
 
     [Fact]
@@ -1445,8 +1444,8 @@ public sealed class TranscriptLayoutIndexTests
 
         Assert.All(rows, row => Assert.NotEqual(Guid.Empty, row.BlockId));
         Assert.Equal(10, rows[0].GlobalRow);
-        Assert.Equal(blocks[10].Id, rows[0].BlockId);
-        Assert.Equal("line 10", rows[0].Text);
+        Assert.Equal(blocks[5].Id, rows[0].BlockId);
+        Assert.Equal("line 5", rows[0].Text);
     }
 
     [Fact]
@@ -1474,16 +1473,17 @@ public sealed class TranscriptLayoutIndexTests
             new ToolTranscriptBlock(toolId, "grep", "{}", null, null, IsError: false, Complete: false),
             new CommandOutputTranscriptBlock(Guid.NewGuid(), "2"));
         index.ReplaceAll(blocks, width: 80);
-        Assert.Equal(3, index.TotalRows);
+        Assert.Equal(6, index.TotalRows);
         calls = 0;
 
         index.ReplaceAt(1, new ToolTranscriptBlock(toolId, "grep", "{}", 5, "done", IsError: false, Complete: true), width: 80);
 
         Assert.Equal(1, calls);
-        Assert.Equal(4, index.TotalRows);
+        Assert.Equal(7, index.TotalRows);
         var rows = index.GetVisibleRows(firstRow: 0, height: 10, overscan: 0);
-        Assert.Equal(4, rows.Count);
-        Assert.Equal("2", rows[^1].Text);
+        Assert.Equal(7, rows.Count);
+        Assert.Equal("2", rows[^2].Text);
+        Assert.True(rows[^1].IsSeparator);
     }
 
     [Fact]
@@ -1509,7 +1509,7 @@ public sealed class TranscriptLayoutIndexTests
         Assert.Equal(250, rows.Count);
         Assert.Equal(400, rows[0].GlobalRow);
         Assert.Equal(649, rows[^1].GlobalRow);
-        Assert.Equal("line 400", rows[0].Text);
+        Assert.Equal("line 200", rows[0].Text);
     }
 }
 
@@ -1629,7 +1629,7 @@ public sealed class VirtualizedTranscriptViewTests
         var rows = view.CollectVisibleRows();
 
         Assert.InRange(rows.Count, 10, 14);
-        Assert.InRange(calls() - before, 10, 16);
+        Assert.InRange(calls() - before, 5, 8);
     }
 
     [Fact]
@@ -1639,15 +1639,15 @@ public sealed class VirtualizedTranscriptViewTests
         var view = CreateView(app, out _);
         view.ReplaceAll(Blocks(1_000));
         Assert.True(view.AutoFollow);
-        Assert.Equal(990, view.TopRow);
+        Assert.Equal(1990, view.TopRow);
 
         view.ScrollBy(-5);
         Assert.False(view.AutoFollow);
-        Assert.Equal(985, view.TopRow);
+        Assert.Equal(1985, view.TopRow);
 
         view.JumpToNewest();
         Assert.True(view.AutoFollow);
-        Assert.Equal(990, view.TopRow);
+        Assert.Equal(1990, view.TopRow);
     }
 
     [Fact]
@@ -1664,7 +1664,8 @@ public sealed class VirtualizedTranscriptViewTests
         view.ScrollBy(-5);
         view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "tail-2"));
         Assert.False(view.AutoFollow);
-        Assert.Equal(1, view.UnseenRows);
+        Assert.Equal(2, view.UnseenRows);
+        Assert.Equal(1, view.UnseenBlocks);
     }
 
     [Fact]
@@ -1676,11 +1677,11 @@ public sealed class VirtualizedTranscriptViewTests
 
         view.NewKeyDownEvent(Key.PageUp);
         Assert.False(view.AutoFollow);
-        Assert.True(view.TopRow < 990);
+        Assert.True(view.TopRow < 1990);
 
         view.NewKeyDownEvent(Key.End.WithCtrl);
         Assert.True(view.AutoFollow);
-        Assert.Equal(990, view.TopRow);
+        Assert.Equal(1990, view.TopRow);
 
         view.NewKeyDownEvent(Key.Home.WithCtrl);
         Assert.Equal(0, view.TopRow);

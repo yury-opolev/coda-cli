@@ -17,6 +17,9 @@ internal sealed class TranscriptViewportState
     /// <summary>Rows appended while scrolled away that the user has not seen yet.</summary>
     public int UnseenRows { get; private set; }
 
+    /// <summary>Visible blocks appended while scrolled away, excluding streaming growth of existing blocks.</summary>
+    public int UnseenBlocks { get; private set; }
+
     /// <summary>Total content rows currently laid out.</summary>
     public int ContentRows { get; private set; }
 
@@ -63,6 +66,7 @@ internal sealed class TranscriptViewportState
         {
             this.AutoFollow = true;
             this.UnseenRows = 0;
+            this.UnseenBlocks = 0;
         }
     }
 
@@ -91,10 +95,32 @@ internal sealed class TranscriptViewportState
         {
             this.TopRow = this.MaxTopRow;
             this.UnseenRows = 0;
+            this.UnseenBlocks = 0;
         }
         else
         {
             this.UnseenRows += rows;
+        }
+    }
+
+    /// <summary>Records one complete visible block append without treating streaming row growth as a message.</summary>
+    public void OnBlockAppended()
+    {
+        if (!this.AutoFollow)
+        {
+            this.UnseenBlocks++;
+        }
+    }
+
+    /// <summary>Moves to an absolute content row, resuming follow when that reaches the bottom.</summary>
+    public void ScrollToRow(int row)
+    {
+        this.TopRow = Math.Clamp(row, 0, this.MaxTopRow);
+        this.AutoFollow = this.TopRow >= this.MaxTopRow;
+        if (this.AutoFollow)
+        {
+            this.UnseenRows = 0;
+            this.UnseenBlocks = 0;
         }
     }
 
@@ -103,6 +129,7 @@ internal sealed class TranscriptViewportState
     {
         this.AutoFollow = true;
         this.UnseenRows = 0;
+        this.UnseenBlocks = 0;
         this.TopRow = this.MaxTopRow;
     }
 
@@ -115,6 +142,12 @@ internal sealed class TranscriptViewportState
         else
         {
             this.TopRow = Math.Clamp(this.TopRow, 0, this.MaxTopRow);
+            if (this.TopRow >= this.MaxTopRow)
+            {
+                this.AutoFollow = true;
+                this.UnseenRows = 0;
+                this.UnseenBlocks = 0;
+            }
         }
     }
 }
