@@ -1,6 +1,8 @@
 using Coda.Sdk;
 using Coda.Tui.Commands;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Mode;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmClient;
@@ -56,6 +58,52 @@ public sealed class ForkCommandTests : IDisposable
         Assert.NotNull(await new SessionTranscriptStore(dir).LoadAsync(newId));
         Assert.Single(await new SessionAuditStore(dir).LoadAsync(newId));      // audit carried
         Assert.Single(await new SessionAuditStore(dir).LoadAsync("source-aaaa")); // source untouched
+    }
+
+    [Theory]
+    [InlineData("current override")]
+    [InlineData("")]
+    public async Task Fork_persists_the_current_system_prompt_override(string systemPromptOverride)
+    {
+        var (_, context) = this.BuildContext();
+        context.Session.SessionId = "source-aaaa";
+        context.Session.SystemPromptOverride = systemPromptOverride;
+        context.Session.History.Add(new ChatMessage(ChatRole.User, [new TextBlock("q")]));
+
+        await new ForkCommand().ExecuteAsync(context, Array.Empty<string>());
+
+        var stored = await new SessionTranscriptStore(context.Session.WorkingDirectory)
+            .LoadSessionAsync(context.Session.SessionId!);
+        Assert.NotNull(stored);
+        Assert.Equal(systemPromptOverride, stored!.Metadata.SystemPromptOverride);
+    }
+
+    [Fact]
+    public async Task Interactive_startup_fork_persists_the_current_precedence_resolved_override()
+    {
+        var (_, context, _, _) = TestAppBuilder.BuildApp(workingDirectory: this.tempDir);
+        context.Session.SystemPromptOverride = string.Empty;
+        var messages = new[] { new ChatMessage(ChatRole.User, [new TextBlock("q")]) };
+        await new SessionTranscriptStore(this.tempDir).SaveAsync(
+            "aaaaaaaaaaaa",
+            messages,
+            new SessionMetadata { SystemPromptOverride = "source override" });
+
+        using var mailbox = new UiEventMailbox(8);
+        var seed = typeof(DefaultInteractiveSessionRunner).GetMethod(
+            "SeedSessionAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(seed);
+
+        var task = Assert.IsAssignableFrom<Task>(seed!.Invoke(
+            null,
+            [context, new TuiLaunchOptions(TuiPreference.Auto, false, ["--fork", "aaaaaaaaaaaa"], null), mailbox, CancellationToken.None]));
+        await task;
+
+        Assert.NotEqual("aaaaaaaaaaaa", context.Session.SessionId);
+        var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(context.Session.SessionId!);
+        Assert.NotNull(stored);
+        Assert.Equal(string.Empty, stored!.Metadata.SystemPromptOverride);
     }
 
     // ── Helpers ─────────────────────────────────────────────────────────────────

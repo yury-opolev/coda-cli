@@ -659,7 +659,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         {
             context.Session.History.AddRange(target.Messages);
             context.Session.SessionId = await Coda.Sdk.SessionForking.ForkAsync(
-                context.Session.WorkingDirectory, target.Id, target.Messages, ct).ConfigureAwait(false);
+                context.Session.WorkingDirectory,
+                target.Id,
+                target.Messages,
+                new Coda.Sdk.SessionMetadata { SystemPromptOverride = context.Session.SystemPromptOverride },
+                ct).ConfigureAwait(false);
             Publish(mailbox, new DiagnosticEvent(
                 "session", $"Forked from {target.Id} into a new session ({target.Messages.Count} messages).", UiNotificationLevel.Information));
         }

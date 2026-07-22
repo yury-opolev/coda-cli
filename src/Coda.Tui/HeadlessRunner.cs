@@ -136,7 +136,7 @@ public static class HeadlessRunner
             // Fork seeds history AND eagerly persists the new session (transcript + carried
             // audit sidecar) so it shows up in /resume immediately.
             seedSessionId = options.Fork
-                ? await SessionForking.ForkAsync(workingDirectory, target.Id, target.Messages, cancellationToken).ConfigureAwait(false)
+                ? await SessionForking.ForkAsync(workingDirectory, target.Id, target.Messages, target.Metadata, cancellationToken).ConfigureAwait(false)
                 : target.Id;
             if (!options.Fork)
             {

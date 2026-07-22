@@ -27,7 +27,11 @@ public sealed class ForkCommand : ISlashCommand
         CancellationToken cancellationToken = default)
     {
         context.Session.SessionId = await SessionForking.ForkAsync(
-            context.Session.WorkingDirectory, context.Session.SessionId, context.Session.History, cancellationToken).ConfigureAwait(false);
+            context.Session.WorkingDirectory,
+            context.Session.SessionId,
+            context.Session.History,
+            new SessionMetadata { SystemPromptOverride = context.Session.SystemPromptOverride },
+            cancellationToken).ConfigureAwait(false);
 
         var escapedId = Markup.Escape(context.Session.SessionId);
         context.Console.MarkupLine($"[grey50]Forked into a new session {escapedId} (original frozen).[/]");
