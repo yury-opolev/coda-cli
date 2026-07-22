@@ -35,6 +35,11 @@ public static class HeadlessRunner
         return Coda.Sdk.Providers.ProviderModelResolver.Resolve(providerFlag, modelFlag, settings, connectedProviderId);
     }
 
+    internal static string? ResolveInitialSystemPromptOverride(
+        HeadlessOptions options,
+        SessionCli.ResumeTarget? target) =>
+        options.Fork ? target?.Metadata.SystemPromptOverride : null;
+
     public static async Task<int> RunAsync(string[] runArgs, CancellationToken cancellationToken = default)
     {
         if (!HeadlessOptions.TryParse(runArgs, out var options, out var parseError))
@@ -99,6 +104,37 @@ public static class HeadlessRunner
             await mcp.ConnectAllAsync(mcpServers, msg => Console.Error.WriteLine(msg), cancellationToken).ConfigureAwait(false);
         }
 
+        List<ChatMessage>? seedHistory = null;
+        string? seedSessionId = null;
+        SessionCli.ResumeTarget? rootResumeTarget = null;
+        SessionCli.ResumeTarget? resolvedTarget = null;
+        if (options.Continue || options.ResumeSessionId is not null || options.Fork)
+        {
+            var continueLatest = options.Continue || (options.Fork && options.ForkSessionId is null);
+            var lookupId = options.Fork ? options.ForkSessionId : options.ResumeSessionId;
+            resolvedTarget = await SessionCli.ResolveAsync(workingDirectory, continueLatest, lookupId, cancellationToken).ConfigureAwait(false);
+            if (resolvedTarget is null)
+            {
+                Console.Error.WriteLine(options.Fork
+                    ? (options.ForkSessionId is not null ? $"Session '{options.ForkSessionId}' not found." : "No session to fork in this directory.")
+                    : options.Continue ? "No session to continue in this directory." : $"Session '{options.ResumeSessionId}' not found.");
+                return 1;
+            }
+
+            seedHistory = [.. resolvedTarget.Messages];
+            // Fork seeds history AND eagerly persists the new session (transcript + carried
+            // audit sidecar) so it shows up in /resume immediately.
+            seedSessionId = options.Fork
+                ? await SessionForking.ForkAsync(workingDirectory, resolvedTarget.Id, resolvedTarget.Messages, resolvedTarget.Metadata, cancellationToken).ConfigureAwait(false)
+                : resolvedTarget.Id;
+            if (!options.Fork)
+            {
+                rootResumeTarget = resolvedTarget;
+            }
+
+            if (options.Fork) { Console.Error.WriteLine($"[fork] from {resolvedTarget.Id} -> {seedSessionId} ({resolvedTarget.Messages.Count} messages)"); }
+        }
+
         var sessionOptions = new SessionOptions
         {
             ProviderId = providerId,
@@ -114,37 +150,8 @@ public static class HeadlessRunner
             GoalMaxContinuations = options.GoalMaxContinuationsOverride,
             EnableSessionMemory = options.EnableSessionMemory,
             MaxStopContinuations = options.MaxStopContinuations,
+            SystemPromptOverride = ResolveInitialSystemPromptOverride(options, resolvedTarget),
         };
-
-        List<ChatMessage>? seedHistory = null;
-        string? seedSessionId = null;
-        SessionCli.ResumeTarget? rootResumeTarget = null;
-        if (options.Continue || options.ResumeSessionId is not null || options.Fork)
-        {
-            var continueLatest = options.Continue || (options.Fork && options.ForkSessionId is null);
-            var lookupId = options.Fork ? options.ForkSessionId : options.ResumeSessionId;
-            var target = await SessionCli.ResolveAsync(workingDirectory, continueLatest, lookupId, cancellationToken).ConfigureAwait(false);
-            if (target is null)
-            {
-                Console.Error.WriteLine(options.Fork
-                    ? (options.ForkSessionId is not null ? $"Session '{options.ForkSessionId}' not found." : "No session to fork in this directory.")
-                    : options.Continue ? "No session to continue in this directory." : $"Session '{options.ResumeSessionId}' not found.");
-                return 1;
-            }
-
-            seedHistory = [.. target.Messages];
-            // Fork seeds history AND eagerly persists the new session (transcript + carried
-            // audit sidecar) so it shows up in /resume immediately.
-            seedSessionId = options.Fork
-                ? await SessionForking.ForkAsync(workingDirectory, target.Id, target.Messages, target.Metadata, cancellationToken).ConfigureAwait(false)
-                : target.Id;
-            if (!options.Fork)
-            {
-                rootResumeTarget = target;
-            }
-
-            if (options.Fork) { Console.Error.WriteLine($"[fork] from {target.Id} -> {seedSessionId} ({target.Messages.Count} messages)"); }
-        }
 
         using var session = new CodaSession(credentials, sessionOptions, history: seedHistory, sessionId: seedSessionId);
         if (rootResumeTarget is not null)
