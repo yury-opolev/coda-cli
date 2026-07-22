@@ -8,6 +8,22 @@ namespace Coda.Tui.Tests;
 public sealed class TerminalGuiModeRunnerTests
 {
     [Fact]
+    public void Explicit_driver_name_wins_over_automatic_compatibility_selection()
+    {
+        var selected = TerminalGuiModeRunner.ResolveDriverName("explicit", () => "auto");
+
+        Assert.Equal("explicit", selected);
+    }
+
+    [Fact]
+    public void Automatic_compatibility_selection_is_used_when_driver_name_is_null()
+    {
+        var selected = TerminalGuiModeRunner.ResolveDriverName(null, () => DriverRegistry.Names.ANSI);
+
+        Assert.Equal(DriverRegistry.Names.ANSI, selected);
+    }
+
+    [Fact]
     public async Task Plain_mode_delegates_to_the_plain_runner_without_creating_an_application()
     {
         var appCreated = false;

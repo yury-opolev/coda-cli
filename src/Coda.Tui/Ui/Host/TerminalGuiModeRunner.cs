@@ -106,6 +106,12 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         return clean.WithCleanupError(cleanupError);
     }
 
+    internal static string? ResolveDriverName(string? explicitDriverName, Func<string?> autoDriverName)
+    {
+        ArgumentNullException.ThrowIfNull(autoDriverName);
+        return explicitDriverName ?? autoDriverName();
+    }
+
     private async Task<TuiShellExit> RunTerminalGuiAsync(TuiRunMode mode, ComposerState composer, CancellationToken cancellationToken)
     {
         IApplication? app = null;
@@ -125,7 +131,7 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
                 mouseService.IsMouseDisabled = this.mouseDisabled;
             }
 
-            app.Init(this.driverName);
+            app.Init(ResolveDriverName(this.driverName, TerminalInputCompatibility.SelectDriverName));
 
             // Register the process-exit stop after Init (so there is a live application to stop) and
             // dispose it before the application itself, below.
