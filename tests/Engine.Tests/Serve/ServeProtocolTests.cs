@@ -26,6 +26,7 @@ public sealed class ServeProtocolTests
         Assert.Equal("session/prompt", ServeMethods.Prompt);
         Assert.Equal("session/interrupt", ServeMethods.Interrupt);
         Assert.Equal("session/steer", ServeMethods.Steer);
+        Assert.Equal("session/recallSteering", ServeMethods.RecallSteering);
         Assert.Equal("session/history", ServeMethods.History);
         Assert.Equal("session/messages", ServeMethods.Messages);
         Assert.Equal("shutdown", ServeMethods.Shutdown);
@@ -35,6 +36,7 @@ public sealed class ServeProtocolTests
         Assert.Equal("event/toolResult", ServeMethods.EventToolResult);
         Assert.Equal("event/error", ServeMethods.EventError);
         Assert.Equal("event/limitReached", ServeMethods.EventLimitReached);
+        Assert.Equal("event/steeringDelivered", ServeMethods.EventSteeringDelivered);
         Assert.Equal("event/stop", ServeMethods.EventStop);
         Assert.Equal("event/usage", ServeMethods.EventUsage);
         Assert.Equal("event/turnComplete", ServeMethods.EventTurnComplete);
@@ -191,6 +193,27 @@ public sealed class ServeProtocolTests
         var original = new SteerResult(true);
         var result = RoundTrip(original);
         Assert.Equal(original.Ok, result.Ok);
+    }
+
+    [Fact]
+    public void Steering_queue_messages_round_trip_with_ids()
+    {
+        var steer = RoundTrip(new SteerResult(true, "entry-1"));
+        var recalled = RoundTrip(new RecallSteeringResult(
+            [new RecalledSteeringMessage("entry-1", "focus tests", DateTimeOffset.Parse("2026-07-22T07:00:00Z"))]));
+        var delivered = RoundTrip(new SteeringDeliveredEvent(["entry-1"]));
+
+        Assert.Equal("entry-1", steer.MessageId);
+        Assert.Equal("focus tests", Assert.Single(recalled.Messages).Text);
+        Assert.Equal(["entry-1"], delivered.MessageIds);
+    }
+
+    [Fact]
+    public void SteerResult_omits_null_message_id()
+    {
+        var node = ServeJson.ToNode(new SteerResult(false))!.AsObject();
+
+        Assert.False(node.ContainsKey("messageId"));
     }
 
     [Fact]

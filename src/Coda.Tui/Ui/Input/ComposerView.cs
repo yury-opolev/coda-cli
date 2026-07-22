@@ -171,6 +171,12 @@ internal sealed class ComposerView : TextView
     internal Func<Key, bool>? ShellKeyHandler { get; set; }
 
     /// <summary>
+    /// Shell/controller seam for Up at an empty top-row composer. A non-null returned draft consumes the key;
+    /// null preserves normal prompt-history navigation.
+    /// </summary>
+    internal Func<string?>? RecallPendingSteering { get; set; }
+
+    /// <summary>
     /// Inserts <paramref name="text"/> into the draft as if typed, used when the shell redirects printable
     /// input that arrived while another view had focus. No-op while input is disabled or the text is empty.
     /// </summary>
@@ -560,6 +566,17 @@ internal sealed class ComposerView : TextView
             CanMoveVisualUp: caret.Row > 0,
             CanMoveVisualDown: caret.Row < layout.VisualLineCount - 1);
         var action = UiActionMap.Map(key, context);
+
+        if (action == UiAction.HistoryPrevious &&
+            key == Key.CursorUp &&
+            context.ComposerEmpty &&
+            !context.CompletionVisible &&
+            !context.CanMoveVisualUp &&
+            this.RecallPendingSteering?.Invoke() is { } recalledDraft)
+        {
+            this.SetDraft(recalledDraft, recalledDraft.Length);
+            return true;
+        }
 
         // While a paste is in progress, a stray Enter is text, never a submission (with or without an open
         // completion).

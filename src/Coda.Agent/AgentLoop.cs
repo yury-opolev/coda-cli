@@ -306,11 +306,12 @@ public sealed partial class AgentLoop : IAgentLoop
                 // seam; runs every iteration so a steer is honored at the next iteration boundary.
                 if (this.steering is not null)
                 {
-                    var steers = this.steering.DrainAll();
+                    var steers = this.steering.TakeAllForDelivery();
                     if (steers.Count > 0)
                     {
-                        var steerText = string.Join("\n\n", steers);
+                        var steerText = string.Join("\n\n", steers.Select(entry => entry.Text));
                         history.Add(new ChatMessage(ChatRole.User, [new TextBlock(steerText)]));
+                        sink.OnSteeringDelivered(steers.Select(entry => entry.Id).ToArray());
                     }
                 }
 
@@ -523,6 +524,13 @@ public sealed partial class AgentLoop : IAgentLoop
                         }
                     }
 
+                    // Seal only at a natural completion. A failed seal means an operator raced the
+                    // boundary; loop once more to deliver it before asking the model again.
+                    if (this.steering is not null && !this.steering.TrySealEmpty())
+                    {
+                        continue;
+                    }
+
                     // Fire user Stop hooks (observation only — ignore exit code and errors).
                     if (this.userHooks is not null)
                     {
@@ -612,8 +620,27 @@ public sealed partial class AgentLoop : IAgentLoop
             Logger = this.logger,
         };
 
-        foreach (var toolUse in toolUses)
+        for (var i = 0; i < toolUses.Count; i++)
         {
+            var toolUse = toolUses[i];
+            var delivered = this.steering?.TakeAllForDelivery() ?? [];
+            if (delivered.Count > 0)
+            {
+                for (var skippedIndex = i; skippedIndex < toolUses.Count; skippedIndex++)
+                {
+                    var skipped = toolUses[skippedIndex];
+                    var skippedResult = new ToolResult(
+                        "Skipped: not executed because new operator steering arrived before this tool started.",
+                        IsError: true);
+                    sink.OnToolResult(skipped.Name, skippedResult);
+                    results.Add(new ToolResultBlock(skipped.Id, skippedResult.Content, skippedResult.IsError));
+                }
+
+                results.Add(new TextBlock(string.Join("\n\n", delivered.Select(entry => entry.Text))));
+                sink.OnSteeringDelivered(delivered.Select(entry => entry.Id).ToArray());
+                break;
+            }
+
             sink.OnToolCall(toolUse.Name, toolUse.InputJson);
             this.LogToolCall(toolUse.Name, SummarizeToolInput(toolUse.InputJson));
 

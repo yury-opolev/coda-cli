@@ -137,8 +137,8 @@ public sealed class ImageBlockTests
 
         Assert.True(result.Success);
         Assert.Equal("I see a cat", result.FinalText);
-        // History: user message + assistant message = 2
-        Assert.Equal(2, session.History.Count);
+        // History also carries the active deferred-tools reminder.
+        Assert.Equal(3, session.History.Count);
         var userMsg = session.History[0];
         Assert.Equal(ChatRole.User, userMsg.Role);
         Assert.Equal(2, userMsg.Content.Count);
@@ -166,6 +166,6 @@ public sealed class ImageBlockTests
 
         Assert.True(result.Success);
         Assert.Equal("I see a cat", result.FinalText);
-        Assert.Equal(2, session.History.Count);
+        Assert.Equal(3, session.History.Count);
     }
 }

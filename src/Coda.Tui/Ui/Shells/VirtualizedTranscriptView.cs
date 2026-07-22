@@ -10,7 +10,7 @@ namespace Coda.Tui.Ui.Shells;
 /// A virtualized transcript surface. Rather than materializing one giant string in a
 /// <see cref="TextView"/>, it draws only the rows currently visible: on each frame it clears the
 /// viewport, asks its <see cref="TranscriptLayoutIndex"/> for the visible rows (plus a small overscan),
-/// and paints each with a role-based color. Scroll position, auto-follow, and the unseen-row count live
+/// and paints each with a role-based color. Scroll position, auto-follow, and unseen counters live
 /// in a Terminal.Gui-independent <see cref="TranscriptViewportState"/>, so a conversation with tens of
 /// thousands of rows stays responsive and bounded in memory.
 /// </summary>
@@ -36,6 +36,8 @@ internal sealed class VirtualizedTranscriptView : View
 
     private readonly TranscriptSelection selection = new();
     private bool dragging;
+    private bool scrollbarDragging;
+    private bool scrollbarVisible;
     private TranscriptCellPosition pressPosition;
 
     public VirtualizedTranscriptView(
@@ -54,9 +56,9 @@ internal sealed class VirtualizedTranscriptView : View
     public bool AutoFollow => this.viewport.AutoFollow;
 
     /// <summary>
-    /// Raised after a user scroll/jump changes the virtual viewport (auto-follow, unseen-row count, or
-    /// top row), so a host can refresh chrome — e.g. the full-screen header's "{n} new — Ctrl+End"
-    /// indicator — immediately instead of waiting for the next snapshot. Distinct from the base
+    /// Raised after a user scroll/jump changes the virtual viewport (auto-follow, unseen counters, or
+    /// top row), so a host can refresh navigation chrome immediately instead of waiting for the next snapshot.
+    /// Distinct from the base
     /// <see cref="View"/>'s own viewport event, which tracks Terminal.Gui layout, not this virtual scroll.
     /// </summary>
     internal event Action? TranscriptScrolled;
@@ -78,6 +80,9 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>Rows appended while scrolled away that have not been seen.</summary>
     public int UnseenRows => this.viewport.UnseenRows;
 
+    /// <summary>Visible blocks appended while away from the bottom.</summary>
+    public int UnseenBlocks => this.viewport.UnseenBlocks;
+
     /// <summary>The first content row rendered at the top of the viewport.</summary>
     internal int TopRow => this.viewport.TopRow;
 
@@ -87,6 +92,16 @@ internal sealed class VirtualizedTranscriptView : View
     /// transcript reflows to the full terminal width on resize.
     /// </summary>
     internal int ActiveLayoutWidth => this.currentWidth;
+
+    internal bool ScrollbarVisibleForTest => this.scrollbarVisible;
+
+    internal int ContentWidthForTest => this.ContentWidth;
+
+    internal int ContentRowsForTest => this.viewport.ContentRows;
+
+    internal int ViewportHeightForTest => this.viewport.ViewportHeight;
+
+    internal bool ScrollbarDraggingForTest => this.scrollbarDragging;
 
     /// <summary>Number of times the transcript was fully rebuilt (initial/reseed/resize).</summary>
     internal int ReplaceAllCount { get; private set; }
@@ -106,6 +121,7 @@ internal sealed class VirtualizedTranscriptView : View
         this.ReplaceAllCount++;
         this.index.ReplaceAll(blocks, this.currentWidth);
         this.viewport.SetContentRows(this.index.TotalRows);
+        this.UpdateScrollbarLayout();
         this.selectedBlockId = blocks.IsDefaultOrEmpty ? null : blocks[^1].Id;
         this.PruneExpanded(blocks);
         this.SetNeedsDraw();
@@ -117,8 +133,16 @@ internal sealed class VirtualizedTranscriptView : View
         this.AppendCount++;
         var before = this.index.TotalRows;
         this.index.Append(block, this.currentWidth);
-        this.viewport.OnRowsAppended(this.index.TotalRows - before);
+        var delta = this.index.TotalRows - before;
+        this.viewport.OnRowsAppended(delta);
+        if (delta > 0)
+        {
+            this.viewport.OnBlockAppended();
+        }
+
+        this.UpdateScrollbarLayout();
         this.selectedBlockId = block.Id;
+        this.UpdateScrollbarLayout();
         this.SetNeedsDraw();
     }
 
@@ -172,6 +196,12 @@ internal sealed class VirtualizedTranscriptView : View
 
     /// <summary>Sets the viewport height in rows (called on layout).</summary>
     internal void SetViewportHeight(int height) => this.viewport.SetViewportHeight(height);
+
+    internal void SetViewportHeightForTest(int height)
+    {
+        this.viewport.SetViewportHeight(height);
+        this.UpdateScrollbarLayout();
+    }
 
     /// <summary>Scrolls the transcript by a number of rows (negative scrolls up).</summary>
     public void ScrollBy(int rows)
@@ -272,6 +302,7 @@ internal sealed class VirtualizedTranscriptView : View
             this.DrawRow(row, screenRow);
         }
 
+        this.DrawScrollbar();
         return true;
     }
 
@@ -287,7 +318,7 @@ internal sealed class VirtualizedTranscriptView : View
     /// </summary>
     private void DrawRow(TranscriptRow row, int screenRow)
     {
-        var viewWidth = Math.Max(0, this.Viewport.Width);
+        var viewWidth = this.ContentWidth;
         var rowAttribute = this.AttributeFor(row.Role);
 
         if (row.FillWidth && viewWidth > 0)
@@ -301,7 +332,7 @@ internal sealed class VirtualizedTranscriptView : View
         }
 
         var rowWidth = TerminalCellText.Width(row.Text);
-        var range = this.selection.RangeForRow(row.GlobalRow, rowWidth);
+        var range = row.IsSeparator ? null : this.selection.RangeForRow(row.GlobalRow, rowWidth);
         if (range is null)
         {
             this.SetAttribute(rowAttribute);
@@ -372,6 +403,52 @@ internal sealed class VirtualizedTranscriptView : View
             mouse.Flags.HasFlag(MouseFlags.Shift))
         {
             return false;
+        }
+
+        var local = mouse.Position ?? System.Drawing.Point.Empty;
+        if (this.scrollbarDragging)
+        {
+            if (mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
+            {
+                this.scrollbarDragging = false;
+                mouseService.UngrabMouse();
+                return true;
+            }
+
+            if (mouse.Flags.HasFlag(MouseFlags.PositionReport) || mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
+            {
+                this.viewport.ScrollToRow(ScrollbarMetrics.TopRowForPointer(
+                    local.Y,
+                    this.viewport.ViewportHeight,
+                    this.viewport.ContentRows));
+                this.SetNeedsDraw();
+                this.TranscriptScrolled?.Invoke();
+                return true;
+            }
+        }
+
+        if (this.scrollbarVisible && local.X == this.Viewport.Width - 1 &&
+            mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
+        {
+            var metrics = ScrollbarMetrics.Compute(
+                this.viewport.ContentRows,
+                this.viewport.ViewportHeight,
+                this.viewport.TopRow);
+            if (local.Y < metrics.ThumbTop)
+            {
+                this.ScrollBy(-this.viewport.ViewportHeight);
+            }
+            else if (local.Y >= metrics.ThumbTop + metrics.ThumbHeight)
+            {
+                this.ScrollBy(this.viewport.ViewportHeight);
+            }
+            else
+            {
+                this.scrollbarDragging = true;
+                mouseService.GrabMouse(this);
+            }
+
+            return true;
         }
 
         if (mouse.Flags.HasFlag(MouseFlags.WheeledUp))
@@ -455,6 +532,12 @@ internal sealed class VirtualizedTranscriptView : View
 
     private void ToggleExpansionAt(int globalRow)
     {
+        var rows = this.index.GetRows(globalRow, 1);
+        if (rows.Count == 0 || rows[0].IsSeparator)
+        {
+            return;
+        }
+
         if (this.index.BlockIdAt(globalRow) is not { } id)
         {
             return;
@@ -560,13 +643,54 @@ internal sealed class VirtualizedTranscriptView : View
 
     private void SyncViewportMetrics()
     {
-        var width = Math.Max(1, this.Viewport.Width);
-        if (width != this.currentWidth)
+        this.viewport.SetViewportHeight(Math.Max(0, this.Viewport.Height));
+        this.UpdateScrollbarLayout();
+    }
+
+    private int ContentWidth => Math.Max(1, this.Viewport.Width - (this.scrollbarVisible ? 1 : 0));
+
+    /// <summary>Reflows before drawing whenever the reserved scrollbar column changes wrap width.</summary>
+    private void UpdateScrollbarLayout()
+    {
+        var viewportWidth = Math.Max(1, this.Viewport.Width > 0 ? this.Viewport.Width : this.currentWidth);
+        var needsScrollbar = this.index.TotalRows > this.viewport.ViewportHeight;
+        var desiredWidth = Math.Max(1, viewportWidth - (needsScrollbar ? 1 : 0));
+        if (desiredWidth != this.currentWidth)
         {
-            this.Reflow(width);
+            this.Reflow(desiredWidth);
         }
 
-        this.viewport.SetViewportHeight(Math.Max(0, this.Viewport.Height));
+        // A reflow can alter the wrapped height, so compute visibility once more from final content.
+        this.scrollbarVisible = this.index.TotalRows > this.viewport.ViewportHeight;
+        var finalWidth = Math.Max(1, viewportWidth - (this.scrollbarVisible ? 1 : 0));
+        if (finalWidth != this.currentWidth)
+        {
+            this.Reflow(finalWidth);
+            this.scrollbarVisible = this.index.TotalRows > this.viewport.ViewportHeight;
+        }
+    }
+
+    private void DrawScrollbar()
+    {
+        if (!this.scrollbarVisible || this.Viewport.Width <= 0)
+        {
+            return;
+        }
+
+        var column = this.Viewport.Width - 1;
+        var metrics = ScrollbarMetrics.Compute(
+            this.viewport.ContentRows,
+            this.viewport.ViewportHeight,
+            this.viewport.TopRow);
+        for (var y = 0; y < this.viewport.ViewportHeight; y++)
+        {
+            var inThumb = y >= metrics.ThumbTop && y < metrics.ThumbTop + metrics.ThumbHeight;
+            this.SetAttribute(inThumb
+                ? this.theme.ScrollbarThumbAttribute(this.app.Driver)
+                : this.theme.ScrollbarTrackAttribute(this.app.Driver));
+            this.Move(column, y);
+            this.AddStr(inThumb ? "█" : "│");
+        }
     }
 
     internal TgAttribute AttributeFor(TranscriptRole role, bool? trueColor = null)

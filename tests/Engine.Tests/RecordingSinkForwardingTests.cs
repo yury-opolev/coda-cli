@@ -17,6 +17,7 @@ public sealed class RecordingSinkForwardingTests
     private sealed class CapturingInner : IAgentSink
     {
         private readonly List<(string ToolName, long ElapsedMs)> progress = [];
+        public List<string> DeliveredIds { get; } = [];
 
         public IReadOnlyList<(string ToolName, long ElapsedMs)> Progress
         {
@@ -36,6 +37,8 @@ public sealed class RecordingSinkForwardingTests
                 this.progress.Add((toolName, elapsedMs));
             }
         }
+
+        public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.DeliveredIds.AddRange(ids);
     }
 
     [Fact]
@@ -47,6 +50,17 @@ public sealed class RecordingSinkForwardingTests
         recording.OnToolProgress("run_command", 5_000);
 
         Assert.Contains(("run_command", 5_000L), inner.Progress);
+    }
+
+    [Fact]
+    public void RecordingSink_forwards_OnSteeringDelivered_to_inner()
+    {
+        var inner = new CapturingInner();
+        IAgentSink recording = new RecordingSink(inner);
+
+        recording.OnSteeringDelivered(["first", "second"]);
+
+        Assert.Equal(["first", "second"], inner.DeliveredIds);
     }
 
     private sealed class ScriptedClient(params IReadOnlyList<AssistantStreamEvent>[] turns) : ILlmClient

@@ -81,6 +81,11 @@ internal sealed class TranscriptSelection
         var selected = new List<string>();
         foreach (var row in rows.OrderBy(row => row.GlobalRow))
         {
+            if (row.IsSeparator)
+            {
+                continue;
+            }
+
             var width = TerminalCellText.Width(row.Text);
             if (this.RangeForRow(row.GlobalRow, width) is not { } range)
             {

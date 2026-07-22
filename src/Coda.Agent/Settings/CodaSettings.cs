@@ -45,6 +45,12 @@ public sealed record CodaSettings(
     /// <summary>Optional telemetry/logging config from the "telemetry" block. Null = off.</summary>
     public TelemetrySettings? Telemetry { get; init; }
 
+    /// <summary>
+    /// Raw user-global tool-display mode string; null when absent. Project settings cannot set this value;
+    /// interpretation belongs to the TUI layer.
+    /// </summary>
+    public string? ToolDisplayMode { get; init; }
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
 }

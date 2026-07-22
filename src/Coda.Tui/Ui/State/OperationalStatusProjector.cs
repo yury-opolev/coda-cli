@@ -1,10 +1,13 @@
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Rendering;
 
 namespace Coda.Tui.Ui.State;
 
 internal static class OperationalStatusProjector
 {
-    public static OperationalStatus Project(UiSessionSnapshot snapshot)
+    public static OperationalStatus Project(
+        UiSessionSnapshot snapshot,
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
 
@@ -27,7 +30,9 @@ internal static class OperationalStatusProjector
         var tool = LastIncompleteTool(snapshot);
         if (tool is not null)
         {
-            return new($"Working · {tool.ToolName}", OperationalTone.Working, true);
+            return toolDisplayMode == ToolDisplayMode.Tiny
+                ? new("Working", OperationalTone.Working, true)
+                : new($"Working · {tool.ToolName}", OperationalTone.Working, true);
         }
 
         if (snapshot.ActiveOperation is { } operation)

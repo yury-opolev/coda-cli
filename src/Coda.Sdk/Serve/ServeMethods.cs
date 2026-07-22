@@ -9,6 +9,7 @@ public static class ServeMethods
     public const string Prompt = "session/prompt";
     public const string Interrupt = "session/interrupt";
     public const string Steer = "session/steer";
+    public const string RecallSteering = "session/recallSteering";
     public const string History = "session/history";
     public const string Messages = "session/messages";
     public const string Models = "session/models";
@@ -22,6 +23,7 @@ public static class ServeMethods
     public const string EventToolResult = "event/toolResult";
     public const string EventError = "event/error";
     public const string EventLimitReached = "event/limitReached";
+    public const string EventSteeringDelivered = "event/steeringDelivered";
     public const string EventStop = "event/stop";
     public const string EventUsage = "event/usage";
     public const string EventTurnComplete = "event/turnComplete";

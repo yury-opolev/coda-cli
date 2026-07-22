@@ -91,6 +91,39 @@ public class NewTaskToolsTests
     }
 
     [Fact]
+    public async Task Task_recall_returns_pending_messages_in_order_and_clears_them()
+    {
+        var mgr = NewManager();
+        var task = mgr.Register(TaskKind.Subagent, "s", parentTaskId: null);
+        task.AttachSteering(new SteeringInbox());
+        task.Steering!.Enqueue("first");
+        task.Steering.Enqueue("second");
+
+        var result = await new TaskRecallTool().ExecuteAsync(
+            Input($$"""{"task_id":"{{task.Id}}"}"""), Ctx(mgr), CancellationToken.None);
+
+        Assert.Contains("- first", result.Content);
+        Assert.Contains("- second", result.Content);
+        Assert.Empty(task.Steering.RecallAll());
+    }
+
+    [Fact]
+    public async Task Task_recall_unauthorized_target_is_indistinguishable_from_not_found()
+    {
+        var mgr = NewManager();
+        var branchA = mgr.Register(TaskKind.Subagent, "a", parentTaskId: null);
+        var branchB = mgr.Register(TaskKind.Subagent, "b", parentTaskId: null);
+        branchB.AttachSteering(new SteeringInbox());
+        branchB.Steering!.Enqueue("secret");
+
+        var result = await new TaskRecallTool().ExecuteAsync(
+            Input($$"""{"task_id":"{{branchB.Id}}"}"""), Ctx(mgr, branchA.Id), CancellationToken.None);
+
+        Assert.Equal($"Task '{branchB.Id}' not found.", result.Content);
+        Assert.Single(branchB.Steering.RecallAll());
+    }
+
+    [Fact]
     public async Task TaskSend_ShellTask_IsRejected()
     {
         var mgr = NewManager();

@@ -24,6 +24,7 @@ internal sealed class RetainedShellFixture : IDisposable
     }
 
     internal FullscreenTuiShell Shell { get; }
+    internal IApplication HostApplication => this.app;
     internal List<UiAction> Actions { get; } = [];
 
     internal static RetainedShellFixture Create(

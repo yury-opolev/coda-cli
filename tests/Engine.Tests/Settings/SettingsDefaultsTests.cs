@@ -132,4 +132,34 @@ public sealed class SettingsDefaultsTests : IDisposable
         Assert.Null(settings.DefaultProvider);
         Assert.Empty(settings.ModelByProvider);
     }
+
+    [Fact]
+    public void Tool_display_mode_preserves_raw_user_value()
+    {
+        this.WriteUser("""{ "toolDisplayMode": "  CoMpAcT  " }""");
+
+        var settings = SettingsLoader.Load(this.projectDir, this.userHome);
+
+        Assert.Equal("  CoMpAcT  ", settings.ToolDisplayMode);
+    }
+
+    [Fact]
+    public void Project_tool_display_mode_cannot_override_user_value()
+    {
+        this.WriteUser("""{ "toolDisplayMode": "verbose" }""");
+        this.WriteProject("""{ "toolDisplayMode": "tiny" }""");
+
+        var settings = SettingsLoader.Load(this.projectDir, this.userHome);
+
+        Assert.Equal("verbose", settings.ToolDisplayMode);
+    }
+
+    [Fact]
+    public void Missing_tool_display_mode_keeps_empty_settings_fast_path()
+    {
+        var settings = SettingsLoader.Load(this.projectDir, this.userHome);
+
+        Assert.Same(CodaSettings.Empty, settings);
+        Assert.Null(settings.ToolDisplayMode);
+    }
 }

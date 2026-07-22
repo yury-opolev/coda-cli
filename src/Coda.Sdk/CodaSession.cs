@@ -348,10 +348,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// in flight. Safe to call concurrently with a running turn; no-op semantics if nothing is running
     /// (the comment is delivered to the next turn).
     /// </summary>
-    public void Steer(string comment)
+    public string? Steer(string comment)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(comment);
-        this.steeringInbox.Enqueue(comment);
+        return this.steeringInbox.Enqueue(comment)?.Id;
     }
 
     /// <summary>
@@ -360,6 +360,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public void ClearSteering() => this.steeringInbox.Clear();
 
+    /// <summary>Atomically removes and returns all still-pending steering messages in FIFO order.</summary>
+    public IReadOnlyList<SteeringEntry> RecallSteering() => this.steeringInbox.RecallAll();
+
     /// <summary>
     /// Run one user turn using a pre-built list of content blocks (e.g. images + text).
     /// The blocks become the content of the user message added to history.
@@ -367,6 +370,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public async Task<RunResult> RunAsync(IReadOnlyList<ContentBlock> userContent, IAgentSink? sink = null, CancellationToken cancellationToken = default)
     {
+        // A previous natural turn seals its inbox. Reopen before publishing the next loop spec,
+        // without dropping a steer that raced a serve host's transition into this turn.
+        this.steeringInbox.OpenForTurn();
         var options = this.ResolveEffectiveOptions();
         var client = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
         if (client is null)
@@ -432,6 +438,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         catch (OperationCanceledException)
         {
             this.Rollback(snapshot);
+            this.steeringInbox.Clear();
             return new RunResult(false, recording.FinalText, recording.ToolCalls, null, "Canceled.")
             {
                 Usage = recording.Usage,
@@ -441,6 +448,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         catch (Exception ex)
         {
             this.Rollback(snapshot);
+            this.steeringInbox.Clear();
             this.LogTurnFailed(options.ProviderId, options.Model, ex.GetType().Name, ex.Message);
             return new RunResult(false, recording.FinalText, recording.ToolCalls, null, ex.Message)
             {

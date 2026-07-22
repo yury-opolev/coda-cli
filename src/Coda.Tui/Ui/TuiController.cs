@@ -1,3 +1,4 @@
+using Coda.Agent;
 using Coda.Tui.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
@@ -40,6 +41,8 @@ public sealed class TuiController
     private readonly Func<string, CancellationToken, Task<CommandResult>> dispatch;
     private readonly Func<bool> tryInterrupt;
     private readonly Func<bool> hasActiveTurn;
+    private readonly Func<string, string?>? steer;
+    private readonly Func<IReadOnlyList<SteeringEntry>> recallSteering;
     private readonly IUiEventPublisher publisher;
     private readonly CancellationToken hostToken;
     private readonly object gate = new();
@@ -50,6 +53,8 @@ public sealed class TuiController
     private bool dispatchInFlight;
     private CancellationTokenSource? dispatchCts;
     private Task? dispatchTask;
+    private readonly Queue<string> nextPrompts = new();
+    private bool shutdownDrainRequested;
 
     // The FIFO chain of out-of-band permission commands (see OnSubmitted). It only ever grows by
     // appending a continuation that awaits the previous tail, so multiple mid-turn permission commands
@@ -78,6 +83,8 @@ public sealed class TuiController
             dispatch: (text, ct) => (app ?? throw new ArgumentNullException(nameof(app))).DispatchAsync(CommandParser.Parse(text), ct),
             tryInterrupt: (runner ?? throw new ArgumentNullException(nameof(runner))).TryInterruptActiveTurn,
             hasActiveTurn: () => runner.HasActiveTurn,
+            steer: runner.Steer,
+            recallSteering: runner.RecallSteering,
             publisher: mailbox,
             initialSnapshot: initialSnapshot,
             hostCancellationToken: hostCancellationToken)
@@ -97,8 +104,18 @@ public sealed class TuiController
         Func<bool> tryInterrupt,
         IUiEventPublisher publisher,
         UiSessionSnapshot initialSnapshot,
-        CancellationToken hostCancellationToken = default)
-        : this(dispatch, tryInterrupt, static () => false, publisher, initialSnapshot, hostCancellationToken)
+        CancellationToken hostCancellationToken = default,
+        Func<string, string?>? steer = null,
+        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null)
+        : this(
+            dispatch,
+            tryInterrupt,
+            static () => false,
+            publisher,
+            initialSnapshot,
+            hostCancellationToken,
+            steer,
+            recallSteering)
     {
     }
 
@@ -111,8 +128,10 @@ public sealed class TuiController
         Func<bool> tryInterrupt,
         IUiEventPublisher publisher,
         UiSessionSnapshot initialSnapshot,
-        CancellationToken hostCancellationToken = default)
-        : this(AsContinuing(dispatch), tryInterrupt, publisher, initialSnapshot, hostCancellationToken)
+        CancellationToken hostCancellationToken = default,
+        Func<string, string?>? steer = null,
+        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null)
+        : this(AsContinuing(dispatch), tryInterrupt, publisher, initialSnapshot, hostCancellationToken, steer, recallSteering)
     {
     }
 
@@ -122,11 +141,15 @@ public sealed class TuiController
         Func<bool> hasActiveTurn,
         IUiEventPublisher publisher,
         UiSessionSnapshot initialSnapshot,
-        CancellationToken hostCancellationToken)
+        CancellationToken hostCancellationToken,
+        Func<string, string?>? steer = null,
+        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null)
     {
         this.dispatch = dispatch ?? throw new ArgumentNullException(nameof(dispatch));
         this.tryInterrupt = tryInterrupt ?? throw new ArgumentNullException(nameof(tryInterrupt));
         this.hasActiveTurn = hasActiveTurn ?? throw new ArgumentNullException(nameof(hasActiveTurn));
+        this.steer = steer;
+        this.recallSteering = recallSteering ?? (static () => (IReadOnlyList<SteeringEntry>)[]);
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
         this.hostToken = hostCancellationToken;
         this.CurrentSnapshot = initialSnapshot ?? throw new ArgumentNullException(nameof(initialSnapshot));
@@ -270,10 +293,55 @@ public sealed class TuiController
     /// <summary>Interrupt the active turn, if any. Returns false when nothing was running.</summary>
     public bool TryInterruptActiveTurn() => this.tryInterrupt();
 
+    /// <summary>
+    /// Stop accepting work and drain the current dispatch for host shutdown. This is idempotent: only the
+    /// first caller interrupts the active turn, while all callers observe the same work completing.
+    /// </summary>
+    public async Task DrainForShutdownAsync(CancellationToken cancellationToken = default)
+    {
+        bool interrupt;
+        lock (this.gate)
+        {
+            interrupt = !this.shutdownDrainRequested;
+            this.shutdownDrainRequested = true;
+            this.nextPrompts.Clear();
+        }
+
+        if (interrupt)
+        {
+            this.TryInterruptActiveTurn();
+        }
+
+        await this.WaitForDispatchAsync(cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Recall pending steering atomically and restore it as a composer draft.</summary>
+    public string? RecallSteering()
+    {
+        IReadOnlyList<SteeringEntry> entries;
+        try
+        {
+            entries = this.recallSteering();
+        }
+        catch (ObjectDisposedException)
+        {
+            return null;
+        }
+
+        if (entries.Count == 0)
+        {
+            return null;
+        }
+
+        this.publisher.Publish(new PendingSteeringRecalledEvent(entries.Select(entry => entry.Id).ToArray()));
+        return string.Join("\n\n", entries.Select(entry => entry.Text));
+    }
+
     /// <summary>Request application exit and, if a shell is attached, stop it with an exit outcome.</summary>
     public void RequestExit()
     {
         Volatile.Write(ref this.exitRequested, true);
+        this.RemovePendingRows();
         this.CurrentShell()?.RequestStop(TuiShellExit.Exited);
     }
 
@@ -307,11 +375,10 @@ public sealed class TuiController
             return;
         }
 
-        CancellationToken token;
         lock (this.gate)
         {
             // Exit/startup always reject every submission, including permission commands.
-            if (Volatile.Read(ref this.exitRequested) || this.startupPending)
+            if (Volatile.Read(ref this.exitRequested) || this.shutdownDrainRequested || this.startupPending)
             {
                 return;
             }
@@ -323,16 +390,41 @@ public sealed class TuiController
                 if (LivePermissionCommands.IsLivePermissionCommand(CommandParser.Parse(text)))
                 {
                     this.QueueSidebandCommand(text);
+                    return;
+                }
+
+                // The live runner validates that the turn still owns an open queue. A null result is the
+                // atomic close race: retain the text and start it normally from the current dispatch's
+                // finally block, never attempting to attach it to the next turn.
+                if (this.steer is null)
+                {
+                    return;
+                }
+
+                var queueEntryId = this.steer(text);
+                if (queueEntryId is not null)
+                {
+                    this.publisher.Publish(new UserPromptEnqueuedEvent(
+                        Guid.NewGuid(), text, queueEntryId, DateTimeOffset.Now));
+                }
+                else
+                {
+                    this.nextPrompts.Enqueue(text);
                 }
 
                 return;
             }
 
-            this.dispatchInFlight = true;
-            this.dispatchCts = CancellationTokenSource.CreateLinkedTokenSource(this.hostToken);
-            token = this.dispatchCts.Token;
-            this.dispatchTask = Task.Run(() => this.RunDispatchAsync(text, token));
+            this.StartDispatchLocked(text);
         }
+    }
+
+    private void StartDispatchLocked(string text)
+    {
+        this.dispatchInFlight = true;
+        this.dispatchCts = CancellationTokenSource.CreateLinkedTokenSource(this.hostToken);
+        var token = this.dispatchCts.Token;
+        this.dispatchTask = Task.Run(() => this.RunDispatchAsync(text, token));
     }
 
     /// <summary>
@@ -440,6 +532,13 @@ public sealed class TuiController
                 this.dispatchCts?.Dispose();
                 this.dispatchCts = null;
                 this.dispatchTask = null;
+                if (!this.exitRequested &&
+                    !this.shutdownDrainRequested &&
+                    !this.hostToken.IsCancellationRequested &&
+                    this.nextPrompts.Count > 0)
+                {
+                    this.StartDispatchLocked(this.nextPrompts.Dequeue());
+                }
             }
         }
     }
@@ -483,16 +582,27 @@ public sealed class TuiController
             return;
         }
 
-        Task? current;
-        Task sideband;
-        lock (this.gate)
+        while (true)
         {
-            current = this.dispatchTask;
-            sideband = this.sidebandChain;
-        }
+            Task? current;
+            Task sideband;
+            lock (this.gate)
+            {
+                current = this.dispatchTask;
+                sideband = this.sidebandChain;
+            }
 
-        await ObserveQuietlyAsync(current, cancellationToken).ConfigureAwait(false);
-        await ObserveQuietlyAsync(sideband, cancellationToken).ConfigureAwait(false);
+            await ObserveQuietlyAsync(current, cancellationToken).ConfigureAwait(false);
+            await ObserveQuietlyAsync(sideband, cancellationToken).ConfigureAwait(false);
+
+            lock (this.gate)
+            {
+                if (ReferenceEquals(current, this.dispatchTask) && ReferenceEquals(sideband, this.sidebandChain))
+                {
+                    return;
+                }
+            }
+        }
     }
 
     /// <summary>Await <paramref name="task"/> for teardown, absorbing cancellation and its own faults.</summary>
@@ -542,6 +652,18 @@ public sealed class TuiController
         lock (this.gate)
         {
             return this.shell;
+        }
+    }
+
+    private void RemovePendingRows()
+    {
+        var ids = this.CurrentSnapshot.Transcript
+            .OfType<PendingUserTranscriptBlock>()
+            .Select(block => block.QueueEntryId)
+            .ToArray();
+        if (ids.Length > 0)
+        {
+            this.publisher.Publish(new PendingSteeringRecalledEvent(ids));
         }
     }
 }

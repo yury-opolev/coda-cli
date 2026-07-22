@@ -124,6 +124,30 @@ public sealed class AgentRunnerTests : IDisposable
     }
 
     [Fact]
+    public async Task Steering_pass_through_accepts_and_recalls_only_during_the_live_turn()
+    {
+        var events = new RecordingUiEvents();
+        var context = this.BuildContext(events, out _);
+        var loop = new BlockingLoop();
+        using var runner = NewRunner(loop);
+
+        Assert.Null(runner.Steer("before"));
+        Assert.Empty(runner.RecallSteering());
+
+        var turn = runner.RunAsync(context, "long", CancellationToken.None);
+        await loop.Started;
+
+        var id = runner.Steer("queued");
+        Assert.NotNull(id);
+        var recalled = Assert.Single(runner.RecallSteering());
+        Assert.Equal(id, recalled.Id);
+        Assert.Equal("queued", recalled.Text);
+
+        runner.TryInterruptActiveTurn();
+        await turn;
+    }
+
+    [Fact]
     public async Task Interrupting_only_cancels_the_turn_not_the_caller_token()
     {
         var events = new RecordingUiEvents();

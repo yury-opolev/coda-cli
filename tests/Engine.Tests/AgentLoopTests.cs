@@ -57,6 +57,46 @@ public sealed class AgentLoopTests
         }
     }
 
+    private sealed class RecordingTool(string name, List<string> ran) : ITool
+    {
+        public string Name => name;
+        public string Description => name;
+        public string InputSchemaJson => "{}";
+        public bool IsReadOnly => true;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
+        {
+            ran.Add(this.Name);
+            return Task.FromResult(new ToolResult("ok"));
+        }
+    }
+
+    private sealed class EnqueueingScriptedClient(
+        SteeringInbox inbox,
+        params IReadOnlyList<AssistantStreamEvent>[] turns) : ILlmClient
+    {
+        private int turn;
+
+        public string ProviderId => "fake";
+
+        public async IAsyncEnumerable<AssistantStreamEvent> StreamAsync(
+            ChatRequest request,
+            [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
+        {
+            var events = turns[this.turn++];
+            foreach (var streamEvent in events)
+            {
+                await Task.Yield();
+                yield return streamEvent;
+            }
+
+            if (this.turn == 1)
+            {
+                inbox.Enqueue("redirect");
+            }
+        }
+    }
+
     /// <summary>
     /// A read-only probe that records the <see cref="ToolContext.AllowOutsideWorkingDirectory"/>
     /// it was handed, then advances the shared <see cref="PermissionModeState"/> to the next
@@ -95,6 +135,7 @@ public sealed class AgentLoopTests
     {
         public List<string> Errors { get; } = [];
         public List<(string Kind, string Message)> Limits { get; } = [];
+        public List<IReadOnlyList<string>> Delivered { get; } = [];
 
         public void OnAssistantText(string delta) { }
         public void OnAssistantTextComplete() { }
@@ -102,6 +143,7 @@ public sealed class AgentLoopTests
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) => this.Errors.Add(message);
         public void OnLimitReached(string kind, string message) => this.Limits.Add((kind, message));
+        public void OnSteeringDelivered(IReadOnlyList<string> messageIds) => this.Delivered.Add(messageIds);
     }
 
     private static AgentOptions Options() => new() { SystemPrompt = "sys", WorkingDirectory = ".", Model = "m" };
@@ -292,6 +334,104 @@ public sealed class AgentLoopTests
             history,
             m => m.Role == ChatRole.User
                 && m.Content.OfType<TextBlock>().Any(t => t.Text.Contains("focus on tests first")));
+    }
+
+    [Fact]
+    public async Task Steering_present_before_sampling_is_delivered_fifo_with_ids()
+    {
+        var inbox = new SteeringInbox();
+        var first = inbox.Enqueue("first");
+        var second = inbox.Enqueue("second");
+        var sink = new RecordingSink();
+        var loop = new AgentLoop(
+            new ScriptedClient([AssistantStreamEvent.Finished("end_turn")]),
+            new ToolRegistry([]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            steering: inbox);
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+
+        await loop.RunAsync(history, sink);
+
+        Assert.Equal([first!.Id, second!.Id], Assert.Single(sink.Delivered));
+        var steering = Assert.Single(history, message => message.Role == ChatRole.User && message != history[0]);
+        Assert.Equal("first\n\nsecond", Assert.IsType<TextBlock>(Assert.Single(steering.Content)).Text);
+    }
+
+    [Fact]
+    public async Task Steering_arriving_during_streaming_skips_every_unstarted_tool_with_results()
+    {
+        var inbox = new SteeringInbox();
+        var ran = new List<string>();
+        var firstTurn = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock("one", "first", "{}")),
+            AssistantStreamEvent.Tool(new ToolUseBlock("two", "second", "{}")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+        var loop = new AgentLoop(
+            new EnqueueingScriptedClient(inbox, firstTurn, [AssistantStreamEvent.Finished("end_turn")]),
+            new ToolRegistry([new RecordingTool("first", ran), new RecordingTool("second", ran)]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            steering: inbox);
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+
+        await loop.RunAsync(history, new RecordingSink());
+
+        Assert.Empty(ran);
+        var toolResultMessage = history.Single(message => message.Role == ChatRole.User && message.Content.OfType<ToolResultBlock>().Any());
+        Assert.Equal(["one", "two"], toolResultMessage.Content.OfType<ToolResultBlock>().Select(result => result.ToolUseId));
+        Assert.All(toolResultMessage.Content.OfType<ToolResultBlock>(), result => Assert.True(result.IsError));
+        Assert.Contains(toolResultMessage.Content.OfType<TextBlock>(), text => text.Text == "redirect");
+    }
+
+    [Fact]
+    public async Task Steering_after_tool_n_skips_only_later_tools()
+    {
+        var inbox = new SteeringInbox();
+        var ran = new List<string>();
+        var loop = new AgentLoop(
+            new ScriptedClient(
+                [
+                    AssistantStreamEvent.Tool(new ToolUseBlock("one", "steer_now", "{}")),
+                    AssistantStreamEvent.Tool(new ToolUseBlock("two", "second", "{}")),
+                    AssistantStreamEvent.Finished("tool_use"),
+                ],
+                [AssistantStreamEvent.Finished("end_turn")]),
+            new ToolRegistry([new SteeringTool(inbox, "after first"), new RecordingTool("second", ran)]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            steering: inbox);
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+
+        await loop.RunAsync(history, new RecordingSink());
+
+        Assert.Empty(ran);
+        var results = history.SelectMany(message => message.Content).OfType<ToolResultBlock>().ToArray();
+        Assert.False(results.Single(result => result.ToolUseId == "one").IsError);
+        Assert.True(results.Single(result => result.ToolUseId == "two").IsError);
+    }
+
+    [Fact]
+    public async Task Text_only_stop_continues_to_deliver_steering_that_arrives_during_streaming()
+    {
+        var inbox = new SteeringInbox();
+        var loop = new AgentLoop(
+            new EnqueueingScriptedClient(
+                inbox,
+                [AssistantStreamEvent.Delta("done"), AssistantStreamEvent.Finished("end_turn")],
+                [AssistantStreamEvent.Finished("end_turn")]),
+            new ToolRegistry([]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            steering: inbox);
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+
+        await loop.RunAsync(history, new RecordingSink());
+
+        Assert.Contains(history, message => message.Role == ChatRole.User
+            && message.Content.OfType<TextBlock>().Any(text => text.Text == "redirect"));
     }
 
     [Fact]

@@ -38,5 +38,8 @@ public sealed class TuiAgentSink : IAgentSink
     public void OnLimitReached(string kind, string message) =>
         this.publisher.Publish(new LimitReachedEvent(kind, message));
 
+    public void OnSteeringDelivered(IReadOnlyList<string> ids) =>
+        this.publisher.Publish(new SteeringDeliveredEvent(ids));
+
     public void OnError(string message) => this.publisher.Publish(new AgentErrorEvent(message));
 }

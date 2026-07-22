@@ -36,6 +36,13 @@ public abstract record TranscriptBlock(Guid Id);
 /// omits the time rather than inventing a changing one.</summary>
 public sealed record UserTranscriptBlock(Guid Id, string Text, DateTimeOffset? SentAt = null) : TranscriptBlock(Id);
 
+/// <summary>A user message accepted into the active turn's steering queue but not yet delivered.</summary>
+public sealed record PendingUserTranscriptBlock(
+    Guid Id,
+    string Text,
+    string QueueEntryId,
+    DateTimeOffset EnqueuedAt) : TranscriptBlock(Id);
+
 /// <summary>Streamed assistant text; <see cref="Complete"/> flips true once the turn's text ends.</summary>
 public sealed record AssistantTranscriptBlock(Guid Id, string Text, bool Complete) : TranscriptBlock(Id);
 

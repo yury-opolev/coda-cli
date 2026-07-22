@@ -76,6 +76,40 @@ public sealed class PlainOutputRendererTests
     }
 
     [Fact]
+    public async Task Compact_tool_output_contains_preview_and_status_but_not_result()
+    {
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Compact);
+
+        await renderer.ApplyEventAsync(
+            new ToolStartedEvent("grep", "\u001b[31mline one\nline two\u001b[0m"),
+            CancellationToken.None);
+        await renderer.ApplyEventAsync(
+            new ToolCompletedEvent("grep", new ToolResult("secret result")),
+            CancellationToken.None);
+
+        var output = writer.ToString();
+        Assert.Contains("[tool] grep line one line two [running]", output, StringComparison.Ordinal);
+        Assert.Contains("[tool-result] grep [success]", output, StringComparison.Ordinal);
+        Assert.DoesNotContain("secret result", output, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u001b', output);
+    }
+
+    [Fact]
+    public async Task Tiny_tool_output_is_suppressed_without_affecting_non_tool_events()
+    {
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Tiny);
+
+        await renderer.ApplyEventAsync(new ToolStartedEvent("grep", "{}"), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolProgressEvent("grep", 1500), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolCompletedEvent("grep", new ToolResult("result")), CancellationToken.None);
+        await renderer.ApplyEventAsync(new WarningEvent("careful"), CancellationToken.None);
+
+        Assert.Equal("[warning] careful" + Environment.NewLine, writer.ToString());
+    }
+
+    [Fact]
     public async Task Warning_limit_and_stop_render_stable_prefixes()
     {
         var writer = new StringWriter();

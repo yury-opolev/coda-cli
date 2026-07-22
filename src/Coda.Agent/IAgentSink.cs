@@ -40,4 +40,7 @@ public interface IAgentSink
 
     /// <summary>Token usage from the completed turn. Called once per sampling iteration with the Finished event's usage. Optional.</summary>
     void OnUsage(TokenUsage usage) { }
+
+    /// <summary>Queued steering entries were delivered into the provider history. Optional.</summary>
+    void OnSteeringDelivered(IReadOnlyList<string> ids) { }
 }

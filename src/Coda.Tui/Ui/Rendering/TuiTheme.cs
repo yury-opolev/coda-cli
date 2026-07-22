@@ -90,6 +90,8 @@ internal sealed class TuiTheme
     public TuiThemeColor PromptAccent { get; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
     public TuiThemeColor SelectionText { get; } = new(new TgColor(23, 19, 16), TgName.Black);
     public TuiThemeColor SelectionBackground { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+    public TuiThemeColor ScrollbarTrack { get; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
+    public TuiThemeColor ScrollbarThumb { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 
     /// <summary>Resolves a role to its exact RGB (true color) or its named 16-color fallback.</summary>
     public static TgColor Resolve(TuiThemeColor role, bool trueColor) =>
@@ -102,6 +104,15 @@ internal sealed class TuiTheme
     /// <summary>Builds a foreground/background attribute for the driver's color depth.</summary>
     public TgAttribute Attribute(TuiThemeColor foreground, TuiThemeColor background, IDriver? driver) =>
         new(Resolve(foreground, SupportsTrueColor(driver)), Resolve(background, SupportsTrueColor(driver)));
+
+    public TgAttribute JumpHintAttribute(IDriver? driver) =>
+        this.Attribute(this.Heading, this.ComposerPanelBackground, driver);
+
+    public TgAttribute ScrollbarTrackAttribute(IDriver? driver) =>
+        this.Attribute(this.ScrollbarTrack, this.Background, driver);
+
+    public TgAttribute ScrollbarThumbAttribute(IDriver? driver) =>
+        this.Attribute(this.ScrollbarThumb, this.Background, driver);
 
     /// <summary>A solid composer panel scheme keyed to the driver's color depth: the warm composer text
     /// over the distinct <see cref="ComposerPanelBackground"/> so the input region reads as its own panel.</summary>

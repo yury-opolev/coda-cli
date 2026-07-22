@@ -68,6 +68,7 @@ public static class ImmediateCli
         writer.WriteLine("  Ctrl+Enter      Insert a newline (terminal-compatible fallback).");
         writer.WriteLine("  Ctrl+J          Insert a newline (terminal-compatible fallback).");
         writer.WriteLine("  Up / Down       Move the composer cursor between the lines of a multi-line prompt.");
+        writer.WriteLine("                  Up on an empty first line recalls queued busy submissions; otherwise it navigates history.");
         writer.WriteLine("  Ctrl+Up / Ctrl+Down");
         writer.WriteLine("                  Step back and forward through prompt history.");
         writer.WriteLine("  Esc             Dismiss the active menu or overlay, or clear a selection.");
@@ -78,6 +79,10 @@ public static class ImmediateCli
         writer.WriteLine("                  hands native selection and copy to the terminal where supported.");
         writer.WriteLine("  /exit           Exit the assistant (also /quit).");
         writer.WriteLine("  F2              Switch between full-screen and inline.");
+        writer.WriteLine("  Ctrl+End        Jump to the newest transcript output (scrollbar shows position).");
+        writer.WriteLine();
+        writer.WriteLine("Tool display: set user-only ~/.coda/settings.json \"toolDisplayMode\" to tiny (default), compact, or verbose.");
+        writer.WriteLine("Busy submissions are queued for the active turn's next safe boundary.");
         writer.WriteLine();
         writer.WriteLine("Subcommands:");
         writer.WriteLine("  run             Run a single task headlessly (for scripting / side-agent use)");

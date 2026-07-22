@@ -114,6 +114,29 @@ public sealed class AgentRunner : IDisposable
         return true;
     }
 
+    /// <summary>Accept steering only while this runner owns an active live session turn.</summary>
+    public string? Steer(string text)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(text);
+        lock (this.turnGate)
+        {
+            return this.activeTurnCts is not null && this.session is not null
+                ? this.session.Steer(text)
+                : null;
+        }
+    }
+
+    /// <summary>Atomically recall still-pending steering entries, or return none when no turn is active.</summary>
+    public IReadOnlyList<SteeringEntry> RecallSteering()
+    {
+        lock (this.turnGate)
+        {
+            return this.activeTurnCts is not null && this.session is not null
+                ? this.session.RecallSteering()
+                : [];
+        }
+    }
+
     /// <summary>A fresh copy of the current session runtime snapshot, or null before the first turn.</summary>
     public SessionRuntimeSnapshot? GetRuntimeSnapshot() => this.session?.GetRuntimeSnapshot();
 
@@ -425,6 +448,7 @@ public sealed class AgentRunner : IDisposable
         }
 
         cts?.Dispose();
+        this.session?.RecallSteering();
         this.session?.Dispose();
     }
 }

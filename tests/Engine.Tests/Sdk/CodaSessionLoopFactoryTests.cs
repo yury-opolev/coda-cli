@@ -85,6 +85,21 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
     }
 
     [Fact]
+    public void Steer_returns_the_accepted_entry_id_and_recall_is_ordered()
+    {
+        using var http = new HttpClient(new SseTestHandler(MessageStopOnly));
+        using var session = new CodaSession(SignedInClaude(), this.Options(), httpClient: http);
+
+        var firstId = session.Steer("first");
+        var secondId = session.Steer("second");
+        var recalled = session.RecallSteering();
+
+        Assert.Equal([firstId, secondId], recalled.Select(entry => entry.Id));
+        Assert.Equal(["first", "second"], recalled.Select(entry => entry.Text));
+        Assert.Empty(session.RecallSteering());
+    }
+
+    [Fact]
     public void DefaultAgentLoopFactory_builds_a_real_AgentLoop_from_the_spec()
     {
         using var http = new HttpClient(new SseTestHandler(MessageStopOnly));
