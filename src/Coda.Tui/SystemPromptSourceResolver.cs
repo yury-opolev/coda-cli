@@ -24,6 +24,8 @@ public static class SystemPromptSourceResolver
         out SystemPromptSource? source,
         out string? error)
     {
+        ArgumentNullException.ThrowIfNull(args);
+
         var remaining = new List<string>(args.Count);
         source = null;
         error = null;
@@ -40,7 +42,8 @@ public static class SystemPromptSourceResolver
                     return false;
                 }
 
-                if (i + 1 >= args.Count || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+                if (i + 1 >= args.Count
+                    || args[i + 1] is "--system-prompt" or "--system-prompt-file")
                 {
                     remainingArgs = args;
                     error = $"{argument} requires a value.";
@@ -81,6 +84,9 @@ public static class SystemPromptSourceResolver
         Func<string, CancellationToken, Task<byte[]>> readAllBytesAsync,
         CancellationToken cancellationToken)
     {
+        ArgumentException.ThrowIfNullOrWhiteSpace(startupWorkingDirectory);
+        ArgumentNullException.ThrowIfNull(readAllBytesAsync);
+
         if (source is null)
         {
             return null;

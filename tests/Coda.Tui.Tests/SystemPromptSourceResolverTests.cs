@@ -39,15 +39,37 @@ public sealed class SystemPromptSourceResolverTests
         Assert.Equal("Specify only one of --system-prompt or --system-prompt-file, once.", error);
     }
 
-    [Fact]
-    public void Prompt_flag_after_flag_is_previous_flag_missing_value()
+    [Theory]
+    [InlineData("--system-prompt", "--system-prompt-file")]
+    [InlineData("--system-prompt-file", "--system-prompt")]
+    public void Prompt_flag_after_flag_is_previous_flag_missing_value(string previousFlag, string valuePositionFlag)
     {
         var result = SystemPromptSourceResolver.TryExtract(
-            new[] { "--plain", "--system-prompt", "--resume" },
+            new[] { "--plain", previousFlag, valuePositionFlag },
             out _, out _, out var error);
 
         Assert.False(result);
-        Assert.Equal("--system-prompt requires a value.", error);
+        Assert.Equal($"{previousFlag} requires a value.", error);
+    }
+
+    [Fact]
+    public void Inline_value_starting_with_other_double_dash_text_is_preserved()
+    {
+        var result = SystemPromptSourceResolver.TryExtract(
+            new[] { "--system-prompt", "--continue" },
+            out var remaining, out var source, out var error);
+
+        Assert.True(result);
+        Assert.Null(error);
+        Assert.Empty(remaining);
+        Assert.Equal("--continue", Assert.IsType<SystemPromptSource.Inline>(source).Text);
+    }
+
+    [Fact]
+    public void TryExtract_rejects_null_args()
+    {
+        Assert.Throws<ArgumentNullException>(() =>
+            SystemPromptSourceResolver.TryExtract(null!, out _, out _, out _));
     }
 
     [Theory]
@@ -142,7 +164,7 @@ public sealed class SystemPromptSourceResolverTests
     {
         var malformed = await Assert.ThrowsAsync<SystemPromptSourceException>(() =>
             SystemPromptSourceResolver.ResolveAsync(
-                new SystemPromptSource.FilePath("\0"), "startup"));
+                new SystemPromptSource.FilePath("\0"), Path.GetTempPath()));
         Assert.NotNull(malformed.InnerException);
 
         var reason = "denied by test";
@@ -152,6 +174,20 @@ public sealed class SystemPromptSourceResolverTests
                 (_, _) => Task.FromException<byte[]>(new UnauthorizedAccessException(reason)), CancellationToken.None));
         Assert.Contains(reason, access.Message);
         Assert.IsType<UnauthorizedAccessException>(access.InnerException);
+    }
+
+    [Fact]
+    public async Task Internal_resolver_rejects_invalid_arguments()
+    {
+        await Assert.ThrowsAsync<ArgumentException>(() =>
+            SystemPromptSourceResolver.ResolveAsync(
+                new SystemPromptSource.FilePath("prompt"), " \t",
+                (_, _) => Task.FromResult(Array.Empty<byte>()), CancellationToken.None));
+
+        await Assert.ThrowsAsync<ArgumentNullException>(() =>
+            SystemPromptSourceResolver.ResolveAsync(
+                new SystemPromptSource.FilePath("prompt"), Path.GetTempPath(),
+                null!, CancellationToken.None));
     }
 
     [Fact]
