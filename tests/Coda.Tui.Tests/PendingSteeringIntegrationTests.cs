@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using Coda.Tui.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui;
@@ -128,6 +129,78 @@ public sealed class PendingSteeringIntegrationTests
 
         await controller.WaitForDispatchAsync();
         Assert.Equal(["run", "next"], dispatched);
+    }
+
+    [Fact]
+    public async Task Shutdown_drain_does_not_start_a_queued_fallback_prompt()
+    {
+        var dispatched = new ConcurrentQueue<string>();
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var interrupted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                dispatched.Enqueue(text);
+                if (text == "run")
+                {
+                    started.TrySetResult();
+                    await release.Task;
+                }
+            },
+            tryInterrupt: () =>
+            {
+                interrupted.TrySetResult();
+                return true;
+            },
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty,
+            steer: _ => null,
+            recallSteering: () => []);
+
+        controller.OnSubmitted("run");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        controller.OnSubmitted("next");
+
+        var drain = controller.DrainForShutdownAsync();
+        await interrupted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        controller.OnSubmitted("after shutdown");
+        release.TrySetResult();
+
+        await drain.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(["run"], dispatched.ToArray());
+    }
+
+    [Fact]
+    public async Task Shutdown_drain_is_idempotent()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var interrupts = 0;
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            },
+            tryInterrupt: () =>
+            {
+                Interlocked.Increment(ref interrupts);
+                return true;
+            },
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("run");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var firstDrain = controller.DrainForShutdownAsync();
+        var secondDrain = controller.DrainForShutdownAsync();
+        release.TrySetResult();
+
+        await Task.WhenAll(firstDrain, secondDrain).WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.Equal(1, interrupts);
+        Assert.False(controller.HasActiveWork);
     }
 
     [Fact]

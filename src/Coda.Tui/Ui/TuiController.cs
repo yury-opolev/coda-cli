@@ -54,6 +54,7 @@ public sealed class TuiController
     private CancellationTokenSource? dispatchCts;
     private Task? dispatchTask;
     private readonly Queue<string> nextPrompts = new();
+    private bool shutdownDrainRequested;
 
     // The FIFO chain of out-of-band permission commands (see OnSubmitted). It only ever grows by
     // appending a continuation that awaits the previous tail, so multiple mid-turn permission commands
@@ -292,6 +293,28 @@ public sealed class TuiController
     /// <summary>Interrupt the active turn, if any. Returns false when nothing was running.</summary>
     public bool TryInterruptActiveTurn() => this.tryInterrupt();
 
+    /// <summary>
+    /// Stop accepting work and drain the current dispatch for host shutdown. This is idempotent: only the
+    /// first caller interrupts the active turn, while all callers observe the same work completing.
+    /// </summary>
+    public async Task DrainForShutdownAsync(CancellationToken cancellationToken = default)
+    {
+        bool interrupt;
+        lock (this.gate)
+        {
+            interrupt = !this.shutdownDrainRequested;
+            this.shutdownDrainRequested = true;
+            this.nextPrompts.Clear();
+        }
+
+        if (interrupt)
+        {
+            this.TryInterruptActiveTurn();
+        }
+
+        await this.WaitForDispatchAsync(cancellationToken).ConfigureAwait(false);
+    }
+
     /// <summary>Recall pending steering atomically and restore it as a composer draft.</summary>
     public string? RecallSteering()
     {
@@ -355,7 +378,7 @@ public sealed class TuiController
         lock (this.gate)
         {
             // Exit/startup always reject every submission, including permission commands.
-            if (Volatile.Read(ref this.exitRequested) || this.startupPending)
+            if (Volatile.Read(ref this.exitRequested) || this.shutdownDrainRequested || this.startupPending)
             {
                 return;
             }
@@ -509,7 +532,10 @@ public sealed class TuiController
                 this.dispatchCts?.Dispose();
                 this.dispatchCts = null;
                 this.dispatchTask = null;
-                if (!this.exitRequested && !this.hostToken.IsCancellationRequested && this.nextPrompts.Count > 0)
+                if (!this.exitRequested &&
+                    !this.shutdownDrainRequested &&
+                    !this.hostToken.IsCancellationRequested &&
+                    this.nextPrompts.Count > 0)
                 {
                     this.StartDispatchLocked(this.nextPrompts.Dequeue());
                 }

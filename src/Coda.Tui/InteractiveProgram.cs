@@ -466,7 +466,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             context,
             realConsole,
             startedAt,
-            drainDispatch: ct => DrainDispatchBeforeShutdownAsync(controller, agentRunner, ct),
+            drainDispatch: ct => DrainDispatchBeforeShutdownAsync(controller, ct),
             flushUi: ct => FlushUiSafelyAsync(actor, actorTask, ct),
             finalize: async () =>
             {
@@ -571,13 +571,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
     /// neither hang on a stuck turn nor let a late producer publish into the disposed mailbox.
     /// </summary>
     private static async Task DrainDispatchBeforeShutdownAsync(
-        TuiController controller, AgentRunner runner, CancellationToken cancellationToken)
+        TuiController controller, CancellationToken cancellationToken)
     {
-        runner.TryInterruptActiveTurn();
-
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(5));
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeout.Token);
-        await controller.WaitForDispatchAsync(linked.Token).ConfigureAwait(false);
+        await controller.DrainForShutdownAsync(linked.Token).ConfigureAwait(false);
     }
 
     /// <summary>
