@@ -103,6 +103,14 @@ internal sealed class VirtualizedTranscriptView : View
 
     internal bool ScrollbarDraggingForTest => this.scrollbarDragging;
 
+    internal void ScrollToRowForTest(int row) =>
+        this.viewport.ScrollToRow(row, this.index.AnchorAt(row));
+
+    internal TranscriptViewportAnchor? TopAnchorForTest =>
+        this.index.AnchorAt(this.viewport.TopRow);
+
+    internal TranscriptFollowMode FollowModeForTest => this.viewport.Mode;
+
     /// <summary>Number of times the transcript was fully rebuilt (initial/reseed/resize).</summary>
     internal int ReplaceAllCount { get; private set; }
 
@@ -119,8 +127,9 @@ internal sealed class VirtualizedTranscriptView : View
     internal void ReplaceAll(ImmutableArray<TranscriptBlock> blocks)
     {
         this.ReplaceAllCount++;
+        var anchor = this.CaptureViewportAnchor();
         this.index.ReplaceAll(blocks, this.currentWidth);
-        this.viewport.SetContentRows(this.index.TotalRows);
+        this.ApplyContentLayout(anchor);
         this.UpdateScrollbarLayout();
         this.selectedBlockId = blocks.IsDefaultOrEmpty ? null : blocks[^1].Id;
         this.PruneExpanded(blocks);
@@ -131,18 +140,19 @@ internal sealed class VirtualizedTranscriptView : View
     internal void Append(TranscriptBlock block)
     {
         this.AppendCount++;
+        var anchor = this.CaptureViewportAnchor();
         var before = this.index.TotalRows;
         this.index.Append(block, this.currentWidth);
         var delta = this.index.TotalRows - before;
-        this.viewport.OnRowsAppended(delta);
+        this.ApplyContentLayout(anchor);
         if (delta > 0)
         {
+            this.viewport.RecordAppendedRows(delta);
             this.viewport.OnBlockAppended();
         }
 
         this.UpdateScrollbarLayout();
         this.selectedBlockId = block.Id;
-        this.UpdateScrollbarLayout();
         this.SetNeedsDraw();
     }
 
@@ -162,6 +172,7 @@ internal sealed class VirtualizedTranscriptView : View
 
     private void ReplaceBlock(int position, TranscriptBlock block, bool tail)
     {
+        var anchor = this.CaptureViewportAnchor();
         var before = this.index.TotalRows;
         if (tail)
         {
@@ -173,25 +184,24 @@ internal sealed class VirtualizedTranscriptView : View
         }
 
         var delta = this.index.TotalRows - before;
+        this.ApplyContentLayout(anchor);
         if (tail && delta > 0)
         {
-            this.viewport.OnRowsAppended(delta);
-        }
-        else if (delta != 0)
-        {
-            this.viewport.SetContentRows(this.index.TotalRows);
+            this.viewport.RecordAppendedRows(delta);
         }
 
         this.selectedBlockId = block.Id;
+        this.UpdateScrollbarLayout();
         this.SetNeedsDraw();
     }
 
     /// <summary>Re-wraps the transcript for a new content width (called on resize).</summary>
     internal void Reflow(int width)
     {
+        var anchor = this.CaptureViewportAnchor();
         this.currentWidth = width > 0 ? width : 1;
         this.index.Reflow(this.currentWidth);
-        this.viewport.SetContentRows(this.index.TotalRows);
+        this.ApplyContentLayout(anchor);
     }
 
     /// <summary>Sets the viewport height in rows (called on layout).</summary>
@@ -206,9 +216,14 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>Scrolls the transcript by a number of rows (negative scrolls up).</summary>
     public void ScrollBy(int rows)
     {
-        this.viewport.ScrollBy(rows);
-        this.SetNeedsDraw();
-        this.TranscriptScrolled?.Invoke();
+        if (rows == 0)
+        {
+            this.SetNeedsDraw();
+            this.TranscriptScrolled?.Invoke();
+            return;
+        }
+
+        this.MoveToRow(this.viewport.TopRow + rows);
     }
 
     /// <summary>Jumps to the newest row and resumes auto-following.</summary>
@@ -417,12 +432,10 @@ internal sealed class VirtualizedTranscriptView : View
 
             if (mouse.Flags.HasFlag(MouseFlags.PositionReport) || mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
             {
-                this.viewport.ScrollToRow(ScrollbarMetrics.TopRowForPointer(
+                this.MoveToRow(ScrollbarMetrics.TopRowForPointer(
                     local.Y,
                     this.viewport.ViewportHeight,
                     this.viewport.ContentRows));
-                this.SetNeedsDraw();
-                this.TranscriptScrolled?.Invoke();
                 return true;
             }
         }
@@ -581,15 +594,13 @@ internal sealed class VirtualizedTranscriptView : View
 
         if (key == Key.Home.WithCtrl)
         {
-            this.viewport.ScrollToTop();
-            this.SetNeedsDraw();
-            this.TranscriptScrolled?.Invoke();
+            this.MoveToRow(0);
             return true;
         }
 
         if (key == Key.End.WithCtrl)
         {
-            this.JumpToNewest();
+            this.MoveToRow(this.viewport.MaxTopRow);
             return true;
         }
 
@@ -639,6 +650,35 @@ internal sealed class VirtualizedTranscriptView : View
     {
         var height = this.viewport.ViewportHeight;
         return height > 1 ? height - 1 : 10;
+    }
+
+    private void MoveToRow(int row)
+    {
+        var target = Math.Clamp(row, 0, this.viewport.MaxTopRow);
+        this.viewport.ScrollToRow(target, this.index.AnchorAt(target));
+        this.SetNeedsDraw();
+        this.TranscriptScrolled?.Invoke();
+    }
+
+    private TranscriptViewportAnchor? CaptureViewportAnchor() =>
+        this.viewport.DetachedAnchor ?? this.index.AnchorAt(this.viewport.TopRow);
+
+    private void ApplyContentLayout(TranscriptViewportAnchor? previousAnchor)
+    {
+        var resolvedAnchorRow = previousAnchor is { } anchor
+            ? this.index.ResolveAnchor(anchor)
+            : null;
+        var fallbackTopRow = Math.Clamp(
+            this.viewport.TopRow,
+            0,
+            Math.Max(0, this.index.TotalRows - this.viewport.ViewportHeight));
+        var detachedAnchor = resolvedAnchorRow is { } resolvedRow
+            ? this.index.AnchorAt(resolvedRow)
+            : this.index.AnchorAt(fallbackTopRow);
+        this.viewport.ApplyContentLayout(
+            this.index.TotalRows,
+            detachedAnchor,
+            resolvedAnchorRow);
     }
 
     private void SyncViewportMetrics()

@@ -27,6 +27,12 @@ public sealed class FullscreenTuiShellTests
             .Select(_ => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), string.Empty))
             .ToImmutableArray();
 
+    private static IReadOnlyList<TranscriptRenderLine> PipeFormatter(TranscriptBlock block, int _) =>
+        ((CommandOutputTranscriptBlock)block).Text
+            .Split('|')
+            .Select(text => new TranscriptRenderLine(text, TranscriptRole.Code))
+            .ToArray();
+
     [Fact]
     public void Virtualized_view_formats_only_visible_rows()
     {
@@ -445,6 +451,38 @@ public sealed class FullscreenTuiShellTests
         {
             app.End(token);
         }
+    }
+
+    [Fact]
+    public async Task Fullscreen_streaming_snapshot_preserves_the_detached_anchor()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            transcriptFormatter: PipeFormatter);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(
+            Guid.NewGuid(),
+            string.Join('|', Enumerable.Range(0, 20).Select(index => $"tail {index}")));
+        var seed = ImmutableArray.Create<TranscriptBlock>(first, anchored, tail);
+        await fixture.Shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        fixture.Shell.Transcript.ScrollToRowForTest(4);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(fixture.Shell.Transcript.TopAnchorForTest);
+
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                Transcript = seed.SetItem(
+                    2,
+                    tail with
+                    {
+                        Text = string.Join('|', Enumerable.Range(0, 30).Select(index => $"tail {index}")),
+                    }),
+            },
+            CancellationToken.None);
+
+        Assert.Equal(anchor, fixture.Shell.Transcript.TopAnchorForTest);
+        Assert.Equal(TranscriptFollowMode.Detached, fixture.Shell.Transcript.FollowModeForTest);
     }
 
     [Fact]
@@ -1612,6 +1650,22 @@ public sealed class VirtualizedTranscriptViewTests
         return view;
     }
 
+    private static VirtualizedTranscriptView CreateAnchorView(IApplication app, int viewportHeight = 3)
+    {
+        var view = new VirtualizedTranscriptView(app, PipeFormatter);
+        view.Reflow(width: 80);
+        view.SetViewportHeight(viewportHeight);
+        return view;
+    }
+
+    private static VirtualizedTranscriptView CreateWrappedAnchorView(IApplication app)
+    {
+        var view = new VirtualizedTranscriptView(app, WrappedFormatter);
+        view.Reflow(width: 5);
+        view.SetViewportHeight(3);
+        return view;
+    }
+
     private static string BlockText(TranscriptBlock block) => block switch
     {
         CommandOutputTranscriptBlock command => command.Text,
@@ -1619,6 +1673,21 @@ public sealed class VirtualizedTranscriptViewTests
         DiffTranscriptBlock diff => diff.Patch,
         _ => "row",
     };
+
+    private static IReadOnlyList<TranscriptRenderLine> PipeFormatter(TranscriptBlock block, int _) =>
+        ((CommandOutputTranscriptBlock)block).Text
+            .Split('|')
+            .Select(text => new TranscriptRenderLine(text, TranscriptRole.Code))
+            .ToArray();
+
+    private static IReadOnlyList<TranscriptRenderLine> WrappedFormatter(TranscriptBlock block, int width)
+    {
+        var text = ((CommandOutputTranscriptBlock)block).Text;
+        var rowCount = Math.Max(1, (text.Length + Math.Max(1, width) - 1) / Math.Max(1, width));
+        return Enumerable.Range(0, rowCount)
+            .Select(index => new TranscriptRenderLine($"{text}:{index}", TranscriptRole.Code))
+            .ToArray();
+    }
 
     [Fact]
     public void Collects_only_the_visible_rows()
@@ -1724,6 +1793,226 @@ public sealed class VirtualizedTranscriptViewTests
         app.Mouse.IsMouseDisabled = true;
         Assert.False(view.ProcessMouse(new Mouse { Flags = MouseFlags.WheeledUp }));
         Assert.True(view.AutoFollow);
+    }
+
+    [Fact]
+    public void Interior_replacement_above_the_detached_viewport_preserves_the_top_anchor()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(Guid.NewGuid(), "six|seven|eight|nine|ten");
+        view.ReplaceAll([first, anchored, tail]);
+        view.ScrollToRowForTest(4);
+        var anchor = new TranscriptViewportAnchor(anchored.Id, WrappedRowOffset: 1);
+
+        view.ReplaceAt(0, first with { Text = "one|two|three|four" });
+        Assert.Equal(anchor, view.TopAnchorForTest);
+        Assert.Equal(6, view.TopRow);
+
+        view.ReplaceAt(0, first with { Text = "one" });
+
+        Assert.Equal(anchor, view.TopAnchorForTest);
+        Assert.Equal(3, view.TopRow);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+    }
+
+    [Fact]
+    public void Streaming_tail_growth_does_not_move_the_detached_anchor()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(Guid.NewGuid(), "six|seven|eight|nine|ten");
+        view.ReplaceAll([first, anchored, tail]);
+        view.ScrollToRowForTest(4);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(view.TopAnchorForTest);
+
+        view.ReplaceLast(tail with { Text = "six|seven|eight|nine|ten|eleven|twelve" });
+
+        Assert.Equal(anchor, view.TopAnchorForTest);
+        Assert.Equal(4, view.TopRow);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+    }
+
+    [Fact]
+    public void Width_reflow_preserves_the_block_anchor_and_clamps_its_wrapped_offset()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateWrappedAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "0123456789");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "abcdefghijklmnopqrstuvwx");
+        var tail = new CommandOutputTranscriptBlock(Guid.NewGuid(), new string('z', 100));
+        view.ReplaceAll([first, anchored, tail]);
+        view.ScrollToRowForTest(7);
+
+        view.Reflow(width: 20);
+
+        Assert.Equal(
+            new TranscriptViewportAnchor(anchored.Id, WrappedRowOffset: 2),
+            view.TopAnchorForTest);
+        Assert.Equal(4, view.TopRow);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+
+        view.ReplaceAt(1, anchored with { Text = new string('a', 60) });
+
+        Assert.Equal(
+            new TranscriptViewportAnchor(anchored.Id, WrappedRowOffset: 2),
+            view.TopAnchorForTest);
+        Assert.Equal(4, view.TopRow);
+    }
+
+    [Fact]
+    public void Append_preserves_detached_anchor_and_keeps_following_view_pinned()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(Guid.NewGuid(), "six|seven|eight|nine|ten");
+        view.ReplaceAll([first, anchored, tail]);
+        view.ScrollToRowForTest(4);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(view.TopAnchorForTest);
+
+        view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new|block"));
+
+        Assert.Equal(anchor, view.TopAnchorForTest);
+        Assert.Equal(3, view.UnseenRows);
+        Assert.Equal(1, view.UnseenBlocks);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+
+        view.JumpToNewest();
+        view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "following|tail"));
+
+        Assert.True(view.AutoFollow);
+        Assert.Equal(view.ContentRowsForTest - view.ViewportHeightForTest, view.TopRow);
+        Assert.Equal(0, view.UnseenRows);
+        Assert.Equal(0, view.UnseenBlocks);
+    }
+
+    [Fact]
+    public void Replace_all_retains_surviving_anchor_and_falls_back_to_the_clamped_row_when_removed()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(Guid.NewGuid(), "six|seven|eight|nine|ten");
+        view.ReplaceAll([first, anchored, tail]);
+        view.ScrollToRowForTest(4);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(view.TopAnchorForTest);
+        var reseededFirst = first with { Text = "one|two|three|four" };
+
+        view.ReplaceAll([reseededFirst, anchored, tail]);
+
+        Assert.Equal(anchor, view.TopAnchorForTest);
+        Assert.Equal(6, view.TopRow);
+
+        view.ReplaceAll([reseededFirst, tail]);
+
+        Assert.Equal(6, view.TopRow);
+        Assert.Equal(new TranscriptViewportAnchor(tail.Id, WrappedRowOffset: 1), view.TopAnchorForTest);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+    }
+
+    [Fact]
+    public void Layout_shrink_to_the_bottom_resumes_following_and_clears_detached_state()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(Guid.NewGuid(), "six|seven|eight|nine|ten");
+        view.ReplaceAll([first, anchored, tail]);
+        view.ScrollToRowForTest(4);
+        view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "new"));
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+        Assert.True(view.UnseenRows > 0);
+        Assert.True(view.UnseenBlocks > 0);
+
+        view.ReplaceAll(
+        [
+            first with { Text = "one" },
+            anchored with { Text = "three" },
+            tail with { Text = "six" },
+        ]);
+
+        Assert.Equal(TranscriptFollowMode.Following, view.FollowModeForTest);
+        Assert.True(view.AutoFollow);
+        Assert.Equal(view.ContentRowsForTest - view.ViewportHeightForTest, view.TopRow);
+        Assert.Equal(0, view.UnseenRows);
+        Assert.Equal(0, view.UnseenBlocks);
+    }
+
+    [Fact]
+    public void Keyboard_wheel_scrollbar_track_and_drag_capture_the_resulting_top_anchor()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            transcriptFormatter: PipeFormatter);
+        var leading = new CommandOutputTranscriptBlock(Guid.NewGuid(), "leading");
+        var blocks = ImmutableArray.Create<TranscriptBlock>(leading).AddRange(
+            Enumerable.Range(1, 100)
+                .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {index}")));
+        var view = fixture.Shell.Transcript;
+        view.ReplaceAll(blocks);
+        fixture.HostApplication.Mouse.IsMouseDisabled = false;
+
+        view.NewKeyDownEvent(Key.PageUp);
+        AssertInputAnchorSurvivesLeadingGrowth(view, leading.Id, 4);
+
+        Assert.True(view.ProcessMouse(new Mouse { Flags = MouseFlags.WheeledUp }));
+        AssertInputAnchorSurvivesLeadingGrowth(view, leading.Id, 6);
+
+        var height = view.ViewportHeightForTest;
+        var x = view.Frame.Width - 1;
+        var metrics = ScrollbarMetrics.Compute(view.ContentRowsForTest, height, view.TopRow);
+        Assert.True(metrics.ThumbTop + metrics.ThumbHeight < height);
+        Assert.True(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(x, height - 1),
+        }));
+        AssertInputAnchorSurvivesLeadingGrowth(view, leading.Id, 8);
+
+        metrics = ScrollbarMetrics.Compute(view.ContentRowsForTest, height, view.TopRow);
+        Assert.True(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(x, metrics.ThumbTop),
+        }));
+        Assert.True(view.ScrollbarDraggingForTest);
+        Assert.True(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(x, height / 2),
+        }));
+        Assert.True(view.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(x, height / 2),
+        }));
+        Assert.False(view.ScrollbarDraggingForTest);
+        AssertInputAnchorSurvivesLeadingGrowth(view, leading.Id, 10);
+    }
+
+    private static void AssertInputAnchorSurvivesLeadingGrowth(
+        VirtualizedTranscriptView view,
+        Guid leadingBlockId,
+        int replacementRows)
+    {
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(view.TopAnchorForTest);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+
+        view.ReplaceAt(
+            0,
+            new CommandOutputTranscriptBlock(
+                leadingBlockId,
+                string.Join('|', Enumerable.Range(0, replacementRows).Select(index => $"leading {index}"))));
+
+        Assert.Equal(anchor, view.TopAnchorForTest);
     }
 
     [Theory]

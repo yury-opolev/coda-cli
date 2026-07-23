@@ -51,8 +51,45 @@ internal sealed class TranscriptViewportState
     /// <summary>Updates the content row count and re-clamps (following the bottom while auto-following).</summary>
     public void SetContentRows(int rows)
     {
-        this.ContentRows = Math.Max(0, rows);
-        this.Reclamp();
+        this.ApplyContentLayout(
+            rows,
+            this.DetachedAnchor,
+            this.Mode == TranscriptFollowMode.Detached ? this.TopRow : null);
+    }
+
+    /// <summary>
+    /// Applies a completed content-layout mutation without exposing an intermediate clamped position. A detached
+    /// anchor that still resolves wins over its previous global row; when it no longer resolves, the current row
+    /// is clamped and the caller-provided replacement anchor is retained when possible.
+    /// </summary>
+    public void ApplyContentLayout(
+        int contentRows,
+        TranscriptViewportAnchor? detachedAnchor,
+        int? resolvedAnchorRow)
+    {
+        this.ContentRows = Math.Max(0, contentRows);
+        if (this.AutoFollow)
+        {
+            this.FollowNewest();
+            return;
+        }
+
+        if (resolvedAnchorRow is { } anchorRow)
+        {
+            this.TopRow = Math.Clamp(anchorRow, 0, this.MaxTopRow);
+        }
+        else
+        {
+            this.TopRow = Math.Clamp(this.TopRow, 0, this.MaxTopRow);
+        }
+
+        if (this.TopRow >= this.MaxTopRow)
+        {
+            this.FollowNewest();
+            return;
+        }
+
+        this.DetachedAnchor = detachedAnchor;
     }
 
     /// <summary>
@@ -102,19 +139,18 @@ internal sealed class TranscriptViewportState
     /// </summary>
     public void OnRowsAppended(int rows)
     {
-        if (rows <= 0)
-        {
-            this.ContentRows = Math.Max(0, this.ContentRows + rows);
-            this.Reclamp();
-            return;
-        }
+        var wasDetached = this.Mode == TranscriptFollowMode.Detached;
+        this.ApplyContentLayout(
+            this.ContentRows + rows,
+            this.DetachedAnchor,
+            wasDetached ? this.TopRow : null);
+        this.RecordAppendedRows(rows);
+    }
 
-        this.ContentRows += rows;
-        if (this.AutoFollow)
-        {
-            this.FollowNewest();
-        }
-        else
+    /// <summary>Records newly appended rows after their content layout has already been applied atomically.</summary>
+    public void RecordAppendedRows(int rows)
+    {
+        if (rows > 0 && this.Mode == TranscriptFollowMode.Detached)
         {
             this.UnseenRows += rows;
         }

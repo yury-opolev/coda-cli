@@ -19,12 +19,16 @@ namespace Coda.Tui.Tests;
 /// </summary>
 internal static class ShellTestFactory
 {
-    public static InlineTuiShell CreateInline(IApplication app, IUiEventPublisher? publisher = null) =>
+    public static InlineTuiShell CreateInline(
+        IApplication app,
+        IUiEventPublisher? publisher = null,
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null) =>
         new(
             app,
             new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
             publisher ?? new RecordingUiEvents(),
-            UiSessionSnapshot.Empty);
+            UiSessionSnapshot.Empty,
+            transcriptFormatter: transcriptFormatter);
 
     public static InlineTuiShell CreateInline(
         IApplication app, IEnumerable<ISlashCommand> commands, IUiEventPublisher? publisher = null) =>
@@ -56,6 +60,12 @@ public sealed class InlineTuiShellTests
         Enumerable.Range(0, count)
             .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {index}"))
             .ToImmutableArray();
+
+    private static IReadOnlyList<TranscriptRenderLine> PipeFormatter(TranscriptBlock block, int _) =>
+        ((CommandOutputTranscriptBlock)block).Text
+            .Split('|')
+            .Select(text => new TranscriptRenderLine(text, TranscriptRole.Code))
+            .ToArray();
 
     /// <summary>
     /// The inline shell reuses the retained-transcript shell layout, so it must expose the same header
@@ -254,6 +264,50 @@ public sealed class InlineTuiShellTests
 
         await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [a, bDone] }, CancellationToken.None);
         Assert.Equal(1, shell.Transcript.ReplaceLastCount);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Inline_streaming_snapshot_preserves_the_detached_anchor()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app, transcriptFormatter: PipeFormatter);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(
+            Guid.NewGuid(),
+            string.Join('|', Enumerable.Range(0, 20).Select(index => $"tail {index}")));
+        var seed = ImmutableArray.Create<TranscriptBlock>(first, anchored, tail);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollToRowForTest(4);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(shell.Transcript.TopAnchorForTest);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                Transcript = seed.SetItem(
+                    2,
+                    tail with
+                    {
+                        Text = string.Join('|', Enumerable.Range(0, 30).Select(index => $"tail {index}")),
+                    }),
+            },
+            CancellationToken.None);
+
+        Assert.Equal(anchor, shell.Transcript.TopAnchorForTest);
+        Assert.Equal(TranscriptFollowMode.Detached, shell.Transcript.FollowModeForTest);
 
         if (token is not null)
         {
