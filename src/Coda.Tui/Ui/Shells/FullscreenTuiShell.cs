@@ -1,5 +1,6 @@
 using System.Collections.Immutable;
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
@@ -85,6 +86,13 @@ internal class FullscreenTuiShell(
 
     /// <inheritdoc />
     protected override VirtualizedTranscriptView TranscriptView => this.transcript;
+
+    /// <summary>Releases transcript mouse capture before a shell exit or mode transition stops the application.</summary>
+    public override void RequestStop(TuiShellExit outcome)
+    {
+        this.transcript.CancelMouseInteraction();
+        base.RequestStop(outcome);
+    }
 
     /// <summary>The current measured composer height in rows; exposed for tests only.</summary>
     internal int ComposerHeight => this.composerHeight;
@@ -402,6 +410,7 @@ internal class FullscreenTuiShell(
     {
         if (disposing && this.transcript is not null)
         {
+            this.transcript.CancelMouseInteraction();
             this.transcript.TranscriptScrolled -= this.RefreshHeaderForViewport;
             this.UnbindTranscriptInput(this.transcript);
         }

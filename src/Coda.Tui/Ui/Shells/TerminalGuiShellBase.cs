@@ -228,7 +228,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// controller on the UI thread in response to an exit or mode-switch action; the mode runner then
     /// reads <see cref="RequestedExit"/> once the loop returns.
     /// </summary>
-    public void RequestStop(TuiShellExit outcome)
+    public virtual void RequestStop(TuiShellExit outcome)
     {
         ArgumentNullException.ThrowIfNull(outcome);
         this.ResetChordOverride();

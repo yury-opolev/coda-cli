@@ -37,6 +37,7 @@ internal sealed class VirtualizedTranscriptView : View
     private readonly TranscriptSelection selection = new();
     private bool dragging;
     private bool scrollbarDragging;
+    private int scrollbarDragOffset;
     private bool scrollbarVisible;
     private TranscriptCellPosition pressPosition;
 
@@ -102,6 +103,8 @@ internal sealed class VirtualizedTranscriptView : View
     internal int ViewportHeightForTest => this.viewport.ViewportHeight;
 
     internal bool ScrollbarDraggingForTest => this.scrollbarDragging;
+
+    internal bool MouseCaptureActiveForTest => this.dragging || this.scrollbarDragging;
 
     internal void ScrollToRowForTest(int row) =>
         this.viewport.ScrollToRow(row, this.index.AnchorAt(row));
@@ -272,7 +275,7 @@ internal sealed class VirtualizedTranscriptView : View
     internal void ClearSelection()
     {
         this.selection.Clear();
-        this.dragging = false;
+        this.ReleaseMouseCapture();
         this.SetNeedsDraw();
     }
 
@@ -408,11 +411,34 @@ internal sealed class VirtualizedTranscriptView : View
     /// <inheritdoc />
     protected override bool OnMouseEvent(Mouse mouse) => this.ProcessMouse(mouse);
 
+    /// <summary>Ends any active transcript mouse interaction and releases this view's capture if it owns it.</summary>
+    internal void CancelMouseInteraction() => this.ReleaseMouseCapture();
+
     /// <summary>Handles a mouse event; returns false (unhandled) when the host has disabled the mouse.</summary>
     internal bool ProcessMouse(Mouse mouse)
     {
         ArgumentNullException.ThrowIfNull(mouse);
         var mouseService = this.app.Mouse;
+        var releasingInteraction =
+            mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased) &&
+            (this.scrollbarDragging || this.dragging);
+        if (releasingInteraction)
+        {
+            var selectionWasDragging = this.dragging;
+            var position = selectionWasDragging ? this.ToTranscriptPosition(mouse) : default;
+            this.ReleaseMouseCapture();
+
+            if (selectionWasDragging &&
+                mouseService is { IsMouseDisabled: false } &&
+                !mouse.Flags.HasFlag(MouseFlags.Shift) &&
+                !this.selection.HasSelection)
+            {
+                this.ToggleExpansionAt(position.GlobalRow);
+            }
+
+            return true;
+        }
+
         if (mouseService is null ||
             mouseService.IsMouseDisabled ||
             mouse.Flags.HasFlag(MouseFlags.Shift))
@@ -423,17 +449,10 @@ internal sealed class VirtualizedTranscriptView : View
         var local = mouse.Position ?? System.Drawing.Point.Empty;
         if (this.scrollbarDragging)
         {
-            if (mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
-            {
-                this.scrollbarDragging = false;
-                mouseService.UngrabMouse();
-                return true;
-            }
-
             if (mouse.Flags.HasFlag(MouseFlags.PositionReport) || mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
             {
                 this.MoveToRow(ScrollbarMetrics.TopRowForPointer(
-                    local.Y,
+                    local.Y - this.scrollbarDragOffset,
                     this.viewport.ViewportHeight,
                     this.viewport.ContentRows));
                 return true;
@@ -458,6 +477,7 @@ internal sealed class VirtualizedTranscriptView : View
             else
             {
                 this.scrollbarDragging = true;
+                this.scrollbarDragOffset = local.Y - metrics.ThumbTop;
                 mouseService.GrabMouse(this);
             }
 
@@ -512,20 +532,20 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        if (this.dragging && mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
-        {
-            var position = this.ToTranscriptPosition(mouse);
-            mouseService.UngrabMouse();
-            this.dragging = false;
-            if (!this.selection.HasSelection)
-            {
-                this.ToggleExpansionAt(position.GlobalRow);
-            }
-
-            return true;
-        }
-
         return false;
+    }
+
+    private void ReleaseMouseCapture()
+    {
+        this.scrollbarDragging = false;
+        this.scrollbarDragOffset = 0;
+        this.dragging = false;
+
+        var mouseService = this.app.Mouse;
+        if (mouseService?.IsGrabbed(this) == true)
+        {
+            mouseService.UngrabMouse();
+        }
     }
 
     /// <summary>
@@ -558,6 +578,16 @@ internal sealed class VirtualizedTranscriptView : View
 
         this.selectedBlockId = id;
         this.ToggleExpansion(id);
+    }
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            this.ReleaseMouseCapture();
+        }
+
+        base.Dispose(disposing);
     }
 
     /// <inheritdoc />
