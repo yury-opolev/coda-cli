@@ -13,11 +13,12 @@ orchestrator ──spawn──► coda serve
 - **Transport:** newline/Content-Length-framed JSON-RPC 2.0 over the child process's stdin/stdout
   (same framing as LSP). **stdout carries only protocol bytes**; human/debug logs go to stderr.
 - **Trust:** local-spawn only (no auth). Networked transports are a future additive layer.
-- **Versioning:** call `initialize` first; current `protocolVersion` is `"1"`.
+- **Versioning:** normally call `initialize` first; current `protocolVersion` is `"1"`. A first
+  `session/prompt` can initialize when `initialize` is omitted.
 
 ## Lifecycle
 1. Spawn `coda serve` (optionally `--provider`, `--model`, `--cwd`, `--permission-mode`, `--yolo`,
-   `--yolo-safe`). Permission modes: `default` (mutating tools raise `request/permission`),
+   `--yolo-safe`, and one of `--system-prompt <text>` or `--system-prompt-file <path>`). Permission modes: `default` (mutating tools raise `request/permission`),
    `accept-edits` (auto-accept edits), `plan` (drives `request/planApproval`), `yolo` /
    `bypass` (no prompts), and `yolo-safe` (bypass with a safety classifier that escalates risky
    actions via `request/permission`).
@@ -26,11 +27,32 @@ orchestrator ──spawn──► coda serve
    budget (e.g. `30m`, `2h`, `1d`); `--goal-max-continuations <n>` overrides the turn budget;
    `--session-memory` enables the background session-memory watcher; `--max-continuations <n>`
    bounds stop-hook continuations per run (default 10).
-2. Send `initialize` → get `{ protocolVersion, sessionId, serverInfo }`.
+2. Normally send `initialize` → get `{ protocolVersion, sessionId, serverInfo }`.
 3. Send `session/prompt` to run a turn. While it runs you receive `event/*` notifications and may
    receive server-initiated `request/*` you must answer. The `session/prompt` response resolves
    when the turn completes (or is interrupted).
 4. Repeat. `session/interrupt` cancels the in-flight turn. `shutdown` (or closing stdin) stops the server.
+
+### Exact startup system prompt
+
+`--system-prompt` and `--system-prompt-file` are mutually exclusive, accepted once only, and require
+a separate value. Missing values, duplicates, and `--flag=value` forms fail before a session,
+transport, or other startup side effect. A relative file is resolved from the process startup
+directory rather than `--cwd`, read once as strict UTF-8 (an optional BOM is removed), and otherwise
+keeps its whitespace, line endings, and trailing newline. These options belong to interactive Coda
+and `coda serve`; `coda run` has no system-prompt option.
+
+The supplied text is the exact complete root prompt, including explicit empty and whitespace-only
+values: Coda's built-in prompt, project/`CLAUDE.md` context, output style, and provider prefix are
+not added. Anthropic must omit an empty optional `system` block, while OpenAI serializes empty
+values; that transport difference does not reinstate defaults. Claude.ai OAuth may warn
+non-blockingly about compatibility, without mutating the prompt.
+
+The root override applies to scheduled root work and `/context`; subagents keep their role prompts.
+For resumes, startup override wins over transcript metadata, which wins over the ordinary generated
+prompt. Metadata is separate from the audited effective `systemPrompt`, and audits are never resume
+input. Interactive, headless, and slash-command forks retain the metadata; session export/import
+uses optional `systemPromptOverride` while remaining `coda.session/1` compatible.
 
 ## MCP servers
 
@@ -133,7 +155,9 @@ exists at `<cwd>/.coda/sessions/<sessionId>.json`, its history is loaded and the
 that id (subsequent turns persist back to the same file). If no transcript exists for that id,
 `initialize` fails with `-32002` "session not found" rather than silently starting fresh — omit
 `sessionId` to start a new session (the returned `sessionId` is then newly generated). Transcripts
-are written automatically after every turn.
+are written automatically after every turn. Resumed metadata is applied before session
+initialization. Although clients should send `initialize` first, the first `session/prompt` can
+initialize the session if that request was omitted.
 
 Only one turn runs at a time — a `session/prompt` while busy returns a JSON-RPC error.
 

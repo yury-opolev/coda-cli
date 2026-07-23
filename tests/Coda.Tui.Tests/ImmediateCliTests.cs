@@ -51,6 +51,18 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
+    public void Help_documents_exact_startup_system_prompt_options_without_advertising_them_for_run()
+    {
+        var (_, output) = Run("--help");
+
+        Assert.Contains("coda --system-prompt <text>", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("coda --system-prompt-file <path>", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("coda serve --system-prompt <text>", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("exact root system prompt", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("coda run --system-prompt", output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Help_says_auto_defaults_to_fullscreen_and_inline_is_optional()
     {
         var (_, output) = Run("--help");

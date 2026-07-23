@@ -137,6 +137,36 @@ dotnet run --project src/Coda.Tui -- --plain            # plain output (screen r
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
 
+### Exact startup system prompts
+
+The interactive TUI and `coda serve` accept one exact root-prompt source:
+
+```text
+coda [interactive options] [--system-prompt <text> | --system-prompt-file <path>]
+coda serve [serve options] [--system-prompt <text> | --system-prompt-file <path>]
+```
+
+The options are mutually exclusive and accepted once only; a missing value, duplicate, or
+`--system-prompt=<text>` / `--system-prompt-file=<path>` form fails before startup. `coda run`
+does **not** accept either option. A file path relative to the process startup directory is
+resolved there, not relative to `--cwd`; it is read once, before session or transport side effects,
+as strict UTF-8 (an optional UTF-8 BOM is removed). Its whitespace, line endings, and trailing
+newline are otherwise preserved.
+
+An explicit value is a complete replacement for the root system prompt: Coda's built-in prompt,
+`CLAUDE.md`/project context, output-style suffix, and provider prefix are not appended. Empty and
+whitespace-only values are valid exact replacements. Anthropic omits an explicitly empty optional
+`system` field because its empty text blocks are invalid; OpenAI request shapes serialize the empty
+value. Neither provider behavior restores Coda defaults. Claude.ai OAuth may show a non-blocking
+compatibility warning, but the supplied text is not changed.
+
+The replacement is used for the root conversation and scheduled root turns (including `/context`);
+subagents retain their role prompts. On resume, precedence is startup override, then the persisted
+override, then the normal generated prompt. Persisted metadata is distinct from the audited
+effective `systemPrompt`; audit data is never a resume source. Forks preserve the override for
+interactive, headless, and slash-command flows. Export/import carries it as the optional
+`systemPromptOverride` field while keeping the `coda.session/1` bundle schema unchanged.
+
 **Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda ·

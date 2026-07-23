@@ -40,9 +40,9 @@ public static class ImmediateCli
     {
         writer.WriteLine($"{Branding.ProductName} v{Branding.Version} — {Branding.Tagline}");
         writer.WriteLine();
-        writer.WriteLine($"Usage: {Branding.CliName} [options] [--tui=auto|inline|fullscreen] [--plain] [--no-mouse] [--continue] [--resume <id>] [--fork [<id>]]");
+        writer.WriteLine($"Usage: {Branding.CliName} [options] [--tui=auto|inline|fullscreen] [--plain] [--no-mouse] [--system-prompt <text> | --system-prompt-file <path>] [--continue] [--resume <id>] [--fork [<id>]]");
         writer.WriteLine($"       {Branding.CliName} run -p \"<task>\" [--json] [--yolo] [--yolo-safe] [--permission-mode <mode>] [--provider <id>] [--model <id>] [--effort <level>] [--log-level <level>] [--cwd <path>] [--goal \"<objective>\"] [--session-memory] [--max-continuations <n>]");
-        writer.WriteLine($"       {Branding.CliName} serve [--provider <id>] [--model <id>] [--cwd <path>] [--permission-mode <mode>] [--goal \"<objective>\"] [--session-memory] [--telemetry] [--no-mcp] [--no-project-mcp] [--api-key <key>] [--endpoint <name>]");
+        writer.WriteLine($"       {Branding.CliName} serve [--system-prompt <text> | --system-prompt-file <path>] [--provider <id>] [--model <id>] [--cwd <path>] [--permission-mode <mode>] [--goal \"<objective>\"] [--session-memory] [--telemetry] [--no-mcp] [--no-project-mcp] [--api-key <key>] [--endpoint <name>]");
         writer.WriteLine();
         writer.WriteLine("With no arguments, starts the interactive assistant (runs first-time setup if needed).");
         writer.WriteLine();
@@ -61,6 +61,12 @@ public static class ImmediateCli
         writer.WriteLine("                  sequences); wins over --tui. Ideal for scripts, pipes, and CI.");
         writer.WriteLine("  --no-mouse      Disable mouse capture; selection and copy stay native to the");
         writer.WriteLine("                  terminal and every action remains available via the keyboard.");
+        writer.WriteLine("  --system-prompt <text>");
+        writer.WriteLine("  --system-prompt-file <path>");
+        writer.WriteLine("                  Set the exact root system prompt. Choose one option once; serve accepts");
+        writer.WriteLine("                  the same mutually exclusive options. These options are not supported by run.");
+        writer.WriteLine($"                  {Branding.CliName} --system-prompt <text> | {Branding.CliName} --system-prompt-file <path>");
+        writer.WriteLine($"                  {Branding.CliName} serve --system-prompt <text> | {Branding.CliName} serve --system-prompt-file <path>");
         writer.WriteLine();
         writer.WriteLine("Interactive keys (Warm Ember):");
         writer.WriteLine("  Enter           Submit the current prompt.");
