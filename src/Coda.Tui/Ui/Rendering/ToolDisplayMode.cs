@@ -19,6 +19,7 @@ public readonly record struct ToolDisplayModeResolution(
 public static class ToolDisplayModeResolver
 {
     public const int CompactInputPreviewMax = 128;
+    public const ToolDisplayMode Default = ToolDisplayMode.Summary;
 
     /// <summary>
     /// Resolves a raw setting and reports whether it was an unrecognized non-blank value.
@@ -31,15 +32,18 @@ public static class ToolDisplayModeResolver
         return resolution.Mode;
     }
 
+    internal static string InvalidValueWarning(string? rawValue) =>
+        $"Invalid toolDisplayMode '{rawValue}'; using summary.";
+
     /// <summary>
-    /// Resolves a raw setting value. Missing, blank, and unrecognized values use the quiet default
-    /// <see cref="ToolDisplayMode.Tiny"/> and report <see cref="ToolDisplayModeResolution.IsValid"/> as false.
+    /// Resolves a raw setting value. Missing and blank values use the default and are valid; unrecognized
+    /// non-blank values use the default and are invalid.
     /// </summary>
     public static ToolDisplayModeResolution Resolve(string? rawValue)
     {
         if (string.IsNullOrWhiteSpace(rawValue))
         {
-            return new(ToolDisplayMode.Tiny, true, rawValue);
+            return new(Default, true, rawValue);
         }
 
         var mode = rawValue.Trim().ToLowerInvariant() switch
@@ -53,7 +57,7 @@ public static class ToolDisplayModeResolver
 
         return mode is { } resolved
             ? new(resolved, true, rawValue)
-            : new(ToolDisplayMode.Tiny, false, rawValue);
+            : new(Default, false, rawValue);
     }
 }
 

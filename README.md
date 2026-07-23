@@ -791,14 +791,23 @@ project files if they exist (it never writes to them).
 ### Tool display mode
 
 Set `toolDisplayMode` only in the user settings file (`~/.coda/settings.json`); project settings cannot
-override it. The default is `"tiny"` (tool details are hidden), `"compact"` shows concise activity, and
-`"verbose"` shows tool inputs and results:
+override it. Existing explicit values remain honored. Manual changes take effect when you start the next
+interactive session; Coda does not rewrite or migrate this setting. The default is `"summary"`:
 
 ```json
-{ "toolDisplayMode": "compact" }
+{ "toolDisplayMode": "summary" }
 ```
 
-An invalid nonblank value is reported safely at startup and falls back to `"tiny"`.
+| Mode | Display |
+|---|---|
+| `"verbose"` | All tool details and results. |
+| `"compact"` | Per-call status without full results. |
+| `"summary"` (default) | Active cumulative parent activity with up to five running leaves, then one final line. Plain interactive output is final-only. |
+| `"tiny"` | Tool activity is hidden. |
+
+Each root turn has one activity block. The full underlying engine, history, audit, serve, task, and telemetry
+data is retained regardless of display mode. An invalid nonblank value is reported safely at startup and falls
+back to `"summary"`.
 
 **Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
 (including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and

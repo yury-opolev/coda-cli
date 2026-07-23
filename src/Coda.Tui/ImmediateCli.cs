@@ -87,7 +87,7 @@ public static class ImmediateCli
         writer.WriteLine("  F2              Switch between full-screen and inline.");
         writer.WriteLine("  Ctrl+End        Jump to the newest transcript output (scrollbar shows position).");
         writer.WriteLine();
-        writer.WriteLine("Tool display: set user-only ~/.coda/settings.json \"toolDisplayMode\" to tiny (default), compact, or verbose.");
+        writer.WriteLine("Tool display: set user-only ~/.coda/settings.json \"toolDisplayMode\" to verbose | compact | summary | tiny (default: summary).");
         writer.WriteLine("Busy submissions are queued for the active turn's next safe boundary.");
         writer.WriteLine();
         writer.WriteLine("Subcommands:");

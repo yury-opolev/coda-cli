@@ -237,7 +237,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         {
             Publish(mailbox, new DiagnosticEvent(
                 "settings",
-                $"Invalid toolDisplayMode '{toolDisplayResolution.RawValue}'; using tiny.",
+                ToolDisplayModeResolver.InvalidValueWarning(toolDisplayResolution.RawValue),
                 UiNotificationLevel.Warning));
         }
 

@@ -40,7 +40,7 @@ internal class FullscreenTuiShell(
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
-    ToolDisplayMode toolDisplayMode = ToolDisplayMode.Tiny)
+    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
     : TerminalGuiShellBase(
         app,
         controller,

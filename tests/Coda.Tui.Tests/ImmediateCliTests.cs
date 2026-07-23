@@ -118,7 +118,8 @@ public sealed class ImmediateCliTests
         Assert.Contains("recalls queued", output, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("Ctrl+End", output);
         Assert.Contains("toolDisplayMode", output);
-        Assert.Contains("tiny (default)", output);
+        Assert.Contains("verbose | compact | summary | tiny", output);
+        Assert.Contains("default: summary", output);
     }
 
     [Fact]

@@ -77,7 +77,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         TuiTheme? theme = null,
         Func<UiSessionSnapshot, int, string>? statusProjection = null,
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
-        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Tiny)
+        ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));

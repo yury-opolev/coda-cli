@@ -585,14 +585,14 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
-    public void Summary_mode_is_resolved_without_changing_tiny_fallback()
+    public void Summary_mode_is_resolved_with_summary_fallback()
     {
         var summary = ToolDisplayModeResolver.Resolve("summary");
         var fallback = ToolDisplayModeResolver.Resolve(null);
 
         Assert.Equal(ToolDisplayMode.Summary, summary.Mode);
         Assert.True(summary.IsValid);
-        Assert.Equal(ToolDisplayMode.Tiny, fallback.Mode);
+        Assert.Equal(ToolDisplayMode.Summary, fallback.Mode);
     }
 
     private static void AssertContentInOrder(
