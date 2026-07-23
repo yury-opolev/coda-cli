@@ -105,6 +105,47 @@ public sealed class McpConfigWriterTests
     }
 
     [Fact]
+    public void Upsert_with_a_stale_expected_revision_leaves_destination_bytes_unchanged()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, ".mcp.json");
+        File.WriteAllText(path, """{ "mcpServers": { "existing": { "command": "old" } } }""");
+        var original = File.ReadAllBytes(path);
+
+        Assert.Throws<McpException>(() => McpConfigWriter.Upsert(
+            McpConfigScope.Project,
+            "added",
+            new McpStdioServerConfig("new", [], new Dictionary<string, string>()),
+            disabled: false,
+            dir.Path,
+            userMcpDir: null,
+            expectedRevision: "stale-revision"));
+
+        Assert.Equal(original, File.ReadAllBytes(path));
+    }
+
+    [Fact]
+    public void ReplaceEntry_with_a_stale_expected_revision_leaves_destination_bytes_unchanged()
+    {
+        using var dir = new TempDir();
+        var path = Path.Combine(dir.Path, ".mcp.json");
+        File.WriteAllText(path, """{ "mcpServers": { "existing": { "command": "old" } } }""");
+        var original = File.ReadAllBytes(path);
+
+        Assert.Throws<McpException>(() => McpConfigWriter.ReplaceEntry(
+            McpConfigScope.Project,
+            "existing",
+            "renamed",
+            new McpStdioServerConfig("new", [], new Dictionary<string, string>()),
+            disabled: false,
+            dir.Path,
+            userMcpDir: null,
+            expectedRevision: "stale-revision"));
+
+        Assert.Equal(original, File.ReadAllBytes(path));
+    }
+
+    [Fact]
     public void Remove_deletes_only_the_target_and_reports_presence()
     {
         using var dir = new TempDir();

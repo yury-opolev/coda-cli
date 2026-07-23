@@ -1,7 +1,9 @@
 using Coda.Mcp;
+using Coda.Tui.Mcp;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
+using LlmAuth;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -71,10 +73,10 @@ public sealed class McpCommand : ISlashCommand
                 await HandleRemove(context, scope, tail, cancellationToken).ConfigureAwait(false);
                 break;
             case "enable":
-                HandleToggle(context, scope, tail, disabled: false);
+                await HandleToggle(context, scope, tail, disabled: false, cancellationToken).ConfigureAwait(false);
                 break;
             case "disable":
-                HandleToggle(context, scope, tail, disabled: true);
+                await HandleToggle(context, scope, tail, disabled: true, cancellationToken).ConfigureAwait(false);
                 break;
             case "start":
                 await HandleStart(context, tail, cancellationToken).ConfigureAwait(false);
@@ -261,7 +263,22 @@ public sealed class McpCommand : ISlashCommand
         }
 
         var name = tail[0];
-        var exists = ExistsInScope(scope, name, context);
+        var beforeRead = McpManagementService.CaptureRevision(
+            context.Session.WorkingDirectory,
+            userMcpDir: null,
+            ct: cancellationToken);
+        var originalConfig = GetConfigInScope(scope, name, context);
+        var exists = originalConfig is not null;
+        var afterRead = McpManagementService.CaptureRevision(
+            context.Session.WorkingDirectory,
+            userMcpDir: null,
+            ct: cancellationToken);
+        if (beforeRead != afterRead)
+        {
+            context.Console.MarkupLine("MCP configuration changed while preparing the edit. Retry the command.");
+            return;
+        }
+
         if (isEdit && !exists)
         {
             context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file. Use /mcp add to create it."));
@@ -276,6 +293,7 @@ public sealed class McpCommand : ISlashCommand
 
         var flags = tail.Skip(1).ToList();
         McpServerConfig? config;
+        McpWizardDraft? wizardDraft = null;
         if (flags.Count > 0)
         {
             var parsed = McpFlagParser.Parse(flags);
@@ -289,11 +307,13 @@ public sealed class McpCommand : ISlashCommand
         }
         else if (context.Prompts.IsInteractive)
         {
-            config = await RunWizardAsync(context, name, cancellationToken).ConfigureAwait(false);
-            if (config is null)
+            wizardDraft = await RunWizardDraftAsync(context, name, cancellationToken).ConfigureAwait(false);
+            if (wizardDraft is null)
             {
                 return; // wizard reported the problem / was cancelled
             }
+
+            config = wizardDraft.Config;
         }
         else
         {
@@ -301,24 +321,110 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
+        var stagedKeys = new List<string>();
+        var savedConfig = config!;
+        string? cleanupWarning = null;
+        McpConfigMutationLease? lease = null;
         try
         {
-            McpConfigWriter.Upsert(scope, name, config!, disabled: false, context.Session.WorkingDirectory);
+            lease = await McpConfigMutationLease
+                .AcquireAsync(context.Session.WorkingDirectory, userMcpDir: null, ct: cancellationToken)
+                .ConfigureAwait(false);
+            var currentRevision = McpManagementService.CaptureRevision(
+                context.Session.WorkingDirectory,
+                userMcpDir: null,
+                ct: cancellationToken);
+            if (currentRevision != afterRead)
+            {
+                context.Console.MarkupLine("MCP configuration changed before saving. Retry the command.");
+                return;
+            }
+
+            savedConfig = await StageWizardSecretsAsync(
+                context.CredentialStore,
+                name,
+                config!,
+                wizardDraft?.Secrets ?? [],
+                stagedKeys,
+                cancellationToken).ConfigureAwait(false);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (McpManagementService.CaptureRevision(
+                    context.Session.WorkingDirectory,
+                    userMcpDir: null,
+                    ct: cancellationToken) != afterRead)
+            {
+                throw new McpException(
+                    "MCP configuration changed while saving. Review the current configuration and try again.");
+            }
+
+            McpConfigWriter.Upsert(
+                scope,
+                name,
+                savedConfig,
+                disabled: false,
+                context.Session.WorkingDirectory,
+                userMcpDir: null,
+                expectedRevision: ScopeRevision(currentRevision, scope));
+            if (isEdit && originalConfig is not null && context.CredentialStore is { } store)
+            {
+                cleanupWarning = await DeleteUnreferencedOwnedSecretsAsync(
+                    store,
+                    name,
+                    originalConfig,
+                    context.Session.WorkingDirectory).ConfigureAwait(false);
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            if (await CleanupStagedKeysAsync(context.CredentialStore, stagedKeys).ConfigureAwait(false))
+            {
+                context.Console.MarkupLine(
+                    "MCP operation was cancelled. Cleanup incomplete; newly staged MCP credentials may remain.");
+                throw new OperationCanceledException(
+                    "MCP operation was cancelled; cleanup incomplete.",
+                    cancellationToken);
+            }
+
+            throw;
         }
         catch (McpException ex)
         {
-            context.Console.MarkupLine(Markup.Escape(ex.Message));
+            var cleanupIncomplete = await CleanupStagedKeysAsync(context.CredentialStore, stagedKeys)
+                .ConfigureAwait(false);
+            context.Console.MarkupLine(Markup.Escape(
+                cleanupIncomplete
+                    ? ex.Message + " Cleanup incomplete; newly staged MCP credentials may remain."
+                    : ex.Message));
             return;
+        }
+        catch (Exception)
+        {
+            var cleanupIncomplete = await CleanupStagedKeysAsync(context.CredentialStore, stagedKeys)
+                .ConfigureAwait(false);
+            context.Console.MarkupLine(
+                cleanupIncomplete
+                    ? "MCP server could not be saved. Cleanup incomplete; newly staged MCP credentials may remain."
+                    : "MCP server could not be saved. Review the configuration and try again.");
+            return;
+        }
+        finally
+        {
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+            }
         }
 
         var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
         context.Console.MarkupLine(Markup.Escape(
-            $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Run /mcp start {name} to connect it, or it loads on next launch."));
+            cleanupWarning is null
+                ? $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Run /mcp start {name} to connect it, or it loads on next launch."
+                : $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Warning: {cleanupWarning}"));
         PublishSnapshot(context);
 
         // The flag path writes values verbatim (unlike the wizard, which offers encryption). Warn if
         // a literal secret-looking value was persisted so the user can move it out of the file.
-        if (flags.Count > 0 && HasLiteralSecret(config!))
+        if (flags.Count > 0 && HasLiteralSecret(savedConfig))
         {
             context.Console.MarkupLine(Markup.Escape(
                 "Note: values were stored as plaintext. Use the wizard (/mcp add with no flags) or a ${ENV_VAR} reference to keep secrets out of .mcp.json."));
@@ -336,7 +442,21 @@ public sealed class McpCommand : ISlashCommand
         }
 
         var name = tail[0];
+        var beforeRead = McpManagementService.CaptureRevision(
+            context.Session.WorkingDirectory,
+            userMcpDir: null,
+            ct: ct);
         var config = GetConfigInScope(scope, name, context);
+        var afterRead = McpManagementService.CaptureRevision(
+            context.Session.WorkingDirectory,
+            userMcpDir: null,
+            ct: ct);
+        if (beforeRead != afterRead)
+        {
+            context.Console.MarkupLine("MCP configuration changed while preparing removal. Retry the command.");
+            return;
+        }
+
         if (config is null)
         {
             context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file."));
@@ -355,22 +475,64 @@ public sealed class McpCommand : ISlashCommand
             }
         }
 
-        McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
-
-        // Delete the server's encrypted secrets (derived from its coda-secret: refs) AFTER the entry
-        // is gone, so a failed write never orphans the config against already-deleted secrets.
-        if (context.CredentialStore is { } store)
+        string? cleanupWarning = null;
+        try
         {
-            await McpSecretStore.DeleteSecretsAsync(store, config, ct).ConfigureAwait(false);
+            await using var lease = await McpConfigMutationLease
+                .AcquireAsync(context.Session.WorkingDirectory, userMcpDir: null, ct: ct)
+                .ConfigureAwait(false);
+            var currentRevision = McpManagementService.CaptureRevision(
+                context.Session.WorkingDirectory,
+                userMcpDir: null,
+                ct: ct);
+            if (currentRevision != afterRead)
+            {
+                context.Console.MarkupLine("MCP configuration changed before removal. Retry the command.");
+                return;
+            }
+
+            if (!McpConfigWriter.Remove(
+                    scope,
+                    name,
+                    context.Session.WorkingDirectory,
+                    userMcpDir: null,
+                    expectedRevision: ScopeRevision(currentRevision, scope)))
+            {
+                context.Console.MarkupLine(Markup.Escape(
+                    $"'{name}' is not configured in the {ScopeName(scope)} file."));
+                return;
+            }
+
+            if (context.CredentialStore is { } store)
+            {
+                cleanupWarning = await DeleteUnreferencedOwnedSecretsAsync(
+                    store,
+                    name,
+                    config,
+                    context.Session.WorkingDirectory).ConfigureAwait(false);
+            }
+        }
+        catch (McpException exception)
+        {
+            context.Console.MarkupLine(Markup.Escape(exception.Message));
+            return;
         }
 
-        context.Console.MarkupLine(Markup.Escape($"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."));
+        context.Console.MarkupLine(Markup.Escape(
+            cleanupWarning is null
+                ? $"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."
+                : $"Removed '{name}' from the {ScopeName(scope)} file. Warning: {cleanupWarning}"));
         PublishSnapshot(context);
     }
 
     // ── enable / disable ──────────────────────────────────────────────────
 
-    private static void HandleToggle(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool disabled)
+    private static async Task HandleToggle(
+        CommandContext context,
+        McpConfigScope scope,
+        IReadOnlyList<string> tail,
+        bool disabled,
+        CancellationToken ct)
     {
         var verb = disabled ? "disable" : "enable";
         if (tail.Count == 0)
@@ -380,9 +542,58 @@ public sealed class McpCommand : ISlashCommand
         }
 
         var name = tail[0];
-        if (!McpConfigWriter.SetDisabled(scope, name, disabled, context.Session.WorkingDirectory))
+        var beforeRead = McpManagementService.CaptureRevision(
+            context.Session.WorkingDirectory,
+            userMcpDir: null,
+            ct: ct);
+        var exists = ExistsInScope(scope, name, context);
+        var afterRead = McpManagementService.CaptureRevision(
+            context.Session.WorkingDirectory,
+            userMcpDir: null,
+            ct: ct);
+        if (beforeRead != afterRead)
+        {
+            context.Console.MarkupLine("MCP configuration changed while preparing the toggle. Retry the command.");
+            return;
+        }
+
+        if (!exists)
         {
             context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file."));
+            return;
+        }
+
+        try
+        {
+            await using var lease = await McpConfigMutationLease
+                .AcquireAsync(context.Session.WorkingDirectory, userMcpDir: null, ct: ct)
+                .ConfigureAwait(false);
+            var currentRevision = McpManagementService.CaptureRevision(
+                context.Session.WorkingDirectory,
+                userMcpDir: null,
+                ct: ct);
+            if (currentRevision != afterRead)
+            {
+                context.Console.MarkupLine("MCP configuration changed before toggling. Retry the command.");
+                return;
+            }
+
+            if (!McpConfigWriter.SetDisabled(
+                    scope,
+                    name,
+                    disabled,
+                    context.Session.WorkingDirectory,
+                    userMcpDir: null,
+                    expectedRevision: ScopeRevision(currentRevision, scope)))
+            {
+                context.Console.MarkupLine(Markup.Escape(
+                    $"'{name}' is not configured in the {ScopeName(scope)} file."));
+                return;
+            }
+        }
+        catch (McpException exception)
+        {
+            context.Console.MarkupLine(Markup.Escape(exception.Message));
             return;
         }
 
@@ -394,8 +605,33 @@ public sealed class McpCommand : ISlashCommand
 
     // ── interactive wizard ────────────────────────────────────────────────
 
-    internal static async Task<McpServerConfig?> RunWizardAsync(CommandContext context, string name, CancellationToken cancellationToken)
+    internal static async Task<McpServerConfig?> RunWizardAsync(
+        CommandContext context,
+        string name,
+        CancellationToken cancellationToken) =>
+        (await RunWizardCoreAsync(
+            context,
+            name,
+            storeSecretsImmediately: true,
+            cancellationToken: cancellationToken).ConfigureAwait(false))?.Config;
+
+    private static Task<McpWizardDraft?> RunWizardDraftAsync(
+        CommandContext context,
+        string name,
+        CancellationToken cancellationToken) =>
+        RunWizardCoreAsync(
+            context,
+            name,
+            storeSecretsImmediately: false,
+            cancellationToken: cancellationToken);
+
+    private static async Task<McpWizardDraft?> RunWizardCoreAsync(
+        CommandContext context,
+        string name,
+        bool storeSecretsImmediately,
+        CancellationToken cancellationToken)
     {
+        var pendingSecrets = new List<McpWizardSecret>();
         var transport = await SelectAsync(context, $"Transport for '{Markup.Escape(name)}'?", cancellationToken, "stdio", "http").ConfigureAwait(false);
         if (transport is null)
         {
@@ -412,8 +648,17 @@ public sealed class McpCommand : ISlashCommand
 
             var argsLine = await AskAsync(context, "Args (space-separated)", required: false, cancellationToken).ConfigureAwait(false) ?? string.Empty;
             var args = argsLine.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            var env = await PromptPairs(context, name, "env", "Env (KEY=VALUE, blank to finish)", cancellationToken).ConfigureAwait(false);
-            return new McpStdioServerConfig(command, args, env);
+            var env = await PromptPairs(
+                context,
+                name,
+                "env",
+                "Env (KEY=VALUE, blank to finish)",
+                pendingSecrets,
+                storeSecretsImmediately,
+                cancellationToken).ConfigureAwait(false);
+            return new McpWizardDraft(
+                new McpStdioServerConfig(command, args, env),
+                pendingSecrets.ToArray());
         }
 
         var url = await AskAsync(context, "URL", required: true, cancellationToken).ConfigureAwait(false);
@@ -428,7 +673,14 @@ public sealed class McpCommand : ISlashCommand
             return null;
         }
 
-        var headers = await PromptPairs(context, name, "header", "Headers (NAME=VALUE, blank to finish)", cancellationToken).ConfigureAwait(false);
+        var headers = await PromptPairs(
+            context,
+            name,
+            "header",
+            "Headers (NAME=VALUE, blank to finish)",
+            pendingSecrets,
+            storeSecretsImmediately,
+            cancellationToken).ConfigureAwait(false);
         var authMode = await SelectAsync(context, "Auth?", cancellationToken, "oauth", "bearer", "none").ConfigureAwait(false);
         if (authMode is null)
         {
@@ -444,7 +696,14 @@ public sealed class McpCommand : ISlashCommand
                 return null;
             }
 
-            token = await MaybeEncrypt(context, name, "auth/token", token, cancellationToken).ConfigureAwait(false);
+            token = await MaybeEncrypt(
+                context,
+                name,
+                "auth/token",
+                token,
+                pendingSecrets,
+                storeSecretsImmediately,
+                cancellationToken).ConfigureAwait(false);
             auth = new McpAuthConfig(McpAuthMode.Bearer, BearerToken: token);
         }
         else
@@ -452,7 +711,9 @@ public sealed class McpCommand : ISlashCommand
             auth = authMode == "none" ? new McpAuthConfig(McpAuthMode.None) : McpAuthConfig.Default;
         }
 
-        return new McpHttpServerConfig(uri, headers, auth);
+        return new McpWizardDraft(
+            new McpHttpServerConfig(uri, headers, auth),
+            pendingSecrets.ToArray());
     }
 
     /// <summary>Single-choice selection over stable lowercase ids, returning the id or null when dismissed.</summary>
@@ -477,7 +738,14 @@ public sealed class McpCommand : ISlashCommand
         return response.Cancelled ? null : response.Text ?? string.Empty;
     }
 
-    private static async Task<Dictionary<string, string>> PromptPairs(CommandContext context, string server, string fieldPrefix, string title, CancellationToken cancellationToken)
+    private static async Task<Dictionary<string, string>> PromptPairs(
+        CommandContext context,
+        string server,
+        string fieldPrefix,
+        string title,
+        List<McpWizardSecret> pendingSecrets,
+        bool storeSecretsImmediately,
+        CancellationToken cancellationToken)
     {
         var map = new Dictionary<string, string>(StringComparer.Ordinal);
         while (true)
@@ -497,7 +765,14 @@ public sealed class McpCommand : ISlashCommand
             }
 
             var key = line[..index];
-            map[key] = await MaybeEncrypt(context, server, $"{fieldPrefix}/{key}", line[(index + 1)..], cancellationToken).ConfigureAwait(false);
+            map[key] = await MaybeEncrypt(
+                context,
+                server,
+                $"{fieldPrefix}/{key}",
+                line[(index + 1)..],
+                pendingSecrets,
+                storeSecretsImmediately,
+                cancellationToken).ConfigureAwait(false);
         }
 
         return map;
@@ -508,8 +783,16 @@ public sealed class McpCommand : ISlashCommand
     /// can answer) and return a <c>coda-secret:</c> reference instead of the plaintext; otherwise return
     /// the literal value.
     /// </summary>
-    private static async Task<string> MaybeEncrypt(CommandContext context, string server, string field, string value, CancellationToken cancellationToken)
+    private static async Task<string> MaybeEncrypt(
+        CommandContext context,
+        string server,
+        string field,
+        string value,
+        List<McpWizardSecret> pendingSecrets,
+        bool storeSecretsImmediately,
+        CancellationToken cancellationToken)
     {
+        pendingSecrets.RemoveAll(secret => string.Equals(secret.Field, field, StringComparison.Ordinal));
         if (context.CredentialStore is { } store
             && !string.IsNullOrEmpty(value)
             && context.Prompts.IsInteractive)
@@ -519,12 +802,144 @@ public sealed class McpCommand : ISlashCommand
                 cancellationToken).ConfigureAwait(false);
             if (!response.Cancelled && response.SelectedIds.Contains("yes"))
             {
-                return await McpSecretStore.StoreAsync(store, server, field, value, cancellationToken).ConfigureAwait(false);
+                if (storeSecretsImmediately)
+                {
+                    return await McpSecretStore.StoreAsync(store, server, field, value, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+
+                pendingSecrets.Add(new McpWizardSecret(field, new McpSecretReplacement(value)));
+                return McpSecretResolver.SecretRefPrefix + "pending:" + Guid.NewGuid().ToString("N");
             }
         }
 
         return value;
     }
+
+    private static async Task<McpServerConfig> StageWizardSecretsAsync(
+        ITokenStore? store,
+        string serverName,
+        McpServerConfig config,
+        IReadOnlyList<McpWizardSecret> secrets,
+        ICollection<string> stagedKeys,
+        CancellationToken ct)
+    {
+        if (secrets.Count == 0)
+        {
+            return config;
+        }
+
+        if (store is null)
+        {
+            throw new McpException("The credential store is unavailable; encrypted MCP values could not be saved.");
+        }
+
+        var references = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var secret in secrets)
+        {
+            string? value = secret.Replacement.RevealForCommit();
+            try
+            {
+                var staged = await McpSecretStore.StageAsync(
+                    store,
+                    serverName,
+                    secret.Field,
+                    value,
+                    ct,
+                    staged => stagedKeys.Add(staged.StoreKey)).ConfigureAwait(false);
+                references.Add(secret.Field, staged.Reference);
+            }
+            finally
+            {
+                value = null;
+            }
+        }
+
+        return config switch
+        {
+            McpStdioServerConfig stdio => CreateStdioWithStagedSecrets(stdio, references),
+            McpHttpServerConfig http => CreateHttpWithStagedSecrets(http, references),
+            _ => throw new McpException("The selected MCP transport is not supported."),
+        };
+    }
+
+    private static McpStdioServerConfig CreateStdioWithStagedSecrets(
+        McpStdioServerConfig config,
+        IReadOnlyDictionary<string, string> references)
+    {
+        var environment = new Dictionary<string, string>(config.Env, StringComparer.Ordinal);
+        foreach (var (field, reference) in references)
+        {
+            if (field.StartsWith("env/", StringComparison.Ordinal))
+            {
+                environment[field["env/".Length..]] = reference;
+            }
+        }
+
+        return new McpStdioServerConfig(config.Command, config.Args, environment)
+        {
+            Disabled = config.Disabled,
+        };
+    }
+
+    private static McpHttpServerConfig CreateHttpWithStagedSecrets(
+        McpHttpServerConfig config,
+        IReadOnlyDictionary<string, string> references)
+    {
+        var headers = new Dictionary<string, string>(config.Headers, StringComparer.Ordinal);
+        foreach (var (field, reference) in references)
+        {
+            if (field.StartsWith("header/", StringComparison.Ordinal))
+            {
+                headers[field["header/".Length..]] = reference;
+            }
+        }
+
+        var bearer = references.TryGetValue("auth/token", out var stagedBearer)
+            ? stagedBearer
+            : config.Auth.BearerToken;
+        return new McpHttpServerConfig(
+            config.Url,
+            headers,
+            new McpAuthConfig(config.Auth.Mode, config.Auth.ClientId, config.Auth.Scopes, bearer))
+        {
+            Disabled = config.Disabled,
+        };
+    }
+
+    private static async Task<bool> CleanupStagedKeysAsync(ITokenStore? store, IEnumerable<string> stagedKeys)
+    {
+        if (store is null)
+        {
+            return false;
+        }
+
+        var incomplete = false;
+        foreach (var key in stagedKeys
+            .Where(static key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.Ordinal))
+        {
+            try
+            {
+                await McpSecretStore.DeleteKeysAsync(store, [key], CancellationToken.None)
+                    .ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                incomplete = true;
+            }
+        }
+
+        return incomplete;
+    }
+
+    private sealed record McpWizardDraft(
+        McpServerConfig Config,
+        IReadOnlyList<McpWizardSecret> Secrets);
+
+    private sealed record McpWizardSecret(
+        string Field,
+        McpSecretReplacement Replacement);
 
     // ── shared helpers ────────────────────────────────────────────────────
 
@@ -548,6 +963,46 @@ public sealed class McpCommand : ISlashCommand
     }
 
     private static string ScopeName(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
+
+    private static string ScopeRevision(McpConfigRevision revision, McpConfigScope scope) =>
+        scope == McpConfigScope.User ? revision.UserSha256 : revision.ProjectSha256;
+
+    private static async Task<string?> DeleteUnreferencedOwnedSecretsAsync(
+        ITokenStore store,
+        string serverName,
+        McpServerConfig removedConfig,
+        string workingDirectory)
+    {
+        try
+        {
+            var oldKeys = McpSecretStore.References(removedConfig)
+                .Where(binding => McpSecretStore.IsOwnedKey(
+                    serverName,
+                    binding.Field,
+                    binding.StoreKey))
+                .Select(static binding => binding.StoreKey)
+                .Distinct(StringComparer.Ordinal)
+                .ToArray();
+            if (oldKeys.Length == 0)
+            {
+                return null;
+            }
+
+            var liveKeys = McpConfig.LoadPhysicalEntries(workingDirectory)
+                .SelectMany(static entry => McpSecretStore.References(entry.Config))
+                .Select(static binding => binding.StoreKey)
+                .ToHashSet(StringComparer.Ordinal);
+            await McpSecretStore.DeleteKeysAsync(
+                store,
+                oldKeys.Where(key => !liveKeys.Contains(key)),
+                CancellationToken.None).ConfigureAwait(false);
+            return null;
+        }
+        catch (Exception)
+        {
+            return "Prior MCP credentials were retained because post-removal cleanup could not be verified.";
+        }
+    }
 
     /// <summary>True when the config carries a literal (non-reference) value in a secret-bearing field.</summary>
     private static bool HasLiteralSecret(McpServerConfig config) => config switch

@@ -1,3 +1,4 @@
+using System.Security.Cryptography;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
@@ -14,33 +15,53 @@ public static class McpConfigWriter
     private static readonly JsonSerializerOptions writeOptions = new() { WriteIndented = true };
     private static readonly string[] knownEntryProperties =
         ["type", "command", "args", "env", "url", "headers", "auth", "disabled"];
+    private const string MissingFileRevision = "missing";
 
     /// <summary>Add or replace <paramref name="name"/> in the scope's file (creating the file if needed).</summary>
     public static void Upsert(
         McpConfigScope scope, string name, McpServerConfig config, bool disabled,
-        string workingDirectory, string? userMcpDir = null)
+        string workingDirectory, string? userMcpDir = null) =>
+        Upsert(scope, name, config, disabled, workingDirectory, userMcpDir, expectedRevision: null);
+
+    /// <summary>
+    /// Add or replace an entry only when the exact destination bytes still match
+    /// <paramref name="expectedRevision"/>. Pass <see langword="null"/> for legacy unconditional writes.
+    /// </summary>
+    public static void Upsert(
+        McpConfigScope scope, string name, McpServerConfig config, bool disabled,
+        string workingDirectory, string? userMcpDir, string? expectedRevision)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
         ArgumentNullException.ThrowIfNull(config);
 
         var path = McpConfig.FilePath(scope, workingDirectory, userMcpDir);
-        var root = ReadRoot(path);
+        var document = ReadDocument(path);
+        EnsureExpectedRevision(expectedRevision, document);
+        var root = ReadRoot(path, document);
         GetOrCreateServers(root)[name] = ToJson(config, disabled);
         Write(path, root);
     }
 
     /// <summary>Remove <paramref name="name"/> from the scope's file. Returns false when absent.</summary>
-    public static bool Remove(McpConfigScope scope, string name, string workingDirectory, string? userMcpDir = null)
+    public static bool Remove(
+        McpConfigScope scope, string name, string workingDirectory, string? userMcpDir = null) =>
+        Remove(scope, name, workingDirectory, userMcpDir, expectedRevision: null);
+
+    /// <summary>Remove an entry only when the destination bytes match <paramref name="expectedRevision"/>.</summary>
+    public static bool Remove(
+        McpConfigScope scope, string name, string workingDirectory, string? userMcpDir, string? expectedRevision)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         var path = McpConfig.FilePath(scope, workingDirectory, userMcpDir);
-        if (!File.Exists(path))
+        var document = ReadDocument(path);
+        EnsureExpectedRevision(expectedRevision, document);
+        if (!document.Exists)
         {
             return false;
         }
 
-        var root = ReadRoot(path);
+        var root = ReadRoot(path, document);
         if (root["mcpServers"] is not JsonObject servers || !servers.ContainsKey(name))
         {
             return false;
@@ -53,17 +74,24 @@ public static class McpConfigWriter
 
     /// <summary>Set or clear the persisted <c>disabled</c> flag on an existing entry. Returns false when absent.</summary>
     public static bool SetDisabled(
-        McpConfigScope scope, string name, bool disabled, string workingDirectory, string? userMcpDir = null)
+        McpConfigScope scope, string name, bool disabled, string workingDirectory, string? userMcpDir = null) =>
+        SetDisabled(scope, name, disabled, workingDirectory, userMcpDir, expectedRevision: null);
+
+    /// <summary>Set an entry's disabled flag only when the destination bytes match <paramref name="expectedRevision"/>.</summary>
+    public static bool SetDisabled(
+        McpConfigScope scope, string name, bool disabled, string workingDirectory, string? userMcpDir, string? expectedRevision)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(name);
 
         var path = McpConfig.FilePath(scope, workingDirectory, userMcpDir);
-        if (!File.Exists(path))
+        var document = ReadDocument(path);
+        EnsureExpectedRevision(expectedRevision, document);
+        if (!document.Exists)
         {
             return false;
         }
 
-        var root = ReadRoot(path);
+        var root = ReadRoot(path, document);
         if (root["mcpServers"] is not JsonObject servers || servers[name] is not JsonObject entry)
         {
             return false;
@@ -89,14 +117,34 @@ public static class McpConfigWriter
     public static void ReplaceEntry(
         McpConfigScope scope, string currentName, string newName,
         McpServerConfig config, bool disabled, string workingDirectory,
-        string? userMcpDir = null)
+        string? userMcpDir = null) =>
+        ReplaceEntry(
+            scope,
+            currentName,
+            newName,
+            config,
+            disabled,
+            workingDirectory,
+            userMcpDir,
+            expectedRevision: null);
+
+    /// <summary>
+    /// Replace an entry only when the exact destination bytes still match
+    /// <paramref name="expectedRevision"/>.
+    /// </summary>
+    public static void ReplaceEntry(
+        McpConfigScope scope, string currentName, string newName,
+        McpServerConfig config, bool disabled, string workingDirectory,
+        string? userMcpDir, string? expectedRevision)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(currentName);
         ArgumentException.ThrowIfNullOrWhiteSpace(newName);
         ArgumentNullException.ThrowIfNull(config);
 
         var path = McpConfig.FilePath(scope, workingDirectory, userMcpDir);
-        var root = ReadExistingRoot(path);
+        var document = ReadDocument(path);
+        EnsureExpectedRevision(expectedRevision, document);
+        var root = ReadExistingRoot(path, document);
         var servers = GetStrictServers(root, path);
         if (servers[currentName] is not JsonObject existing)
         {
@@ -133,9 +181,35 @@ public static class McpConfigWriter
         Write(path, root);
     }
 
-    private static JsonObject ReadRoot(string path)
+    private static ConfigDocument ReadDocument(string path)
     {
         if (!File.Exists(path))
+        {
+            return new ConfigDocument(false, []);
+        }
+
+        return new ConfigDocument(true, File.ReadAllBytes(path));
+    }
+
+    private static void EnsureExpectedRevision(string? expectedRevision, ConfigDocument document)
+    {
+        if (expectedRevision is null)
+        {
+            return;
+        }
+
+        var actualRevision = document.Exists
+            ? Convert.ToHexString(SHA256.HashData(document.Bytes)).ToLowerInvariant()
+            : MissingFileRevision;
+        if (!string.Equals(actualRevision, expectedRevision, StringComparison.Ordinal))
+        {
+            throw new McpException("MCP configuration changed before it could be saved.");
+        }
+    }
+
+    private static JsonObject ReadRoot(string path, ConfigDocument document)
+    {
+        if (!document.Exists)
         {
             return new JsonObject(); // brand-new config file
         }
@@ -145,7 +219,7 @@ public static class McpConfigWriter
         JsonNode? root;
         try
         {
-            root = JsonNode.Parse(File.ReadAllText(path));
+            root = JsonNode.Parse(document.Bytes);
         }
         catch (JsonException ex)
         {
@@ -156,14 +230,14 @@ public static class McpConfigWriter
             ?? throw new McpException($"'{path}' does not contain a JSON object; fix or remove it before editing MCP servers.");
     }
 
-    private static JsonObject ReadExistingRoot(string path)
+    private static JsonObject ReadExistingRoot(string path, ConfigDocument document)
     {
-        if (!File.Exists(path))
+        if (!document.Exists)
         {
             throw new McpException($"MCP config '{path}' does not exist.");
         }
 
-        return ReadRoot(path);
+        return ReadRoot(path, document);
     }
 
     private static JsonObject GetStrictServers(JsonObject root, string path)
@@ -348,4 +422,6 @@ public static class McpConfigWriter
 
         return obj;
     }
+
+    private sealed record ConfigDocument(bool Exists, byte[] Bytes);
 }

@@ -46,6 +46,29 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
 
     public IMcpManagementService Service { get; }
 
+    public IMcpManagementService CreatePeerService(
+        string? project = null,
+        string? user = null,
+        IMcpConfigMutator? mutator = null) =>
+        new McpManagementService(
+            project ?? this.Project,
+            user ?? this.User,
+            null,
+            this.Store,
+            this.OAuth,
+            new RecordingUiEvents(),
+            mutator);
+
+    public string CreateProjectDirectory()
+    {
+        var path = Path.Combine(this.root, "project-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(path);
+        return path;
+    }
+
+    public bool HasNoConfigLockFiles() =>
+        !Directory.EnumerateFiles(this.root, ".mcp.json.lock", SearchOption.AllDirectories).Any();
+
     public static Task<McpManagementTestHarness> CreateAsync(
         IMcpConfigMutator? mutator = null,
         Action? afterPreparationEntriesRead = null)
@@ -151,6 +174,10 @@ internal sealed class TestTokenStore : ITokenStore
 
     public int DeleteCalls { get; private set; }
 
+    public List<string> ReadKeys { get; } = [];
+
+    public List<string> DeletedKeys { get; } = [];
+
     public CancellationTokenSource? CancelAfterNextSet { get; set; }
 
     public CancellationTokenSource? CancelAndThrowAfterNextSet { get; set; }
@@ -160,6 +187,8 @@ internal sealed class TestTokenStore : ITokenStore
     public int? WriteThenThrowOnSetCall { get; set; }
 
     public Exception? DeleteException { get; set; }
+
+    public Action<string>? BeforeDelete { get; set; }
 
     public IReadOnlyCollection<string> Keys => this.values.Keys.ToArray();
 
@@ -171,6 +200,7 @@ internal sealed class TestTokenStore : ITokenStore
     {
         cancellationToken.ThrowIfCancellationRequested();
         this.GetCalls++;
+        this.ReadKeys.Add(key);
         return Task.FromResult(this.values.GetValueOrDefault(key));
     }
 
@@ -211,7 +241,9 @@ internal sealed class TestTokenStore : ITokenStore
             throw exception;
         }
 
+        this.BeforeDelete?.Invoke(key);
         this.values.Remove(key);
+        this.DeletedKeys.Add(key);
         return Task.CompletedTask;
     }
 
@@ -282,6 +314,9 @@ internal sealed class ThrowingConfigMutator : IMcpConfigMutator
 
 internal sealed class CountingConfigMutator : IMcpConfigMutator
 {
+    private int activeWrites;
+    private int maximumConcurrentWrites;
+
     public int UpsertCalls { get; private set; }
 
     public int ReplaceEntryCalls { get; private set; }
@@ -294,6 +329,8 @@ internal sealed class CountingConfigMutator : IMcpConfigMutator
 
     public Action? AfterWrite { get; set; }
 
+    public int MaximumConcurrentWrites => Volatile.Read(ref this.maximumConcurrentWrites);
+
     public void Upsert(
         McpConfigScope scope,
         string name,
@@ -303,9 +340,7 @@ internal sealed class CountingConfigMutator : IMcpConfigMutator
         string? userMcpDir)
     {
         this.UpsertCalls++;
-        this.BeforeWrite?.Invoke();
-        McpConfigWriter.Upsert(scope, name, config, disabled, workingDirectory, userMcpDir);
-        this.AfterWrite?.Invoke();
+        this.Write(() => McpConfigWriter.Upsert(scope, name, config, disabled, workingDirectory, userMcpDir));
     }
 
     public void ReplaceEntry(
@@ -318,16 +353,14 @@ internal sealed class CountingConfigMutator : IMcpConfigMutator
         string? userMcpDir)
     {
         this.ReplaceEntryCalls++;
-        this.BeforeWrite?.Invoke();
-        McpConfigWriter.ReplaceEntry(
+        this.Write(() => McpConfigWriter.ReplaceEntry(
             scope,
             currentName,
             newName,
             config,
             disabled,
             workingDirectory,
-            userMcpDir);
-        this.AfterWrite?.Invoke();
+            userMcpDir));
     }
 
     public bool Remove(
@@ -337,9 +370,8 @@ internal sealed class CountingConfigMutator : IMcpConfigMutator
         string? userMcpDir)
     {
         this.RemoveCalls++;
-        this.BeforeWrite?.Invoke();
-        var removed = McpConfigWriter.Remove(scope, name, workingDirectory, userMcpDir);
-        this.AfterWrite?.Invoke();
+        var removed = false;
+        this.Write(() => removed = McpConfigWriter.Remove(scope, name, workingDirectory, userMcpDir));
         return removed;
     }
 
@@ -351,10 +383,34 @@ internal sealed class CountingConfigMutator : IMcpConfigMutator
         string? userMcpDir)
     {
         this.SetDisabledCalls++;
-        this.BeforeWrite?.Invoke();
-        var changed = McpConfigWriter.SetDisabled(scope, name, disabled, workingDirectory, userMcpDir);
-        this.AfterWrite?.Invoke();
+        var changed = false;
+        this.Write(() => changed = McpConfigWriter.SetDisabled(scope, name, disabled, workingDirectory, userMcpDir));
         return changed;
+    }
+
+    private void Write(Action write)
+    {
+        var active = Interlocked.Increment(ref this.activeWrites);
+        while (true)
+        {
+            var maximum = Volatile.Read(ref this.maximumConcurrentWrites);
+            if (active <= maximum
+                || Interlocked.CompareExchange(ref this.maximumConcurrentWrites, active, maximum) == maximum)
+            {
+                break;
+            }
+        }
+
+        try
+        {
+            this.BeforeWrite?.Invoke();
+            write();
+            this.AfterWrite?.Invoke();
+        }
+        finally
+        {
+            Interlocked.Decrement(ref this.activeWrites);
+        }
     }
 }
 

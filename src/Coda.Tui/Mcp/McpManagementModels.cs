@@ -109,6 +109,16 @@ internal sealed record McpServerDetail(
     ImmutableArray<McpCapabilitySummary> Prompts,
     ImmutableArray<McpCapabilitySummary> Resources);
 
+/// <summary>
+/// A safe, display-only list item in an MCP edit draft. Service-created item IDs identify an
+/// original list position without retaining that position's raw configuration value.
+/// </summary>
+internal sealed record McpDraftListItem(Guid Id, string Value)
+{
+    /// <summary>Create a new user-entered item that cannot be mistaken for an original item.</summary>
+    public static McpDraftListItem New(string value) => new(Guid.NewGuid(), value);
+}
+
 internal sealed record McpServerDraft(
     string Name,
     McpConfigScope Scope,
@@ -123,7 +133,32 @@ internal sealed record McpServerDraft(
     string? ClientId,
     ImmutableArray<string> Scopes,
     McpSecretChange BearerToken,
-    McpConfigRevision? BaseRevision = null);
+    McpConfigRevision? BaseRevision = null)
+{
+    /// <summary>
+    /// Stable, non-secret identity for service-created edit drafts. A zero value indicates a legacy
+    /// draft that only uses the positional fields above.
+    /// </summary>
+    public Guid DraftId { get; init; }
+
+    /// <summary>
+    /// Authoritative service-created stdio argument items. Values are safe display values only; a
+    /// default array means callers are using the compatible positional <see cref="Args"/> field.
+    /// </summary>
+    public ImmutableArray<McpDraftListItem> ArgumentItems { get; init; }
+
+    /// <summary>
+    /// Authoritative service-created OAuth scope items. Values are safe display values only; a
+    /// default array means callers are using the compatible positional <see cref="Scopes"/> field.
+    /// </summary>
+    public ImmutableArray<McpDraftListItem> ScopeItems { get; init; }
+
+    /// <summary>
+    /// Indicates that an editor intentionally changed the URL, even when its value equals the safe
+    /// display form of a redacted original URL.
+    /// </summary>
+    public bool UrlChanged { get; init; }
+}
 
 internal sealed record McpConfigRevision(
     string UserSha256,

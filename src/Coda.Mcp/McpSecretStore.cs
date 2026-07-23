@@ -47,6 +47,33 @@ public static class McpSecretStore
     }
 
     /// <summary>
+    /// Returns whether <paramref name="storeKey"/> belongs to precisely this server field. A managed
+    /// key is either the canonical key or a versioned child written by <see cref="StageAsync"/>.
+    /// Similar prefixes and credentials in other namespaces are not owned by this manager.
+    /// </summary>
+    public static bool IsOwnedKey(string server, string field, string storeKey)
+    {
+        if (storeKey is null)
+        {
+            return false;
+        }
+
+        var canonical = KeyFor(server, field);
+        if (string.Equals(storeKey, canonical, StringComparison.Ordinal))
+        {
+            return true;
+        }
+
+        if (!storeKey.StartsWith(canonical + "/", StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var version = storeKey[(canonical.Length + 1)..];
+        return version.Length == 32 && version.All(Uri.IsHexDigit);
+    }
+
+    /// <summary>
     /// Gets the credential-store key from an exact managed secret reference. Ordinary Unicode space
     /// separators are retained inside a key, while surrounding whitespace and unsafe control or
     /// format characters are rejected.

@@ -186,6 +186,25 @@ public sealed class McpSecretStoreTests
     }
 
     [Fact]
+    public void IsOwnedKey_accepts_only_the_server_field_canonical_or_versioned_key()
+    {
+        const string server = "my server";
+        const string field = "env/TOKEN";
+        var canonical = McpSecretStore.KeyFor(server, field);
+
+        Assert.True(McpSecretStore.IsOwnedKey(server, field, canonical));
+        Assert.True(McpSecretStore.IsOwnedKey(
+            server,
+            field,
+            canonical + "/0123456789abcdef0123456789ABCDEF"));
+        Assert.False(McpSecretStore.IsOwnedKey(server, field, canonical + "/not-a-guid"));
+        Assert.False(McpSecretStore.IsOwnedKey(server, field, canonical + "/0123456789abcdef0123456789abcdef/child"));
+        Assert.False(McpSecretStore.IsOwnedKey(server, field, "mcp:my server/env/TOKEN-extra"));
+        Assert.False(McpSecretStore.IsOwnedKey(server, field, "mcp:other/env/TOKEN"));
+        Assert.False(McpSecretStore.IsOwnedKey(server, field, "llmauth:provider"));
+    }
+
+    [Fact]
     public async Task References_and_DeleteSecretsAsync_require_exact_safe_managed_references()
     {
         const string validKey = "mcp:my server/env/VALID";

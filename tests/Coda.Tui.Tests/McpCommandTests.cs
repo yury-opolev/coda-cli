@@ -3,6 +3,7 @@ using System.Text.Json.Nodes;
 using Coda.Mcp;
 using Coda.Tui.Commands;
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Prompts;
 using LlmAuth;
 
 namespace Coda.Tui.Tests;
@@ -102,6 +103,140 @@ public sealed class McpCommandTests
         Assert.Contains("Provide flags", console.Output);
     }
 
+    [Fact]
+    public async Task Interactive_add_stages_secret_without_overwriting_the_canonical_key()
+    {
+        using var dirs = new McpTestDirs();
+        var prompts = new RecordingPromptService(
+            new UiPromptResponse(false, ["stdio"], null),
+            new UiPromptResponse(false, [], "node"),
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, [], "TOKEN=wizard-secret"),
+            new UiPromptResponse(false, ["yes"], null),
+            new UiPromptResponse(false, [], string.Empty));
+        var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync("mcp:demo/env/TOKEN", "canonical-value");
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["add", "demo"], CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json")))["demo"]);
+        var reference = config.Env["TOKEN"];
+        Assert.StartsWith("coda-secret:mcp:demo/env/TOKEN/", reference, StringComparison.Ordinal);
+        Assert.Equal("canonical-value", await store.GetAsync("mcp:demo/env/TOKEN"));
+        Assert.Equal("wizard-secret", await store.GetAsync(reference["coda-secret:".Length..]));
+    }
+
+    [Fact]
+    public async Task Interactive_edit_cleans_an_unreferenced_prior_owned_staged_secret()
+    {
+        const string oldKey = "mcp:demo/env/TOKEN/0123456789abcdef0123456789abcdef";
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig(
+            """{ "mcpServers": { "demo": { "command": "node", "env": { "TOKEN": "coda-secret:mcp:demo/env/TOKEN/0123456789abcdef0123456789abcdef" } } } }""");
+        var prompts = new RecordingPromptService(
+            new UiPromptResponse(false, ["stdio"], null),
+            new UiPromptResponse(false, [], "node"),
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, [], "TOKEN=replacement-secret"),
+            new UiPromptResponse(false, ["yes"], null),
+            new UiPromptResponse(false, [], string.Empty));
+        var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync(oldKey, "old-secret");
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["edit", "demo"], CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json")))["demo"]);
+        Assert.Null(await store.GetAsync(oldKey));
+        Assert.Equal(
+            "replacement-secret",
+            await store.GetAsync(config.Env["TOKEN"]["coda-secret:".Length..]));
+    }
+
+    [Fact]
+    public async Task Interactive_add_uses_the_last_duplicate_environment_value_when_encryption_is_declined()
+    {
+        using var dirs = new McpTestDirs();
+        var prompts = new RecordingPromptService(
+            new UiPromptResponse(false, ["stdio"], null),
+            new UiPromptResponse(false, [], "node"),
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, [], "TOKEN=first-secret"),
+            new UiPromptResponse(false, ["yes"], null),
+            new UiPromptResponse(false, [], "TOKEN=second-literal"),
+            new UiPromptResponse(false, ["no"], null),
+            new UiPromptResponse(false, [], string.Empty));
+        var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
+        context.Session.WorkingDirectory = dirs.Project;
+        context.CredentialStore = new InMemoryStore();
+
+        await new McpCommand().ExecuteAsync(context, ["add", "demo"], CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json")))["demo"]);
+        Assert.Equal("second-literal", config.Env["TOKEN"]);
+    }
+
+    [Fact]
+    public async Task Interactive_add_cancellation_after_staging_does_not_write_config_or_retain_a_secret()
+    {
+        using var dirs = new McpTestDirs();
+        var prompts = new RecordingPromptService(
+            new UiPromptResponse(false, ["stdio"], null),
+            new UiPromptResponse(false, [], "node"),
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, [], "TOKEN=staged-secret"),
+            new UiPromptResponse(false, ["yes"], null),
+            new UiPromptResponse(false, [], string.Empty));
+        var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        using var cancellation = new CancellationTokenSource();
+        store.CancelAfterNextSet = cancellation;
+        context.CredentialStore = store;
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => new McpCommand().ExecuteAsync(context, ["add", "demo"], cancellation.Token));
+
+        Assert.False(File.Exists(Path.Combine(dirs.Project, ".mcp.json")));
+        Assert.Empty(store.Keys);
+    }
+
+    [Fact]
+    public async Task Interactive_add_rejects_cross_scope_change_during_staging_and_cleans_the_staged_secret()
+    {
+        using var dirs = new McpTestDirs();
+        var prompts = new RecordingPromptService(
+            new UiPromptResponse(false, ["stdio"], null),
+            new UiPromptResponse(false, [], "node"),
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, [], "TOKEN=staged-secret"),
+            new UiPromptResponse(false, ["yes"], null),
+            new UiPromptResponse(false, [], string.Empty));
+        var (_, context, console, _) = TestAppBuilder.BuildApp(prompts: prompts);
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore
+        {
+            AfterSet = () => File.WriteAllText(
+                Path.Combine(dirs.User, ".mcp.json"),
+                """{ "mcpServers": { "other": { "command": "node" } } }"""),
+        };
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["add", "demo"], CancellationToken.None);
+
+        Assert.False(File.Exists(Path.Combine(dirs.Project, ".mcp.json")));
+        Assert.Empty(store.Keys);
+        Assert.Contains("changed", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
     // The no-name usage strings for add/edit/remove/enable/disable embed literal "[--command …]" /
     // "[--user]" flag hints. Spectre parses "[...]" as markup, so an unescaped usage line makes
     // MarkupLine throw "Could not find color or style '--command'/'--user'". Each must Markup.Escape.
@@ -190,6 +325,49 @@ public sealed class McpCommandTests
 
         Assert.Null(await store.GetAsync("mcp:github/env/TOKEN")); // secret deleted, not orphaned
         Assert.False(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("github"));
+    }
+
+    [Fact]
+    public async Task Remove_preserves_a_foreign_stored_secret()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig(
+            """{ "mcpServers": { "github": { "command": "npx", "env": { "TOKEN": "coda-secret:llmauth:provider" } } } }""");
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync("llmauth:provider", "foreign-value");
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["remove", "github"], CancellationToken.None);
+
+        Assert.Equal("foreign-value", await store.GetAsync("llmauth:provider"));
+        Assert.False(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("github"));
+    }
+
+    [Fact]
+    public async Task Remove_keeps_an_owned_secret_still_referenced_by_another_server()
+    {
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig(
+            """
+            { "mcpServers": {
+              "github": { "command": "npx", "env": { "TOKEN": "coda-secret:mcp:github/env/TOKEN" } },
+              "other": { "command": "node", "env": { "TOKEN": "coda-secret:mcp:github/env/TOKEN" } }
+            } }
+            """);
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync("mcp:github/env/TOKEN", "shared-value");
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["remove", "github"], CancellationToken.None);
+
+        Assert.Equal("shared-value", await store.GetAsync("mcp:github/env/TOKEN"));
+        var servers = McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json")));
+        Assert.False(servers.ContainsKey("github"));
+        Assert.True(servers.ContainsKey("other"));
     }
 
     [Fact]
@@ -375,12 +553,23 @@ public sealed class McpCommandTests
     {
         private readonly Dictionary<string, string> map = new(StringComparer.Ordinal);
 
+        public CancellationTokenSource? CancelAfterNextSet { get; set; }
+
+        public Action? AfterSet { get; set; }
+
+        public IReadOnlyCollection<string> Keys => this.map.Keys.ToArray();
+
         public Task<string?> GetAsync(string key, CancellationToken ct = default)
             => Task.FromResult(this.map.TryGetValue(key, out var v) ? v : null);
 
         public Task SetAsync(string key, string value, CancellationToken ct = default)
         {
+            ct.ThrowIfCancellationRequested();
             this.map[key] = value;
+            this.AfterSet?.Invoke();
+            var cancellation = this.CancelAfterNextSet;
+            this.CancelAfterNextSet = null;
+            cancellation?.Cancel();
             return Task.CompletedTask;
         }
 
