@@ -114,6 +114,12 @@ public sealed class CommandContext
     /// </summary>
     public LlmAuth.ITokenStore? CredentialStore { get; set; }
 
+    /// <summary>
+    /// Cached MCP management service shared by textual commands and the interactive MCP browser.
+    /// Null in contexts that do not construct an interactive MCP runtime.
+    /// </summary>
+    internal Coda.Tui.Mcp.IMcpManagementService? McpManagement { get; set; }
+
     public ProviderDescriptor? FindProvider(string id) =>
         this.Providers.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));
 
