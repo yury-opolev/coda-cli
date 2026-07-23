@@ -76,6 +76,87 @@ public sealed class PlainOutputRendererTests
     }
 
     [Fact]
+    public async Task Summary_emits_only_final_activity_completion()
+    {
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Summary);
+        var identity = new ToolCallIdentity("turn", "activity", "call", "root:turn");
+
+        await renderer.ApplyEventAsync(new ToolQueuedEvent(identity, "grep", "{}"), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolStartedEvent("grep", "{}", identity), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolStateChangedEvent(identity, "grep", ToolCallStatus.Running), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolProgressEvent("grep", 1200, identity), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolCompletedEvent("grep", new ToolResult("secret"), identity), CancellationToken.None);
+
+        Assert.Equal(string.Empty, writer.ToString());
+
+        await renderer.ApplyEventAsync(
+            new ToolActivityCompletedEvent(new ToolActivitySummary("turn", "activity", 12, 1, 0, 0, null)),
+            CancellationToken.None);
+
+        Assert.Equal("Ran 12 tools - 1 failed" + Environment.NewLine, writer.ToString());
+    }
+
+    [Fact]
+    public async Task Summary_suppresses_legacy_tool_events_and_preserves_shell_cancelled_wording()
+    {
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Summary);
+
+        await renderer.ApplyEventAsync(new ToolStartedEvent("run_command", """{"command":"echo one"}"""), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolProgressEvent("run_command", 1000), CancellationToken.None);
+        await renderer.ApplyEventAsync(
+            new ToolCompletedEvent("run_command", new ToolResult("result")),
+            CancellationToken.None);
+
+        Assert.Equal(string.Empty, writer.ToString());
+
+        await renderer.ApplyEventAsync(
+            new ToolActivityCompletedEvent(new ToolActivitySummary("turn", "activity", 2, 0, 2, 0, "run_command")),
+            CancellationToken.None);
+
+        Assert.Equal("Ran 2 shell commands - cancelled" + Environment.NewLine, writer.ToString());
+    }
+
+    [Fact]
+    public async Task Summary_suppresses_multiple_correlated_batches_until_each_completion()
+    {
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Summary);
+        var first = new ToolCallIdentity("turn", "activity-1", "call-1", "root:turn");
+        var second = new ToolCallIdentity("turn", "activity-2", "call-2", "root:turn");
+
+        await renderer.ApplyEventAsync(new ToolQueuedEvent(first, "grep", "{}"), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolQueuedEvent(second, "read_file", "{}"), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolStateChangedEvent(first, "grep", ToolCallStatus.Running), CancellationToken.None);
+        await renderer.ApplyEventAsync(new ToolStateChangedEvent(second, "read_file", ToolCallStatus.Succeeded), CancellationToken.None);
+        await renderer.ApplyEventAsync(
+            new ToolActivityCompletedEvent(new ToolActivitySummary("turn", "activity-1", 1, 0, 0, 0, "grep")),
+            CancellationToken.None);
+
+        Assert.Equal("Ran 1 tool" + Environment.NewLine, writer.ToString());
+
+        await renderer.ApplyEventAsync(
+            new ToolActivityCompletedEvent(new ToolActivitySummary("turn", "activity-2", 1, 0, 0, 0, "read_file")),
+            CancellationToken.None);
+
+        Assert.Equal(
+            "Ran 1 tool" + Environment.NewLine + "Ran 1 tool" + Environment.NewLine,
+            writer.ToString());
+    }
+
+    [Fact]
+    public async Task Default_constructor_remains_verbose()
+    {
+        var writer = new StringWriter();
+        var renderer = new PlainOutputRenderer(writer);
+
+        await renderer.ApplyEventAsync(new ToolStartedEvent("grep", "{}"), CancellationToken.None);
+
+        Assert.Equal("[tool] grep {}" + Environment.NewLine, writer.ToString());
+    }
+
+    [Fact]
     public async Task Compact_tool_output_contains_preview_and_status_but_not_result()
     {
         var writer = new StringWriter();
