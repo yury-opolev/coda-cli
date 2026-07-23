@@ -8,7 +8,7 @@ namespace Coda.Tui.Tests;
 public sealed class TranscriptNavigationChromeTests
 {
     [Fact]
-    public async Task Hint_is_visible_while_scrolled_away_and_clicking_it_jumps()
+    public async Task Hint_is_visible_while_scrolled_away_and_an_actual_routed_click_jumps()
     {
         using var fixture = RetainedShellFixture.Create(activeWork: false);
         var seed = Blocks(50);
@@ -26,9 +26,42 @@ public sealed class TranscriptNavigationChromeTests
 
         Assert.True(fixture.Shell.JumpHint.Visible);
         Assert.DoesNotContain("Ctrl+End", fixture.Shell.Header.Text, StringComparison.Ordinal);
-        fixture.Shell.JumpHint.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonClicked });
+        fixture.HostApplication.LayoutAndDraw();
+        var target = Assert.IsType<JumpHintHitTarget>(fixture.Shell.JumpHint.RenderedHitTargetForTest);
+        var position = new Point(target.Left, fixture.Shell.JumpHint.Frame.Y);
+        fixture.HostApplication.Mouse.RaiseMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonClicked,
+            ScreenPosition = position,
+        });
         Assert.True(fixture.Shell.Transcript.AutoFollow);
         Assert.False(fixture.Shell.JumpHint.Visible);
+    }
+
+    [Fact]
+    public void Jump_control_uses_a_dedicated_row_that_remains_reserved_when_hidden()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        var shell = fixture.Shell;
+
+        Assert.False(shell.JumpHint.Visible);
+        Assert.Equal(shell.Chrome.Frame.Y - 1, shell.JumpHint.Frame.Y);
+        Assert.NotEqual(shell.Operational.Frame.Y, shell.JumpHint.Frame.Y);
+        Assert.NotEqual(shell.Status.Frame.Y, shell.JumpHint.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Bottom, shell.JumpHint.Frame.Y);
+        Assert.Equal(shell.JumpHint.Frame.Bottom, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+
+        shell.JumpHint.Update(autoFollow: false, unseenBlockCount: 1);
+        fixture.HostApplication.LayoutAndDraw();
+        Assert.True(shell.JumpHint.Visible);
+        Assert.Equal(shell.Chrome.Frame.Y - 1, shell.JumpHint.Frame.Y);
+
+        shell.JumpHint.Update(autoFollow: true, unseenBlockCount: 0);
+        fixture.HostApplication.LayoutAndDraw();
+        Assert.False(shell.JumpHint.Visible);
+        Assert.Equal(shell.Chrome.Frame.Y - 1, shell.JumpHint.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
     }
 
     [Fact]

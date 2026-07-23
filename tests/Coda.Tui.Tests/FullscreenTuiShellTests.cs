@@ -865,9 +865,9 @@ public sealed class FullscreenTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Retained row order: header, transcript, operational row, chrome (top edge + composer + bottom
-        // edge), metadata (status). The composer sits one row below the chrome's top edge, and the chrome
-        // is exactly two rows taller than the composer (its half-block edges).
+        // Retained row order: header, transcript, operational row, navigation chrome, composer chrome
+        // (top edge + composer + bottom edge), metadata (status). The composer sits one row below the
+        // chrome's top edge, and the chrome is exactly two rows taller than the composer (its half-block edges).
         Assert.Equal(0, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
         Assert.Equal(1, shell.Composer.Frame.Height);
@@ -876,7 +876,8 @@ public sealed class FullscreenTuiShellTests
 
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
         Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
         Assert.Equal(shell.Composer.Frame.Height + 2, shell.Chrome.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
@@ -2108,7 +2109,8 @@ public sealed class VirtualizedTranscriptViewTests
         Assert.Equal(cap, shell.Composer.Frame.Height);
         Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
         Assert.Equal(shell.Composer.Frame.Height + 2, shell.Chrome.Frame.Height);
 
@@ -2460,7 +2462,7 @@ public sealed class VirtualizedTranscriptViewTests
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
         app.Init(DriverRegistry.Names.ANSI);
-        app.Driver!.SetScreenSize(40, 12);
+        app.Driver!.SetScreenSize(40, 13);
         using var shell = ShellTestFactory.CreateFullscreen(app);
         var token = app.Begin(shell);
         app.LayoutAndDraw();

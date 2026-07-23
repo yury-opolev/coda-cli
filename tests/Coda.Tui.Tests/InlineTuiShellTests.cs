@@ -100,8 +100,8 @@ public sealed class InlineTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Retained row order: header, transcript, operational row, chrome (top edge + composer + bottom
-        // edge), metadata (status).
+        // Retained row order: header, transcript, operational row, navigation chrome, composer chrome
+        // (top edge + composer + bottom edge), metadata (status).
         Assert.Equal(shell.Frame.Y, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
         Assert.Equal(1, shell.Operational.Frame.Height);
@@ -111,7 +111,8 @@ public sealed class InlineTuiShellTests
         // above and below, so the chrome is two rows taller than the composer.
         Assert.Equal(1, shell.Composer.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
 
         // Transcript fills every row between the header and the operational row.
@@ -643,13 +644,14 @@ public sealed class InlineTuiShellTests
         Assert.NotEqual(screenCap, shell.Composer.Frame.Height);
 
         // Status and transcript geometry are preserved: the status row is one row pinned to the region
-        // bottom, the operational row and composer stack above it, and the transcript fills every row
-        // between the header and the operational row.
+        // bottom, the operational row, navigation row, and composer stack above it, and the transcript
+        // fills every row between the header and the operational row.
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.Equal(shell.Frame.Height, shell.Status.Frame.Bottom);
         Assert.Equal(1, shell.Operational.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
         Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
