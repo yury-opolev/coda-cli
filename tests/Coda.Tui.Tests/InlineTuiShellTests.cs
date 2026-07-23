@@ -127,6 +127,34 @@ public sealed class InlineTuiShellTests
         }
     }
 
+    [Fact]
+    public void Inline_layout_at_minimum_height_keeps_navigation_rows_non_overlapping()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 6);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(7, shell.Frame.Height);
+        Assert.True(shell.Header.Frame.Bottom <= shell.Operational.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Bottom, shell.JumpHint.Frame.Y);
+        Assert.Equal(shell.JumpHint.Frame.Bottom, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
+        Assert.True(shell.Transcript.Frame.Height >= 0);
+        Assert.True(shell.Transcript.Frame.Bottom <= shell.Operational.Frame.Y);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
     [Theory]
     [InlineData(60, 12)]
     [InlineData(80, 24)]
