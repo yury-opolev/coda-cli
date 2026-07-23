@@ -99,6 +99,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
     internal const string MissingFileRevision = "missing";
 
     private static readonly TimeSpan capabilityTimeout = TimeSpan.FromSeconds(5);
+    private const long maximumLcsCells = 1_000_000;
     private readonly string workingDirectory;
     private readonly string? userMcpDir;
     private readonly McpClientManager? runtime;
@@ -614,7 +615,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             throw new McpException("HTTP MCP URLs cannot include user information.");
         }
 
-        return new Uri(uri.GetLeftPart(UriPartial.Path), UriKind.Absolute).ToString();
+        return uri.OriginalString;
     }
 
     private static string? NormalizeOptionalText(string? value, string unsafeMessage)
@@ -1678,9 +1679,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 Command = string.Equals(draft.Command, baseline.Command, StringComparison.Ordinal)
                     ? stdio.Command
                     : draft.Command,
-                Args = draft.Args.SequenceEqual(baseline.Args, StringComparer.Ordinal)
-                    ? stdio.Args.ToImmutableArray()
-                    : draft.Args,
+                Args = MergeUnchangedStdioArgs(stdio.Args, baseline.Args, draft.Args),
             },
             McpHttpServerConfig http => draft with
             {
@@ -1696,6 +1695,122 @@ internal sealed partial class McpManagementService : IMcpManagementService
             },
             _ => throw new McpException("MCP configuration has an unsupported transport."),
         };
+    }
+
+    private static ImmutableArray<string> MergeUnchangedStdioArgs(
+        IReadOnlyList<string> originalArgs,
+        ImmutableArray<string> baselineDisplayedArgs,
+        ImmutableArray<string> editedArgs)
+    {
+        if (originalArgs.Count != baselineDisplayedArgs.Length
+            || originalArgs.Count == 0
+            || editedArgs.IsDefaultOrEmpty)
+        {
+            return editedArgs;
+        }
+
+        var rawForEditedIndex = new string?[editedArgs.Length];
+        var matchedOriginal = new bool[originalArgs.Count];
+        var matchedEdited = new bool[editedArgs.Length];
+
+        if (((long)baselineDisplayedArgs.Length + 1) * ((long)editedArgs.Length + 1) <= maximumLcsCells)
+        {
+            foreach (var (originalIndex, editedIndex) in LongestCommonSubsequenceMatches(
+                         baselineDisplayedArgs,
+                         editedArgs))
+            {
+                rawForEditedIndex[editedIndex] = originalArgs[originalIndex];
+                matchedOriginal[originalIndex] = true;
+                matchedEdited[editedIndex] = true;
+            }
+        }
+
+        // The ordinal queues also retain values moved outside of the LCS and avoid
+        // allocating quadratically for large user-provided argument arrays.
+        var remainingOriginalByDisplay = new Dictionary<string, Queue<int>>(StringComparer.Ordinal);
+        for (var originalIndex = 0; originalIndex < baselineDisplayedArgs.Length; originalIndex++)
+        {
+            if (matchedOriginal[originalIndex])
+            {
+                continue;
+            }
+
+            var display = baselineDisplayedArgs[originalIndex];
+            if (!remainingOriginalByDisplay.TryGetValue(display, out var remainingIndices))
+            {
+                remainingIndices = new Queue<int>();
+                remainingOriginalByDisplay.Add(display, remainingIndices);
+            }
+
+            remainingIndices.Enqueue(originalIndex);
+        }
+
+        for (var editedIndex = 0; editedIndex < editedArgs.Length; editedIndex++)
+        {
+            if (matchedEdited[editedIndex]
+                || !remainingOriginalByDisplay.TryGetValue(editedArgs[editedIndex], out var remainingIndices)
+                || remainingIndices.Count == 0)
+            {
+                continue;
+            }
+
+            var originalIndex = remainingIndices.Dequeue();
+            rawForEditedIndex[editedIndex] = originalArgs[originalIndex];
+        }
+
+        var merged = ImmutableArray.CreateBuilder<string>(editedArgs.Length);
+        for (var editedIndex = 0; editedIndex < editedArgs.Length; editedIndex++)
+        {
+            merged.Add(rawForEditedIndex[editedIndex] ?? editedArgs[editedIndex]);
+        }
+
+        return merged.MoveToImmutable();
+    }
+
+    private static IEnumerable<(int OriginalIndex, int EditedIndex)> LongestCommonSubsequenceMatches(
+        ImmutableArray<string> baselineDisplayedArgs,
+        ImmutableArray<string> editedArgs)
+    {
+        var lengths = new int[baselineDisplayedArgs.Length + 1, editedArgs.Length + 1];
+        for (var originalIndex = baselineDisplayedArgs.Length - 1; originalIndex >= 0; originalIndex--)
+        {
+            for (var editedIndex = editedArgs.Length - 1; editedIndex >= 0; editedIndex--)
+            {
+                lengths[originalIndex, editedIndex] =
+                    string.Equals(
+                        baselineDisplayedArgs[originalIndex],
+                        editedArgs[editedIndex],
+                        StringComparison.Ordinal)
+                        ? lengths[originalIndex + 1, editedIndex + 1] + 1
+                        : Math.Max(
+                            lengths[originalIndex + 1, editedIndex],
+                            lengths[originalIndex, editedIndex + 1]);
+            }
+        }
+
+        var original = 0;
+        var edited = 0;
+        while (original < baselineDisplayedArgs.Length && edited < editedArgs.Length)
+        {
+            if (string.Equals(
+                    baselineDisplayedArgs[original],
+                    editedArgs[edited],
+                    StringComparison.Ordinal)
+                && lengths[original, edited] == lengths[original + 1, edited + 1] + 1)
+            {
+                yield return (original, edited);
+                original++;
+                edited++;
+            }
+            else if (lengths[original + 1, edited] >= lengths[original, edited + 1])
+            {
+                original++;
+            }
+            else
+            {
+                edited++;
+            }
+        }
     }
 
     private async Task<CapabilityRead> ReadCapabilitiesAsync(string serverName, CancellationToken ct)
@@ -1877,8 +1992,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
             return $"{url.Scheme}:[redacted]";
         }
 
-        var host = url.Host.Contains(':')
-            ? $"[{url.Host}]"
+        var host = url.HostNameType == UriHostNameType.IPv6
+            ? $"[{url.DnsSafeHost.Trim('[', ']')}]"
             : url.Host;
         var port = url.IsDefaultPort ? string.Empty : $":{url.Port}";
         var path = url.AbsolutePath;

@@ -490,6 +490,27 @@ public sealed class McpManagementReadTests
     }
 
     [Fact]
+    public async Task Detail_and_draft_display_an_ipv6_http_url_with_single_brackets()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://[2001:db8::1]:8443/mcp?x=y#z"}}}""");
+        var key = new McpServerKey(McpConfigScope.Project, "server");
+
+        var detail = await harness.Service.GetDetailAsync(key, CancellationToken.None);
+        var draft = await harness.Service.CreateEditDraftAsync(key, CancellationToken.None);
+
+        Assert.NotNull(detail);
+        Assert.NotNull(draft);
+        Assert.Equal("https://[2001:db8::1]:8443/mcp", detail.Url);
+        Assert.Equal(detail.Url, draft.Url);
+        Assert.DoesNotContain("?x=y", detail.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("#z", detail.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("?x=y", draft.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("#z", draft.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Edit_draft_is_prepopulated_and_keeps_secret_changes_unchanged_in_deterministic_order()
     {
         await using var harness = await McpManagementTestHarness.CreateAsync();

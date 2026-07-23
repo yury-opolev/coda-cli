@@ -265,6 +265,235 @@ public sealed class McpManagementEditTests
     }
 
     [Fact]
+    public async Task Commit_edit_preserves_raw_stdio_arg_siblings_when_one_arg_changes()
+    {
+        const string rawUrl = "https://example.test/mcp?access_token=original-url-secret#fragment";
+        const string rawWhitespace = "  preserve\tthis\nexactly  ";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """
+            {"mcpServers":{"server":{
+              "command":"node",
+              "args":["https://example.test/mcp?access_token=original-url-secret#fragment","  preserve\u0009this\u000Aexactly  ","--replace"]
+            }}}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        Assert.Equal("[redacted URL]", draft.Args[0]);
+        Assert.Equal("preserve this exactly", draft.Args[1]);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with { Args = [draft.Args[0], draft.Args[1], "--replacement"] },
+            CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal([rawUrl, rawWhitespace, "--replacement"], config.Args);
+        Assert.DoesNotContain("original-url-secret", draft.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Commit_edit_preserves_raw_stdio_args_across_insert_and_delete()
+    {
+        const string rawUrl = "https://example.test/mcp?access_token=original-url-secret#fragment";
+        const string rawWhitespace = "  preserve\tthis\nexactly  ";
+        await using var insertHarness = await McpManagementTestHarness.CreateAsync();
+        insertHarness.WriteProject(
+            """
+            {"mcpServers":{"server":{
+              "command":"node",
+              "args":["https://example.test/mcp?access_token=original-url-secret#fragment","  preserve\u0009this\u000Aexactly  "]
+            }}}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var insertDraft = await insertHarness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(insertDraft);
+
+        var insertPreview = await insertHarness.Service.PrepareEditAsync(
+            original,
+            insertDraft with { Args = [insertDraft.Args[0], "--inserted", insertDraft.Args[1]] },
+            CancellationToken.None);
+        await insertHarness.Service.CommitEditAsync(insertPreview, CancellationToken.None);
+        var inserted = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(insertHarness.Project, insertHarness.User)).Config);
+        Assert.Equal([rawUrl, "--inserted", rawWhitespace], inserted.Args);
+
+        await using var deleteHarness = await McpManagementTestHarness.CreateAsync();
+        deleteHarness.WriteProject(
+            """
+            {"mcpServers":{"server":{
+              "command":"node",
+              "args":["https://example.test/mcp?access_token=original-url-secret#fragment","--delete","  preserve\u0009this\u000Aexactly  "]
+            }}}
+            """);
+        var deleteDraft = await deleteHarness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(deleteDraft);
+
+        var deletePreview = await deleteHarness.Service.PrepareEditAsync(
+            original,
+            deleteDraft with { Args = [deleteDraft.Args[0], deleteDraft.Args[2]] },
+            CancellationToken.None);
+        await deleteHarness.Service.CommitEditAsync(deletePreview, CancellationToken.None);
+        var deleted = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(deleteHarness.Project, deleteHarness.User)).Config);
+        Assert.Equal([rawUrl, rawWhitespace], deleted.Args);
+    }
+
+    [Fact]
+    public async Task Commit_edit_maps_duplicate_safe_stdio_args_to_the_first_original_occurrence()
+    {
+        const string firstRaw = "duplicate \t value";
+        const string secondRaw = "duplicate\nvalue";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """
+            {"mcpServers":{"server":{
+              "command":"node",
+              "args":["duplicate \u0009 value","duplicate\u000Avalue","--remove"]
+            }}}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        Assert.Equal("duplicate value", draft.Args[0]);
+        Assert.Equal(draft.Args[0], draft.Args[1]);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with { Args = [draft.Args[1]] },
+            CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal([firstRaw], config.Args);
+        Assert.NotEqual(secondRaw, config.Args[0]);
+    }
+
+    [Fact]
+    public async Task Commit_edit_preserves_raw_stdio_args_when_their_safe_values_are_reordered()
+    {
+        const string rawUrl = "https://example.test/mcp?access_token=original-url-secret#fragment";
+        const string rawWhitespace = "  preserve\tthis\nexactly  ";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """
+            {"mcpServers":{"server":{
+              "command":"node",
+              "args":["https://example.test/mcp?access_token=original-url-secret#fragment","  preserve\u0009this\u000Aexactly  ","--keep"]
+            }}}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with { Args = [draft.Args[1], draft.Args[0], draft.Args[2]] },
+            CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal([rawWhitespace, rawUrl, "--keep"], config.Args);
+    }
+
+    [Fact]
+    public async Task Commit_edit_keeps_an_intentionally_entered_http_url_exact()
+    {
+        const string enteredUrl = "https://example.test/mcp?token=value#frag";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://original.test/mcp?old=value#old-frag"}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with { Url = enteredUrl },
+            CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        var detail = await harness.Service.GetDetailAsync(original, CancellationToken.None);
+
+        Assert.Equal(enteredUrl, config.Url.OriginalString);
+        Assert.Contains(enteredUrl, Encoding.UTF8.GetString(harness.ReadProjectBytes()), StringComparison.Ordinal);
+        Assert.NotNull(detail);
+        Assert.Equal("https://example.test/mcp", detail.Url);
+        Assert.DoesNotContain("token=value", detail.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("frag", detail.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Commit_edit_keeps_an_intentionally_entered_http_url_path_escaping_exact()
+    {
+        const string enteredUrl = "https://example.test/%7e/a%2fb?token=value#frag";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://original.test/mcp"}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with { Url = enteredUrl },
+            CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal(enteredUrl, config.Url.OriginalString);
+        Assert.Contains(enteredUrl, Encoding.UTF8.GetString(harness.ReadProjectBytes()), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Commit_edit_preserves_an_unchanged_ipv6_http_url_exactly()
+    {
+        const string rawUrl = "https://[2001:db8::1]:8443/mcp?x=y#z";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://[2001:db8::1]:8443/mcp?x=y#z"}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(original, draft, CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal(rawUrl, config.Url.OriginalString);
+        Assert.Contains(rawUrl, Encoding.UTF8.GetString(harness.ReadProjectBytes()), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Prepare_edit_rejects_an_external_draft_when_http_url_display_is_sanitized()
+    {
+        const string querySecret = "never-show-external-draft-url-secret";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp?token=never-show-external-draft-url-secret"}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var exception = await Assert.ThrowsAsync<McpException>(
+            () => harness.Service.PrepareEditAsync(
+                original,
+                draft with { BaseRevision = null },
+                CancellationToken.None));
+
+        Assert.Contains("without a base revision", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(querySecret, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Prepare_edit_rejects_a_draft_when_config_changes_after_it_is_created()
     {
         await using var harness = await McpManagementTestHarness.CreateAsync();
