@@ -176,6 +176,53 @@ public sealed class McpOAuthTokenLifecycleTests
     }
 
     [Fact]
+    public async Task HandleUnauthorized_does_not_log_a_secret_bearing_resource_query()
+    {
+        const string secret = "resource-query-secret-DO-NOT-LEAK";
+        var logs = new List<string>();
+        using var http = new HttpClient();
+        var provider = new McpOAuthProvider(
+            http,
+            new InMemoryTokenStore(),
+            $"https://mcp.example.com/mcp?access_token={secret}",
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: false,
+            log: logs.Add);
+
+        using var response = new HttpResponseMessage(HttpStatusCode.Unauthorized);
+        Assert.False(await provider.HandleUnauthorizedAsync(response));
+
+        Assert.DoesNotContain(secret, Assert.Single(logs));
+        Assert.Contains("https://mcp.example.com/mcp", logs[0]);
+    }
+
+    [Fact]
+    public async Task HandleUnauthorized_does_not_log_a_provider_failure_message()
+    {
+        const string secret = "provider-failure-secret-DO-NOT-LEAK";
+        var handler = new McpAuthRouteHandler();
+        ConfigureOAuthRoutes(handler);
+        using var http = new HttpClient(handler);
+        var store = new InMemoryTokenStore();
+        await store.SetAsync("mcp-client:https://auth.example.com", """{"clientId":"cached-client"}""");
+        var logs = new List<string>();
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            "https://mcp.example.com/mcp",
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: true,
+            openBrowser: (_, _) => Task.FromException(new LlmAuthException(secret)),
+            log: logs.Add);
+
+        using var response = new HttpResponseMessage(HttpStatusCode.Unauthorized);
+        Assert.False(await provider.HandleUnauthorizedAsync(response));
+
+        Assert.DoesNotContain(logs, message => message.Contains(secret, StringComparison.Ordinal));
+        Assert.Contains(logs, message => message.Contains("Authorization failed", StringComparison.Ordinal));
+    }
+
+    [Fact]
     public async Task GetAccessToken_refreshes_expired_token_using_refresh_grant()
     {
         var handler = new McpAuthRouteHandler();
@@ -194,6 +241,301 @@ public sealed class McpOAuthTokenLifecycleTests
         var provider = new McpOAuthProvider(http, store, resource, new McpAuthConfig(McpAuthMode.OAuth), interactive: false);
 
         Assert.Equal("refreshed-token", await provider.GetAccessTokenAsync());
+    }
+
+    [Fact]
+    public async Task ForceReauthorize_replaces_only_canonical_token_and_preserves_cached_dcr_registration()
+    {
+        const string sourceResource = "https://MCP.Example.com:443/mcp/#fragment";
+        const string canonicalResource = "https://mcp.example.com/mcp";
+        const string oldToken = """{"accessToken":"old-token","expiresAtUnix":0,"issuer":"https://auth.example.com","clientId":"cached-client"}""";
+        const string unrelatedToken = """{"accessToken":"unrelated-token"}""";
+        const string registration = """{"clientId":"cached-client","clientSecret":"cached-registration-secret"}""";
+        var handler = new McpAuthRouteHandler();
+        ConfigureOAuthRoutes(handler);
+        using var http = new HttpClient(handler);
+        var store = new RecordingTokenStore();
+        store.Seed($"mcp-token:{canonicalResource}", oldToken);
+        store.Seed($"mcp-token:{sourceResource}", unrelatedToken);
+        store.Seed("mcp-client:https://auth.example.com", registration);
+        var browser = new ScriptedBrowser();
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            sourceResource,
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: true,
+            openBrowser: browser.OpenAsync);
+
+        var result = await provider.ForceReauthorizeAsync();
+        await browser.CallbackCompleted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(result.Succeeded);
+        Assert.Null(result.Error);
+        Assert.Equal([$"mcp-token:{canonicalResource}"], store.DeletedKeys);
+        Assert.NotEqual(oldToken, await store.GetAsync($"mcp-token:{canonicalResource}"));
+        Assert.Equal(unrelatedToken, await store.GetAsync($"mcp-token:{sourceResource}"));
+        Assert.Equal(registration, await store.GetAsync("mcp-client:https://auth.example.com"));
+        Assert.Contains(
+            "resource=https%3A%2F%2Fmcp.example.com%2Fmcp",
+            Assert.Single(handler.SeenFormBodies));
+    }
+
+    [Fact]
+    public async Task ForceReauthorize_acquires_proactively_without_a_runtime_unauthorized_request()
+    {
+        const string resource = "https://mcp.example.com/mcp";
+        var handler = new McpAuthRouteHandler();
+        ConfigureOAuthRoutes(handler);
+        using var http = new HttpClient(handler);
+        var store = new RecordingTokenStore();
+        store.Seed("mcp-client:https://auth.example.com", """{"clientId":"cached-client"}""");
+        var browser = new ScriptedBrowser();
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            resource,
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: true,
+            openBrowser: browser.OpenAsync);
+
+        var result = await provider.ForceReauthorizeAsync();
+        await browser.CallbackCompleted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(result.Succeeded);
+        Assert.Contains("https://mcp.example.com/.well-known/oauth-protected-resource", handler.SeenUrls);
+        Assert.DoesNotContain(resource, handler.SeenUrls);
+    }
+
+    [Fact]
+    public async Task ForceReauthorize_returns_sanitized_discovery_failure_after_clearing_token()
+    {
+        const string secret = "discovery-secret-DO-NOT-LEAK";
+        const string resource = "https://mcp.example.com/mcp?access_token=discovery-secret-DO-NOT-LEAK";
+        const string registration = """{"clientId":"cached-client","clientSecret":"cached-registration-secret"}""";
+        var store = new RecordingTokenStore();
+        store.Seed($"mcp-token:{resource}", """{"accessToken":"old-token"}""");
+        store.Seed("mcp-client:https://auth.example.com", registration);
+        using var http = new HttpClient(new McpAuthRouteHandler());
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            resource,
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: true);
+
+        var result = await provider.ForceReauthorizeAsync();
+
+        Assert.False(result.Succeeded);
+        Assert.Contains("protected-resource metadata", result.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(secret, result.Error);
+        Assert.Null(await store.GetAsync($"mcp-token:{resource}"));
+        Assert.Equal(registration, await store.GetAsync("mcp-client:https://auth.example.com"));
+    }
+
+    [Fact]
+    public async Task ForceReauthorize_returns_sanitized_exchange_failure_after_clearing_token()
+    {
+        const string resource = "https://mcp.example.com/mcp";
+        const string secret = "exchange-secret-DO-NOT-LEAK";
+        const string registration = """{"clientId":"cached-client","clientSecret":"cached-registration-secret"}""";
+        var handler = new McpAuthRouteHandler();
+        ConfigureOAuthRoutes(
+            handler,
+            $$"""{"error":"invalid_grant","access_token":"{{secret}}"}""",
+            HttpStatusCode.BadRequest);
+        using var http = new HttpClient(handler);
+        var store = new RecordingTokenStore();
+        store.Seed($"mcp-token:{resource}", """{"accessToken":"old-token"}""");
+        store.Seed("mcp-client:https://auth.example.com", registration);
+        var browser = new ScriptedBrowser();
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            resource,
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: true,
+            openBrowser: browser.OpenAsync);
+
+        var result = await provider.ForceReauthorizeAsync();
+        await browser.CallbackCompleted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.False(result.Succeeded);
+        Assert.Contains("token exchange", result.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(secret, result.Error);
+        Assert.Null(await store.GetAsync($"mcp-token:{resource}"));
+        Assert.Equal(registration, await store.GetAsync("mcp-client:https://auth.example.com"));
+    }
+
+    [Fact]
+    public async Task ForceReauthorize_propagates_requested_cancellation_after_clearing_token()
+    {
+        const string resource = "https://mcp.example.com/mcp";
+        const string registration = """{"clientId":"cached-client","clientSecret":"cached-registration-secret"}""";
+        var handler = new McpAuthRouteHandler();
+        ConfigureOAuthRoutes(handler);
+        using var http = new HttpClient(handler);
+        var store = new RecordingTokenStore();
+        store.Seed($"mcp-token:{resource}", """{"accessToken":"old-token"}""");
+        store.Seed("mcp-client:https://auth.example.com", registration);
+        using var cts = new CancellationTokenSource();
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            resource,
+            new McpAuthConfig(McpAuthMode.OAuth),
+            interactive: true,
+            openBrowser: (_, _) =>
+            {
+                cts.Cancel();
+                return Task.CompletedTask;
+            });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => provider.ForceReauthorizeAsync(cts.Token));
+
+        Assert.Equal([$"mcp-token:{resource}"], store.DeletedKeys);
+        Assert.Null(await store.GetAsync($"mcp-token:{resource}"));
+        Assert.Equal(registration, await store.GetAsync("mcp-client:https://auth.example.com"));
+    }
+
+    [Fact]
+    public async Task ForceReauthorize_rejects_non_oauth_configuration_without_clearing_token()
+    {
+        const string resource = "https://mcp.example.com/mcp";
+        var store = new RecordingTokenStore();
+        store.Seed($"mcp-token:{resource}", """{"accessToken":"existing-token"}""");
+        using var http = new HttpClient(new McpAuthRouteHandler());
+        var provider = new McpOAuthProvider(
+            http,
+            store,
+            resource,
+            new McpAuthConfig(McpAuthMode.Bearer, BearerToken: "configured-token"),
+            interactive: true);
+
+        var result = await provider.ForceReauthorizeAsync();
+
+        Assert.False(result.Succeeded);
+        Assert.Contains("OAuth", result.Error, StringComparison.OrdinalIgnoreCase);
+        Assert.NotNull(await store.GetAsync($"mcp-token:{resource}"));
+        Assert.Empty(store.DeletedKeys);
+    }
+
+    [Fact]
+    public async Task DefaultReauthenticator_delegates_to_proactive_oauth_provider()
+    {
+        const string resource = "https://mcp.example.com/mcp";
+        var handler = new McpAuthRouteHandler();
+        ConfigureOAuthRoutes(handler);
+        using var http = new HttpClient(handler);
+        var store = new RecordingTokenStore();
+        store.Seed("mcp-client:https://auth.example.com", """{"clientId":"cached-client"}""");
+        var browser = new ScriptedBrowser();
+        var reauthenticator = new DefaultMcpOAuthReauthenticator(http, store, browser.OpenAsync);
+        var config = new McpHttpServerConfig(
+            new Uri(resource),
+            new Dictionary<string, string>(),
+            new McpAuthConfig(McpAuthMode.OAuth));
+
+        var result = await reauthenticator.ReauthenticateAsync(config);
+        await browser.CallbackCompleted.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(result.Succeeded);
+        Assert.NotNull(await store.GetAsync($"mcp-token:{resource}"));
+    }
+
+    private static void ConfigureOAuthRoutes(
+        McpAuthRouteHandler handler,
+        string tokenJson = """{"access_token":"fresh-token","expires_in":3600}""",
+        HttpStatusCode tokenStatus = HttpStatusCode.OK)
+    {
+        handler.Get(
+            "https://mcp.example.com/.well-known/oauth-protected-resource",
+            """{"resource":"https://mcp.example.com/mcp","authorization_servers":["https://auth.example.com"]}""");
+        handler.Get(
+            "https://auth.example.com/.well-known/oauth-authorization-server",
+            """{"issuer":"https://auth.example.com","authorization_endpoint":"https://auth.example.com/authorize","token_endpoint":"https://auth.example.com/token"}""");
+        handler.Post("https://auth.example.com/token", tokenJson, tokenStatus);
+    }
+
+    private sealed class ScriptedBrowser
+    {
+        private readonly TaskCompletionSource callbackCompleted =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public Task CallbackCompleted => this.callbackCompleted.Task;
+
+        public Task OpenAsync(Uri authorizeUri, CancellationToken cancellationToken)
+        {
+            var redirectUri = QueryParameter(authorizeUri, "redirect_uri");
+            var state = QueryParameter(authorizeUri, "state");
+            var callbackUri = new UriBuilder(redirectUri)
+            {
+                Query = $"code=fresh-code&state={Uri.EscapeDataString(state)}",
+            }.Uri;
+
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    using var client = new HttpClient();
+                    using var response = await client.GetAsync(callbackUri, cancellationToken).ConfigureAwait(false);
+                    response.EnsureSuccessStatusCode();
+                    this.callbackCompleted.TrySetResult();
+                }
+                catch (Exception ex)
+                {
+                    this.callbackCompleted.TrySetException(ex);
+                }
+            });
+
+            return Task.CompletedTask;
+        }
+
+        private static string QueryParameter(Uri uri, string name)
+        {
+            foreach (var part in uri.Query.TrimStart('?').Split('&', StringSplitOptions.RemoveEmptyEntries))
+            {
+                var separator = part.IndexOf('=');
+                var key = Uri.UnescapeDataString(separator < 0 ? part : part[..separator]);
+                if (string.Equals(key, name, StringComparison.Ordinal))
+                {
+                    return Uri.UnescapeDataString(part[(separator + 1)..]);
+                }
+            }
+
+            throw new InvalidOperationException($"Missing '{name}' authorization query parameter.");
+        }
+    }
+
+    private sealed class RecordingTokenStore : ITokenStore
+    {
+        private readonly Dictionary<string, string> values = new(StringComparer.Ordinal);
+
+        public List<string> DeletedKeys { get; } = [];
+
+        public void Seed(string key, string value) => this.values[key] = value;
+
+        public Task<string?> GetAsync(string key, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return Task.FromResult(this.values.GetValueOrDefault(key));
+        }
+
+        public Task SetAsync(string key, string value, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            this.values[key] = value;
+            return Task.CompletedTask;
+        }
+
+        public Task DeleteAsync(string key, CancellationToken cancellationToken = default)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            this.DeletedKeys.Add(key);
+            this.values.Remove(key);
+            return Task.CompletedTask;
+        }
     }
 }
 
@@ -444,6 +786,8 @@ internal sealed class McpAuthRouteHandler : HttpMessageHandler
 
     public List<string> SeenUrls { get; } = [];
 
+    public List<string> SeenFormBodies { get; } = [];
+
     public int PostCount { get; private set; }
 
     public void Get(string url, string json) => this.gets[url] = (HttpStatusCode.OK, json);
@@ -453,7 +797,7 @@ internal sealed class McpAuthRouteHandler : HttpMessageHandler
     /// <summary>Register a POST endpoint whose send faults with a transport error.</summary>
     public void PostFaults(string url) => this.postFaults.Add(url);
 
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+    protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
 
@@ -463,19 +807,25 @@ internal sealed class McpAuthRouteHandler : HttpMessageHandler
         if (request.Method == HttpMethod.Post)
         {
             this.PostCount++;
+            if (request.Content is not null)
+            {
+                this.SeenFormBodies.Add(
+                    await request.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false));
+            }
+
             if (this.postFaults.Contains(url))
             {
                 throw new HttpRequestException("connection refused to registration endpoint");
             }
 
-            return Task.FromResult(this.posts.TryGetValue(url, out var p)
+            return this.posts.TryGetValue(url, out var p)
                 ? Response(p.Status, p.Body)
-                : new HttpResponseMessage(HttpStatusCode.NotFound));
+                : new HttpResponseMessage(HttpStatusCode.NotFound);
         }
 
-        return Task.FromResult(this.gets.TryGetValue(url, out var g)
+        return this.gets.TryGetValue(url, out var g)
             ? Response(g.Status, g.Body)
-            : new HttpResponseMessage(HttpStatusCode.NotFound));
+            : new HttpResponseMessage(HttpStatusCode.NotFound);
     }
 
     private static HttpResponseMessage Response(HttpStatusCode status, string json) =>
