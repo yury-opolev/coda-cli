@@ -54,7 +54,30 @@ public sealed class TranscriptBlockFormatterTests
         // The sent time is attached to the block (HH:mm), drawn as a right annotation — never mixed into the
         // copyable text.
         Assert.Equal("09:05", line.RightText);
+        Assert.Equal(1, line.RightTextTrailingCells);
         Assert.DoesNotContain(":", line.Text);
+    }
+
+    [Theory]
+    [InlineData(5)]
+    [InlineData(6)]
+    [InlineData(8)]
+    [InlineData(12)]
+    public void User_timestamp_reserves_one_trailing_cell(int width)
+    {
+        var sentAt = new DateTimeOffset(2026, 7, 21, 9, 5, 0, TimeSpan.Zero);
+        var lines = TranscriptBlockFormatter.Format(
+            new UserTranscriptBlock(Guid.NewGuid(), "timestamped user message", sentAt),
+            width);
+
+        var first = lines[0];
+        if (first.RightText is { } timestamp)
+        {
+            Assert.Equal("09:05", timestamp);
+            Assert.Equal(1, first.RightTextTrailingCells);
+            Assert.True(
+                TerminalCellText.Width(first.Text) + 1 + TerminalCellText.Width(timestamp) + first.RightTextTrailingCells <= width);
+        }
     }
 
     [Fact]
@@ -69,8 +92,9 @@ public sealed class TranscriptBlockFormatterTests
 
         Assert.True(lines.Count >= 2, "the reserved time zone must force the first row to wrap earlier");
         Assert.Equal("09:05", lines[0].RightText);
-        // "09:05" is five cells plus a one-cell gap, so the first row keeps at most 14 cells of text.
-        Assert.True(TerminalCellText.Width(lines[0].Text) <= 14);
+        // "09:05" is five cells plus one cell on each side, so the first row keeps at most 13 cells of text.
+        Assert.True(TerminalCellText.Width(lines[0].Text) <= 13);
+        Assert.Equal(1, lines[0].RightTextTrailingCells);
         Assert.All(lines, line => Assert.True(line.FillWidth));
         Assert.Null(lines[1].RightText);
     }

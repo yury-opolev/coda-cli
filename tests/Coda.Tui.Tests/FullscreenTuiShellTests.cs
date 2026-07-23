@@ -967,7 +967,40 @@ public sealed class FullscreenTuiShellTests
         Assert.True(shell.Transcript.RightAnnotationDrawCount > 0, "user row must draw its send-time annotation");
         var userRow = shell.Transcript.CollectVisibleRows().First(row => row.BlockId == user.Id);
         Assert.Equal("08:24", userRow.RightText);
+        Assert.Equal(1, userRow.RightTextTrailingCells);
+        Assert.False(shell.Transcript.ScrollbarVisibleForTest);
+        Assert.Equal(shell.Transcript.Frame.Width - 2, shell.Transcript.LastRightAnnotationEndColumnForTest);
         Assert.DoesNotContain("08:24", userRow.Text);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Drawn_timestamp_leaves_a_blank_cell_before_the_scrollbar()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var user = new UserTranscriptBlock(
+            Guid.NewGuid(),
+            "latest timestamped prompt",
+            new DateTimeOffset(2026, 7, 21, 8, 24, 0, TimeSpan.Zero));
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = Lines(50).Add(user) },
+            CancellationToken.None);
+        app.LayoutAndDraw();
+
+        Assert.True(shell.Transcript.ScrollbarVisibleForTest);
+        var scrollbarColumn = shell.Transcript.Frame.Width - 1;
+        Assert.Equal(scrollbarColumn - 2, shell.Transcript.LastRightAnnotationEndColumnForTest);
 
         if (token is not null)
         {
@@ -994,6 +1027,7 @@ public sealed class FullscreenTuiShellTests
         // The block still paints (full-width fill) but omits the time when SentAt is null.
         Assert.True(shell.Transcript.UserRowFillCount > 0);
         Assert.Equal(0, shell.Transcript.RightAnnotationDrawCount);
+        Assert.Null(shell.Transcript.LastRightAnnotationEndColumnForTest);
         Assert.Null(shell.Transcript.CollectVisibleRows().First(row => row.BlockId == user.Id).RightText);
 
         if (token is not null)

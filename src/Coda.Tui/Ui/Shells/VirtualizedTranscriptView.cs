@@ -98,6 +98,8 @@ internal sealed class VirtualizedTranscriptView : View
 
     internal int ContentWidthForTest => this.ContentWidth;
 
+    internal int? LastRightAnnotationEndColumnForTest { get; private set; }
+
     internal int ContentRowsForTest => this.viewport.ContentRows;
 
     internal int ViewportHeightForTest => this.viewport.ViewportHeight;
@@ -301,6 +303,7 @@ internal sealed class VirtualizedTranscriptView : View
     /// <inheritdoc />
     protected override bool OnDrawingContent(DrawContext? context)
     {
+        this.LastRightAnnotationEndColumnForTest = null;
         this.SyncViewportMetrics();
         if (context is not null)
         {
@@ -331,8 +334,8 @@ internal sealed class VirtualizedTranscriptView : View
     /// role color; where the selection covers part (or all) of the row, the text is drawn in three cell-sliced
     /// segments — role-colored prefix, Warm Ember selection-highlighted middle, role-colored suffix — so the
     /// highlight is segmented exactly over the selected cells and survives redraw/scroll. Finally, a
-    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute at
-    /// the row's right edge; the row text was wrapped to reserve those cells, so it never overlaps.
+    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute
+    /// near the row's trailing edge; the row text was wrapped to reserve its cells, so it never overlaps.
     /// </summary>
     private void DrawRow(TranscriptRow row, int screenRow)
     {
@@ -397,13 +400,14 @@ internal sealed class VirtualizedTranscriptView : View
         if (row.RightText is { Length: > 0 } annotation && viewWidth > 0)
         {
             var annotationWidth = TerminalCellText.Width(annotation);
-            var column = viewWidth - annotationWidth;
-            if (column >= 0)
+            var column = viewWidth - row.RightTextTrailingCells - annotationWidth;
+            if (annotationWidth > 0 && column >= rowWidth)
             {
                 this.SetAttribute(this.AnnotationAttributeFor(row.Role));
                 this.Move(column, screenRow);
                 this.AddStr(annotation);
                 this.RightAnnotationDrawCount++;
+                this.LastRightAnnotationEndColumnForTest = column + annotationWidth - 1;
             }
         }
     }

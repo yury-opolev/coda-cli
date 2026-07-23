@@ -11,8 +11,11 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
     /// <summary>Whether the row paints its background across the full viewport width (user message blocks).</summary>
     public bool FillWidth { get; init; }
 
-    /// <summary>An optional right-aligned annotation (e.g. a sent-time HH:mm) drawn at the row's right edge.</summary>
+    /// <summary>An optional right-aligned annotation (e.g. a sent-time HH:mm) drawn near the row's trailing edge.</summary>
     public string? RightText { get; init; }
+
+    /// <summary>Cells intentionally left blank after <see cref="RightText"/>.</summary>
+    public int RightTextTrailingCells { get; init; }
 
     /// <summary>Whether this is the synthetic, inert blank row after a visible semantic block.</summary>
     public bool IsSeparator { get; init; }
@@ -266,6 +269,7 @@ internal sealed class TranscriptLayoutIndex
                 {
                     FillWidth = line.FillWidth,
                     RightText = line.RightText,
+                    RightTextTrailingCells = line.RightTextTrailingCells,
                 });
             }
 

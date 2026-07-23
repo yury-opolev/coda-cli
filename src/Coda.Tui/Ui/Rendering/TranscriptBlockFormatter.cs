@@ -48,11 +48,14 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     public bool FillWidth { get; init; }
 
     /// <summary>
-    /// An optional right-aligned annotation (e.g. a sent-time <c>HH:mm</c>) drawn at the row's right edge in
-    /// a dim attribute. It is never part of <see cref="Text"/>, so it does not wrap and is excluded from
-    /// selection/copy; the row's text is wrapped to reserve these cells so the two never overlap.
+    /// An optional right-aligned annotation (e.g. a sent-time <c>HH:mm</c>) drawn near the row's trailing edge
+    /// in a dim attribute. It is never part of <see cref="Text"/>, so it does not wrap and is excluded from
+    /// selection/copy; the row's text and trailing cells are reserved so the two never overlap.
     /// </summary>
     public string? RightText { get; init; }
+
+    /// <summary>Cells intentionally left blank after <see cref="RightText"/>.</summary>
+    public int RightTextTrailingCells { get; init; }
 
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
@@ -417,8 +420,8 @@ public static class TranscriptBlockFormatter
 
     /// <summary>
     /// Projects a user message onto full-width background-block rows. When the block carries a send time it is
-    /// formatted as a local <c>HH:mm</c> annotation pinned to the top-right of the first row; the first source
-    /// line is wrapped into a narrower zone so the reserved time cells can never overlap the message text. The
+    /// formatted as a local <c>HH:mm</c> annotation on the first row; the first source line is wrapped into a
+    /// narrower zone so the reserved time and trailing cells can never overlap the message text. The
     /// time is carried as <see cref="TranscriptRenderLine.RightText"/> (never mixed into the copyable text) and
     /// every row is marked <see cref="TranscriptRenderLine.FillWidth"/> so the whole block paints its distinct
     /// background across the visible width.
@@ -429,12 +432,18 @@ public static class TranscriptBlockFormatter
             ? sentAt.ToString("HH:mm", CultureInfo.InvariantCulture)
             : null;
 
-        // Reserve the time's cells (plus a one-cell gap) on the first row so the annotation and the text never
-        // collide. Only narrow the first row when the reservation still leaves a usable text zone.
+        const int TextToTimestampGap = 1;
+        const int TimestampTrailingGap = 1;
+
+        // Reserve the timestamp's cells, its separation from the text, and a trailing blank cell so the
+        // annotation stays clear of both the message and a possible scrollbar. Only narrow the first row when
+        // the reservation still leaves a usable text zone.
         var firstRowWidth = width;
         if (time is not null)
         {
-            var reserved = TerminalCellText.Width(time) + 1;
+            var reserved = TerminalCellText.Width(time)
+                + TextToTimestampGap
+                + TimestampTrailingGap;
             if (width - reserved >= 1)
             {
                 firstRowWidth = width - reserved;
@@ -459,6 +468,7 @@ public static class TranscriptBlockFormatter
                 {
                     FillWidth = true,
                     RightText = right,
+                    RightTextTrailingCells = right is null ? 0 : TimestampTrailingGap,
                 });
             }
         }
