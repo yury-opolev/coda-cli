@@ -122,6 +122,71 @@ public sealed class McpLifecycleTests
     }
 
     [Fact]
+    public async Task ConnectClientAsync_failure_redacts_bare_secret_assignments()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = "connection failed: token=bare-token-value secret:bare-secret-value password=\"bare password value\" api_key:bare-api-key-value apikey=bare-apikey-value",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Contains("connection failed", result.Error!);
+        Assert.DoesNotContain("bare-token-value", result.Error!);
+        Assert.DoesNotContain("bare-secret-value", result.Error!);
+        Assert.DoesNotContain("bare password value", result.Error!);
+        Assert.DoesNotContain("password value", result.Error!);
+        Assert.DoesNotContain("bare-api-key-value", result.Error!);
+        Assert.DoesNotContain("bare-apikey-value", result.Error!);
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_redacts_prefixed_secret_assignments()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = "connection failed: MCP_TOKEN=prefixed-mcp-token github_token:prefixed-github-token mySecret=prefixed-secret client_secret:prefixed-client-secret",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.DoesNotContain("prefixed-mcp-token", result.Error!);
+        Assert.DoesNotContain("prefixed-github-token", result.Error!);
+        Assert.DoesNotContain("prefixed-secret", result.Error!);
+        Assert.DoesNotContain("prefixed-client-secret", result.Error!);
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_sanitizes_controls_to_a_single_line_before_storing()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = "first line\r\n\u001b[31msecond\tline\u001b]0;spoofed title\u009C\u0001 to\rken=multiline-token-value\u202E",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Equal("first line second line to ken=***redacted***", result.Error);
+        Assert.DoesNotContain("multiline-token-value", result.Error!);
+        Assert.All(result.Error!, ch => Assert.False(char.IsControl(ch)));
+        Assert.DoesNotContain('\u202E', result.Error!);
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_preserves_non_secret_token_words()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad") { ThrowOnInit = "tokenization failed" };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Equal("tokenization failed", result.Error);
+    }
+
+    [Fact]
     public async Task DisconnectServerAsync_dispose_failure_removes_server_bumps_version_and_records_safe_error()
     {
         var manager = new McpClientManager();

@@ -1,5 +1,6 @@
 using Coda.Agent;
 using Coda.Common;
+using System.Text;
 using System.Text.RegularExpressions;
 
 namespace Coda.Mcp;
@@ -446,23 +447,105 @@ public sealed partial class McpClientManager : IAsyncDisposable
     }
 
     /// <summary>
-    /// Creates a bounded user-visible error using the shared secret redactor, then removes complete
-    /// URLs and common secret-bearing header/environment assignments that cannot safely be useful in
-    /// a runtime status line.
+    /// Creates a bounded, single-line user-visible error after redacting secrets and removing terminal
+    /// control sequences, controls, and bidirectional formatting characters.
     /// </summary>
     private string SanitizeRuntimeError(string error)
     {
-        var safe = SecretRedactor.Redact(error);
-        safe = SecretAssignmentPattern().Replace(safe, SecretRedactor.Placeholder);
+        var safe = TerminalEscapePattern().Replace(error, string.Empty);
+        safe = ObfuscatedSecretAssignmentPattern().Replace(safe, RedactObfuscatedSecretAssignment);
+        safe = SanitizeSingleLine(safe);
+        safe = SecretRedactor.Redact(safe);
+        safe = SecretAssignmentPattern().Replace(safe, $"$1$2{SecretRedactor.Placeholder}");
         safe = UrlPattern().Replace(safe, "[redacted URL]");
         return TelemetryText.Truncate(safe);
     }
 
+    private static string SanitizeSingleLine(string text)
+    {
+        var stripped = TerminalEscapePattern().Replace(text, string.Empty);
+        var builder = new StringBuilder(stripped.Length);
+        var pendingSpace = false;
+
+        foreach (var ch in stripped)
+        {
+            if (char.IsWhiteSpace(ch))
+            {
+                pendingSpace = builder.Length > 0;
+                continue;
+            }
+
+            if (char.IsControl(ch) || IsBidiFormattingControl(ch))
+            {
+                continue;
+            }
+
+            if (pendingSpace)
+            {
+                builder.Append(' ');
+                pendingSpace = false;
+            }
+
+            builder.Append(ch);
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool IsBidiFormattingControl(char ch) => ch is
+        '\u061C' or
+        '\u202A' or '\u202B' or '\u202C' or '\u202D' or '\u202E' or
+        '\u2066' or '\u2067' or '\u2068' or '\u2069' or
+        '\u200E' or '\u200F';
+
+    private static string RedactObfuscatedSecretAssignment(Match match) =>
+        IsSecretAssignmentKey(match.Groups[1].Value)
+            ? $"{match.Groups[1].Value}{match.Groups[2].Value}{SecretRedactor.Placeholder}"
+            : match.Value;
+
+    private static bool IsSecretAssignmentKey(string key)
+    {
+        var normalized = new StringBuilder(key.Length);
+        foreach (var ch in key)
+        {
+            if (!char.IsControl(ch) && !IsBidiFormattingControl(ch))
+            {
+                normalized.Append(ch);
+            }
+        }
+
+        var name = normalized.ToString();
+        return name.Equals("authorization", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("proxy-authorization", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("x-api-key", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("cookie", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("set-cookie", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("token", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("secret", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("password", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("api_key", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("api-key", StringComparison.OrdinalIgnoreCase) ||
+               name.Equals("apikey", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("token", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("secret", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("password", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("api_key", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("api-key", StringComparison.OrdinalIgnoreCase) ||
+               name.Contains("apikey", StringComparison.OrdinalIgnoreCase);
+    }
+
+    [GeneratedRegex(@"\x1B(?:[@-Z\\_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B\x9C]*(?:\x07|\x1B\\|\x9C))|\x9B[0-?]*[ -/]*[@-~]|\x9D[^\x07\x9C]*(?:\x07|\x9C)", RegexOptions.Compiled)]
+    private static partial Regex TerminalEscapePattern();
+
     [GeneratedRegex(@"(?ix)
-        \b(?:authorization|proxy-authorization|x-api-key|cookie|set-cookie|
-        [a-z_][a-z0-9_]*(?:token|secret|password|api[_-]?key)[a-z0-9_]*)
-        \s*(?:=|:)\s*(?:Bearer\s+)?[^\s;,]+")]
+        \b(authorization|proxy-authorization|x-api-key|cookie|set-cookie|
+        token|secret|password|api[_-]?key|apikey|
+        [a-z_][a-z0-9_-]*(?:token|secret|password|api[_-]?key)[a-z0-9_-]*)
+        (\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)")]
     private static partial Regex SecretAssignmentPattern();
+
+    [GeneratedRegex(@"\b([a-z_][a-z0-9_\-\x00-\x1F\x7F-\x9F\u061C\u200E\u200F\u202A-\u202E\u2066-\u2069]*)(\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)", RegexOptions.IgnoreCase)]
+    private static partial Regex ObfuscatedSecretAssignmentPattern();
 
     [GeneratedRegex(@"https?://\S+", RegexOptions.IgnoreCase)]
     private static partial Regex UrlPattern();
