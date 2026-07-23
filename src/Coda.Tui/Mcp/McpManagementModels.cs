@@ -122,7 +122,8 @@ internal sealed record McpServerDraft(
     McpAuthMode AuthMode,
     string? ClientId,
     ImmutableArray<string> Scopes,
-    McpSecretChange BearerToken);
+    McpSecretChange BearerToken,
+    McpConfigRevision? BaseRevision = null);
 
 internal sealed record McpConfigRevision(
     string UserSha256,

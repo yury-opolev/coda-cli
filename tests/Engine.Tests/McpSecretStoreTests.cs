@@ -74,6 +74,58 @@ public sealed class McpSecretStoreTests
     }
 
     [Fact]
+    public async Task StageAsync_compensates_a_write_that_succeeds_before_throwing()
+    {
+        var store = new FakeStore();
+        var canonicalKey = McpSecretStore.KeyFor("github", "env/TOKEN");
+        await store.SetAsync(canonicalKey, "old-value");
+        store.SetAfterWriteException = new InvalidOperationException("set failed after write");
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => McpSecretStore.StageAsync(store, "github", "env/TOKEN", "new-value"));
+
+        Assert.Equal("old-value", await store.GetAsync(canonicalKey));
+        Assert.DoesNotContain(
+            store.Keys,
+            key => key.StartsWith(canonicalKey + "/", StringComparison.Ordinal));
+        Assert.Contains(
+            store.DeletedKeys,
+            key => key.StartsWith(canonicalKey + "/", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task StageAsync_compensates_a_cancellation_after_write()
+    {
+        var store = new FakeStore
+        {
+            SetAfterWriteException = new OperationCanceledException(),
+        };
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => McpSecretStore.StageAsync(store, "github", "env/TOKEN", "new-value"));
+
+        Assert.Empty(store.Keys);
+        Assert.Single(store.DeletedKeys);
+    }
+
+    [Fact]
+    public async Task StageAsync_reports_safe_cleanup_incomplete_failure()
+    {
+        const string failureMarker = "never-show-stage-failure";
+        var store = new FakeStore
+        {
+            SetAfterWriteException = new InvalidOperationException(failureMarker),
+            DeleteException = new InvalidOperationException("delete failed"),
+        };
+
+        var exception = await Assert.ThrowsAnyAsync<Exception>(
+            () => McpSecretStore.StageAsync(store, "github", "env/TOKEN", "new-value"));
+
+        Assert.Contains("cleanup incomplete", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain(failureMarker, exception.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void References_returns_only_exact_managed_bindings_in_deterministic_order()
     {
         var stdio = new McpStdioServerConfig("npx", [], new Dictionary<string, string>
@@ -186,7 +238,11 @@ public sealed class McpSecretStoreTests
 
         public List<string> DeletedKeys { get; } = [];
 
+        public IReadOnlyCollection<string> Keys => this.map.Keys.ToArray();
+
         public Exception? SetException { get; init; }
+
+        public Exception? SetAfterWriteException { get; set; }
 
         public Exception? DeleteException { get; init; }
 
@@ -202,6 +258,12 @@ public sealed class McpSecretStoreTests
             }
 
             this.map[key] = value;
+            if (this.SetAfterWriteException is { } afterWriteException)
+            {
+                this.SetAfterWriteException = null;
+                throw afterWriteException;
+            }
+
             return Task.CompletedTask;
         }
 

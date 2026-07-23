@@ -279,7 +279,7 @@ public static class McpConfigWriter
         var obj = new JsonObject
         {
             ["type"] = "http",
-            ["url"] = config.Url.ToString(),
+            ["url"] = config.Url.OriginalString,
         };
 
         if (config.Headers.Count > 0)

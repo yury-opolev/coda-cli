@@ -150,6 +150,14 @@ internal sealed class TestTokenStore : ITokenStore
 
     public CancellationTokenSource? CancelAfterNextSet { get; set; }
 
+    public CancellationTokenSource? CancelAndThrowAfterNextSet { get; set; }
+
+    public Exception? WriteThenThrowException { get; set; }
+
+    public int? WriteThenThrowOnSetCall { get; set; }
+
+    public Exception? DeleteException { get; set; }
+
     public IReadOnlyCollection<string> Keys => this.values.Keys.ToArray();
 
     public bool ContainsKey(string key) => this.values.ContainsKey(key);
@@ -168,6 +176,23 @@ internal sealed class TestTokenStore : ITokenStore
         cancellationToken.ThrowIfCancellationRequested();
         this.SetCalls++;
         this.values[key] = value;
+        var cancelAndThrow = this.CancelAndThrowAfterNextSet;
+        this.CancelAndThrowAfterNextSet = null;
+        if (cancelAndThrow is not null)
+        {
+            cancelAndThrow.Cancel();
+            throw new OperationCanceledException(cancelAndThrow.Token);
+        }
+
+        if (this.WriteThenThrowException is { } writeThenThrow
+            && (this.WriteThenThrowOnSetCall is null
+                || this.WriteThenThrowOnSetCall == this.SetCalls))
+        {
+            this.WriteThenThrowException = null;
+            this.WriteThenThrowOnSetCall = null;
+            throw writeThenThrow;
+        }
+
         var cancellation = this.CancelAfterNextSet;
         this.CancelAfterNextSet = null;
         cancellation?.Cancel();
@@ -178,6 +203,11 @@ internal sealed class TestTokenStore : ITokenStore
     {
         cancellationToken.ThrowIfCancellationRequested();
         this.DeleteCalls++;
+        if (this.DeleteException is { } exception)
+        {
+            throw exception;
+        }
+
         this.values.Remove(key);
         return Task.CompletedTask;
     }

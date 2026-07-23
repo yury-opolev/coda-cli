@@ -9,6 +9,25 @@ public sealed record McpSecretBinding(string Field, string StoreKey);
 public sealed record McpStagedSecret(string Field, string StoreKey, string Reference);
 
 /// <summary>
+/// Indicates that a staged secret write failed and its compensation could not be confirmed.
+/// The original failures are retained for programmatic diagnostics without becoming part of
+/// exception rendering, which could otherwise expose a credential-store error value.
+/// </summary>
+internal sealed class McpSecretStagingCleanupException : Exception
+{
+    internal McpSecretStagingCleanupException(Exception stagingFailure, Exception cleanupFailure)
+        : base("MCP secret staging failed and cleanup incomplete.")
+    {
+        this.StagingFailure = stagingFailure;
+        this.CleanupFailure = cleanupFailure;
+    }
+
+    internal Exception StagingFailure { get; }
+
+    internal Exception CleanupFailure { get; }
+}
+
+/// <summary>
 /// Stores an MCP secret (encrypted) in the credential store and returns the
 /// <c>coda-secret:</c> reference to write into <c>.mcp.json</c> in its place. The key convention is
 /// <c>mcp:&lt;server&gt;/&lt;field&gt;</c> (distinct from the <c>llmauth:&lt;provider&gt;</c> namespace);
@@ -37,17 +56,51 @@ public static class McpSecretStore
 
     /// <summary>
     /// Encrypt a replacement value under a new versioned key without changing the current canonical
-    /// key. The returned reference is safe to place in a subsequently committed config edit.
+    /// key. The returned reference is safe to place in a subsequently committed config edit. The
+    /// optional callback registers the generated key before the write so a caller can compensate
+    /// a failed multi-secret operation even if the store writes and then throws.
     /// </summary>
+    public static Task<McpStagedSecret> StageAsync(
+        ITokenStore store,
+        string server,
+        string field,
+        string value,
+        CancellationToken ct = default) =>
+        StageAsync(store, server, field, value, ct, onStaging: null);
+
+    /// <inheritdoc cref="StageAsync(ITokenStore, string, string, string, CancellationToken)"/>
     public static async Task<McpStagedSecret> StageAsync(
-        ITokenStore store, string server, string field, string value, CancellationToken ct = default)
+        ITokenStore store,
+        string server,
+        string field,
+        string value,
+        CancellationToken ct,
+        Action<McpStagedSecret>? onStaging)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(value);
 
         var storeKey = $"{KeyFor(server, field)}/{Guid.NewGuid():N}";
-        await store.SetAsync(storeKey, value, ct).ConfigureAwait(false);
-        return new McpStagedSecret(field, storeKey, McpSecretResolver.SecretRefPrefix + storeKey);
+        var staged = new McpStagedSecret(field, storeKey, McpSecretResolver.SecretRefPrefix + storeKey);
+        onStaging?.Invoke(staged);
+        try
+        {
+            await store.SetAsync(storeKey, value, ct).ConfigureAwait(false);
+            return staged;
+        }
+        catch (Exception stagingFailure)
+        {
+            try
+            {
+                await store.DeleteAsync(storeKey, CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception cleanupFailure)
+            {
+                throw new McpSecretStagingCleanupException(stagingFailure, cleanupFailure);
+            }
+
+            throw;
+        }
     }
 
     /// <summary>

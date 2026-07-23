@@ -185,14 +185,21 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
     public Task<McpServerDraft?> CreateEditDraftAsync(McpServerKey key, CancellationToken ct)
     {
+        ct.ThrowIfCancellationRequested();
+        var beforeRead = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
         var entry = this.FindPhysicalEntry(key, ct);
         if (entry is null)
         {
             return Task.FromResult<McpServerDraft?>(null);
         }
 
-        ct.ThrowIfCancellationRequested();
-        return Task.FromResult<McpServerDraft?>(this.CreateDraft(entry));
+        var afterRead = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+        if (beforeRead != afterRead)
+        {
+            throw StaleEditDraft();
+        }
+
+        return Task.FromResult<McpServerDraft?>(this.CreateDraft(entry, afterRead));
     }
 
     public Task<McpEditPreview> PrepareAddAsync(McpServerDraft draft, CancellationToken ct) =>
@@ -283,11 +290,32 @@ internal sealed partial class McpManagementService : IMcpManagementService
         CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
+        ArgumentNullException.ThrowIfNull(draft);
+        var beforeRead = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+        if (draft.BaseRevision is { } baseRevision && baseRevision != beforeRead)
+        {
+            throw StaleEditDraft();
+        }
+
         var entries = this.LoadPhysicalEntriesForMutation(ct);
+        var revision = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+        if (beforeRead != revision
+            || (draft.BaseRevision is { } currentBaseRevision && currentBaseRevision != revision))
+        {
+            throw StaleEditDraft();
+        }
+
         var current = entries.FirstOrDefault(entry => entry.Key == original);
         if (current is null)
         {
             throw new McpException("The selected MCP server no longer exists in the selected scope.");
+        }
+
+        var baseline = this.CreateDraft(current, revision);
+        if (draft.BaseRevision is null && !IsSafeExternalEditBaseline(baseline, current.Config))
+        {
+            throw new McpException(
+                "An MCP edit draft without a base revision is not safe for this configuration. Reopen the edit and try again.");
         }
 
         var normalized = ValidateAndNormalizeDraft(draft, isAdd: false);
@@ -304,7 +332,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             throw new McpException("An MCP server with this name already exists in the selected scope.");
         }
 
-        var revision = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+        normalized = normalized with { BaseRevision = revision };
         return new McpEditPreview(
             Guid.NewGuid(),
             original,
@@ -325,6 +353,9 @@ internal sealed partial class McpManagementService : IMcpManagementService
             throw new McpException("The project MCP configuration scope is unavailable.");
         }
     }
+
+    private static McpException StaleEditDraft() =>
+        new("MCP configuration changed after this edit was opened. Review the current configuration and try again.");
 
     private static McpServerDraft ValidateAndNormalizeDraft(McpServerDraft draft, bool isAdd)
     {
@@ -532,9 +563,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             normalized.Add(named with { Change = change });
         }
 
-        return normalized
-            .OrderBy(named => named.Name, StringComparer.Ordinal)
-            .ToImmutableArray();
+        return normalized.ToImmutableArray();
     }
 
     private static McpSecretChange NormalizeSecretChange(
@@ -728,25 +757,52 @@ internal sealed partial class McpManagementService : IMcpManagementService
             }
 
             var entries = this.LoadPhysicalEntriesForMutation(ct);
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != preview.Revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP configuration changed after this edit was prepared. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
             var draft = ValidateAndNormalizeDraft(preview.Draft, isAdd);
             this.ValidateScopeAvailable(draft.Scope);
             var original = ValidateCommitEntries(entries, preview, draft, isAdd);
             ValidateBearerTokenAvailability(draft, original?.Config);
+            if (!isAdd && draft.BaseRevision != preview.Revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "This MCP edit preview is invalid or stale. Reopen the edit and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            var finalDraft = original is null
+                ? draft
+                : PreserveUnchangedNonSecretValues(
+                    draft,
+                    this.CreateDraft(original, currentRevision),
+                    original.Config);
             var renamed = original is not null
-                && !string.Equals(original.Key.Name, draft.Name, StringComparison.Ordinal);
+                && !string.Equals(original.Key.Name, finalDraft.Name, StringComparison.Ordinal);
             var config = await this.BuildFinalConfigAsync(
-                draft,
+                finalDraft,
                 original?.Config,
                 renamed,
                 stagedKeys,
                 ct).ConfigureAwait(false);
 
             ct.ThrowIfCancellationRequested();
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != preview.Revision)
+            {
+                return await this.CreateRejectedAfterStagedCleanupAsync(
+                    "MCP configuration changed while this edit was being saved. Review the current configuration and try again.",
+                    stagedKeys).ConfigureAwait(false);
+            }
+
             if (isAdd)
             {
                 this.configMutator.Upsert(
-                    draft.Scope,
-                    draft.Name,
+                    finalDraft.Scope,
+                    finalDraft.Name,
                     config,
                     disabled: false,
                     this.workingDirectory,
@@ -755,11 +811,11 @@ internal sealed partial class McpManagementService : IMcpManagementService
             else
             {
                 this.configMutator.ReplaceEntry(
-                    draft.Scope,
+                    finalDraft.Scope,
                     original!.Key.Name,
-                    draft.Name,
+                    finalDraft.Name,
                     config,
-                    disabled: !draft.Enabled,
+                    disabled: !finalDraft.Enabled,
                     this.workingDirectory,
                     this.userMcpDir);
             }
@@ -769,7 +825,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
             return new McpMutationResult(
                 McpMutationStatus.Succeeded,
-                new McpServerKey(draft.Scope, draft.Name),
+                new McpServerKey(finalDraft.Scope, finalDraft.Name),
                 cleanupWarning is null
                     ? "MCP server saved."
                     : $"MCP server saved. Warning: {cleanupWarning}",
@@ -779,7 +835,11 @@ internal sealed partial class McpManagementService : IMcpManagementService
         {
             if (!writeSucceeded)
             {
-                await this.DeleteStagedKeysBestEffortAsync(stagedKeys).ConfigureAwait(false);
+                if (await this.CleanupStagedKeysAsync(stagedKeys).ConfigureAwait(false))
+                {
+                    throw new OperationCanceledException("MCP operation was cancelled; cleanup incomplete.", ct);
+                }
+
                 throw;
             }
 
@@ -791,9 +851,9 @@ internal sealed partial class McpManagementService : IMcpManagementService
         {
             if (!writeSucceeded)
             {
-                await this.DeleteStagedKeysBestEffortAsync(stagedKeys).ConfigureAwait(false);
-                return await this.CreateRejectedResultAsync(
-                    "MCP server could not be saved. Review the configuration and try again.")
+                return await this.CreateRejectedAfterStagedCleanupAsync(
+                    "MCP server could not be saved. Review the configuration and try again.",
+                    stagedKeys)
                     .ConfigureAwait(false);
             }
 
@@ -925,17 +985,37 @@ internal sealed partial class McpManagementService : IMcpManagementService
     {
         var originalValues = original ?? new Dictionary<string, string>(StringComparer.Ordinal);
         var draftByName = drafts.ToDictionary(draft => draft.Name, StringComparer.Ordinal);
-        var names = new SortedSet<string>(originalValues.Keys, StringComparer.Ordinal);
-        names.UnionWith(draftByName.Keys);
         var result = new Dictionary<string, string>(StringComparer.Ordinal);
 
-        foreach (var name in names)
+        foreach (var draft in drafts)
         {
+            var name = draft.Name;
             var hasOriginal = originalValues.TryGetValue(name, out var originalValue);
-            draftByName.TryGetValue(name, out var draft);
             var value = await this.ResolveNamedSecretValueAsync(
                 draft,
                 hasOriginal,
+                originalValue,
+                $"{fieldPrefix}/{name}",
+                finalServerName,
+                renamed,
+                stagedKeys,
+                ct).ConfigureAwait(false);
+            if (value is not null)
+            {
+                result.Add(name, value);
+            }
+        }
+
+        foreach (var (name, originalValue) in originalValues)
+        {
+            if (draftByName.ContainsKey(name))
+            {
+                continue;
+            }
+
+            var value = await this.ResolveNamedSecretValueAsync(
+                null,
+                hasOriginal: true,
                 originalValue,
                 $"{fieldPrefix}/{name}",
                 finalServerName,
@@ -1066,8 +1146,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 finalServerName,
                 field,
                 secret,
-                ct).ConfigureAwait(false);
-            stagedKeys.Add(staged.StoreKey);
+                ct,
+                staged => stagedKeys.Add(staged.StoreKey)).ConfigureAwait(false);
             return staged.Reference;
         }
         finally
@@ -1091,8 +1171,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 finalServerName,
                 field,
                 value,
-                ct).ConfigureAwait(false);
-            stagedKeys.Add(staged.StoreKey);
+                ct,
+                staged => stagedKeys.Add(staged.StoreKey)).ConfigureAwait(false);
             return staged.Reference;
         }
         finally
@@ -1136,19 +1216,39 @@ internal sealed partial class McpManagementService : IMcpManagementService
         }
     }
 
-    private async Task DeleteStagedKeysBestEffortAsync(IEnumerable<string> stagedKeys)
+    private async Task<McpMutationResult> CreateRejectedAfterStagedCleanupAsync(
+        string message,
+        IEnumerable<string> stagedKeys)
     {
-        try
+        if (await this.CleanupStagedKeysAsync(stagedKeys).ConfigureAwait(false))
         {
-            await McpSecretStore.DeleteKeysAsync(
-                this.credentials,
-                stagedKeys,
-                CancellationToken.None).ConfigureAwait(false);
+            message += " Cleanup incomplete; newly staged MCP credentials may remain.";
         }
-        catch (Exception)
+
+        return await this.CreateRejectedResultAsync(message).ConfigureAwait(false);
+    }
+
+    private async Task<bool> CleanupStagedKeysAsync(IEnumerable<string> stagedKeys)
+    {
+        var incomplete = false;
+        foreach (var key in stagedKeys
+            .Where(static key => !string.IsNullOrWhiteSpace(key))
+            .Distinct(StringComparer.Ordinal))
         {
-            // A failed staged-key cleanup must not hide the original mutation failure.
+            try
+            {
+                await McpSecretStore.DeleteKeysAsync(
+                    this.credentials,
+                    [key],
+                    CancellationToken.None).ConfigureAwait(false);
+            }
+            catch (Exception)
+            {
+                incomplete = true;
+            }
         }
+
+        return incomplete;
     }
 
     private async Task<McpMutationResult> CreateRejectedResultAsync(string message)
@@ -1504,7 +1604,9 @@ internal sealed partial class McpManagementService : IMcpManagementService
         };
     }
 
-    private McpServerDraft CreateDraft(McpPhysicalServerEntry entry)
+    private McpServerDraft CreateDraft(
+        McpPhysicalServerEntry entry,
+        McpConfigRevision? baseRevision = null)
     {
         return entry.Config switch
         {
@@ -1521,7 +1623,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 McpAuthMode.None,
                 null,
                 ImmutableArray<string>.Empty,
-                UnchangedBearerToken()),
+                UnchangedBearerToken(),
+                baseRevision),
             McpHttpServerConfig http => new McpServerDraft(
                 entry.Key.Name,
                 entry.Key.Scope,
@@ -1535,7 +1638,62 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 http.Auth.Mode,
                 SanitizeOptionalVisibleText(http.Auth.ClientId),
                 (http.Auth.Scopes ?? []).Select(SanitizeVisibleText).ToImmutableArray(),
-                UnchangedBearerToken()),
+                UnchangedBearerToken(),
+                baseRevision),
+            _ => throw new McpException("MCP configuration has an unsupported transport."),
+        };
+    }
+
+    private static bool IsSafeExternalEditBaseline(
+        McpServerDraft baseline,
+        McpServerConfig config)
+    {
+        return config switch
+        {
+            McpStdioServerConfig stdio =>
+                string.Equals(stdio.Command, baseline.Command, StringComparison.Ordinal)
+                && stdio.Args.SequenceEqual(baseline.Args, StringComparer.Ordinal),
+            McpHttpServerConfig http =>
+                string.Equals(http.Url.OriginalString, baseline.Url, StringComparison.Ordinal)
+                && string.Equals(http.Auth.ClientId, baseline.ClientId, StringComparison.Ordinal)
+                && (http.Auth.Scopes ?? []).SequenceEqual(baseline.Scopes, StringComparer.Ordinal),
+            _ => false,
+        };
+    }
+
+    private static McpServerDraft PreserveUnchangedNonSecretValues(
+        McpServerDraft draft,
+        McpServerDraft baseline,
+        McpServerConfig original)
+    {
+        if (draft.Transport != baseline.Transport)
+        {
+            return draft;
+        }
+
+        return original switch
+        {
+            McpStdioServerConfig stdio => draft with
+            {
+                Command = string.Equals(draft.Command, baseline.Command, StringComparison.Ordinal)
+                    ? stdio.Command
+                    : draft.Command,
+                Args = draft.Args.SequenceEqual(baseline.Args, StringComparer.Ordinal)
+                    ? stdio.Args.ToImmutableArray()
+                    : draft.Args,
+            },
+            McpHttpServerConfig http => draft with
+            {
+                Url = string.Equals(draft.Url, baseline.Url, StringComparison.Ordinal)
+                    ? http.Url.OriginalString
+                    : draft.Url,
+                ClientId = string.Equals(draft.ClientId, baseline.ClientId, StringComparison.Ordinal)
+                    ? http.Auth.ClientId
+                    : draft.ClientId,
+                Scopes = draft.Scopes.SequenceEqual(baseline.Scopes, StringComparer.Ordinal)
+                    ? (http.Auth.Scopes ?? []).ToImmutableArray()
+                    : draft.Scopes,
+            },
             _ => throw new McpException("MCP configuration has an unsupported transport."),
         };
     }
