@@ -22,6 +22,9 @@ public sealed record ToolContext(string WorkingDirectory)
     /// <summary>The live agent sink (so tools like <c>task</c> can stream subagent output).</summary>
     public IAgentSink? Sink { get; init; }
 
+    /// <summary>Correlation context for the current root turn's tool activity.</summary>
+    public ToolActivityContext? ToolActivity { get; init; }
+
     /// <summary>Host that runs nested subagents (provided when the <c>task</c> tool is available).</summary>
     public ISubagentHost? Subagents { get; init; }
 
