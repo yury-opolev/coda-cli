@@ -52,7 +52,15 @@ public sealed class TaskTool : ITool
         var parentSink = context.Sink ?? NullAgentSink.Instance;
 
         var report = await context.Tasks
-            .RunSubagentForegroundAsync(context.Subagents, subagentType, prompt, description, parentSink, context.CurrentTaskId, cancellationToken)
+            .RunSubagentForegroundAsync(
+                context.Subagents,
+                subagentType,
+                prompt,
+                description,
+                parentSink,
+                context.CurrentTaskId,
+                parentActivity: context.ToolActivity,
+                cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 
         return new ToolResult(report);
@@ -65,7 +73,14 @@ public sealed class TaskTool : ITool
         public void OnAssistantText(string delta) { }
         public void OnAssistantTextComplete() { }
         public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) { }
+        public void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) { }
+        public void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) { }
+        public void OnToolProgress(string toolName, long elapsedMs) { }
+        public void OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs) { }
         public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) { }
+        public void OnToolActivityCompleted(ToolActivitySummary summary) { }
         public void OnError(string message) { }
     }
 }
