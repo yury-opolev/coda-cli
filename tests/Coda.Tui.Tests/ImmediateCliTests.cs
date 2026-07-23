@@ -55,11 +55,11 @@ public sealed class ImmediateCliTests
     {
         var (_, output) = Run("--help");
 
-        Assert.Contains("coda --system-prompt <text>", output, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("coda --system-prompt-file <path>", output, StringComparison.OrdinalIgnoreCase);
-        Assert.Contains("coda serve --system-prompt <text>", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains($"{Branding.CliName} --system-prompt <text>", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains($"{Branding.CliName} --system-prompt-file <path>", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains($"{Branding.CliName} serve --system-prompt <text>", output, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("exact root system prompt", output, StringComparison.OrdinalIgnoreCase);
-        Assert.DoesNotContain("coda run --system-prompt", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain($"{Branding.CliName} run --system-prompt", output, StringComparison.OrdinalIgnoreCase);
     }
 
     [Fact]

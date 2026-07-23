@@ -94,9 +94,10 @@ context reporting; role prompts for subagents remain isolated. Session forks pre
 interactive, headless, and slash-command flows. Export/import carries it in the optional
 `systemPromptOverride` field without changing the `coda.session/1` schema.
 
-Serve applies resumed metadata before it initializes the session. A client normally sends
-`initialize` first, but the first `session/prompt` can initialize a session when that request is
-omitted.
+Serve applies resumed metadata before it initializes the session. On unauthenticated local stdio,
+the first `session/prompt` can initialize a session when `initialize` is omitted. Authenticated
+local-socket transport requires `initialize` with `apiKey` first; prompt-first returns `-32001`
+and starts no agent work.
 
 **Coda → Orchestrator (notifications, streamed during a turn):**
 `event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson}` · `event/toolResult {toolName, content, isError}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` · `event/turnComplete {stopReason?, interrupted}`.
