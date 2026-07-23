@@ -1,6 +1,8 @@
 using Coda.Sdk;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.State;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -146,6 +148,12 @@ public sealed class ResumeCommand : ISlashCommand
         SessionCli.ApplyResumeTarget(
             context.Session,
             new SessionCli.ResumeTarget(sessionId, stored.Messages, stored.Metadata));
+
+        var auditTurns = await new SessionAuditStore(context.Session.WorkingDirectory)
+            .LoadAsync(sessionId, cancellationToken)
+            .ConfigureAwait(false);
+        context.Events.Publish(new TranscriptSeededEvent(
+            SessionHistoryProjector.Project(context.Session.History, auditTurns)));
 
         var escapedId = Markup.Escape(sessionId);
         context.Console.MarkupLine($"[grey50]Resumed session {escapedId} ({stored.Messages.Count} messages).[/]");

@@ -676,7 +676,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 "session", $"Resumed session {target.Id} ({target.Messages.Count} messages).", UiNotificationLevel.Information));
         }
 
-        Publish(mailbox, new TranscriptSeededEvent(SessionHistoryProjector.Project(context.Session.History)));
+        var auditSessionId = context.Session.SessionId ?? target.Id;
+        var auditTurns = await new Coda.Sdk.SessionAuditStore(context.Session.WorkingDirectory)
+            .LoadAsync(auditSessionId, ct)
+            .ConfigureAwait(false);
+        Publish(mailbox, new TranscriptSeededEvent(SessionHistoryProjector.Project(context.Session.History, auditTurns)));
     }
 
     /// <summary>Connect configured MCP servers, routing status through MCP diagnostics.</summary>
