@@ -637,6 +637,54 @@ public sealed class McpManagementEditTests
     }
 
     [Fact]
+    public async Task Prepare_add_retries_a_changed_read_and_warns_about_the_new_cross_scope_override()
+    {
+        var changed = false;
+        McpManagementTestHarness? harness = null;
+        harness = await McpManagementTestHarness.CreateAsync(
+            afterPreparationEntriesRead: () =>
+            {
+                if (!changed)
+                {
+                    changed = true;
+                    harness!.WriteUser("""{"mcpServers":{"server":{"command":"node"}}}""");
+                }
+            });
+        await using (harness)
+        {
+            var preview = await harness.Service.PrepareAddAsync(StdioDraft(), CancellationToken.None);
+
+            Assert.True(changed);
+            Assert.Equal(
+                McpManagementService.CaptureRevision(harness.Project, harness.User),
+                preview.Revision);
+            Assert.Contains(preview.Warnings, warning => warning.Contains("override", StringComparison.OrdinalIgnoreCase));
+        }
+    }
+
+    [Fact]
+    public async Task Prepare_rejects_when_configuration_changes_during_every_read_attempt_without_staging_or_writing()
+    {
+        var mutator = new CountingConfigMutator();
+        var writes = 0;
+        McpManagementTestHarness? harness = null;
+        harness = await McpManagementTestHarness.CreateAsync(
+            mutator,
+            () => harness!.WriteUser(
+                "{\"mcpServers\":{\"other" + ++writes + "\":{\"command\":\"node\"}}}"));
+        await using (harness)
+        {
+            var exception = await Assert.ThrowsAsync<McpException>(
+                () => harness.Service.PrepareAddAsync(StdioDraft(), CancellationToken.None));
+
+            Assert.Contains("configuration changed while preparing", exception.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Equal(0, harness.Store.SetCalls);
+            Assert.Equal(0, mutator.UpsertCalls);
+            Assert.Equal(3, writes);
+        }
+    }
+
+    [Fact]
     public async Task Commit_rename_restages_unchanged_managed_secret_and_deletes_unreferenced_old_key()
     {
         const string oldKey = "mcp:server/env/TOKEN";

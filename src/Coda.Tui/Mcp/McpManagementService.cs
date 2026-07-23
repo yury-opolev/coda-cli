@@ -107,6 +107,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
     private readonly IMcpOAuthReauthenticator oauth;
     private readonly IUiEventPublisher events;
     private readonly IMcpConfigMutator configMutator;
+    private readonly Action? afterPreparationEntriesRead;
     private readonly SemaphoreSlim mutationGate = new(1, 1);
     private readonly HashSet<Guid> completedOperations = [];
 
@@ -117,7 +118,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
         ITokenStore credentials,
         IMcpOAuthReauthenticator oauth,
         IUiEventPublisher events,
-        IMcpConfigMutator? configMutator = null)
+        IMcpConfigMutator? configMutator = null,
+        Action? afterPreparationEntriesRead = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
         this.workingDirectory = workingDirectory;
@@ -127,6 +129,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         this.oauth = oauth ?? throw new ArgumentNullException(nameof(oauth));
         this.events = events ?? throw new ArgumentNullException(nameof(events));
         this.configMutator = configMutator ?? McpConfigWriterMutator.Instance;
+        this.afterPreparationEntriesRead = afterPreparationEntriesRead;
     }
 
     public event Action? Changed;
@@ -269,19 +272,19 @@ internal sealed partial class McpManagementService : IMcpManagementService
         ct.ThrowIfCancellationRequested();
         var normalized = ValidateAndNormalizeDraft(draft, isAdd: true);
         this.ValidateScopeAvailable(normalized.Scope);
-        var entries = this.LoadPhysicalEntriesForMutation(ct);
+        var prepared = this.LoadStablePreparationEntries(ct);
+        var entries = prepared.Entries;
         var target = new McpServerKey(normalized.Scope, normalized.Name);
         if (entries.Any(entry => entry.Key == target))
         {
             throw new McpException("An MCP server with this name already exists in the selected scope.");
         }
 
-        var revision = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
         return new McpEditPreview(
             Guid.NewGuid(),
             null,
             normalized,
-            revision,
+            prepared.Revision,
             CreateScopeWarnings(entries, null, normalized));
     }
 
@@ -292,27 +295,20 @@ internal sealed partial class McpManagementService : IMcpManagementService
     {
         ct.ThrowIfCancellationRequested();
         ArgumentNullException.ThrowIfNull(draft);
-        var beforeRead = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
-        if (draft.BaseRevision is { } baseRevision && baseRevision != beforeRead)
+        var prepared = this.LoadStablePreparationEntries(ct);
+        if (draft.BaseRevision is { } baseRevision && baseRevision != prepared.Revision)
         {
             throw StaleEditDraft();
         }
 
-        var entries = this.LoadPhysicalEntriesForMutation(ct);
-        var revision = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
-        if (beforeRead != revision
-            || (draft.BaseRevision is { } currentBaseRevision && currentBaseRevision != revision))
-        {
-            throw StaleEditDraft();
-        }
-
+        var entries = prepared.Entries;
         var current = entries.FirstOrDefault(entry => entry.Key == original);
         if (current is null)
         {
             throw new McpException("The selected MCP server no longer exists in the selected scope.");
         }
 
-        var baseline = this.CreateDraft(current, revision);
+        var baseline = this.CreateDraft(current, prepared.Revision);
         if (draft.BaseRevision is null && !IsSafeExternalEditBaseline(baseline, current.Config))
         {
             throw new McpException(
@@ -333,12 +329,12 @@ internal sealed partial class McpManagementService : IMcpManagementService
             throw new McpException("An MCP server with this name already exists in the selected scope.");
         }
 
-        normalized = normalized with { BaseRevision = revision };
+        normalized = normalized with { BaseRevision = prepared.Revision };
         return new McpEditPreview(
             Guid.NewGuid(),
             original,
             normalized,
-            revision,
+            prepared.Revision,
             CreateScopeWarnings(entries, original, normalized));
     }
 
@@ -1321,6 +1317,30 @@ internal sealed partial class McpManagementService : IMcpManagementService
             throw new McpException("MCP configuration could not be read safely. Fix the configuration before editing.");
         }
     }
+
+    private StablePreparationRead LoadStablePreparationEntries(CancellationToken ct)
+    {
+        const int maximumAttempts = 3;
+        for (var attempt = 0; attempt < maximumAttempts; attempt++)
+        {
+            ct.ThrowIfCancellationRequested();
+            var beforeRead = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+            var entries = this.LoadPhysicalEntriesForMutation(ct);
+            this.afterPreparationEntriesRead?.Invoke();
+            ct.ThrowIfCancellationRequested();
+            var afterRead = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+            if (beforeRead == afterRead)
+            {
+                return new StablePreparationRead(entries, afterRead);
+            }
+        }
+
+        throw new McpException("MCP configuration changed while preparing; retry.");
+    }
+
+    private sealed record StablePreparationRead(
+        IReadOnlyList<McpPhysicalServerEntry> Entries,
+        McpConfigRevision Revision);
 
     private void ValidatePhysicalConfiguration(CancellationToken ct)
     {

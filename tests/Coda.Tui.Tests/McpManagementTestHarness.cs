@@ -46,7 +46,9 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
 
     public IMcpManagementService Service { get; }
 
-    public static Task<McpManagementTestHarness> CreateAsync(IMcpConfigMutator? mutator = null)
+    public static Task<McpManagementTestHarness> CreateAsync(
+        IMcpConfigMutator? mutator = null,
+        Action? afterPreparationEntriesRead = null)
     {
         var root = Path.Combine(
             Directory.GetCurrentDirectory(),
@@ -71,7 +73,8 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
                 store,
                 oauth,
                 new RecordingUiEvents(),
-                mutator);
+                mutator,
+                afterPreparationEntriesRead);
 
             return Task.FromResult(new McpManagementTestHarness(
                 root,
