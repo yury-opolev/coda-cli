@@ -368,7 +368,12 @@ public sealed class ServeHostTests : IDisposable
         Assert.True(pr!.Ok);
         Assert.False(pr.Interrupted);
 
-        await turnCompleteTcs.Task.WaitAsync(WaitTimeout);
+        var turnComplete = await turnCompleteTcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(turnComplete);
+        Assert.Equal(pr.StopReason, turnComplete!["stopReason"]!.GetValue<string>());
+        Assert.Equal(pr.Interrupted, turnComplete["interrupted"]!.GetValue<bool>());
+        Assert.False(string.IsNullOrWhiteSpace(turnComplete["rootTurnId"]?.GetValue<string>()));
+        Assert.Null(turnComplete["activityId"]);
         Assert.Equal("hi there", string.Join("", deltas));
 
         cts.Cancel();
@@ -651,9 +656,15 @@ public sealed class ServeHostTests : IDisposable
         orchestrator.OnRequest(ServeMethods.RequestPermission, _ =>
             ServeJson.ToNode(new PermissionResponse(true)));
 
+        var toolCallTcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var toolResultTcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var turnCompleteTcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        orchestrator.OnNotification(ServeMethods.EventToolCall, node =>
+            toolCallTcs.TrySetResult(node));
         orchestrator.OnNotification(ServeMethods.EventToolResult, node =>
             toolResultTcs.TrySetResult(node));
+        orchestrator.OnNotification(ServeMethods.EventTurnComplete, node =>
+            turnCompleteTcs.TrySetResult(node));
 
         // Send prompt and wait.
         var promptResult = await orchestrator
@@ -668,10 +679,29 @@ public sealed class ServeHostTests : IDisposable
         Assert.NotNull(pr);
         Assert.True(pr!.Ok);
 
-        // Tool result must have been observed.
+        // The complete tool loop must preserve a single correlation through turn completion.
+        var toolCallNode = await toolCallTcs.Task.WaitAsync(WaitTimeout);
         var toolResultNode = await toolResultTcs.Task.WaitAsync(WaitTimeout);
+        var turnCompleteNode = await turnCompleteTcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(toolCallNode);
         Assert.NotNull(toolResultNode);
+        Assert.NotNull(turnCompleteNode);
+        Assert.Equal("run_command", toolCallNode!["toolName"]!.GetValue<string>());
         Assert.Equal("run_command", toolResultNode!["toolName"]!.GetValue<string>());
+
+        var rootTurnId = toolCallNode["rootTurnId"]!.GetValue<string>();
+        var activityId = toolCallNode["activityId"]!.GetValue<string>();
+        Assert.False(string.IsNullOrWhiteSpace(rootTurnId));
+        Assert.False(string.IsNullOrWhiteSpace(activityId));
+        Assert.Equal(rootTurnId, toolResultNode["rootTurnId"]!.GetValue<string>());
+        Assert.Equal(rootTurnId, turnCompleteNode!["rootTurnId"]!.GetValue<string>());
+        Assert.Equal(activityId, toolResultNode["activityId"]!.GetValue<string>());
+        Assert.Equal(activityId, turnCompleteNode["activityId"]!.GetValue<string>());
+        foreach (var toolEvent in new[] { toolCallNode, toolResultNode })
+        {
+            Assert.False(string.IsNullOrWhiteSpace(toolEvent!["callId"]?.GetValue<string>()));
+            Assert.False(string.IsNullOrWhiteSpace(toolEvent["sourceId"]?.GetValue<string>()));
+        }
 
         cts.Cancel();
         try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
