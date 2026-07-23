@@ -79,11 +79,6 @@ internal sealed class TranscriptViewportState
             return;
         }
 
-        if (nextTopRow == this.TopRow && deltaRows < 0 && this.AutoFollow)
-        {
-            return;
-        }
-
         this.TopRow = nextTopRow;
         this.Mode = TranscriptFollowMode.Detached;
         this.DetachedAnchor = anchor;
