@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Coda.Agent;
 using LlmClient;
 
 namespace Coda.Sdk;
@@ -17,13 +18,39 @@ internal static class AuditJson
         var array = new JsonArray();
         foreach (var call in toolCalls)
         {
-            array.Add(new JsonObject
+            var obj = new JsonObject
             {
                 ["name"] = call.Name,
                 ["input"] = call.Input,
                 ["result"] = call.Result,
                 ["isError"] = call.IsError,
-            });
+            };
+            if (call.RootTurnId is not null)
+            {
+                obj["rootTurnId"] = call.RootTurnId;
+            }
+
+            if (call.ActivityId is not null)
+            {
+                obj["activityId"] = call.ActivityId;
+            }
+
+            if (call.CallId is not null)
+            {
+                obj["callId"] = call.CallId;
+            }
+
+            if (call.SourceId is not null)
+            {
+                obj["sourceId"] = call.SourceId;
+            }
+
+            if (call.Status is { } status)
+            {
+                obj["status"] = status.ToString();
+            }
+
+            array.Add(obj);
         }
 
         return array;
@@ -43,10 +70,39 @@ internal static class AuditJson
                 obj["name"]?.GetValue<string>() ?? string.Empty,
                 obj["input"]?.GetValue<string>() ?? string.Empty,
                 obj["result"]?.GetValue<string>(),
-                obj["isError"]?.GetValue<bool>() ?? false));
+                obj["isError"]?.GetValue<bool>() ?? false)
+            {
+                RootTurnId = OptionalString(obj["rootTurnId"]),
+                ActivityId = OptionalString(obj["activityId"]),
+                CallId = OptionalString(obj["callId"]),
+                SourceId = OptionalString(obj["sourceId"]),
+                Status = OptionalStatus(obj["status"]),
+            });
         }
 
         return list;
+    }
+
+    private static string? OptionalString(JsonNode? node) =>
+        node is JsonValue value && value.TryGetValue<string>(out var text) ? text : null;
+
+    private static ToolCallStatus? OptionalStatus(JsonNode? node)
+    {
+        var text = OptionalString(node);
+        if (text is null)
+        {
+            return null;
+        }
+
+        foreach (var name in Enum.GetNames<ToolCallStatus>())
+        {
+            if (string.Equals(name, text, StringComparison.OrdinalIgnoreCase))
+            {
+                return Enum.Parse<ToolCallStatus>(name);
+            }
+        }
+
+        return null;
     }
 
     public static JsonArray SerializeToolDefs(IReadOnlyList<ToolDefinition> toolDefs)

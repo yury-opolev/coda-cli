@@ -1,4 +1,5 @@
 using System.Text.Json.Nodes;
+using Coda.Agent;
 using Coda.Sdk;
 using LlmClient;
 
@@ -361,5 +362,67 @@ public sealed class SessionBundleServiceTests : IDisposable
         var loaded = await new SessionTranscriptStore(this.tempDir).LoadAsync(importedId);
         Assert.NotNull(loaded);
         Assert.Single(loaded);
+    }
+
+    [Fact]
+    public async Task Export_import_round_trips_correlated_tool_calls_without_changing_schema()
+    {
+        var transcript = new SessionTranscriptStore(this.tempDir);
+        await transcript.SaveAsync("correlated",
+        [
+            new(ChatRole.User, [new TextBlock("go")]),
+            new(ChatRole.Assistant, [new TextBlock("done")]),
+        ]);
+        var audit = new SessionAuditStore(this.tempDir);
+        await audit.AppendTurnAsync("correlated", new SessionAuditTurn
+        {
+            TurnIndex = 0,
+            TsUtc = new DateTime(2026, 7, 13, 9, 0, 0, DateTimeKind.Utc),
+            Provider = "github-copilot",
+            Model = "claude-opus-4.8",
+            InputTokens = 200,
+            OutputTokens = 20,
+            StopReason = "end_turn",
+            ToolCalls =
+            [
+                new ToolCallRecord("grep", """{"pattern":"a"}""", "ok", false)
+                {
+                    RootTurnId = "root",
+                    ActivityId = "activity",
+                    CallId = "call-1",
+                    SourceId = "subagent:research",
+                    Status = ToolCallStatus.Succeeded,
+                },
+            ],
+            SystemPrompt = "SYSTEM-PROMPT-TEXT",
+            ToolDefs = [new ToolDefinition("grep", "searches", "{}")],
+        });
+        var service = new SessionBundleService(this.tempDir, "0.1.63");
+        var bundle = await service.ExportAsync("correlated", FixedExport);
+        var path = Path.Combine(this.tempDir, "correlated.coda-session.json");
+
+        Assert.NotNull(bundle);
+        Assert.Equal("coda.session/1", bundle.Schema);
+        var exported = Assert.Single(bundle.AuditTurns).ToolCalls.Single();
+        Assert.Equal("call-1", exported.CallId);
+        Assert.Equal("subagent:research", exported.SourceId);
+
+        await service.WriteAsync(bundle, path, pretty: false);
+        var destination = Directory.CreateTempSubdirectory("coda_bundle_dst_").FullName;
+        try
+        {
+            var importedId = await new SessionBundleService(destination, "0.1.63").ImportAsync(path);
+            var imported = Assert.Single((await new SessionAuditStore(destination).LoadAsync(importedId)).Single().ToolCalls);
+
+            Assert.Equal("root", imported.RootTurnId);
+            Assert.Equal("activity", imported.ActivityId);
+            Assert.Equal("call-1", imported.CallId);
+            Assert.Equal("subagent:research", imported.SourceId);
+            Assert.Equal(ToolCallStatus.Succeeded, imported.Status);
+        }
+        finally
+        {
+            try { Directory.Delete(destination, recursive: true); } catch { /* ignore */ }
+        }
     }
 }
