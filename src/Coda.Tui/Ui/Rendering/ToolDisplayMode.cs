@@ -6,6 +6,7 @@ public enum ToolDisplayMode
     Verbose,
     Compact,
     Tiny,
+    Summary,
 }
 
 /// <summary>The resolved display mode plus the raw setting information needed for diagnostics.</summary>
@@ -46,6 +47,7 @@ public static class ToolDisplayModeResolver
             "verbose" => ToolDisplayMode.Verbose,
             "compact" => ToolDisplayMode.Compact,
             "tiny" => ToolDisplayMode.Tiny,
+            "summary" => ToolDisplayMode.Summary,
             _ => (ToolDisplayMode?)null,
         };
 

@@ -33,6 +33,35 @@ public sealed class FullscreenTuiShellTests
             .Select(text => new TranscriptRenderLine(text, TranscriptRole.Code))
             .ToArray();
 
+    private static ToolActivityTranscriptBlock Activity(
+        ToolActivityCompletionState completionState,
+        params ToolCallStatus[] statuses) =>
+        new(
+            Guid.NewGuid(),
+            "root",
+            "activity",
+            statuses
+                .Select((status, index) => new ToolActivityCall(
+                    $"call-{index}",
+                    "root",
+                    "read_file",
+                    $$"""{"path":"file-{{index}}"}""",
+                    "unsafe",
+                    status,
+                    null,
+                    status == ToolCallStatus.Succeeded ? "done" : null,
+                    status == ToolCallStatus.Failed ? "failed" : null))
+                .ToImmutableArray(),
+            completionState);
+
+    private static bool HasInterruptibleWork(FullscreenTuiShell shell)
+    {
+        var method = typeof(TerminalGuiShellBase).GetMethod(
+            "HasInterruptibleWork",
+            System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic);
+        return Assert.IsType<bool>(method!.Invoke(shell, null));
+    }
+
     [Fact]
     public void Virtualized_view_formats_only_visible_rows()
     {
@@ -421,6 +450,91 @@ public sealed class FullscreenTuiShellTests
         if (token is not null)
         {
             app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Summary_activity_insertion_is_unseen_once_and_completion_shrinks_without_losing_anchor()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.FullScreen;
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        using var shell = ShellTestFactory.CreateFullscreen(
+            app,
+            transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(
+                block,
+                width,
+                ToolDisplayMode.Summary));
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var seed = Lines(50);
+        var active = Activity(
+            ToolActivityCompletionState.Active,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-10);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(shell.Transcript.TopAnchorForTest);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = seed.Add(active) },
+            CancellationToken.None);
+        var activeRows = shell.Transcript.ContentRowsForTest;
+        Assert.Equal(1, shell.Transcript.UnseenBlocks);
+
+        var completed = active with
+        {
+            Calls = active.Calls.Select(call => call with { Status = ToolCallStatus.Succeeded }).ToImmutableArray(),
+            CompletionState = ToolActivityCompletionState.Completed,
+        };
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = seed.Add(completed) },
+            CancellationToken.None);
+
+        Assert.Equal(activeRows - 5, shell.Transcript.ContentRowsForTest);
+        Assert.Equal(1, shell.Transcript.UnseenBlocks);
+        Assert.Equal(anchor, shell.Transcript.TopAnchorForTest);
+        Assert.Equal(1, shell.Transcript.ReplaceLastCount);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Pending_approval_and_running_activity_calls_are_recognized_as_interruptible_until_finalized()
+    {
+        foreach (var status in new[]
+        {
+            ToolCallStatus.Pending,
+            ToolCallStatus.AwaitingApproval,
+            ToolCallStatus.Running,
+        })
+        {
+            using var fixture = RetainedShellFixture.Create(activeWork: false);
+            var active = Activity(ToolActivityCompletionState.Active, status);
+            await fixture.Shell.ApplyAsync(
+                UiSessionSnapshot.Empty with { Transcript = [active] },
+                CancellationToken.None);
+
+            Assert.True(HasInterruptibleWork(fixture.Shell));
+
+            var finalized = active with
+            {
+                Calls = active.Calls.Select(call => call with { Status = ToolCallStatus.Cancelled }).ToImmutableArray(),
+                CompletionState = ToolActivityCompletionState.Cancelled,
+            };
+            await fixture.Shell.ApplyAsync(
+                UiSessionSnapshot.Empty with { Transcript = [finalized] },
+                CancellationToken.None);
+            Assert.False(HasInterruptibleWork(fixture.Shell));
         }
     }
 

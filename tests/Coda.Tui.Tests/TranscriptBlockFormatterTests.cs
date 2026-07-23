@@ -1,6 +1,9 @@
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 
+using System.Collections.Immutable;
+using Coda.Agent;
+
 namespace Coda.Tui.Tests;
 
 /// <summary>
@@ -389,6 +392,209 @@ public sealed class TranscriptBlockFormatterTests
         Assert.DoesNotContain(lines, line => line.Text.Contains("\u001b[", StringComparison.Ordinal));
     }
 
+    [Theory]
+    [InlineData(1)]
+    [InlineData(2)]
+    [InlineData(3)]
+    [InlineData(4)]
+    [InlineData(5)]
+    public void Summary_renders_every_running_child_through_five(int count)
+    {
+        var lines = TranscriptBlockFormatter.Format(
+            ActivityWithRunningCalls(count, "read_file"),
+            width: 120,
+            ToolDisplayMode.Summary);
+
+        Assert.Equal(count + 1, lines.Count);
+        Assert.Equal($"Running {count} tool{(count == 1 ? "" : "s")}...", lines[0].Text);
+        Assert.Equal(count == 1 ? "`- Reading file-0" : "|- Reading file-0", lines[1].Text);
+        Assert.Equal($"`- Reading file-{count - 1}", lines[^1].Text);
+    }
+
+    [Fact]
+    public void Six_running_calls_reserve_the_fifth_child_row_for_overflow()
+    {
+        var lines = TranscriptBlockFormatter.Format(
+            ActivityWithRunningCalls(6, "read_file"),
+            width: 120,
+            ToolDisplayMode.Summary);
+
+        Assert.Equal(6, lines.Count);
+        Assert.Equal("Running 6 tools...", lines[0].Text);
+        Assert.Equal("|- Reading file-0", lines[1].Text);
+        Assert.Equal("|- Reading file-3", lines[4].Text);
+        Assert.Equal("`- ...and 2 more", lines[^1].Text);
+    }
+
+    [Fact]
+    public void Summary_counts_every_call_but_renders_only_running_children()
+    {
+        var activity = Activity(
+            ToolActivityCompletionState.Active,
+            Call("read_file", """{"path":"done"}""", ToolCallStatus.Succeeded),
+            Call("read_file", """{"path":"queued"}""", ToolCallStatus.Pending),
+            Call("read_file", """{"path":"first"}""", ToolCallStatus.Running),
+            Call("grep", """{"pattern":"second"}""", ToolCallStatus.Running));
+
+        var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
+
+        Assert.Equal(
+            ["Running 4 tools...", "|- Reading first", "`- Searching for second"],
+            lines.Select(line => line.Text));
+    }
+
+    [Fact]
+    public void Summary_uses_shell_command_wording_only_for_homogeneous_run_commands()
+    {
+        var oneRunning = TranscriptBlockFormatter.Format(
+            ActivityWithRunningCalls(1, "run_command"),
+            width: 120,
+            ToolDisplayMode.Summary);
+        var manyRunning = TranscriptBlockFormatter.Format(
+            ActivityWithRunningCalls(2, "run_command"),
+            width: 120,
+            ToolDisplayMode.Summary);
+
+        Assert.Equal("Running 1 shell command...", oneRunning[0].Text);
+        Assert.Equal("Running 2 shell commands...", manyRunning[0].Text);
+
+        var oneCompleted = Activity(
+            ToolActivityCompletionState.Completed,
+            Call("run_command", """{"command":"echo one"}""", ToolCallStatus.Succeeded));
+        var manyCompleted = Activity(
+            ToolActivityCompletionState.Completed,
+            Call("run_command", """{"command":"echo one"}""", ToolCallStatus.Succeeded),
+            Call("run_command", """{"command":"echo two"}""", ToolCallStatus.Succeeded));
+        var homogeneousOther = Activity(
+            ToolActivityCompletionState.Completed,
+            Call("read_file", """{"path":"one"}""", ToolCallStatus.Succeeded));
+        var mixed = Activity(
+            ToolActivityCompletionState.Completed,
+            Call("read_file", """{"path":"one"}""", ToolCallStatus.Succeeded),
+            Call("grep", """{"pattern":"two"}""", ToolCallStatus.Succeeded));
+
+        Assert.Equal("Ran 1 shell command", Assert.Single(TranscriptBlockFormatter.Format(oneCompleted, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal("Ran 2 shell commands", Assert.Single(TranscriptBlockFormatter.Format(manyCompleted, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal("Ran 1 tool", Assert.Single(TranscriptBlockFormatter.Format(homogeneousOther, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal("Ran 2 tools", Assert.Single(TranscriptBlockFormatter.Format(mixed, 120, ToolDisplayMode.Summary)).Text);
+    }
+
+    [Fact]
+    public void Summary_completed_and_cancelled_activity_uses_one_shared_suffix_line()
+    {
+        var activity = Activity(
+            ToolActivityCompletionState.Cancelled,
+            Call("read_file", """{"path":"failed"}""", ToolCallStatus.Failed, error: "denied"),
+            Call("grep", """{"pattern":"cancelled"}""", ToolCallStatus.Cancelled),
+            Call("grep", """{"pattern":"skipped"}""", ToolCallStatus.Skipped));
+
+        var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
+
+        Assert.Equal("Ran 3 tools - 1 failed, cancelled", Assert.Single(lines).Text);
+        Assert.Equal(
+            "Ran 1 tool",
+            Assert.Single(TranscriptBlockFormatter.Format(
+                Activity(
+                    ToolActivityCompletionState.Completed,
+                    Call("grep", """{"pattern":"skipped"}""", ToolCallStatus.Skipped)),
+                120,
+                ToolDisplayMode.Summary)).Text);
+        Assert.Equal(
+            "Ran 1 tool - cancelled",
+            Assert.Single(TranscriptBlockFormatter.Format(
+                Activity(
+                    ToolActivityCompletionState.Cancelled,
+                    Call("grep", """{"pattern":"skipped"}""", ToolCallStatus.Skipped)),
+                120,
+                ToolDisplayMode.Summary)).Text);
+    }
+
+    [Theory]
+    [InlineData("run_command", """{"command":"echo hello"}""", "$ echo hello")]
+    [InlineData("read_file", """{"path":"src/file.cs"}""", "Reading src/file.cs")]
+    [InlineData("write_file", """{"path":"src/file.cs"}""", "Writing src/file.cs")]
+    [InlineData("edit_file", """{"path":"src/file.cs"}""", "Editing src/file.cs")]
+    [InlineData("notebook_edit", """{"notebook_path":"work.ipynb"}""", "Editing work.ipynb")]
+    [InlineData("grep", """{"pattern":"needle"}""", "Searching for needle")]
+    [InlineData("glob", """{"pattern":"**/*.cs"}""", "Searching for **/*.cs")]
+    [InlineData("web_search", """{"query":"coda"}""", "Searching for coda")]
+    [InlineData("tool_search", """{"query":"files"}""", "Searching for files")]
+    public void Activity_preview_maps_known_tools(string toolName, string inputJson, string expected)
+    {
+        Assert.Equal(expected, ToolActivityPreview.Create(toolName, inputJson));
+    }
+
+    [Fact]
+    public void Activity_preview_redacts_before_extracting_sanitizes_and_bounds()
+    {
+        var preview = ToolActivityPreview.Create(
+            "run_command",
+            """{"command":"echo \u001b[31mhello\nworld","password":"not-visible"}""");
+        var fallback = ToolActivityPreview.Create(
+            "custom\u001b[2J",
+            """{"password":"not-visible","value":"ok"}""");
+        var headerFallback = ToolActivityPreview.Create(
+            "custom",
+            """{"x-api-key":"not-visible","set-cookie":"not-visible","proxy-authorization":"not-visible"}""");
+        var malformed = ToolActivityPreview.Create("read_file", "{not valid");
+        var missing = ToolActivityPreview.Create("read_file", "{}");
+        var bounded = ToolActivityPreview.Create(
+            "custom",
+            "{\"value\":\"" + new string('界', 200) + "\"}");
+
+        Assert.Equal("$ echo hello world", preview);
+        Assert.DoesNotContain("not-visible", preview, StringComparison.Ordinal);
+        Assert.DoesNotContain("not-visible", fallback, StringComparison.Ordinal);
+        Assert.DoesNotContain("not-visible", headerFallback, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u001b', fallback);
+        Assert.DoesNotContain('\n', fallback);
+        Assert.DoesNotContain('\r', fallback);
+        Assert.NotEmpty(malformed);
+        Assert.Equal("Reading read_file", missing);
+        Assert.True(TerminalCellText.Width(bounded) <= ToolDisplayModeResolver.CompactInputPreviewMax);
+    }
+
+    [Fact]
+    public void Activity_modes_project_verbose_compact_and_tiny_without_changing_legacy_tool_modes()
+    {
+        var activity = Activity(
+            ToolActivityCompletionState.Active,
+            Call("run_command", """{"command":"echo \u001b[31mhello"}""", ToolCallStatus.Running, result: "line one\nline two"),
+            Call("write_file", """{"path":"x"}""", ToolCallStatus.Failed, error: "\u001b[2Jdenied"));
+
+        var verbose = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Verbose);
+        var compact = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Compact);
+        var tiny = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Tiny);
+        var legacy = new ToolTranscriptBlock(
+            Guid.NewGuid(), "grep", "{}", 1, "legacy result", IsError: false, Complete: true);
+
+        Assert.Contains(verbose, line => line.Text.Contains("line one", StringComparison.Ordinal));
+        Assert.Contains(verbose, line => line.Text.Contains("denied", StringComparison.Ordinal));
+        Assert.DoesNotContain(verbose, line => line.Text.Contains('\u001b'));
+        Assert.Equal(2, compact.Count);
+        Assert.All(compact, line => Assert.DoesNotContain('\u001b', line.Text));
+        Assert.DoesNotContain(compact, line => line.Text.Contains("line one", StringComparison.Ordinal));
+        Assert.Empty(tiny);
+        Assert.Contains(
+            TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Verbose),
+            line => line.Text == "legacy result");
+        Assert.Equal(
+            "grep {} [success]",
+            Assert.Single(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Compact)).Text);
+        Assert.Empty(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Tiny));
+    }
+
+    [Fact]
+    public void Summary_mode_is_resolved_without_changing_tiny_fallback()
+    {
+        var summary = ToolDisplayModeResolver.Resolve("summary");
+        var fallback = ToolDisplayModeResolver.Resolve(null);
+
+        Assert.Equal(ToolDisplayMode.Summary, summary.Mode);
+        Assert.True(summary.IsValid);
+        Assert.Equal(ToolDisplayMode.Tiny, fallback.Mode);
+    }
+
     private static void AssertContentInOrder(
         IReadOnlyList<TranscriptRenderLine> lines, IReadOnlyList<string> needles)
     {
@@ -410,4 +616,38 @@ public sealed class TranscriptBlockFormatterTests
             lastIndex = index;
         }
     }
+
+    private static ToolActivityTranscriptBlock Activity(
+        ToolActivityCompletionState completionState,
+        params ToolActivityCall[] calls) =>
+        new(Guid.NewGuid(), "root", "activity", calls.ToImmutableArray(), completionState);
+
+    private static ToolActivityTranscriptBlock ActivityWithRunningCalls(int count, string toolName) =>
+        Activity(
+            ToolActivityCompletionState.Active,
+            Enumerable.Range(0, count)
+                .Select(index => Call(
+                    toolName,
+                    toolName == "run_command"
+                        ? $$"""{"command":"echo {{index}}"}"""
+                        : $$"""{"path":"file-{{index}}"}""",
+                    ToolCallStatus.Running))
+                .ToArray());
+
+    private static ToolActivityCall Call(
+        string toolName,
+        string inputJson,
+        ToolCallStatus status,
+        string? result = null,
+        string? error = null) =>
+        new(
+            Guid.NewGuid().ToString("N"),
+            "root:root",
+            toolName,
+            inputJson,
+            "unsafe preview",
+            status,
+            ElapsedMs: 10,
+            Result: result,
+            Error: error);
 }

@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Coda.Agent;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
@@ -174,4 +175,104 @@ public sealed class OperationalStatusProjectorTests
             new OperationalStatus("Ready", OperationalTone.Ready, Animated: false),
             OperationalStatusProjector.Project(UiSessionSnapshot.Empty));
     }
+
+    [Fact]
+    public void Active_activity_projects_mode_specific_status_without_specializing_summary_noun()
+    {
+        var snapshot = UiSessionSnapshot.Empty with
+        {
+            ActiveOperation = new ActiveOperation("turn", "answer", null),
+            Transcript =
+            [
+                Activity(
+                    ("read_file", ToolCallStatus.Pending),
+                    ("run_command", ToolCallStatus.Running),
+                    ("grep", ToolCallStatus.Succeeded)),
+            ],
+        };
+
+        Assert.Equal(
+            new OperationalStatus("Working · 3 tools", OperationalTone.Working, Animated: true),
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Summary));
+        Assert.Equal(
+            new OperationalStatus("Working", OperationalTone.Working, Animated: true),
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Tiny));
+        Assert.Equal(
+            new OperationalStatus("Working · run_command", OperationalTone.Working, Animated: true),
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Verbose));
+        Assert.Equal(
+            new OperationalStatus("Working · run_command", OperationalTone.Working, Animated: true),
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Compact));
+    }
+
+    [Fact]
+    public void Approval_and_input_remain_higher_priority_than_an_active_activity()
+    {
+        var activity = Activity(("grep", ToolCallStatus.AwaitingApproval));
+
+        Assert.Equal(
+            new OperationalStatus("Waiting for approval", OperationalTone.Approval, Animated: false),
+            OperationalStatusProjector.Project(
+                UiSessionSnapshot.Empty with
+                {
+                    Permission = new PermissionStatus(PermissionMode.Default, 1),
+                    Transcript = [activity],
+                },
+                ToolDisplayMode.Summary));
+        Assert.Equal(
+            new OperationalStatus("Waiting for input", OperationalTone.Waiting, Animated: false),
+            OperationalStatusProjector.Project(
+                UiSessionSnapshot.Empty with
+                {
+                    PendingPrompt = UiPromptRequest.Text("Name?"),
+                    Transcript = [activity],
+                },
+                ToolDisplayMode.Summary));
+    }
+
+    [Fact]
+    public void Finalized_activity_no_longer_projects_active_tool_work()
+    {
+        var activity = new ToolActivityTranscriptBlock(
+            Guid.NewGuid(),
+            "root",
+            "activity",
+            [new ToolActivityCall(
+                "call",
+                "root",
+                "grep",
+                """{"pattern":"x"}""",
+                "grep x",
+                ToolCallStatus.Succeeded,
+                null,
+                "result",
+                null)],
+            ToolActivityCompletionState.Completed);
+
+        Assert.Equal(
+            new OperationalStatus("Ready", OperationalTone.Ready, Animated: false),
+            OperationalStatusProjector.Project(
+                UiSessionSnapshot.Empty with { Transcript = [activity] },
+                ToolDisplayMode.Summary));
+    }
+
+    private static ToolActivityTranscriptBlock Activity(
+        params (string ToolName, ToolCallStatus Status)[] calls) =>
+        new(
+            Guid.NewGuid(),
+            "root",
+            "activity",
+            calls
+                .Select((call, index) => new ToolActivityCall(
+                    $"call-{index}",
+                    "root",
+                    call.ToolName,
+                    "{}",
+                    call.ToolName,
+                    call.Status,
+                    null,
+                    null,
+                    null))
+                .ToImmutableArray(),
+            ToolActivityCompletionState.Active);
 }

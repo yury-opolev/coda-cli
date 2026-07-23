@@ -2,6 +2,7 @@ using System.Text;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
+using Coda.Agent;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -798,7 +799,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>
     /// Whether there is anything an interrupt chord should be allowed to interrupt: the injected active-work
-    /// delegate is true, an operation is active, background tasks are running, or an incomplete tool exists.
+    /// delegate is true, an operation is active, background tasks are running, an incomplete legacy tool
+    /// exists, or an activity call is pending approval or running.
     /// </summary>
     private bool HasInterruptibleWork()
     {
@@ -809,8 +811,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return true;
         }
 
-        return this.Snapshot.Transcript.Any(
-            block => block is ToolTranscriptBlock { Complete: false });
+        return this.Snapshot.Transcript.Any(block =>
+            block is ToolTranscriptBlock { Complete: false } ||
+            block is ToolActivityTranscriptBlock
+            {
+                CompletionState: ToolActivityCompletionState.Active,
+            } activity &&
+            activity.Calls.Any(call => call.Status is
+                ToolCallStatus.Pending or ToolCallStatus.AwaitingApproval or ToolCallStatus.Running));
     }
 
     /// <summary>

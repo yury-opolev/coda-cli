@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Coda.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
@@ -38,12 +39,16 @@ internal static class ShellTestFactory
             publisher ?? new RecordingUiEvents(),
             UiSessionSnapshot.Empty);
 
-    public static FullscreenTuiShell CreateFullscreen(IApplication app, IUiEventPublisher? publisher = null) =>
+    public static FullscreenTuiShell CreateFullscreen(
+        IApplication app,
+        IUiEventPublisher? publisher = null,
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null) =>
         new(
             app,
             new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
             publisher ?? new RecordingUiEvents(),
-            UiSessionSnapshot.Empty);
+            UiSessionSnapshot.Empty,
+            transcriptFormatter: transcriptFormatter);
 
     public static FullscreenTuiShell CreateFullscreen(
         IApplication app, IEnumerable<ISlashCommand> commands, IUiEventPublisher? publisher = null) =>
@@ -66,6 +71,27 @@ public sealed class InlineTuiShellTests
             .Split('|')
             .Select(text => new TranscriptRenderLine(text, TranscriptRole.Code))
             .ToArray();
+
+    private static ToolActivityTranscriptBlock Activity(
+        ToolActivityCompletionState completionState,
+        params ToolCallStatus[] statuses) =>
+        new(
+            Guid.NewGuid(),
+            "root",
+            "activity",
+            statuses
+                .Select((status, index) => new ToolActivityCall(
+                    $"call-{index}",
+                    "root",
+                    "read_file",
+                    $$"""{"path":"file-{{index}}"}""",
+                    "unsafe",
+                    status,
+                    null,
+                    status == ToolCallStatus.Succeeded ? "done" : null,
+                    status == ToolCallStatus.Failed ? "failed" : null))
+                .ToImmutableArray(),
+            completionState);
 
     /// <summary>
     /// The inline shell reuses the retained-transcript shell layout, so it must expose the same header
@@ -292,6 +318,63 @@ public sealed class InlineTuiShellTests
         Assert.Equal(1, shell.Transcript.AppendCount);
 
         await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [a, bDone] }, CancellationToken.None);
+        Assert.Equal(1, shell.Transcript.ReplaceLastCount);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Inline_summary_activity_matches_fullscreen_insertion_and_completion_behavior()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(
+            app,
+            transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(
+                block,
+                width,
+                ToolDisplayMode.Summary));
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var seed = Lines(50);
+        var active = Activity(
+            ToolActivityCompletionState.Active,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-10);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(shell.Transcript.TopAnchorForTest);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = seed.Add(active) },
+            CancellationToken.None);
+        var activeRows = shell.Transcript.ContentRowsForTest;
+        Assert.Equal(1, shell.Transcript.UnseenBlocks);
+
+        var completed = active with
+        {
+            Calls = active.Calls.Select(call => call with { Status = ToolCallStatus.Succeeded }).ToImmutableArray(),
+            CompletionState = ToolActivityCompletionState.Completed,
+        };
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = seed.Add(completed) },
+            CancellationToken.None);
+
+        Assert.Equal(activeRows - 5, shell.Transcript.ContentRowsForTest);
+        Assert.Equal(1, shell.Transcript.UnseenBlocks);
+        Assert.Equal(anchor, shell.Transcript.TopAnchorForTest);
         Assert.Equal(1, shell.Transcript.ReplaceLastCount);
 
         if (token is not null)
