@@ -169,11 +169,33 @@ any turn runs; the session remains idle and accepts the next prompt normally.
 
 ## Coda → Orchestrator (notifications — streamed during a turn)
 `event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName,
-inputJson}` · `event/toolResult {toolName, content, isError}` · `event/error {message}` ·
+inputJson, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolProgress {toolName,
+elapsedMs, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolResult {toolName, content,
+isError, rootTurnId?, activityId?, callId?, sourceId?, status?}` · `event/error {message}` ·
 `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` ·
-`event/turnComplete {stopReason?, interrupted}`.
+`event/turnComplete {stopReason?, interrupted, rootTurnId?, activityId?}`.
 
 Assistant-text deltas arrive in order.
+
+### Tool correlation
+
+The optional identity fields on `event/toolCall`, `event/toolProgress`, and `event/toolResult`
+correlate all notifications for one invocation:
+
+- `rootTurnId` identifies the root turn. `event/turnComplete` carries it even when that turn made
+  no tool calls.
+- `activityId` identifies the tool-activity batch. It is omitted from `event/turnComplete` when
+  the root turn made no tool calls.
+- `callId` identifies an individual tool invocation, so same-name calls remain distinct.
+- `sourceId` identifies the originating agent: `root:<rootTurnId>` for root work, or
+  `subagent:<taskId>` for forwarded subagent work.
+- `status` is present on correlated `event/toolResult` and is the stable `ToolCallStatus` enum
+  name: `Pending`, `AwaitingApproval`, `Running`, `Succeeded`, `Failed`, `Cancelled`, or
+  `Skipped`.
+
+These fields are additive. Clients that do not need correlation may ignore them; absent fields mean
+the event came from a legacy caller or does not have that identity. The protocol version remains
+`"1"` and all JSON-RPC method names are unchanged.
 
 ## Coda → Orchestrator (schedule lifecycle — out of band)
 

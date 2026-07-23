@@ -100,7 +100,15 @@ local-socket transport requires `initialize` with `apiKey` first; prompt-first r
 and starts no agent work.
 
 **Coda → Orchestrator (notifications, streamed during a turn):**
-`event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson}` · `event/toolResult {toolName, content, isError}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` · `event/turnComplete {stopReason?, interrupted}`.
+`event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolProgress {toolName, elapsedMs, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolResult {toolName, content, isError, rootTurnId?, activityId?, callId?, sourceId?, status?}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` · `event/turnComplete {stopReason?, interrupted, rootTurnId?, activityId?}`.
+
+Tool identity fields are optional and additive: `rootTurnId` identifies the root turn,
+`activityId` its tool batch, `callId` a single invocation, and `sourceId` the origin
+(`root:<rootTurnId>` or `subagent:<taskId>`). `event/turnComplete` carries `rootTurnId`; its
+`activityId` is omitted when no tools ran. A correlated `event/toolResult` includes `status` as
+the stable `ToolCallStatus` enum name (`Pending`, `AwaitingApproval`, `Running`, `Succeeded`,
+`Failed`, `Cancelled`, or `Skipped`). Clients can ignore absent or unknown optional fields.
+This does not change protocol version `"1"` or any JSON-RPC method name.
 
 **Coda → Orchestrator (server-initiated requests — the agent blocks until you answer):**
 

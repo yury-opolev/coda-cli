@@ -37,15 +37,52 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventToolCall, node);
     }
 
+    void IAgentSink.OnToolCall(ToolCallIdentity identity, string toolName, string inputJson)
+    {
+        var node = ServeJson.ToNode(new ToolCallEvent(toolName, inputJson)
+        {
+            RootTurnId = identity.RootTurnId,
+            ActivityId = identity.ActivityId,
+            CallId = identity.CallId,
+            SourceId = identity.SourceId,
+        });
+        _ = this.SendAsync(ServeMethods.EventToolCall, node);
+    }
+
     public void OnToolResult(string toolName, ToolResult result)
     {
         var node = ServeJson.ToNode(new ToolResultEvent(toolName, result.Content, result.IsError));
         _ = this.SendAsync(ServeMethods.EventToolResult, node);
     }
 
+    void IAgentSink.OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status)
+    {
+        var node = ServeJson.ToNode(new ToolResultEvent(toolName, result.Content, result.IsError)
+        {
+            RootTurnId = identity.RootTurnId,
+            ActivityId = identity.ActivityId,
+            CallId = identity.CallId,
+            SourceId = identity.SourceId,
+            Status = status.ToString(),
+        });
+        _ = this.SendAsync(ServeMethods.EventToolResult, node);
+    }
+
     public void OnToolProgress(string toolName, long elapsedMs)
     {
         var node = ServeJson.ToNode(new ToolProgressEvent(toolName, elapsedMs));
+        _ = this.SendAsync(ServeMethods.EventToolProgress, node);
+    }
+
+    void IAgentSink.OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs)
+    {
+        var node = ServeJson.ToNode(new ToolProgressEvent(toolName, elapsedMs)
+        {
+            RootTurnId = identity.RootTurnId,
+            ActivityId = identity.ActivityId,
+            CallId = identity.CallId,
+            SourceId = identity.SourceId,
+        });
         _ = this.SendAsync(ServeMethods.EventToolProgress, node);
     }
 

@@ -445,7 +445,11 @@ public sealed class ServeHost : IAsyncDisposable
                 {
                     _ = conn.SendNotificationAsync(
                         ServeMethods.EventTurnComplete,
-                        ServeJson.ToNode(new TurnCompleteEvent(null, true)),
+                        ServeJson.ToNode(new TurnCompleteEvent(null, true)
+                        {
+                            RootTurnId = result.RootTurnId,
+                            ActivityId = result.ToolActivity?.ActivityId,
+                        }),
                         CancellationToken.None);
 
                     return ServeJson.ToNode(new PromptResult(false, null, true));
@@ -466,7 +470,11 @@ public sealed class ServeHost : IAsyncDisposable
                 // Send turnComplete notification (fire-and-forget from handler).
                 _ = conn.SendNotificationAsync(
                     ServeMethods.EventTurnComplete,
-                    ServeJson.ToNode(new TurnCompleteEvent(result.StopReason, false)),
+                    ServeJson.ToNode(new TurnCompleteEvent(result.StopReason, false)
+                    {
+                        RootTurnId = result.RootTurnId,
+                        ActivityId = result.ToolActivity?.ActivityId,
+                    }),
                     CancellationToken.None);
 
                 var promptResult = new PromptResult(result.Success, result.StopReason, false)

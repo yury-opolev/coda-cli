@@ -280,6 +280,65 @@ public sealed class ServeProtocolTests
     }
 
     [Fact]
+    public void Correlated_tool_events_serialize_optional_camel_case_fields()
+    {
+        var toolCall = ServeJson.ToNode(new ToolCallEvent("write_file", "{}")
+        {
+            RootTurnId = "root-1",
+            ActivityId = "activity-1",
+            CallId = "call-1",
+            SourceId = "subagent:task-1",
+        })!;
+        var progress = ServeJson.ToNode(new ToolProgressEvent("write_file", 123)
+        {
+            RootTurnId = "root-1",
+            ActivityId = "activity-1",
+            CallId = "call-1",
+            SourceId = "subagent:task-1",
+        })!;
+        var result = ServeJson.ToNode(new ToolResultEvent("write_file", "done", false)
+        {
+            RootTurnId = "root-1",
+            ActivityId = "activity-1",
+            CallId = "call-1",
+            SourceId = "subagent:task-1",
+            Status = "Succeeded",
+        })!;
+
+        foreach (var node in new[] { toolCall, progress, result })
+        {
+            Assert.Equal("root-1", node["rootTurnId"]!.GetValue<string>());
+            Assert.Equal("activity-1", node["activityId"]!.GetValue<string>());
+            Assert.Equal("call-1", node["callId"]!.GetValue<string>());
+            Assert.Equal("subagent:task-1", node["sourceId"]!.GetValue<string>());
+        }
+
+        Assert.Equal("Succeeded", result["status"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void Legacy_tool_and_turn_events_omit_optional_correlation_fields()
+    {
+        var toolCall = ServeJson.ToNode(new ToolCallEvent("write_file", "{}"))!;
+        var progress = ServeJson.ToNode(new ToolProgressEvent("write_file", 123))!;
+        var result = ServeJson.ToNode(new ToolResultEvent("write_file", "done", false))!;
+        var turnComplete = ServeJson.ToNode(new TurnCompleteEvent("end_turn", false))!;
+
+        foreach (var node in new[] { toolCall, progress, result })
+        {
+            Assert.Null(node["rootTurnId"]);
+            Assert.Null(node["activityId"]);
+            Assert.Null(node["callId"]);
+            Assert.Null(node["sourceId"]);
+            Assert.Null(node["Item1"]);
+        }
+
+        Assert.Null(result["status"]);
+        Assert.Null(turnComplete["rootTurnId"]);
+        Assert.Null(turnComplete["activityId"]);
+    }
+
+    [Fact]
     public void ToolResultEvent_round_trips()
     {
         var original = new ToolResultEvent("write_file", "done", false);
@@ -338,6 +397,31 @@ public sealed class ServeProtocolTests
         var result = RoundTrip(original);
         Assert.Equal(original.StopReason, result.StopReason);
         Assert.Equal(original.Interrupted, result.Interrupted);
+    }
+
+    [Fact]
+    public void TurnCompleteEvent_serializes_optional_root_and_activity()
+    {
+        var node = ServeJson.ToNode(new TurnCompleteEvent("end_turn", false)
+        {
+            RootTurnId = "root-1",
+            ActivityId = "activity-1",
+        })!;
+
+        Assert.Equal("root-1", node["rootTurnId"]!.GetValue<string>());
+        Assert.Equal("activity-1", node["activityId"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void TurnCompleteEvent_with_no_tools_includes_root_without_activity()
+    {
+        var node = ServeJson.ToNode(new TurnCompleteEvent("end_turn", false)
+        {
+            RootTurnId = "root-1",
+        })!;
+
+        Assert.Equal("root-1", node["rootTurnId"]!.GetValue<string>());
+        Assert.Null(node["activityId"]);
     }
 
     // ── ScheduleLifecycleEvent (event/scheduleLifecycle wire DTO) ────────────

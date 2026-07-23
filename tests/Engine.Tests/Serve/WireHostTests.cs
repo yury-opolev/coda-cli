@@ -57,6 +57,53 @@ public sealed class WireHostTests
     }
 
     [Fact]
+    public async Task WireAgentSink_correlated_tool_events_include_identity_status_and_emit_once()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        var calls = new List<JsonNode?>();
+        var results = new List<JsonNode?>();
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConn.OnNotification(ServeMethods.EventToolCall, node =>
+        {
+            calls.Add(node);
+            if (calls.Count == 2 && results.Count == 2)
+            {
+                completed.TrySetResult();
+            }
+        });
+        serverConn.OnNotification(ServeMethods.EventToolResult, node =>
+        {
+            results.Add(node);
+            if (calls.Count == 2 && results.Count == 2)
+            {
+                completed.TrySetResult();
+            }
+        });
+
+        IAgentSink sink = new WireAgentSink(clientConn);
+        var first = new ToolCallIdentity("root-1", "activity-1", "call-1", "subagent:one");
+        var second = new ToolCallIdentity("root-1", "activity-1", "call-2", "subagent:two");
+        sink.OnToolCall(first, "read_file", "{\"path\":\"one\"}");
+        sink.OnToolResult(first, "read_file", new ToolResult("one", false), ToolCallStatus.Succeeded);
+        sink.OnToolCall(second, "read_file", "{\"path\":\"two\"}");
+        sink.OnToolResult(second, "read_file", new ToolResult("two", true), ToolCallStatus.Failed);
+
+        await completed.Task.WaitAsync(WaitTimeout);
+        Assert.Equal(2, calls.Count);
+        Assert.Equal(2, results.Count);
+
+        Assert.Equal("call-1", calls[0]!["callId"]!.GetValue<string>());
+        Assert.Equal("subagent:one", calls[0]!["sourceId"]!.GetValue<string>());
+        Assert.Equal("call-2", calls[1]!["callId"]!.GetValue<string>());
+        Assert.Equal("subagent:two", calls[1]!["sourceId"]!.GetValue<string>());
+        Assert.Equal("Succeeded", results[0]!["status"]!.GetValue<string>());
+        Assert.Equal("Failed", results[1]!["status"]!.GetValue<string>());
+    }
+
+    [Fact]
     public async Task WireAgentSink_OnAssistantTextComplete_sends_notification()
     {
         using var pair = new DuplexStreamPair();
