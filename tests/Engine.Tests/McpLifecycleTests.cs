@@ -90,6 +90,77 @@ public sealed class McpLifecycleTests
     }
 
     [Fact]
+    public async Task ConnectClientAsync_failure_records_safe_error_and_a_later_success_clears_it()
+    {
+        var manager = new McpClientManager();
+        const string secret = "Bearer abcdefghijklmnopqrstuvwxyz123456";
+        var failed = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = $"upstream rejected https://user:password@example.test/mcp?token=raw-secret; {secret}; MCP_TOKEN=env-secret",
+        };
+
+        var result = await manager.ConnectClientAsync(failed, default);
+
+        Assert.False(result.Connected);
+        Assert.False(manager.IsServerConnected("bad"));
+        Assert.Empty(manager.ServerTools("bad"));
+        Assert.NotNull(manager.LastConnectionErrorFor("bad"));
+        Assert.DoesNotContain("raw-secret", result.Error!);
+        Assert.DoesNotContain("env-secret", result.Error!);
+        Assert.DoesNotContain(secret, result.Error!);
+        Assert.DoesNotContain("raw-secret", manager.LastConnectionErrorFor("bad")!);
+        Assert.DoesNotContain("env-secret", manager.LastConnectionErrorFor("bad")!);
+        Assert.DoesNotContain(secret, manager.LastConnectionErrorFor("bad")!);
+
+        var recovered = new FakeMcpClient("bad") { ThrowOnPromptList = "prompt list failed" };
+        Assert.True((await manager.ConnectClientAsync(recovered, default)).Connected);
+        Assert.Null(manager.LastConnectionErrorFor("bad"));
+        Assert.Empty(await manager.ServerPromptsAsync("bad"));
+        Assert.NotNull(manager.LastConnectionErrorFor("bad"));
+        Assert.True(await manager.DisconnectServerAsync("bad"));
+        Assert.Null(manager.LastConnectionErrorFor("bad"));
+    }
+
+    [Fact]
+    public async Task DisconnectServerAsync_dispose_failure_removes_server_bumps_version_and_records_safe_error()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            Tools = [new McpToolInfo("echo", "d", "{}", true)],
+            ThrowOnDispose = "failed to close https://example.test/mcp?access_token=dispose-secret",
+        };
+        Assert.True((await manager.ConnectClientAsync(client, default)).Connected);
+        var before = manager.Version;
+
+        var removed = await manager.DisconnectServerAsync("bad");
+
+        Assert.True(removed);
+        Assert.False(manager.IsServerConnected("bad"));
+        Assert.Empty(manager.ServerTools("bad"));
+        Assert.Equal(before + 1, manager.Version);
+        Assert.DoesNotContain("dispose-secret", manager.LastConnectionErrorFor("bad")!);
+
+        Assert.True((await manager.ConnectClientAsync(new FakeMcpClient("bad"), default)).Connected);
+        Assert.Null(manager.LastConnectionErrorFor("bad"));
+    }
+
+    [Fact]
+    public async Task LastConnectionErrorFor_is_isolated_by_exact_server_name_and_absent_disconnect_does_not_create_an_error()
+    {
+        var manager = new McpClientManager();
+
+        await manager.ConnectClientAsync(new FakeMcpClient("one") { ThrowOnInit = "one failed" }, default);
+        await manager.ConnectClientAsync(new FakeMcpClient("two") { ThrowOnInit = "two failed" }, default);
+
+        Assert.Contains("one failed", manager.LastConnectionErrorFor("one")!);
+        Assert.Contains("two failed", manager.LastConnectionErrorFor("two")!);
+        Assert.Null(manager.LastConnectionErrorFor("ONE"));
+        Assert.False(await manager.DisconnectServerAsync("absent"));
+        Assert.Null(manager.LastConnectionErrorFor("absent"));
+    }
+
+    [Fact]
     public async Task ConnectClientAsync_failed_initialize_disposes_exactly_once_and_leaves_no_state()
     {
         var manager = new McpClientManager();
@@ -308,6 +379,10 @@ public sealed class McpLifecycleTests
 
         public string? ThrowOnInit { get; init; }
 
+        public string? ThrowOnDispose { get; init; }
+
+        public string? ThrowOnPromptList { get; init; }
+
         /// <summary>When set, drives initialize so tests can script cancellation/timeout/typed failures.</summary>
         public Func<CancellationToken, Task<IReadOnlyList<McpToolInfo>>>? InitOverride { get; init; }
 
@@ -333,15 +408,19 @@ public sealed class McpLifecycleTests
 
         public Task<string> ReadResourceAsync(string uri, CancellationToken ct = default) => Task.FromResult(string.Empty);
 
-        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken ct = default)
-            => Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
+        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken ct = default) =>
+            this.ThrowOnPromptList is { } message
+                ? throw new McpException(message)
+                : Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
 
         public Task<string> GetPromptAsync(string name, JsonNode? arguments, CancellationToken ct = default) => Task.FromResult(string.Empty);
 
         public ValueTask DisposeAsync()
         {
             this.DisposeCount++;
-            return ValueTask.CompletedTask;
+            return this.ThrowOnDispose is { } message
+                ? ValueTask.FromException(new McpException(message))
+                : ValueTask.CompletedTask;
         }
     }
 }

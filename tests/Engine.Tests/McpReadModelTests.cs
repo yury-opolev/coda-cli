@@ -236,6 +236,70 @@ public sealed class McpReadModelTests
         Assert.Null(manager.ServerInfoFor("nope"));
     }
 
+    [Fact]
+    public async Task ServerPromptsAsync_and_ServerResourcesAsync_call_only_the_target_client()
+    {
+        var github = new FakeMcpClient("github")
+        {
+            Prompts = [new McpPromptInfo("github", "review", "Review code")],
+            Resources = [new McpResourceInfo("github", "file:///repo/readme", "README", "text/plain")],
+        };
+        var filesystem = new FakeMcpClient("filesystem")
+        {
+            Prompts = [new McpPromptInfo("filesystem", "search", "Search files")],
+            Resources = [new McpResourceInfo("filesystem", "file:///repo/src", "src", null)],
+        };
+        var manager = new McpClientManager(new IMcpClient[] { github, filesystem });
+
+        var prompts = await manager.ServerPromptsAsync("github");
+        var resources = await manager.ServerResourcesAsync("github");
+
+        Assert.Single(prompts);
+        Assert.Single(resources);
+        Assert.Equal(1, github.PromptListCalls);
+        Assert.Equal(1, github.ResourceListCalls);
+        Assert.Equal(0, filesystem.PromptListCalls);
+        Assert.Equal(0, filesystem.ResourceListCalls);
+        Assert.Empty(await manager.ServerPromptsAsync("absent"));
+        Assert.Empty(await manager.ServerResourcesAsync("absent"));
+    }
+
+    [Fact]
+    public async Task ServerPromptsAsync_records_safe_failure_returns_empty_and_clears_error_after_success()
+    {
+        var fail = true;
+        var client = new FakeMcpClient("github")
+        {
+            ListPromptsOverride = _ => fail
+                ? throw new McpException("failed at https://example.test/mcp?access_token=prompt-secret")
+                : Task.FromResult<IReadOnlyList<McpPromptInfo>>([new McpPromptInfo("github", "review", null)]),
+        };
+        var manager = new McpClientManager(new IMcpClient[] { client });
+
+        Assert.Empty(await manager.ServerPromptsAsync("github"));
+        Assert.DoesNotContain("prompt-secret", manager.LastConnectionErrorFor("github")!);
+        fail = false;
+
+        Assert.Single(await manager.ServerPromptsAsync("github"));
+        Assert.Null(manager.LastConnectionErrorFor("github"));
+    }
+
+    [Fact]
+    public async Task ServerResourcesAsync_propagates_caller_cancellation()
+    {
+        using var cancellation = new CancellationTokenSource();
+        var client = new FakeMcpClient("github")
+        {
+            ListResourcesOverride = ct => Task.FromCanceled<IReadOnlyList<McpResourceInfo>>(ct),
+        };
+        var manager = new McpClientManager(new IMcpClient[] { client });
+        cancellation.Cancel();
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => manager.ServerResourcesAsync("github", cancellation.Token));
+        Assert.Null(manager.LastConnectionErrorFor("github"));
+    }
+
     private sealed class FakeMcpClient : IMcpClient
     {
         public FakeMcpClient(string serverName) => this.ServerName = serverName;
@@ -244,6 +308,18 @@ public sealed class McpReadModelTests
 
         public McpServerInfo? ServerInfo { get; set; }
 
+        public IReadOnlyList<McpResourceInfo> Resources { get; init; } = [];
+
+        public IReadOnlyList<McpPromptInfo> Prompts { get; init; } = [];
+
+        public Func<CancellationToken, Task<IReadOnlyList<McpResourceInfo>>>? ListResourcesOverride { get; init; }
+
+        public Func<CancellationToken, Task<IReadOnlyList<McpPromptInfo>>>? ListPromptsOverride { get; init; }
+
+        public int ResourceListCalls { get; private set; }
+
+        public int PromptListCalls { get; private set; }
+
         public Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken ct = default)
             => Task.FromResult<IReadOnlyList<McpToolInfo>>([]);
 
@@ -251,12 +327,18 @@ public sealed class McpReadModelTests
             => Task.FromResult((string.Empty, false));
 
         public Task<IReadOnlyList<McpResourceInfo>> ListResourcesAsync(CancellationToken ct = default)
-            => Task.FromResult<IReadOnlyList<McpResourceInfo>>([]);
+        {
+            this.ResourceListCalls++;
+            return this.ListResourcesOverride?.Invoke(ct) ?? Task.FromResult(this.Resources);
+        }
 
         public Task<string> ReadResourceAsync(string uri, CancellationToken ct = default) => Task.FromResult(string.Empty);
 
         public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken ct = default)
-            => Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
+        {
+            this.PromptListCalls++;
+            return this.ListPromptsOverride?.Invoke(ct) ?? Task.FromResult(this.Prompts);
+        }
 
         public Task<string> GetPromptAsync(string name, JsonNode? arguments, CancellationToken ct = default) => Task.FromResult(string.Empty);
 
