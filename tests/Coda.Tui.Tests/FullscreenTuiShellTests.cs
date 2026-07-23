@@ -1520,6 +1520,8 @@ public sealed class TranscriptViewportStateTests
     public void Scrolling_away_disables_auto_follow_and_counts_new_rows()
     {
         var state = new TranscriptViewportState();
+        state.SetViewportHeight(10);
+        state.SetContentRows(20);
         state.ScrollBy(-10);
         state.OnRowsAppended(3);
 
