@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Threading;
 using System.Threading.Tasks;
+using Coda.Agent;
 
 namespace Coda.Tui.Ui.Events;
 
@@ -14,12 +15,12 @@ namespace Coda.Tui.Ui.Events;
 /// </summary>
 public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
 {
-    private const string AssistantKey = "assistant";
+    private static readonly CoalesceKey AssistantKey = new(CoalesceKind.Assistant, null, null);
 
     private readonly int _capacity;
     private readonly CancellationToken _hostCancellationToken;
     private readonly LinkedList<UiEvent> _queue = new();
-    private readonly Dictionary<string, LinkedListNode<UiEvent>> _coalesce = new();
+    private readonly Dictionary<CoalesceKey, LinkedListNode<UiEvent>> _coalesce = new();
     private readonly object _lock = new();
     private readonly SemaphoreSlim _items = new(0);
     private readonly SemaphoreSlim _spaces = new(0);
@@ -62,8 +63,8 @@ public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
             {
                 ThrowIfDisposed();
 
-                var key = CoalesceKey(uiEvent);
-                if (key is not null && _coalesce.TryGetValue(key, out var existing))
+                var key = GetCoalesceKey(uiEvent);
+                if (key is not null && _coalesce.TryGetValue(key.Value, out var existing))
                 {
                     existing.Value = Merge(existing.Value, uiEvent);
                     return;
@@ -183,10 +184,11 @@ public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
         _disposeCts.Dispose();
     }
 
-    private static string? CoalesceKey(UiEvent uiEvent) => uiEvent switch
+    private static CoalesceKey? GetCoalesceKey(UiEvent uiEvent) => uiEvent switch
     {
         AssistantTextDeltaEvent => AssistantKey,
-        ToolProgressEvent tool => "tool:" + tool.ToolName,
+        ToolProgressEvent { Identity: { } identity } => new(CoalesceKind.ToolProgress, identity, null),
+        ToolProgressEvent tool => new(CoalesceKind.ToolProgress, null, tool.ToolName),
         _ => null,
     };
 
@@ -196,12 +198,12 @@ public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
         _ => incoming,
     };
 
-    private void Enqueue(UiEvent uiEvent, string? key)
+    private void Enqueue(UiEvent uiEvent, CoalesceKey? key)
     {
         var node = _queue.AddLast(uiEvent);
         if (key is not null)
         {
-            _coalesce[key] = node;
+            _coalesce[key.Value] = node;
         }
     }
 
@@ -209,7 +211,7 @@ public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
     {
         for (var node = _queue.First; node is not null; node = node.Next)
         {
-            if (CoalesceKey(node.Value) is not null)
+            if (GetCoalesceKey(node.Value) is not null)
             {
                 return node;
             }
@@ -220,10 +222,10 @@ public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
 
     private void RemoveNode(LinkedListNode<UiEvent> node)
     {
-        var key = CoalesceKey(node.Value);
-        if (key is not null && _coalesce.TryGetValue(key, out var mapped) && ReferenceEquals(mapped, node))
+        var key = GetCoalesceKey(node.Value);
+        if (key is not null && _coalesce.TryGetValue(key.Value, out var mapped) && ReferenceEquals(mapped, node))
         {
-            _coalesce.Remove(key);
+            _coalesce.Remove(key.Value);
         }
 
         _queue.Remove(node);
@@ -258,4 +260,15 @@ public sealed class UiEventMailbox : IUiEventPublisher, IDisposable
             throw new ObjectDisposedException(nameof(UiEventMailbox));
         }
     }
+
+    private enum CoalesceKind
+    {
+        Assistant,
+        ToolProgress,
+    }
+
+    private readonly record struct CoalesceKey(
+        CoalesceKind Kind,
+        ToolCallIdentity? Identity,
+        string? LegacyToolName);
 }

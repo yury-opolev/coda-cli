@@ -39,13 +39,56 @@ public sealed record AssistantTextDeltaEvent(string Delta) : UiEvent;
 public sealed record AssistantTextCompletedEvent : UiEvent;
 
 /// <summary>A tool invocation started.</summary>
-public sealed record ToolStartedEvent(string ToolName, string InputJson) : UiEvent;
+public sealed record ToolStartedEvent(
+    string ToolName,
+    string InputJson,
+    ToolCallIdentity? Identity = null) : UiEvent
+{
+    public void Deconstruct(out string toolName, out string inputJson)
+    {
+        toolName = this.ToolName;
+        inputJson = this.InputJson;
+    }
+}
 
 /// <summary>A tool invocation reported elapsed progress.</summary>
-public sealed record ToolProgressEvent(string ToolName, long ElapsedMs) : UiEvent;
+public sealed record ToolProgressEvent(
+    string ToolName,
+    long ElapsedMs,
+    ToolCallIdentity? Identity = null) : UiEvent
+{
+    public void Deconstruct(out string toolName, out long elapsedMs)
+    {
+        toolName = this.ToolName;
+        elapsedMs = this.ElapsedMs;
+    }
+}
 
 /// <summary>A tool invocation completed with a result.</summary>
-public sealed record ToolCompletedEvent(string ToolName, ToolResult Result) : UiEvent;
+public sealed record ToolCompletedEvent(
+    string ToolName,
+    ToolResult Result,
+    ToolCallIdentity? Identity = null,
+    ToolCallStatus? Status = null) : UiEvent
+{
+    public void Deconstruct(out string toolName, out ToolResult result)
+    {
+        toolName = this.ToolName;
+        result = this.Result;
+    }
+}
+
+/// <summary>A correlated tool invocation was queued for execution.</summary>
+public sealed record ToolQueuedEvent(ToolCallIdentity Identity, string ToolName, string InputJson) : UiEvent;
+
+/// <summary>A correlated tool invocation changed execution state.</summary>
+public sealed record ToolStateChangedEvent(
+    ToolCallIdentity Identity,
+    string ToolName,
+    ToolCallStatus Status) : UiEvent;
+
+/// <summary>A correlated tool activity finished.</summary>
+public sealed record ToolActivityCompletedEvent(ToolActivitySummary Summary) : UiEvent;
 
 /// <summary>The agent raised an error.</summary>
 public sealed record AgentErrorEvent(string Message) : UiEvent;

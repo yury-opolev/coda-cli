@@ -269,6 +269,7 @@ public sealed class UiActor
     {
         AssistantTextCompletedEvent => true,
         ToolCompletedEvent => true,
+        ToolActivityCompletedEvent => true,
         AgentErrorEvent => true,
         LimitReachedEvent => true,
         PermissionRequestedEvent => true,

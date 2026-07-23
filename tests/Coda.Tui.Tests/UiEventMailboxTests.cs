@@ -2,6 +2,7 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
+using Coda.Agent;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.State;
 
@@ -45,6 +46,65 @@ public sealed class UiEventMailboxTests
         var progress = Assert.IsType<ToolProgressEvent>(read);
         Assert.Equal("build", progress.ToolName);
         Assert.Equal(300, progress.ElapsedMs);
+    }
+
+    [Fact]
+    public async Task Identity_rich_progress_for_different_calls_does_not_coalesce()
+    {
+        using var mailbox = new UiEventMailbox(capacity: 4);
+        var first = new ToolCallIdentity("turn", "activity", "call-1", "source");
+        var second = new ToolCallIdentity("turn", "activity", "call-2", "source");
+
+        mailbox.Publish(new ToolProgressEvent("build", 100, first));
+        mailbox.Publish(new ToolProgressEvent("build", 200, second));
+
+        Assert.Equal(2, mailbox.Count);
+        Assert.Equal(new ToolProgressEvent("build", 100, first), await mailbox.ReadAsync());
+        Assert.Equal(new ToolProgressEvent("build", 200, second), await mailbox.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Identity_rich_progress_for_same_call_keeps_latest_value()
+    {
+        using var mailbox = new UiEventMailbox(capacity: 4);
+        var identity = new ToolCallIdentity("turn", "activity", "call", "source");
+
+        mailbox.Publish(new ToolProgressEvent("build", 100, identity));
+        mailbox.Publish(new ToolProgressEvent("build", 300, identity));
+
+        Assert.Equal(1, mailbox.Count);
+        Assert.Equal(new ToolProgressEvent("build", 300, identity), await mailbox.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Identity_rich_progress_for_same_call_from_different_sources_does_not_coalesce()
+    {
+        using var mailbox = new UiEventMailbox(capacity: 4);
+        var root = new ToolCallIdentity("turn", "activity", "call", "root");
+        var subagent = new ToolCallIdentity("turn", "activity", "call", "subagent");
+
+        mailbox.Publish(new ToolProgressEvent("build", 100, root));
+        mailbox.Publish(new ToolProgressEvent("build", 200, subagent));
+
+        Assert.Equal(2, mailbox.Count);
+        Assert.Equal(new ToolProgressEvent("build", 100, root), await mailbox.ReadAsync());
+        Assert.Equal(new ToolProgressEvent("build", 200, subagent), await mailbox.ReadAsync());
+    }
+
+    [Fact]
+    public async Task Queued_and_status_events_are_not_coalesced_as_progress()
+    {
+        using var mailbox = new UiEventMailbox(capacity: 4);
+        var identity = new ToolCallIdentity("turn", "activity", "call", "source");
+
+        mailbox.Publish(new ToolProgressEvent("build", 100, identity));
+        mailbox.Publish(new ToolQueuedEvent(identity, "build", "{}"));
+        mailbox.Publish(new ToolStateChangedEvent(identity, "build", ToolCallStatus.Running));
+
+        Assert.Equal(3, mailbox.Count);
+        Assert.IsType<ToolProgressEvent>(await mailbox.ReadAsync());
+        Assert.IsType<ToolQueuedEvent>(await mailbox.ReadAsync());
+        Assert.IsType<ToolStateChangedEvent>(await mailbox.ReadAsync());
     }
 
     [Fact]

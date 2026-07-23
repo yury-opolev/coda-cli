@@ -70,14 +70,18 @@ public sealed class TuiAgentSinkTests
         var started = Assert.IsType<ToolStartedEvent>(events[1]);
         Assert.Equal("grep", started.ToolName);
         Assert.Equal("{\"q\":1}", started.InputJson);
+        Assert.Null(started.Identity);
 
         var progress = Assert.IsType<ToolProgressEvent>(events[2]);
         Assert.Equal("grep", progress.ToolName);
         Assert.Equal(1234, progress.ElapsedMs);
+        Assert.Null(progress.Identity);
 
         var completed = Assert.IsType<ToolCompletedEvent>(events[3]);
         Assert.Equal("grep", completed.ToolName);
         Assert.Same(result, completed.Result);
+        Assert.Null(completed.Identity);
+        Assert.Null(completed.Status);
 
         Assert.Equal(usage, Assert.IsType<UsageEvent>(events[4]).Usage);
         Assert.Equal("end_turn", Assert.IsType<StopReasonEvent>(events[5]).StopReason);
@@ -87,6 +91,63 @@ public sealed class TuiAgentSinkTests
         Assert.Equal("limit hit", limit.Message);
 
         Assert.Equal("boom", Assert.IsType<AgentErrorEvent>(events[7]).Message);
+    }
+
+    [Fact]
+    public void Sink_publishes_enriched_tool_events_once_with_their_exact_correlation()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+        var identity = new ToolCallIdentity("turn", "activity", "call", "source");
+        var result = new ToolResult("output", IsError: true);
+        var summary = new ToolActivitySummary("turn", "activity", 1, 1, 0, 0, "grep");
+
+        sink.OnToolQueued(identity, "grep", "{\"q\":1}");
+        sink.OnToolCall(identity, "grep", "{\"q\":1}");
+        sink.OnToolStatus(identity, "grep", ToolCallStatus.Running);
+        sink.OnToolProgress(identity, "grep", 1234);
+        sink.OnToolResult(identity, "grep", result, ToolCallStatus.Failed);
+        sink.OnToolActivityCompleted(summary);
+
+        Assert.Collection(
+            events,
+            item =>
+            {
+                var queued = Assert.IsType<ToolQueuedEvent>(item);
+                Assert.Equal(identity, queued.Identity);
+                Assert.Equal("grep", queued.ToolName);
+                Assert.Equal("{\"q\":1}", queued.InputJson);
+            },
+            item =>
+            {
+                var started = Assert.IsType<ToolStartedEvent>(item);
+                Assert.Equal(identity, started.Identity);
+                Assert.Equal("grep", started.ToolName);
+                Assert.Equal("{\"q\":1}", started.InputJson);
+            },
+            item =>
+            {
+                var status = Assert.IsType<ToolStateChangedEvent>(item);
+                Assert.Equal(identity, status.Identity);
+                Assert.Equal("grep", status.ToolName);
+                Assert.Equal(ToolCallStatus.Running, status.Status);
+            },
+            item =>
+            {
+                var progress = Assert.IsType<ToolProgressEvent>(item);
+                Assert.Equal(identity, progress.Identity);
+                Assert.Equal("grep", progress.ToolName);
+                Assert.Equal(1234, progress.ElapsedMs);
+            },
+            item =>
+            {
+                var completed = Assert.IsType<ToolCompletedEvent>(item);
+                Assert.Equal(identity, completed.Identity);
+                Assert.Equal("grep", completed.ToolName);
+                Assert.Same(result, completed.Result);
+                Assert.Equal(ToolCallStatus.Failed, completed.Status);
+            },
+            item => Assert.Equal(summary, Assert.IsType<ToolActivityCompletedEvent>(item).Summary));
     }
 
     private sealed class CollectingPublisher(List<UiEvent> events) : IUiEventPublisher
