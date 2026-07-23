@@ -1550,6 +1550,79 @@ public sealed class McpManagementEditTests
     }
 
     [Fact]
+    public async Task Lease_can_be_immediately_reacquired_after_release_repeatedly()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+
+        for (var attempt = 0; attempt < 100; attempt++)
+        {
+            await using (await McpConfigMutationLease.AcquireAsync(
+                harness.Project,
+                harness.User,
+                CancellationToken.None))
+            {
+            }
+
+            await using var reacquired = await McpConfigMutationLease.AcquireAsync(
+                harness.Project,
+                harness.User,
+                CancellationToken.None);
+        }
+
+        Assert.True(harness.HasNoConfigLockFiles());
+    }
+
+    [Fact]
+    public async Task Independent_services_repeatedly_serialize_commits_across_lease_releases()
+    {
+        var mutator = new CountingConfigMutator();
+        await using var harness = await McpManagementTestHarness.CreateAsync(mutator);
+        var secondService = harness.CreatePeerService(mutator: mutator);
+
+        for (var attempt = 0; attempt < 25; attempt++)
+        {
+            var firstPreview = await harness.Service.PrepareAddAsync(
+                StdioDraft($"first-{attempt}"),
+                CancellationToken.None);
+            var secondPreview = await secondService.PrepareAddAsync(
+                StdioDraft($"second-{attempt}"),
+                CancellationToken.None);
+            using var entered = new ManualResetEventSlim();
+            using var release = new ManualResetEventSlim();
+            mutator.BeforeWrite = () =>
+            {
+                entered.Set();
+                release.Wait();
+            };
+
+            var first = Task.Run(() => harness.Service.CommitAddAsync(firstPreview, CancellationToken.None));
+            Assert.True(entered.Wait(TimeSpan.FromSeconds(5)));
+            var second = secondService.CommitAddAsync(secondPreview, CancellationToken.None);
+            release.Set();
+            var results = await Task.WhenAll(first, second);
+
+            Assert.Single(results, result => result.Status == McpMutationStatus.Succeeded);
+            Assert.Single(results, result => result.Status == McpMutationStatus.Rejected);
+            Assert.True(harness.HasNoConfigLockFiles());
+        }
+    }
+
+    [Fact]
+    public async Task Lease_reports_a_safe_error_when_its_lock_directory_cannot_be_created()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        var blockedDirectory = Path.Combine(harness.Project, "not-a-directory");
+        await File.WriteAllTextAsync(blockedDirectory, "blocked");
+
+        var exception = await Assert.ThrowsAsync<McpException>(() =>
+            McpConfigMutationLease.AcquireAsync(blockedDirectory, harness.User, CancellationToken.None));
+
+        Assert.Equal(
+            "MCP configuration lock could not be acquired. Check access to the configuration directory and try again.",
+            exception.Message);
+    }
+
+    [Fact]
     public async Task Independent_services_sharing_only_the_user_config_serialize_commits()
     {
         var mutator = new CountingConfigMutator();

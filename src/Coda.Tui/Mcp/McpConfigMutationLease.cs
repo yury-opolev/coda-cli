@@ -8,6 +8,7 @@ namespace Coda.Tui.Mcp;
 /// </summary>
 internal sealed class McpConfigMutationLease : IAsyncDisposable
 {
+    private const int maxAcquireAttempts = 200;
     private static readonly TimeSpan retryDelay = TimeSpan.FromMilliseconds(25);
     private readonly IReadOnlyList<FileStream> streams;
 
@@ -36,12 +37,6 @@ internal sealed class McpConfigMutationLease : IAsyncDisposable
             foreach (var lockPath in lockPaths)
             {
                 ct.ThrowIfCancellationRequested();
-                var directory = Path.GetDirectoryName(lockPath);
-                if (!string.IsNullOrEmpty(directory))
-                {
-                    Directory.CreateDirectory(directory);
-                }
-
                 streams.Add(await AcquireFileAsync(lockPath, ct).ConfigureAwait(false));
             }
 
@@ -62,11 +57,17 @@ internal sealed class McpConfigMutationLease : IAsyncDisposable
 
     private static async Task<FileStream> AcquireFileAsync(string lockPath, CancellationToken ct)
     {
-        while (true)
+        for (var attempt = 0; attempt < maxAcquireAttempts; attempt++)
         {
             ct.ThrowIfCancellationRequested();
             try
             {
+                var directory = Path.GetDirectoryName(lockPath);
+                if (!string.IsNullOrEmpty(directory))
+                {
+                    Directory.CreateDirectory(directory);
+                }
+
                 return new FileStream(
                     lockPath,
                     FileMode.OpenOrCreate,
@@ -75,13 +76,22 @@ internal sealed class McpConfigMutationLease : IAsyncDisposable
                     bufferSize: 1,
                     FileOptions.DeleteOnClose);
             }
-            catch (IOException)
+            catch (Exception exception) when (exception is IOException or UnauthorizedAccessException)
             {
-                ct.ThrowIfCancellationRequested();
+                if (attempt == maxAcquireAttempts - 1)
+                {
+                    throw LockAcquireFailed();
+                }
+
                 await Task.Delay(retryDelay, ct).ConfigureAwait(false);
             }
         }
+
+        throw LockAcquireFailed();
     }
+
+    private static McpException LockAcquireFailed() =>
+        new("MCP configuration lock could not be acquired. Check access to the configuration directory and try again.");
 
     private static void DisposeStreams(IEnumerable<FileStream> streams)
     {
