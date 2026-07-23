@@ -7,6 +7,154 @@ namespace Engine.Tests;
 
 public sealed class McpReadModelTests
 {
+    // ── McpConfig.LoadPhysicalEntries ───────────────────────────────────────
+
+    [Fact]
+    public void LoadPhysicalEntries_returns_both_scopes_and_marks_disabled_project_override_effective()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(Path.Combine(user.Path, ".mcp.json"),
+            """{ "mcpServers": { "shared": { "command": "user" } } }""");
+        File.WriteAllText(Path.Combine(work.Path, ".mcp.json"),
+            """{ "mcpServers": { "shared": { "command": "project", "disabled": true } } }""");
+
+        var entries = McpConfig.LoadPhysicalEntries(work.Path, user.Path);
+
+        Assert.Collection(entries,
+            entry =>
+            {
+                Assert.Equal(new McpServerKey(McpConfigScope.User, "shared"), entry.Key);
+                Assert.False(entry.IsEffective);
+                Assert.False(entry.Config.Disabled);
+            },
+            entry =>
+            {
+                Assert.Equal(new McpServerKey(McpConfigScope.Project, "shared"), entry.Key);
+                Assert.True(entry.IsEffective);
+                Assert.True(entry.Config.Disabled);
+            });
+    }
+
+    [Fact]
+    public void LoadPhysicalEntries_marks_user_effective_without_project_or_when_project_is_excluded()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(Path.Combine(user.Path, ".mcp.json"),
+            """{ "mcpServers": { "shared": { "command": "user" } } }""");
+
+        var withoutProject = Assert.Single(McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+        Assert.True(withoutProject.IsEffective);
+
+        File.WriteAllText(Path.Combine(work.Path, ".mcp.json"),
+            """{ "mcpServers": { "shared": { "command": "project" } } }""");
+
+        var userOnly = Assert.Single(McpConfig.LoadPhysicalEntries(work.Path, user.Path, includeProject: false));
+        Assert.Equal(McpConfigScope.User, userOnly.Key.Scope);
+        Assert.True(userOnly.IsEffective);
+    }
+
+    [Fact]
+    public void LoadPhysicalEntries_marks_unique_entries_effective_in_user_then_project_order()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(Path.Combine(user.Path, ".mcp.json"),
+            """{ "mcpServers": { "z-user": { "command": "u" }, "a-user": { "command": "u" } } }""");
+        File.WriteAllText(Path.Combine(work.Path, ".mcp.json"),
+            """{ "mcpServers": { "z-project": { "command": "p" }, "a-project": { "command": "p" } } }""");
+
+        var entries = McpConfig.LoadPhysicalEntries(work.Path, user.Path);
+
+        Assert.Equal(
+            [
+                new McpServerKey(McpConfigScope.User, "z-user"),
+                new McpServerKey(McpConfigScope.User, "a-user"),
+                new McpServerKey(McpConfigScope.Project, "z-project"),
+                new McpServerKey(McpConfigScope.Project, "a-project"),
+            ],
+            entries.Select(entry => entry.Key));
+        Assert.All(entries, entry => Assert.True(entry.IsEffective));
+    }
+
+    [Theory]
+    [InlineData(McpConfigScope.User)]
+    [InlineData(McpConfigScope.Project)]
+    public void LoadPhysicalEntries_rejects_corrupt_existing_json_with_source_context(McpConfigScope scope)
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        var sourceFile = McpConfig.FilePath(scope, work.Path, user.Path);
+        File.WriteAllText(sourceFile, "{ invalid");
+
+        var exception = Assert.Throws<McpException>(() => McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+
+        Assert.Contains("valid JSON", exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(sourceFile, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("[]", "JSON object")]
+    [InlineData("""{ "mcpServers": [] }""", "mcpServers")]
+    [InlineData("""{ "mcpServers": null }""", "mcpServers")]
+    public void LoadPhysicalEntries_rejects_invalid_root_or_mcpServers_structure(string json, string context)
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        var sourceFile = McpConfig.FilePath(McpConfigScope.User, work.Path, user.Path);
+        File.WriteAllText(sourceFile, json);
+
+        var exception = Assert.Throws<McpException>(() => McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+
+        Assert.Contains(context, exception.Message, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains(sourceFile, exception.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void LoadPhysicalEntries_returns_empty_for_missing_files()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+
+        Assert.Empty(McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+    }
+
+    [Fact]
+    public void LoadPhysicalEntries_preserves_source_scope_name_and_http_config()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        var sourceFile = McpConfig.FilePath(McpConfigScope.User, work.Path, user.Path);
+        File.WriteAllText(sourceFile,
+            """{ "mcpServers": { "remote": { "type": "http", "url": "https://example.test/mcp", "disabled": true } } }""");
+
+        var entry = Assert.Single(McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+
+        Assert.Equal(new McpServerKey(McpConfigScope.User, "remote"), entry.Key);
+        Assert.Equal(sourceFile, entry.SourceFile);
+        Assert.True(entry.IsEffective);
+        Assert.True(entry.Config.Disabled);
+        var http = Assert.IsType<McpHttpServerConfig>(entry.Config);
+        Assert.Equal(new Uri("https://example.test/mcp"), http.Url);
+    }
+
+    [Fact]
+    public void LoadPhysicalEntries_uses_case_sensitive_names_for_effective_precedence()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(Path.Combine(user.Path, ".mcp.json"),
+            """{ "mcpServers": { "GitHub": { "command": "user" } } }""");
+        File.WriteAllText(Path.Combine(work.Path, ".mcp.json"),
+            """{ "mcpServers": { "github": { "command": "project" } } }""");
+
+        var entries = McpConfig.LoadPhysicalEntries(work.Path, user.Path);
+
+        Assert.Equal(2, entries.Count);
+        Assert.All(entries, entry => Assert.True(entry.IsEffective));
+    }
+
     // ── McpConfig.LoadEntries scope tagging ───────────────────────────────
 
     [Fact]

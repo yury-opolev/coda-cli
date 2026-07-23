@@ -64,6 +64,19 @@ public sealed class McpConfigDisabledTests
         Assert.True(userOnly.ContainsKey("u"));    // user layer kept
     }
 
+    [Fact]
+    public void Load_project_disabled_override_does_not_reveal_user_server()
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(Path.Combine(user.Path, ".mcp.json"), """{ "mcpServers": { "shared": { "command": "user" } } }""");
+        File.WriteAllText(Path.Combine(work.Path, ".mcp.json"), """{ "mcpServers": { "shared": { "command": "project", "disabled": true } } }""");
+
+        var loaded = McpConfig.Load(work.Path, user.Path);
+
+        Assert.False(loaded.ContainsKey("shared"));
+    }
+
     private sealed class TempDir : IDisposable
     {
         public string Path { get; } = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "coda-mcp-dis-" + Guid.NewGuid().ToString("N"));
