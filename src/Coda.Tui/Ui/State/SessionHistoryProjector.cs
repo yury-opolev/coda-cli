@@ -166,16 +166,15 @@ public static class SessionHistoryProjector
     private static LegacyHistory BuildLegacyHistory(IReadOnlyList<ChatMessage> history)
     {
         var legacy = new LegacyHistory();
-        LegacyActivity? active = null;
+        LegacyPendingCallIndex? pendingCalls = null;
 
         for (var messageIndex = 0; messageIndex < history.Count; messageIndex++)
         {
             var message = history[messageIndex];
-            if (message.Role == ChatRole.Assistant
-                && active is not null
-                && active.AssistantMessageIndex != messageIndex)
+            LegacyActivity? active = null;
+            if (message.Role == ChatRole.Assistant)
             {
-                active = null;
+                pendingCalls = new LegacyPendingCallIndex();
             }
 
             for (var blockIndex = 0; blockIndex < message.Content.Count; blockIndex++)
@@ -189,7 +188,7 @@ public static class SessionHistoryProjector
                         active = null;
                         break;
 
-                    case ToolUseBlock toolUse when HasAnyCorrelationMetadata(toolUse):
+                    case ToolUseBlock toolUse when TryCreateHistoricalCallKey(toolUse, out _):
                         active = null;
                         break;
 
@@ -199,8 +198,13 @@ public static class SessionHistoryProjector
                             active = legacy.CreateActivity(messageIndex);
                         }
 
-                        active.AddUse(toolUse, location);
+                        var added = active.AddUse(toolUse, location);
                         legacy.UseActivities[location] = active;
+                        if (added)
+                        {
+                            pendingCalls!.Add(toolUse.Id, active);
+                        }
+
                         break;
 
                     case ToolUseBlock toolUse:
@@ -214,20 +218,23 @@ public static class SessionHistoryProjector
                         break;
                     }
 
-                    case ToolResultBlock toolResult when HasAnyCorrelationMetadata(toolResult):
-                        active = null;
+                    case ToolResultBlock toolResult when TryCreateHistoricalCallKey(toolResult, out _):
                         break;
 
                     case ToolResultBlock toolResult
                         when message.Role == ChatRole.User
-                             && active is not null
-                             && active.TryAddResult(toolResult):
+                             && pendingCalls is not null
+                             && pendingCalls.TryAddResult(toolResult):
                         break;
 
                     case ToolResultBlock:
-                        active = null;
                         break;
                 }
+            }
+
+            if (message.Role == ChatRole.User)
+            {
+                pendingCalls = null;
             }
         }
 
@@ -277,20 +284,6 @@ public static class SessionHistoryProjector
         key = default;
         return false;
     }
-
-    private static bool HasAnyCorrelationMetadata(ToolUseBlock toolUse) =>
-        HasAnyCorrelationMetadata(toolUse.RootTurnId, toolUse.ActivityId, toolUse.SourceId);
-
-    private static bool HasAnyCorrelationMetadata(ToolResultBlock toolResult) =>
-        HasAnyCorrelationMetadata(toolResult.RootTurnId, toolResult.ActivityId, toolResult.SourceId);
-
-    private static bool HasAnyCorrelationMetadata(
-        string? rootTurnId,
-        string? activityId,
-        string? sourceId) =>
-        !string.IsNullOrWhiteSpace(rootTurnId)
-        || !string.IsNullOrWhiteSpace(activityId)
-        || !string.IsNullOrWhiteSpace(sourceId);
 
     private static ToolCallStatus? ParseStatus(string? status)
     {
@@ -479,6 +472,52 @@ public static class SessionHistoryProjector
             new(assistantMessageIndex);
     }
 
+    private sealed class LegacyPendingCallIndex
+    {
+        private readonly Dictionary<string, List<LegacyPendingCall>> callsByToolUseId =
+            new(StringComparer.Ordinal);
+
+        public void Add(string toolUseId, LegacyActivity activity)
+        {
+            if (!this.callsByToolUseId.TryGetValue(toolUseId, out var pendingCalls))
+            {
+                pendingCalls = [];
+                this.callsByToolUseId.Add(toolUseId, pendingCalls);
+            }
+
+            pendingCalls.Add(new LegacyPendingCall(toolUseId, activity));
+        }
+
+        public bool TryAddResult(ToolResultBlock toolResult)
+        {
+            if (!this.callsByToolUseId.TryGetValue(toolResult.ToolUseId, out var pendingCalls))
+            {
+                return false;
+            }
+
+            for (var index = pendingCalls.Count - 1; index >= 0; index--)
+            {
+                var pendingCall = pendingCalls[index];
+                if (!pendingCall.Activity.TryAddResult(toolResult))
+                {
+                    continue;
+                }
+
+                pendingCalls.RemoveAt(index);
+                if (pendingCalls.Count == 0)
+                {
+                    this.callsByToolUseId.Remove(toolResult.ToolUseId);
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    private readonly record struct LegacyPendingCall(string ToolUseId, LegacyActivity Activity);
+
     private sealed class LegacyActivity(int assistantMessageIndex)
     {
         private readonly Dictionary<string, int> callIndexes = new(StringComparer.Ordinal);
@@ -492,16 +531,17 @@ public static class SessionHistoryProjector
 
         public HistoricalBlockLocation? FirstUseLocation { get; private set; }
 
-        public void AddUse(ToolUseBlock toolUse, HistoricalBlockLocation location)
+        public bool AddUse(ToolUseBlock toolUse, HistoricalBlockLocation location)
         {
             this.FirstUseLocation ??= location;
             if (this.callIndexes.ContainsKey(toolUse.Id))
             {
-                return;
+                return false;
             }
 
             this.callIndexes.Add(toolUse.Id, this.calls.Count);
             this.calls.Add(new LegacyCall(toolUse.Id, toolUse.Name, toolUse.InputJson, null));
+            return true;
         }
 
         public bool TryAddResult(ToolResultBlock toolResult)
@@ -511,17 +551,18 @@ public static class SessionHistoryProjector
                 return false;
             }
 
-            if (this.calls[callIndex].Result is null)
+            if (this.calls[callIndex].Result is not null)
             {
-                this.calls[callIndex] = this.calls[callIndex] with
-                {
-                    Result = new HistoricalResult(
-                        toolResult.Content,
-                        toolResult.IsError,
-                        ParseStatus(toolResult.ToolStatus)),
-                };
+                return false;
             }
 
+            this.calls[callIndex] = this.calls[callIndex] with
+            {
+                Result = new HistoricalResult(
+                    toolResult.Content,
+                    toolResult.IsError,
+                    ParseStatus(toolResult.ToolStatus)),
+            };
             return true;
         }
 

@@ -204,6 +204,82 @@ public sealed class ToolActivityHistoryProjectorTests : IDisposable
     }
 
     [Fact]
+    public void Interleaved_legacy_tool_uses_attach_following_results_to_their_activities()
+    {
+        var history = new List<ChatMessage>
+        {
+            new(ChatRole.Assistant,
+            [
+                new TextBlock("before"),
+                new ToolUseBlock("call-a", "grep", """{"pattern":"a"}"""),
+                new TextBlock("between"),
+                new ToolUseBlock("call-b", "read_file", """{"path":"b"}"""),
+            ]),
+            new(ChatRole.User,
+            [
+                new ToolResultBlock("unknown", "ignored"),
+                new ToolResultBlock("call-a", "A"),
+                new ToolResultBlock("call-b", "B"),
+            ]),
+        };
+
+        var projected = SessionHistoryProjector.Project(history);
+        var activities = projected.OfType<ToolActivityTranscriptBlock>().ToArray();
+
+        Assert.Collection(
+            projected,
+            block => Assert.Equal("before", Assert.IsType<AssistantTranscriptBlock>(block).Text),
+            block => Assert.Same(activities[0], block),
+            block => Assert.Equal("between", Assert.IsType<AssistantTranscriptBlock>(block).Text),
+            block => Assert.Same(activities[1], block));
+        Assert.Equal(["call-a", "call-b"], activities.Select(activity => Assert.Single(activity.Calls).CallId).ToArray());
+        Assert.Equal(
+            ["A", "B"],
+            activities.Select(activity => Assert.Single(activity.Calls).Result ?? string.Empty).ToArray());
+        Assert.All(activities, activity => Assert.Equal(ToolActivityCompletionState.Completed, activity.CompletionState));
+        Assert.All(
+            activities.Select(activity => Assert.Single(activity.Calls)),
+            call => Assert.Equal(ToolCallStatus.Succeeded, call.Status));
+    }
+
+    [Fact]
+    public void Partial_correlation_metadata_falls_back_to_legacy_without_merging()
+    {
+        var partialUse = new ToolUseBlock("partial-call", "grep", """{"pattern":"partial"}""")
+        {
+            RootTurnId = "partial-root",
+        };
+        var partialResult = new ToolResultBlock("partial-call", "partial result")
+        {
+            RootTurnId = "partial-root",
+        };
+        var history = new List<ChatMessage>
+        {
+            new(ChatRole.Assistant,
+            [
+                partialUse,
+                CorrelatedUse("correlated-call", "read_file", "{}", "root", "activity", "root:root"),
+            ]),
+            new(ChatRole.User,
+            [
+                partialResult,
+                CorrelatedResult("correlated-call", "correlated result", ToolCallStatus.Succeeded),
+            ]),
+        };
+
+        var activities = SessionHistoryProjector.Project(history)
+            .OfType<ToolActivityTranscriptBlock>()
+            .ToArray();
+
+        Assert.Equal(2, activities.Length);
+        Assert.Equal("partial-call", Assert.Single(activities[0].Calls).CallId);
+        Assert.Equal("partial result", Assert.Single(activities[0].Calls).Result);
+        Assert.Equal(ToolCallStatus.Succeeded, Assert.Single(activities[0].Calls).Status);
+        Assert.Equal("correlated-call", Assert.Single(activities[1].Calls).CallId);
+        Assert.Equal("correlated result", Assert.Single(activities[1].Calls).Result);
+    }
+
+    [Fact]
     public void Legacy_call_without_a_terminal_result_is_cancelled_in_historical_output()
     {
         var history = new List<ChatMessage>
