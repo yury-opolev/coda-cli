@@ -180,20 +180,32 @@ public static class McpConfig
                 throw new McpException($"MCP config '{path}' must be a JSON object.");
             }
 
-            if (!doc.RootElement.TryGetProperty("mcpServers", out var servers) ||
-                servers.ValueKind != JsonValueKind.Object)
+            if (!doc.RootElement.TryGetProperty("mcpServers", out var servers))
             {
-                throw new McpException($"MCP config '{path}' must contain an mcpServers object.");
+                return new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
+            }
+
+            if (servers.ValueKind != JsonValueKind.Object)
+            {
+                throw new McpException($"MCP config '{path}' must contain an mcpServers object when present.");
             }
 
             var result = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
             foreach (var server in servers.EnumerateObject())
             {
-                var config = ParseServer(server.Value);
-                if (config is not null)
+                if (server.Value.ValueKind != JsonValueKind.Object)
                 {
-                    result[server.Name] = config;
+                    throw new McpException(
+                        $"MCP server '{server.Name}' in config '{path}' has an invalid definition: server values must be JSON objects.");
                 }
+
+                var config = ParseServer(server.Value);
+                if (config is null)
+                {
+                    throw new McpException($"MCP server '{server.Name}' in config '{path}' has an invalid definition.");
+                }
+
+                result[server.Name] = config;
             }
 
             return result;

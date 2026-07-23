@@ -111,6 +111,36 @@ public sealed class McpReadModelTests
         Assert.Contains(sourceFile, exception.Message, StringComparison.Ordinal);
     }
 
+    [Theory]
+    [InlineData("{}")]
+    [InlineData("""{ "$schema": "https://example.test/mcp.schema.json" }""")]
+    public void LoadPhysicalEntries_returns_empty_when_mcpServers_is_absent(string json)
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        File.WriteAllText(McpConfig.FilePath(McpConfigScope.User, work.Path, user.Path), json);
+
+        Assert.Empty(McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+    }
+
+    [Theory]
+    [InlineData("""{ "mcpServers": { "missing-command": {} } }""", "missing-command")]
+    [InlineData("""{ "mcpServers": { "invalid-url": { "type": "http", "url": "not a URL" } } }""", "invalid-url")]
+    [InlineData("""{ "mcpServers": { "unknown-type": { "type": "sse", "url": "https://example.test/mcp" } } }""", "unknown-type")]
+    [InlineData("""{ "mcpServers": { "not-an-object": "invalid" } }""", "not-an-object")]
+    public void LoadPhysicalEntries_rejects_invalid_named_server_definitions(string json, string serverName)
+    {
+        using var work = new TempDir();
+        using var user = new TempDir();
+        var sourceFile = McpConfig.FilePath(McpConfigScope.User, work.Path, user.Path);
+        File.WriteAllText(sourceFile, json);
+
+        var exception = Assert.Throws<McpException>(() => McpConfig.LoadPhysicalEntries(work.Path, user.Path));
+
+        Assert.Contains(serverName, exception.Message, StringComparison.Ordinal);
+        Assert.Contains(sourceFile, exception.Message, StringComparison.Ordinal);
+    }
+
     [Fact]
     public void LoadPhysicalEntries_returns_empty_for_missing_files()
     {
