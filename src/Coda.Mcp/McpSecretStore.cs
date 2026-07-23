@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text;
 using LlmAuth;
 
 namespace Coda.Mcp;
@@ -42,6 +44,46 @@ public static class McpSecretStore
         ArgumentException.ThrowIfNullOrWhiteSpace(server);
         ArgumentException.ThrowIfNullOrWhiteSpace(field);
         return $"mcp:{server}/{field}";
+    }
+
+    /// <summary>
+    /// Gets the credential-store key from an exact managed secret reference. Ordinary Unicode space
+    /// separators are retained inside a key, while surrounding whitespace and unsafe control or
+    /// format characters are rejected.
+    /// </summary>
+    public static bool TryGetStoreKey(string? value, out string storeKey)
+    {
+        storeKey = string.Empty;
+        if (string.IsNullOrEmpty(value)
+            || !value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal))
+        {
+            return false;
+        }
+
+        var candidate = value[McpSecretResolver.SecretRefPrefix.Length..];
+        if (candidate.Length == 0
+            || char.IsWhiteSpace(candidate[0])
+            || char.IsWhiteSpace(candidate[^1])
+            || !IsWellFormedUtf16(candidate))
+        {
+            return false;
+        }
+
+        foreach (var rune in candidate.EnumerateRunes())
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            if (category is UnicodeCategory.Control
+                or UnicodeCategory.Format
+                or UnicodeCategory.LineSeparator
+                or UnicodeCategory.ParagraphSeparator
+                || (Rune.IsWhiteSpace(rune) && category != UnicodeCategory.SpaceSeparator))
+            {
+                return false;
+            }
+        }
+
+        storeKey = candidate;
+        return true;
     }
 
     /// <summary>Encrypt <paramref name="value"/> under <c>mcp:&lt;server&gt;/&lt;field&gt;</c>; returns the reference to store in config.</summary>
@@ -162,9 +204,9 @@ public static class McpSecretStore
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(config);
-        foreach (var key in SecretKeys(config))
+        foreach (var binding in References(config))
         {
-            await store.DeleteAsync(key, cancellationToken).ConfigureAwait(false);
+            await store.DeleteAsync(binding.StoreKey, cancellationToken).ConfigureAwait(false);
         }
     }
 
@@ -179,48 +221,32 @@ public static class McpSecretStore
 
     private static void AddBinding(ICollection<McpSecretBinding> bindings, string field, string? value)
     {
-        if (TryGetManagedSecretKey(value, out var storeKey))
+        if (TryGetStoreKey(value, out var storeKey))
         {
             bindings.Add(new McpSecretBinding(field, storeKey));
         }
     }
 
-    private static bool TryGetManagedSecretKey(string? value, out string storeKey)
+    private static bool IsWellFormedUtf16(string value)
     {
-        storeKey = string.Empty;
-        if (string.IsNullOrEmpty(value)
-            || !value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal))
+        for (var index = 0; index < value.Length; index++)
         {
-            return false;
-        }
-
-        var candidate = value[McpSecretResolver.SecretRefPrefix.Length..];
-        if (string.IsNullOrWhiteSpace(candidate) || candidate.Any(char.IsWhiteSpace))
-        {
-            return false;
-        }
-
-        storeKey = candidate;
-        return true;
-    }
-
-    private static IEnumerable<string> SecretKeys(McpServerConfig config)
-    {
-        IEnumerable<string> values = config switch
-        {
-            McpStdioServerConfig stdio => stdio.Env.Values,
-            McpHttpServerConfig http => http.Auth.BearerToken is { } token
-                ? http.Headers.Values.Append(token)
-                : http.Headers.Values,
-            _ => [],
-        };
-
-        foreach (var value in values)
-        {
-            if (value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal))
+            var character = value[index];
+            if (char.IsHighSurrogate(character))
             {
-                yield return value[McpSecretResolver.SecretRefPrefix.Length..];
+                if (index + 1 >= value.Length || !char.IsLowSurrogate(value[index + 1]))
+                {
+                    return false;
+                }
+
+                index++;
+            }
+            else if (char.IsLowSurrogate(character))
+            {
+                return false;
             }
         }
+
+        return true;
     }
 }

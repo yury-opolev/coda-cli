@@ -135,7 +135,7 @@ public sealed class McpSecretStoreTests
             ["VARIABLE"] = "${TOKEN}",
             ["LITERAL"] = "literal",
             ["EMBEDDED"] = "prefix coda-secret:mcp:github/env/EMBEDDED",
-            ["NON_WHOLE"] = "coda-secret:mcp:github/env/NON_WHOLE suffix",
+            ["NON_WHOLE"] = "coda-secret:mcp:github/env/NON_WHOLE ",
             ["STAGED"] = "coda-secret:mcp:github/env/STAGED/0123456789abcdef0123456789abcdef",
         });
         var http = new McpHttpServerConfig(
@@ -165,6 +165,60 @@ public sealed class McpSecretStoreTests
             new McpSecretBinding("header/Shared", "shared-key"),
         ],
         McpSecretStore.References(http));
+    }
+
+    [Fact]
+    public async Task Stage_KeyFor_and_References_preserve_spaces_in_server_store_keys()
+    {
+        var store = new FakeStore();
+        var key = McpSecretStore.KeyFor("my server", "env/TOKEN");
+        var staged = await McpSecretStore.StageAsync(store, "my server", "env/TOKEN", "secret");
+        var config = new McpStdioServerConfig(
+            "npx",
+            [],
+            new Dictionary<string, string> { ["TOKEN"] = staged.Reference });
+
+        Assert.Equal("mcp:my server/env/TOKEN", key);
+        Assert.StartsWith(key + "/", staged.StoreKey, StringComparison.Ordinal);
+        Assert.Equal(
+            [new McpSecretBinding("env/TOKEN", staged.StoreKey)],
+            McpSecretStore.References(config));
+    }
+
+    [Fact]
+    public async Task References_and_DeleteSecretsAsync_require_exact_safe_managed_references()
+    {
+        const string validKey = "mcp:my server/env/VALID";
+        const string trailingKey = "mcp:my server/env/TRAILING ";
+        const string formatKey = "mcp:my\u200Bserver/env/FORMAT";
+        const string controlKey = "mcp:my\tserver/env/CONTROL";
+        var store = new FakeStore();
+        await store.SetAsync(validKey, "valid");
+        await store.SetAsync(trailingKey, "trailing");
+        await store.SetAsync(formatKey, "format");
+        await store.SetAsync(controlKey, "control");
+        var config = new McpStdioServerConfig(
+            "npx",
+            [],
+            new Dictionary<string, string>
+            {
+                ["VALID"] = "coda-secret:mcp:my server/env/VALID",
+                ["LEADING"] = " coda-secret:mcp:my server/env/LEADING",
+                ["TRAILING"] = "coda-secret:mcp:my server/env/TRAILING ",
+                ["FORMAT"] = "coda-secret:mcp:my\u200Bserver/env/FORMAT",
+                ["CONTROL"] = "coda-secret:mcp:my\tserver/env/CONTROL",
+            });
+
+        Assert.Equal(
+            [new McpSecretBinding("env/VALID", validKey)],
+            McpSecretStore.References(config));
+
+        await McpSecretStore.DeleteSecretsAsync(store, config);
+
+        Assert.Null(await store.GetAsync(validKey));
+        Assert.Equal("trailing", await store.GetAsync(trailingKey));
+        Assert.Equal("format", await store.GetAsync(formatKey));
+        Assert.Equal("control", await store.GetAsync(controlKey));
     }
 
     [Fact]

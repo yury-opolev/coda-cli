@@ -504,7 +504,6 @@ internal sealed partial class McpManagementService : IMcpManagementService
             return ImmutableArray<string>.Empty;
         }
 
-        var seen = new HashSet<string>(StringComparer.Ordinal);
         var result = ImmutableArray.CreateBuilder<string>(values.Length);
         foreach (var value in values)
         {
@@ -514,11 +513,6 @@ internal sealed partial class McpManagementService : IMcpManagementService
             }
 
             ValidateSafeText(value, "An OAuth scope contains unsafe characters.");
-            if (!seen.Add(value))
-            {
-                throw new McpException("OAuth scopes must be unique.");
-            }
-
             result.Add(value);
         }
 
@@ -1128,7 +1122,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         ICollection<string> stagedKeys,
         CancellationToken ct)
     {
-        if (!renamed || !TryGetManagedSecretKey(rawValue, out var oldStoreKey))
+        if (!renamed || !McpSecretStore.TryGetStoreKey(rawValue, out var oldStoreKey))
         {
             return rawValue;
         }
@@ -1272,18 +1266,6 @@ internal sealed partial class McpManagementService : IMcpManagementService
             new McpServerKey(draft.Scope, draft.Name),
             $"MCP server saved. Warning: {SanitizeError(warning)}",
             snapshot);
-    }
-
-    private static bool TryGetManagedSecretKey(string value, out string storeKey)
-    {
-        storeKey = string.Empty;
-        if (!IsWholeManagedReference(value))
-        {
-            return false;
-        }
-
-        storeKey = value[McpSecretResolver.SecretRefPrefix.Length..];
-        return true;
     }
 
     private static Task<T> MutationUnavailable<T>(CancellationToken ct)
@@ -1679,7 +1661,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 Command = string.Equals(draft.Command, baseline.Command, StringComparison.Ordinal)
                     ? stdio.Command
                     : draft.Command,
-                Args = MergeUnchangedStdioArgs(stdio.Args, baseline.Args, draft.Args),
+                Args = MergeUnchangedDisplayedValues(stdio.Args, baseline.Args, draft.Args),
             },
             McpHttpServerConfig http => draft with
             {
@@ -1689,53 +1671,54 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 ClientId = string.Equals(draft.ClientId, baseline.ClientId, StringComparison.Ordinal)
                     ? http.Auth.ClientId
                     : draft.ClientId,
-                Scopes = draft.Scopes.SequenceEqual(baseline.Scopes, StringComparer.Ordinal)
-                    ? (http.Auth.Scopes ?? []).ToImmutableArray()
-                    : draft.Scopes,
+                Scopes = MergeUnchangedDisplayedValues(
+                    http.Auth.Scopes ?? [],
+                    baseline.Scopes,
+                    draft.Scopes),
             },
             _ => throw new McpException("MCP configuration has an unsupported transport."),
         };
     }
 
-    private static ImmutableArray<string> MergeUnchangedStdioArgs(
-        IReadOnlyList<string> originalArgs,
-        ImmutableArray<string> baselineDisplayedArgs,
-        ImmutableArray<string> editedArgs)
+    private static ImmutableArray<string> MergeUnchangedDisplayedValues(
+        IReadOnlyList<string> originalValues,
+        ImmutableArray<string> baselineDisplayedValues,
+        ImmutableArray<string> editedValues)
     {
-        if (originalArgs.Count != baselineDisplayedArgs.Length
-            || originalArgs.Count == 0
-            || editedArgs.IsDefaultOrEmpty)
+        if (originalValues.Count != baselineDisplayedValues.Length
+            || originalValues.Count == 0
+            || editedValues.IsDefaultOrEmpty)
         {
-            return editedArgs;
+            return editedValues;
         }
 
-        var rawForEditedIndex = new string?[editedArgs.Length];
-        var matchedOriginal = new bool[originalArgs.Count];
-        var matchedEdited = new bool[editedArgs.Length];
+        var rawForEditedIndex = new string?[editedValues.Length];
+        var matchedOriginal = new bool[originalValues.Count];
+        var matchedEdited = new bool[editedValues.Length];
 
-        if (((long)baselineDisplayedArgs.Length + 1) * ((long)editedArgs.Length + 1) <= maximumLcsCells)
+        if (((long)baselineDisplayedValues.Length + 1) * ((long)editedValues.Length + 1) <= maximumLcsCells)
         {
             foreach (var (originalIndex, editedIndex) in LongestCommonSubsequenceMatches(
-                         baselineDisplayedArgs,
-                         editedArgs))
+                         baselineDisplayedValues,
+                         editedValues))
             {
-                rawForEditedIndex[editedIndex] = originalArgs[originalIndex];
+                rawForEditedIndex[editedIndex] = originalValues[originalIndex];
                 matchedOriginal[originalIndex] = true;
                 matchedEdited[editedIndex] = true;
             }
         }
 
-        // The ordinal queues also retain values moved outside of the LCS and avoid
-        // allocating quadratically for large user-provided argument arrays.
+        // The ordinal queues retain values moved outside the LCS and keep identical
+        // safe display values deterministic without quadratic allocation.
         var remainingOriginalByDisplay = new Dictionary<string, Queue<int>>(StringComparer.Ordinal);
-        for (var originalIndex = 0; originalIndex < baselineDisplayedArgs.Length; originalIndex++)
+        for (var originalIndex = 0; originalIndex < baselineDisplayedValues.Length; originalIndex++)
         {
             if (matchedOriginal[originalIndex])
             {
                 continue;
             }
 
-            var display = baselineDisplayedArgs[originalIndex];
+            var display = baselineDisplayedValues[originalIndex];
             if (!remainingOriginalByDisplay.TryGetValue(display, out var remainingIndices))
             {
                 remainingIndices = new Queue<int>();
@@ -1745,41 +1728,41 @@ internal sealed partial class McpManagementService : IMcpManagementService
             remainingIndices.Enqueue(originalIndex);
         }
 
-        for (var editedIndex = 0; editedIndex < editedArgs.Length; editedIndex++)
+        for (var editedIndex = 0; editedIndex < editedValues.Length; editedIndex++)
         {
             if (matchedEdited[editedIndex]
-                || !remainingOriginalByDisplay.TryGetValue(editedArgs[editedIndex], out var remainingIndices)
+                || !remainingOriginalByDisplay.TryGetValue(editedValues[editedIndex], out var remainingIndices)
                 || remainingIndices.Count == 0)
             {
                 continue;
             }
 
             var originalIndex = remainingIndices.Dequeue();
-            rawForEditedIndex[editedIndex] = originalArgs[originalIndex];
+            rawForEditedIndex[editedIndex] = originalValues[originalIndex];
         }
 
-        var merged = ImmutableArray.CreateBuilder<string>(editedArgs.Length);
-        for (var editedIndex = 0; editedIndex < editedArgs.Length; editedIndex++)
+        var merged = ImmutableArray.CreateBuilder<string>(editedValues.Length);
+        for (var editedIndex = 0; editedIndex < editedValues.Length; editedIndex++)
         {
-            merged.Add(rawForEditedIndex[editedIndex] ?? editedArgs[editedIndex]);
+            merged.Add(rawForEditedIndex[editedIndex] ?? editedValues[editedIndex]);
         }
 
         return merged.MoveToImmutable();
     }
 
     private static IEnumerable<(int OriginalIndex, int EditedIndex)> LongestCommonSubsequenceMatches(
-        ImmutableArray<string> baselineDisplayedArgs,
-        ImmutableArray<string> editedArgs)
+        ImmutableArray<string> baselineDisplayedValues,
+        ImmutableArray<string> editedValues)
     {
-        var lengths = new int[baselineDisplayedArgs.Length + 1, editedArgs.Length + 1];
-        for (var originalIndex = baselineDisplayedArgs.Length - 1; originalIndex >= 0; originalIndex--)
+        var lengths = new int[baselineDisplayedValues.Length + 1, editedValues.Length + 1];
+        for (var originalIndex = baselineDisplayedValues.Length - 1; originalIndex >= 0; originalIndex--)
         {
-            for (var editedIndex = editedArgs.Length - 1; editedIndex >= 0; editedIndex--)
+            for (var editedIndex = editedValues.Length - 1; editedIndex >= 0; editedIndex--)
             {
                 lengths[originalIndex, editedIndex] =
                     string.Equals(
-                        baselineDisplayedArgs[originalIndex],
-                        editedArgs[editedIndex],
+                        baselineDisplayedValues[originalIndex],
+                        editedValues[editedIndex],
                         StringComparison.Ordinal)
                         ? lengths[originalIndex + 1, editedIndex + 1] + 1
                         : Math.Max(
@@ -1790,11 +1773,11 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
         var original = 0;
         var edited = 0;
-        while (original < baselineDisplayedArgs.Length && edited < editedArgs.Length)
+        while (original < baselineDisplayedValues.Length && edited < editedValues.Length)
         {
             if (string.Equals(
-                    baselineDisplayedArgs[original],
-                    editedArgs[edited],
+                    baselineDisplayedValues[original],
+                    editedValues[edited],
                     StringComparison.Ordinal)
                 && lengths[original, edited] == lengths[original + 1, edited + 1] + 1)
             {
@@ -1953,7 +1936,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             return McpSecretSource.None;
         }
 
-        if (IsWholeManagedReference(value))
+        if (McpSecretStore.TryGetStoreKey(value, out _))
         {
             return McpSecretSource.Managed;
         }
@@ -1961,17 +1944,6 @@ internal sealed partial class McpManagementService : IMcpManagementService
         return value.Contains("${", StringComparison.Ordinal)
             ? McpSecretSource.Environment
             : McpSecretSource.Literal;
-    }
-
-    private static bool IsWholeManagedReference(string value)
-    {
-        if (!value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal))
-        {
-            return false;
-        }
-
-        var key = value[McpSecretResolver.SecretRefPrefix.Length..];
-        return key.Length > 0 && !key.Any(char.IsWhiteSpace);
     }
 
     private static string DisplayValueFor(McpSecretSource source) => source switch
