@@ -376,6 +376,31 @@ public sealed class InlineTuiShellTests
     }
 
     [Fact]
+    public void Inline_composer_ctrl_end_jumps_to_newest()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Transcript.ReplaceAll(Lines(50));
+        shell.Transcript.ScrollBy(-10);
+        shell.Composer.SetFocus();
+
+        shell.Composer.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.True(shell.Transcript.AutoFollow);
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public async Task Closing_prompt_overlay_restores_composer_focus()
     {
         using IApplication app = Application.Create();

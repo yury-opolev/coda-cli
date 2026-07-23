@@ -445,12 +445,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// </summary>
     private bool TryHandleShellKey(Key key)
     {
-        if (this.PromptOverlay.Visible)
-        {
-            return false;
-        }
-
-        if (this.taskOverlay?.Visible == true)
+        if (this.HasVisibleModalOverlay())
         {
             // While the browser is up it owns the keyboard (it holds focus); the shell chords stand down so
             // Ctrl+B is consumed by the overlay, never re-interpreted as the background chord below.
@@ -505,9 +500,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return this.ApplyChord(this.chords.HandleCtrlC());
         }
 
-        if (key == Key.End.WithCtrl)
+        if (this.TryHandleTranscriptNavigationKey(key))
         {
-            this.TranscriptView.JumpToNewest();
             return true;
         }
 
@@ -525,6 +519,31 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
 
         return false;
+    }
+
+    /// <inheritdoc />
+    protected override bool OnKeyDown(Key key)
+    {
+        if (this.HasVisibleModalOverlay())
+        {
+            return false;
+        }
+
+        return this.TryHandleTranscriptNavigationKey(key) || base.OnKeyDown(key);
+    }
+
+    private bool HasVisibleModalOverlay() =>
+        this.PromptOverlay.Visible || this.taskOverlay?.Visible == true;
+
+    private bool TryHandleTranscriptNavigationKey(Key key)
+    {
+        if (this.HasVisibleModalOverlay() || key != Key.End.WithCtrl)
+        {
+            return false;
+        }
+
+        this.TranscriptView.JumpToNewest();
+        return true;
     }
 
     /// <summary>

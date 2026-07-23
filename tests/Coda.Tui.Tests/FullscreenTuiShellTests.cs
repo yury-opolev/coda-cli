@@ -454,6 +454,22 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
+    public void Ctrl_end_reaches_bottom_from_an_ordinary_main_shell_focus()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        var view = fixture.Shell.Transcript;
+        view.ReplaceAll(Lines(50));
+        view.ScrollBy(-10);
+        fixture.Shell.Status.CanFocus = true;
+        fixture.Shell.Status.SetFocus();
+        Assert.True(fixture.Shell.Status.HasFocus);
+
+        fixture.Shell.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.True(view.AutoFollow);
+    }
+
+    [Fact]
     public async Task Fullscreen_streaming_snapshot_preserves_the_detached_anchor()
     {
         using var fixture = RetainedShellFixture.Create(

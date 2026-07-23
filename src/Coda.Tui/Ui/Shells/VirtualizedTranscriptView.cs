@@ -592,15 +592,15 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        if (key == Key.Home.WithCtrl)
+        if (key == Key.Home || key == Key.Home.WithCtrl)
         {
             this.MoveToRow(0);
             return true;
         }
 
-        if (key == Key.End.WithCtrl)
+        if (key == Key.End || key == Key.End.WithCtrl)
         {
-            this.MoveToRow(this.viewport.MaxTopRow);
+            this.JumpToNewest();
             return true;
         }
 

@@ -79,6 +79,109 @@ public sealed class TranscriptNavigationChromeTests
     }
 
     [Fact]
+    public void Transcript_navigation_keys_detach_and_end_restores_following_once()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        var view = fixture.Shell.Transcript;
+        view.ReplaceAll(Blocks(50));
+        var scrolled = 0;
+        view.TranscriptScrolled += () => scrolled++;
+
+        view.NewKeyDownEvent(Key.CursorUp);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+        view.NewKeyDownEvent(Key.PageUp);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+
+        view.NewKeyDownEvent(Key.Home);
+        Assert.Equal(0, view.TopRow);
+        Assert.Equal(TranscriptFollowMode.Detached, view.FollowModeForTest);
+        view.NewKeyDownEvent(Key.Home.WithCtrl);
+        Assert.Equal(0, view.TopRow);
+
+        view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "unseen"));
+        Assert.True(view.UnseenBlocks > 0);
+        var beforeEnd = scrolled;
+
+        view.NewKeyDownEvent(Key.End);
+
+        Assert.Equal(beforeEnd + 1, scrolled);
+        Assert.Equal(TranscriptFollowMode.Following, view.FollowModeForTest);
+        Assert.Equal(0, view.UnseenRows);
+        Assert.Equal(0, view.UnseenBlocks);
+    }
+
+    [Fact]
+    public void Ctrl_end_reaches_bottom_from_the_shell_root()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        var view = fixture.Shell.Transcript;
+        view.ReplaceAll(Blocks(50));
+        view.ScrollBy(-10);
+
+        fixture.Shell.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.True(view.AutoFollow);
+    }
+
+    [Fact]
+    public async Task Ctrl_end_does_not_move_transcript_behind_the_prompt_overlay()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        var view = fixture.Shell.Transcript;
+        var transcript = Blocks(50);
+        view.ReplaceAll(transcript);
+        view.ScrollBy(-10);
+        var top = view.TopRow;
+        await fixture.Shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                Transcript = transcript,
+                PendingPrompt = Coda.Tui.Ui.Prompts.UiPromptRequest.Confirm("Allow?", defaultValue: false),
+            },
+            CancellationToken.None);
+
+        fixture.Shell.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.Equal(top, view.TopRow);
+        Assert.False(view.AutoFollow);
+    }
+
+    [Fact]
+    public void Ctrl_end_does_not_move_transcript_behind_the_task_overlay()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            taskBrowserProvider: () => null);
+        var view = fixture.Shell.Transcript;
+        view.ReplaceAll(Blocks(50));
+        view.ScrollBy(-10);
+        var top = view.TopRow;
+        fixture.Shell.Composer.SetDraft("/tasks", 6);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.True(fixture.Shell.TaskOverlay!.Visible);
+
+        fixture.Shell.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.Equal(top, view.TopRow);
+        Assert.False(view.AutoFollow);
+    }
+
+    [Fact]
+    public void Plain_composer_end_moves_its_caret_without_jumping_the_transcript()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        var view = fixture.Shell.Transcript;
+        view.ReplaceAll(Blocks(50));
+        view.ScrollBy(-10);
+        fixture.Shell.Composer.SetDraft("first\nsecond", 0);
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.End);
+
+        Assert.Equal(5, fixture.Shell.ExportComposerState().CursorIndex);
+        Assert.False(view.AutoFollow);
+    }
+
+    [Fact]
     public void Separator_click_does_not_expand_its_semantic_block()
     {
         using var fixture = RetainedShellFixture.Create(activeWork: false);
