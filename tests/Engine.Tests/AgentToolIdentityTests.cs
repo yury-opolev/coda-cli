@@ -421,6 +421,71 @@ public sealed class AgentToolIdentityTests
     }
 
     [Fact]
+    public async Task Committed_tool_history_blocks_keep_correlation_and_terminal_status()
+    {
+        var root = new ToolActivityContext("root-turn", "root:root-turn");
+        var steering = new SteeringInbox();
+        var first = new DelegateTool(
+            "first",
+            true,
+            (_, _, _) =>
+            {
+                steering.Enqueue("redirect");
+                return Task.FromResult(new ToolResult("first complete"));
+            });
+        var history = History();
+        var loop = new AgentLoop(
+            new ScriptedClient(
+                ToolTurn(
+                    new ToolUseBlock("unknown-id", "unknown", "{}"),
+                    new ToolUseBlock("first-id", "first", "{}"),
+                    new ToolUseBlock("skipped-id", "skipped", "{}")),
+                EndTurn()),
+            new ToolRegistry([first]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            steering: steering,
+            toolActivity: root);
+
+        await loop.RunAsync(history, new CorrelatedSink());
+
+        var toolUses = history.SelectMany(message => message.Content).OfType<ToolUseBlock>().ToArray();
+        var results = history.SelectMany(message => message.Content).OfType<ToolResultBlock>().ToArray();
+        Assert.Equal(["unknown-id", "first-id", "skipped-id"], toolUses.Select(block => block.Id));
+        Assert.All(toolUses, block =>
+        {
+            Assert.Equal("root-turn", block.RootTurnId);
+            Assert.NotNull(block.ActivityId);
+            Assert.Equal("root:root-turn", block.SourceId);
+        });
+        Assert.Single(toolUses.Select(block => block.ActivityId).Distinct());
+
+        Assert.Collection(
+            results,
+            block =>
+            {
+                Assert.Equal("unknown-id", block.ToolUseId);
+                Assert.Equal("Failed", block.ToolStatus);
+            },
+            block =>
+            {
+                Assert.Equal("first-id", block.ToolUseId);
+                Assert.Equal("Succeeded", block.ToolStatus);
+            },
+            block =>
+            {
+                Assert.Equal("skipped-id", block.ToolUseId);
+                Assert.Equal("Skipped", block.ToolStatus);
+            });
+        Assert.All(results, block =>
+        {
+            Assert.Equal("root-turn", block.RootTurnId);
+            Assert.Equal(toolUses[0].ActivityId, block.ActivityId);
+            Assert.Equal("root:root-turn", block.SourceId);
+        });
+    }
+
+    [Fact]
     public async Task Progress_heartbeats_keep_the_correct_identity_for_repeated_tool_names()
     {
         var slow = new DelegateTool(

@@ -103,6 +103,33 @@ public sealed class ScheduledAgentHostTests : IDisposable
         }
     }
 
+    private sealed class CorrelatedLoopFactory(
+        Func<int, IAgentSink, ToolCallIdentity, Task> body) : IAgentLoopFactory
+    {
+        private int firing;
+
+        public List<AgentLoopSpec> Specs { get; } = [];
+
+        public IAgentLoop Create(AgentLoopSpec spec)
+        {
+            this.Specs.Add(spec);
+            var currentFiring = this.firing++;
+            return new CorrelatedLoop(
+                spec.ToolActivity ?? throw new InvalidOperationException("Expected a root tool activity."),
+                (sink, identity) => body(currentFiring, sink, identity));
+        }
+    }
+
+    private sealed class CorrelatedLoop(
+        ToolActivityContext activity,
+        Func<IAgentSink, ToolCallIdentity, Task> body) : IAgentLoop
+    {
+        public GoalStatus? LastGoalStatus => null;
+
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default) =>
+            body(sink, activity.EnsureActivity().ForCall("scheduled-call"));
+    }
+
     /// <summary>A loop whose body is a supplied delegate; captures the history it is run against.</summary>
     private sealed class ProgrammableLoop(Func<List<ChatMessage>, IAgentSink, CancellationToken, Task> body) : IAgentLoop
     {
@@ -179,6 +206,19 @@ public sealed class ScheduledAgentHostTests : IDisposable
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+    }
+
+    private sealed class CompletionSink : IAgentSink
+    {
+        public List<ToolActivitySummary> Completions { get; } = [];
+
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+
+        public void OnToolActivityCompleted(ToolActivitySummary summary) => this.Completions.Add(summary);
     }
 
     // ---- Builders --------------------------------------------------------------------------
@@ -429,6 +469,60 @@ public sealed class ScheduledAgentHostTests : IDisposable
         Assert.Single(loop.SeenHistory!);
         var block = Assert.IsType<TextBlock>(loop.SeenHistory![0].Content[0]);
         Assert.Equal("do the work", block.Text);
+    }
+
+    [Fact]
+    public async Task RunScheduledAsync_uses_fresh_roots_and_finalizes_success_cancellation_and_fault_once()
+    {
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        using var http = new HttpClient();
+        var factory = new CorrelatedLoopFactory((firing, sink, identity) =>
+        {
+            sink.OnToolQueued(identity, "probe", "{}");
+            sink.OnToolCall(identity, "probe", "{}");
+
+            if (firing == 0)
+            {
+                sink.OnToolStatus(identity, "probe", ToolCallStatus.Running);
+                sink.OnToolResult(identity, "probe", new ToolResult("ok"), ToolCallStatus.Succeeded);
+                return Task.CompletedTask;
+            }
+
+            if (firing == 1)
+            {
+                sink.OnToolStatus(identity, "probe", ToolCallStatus.Running);
+                return Task.FromException(new OperationCanceledException());
+            }
+
+            return Task.FromException(new InvalidOperationException("boom"));
+        });
+        var sink = new CompletionSink();
+        var host = this.NewHost(
+            () => this.Options(),
+            new FakeClientFactory(new InertClient()),
+            factory,
+            builder,
+            http);
+
+        await host.RunScheduledAsync("success", sink, new SteeringInbox(), "task-1", 1, CancellationToken.None);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            host.RunScheduledAsync("cancel", sink, new SteeringInbox(), "task-2", 1, CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            host.RunScheduledAsync("fault", sink, new SteeringInbox(), "task-3", 1, CancellationToken.None));
+
+        Assert.Equal(3, factory.Specs.Count);
+        Assert.Equal(3, sink.Completions.Count);
+        Assert.Equal(
+            factory.Specs.Select(spec => spec.ToolActivity!.RootTurnId),
+            sink.Completions.Select(summary => summary.RootTurnId));
+        Assert.Equal(3, factory.Specs.Select(spec => spec.ToolActivity!.RootTurnId).Distinct().Count());
+        Assert.Equal(0, sink.Completions[0].CancelledCalls);
+        Assert.Equal(0, sink.Completions[0].SkippedCalls);
+        Assert.Equal(1, sink.Completions[1].CancelledCalls);
+        Assert.Equal(0, sink.Completions[1].SkippedCalls);
+        Assert.Equal(0, sink.Completions[2].CancelledCalls);
+        Assert.Equal(1, sink.Completions[2].SkippedCalls);
     }
 
     [Fact]

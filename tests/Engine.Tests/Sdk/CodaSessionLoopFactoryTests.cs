@@ -59,6 +59,54 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
         }
     }
 
+    private sealed class CorrelatedLoopFactory(
+        Func<IAgentSink, ToolCallIdentity, Task> body) : IAgentLoopFactory
+    {
+        public List<AgentLoopSpec> Specs { get; } = [];
+
+        public IAgentLoop Create(AgentLoopSpec spec)
+        {
+            this.Specs.Add(spec);
+            return new CorrelatedFakeLoop(
+                spec.ToolActivity ?? throw new InvalidOperationException("Expected a root tool activity."),
+                body);
+        }
+    }
+
+    private sealed class CorrelatedFakeLoop(
+        ToolActivityContext activity,
+        Func<IAgentSink, ToolCallIdentity, Task> body) : IAgentLoop
+    {
+        public GoalStatus? LastGoalStatus => null;
+
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default) =>
+            body(sink, activity.EnsureActivity().ForCall("provider-call-id"));
+    }
+
+    private sealed class CompletionSink : IAgentSink
+    {
+        public List<ToolActivitySummary> Completions { get; } = [];
+
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+
+        public void OnToolActivityCompleted(ToolActivitySummary summary) => this.Completions.Add(summary);
+    }
+
+    private static Task EmitSucceededToolAsync(IAgentSink sink, ToolCallIdentity identity)
+    {
+        sink.OnToolQueued(identity, "probe", "{}");
+        sink.OnToolCall(identity, "probe", "{}");
+        sink.OnToolStatus(identity, "probe", ToolCallStatus.Running);
+        sink.OnToolResult(identity, "probe", new ToolResult("ok"), ToolCallStatus.Succeeded);
+        sink.OnAssistantText("done");
+        sink.OnAssistantTextComplete();
+        return Task.CompletedTask;
+    }
+
     [Fact]
     public async Task RunAsync_drives_the_loop_from_the_injected_factory()
     {
@@ -82,6 +130,110 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
         Assert.NotNull(loopFactory.LastSpec.Tools);
         Assert.NotNull(loopFactory.LastSpec.Permissions);
         Assert.Equal("claude-sonnet-4-6", loopFactory.LastSpec.Options.Model);
+        Assert.NotNull(loopFactory.LastSpec.ToolActivity);
+        Assert.Equal(loopFactory.LastSpec.ToolActivity.RootTurnId, result.RootTurnId);
+        Assert.Null(result.ToolActivity);
+    }
+
+    [Fact]
+    public async Task RunAsync_attaches_root_activity_to_the_loop_and_returns_the_completed_summary()
+    {
+        using var http = new HttpClient(new SseTestHandler(MessageStopOnly));
+        var factory = new CorrelatedLoopFactory(EmitSucceededToolAsync);
+        var sink = new CompletionSink();
+        using var session = new CodaSession(
+            SignedInClaude(),
+            this.Options(),
+            httpClient: http,
+            agentLoopFactory: factory);
+
+        var result = await session.RunAsync("hi", sink);
+
+        var root = Assert.IsType<ToolActivityContext>(Assert.Single(factory.Specs).ToolActivity);
+        var summary = Assert.IsType<ToolActivitySummary>(result.ToolActivity);
+        var call = Assert.Single(result.ToolCalls);
+        Assert.Equal(root.RootTurnId, result.RootTurnId);
+        Assert.Equal(root.RootTurnId, summary.RootTurnId);
+        Assert.Equal(summary.ActivityId, call.ActivityId);
+        Assert.Equal("provider-call-id", call.CallId);
+        Assert.Equal(ToolCallStatus.Succeeded, call.Status);
+        Assert.Equal([summary], sink.Completions);
+    }
+
+    [Fact]
+    public async Task RunAsync_creates_a_fresh_root_activity_for_each_run()
+    {
+        using var http = new HttpClient(new SseTestHandler(MessageStopOnly));
+        var factory = new CorrelatedLoopFactory(EmitSucceededToolAsync);
+        using var session = new CodaSession(
+            SignedInClaude(),
+            this.Options(),
+            httpClient: http,
+            agentLoopFactory: factory);
+
+        var first = await session.RunAsync("first");
+        var second = await session.RunAsync("second");
+
+        Assert.Equal(2, factory.Specs.Count);
+        Assert.NotEqual(first.RootTurnId, second.RootTurnId);
+        Assert.Equal(factory.Specs[0].ToolActivity!.RootTurnId, first.RootTurnId);
+        Assert.Equal(factory.Specs[1].ToolActivity!.RootTurnId, second.RootTurnId);
+        Assert.Equal(first.RootTurnId, Assert.IsType<ToolActivitySummary>(first.ToolActivity).RootTurnId);
+        Assert.Equal(second.RootTurnId, Assert.IsType<ToolActivitySummary>(second.ToolActivity).RootTurnId);
+    }
+
+    [Fact]
+    public async Task RunAsync_finalizes_an_active_call_once_when_canceled()
+    {
+        using var http = new HttpClient(new SseTestHandler(MessageStopOnly));
+        var factory = new CorrelatedLoopFactory((sink, identity) =>
+        {
+            sink.OnToolQueued(identity, "probe", "{}");
+            sink.OnToolCall(identity, "probe", "{}");
+            sink.OnToolStatus(identity, "probe", ToolCallStatus.Running);
+            throw new OperationCanceledException();
+        });
+        var sink = new CompletionSink();
+        using var session = new CodaSession(
+            SignedInClaude(),
+            this.Options(),
+            httpClient: http,
+            agentLoopFactory: factory);
+
+        var result = await session.RunAsync("hi", sink);
+
+        var summary = Assert.IsType<ToolActivitySummary>(result.ToolActivity);
+        Assert.False(result.Success);
+        Assert.Equal(1, summary.CancelledCalls);
+        Assert.Equal(0, summary.SkippedCalls);
+        Assert.Equal(ToolCallStatus.Cancelled, Assert.Single(result.ToolCalls).Status);
+        Assert.Equal([summary], sink.Completions);
+    }
+
+    [Fact]
+    public async Task RunAsync_finalizes_a_pending_call_once_when_the_loop_faults()
+    {
+        using var http = new HttpClient(new SseTestHandler(MessageStopOnly));
+        var factory = new CorrelatedLoopFactory((sink, identity) =>
+        {
+            sink.OnToolQueued(identity, "probe", "{}");
+            throw new InvalidOperationException("boom");
+        });
+        var sink = new CompletionSink();
+        using var session = new CodaSession(
+            SignedInClaude(),
+            this.Options(),
+            httpClient: http,
+            agentLoopFactory: factory);
+
+        var result = await session.RunAsync("hi", sink);
+
+        var summary = Assert.IsType<ToolActivitySummary>(result.ToolActivity);
+        Assert.False(result.Success);
+        Assert.Equal(0, summary.CancelledCalls);
+        Assert.Equal(1, summary.SkippedCalls);
+        Assert.Equal(ToolCallStatus.Skipped, Assert.Single(result.ToolCalls).Status);
+        Assert.Equal([summary], sink.Completions);
     }
 
     [Fact]

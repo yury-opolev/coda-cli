@@ -437,6 +437,22 @@ public sealed partial class AgentLoop : IAgentLoop
                     assistantContent.Add(new TextBlock(text.ToString()));
                 }
 
+                if (toolUses.Count > 0)
+                {
+                    activity = activity.EnsureActivity();
+                    for (var index = 0; index < toolUses.Count; index++)
+                    {
+                        var toolUse = toolUses[index];
+                        var identity = activity.ForCall(toolUse.Id);
+                        toolUses[index] = toolUse with
+                        {
+                            RootTurnId = identity.RootTurnId,
+                            ActivityId = identity.ActivityId,
+                            SourceId = identity.SourceId,
+                        };
+                    }
+                }
+
                 assistantContent.AddRange(toolUses);
                 history.Add(new ChatMessage(ChatRole.Assistant, assistantContent));
 
@@ -562,7 +578,6 @@ public sealed partial class AgentLoop : IAgentLoop
                 // direct result of a prior stop-hook continuation. Reset so stop hooks
                 // treat the next natural stop correctly.
                 stopHookActive = false;
-                activity = activity.EnsureActivity();
                 var resultBlocks = await this.RunToolsAsync(toolUses, activity, sink, cancellationToken).ConfigureAwait(false);
                 history.Add(new ChatMessage(ChatRole.User, resultBlocks));
 
@@ -649,7 +664,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         "Skipped: not executed because new operator steering arrived before this tool started.",
                         IsError: true);
                     sink.OnToolResult(skippedIdentity, skipped.Name, skippedResult, ToolCallStatus.Skipped);
-                    results.Add(new ToolResultBlock(skipped.Id, skippedResult.Content, skippedResult.IsError));
+                    results.Add(CreateToolResultBlock(skippedIdentity, skippedResult, ToolCallStatus.Skipped));
                 }
 
                 results.Add(new TextBlock(string.Join("\n\n", delivered.Select(entry => entry.Text))));
@@ -665,7 +680,7 @@ public sealed partial class AgentLoop : IAgentLoop
             {
                 var unknown = new ToolResult($"Unknown tool '{toolUse.Name}'.", IsError: true);
                 sink.OnToolResult(identity, toolUse.Name, unknown, ToolCallStatus.Failed);
-                results.Add(new ToolResultBlock(toolUse.Id, unknown.Content, unknown.IsError));
+                results.Add(CreateToolResultBlock(identity, unknown, ToolCallStatus.Failed));
                 continue;
             }
 
@@ -683,7 +698,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         $"Blocked by hook: {hookResult.Message}",
                         IsError: true);
                     sink.OnToolResult(identity, toolUse.Name, blocked, ToolCallStatus.Failed);
-                    results.Add(new ToolResultBlock(toolUse.Id, blocked.Content, blocked.IsError));
+                    results.Add(CreateToolResultBlock(identity, blocked, ToolCallStatus.Failed));
                     continue;
                 }
             }
@@ -706,7 +721,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 {
                     var promptError = new ToolResult($"Permission prompt error: {ex.Message}", IsError: true);
                     sink.OnToolResult(identity, toolUse.Name, promptError, ToolCallStatus.Failed);
-                    results.Add(new ToolResultBlock(toolUse.Id, promptError.Content, promptError.IsError));
+                    results.Add(CreateToolResultBlock(identity, promptError, ToolCallStatus.Failed));
                     continue;
                 }
 
@@ -714,7 +729,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 {
                     var denied = new ToolResult("Permission denied by the user.", IsError: true);
                     sink.OnToolResult(identity, toolUse.Name, denied, ToolCallStatus.Failed);
-                    results.Add(new ToolResultBlock(toolUse.Id, denied.Content, denied.IsError));
+                    results.Add(CreateToolResultBlock(identity, denied, ToolCallStatus.Failed));
                     continue;
                 }
             }
@@ -805,13 +820,10 @@ public sealed partial class AgentLoop : IAgentLoop
                 }
             }
 
-            sink.OnToolResult(
-                identity,
-                toolUse.Name,
-                result,
-                result.IsError ? ToolCallStatus.Failed : ToolCallStatus.Succeeded);
+            var terminalStatus = result.IsError ? ToolCallStatus.Failed : ToolCallStatus.Succeeded;
+            sink.OnToolResult(identity, toolUse.Name, result, terminalStatus);
             this.LogToolResult(toolUse.Name, result.IsError, result.Content.Length);
-            results.Add(new ToolResultBlock(toolUse.Id, result.Content, result.IsError));
+            results.Add(CreateToolResultBlock(identity, result, terminalStatus));
 
             // EDIT SEAM: when a mutating file tool succeeds, notify the LSP server
             // about the new file content (change + save) so it can publish diagnostics.
@@ -824,6 +836,18 @@ public sealed partial class AgentLoop : IAgentLoop
 
         return results;
     }
+
+    private static ToolResultBlock CreateToolResultBlock(
+        ToolCallIdentity identity,
+        ToolResult result,
+        ToolCallStatus status) =>
+        new(identity.CallId, result.Content, result.IsError)
+        {
+            RootTurnId = identity.RootTurnId,
+            ActivityId = identity.ActivityId,
+            SourceId = identity.SourceId,
+            ToolStatus = status.ToString(),
+        };
 
     /// <summary>
     /// Best-effort incremental transcript persist ("record on the go"). Invoked after each

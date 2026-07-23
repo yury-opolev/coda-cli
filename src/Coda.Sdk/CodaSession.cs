@@ -385,30 +385,63 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // A previous natural turn seals its inbox. Reopen before publishing the next loop spec,
         // without dropping a steer that raced a serve host's transition into this turn.
         this.steeringInbox.OpenForTurn();
-        var options = this.ResolveEffectiveOptions();
-        var client = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
-        if (client is null)
+        var rootToolActivity = ToolActivityContext.CreateRoot();
+        var recording = new RecordingSink(sink);
+        ToolActivitySummary? completedToolActivity = null;
+        var toolActivityFinalized = false;
+
+        ToolActivitySummary? CompleteToolActivity(bool interrupted)
         {
-            return new RunResult(false, string.Empty, [], null, $"No chat client for provider '{options.ProviderId}'.");
+            if (toolActivityFinalized)
+            {
+                return completedToolActivity;
+            }
+
+            toolActivityFinalized = true;
+            completedToolActivity = recording.CompleteActivity(interrupted);
+            return completedToolActivity;
         }
 
-        // Load allow/deny rules, user hooks, and goal/LSP settings once for the turn, then delegate
-        // the per-turn assembly (agent options, permission stack, goal supervisor, tools, subagent
-        // host, and the loop spec) to the pipeline builder.
-        var settings = SettingsLoader.Load(options.WorkingDirectory);
-        var loopSpec = this.turnPipelineBuilder.BuildSpec(options, client, settings) with
+        SessionOptions options;
+        AgentLoopSpec loopSpec;
+        IAgentLoop loop;
+        ILlmClient client;
+        try
         {
-            Steering = this.steeringInbox,
-            // Record on the go: the loop persists the transcript after every turn/tool cycle, so a
-            // session killed mid-run still leaves a record (not just the once-at-the-end save below).
-            PersistTurnAsync = this.PersistTranscriptAsync,
-            // The stable per-session cooperative gate: lets an outside actor pause the loop at an
-            // iteration boundary. Inert unless a pause is requested, so serve/headless are unchanged.
-            Gate = this.ExecutionGate,
-        };
-        var loop = this.agentLoopFactory.Create(loopSpec);
+            options = this.ResolveEffectiveOptions();
+            var resolvedClient = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
+            if (resolvedClient is null)
+            {
+                return new RunResult(false, string.Empty, [], null, $"No chat client for provider '{options.ProviderId}'.")
+                {
+                    RootTurnId = rootToolActivity.RootTurnId,
+                    ToolActivity = CompleteToolActivity(interrupted: false),
+                };
+            }
 
-        var recording = new RecordingSink(sink);
+            client = resolvedClient;
+            // Load allow/deny rules, user hooks, and goal/LSP settings once for the turn, then delegate
+            // the per-turn assembly (agent options, permission stack, goal supervisor, tools, subagent
+            // host, and the loop spec) to the pipeline builder.
+            var settings = SettingsLoader.Load(options.WorkingDirectory);
+            loopSpec = this.turnPipelineBuilder.BuildSpec(options, client, settings) with
+            {
+                Steering = this.steeringInbox,
+                // Record on the go: the loop persists the transcript after every turn/tool cycle, so a
+                // session killed mid-run still leaves a record (not just the once-at-the-end save below).
+                PersistTurnAsync = this.PersistTranscriptAsync,
+                // The stable per-session cooperative gate: lets an outside actor pause the loop at an
+                // iteration boundary. Inert unless a pause is requested, so serve/headless are unchanged.
+                Gate = this.ExecutionGate,
+                ToolActivity = rootToolActivity,
+            };
+            loop = this.agentLoopFactory.Create(loopSpec);
+        }
+        catch
+        {
+            CompleteToolActivity(interrupted: true);
+            throw;
+        }
 
         // Snapshot BEFORE any agentic work. Reassigned after compaction so a turn failure rolls back
         // only the turn's own user message, never a successful compaction. If compaction itself
@@ -441,24 +474,31 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
             await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
+            var toolActivity = CompleteToolActivity(interrupted: false);
             return new RunResult(true, recording.FinalText, recording.ToolCalls, recording.StopReason, null)
             {
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
+                RootTurnId = rootToolActivity.RootTurnId,
+                ToolActivity = toolActivity,
             };
         }
         catch (OperationCanceledException)
         {
+            var toolActivity = CompleteToolActivity(interrupted: true);
             this.Rollback(snapshot);
             this.steeringInbox.Clear();
             return new RunResult(false, recording.FinalText, recording.ToolCalls, null, "Canceled.")
             {
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
+                RootTurnId = rootToolActivity.RootTurnId,
+                ToolActivity = toolActivity,
             };
         }
         catch (Exception ex)
         {
+            var toolActivity = CompleteToolActivity(interrupted: true);
             this.Rollback(snapshot);
             this.steeringInbox.Clear();
             this.LogTurnFailed(options.ProviderId, options.Model, ex.GetType().Name, ex.Message);
@@ -466,10 +506,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             {
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
+                RootTurnId = rootToolActivity.RootTurnId,
+                ToolActivity = toolActivity,
             };
         }
         finally
         {
+            CompleteToolActivity(interrupted: true);
             // Remember the most recent goal outcome so GetRuntimeSnapshot can surface it between
             // turns. Only overwrite on a non-null result so a subsequent goal-less turn does not
             // erase the last real goal status.
