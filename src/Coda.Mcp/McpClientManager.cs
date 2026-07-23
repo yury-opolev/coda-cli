@@ -542,20 +542,20 @@ public sealed partial class McpClientManager : IAsyncDisposable
                name.Contains("apikey", StringComparison.Ordinal);
     }
 
-    [GeneratedRegex(@"\x1B(?:[@-Z\\_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B\x9C]*(?:\x07|\x1B\\|\x9C))|\x9B[0-?]*[ -/]*[@-~]|\x9D[^\x07\x9C]*(?:\x07|\x9C)", RegexOptions.Compiled)]
+    [GeneratedRegex(@"\x1B(?:[@-Z\\_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B\x9C]*(?:\x07|\x1B\\|\x9C))|\x9B[0-?]*[ -/]*[@-~]|\x9D[^\x07\x9C]*(?:\x07|\x9C)", RegexOptions.Compiled | RegexOptions.NonBacktracking, 1000)]
     private static partial Regex TerminalEscapePattern();
 
-    [GeneratedRegex(@"(?ix)
+    [GeneratedRegex(@"(?x)
         \b(authorization|proxy-authorization|x-api-key|cookie|set-cookie|
         token|secret|password|api[_-]?key|apikey|
         [a-z_][a-z0-9_-]*(?:token|secret|password|api[_-]?key)[a-z0-9_-]*)
-        (\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)")]
+        (\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
     private static partial Regex SecretAssignmentPattern();
 
     [GeneratedRegex(@"\b([a-z_][a-z0-9_\-\p{Cc}\p{Cf}]*)(\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
     private static partial Regex ObfuscatedSecretAssignmentPattern();
 
-    [GeneratedRegex(@"https?://\S+", RegexOptions.IgnoreCase)]
+    [GeneratedRegex(@"https?://\S+", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
     private static partial Regex UrlPattern();
 
     private enum RuntimeErrorSource

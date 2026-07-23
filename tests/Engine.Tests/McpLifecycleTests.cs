@@ -1,8 +1,10 @@
 using System.Diagnostics;
 using System.Globalization;
+using System.Reflection;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Coda.Mcp;
 
 namespace Engine.Tests;
@@ -231,6 +233,31 @@ public sealed class McpLifecycleTests
         Assert.True(
             stopwatch.Elapsed < TimeSpan.FromSeconds(10),
             $"Sanitizing an unterminated obfuscated key candidate took {stopwatch.Elapsed}.");
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_bounds_all_regex_stages_for_large_undelimited_secret_like_text()
+    {
+        AssertBoundedNonBacktrackingRegex("TerminalEscapePattern");
+        AssertBoundedNonBacktrackingRegex("SecretAssignmentPattern");
+        AssertBoundedNonBacktrackingRegex("ObfuscatedSecretAssignmentPattern");
+        AssertBoundedNonBacktrackingRegex("UrlPattern");
+        Assert.True(
+            GetGeneratedRegex("SecretAssignmentPattern").Options.HasFlag(RegexOptions.IgnoreCase),
+            "SecretAssignmentPattern must use case-insensitive matching.");
+
+        var hostile = string.Concat(Enumerable.Repeat("secretapi_key", 100_000));
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad") { ThrowOnInit = hostile };
+
+        var stopwatch = Stopwatch.StartNew();
+        var result = await manager.ConnectClientAsync(client, default);
+        stopwatch.Stop();
+
+        Assert.False(result.Connected);
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(5),
+            $"Sanitizing 1.3 MB of undelimited secret-like text took {stopwatch.Elapsed}.");
     }
 
     [Fact]
@@ -545,5 +572,19 @@ public sealed class McpLifecycleTests
                 ? ValueTask.FromException(new McpException(message))
                 : ValueTask.CompletedTask;
         }
+    }
+
+    private static void AssertBoundedNonBacktrackingRegex(string methodName)
+    {
+        var regex = GetGeneratedRegex(methodName);
+
+        Assert.True(regex.Options.HasFlag(RegexOptions.NonBacktracking), $"{methodName} must use non-backtracking matching.");
+        Assert.InRange(regex.MatchTimeout, TimeSpan.Zero, TimeSpan.FromMilliseconds(1000));
+    }
+
+    private static Regex GetGeneratedRegex(string methodName)
+    {
+        var method = typeof(McpClientManager).GetMethod(methodName, BindingFlags.Static | BindingFlags.NonPublic);
+        return Assert.IsAssignableFrom<Regex>(method?.Invoke(null, null));
     }
 }
