@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Mcp;
@@ -173,6 +176,61 @@ public sealed class McpLifecycleTests
         Assert.DoesNotContain("multiline-token-value", result.Error!);
         Assert.All(result.Error!, ch => Assert.False(char.IsControl(ch)));
         Assert.DoesNotContain('\u202E', result.Error!);
+    }
+
+    [Theory]
+    [InlineData("authoriz\u200Bation", "=", "zwsp")]
+    [InlineData("to\u200Cken", "=", "zwnj")]
+    [InlineData("pass\u200Dword", ":", "zwj")]
+    [InlineData("api\u2060_key", "=", "word-joiner")]
+    [InlineData("authoriz\uFEFFation", "=", "bom")]
+    [InlineData("to\u202Eken", "=", "bidi")]
+    [InlineData("to\U000E0001ken", "=", "supplementary-format")]
+    [InlineData("pass\tword", ":", "tab-control")]
+    [InlineData("api\r_key", "=", "cr-control")]
+    [InlineData("to\nken", "=", "lf-control")]
+    public async Task ConnectClientAsync_failure_redacts_secret_assignments_with_format_or_control_key_splits(
+        string key,
+        string delimiter,
+        string identifier)
+    {
+        var secret = $"unicode-{identifier}-secret";
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = $"connection failed: caf\u00E9 {key}{delimiter}{secret}",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Contains("connection failed: caf\u00E9", result.Error!);
+        Assert.Contains("***redacted***", result.Error!);
+        Assert.DoesNotContain(secret, result.Error!);
+        Assert.DoesNotContain(key, result.Error!, StringComparison.Ordinal);
+        Assert.All(result.Error!.EnumerateRunes(), rune =>
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            Assert.NotEqual(UnicodeCategory.Control, category);
+            Assert.NotEqual(UnicodeCategory.Format, category);
+        });
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_handles_large_unterminated_obfuscated_key_candidate_without_hanging()
+    {
+        const int repetitions = 50_000;
+        var hostile = "a" + string.Concat(Enumerable.Repeat("\t\u200B", repetitions));
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad") { ThrowOnInit = hostile };
+
+        var stopwatch = Stopwatch.StartNew();
+        var result = await manager.ConnectClientAsync(client, default);
+        stopwatch.Stop();
+
+        Assert.False(result.Connected);
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(10),
+            $"Sanitizing an unterminated obfuscated key candidate took {stopwatch.Elapsed}.");
     }
 
     [Fact]
