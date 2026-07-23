@@ -12,6 +12,8 @@ namespace Coda.Mcp;
 public static class McpConfigWriter
 {
     private static readonly JsonSerializerOptions writeOptions = new() { WriteIndented = true };
+    private static readonly string[] knownEntryProperties =
+        ["type", "command", "args", "env", "url", "headers", "auth", "disabled"];
 
     /// <summary>Add or replace <paramref name="name"/> in the scope's file (creating the file if needed).</summary>
     public static void Upsert(
@@ -80,6 +82,57 @@ public static class McpConfigWriter
         return true;
     }
 
+    /// <summary>
+    /// Replace an existing server entry, optionally renaming it, while preserving unknown entry
+    /// properties and all unrelated configuration.
+    /// </summary>
+    public static void ReplaceEntry(
+        McpConfigScope scope, string currentName, string newName,
+        McpServerConfig config, bool disabled, string workingDirectory,
+        string? userMcpDir = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(currentName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(newName);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var path = McpConfig.FilePath(scope, workingDirectory, userMcpDir);
+        var root = ReadExistingRoot(path);
+        var servers = GetStrictServers(root, path);
+        if (servers[currentName] is not JsonObject existing)
+        {
+            throw new McpException($"MCP server '{currentName}' does not exist in config '{path}'.");
+        }
+
+        if (!string.Equals(currentName, newName, StringComparison.Ordinal) && servers.ContainsKey(newName))
+        {
+            throw new McpException($"MCP server '{newName}' already exists in config '{path}'.");
+        }
+
+        var replacement = existing.DeepClone().AsObject();
+        var serialized = ToJson(config, disabled);
+        foreach (var property in knownEntryProperties)
+        {
+            replacement.Remove(property);
+        }
+
+        foreach (var property in serialized)
+        {
+            replacement[property.Key] = property.Value?.DeepClone();
+        }
+
+        if (string.Equals(currentName, newName, StringComparison.Ordinal))
+        {
+            servers[currentName] = replacement;
+        }
+        else
+        {
+            servers.Remove(currentName);
+            servers[newName] = replacement;
+        }
+
+        Write(path, root);
+    }
+
     private static JsonObject ReadRoot(string path)
     {
         if (!File.Exists(path))
@@ -103,6 +156,54 @@ public static class McpConfigWriter
             ?? throw new McpException($"'{path}' does not contain a JSON object; fix or remove it before editing MCP servers.");
     }
 
+    private static JsonObject ReadExistingRoot(string path)
+    {
+        if (!File.Exists(path))
+        {
+            throw new McpException($"MCP config '{path}' does not exist.");
+        }
+
+        return ReadRoot(path);
+    }
+
+    private static JsonObject GetStrictServers(JsonObject root, string path)
+    {
+        if (!root.TryGetPropertyValue("mcpServers", out var serversNode) || serversNode is not JsonObject servers)
+        {
+            throw new McpException($"MCP config '{path}' must contain an mcpServers object.");
+        }
+
+        foreach (var server in servers)
+        {
+            if (server.Value is not JsonObject entry)
+            {
+                throw new McpException(
+                    $"MCP server '{server.Key}' in config '{path}' has an invalid definition: server values must be JSON objects.");
+            }
+
+            ValidateServer(entry, server.Key, path);
+        }
+
+        return servers;
+    }
+
+    private static void ValidateServer(JsonObject entry, string name, string path)
+    {
+        var type = entry["type"]?.GetValue<string>();
+        var valid = type switch
+        {
+            "http" or "streamable-http" => entry["url"]?.GetValue<string>() is { Length: > 0 } url
+                && Uri.TryCreate(url, UriKind.Absolute, out _),
+            null or "stdio" => entry["command"]?.GetValue<string>() is { Length: > 0 },
+            _ => false,
+        };
+
+        if (!valid)
+        {
+            throw new McpException($"MCP server '{name}' in config '{path}' has an invalid definition.");
+        }
+    }
+
     private static JsonObject GetOrCreateServers(JsonObject root)
     {
         if (root["mcpServers"] is JsonObject servers)
@@ -123,10 +224,21 @@ public static class McpConfigWriter
             Directory.CreateDirectory(directory);
         }
 
-        // Write to a temp file then move over the target, so a crash mid-write can't truncate the config.
-        var temp = path + ".tmp";
-        File.WriteAllText(temp, root.ToJsonString(writeOptions));
-        File.Move(temp, path, overwrite: true);
+        // Write to a unique same-directory temp file then move over the target, so concurrent
+        // writers do not collide and a crash mid-write cannot truncate the config.
+        var temp = $"{path}.{Guid.NewGuid():N}.tmp";
+        try
+        {
+            File.WriteAllText(temp, root.ToJsonString(writeOptions));
+            File.Move(temp, path, overwrite: true);
+        }
+        finally
+        {
+            if (File.Exists(temp))
+            {
+                File.Delete(temp);
+            }
+        }
     }
 
     private static JsonObject ToJson(McpServerConfig config, bool disabled)
