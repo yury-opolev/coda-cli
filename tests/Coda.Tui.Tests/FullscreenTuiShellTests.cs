@@ -1740,6 +1740,75 @@ public sealed class VirtualizedTranscriptViewTests
     }
 
     [Fact]
+    public void First_visible_insert_counts_once_through_progress_and_completion_replacements()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateView(app, out _);
+        view.ReplaceAll(Blocks(20));
+        view.ScrollBy(-5);
+
+        var id = Guid.NewGuid();
+        var started = new ToolTranscriptBlock(id, "grep", "{}", 1, null, false, false);
+        var progress = started with { ElapsedMs = 2 };
+        var completed = progress with { Result = "hit", Complete = true };
+        view.Append(started);
+        view.ReplaceLast(progress);
+        view.ReplaceLast(completed);
+
+        Assert.Equal(1, view.UnseenBlocks);
+    }
+
+    [Fact]
+    public void Hidden_block_and_separator_are_not_counted_as_unseen()
+    {
+        using IApplication app = Application.Create();
+        var view = new VirtualizedTranscriptView(
+            app,
+            (block, _) => block is ToolTranscriptBlock ? [] : [new TranscriptRenderLine("visible", TranscriptRole.Code)]);
+        view.Reflow(width: 80);
+        view.SetViewportHeight(5);
+        view.ReplaceAll(Blocks(20));
+        view.ScrollBy(-5);
+        var before = view.ContentRowsForTest;
+
+        view.Append(new ToolTranscriptBlock(Guid.NewGuid(), "tiny", "{}", null, null, false, true));
+
+        Assert.Equal(0, view.UnseenBlocks);
+        Assert.Equal(before, view.ContentRowsForTest);
+    }
+
+    [Fact]
+    public void Visible_blocks_count_once_independent_of_wrapped_rows_and_separator()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateWrappedAnchorView(app);
+        view.ReplaceAll(Blocks(20));
+        view.ScrollBy(-5);
+
+        view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "12345678901234567890"));
+        view.Append(new CommandOutputTranscriptBlock(Guid.NewGuid(), "short"));
+
+        Assert.Equal(2, view.UnseenBlocks);
+    }
+
+    [Fact]
+    public void Replacements_and_reflow_do_not_count_as_inserted_blocks()
+    {
+        using IApplication app = Application.Create();
+        var view = CreateAnchorView(app);
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "first");
+        var last = new CommandOutputTranscriptBlock(Guid.NewGuid(), "last");
+        view.ReplaceAll(ImmutableArray.Create<TranscriptBlock>(first, last));
+        view.ScrollBy(-1);
+
+        view.ReplaceAt(0, first with { Text = "first|expanded" });
+        view.ReplaceLast(last with { Text = "last|expanded" });
+        view.Reflow(40);
+
+        Assert.Equal(0, view.UnseenBlocks);
+    }
+
+    [Fact]
     public void Key_bindings_scroll_and_jump()
     {
         using IApplication app = Application.Create();

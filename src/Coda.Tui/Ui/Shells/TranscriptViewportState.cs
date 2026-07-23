@@ -156,14 +156,17 @@ internal sealed class TranscriptViewportState
         }
     }
 
-    /// <summary>Records one complete visible block append without treating streaming row growth as a message.</summary>
-    public void OnBlockAppended()
+    /// <summary>Records one newly inserted visible block without treating streaming row growth as a message.</summary>
+    public void OnVisibleBlockInserted()
     {
         if (!this.AutoFollow)
         {
             this.UnseenBlocks++;
         }
     }
+
+    /// <summary>Compatibility alias for callers that already distinguish complete block appends.</summary>
+    public void OnBlockAppended() => this.OnVisibleBlockInserted();
 
     /// <summary>Moves to an absolute content row, resuming follow when that reaches the bottom.</summary>
     public void ScrollToRow(int row)

@@ -148,7 +148,7 @@ internal sealed class VirtualizedTranscriptView : View
         if (delta > 0)
         {
             this.viewport.RecordAppendedRows(delta);
-            this.viewport.OnBlockAppended();
+            this.viewport.OnVisibleBlockInserted();
         }
 
         this.UpdateScrollbarLayout();
