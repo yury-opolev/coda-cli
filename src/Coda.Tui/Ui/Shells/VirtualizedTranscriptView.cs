@@ -56,7 +56,9 @@ internal sealed class VirtualizedTranscriptView : View
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.theme = theme ?? TuiTheme.WarmEmber;
-        this.index = new TranscriptLayoutIndex(formatter ?? TranscriptBlockFormatter.Format);
+        this.index = new TranscriptLayoutIndex(
+            formatter ?? TranscriptBlockFormatter.Format,
+            enableIncrementalAssistant: formatter is null);
         this.CanFocus = true;
         this.MousePositionTracking = true;
     }

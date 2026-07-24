@@ -47,6 +47,7 @@ internal sealed class TranscriptLayoutIndex
     internal const int MaxCachedBlocks = 256;
 
     private readonly Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> formatter;
+    private readonly IncrementalMarkdownFormatter? streamingFormatter;
     private readonly Dictionary<Guid, LinkedListNode<CacheEntry>> cacheMap = new();
     private readonly LinkedList<CacheEntry> cacheOrder = new();
     private readonly Dictionary<Guid, int> blockPositions = new();
@@ -56,9 +57,20 @@ internal sealed class TranscriptLayoutIndex
     private readonly List<int> prefix = new() { 0 };
     private int width = 1;
 
-    public TranscriptLayoutIndex(Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> formatter)
+    /// <param name="formatter">Projects a block onto wrapped lines.</param>
+    /// <param name="enableIncrementalAssistant">
+    /// When true, an incomplete (streaming) <see cref="AssistantTranscriptBlock"/> is projected through an
+    /// <see cref="IncrementalMarkdownFormatter"/> that reuses completed leading blocks, avoiding the
+    /// quadratic re-parse of the growing response. Enabled only when <paramref name="formatter"/> is the
+    /// default <see cref="TranscriptBlockFormatter.Format"/>, since the incremental formatter is guaranteed
+    /// output-identical to that formatter and would otherwise bypass an injected one.
+    /// </param>
+    public TranscriptLayoutIndex(
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> formatter,
+        bool enableIncrementalAssistant = false)
     {
         this.formatter = formatter ?? throw new ArgumentNullException(nameof(formatter));
+        this.streamingFormatter = enableIncrementalAssistant ? new IncrementalMarkdownFormatter() : null;
     }
 
     /// <summary>Total wrapped rows across every block.</summary>
@@ -383,7 +395,10 @@ internal sealed class TranscriptLayoutIndex
         return lines;
     }
 
-    private IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block) => this.formatter(block, this.width);
+    private IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block) =>
+        this.streamingFormatter is { } streaming && block is AssistantTranscriptBlock { Complete: false } assistant
+            ? streaming.Update(assistant.Id, assistant.Text, this.width)
+            : this.formatter(block, this.width);
 
     private static int EffectiveRowCount(int formattedRowCount) =>
         formattedRowCount > 0 ? formattedRowCount + 1 : 0;
