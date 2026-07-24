@@ -163,8 +163,29 @@ public sealed class McpSecretStoreTests
             new McpSecretBinding("header/A-Duplicate", "mcp:github/header/shared"),
             new McpSecretBinding("header/Live", "mcp:github/header/live"),
             new McpSecretBinding("header/Shared", "shared-key"),
+            new McpSecretBinding("header/Z-Duplicate", "mcp:github/header/shared"),
         ],
         McpSecretStore.References(http));
+    }
+
+    [Fact]
+    public void References_preserves_alias_and_owned_bindings_for_the_same_key()
+    {
+        var config = new McpStdioServerConfig(
+            "npx",
+            [],
+            new Dictionary<string, string>
+            {
+                ["Z"] = "coda-secret:mcp:github/env/Z",
+                ["A"] = "coda-secret:mcp:github/env/Z",
+            });
+
+        Assert.Equal(
+        [
+            new McpSecretBinding("env/A", "mcp:github/env/Z"),
+            new McpSecretBinding("env/Z", "mcp:github/env/Z"),
+        ],
+        McpSecretStore.References(config));
     }
 
     [Fact]
@@ -303,6 +324,26 @@ public sealed class McpSecretStoreTests
 
         Assert.Null(await store.GetAsync("mcp:github/env/TOKEN")); // deleted
         Assert.Equal("y", await store.GetAsync("mcp:other/env/K")); // untouched
+    }
+
+    [Fact]
+    public async Task DeleteSecretsAsync_deletes_an_aliased_key_only_once()
+    {
+        const string key = "mcp:github/env/Z";
+        var store = new FakeStore();
+        await store.SetAsync(key, "value");
+        var config = new McpStdioServerConfig(
+            "npx",
+            [],
+            new Dictionary<string, string>
+            {
+                ["A"] = "coda-secret:mcp:github/env/Z",
+                ["Z"] = "coda-secret:mcp:github/env/Z",
+            });
+
+        await McpSecretStore.DeleteSecretsAsync(store, config);
+
+        Assert.Equal([key], store.DeletedKeys);
     }
 
     private sealed class FakeStore : ITokenStore

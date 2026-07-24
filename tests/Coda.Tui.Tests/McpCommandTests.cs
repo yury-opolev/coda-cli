@@ -346,6 +346,29 @@ public sealed class McpCommandTests
     }
 
     [Fact]
+    public async Task Remove_deletes_an_owned_key_when_a_sorted_alias_precedes_its_owner()
+    {
+        const string key = "mcp:github/env/Z";
+        using var dirs = new McpTestDirs();
+        dirs.WriteProjectConfig(
+            """
+            { "mcpServers": { "github": { "command": "npx", "env": {
+              "A": "coda-secret:mcp:github/env/Z",
+              "Z": "coda-secret:mcp:github/env/Z"
+            } } } }
+            """);
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.WorkingDirectory = dirs.Project;
+        var store = new InMemoryStore();
+        await store.SetAsync(key, "owned-value");
+        context.CredentialStore = store;
+
+        await new McpCommand().ExecuteAsync(context, ["remove", "github"], CancellationToken.None);
+
+        Assert.Null(await store.GetAsync(key));
+    }
+
+    [Fact]
     public async Task Remove_keeps_an_owned_secret_still_referenced_by_another_server()
     {
         using var dirs = new McpTestDirs();

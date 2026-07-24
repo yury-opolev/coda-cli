@@ -174,7 +174,7 @@ public static class McpSecretStore
 
     /// <summary>
     /// Enumerate exact, managed secret references in a config. Results are ordered by typed field
-    /// using ordinal comparison, with duplicate fields and store keys removed.
+    /// using ordinal comparison, with only exact duplicate bindings removed.
     /// </summary>
     public static IReadOnlyList<McpSecretBinding> References(McpServerConfig config)
     {
@@ -196,8 +196,7 @@ public static class McpSecretStore
         return bindings
             .OrderBy(static binding => binding.Field, StringComparer.Ordinal)
             .ThenBy(static binding => binding.StoreKey, StringComparer.Ordinal)
-            .DistinctBy(static binding => binding.Field, StringComparer.Ordinal)
-            .DistinctBy(static binding => binding.StoreKey, StringComparer.Ordinal)
+            .Distinct()
             .ToArray();
     }
 
@@ -231,10 +230,10 @@ public static class McpSecretStore
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(config);
-        foreach (var binding in References(config))
-        {
-            await store.DeleteAsync(binding.StoreKey, cancellationToken).ConfigureAwait(false);
-        }
+        await DeleteKeysAsync(
+            store,
+            References(config).Select(static binding => binding.StoreKey),
+            cancellationToken).ConfigureAwait(false);
     }
 
     private static void AddBindings(

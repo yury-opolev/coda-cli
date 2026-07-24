@@ -875,6 +875,77 @@ public sealed class McpManagementEditTests
     }
 
     [Fact]
+    public async Task Commit_edit_removes_an_owned_key_when_a_sorted_alias_precedes_its_owner()
+    {
+        const string key = "mcp:server/env/Z";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        await harness.Store.SetAsync(key, "old-value");
+        harness.WriteProject(
+            """
+            {"mcpServers":{"server":{"command":"node","env":{
+              "A":"coda-secret:mcp:server/env/Z",
+              "Z":"coda-secret:mcp:server/env/Z"
+            }}}}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with
+            {
+                Environment =
+                [
+                    Named("A", McpSecretSource.Managed, McpSecretChangeKind.Remove, fieldPrefix: "env"),
+                    Named("Z", McpSecretSource.Managed, McpSecretChangeKind.Remove, fieldPrefix: "env"),
+                ],
+            },
+            CancellationToken.None);
+
+        var result = await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.False(harness.Store.ContainsKey(key));
+    }
+
+    [Fact]
+    public async Task Commit_edit_keeps_an_owned_key_when_a_postwrite_alias_still_references_it()
+    {
+        const string key = "mcp:server/env/Z";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        await harness.Store.SetAsync(key, "old-value");
+        harness.WriteProject(
+            """
+            {"mcpServers":{
+              "server":{"command":"node","env":{
+                "A":"coda-secret:mcp:server/env/Z",
+                "Z":"coda-secret:mcp:server/env/Z"
+              }},
+              "other":{"command":"node","env":{"ALIAS":"coda-secret:mcp:server/env/Z"}}
+            }}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with
+            {
+                Environment =
+                [
+                    Named("A", McpSecretSource.Managed, McpSecretChangeKind.Remove, fieldPrefix: "env"),
+                    Named("Z", McpSecretSource.Managed, McpSecretChangeKind.Remove, fieldPrefix: "env"),
+                ],
+            },
+            CancellationToken.None);
+
+        var result = await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.True(harness.Store.ContainsKey(key));
+    }
+
+    [Fact]
     public async Task Prepare_reports_sanitized_cross_scope_override_and_reveal_warnings()
     {
         const string secretName = "token=never-show-warning-secret";
