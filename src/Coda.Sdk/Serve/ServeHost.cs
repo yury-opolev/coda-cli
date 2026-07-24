@@ -443,6 +443,9 @@ public sealed class ServeHost : IAsyncDisposable
 
                 if (wasInterrupted)
                 {
+                    // The interrupt path bypasses the sink, so flush any buffered assistant text before the
+                    // turn-complete so a trailing coalesced fragment is not dropped.
+                    sink.Flush();
                     _ = conn.SendNotificationAsync(
                         ServeMethods.EventTurnComplete,
                         ServeJson.ToNode(new TurnCompleteEvent(null, true)
@@ -486,7 +489,9 @@ public sealed class ServeHost : IAsyncDisposable
             }
             catch (OperationCanceledException)
             {
-                // The only cancellation source is a user/host interrupt (or host shutdown).
+                // The only cancellation source is a user/host interrupt (or host shutdown). Flush any
+                // buffered assistant text before the turn-complete so no streamed fragment is lost.
+                sink.Flush();
                 _ = conn.SendNotificationAsync(
                     ServeMethods.EventTurnComplete,
                     ServeJson.ToNode(new TurnCompleteEvent(null, true)),

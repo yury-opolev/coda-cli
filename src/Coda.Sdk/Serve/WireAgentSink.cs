@@ -1,3 +1,4 @@
+using System.Text;
 using System.Text.Json.Nodes;
 using Coda.Agent;
 using Coda.JsonRpc;
@@ -11,20 +12,44 @@ namespace Coda.Sdk.Serve;
 /// over an IJsonRpcConnection. Each On* method is sync void and fires notifications
 /// fire-and-forget; a dead pipe never crashes the agent.
 /// </summary>
+/// <remarks>
+/// Assistant text deltas are losslessly coalesced: a burst of deltas within
+/// <see cref="FlushIntervalMs"/> (or up to <see cref="FlushThresholdChars"/>) is merged into a single
+/// <c>event/assistantText</c> notification, cutting the notification count during fast streaming without
+/// dropping any text. Ordering is preserved because every other event flushes the buffered text first, and
+/// the first delta always sends immediately so first-token latency is unaffected.
+/// </remarks>
 public sealed class WireAgentSink : IAgentSink
 {
+    private const int FlushIntervalMs = 20;
+    private const int FlushThresholdChars = 4096;
+
     private readonly IJsonRpcConnection connection;
+    private readonly Func<long> clock;
+
+    private readonly object textGate = new();
+    private readonly StringBuilder pendingText = new();
+    private long lastFlushTicks;
 
     public WireAgentSink(IJsonRpcConnection connection)
+        : this(connection, static () => Environment.TickCount64)
     {
-        this.connection = connection;
     }
 
-    public void OnAssistantText(string delta)
+    internal WireAgentSink(IJsonRpcConnection connection, Func<long> clock)
     {
-        var node = ServeJson.ToNode(new AssistantTextEvent(delta));
-        _ = this.SendAsync(ServeMethods.EventAssistantText, node);
+        this.connection = connection;
+        this.clock = clock;
     }
+
+    public void OnAssistantText(string delta) => this.CoalesceText(delta);
+
+    /// <summary>
+    /// Flushes any buffered assistant text immediately. The host calls this when a turn ends on a path that
+    /// bypasses the sink (an interrupt/cancellation, where <see cref="OnAssistantTextComplete"/> is not
+    /// raised), so a trailing coalesced fragment is never dropped.
+    /// </summary>
+    public void Flush() => this.FlushPendingText();
 
     public void OnAssistantTextComplete()
     {
@@ -116,7 +141,67 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventUsage, node);
     }
 
-    private async Task SendAsync(string method, JsonNode node)
+    private void CoalesceText(string delta)
+    {
+        if (string.IsNullOrEmpty(delta))
+        {
+            return;
+        }
+
+        string? merged = null;
+        lock (this.textGate)
+        {
+            this.pendingText.Append(delta);
+            var now = this.clock();
+
+            // Flush the first delta immediately (lastFlushTicks starts at 0) so first-token latency is
+            // unchanged, then merge subsequent deltas until the interval elapses or the buffer grows large.
+            if (this.pendingText.Length >= FlushThresholdChars || now - this.lastFlushTicks >= FlushIntervalMs)
+            {
+                merged = this.pendingText.ToString();
+                this.pendingText.Clear();
+                this.lastFlushTicks = now;
+            }
+        }
+
+        if (merged is not null)
+        {
+            this.SendText(merged);
+        }
+    }
+
+    /// <summary>Sends any buffered assistant text so it precedes the next event in wire order.</summary>
+    private void FlushPendingText()
+    {
+        string? merged = null;
+        lock (this.textGate)
+        {
+            if (this.pendingText.Length > 0)
+            {
+                merged = this.pendingText.ToString();
+                this.pendingText.Clear();
+                this.lastFlushTicks = this.clock();
+            }
+        }
+
+        if (merged is not null)
+        {
+            this.SendText(merged);
+        }
+    }
+
+    private void SendText(string text) =>
+        _ = this.SendRawAsync(ServeMethods.EventAssistantText, ServeJson.ToNode(new AssistantTextEvent(text)));
+
+    private Task SendAsync(string method, JsonNode node)
+    {
+        // Every non-text event flushes buffered assistant text first, preserving the interleaving of text
+        // with tool calls, completion, errors, and turn boundaries.
+        this.FlushPendingText();
+        return this.SendRawAsync(method, node);
+    }
+
+    private async Task SendRawAsync(string method, JsonNode node)
     {
         try
         {
