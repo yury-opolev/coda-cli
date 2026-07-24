@@ -34,6 +34,12 @@ internal enum McpEditorField
     Cancel,
 }
 
+internal enum McpEditorItemPart
+{
+    Value,
+    Name,
+}
+
 internal enum McpBrowserCommand
 {
     None,
@@ -58,10 +64,21 @@ internal enum McpBrowserCommand
     EditorBackspace,
     EditorDelete,
     EditorInsert,
+    EditorAddItem,
+    EditorRemoveItem,
+    EditorPreviousItem,
+    EditorNextItem,
+    EditorPreviousItemPart,
+    EditorNextItemPart,
 }
 
 internal sealed record McpEditorState(
     McpEditorMode Mode,
     McpBrowserView Origin,
     McpServerDraft Draft,
-    McpEditorField FocusedField);
+    McpEditorField FocusedField)
+{
+    public int SelectedItem { get; init; }
+
+    public McpEditorItemPart SelectedItemPart { get; init; } = McpEditorItemPart.Value;
+}

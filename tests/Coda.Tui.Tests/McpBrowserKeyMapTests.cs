@@ -55,6 +55,12 @@ public sealed class McpBrowserKeyMapTests
         Assert.Equal(McpBrowserCommand.EditorApply, McpBrowserKeyMap.Map(Key.Enter, McpBrowserView.Editor));
         Assert.Equal(McpBrowserCommand.EditorBackspace, McpBrowserKeyMap.Map(Key.Backspace, McpBrowserView.Editor));
         Assert.Equal(McpBrowserCommand.EditorDelete, McpBrowserKeyMap.Map(Key.Delete, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorAddItem, McpBrowserKeyMap.Map(Key.N.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorRemoveItem, McpBrowserKeyMap.Map(Key.R.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorPreviousItem, McpBrowserKeyMap.Map(Key.CursorUp.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorNextItem, McpBrowserKeyMap.Map(Key.CursorDown.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorPreviousItemPart, McpBrowserKeyMap.Map(Key.CursorLeft.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorNextItemPart, McpBrowserKeyMap.Map(Key.CursorRight.WithCtrl, McpBrowserView.Editor));
     }
 
     [Fact]
