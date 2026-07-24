@@ -7,6 +7,30 @@ namespace Engine.Tests.JsonRpc;
 public sealed class JsonRpcMessageCodecTests
 {
     [Fact]
+    public async Task WriteMessages_is_byte_identical_to_individual_writes()
+    {
+        var messages = new List<JsonNode>
+        {
+            JsonNode.Parse("""{"jsonrpc":"2.0","id":1,"method":"first","params":{"s":"héllo \"世界\" \n\t","n":42,"b":true,"z":null}}""")!,
+            JsonNode.Parse("""{"jsonrpc":"2.0","method":"event/assistantText","params":{"delta":"emoji 😀 and </script>"}}""")!,
+            JsonNode.Parse("""{"jsonrpc":"2.0","id":2,"result":{"arr":[1,2,3],"nested":{"x":[true,false]}}}""")!,
+        };
+
+        // Individual writes (string-based WriteMessageAsync) form the reference wire bytes.
+        var reference = new MemoryStream();
+        foreach (var message in messages)
+        {
+            await JsonRpcMessageCodec.WriteMessageAsync(reference, message, CancellationToken.None);
+        }
+
+        // Batched pooled-UTF-8 write must produce the exact same frames (only the flush boundary differs).
+        var batched = new MemoryStream();
+        await JsonRpcMessageCodec.WriteMessagesAsync(batched, messages, CancellationToken.None);
+
+        Assert.Equal(reference.ToArray(), batched.ToArray());
+    }
+
+    [Fact]
     public async Task WriteThenRead_roundtrips_a_message()
     {
         var message = JsonNode.Parse("""{"jsonrpc":"2.0","id":1,"method":"x"}""")!;
