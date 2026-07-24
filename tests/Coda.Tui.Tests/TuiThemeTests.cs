@@ -86,6 +86,25 @@ public sealed class TuiThemeTests
             view.AttributeFor(TranscriptRole.Permission).Foreground);
     }
 
+    [Fact]
+    public void Cached_role_attribute_refreshes_when_driver_color_capability_flips()
+    {
+        using IApplication app = Application.Create();
+        app.Init(DriverRegistry.Names.ANSI);
+        using var view = new VirtualizedTranscriptView(app, theme: TuiTheme.WarmEmber);
+
+        // Prime the memo on the 16-color path, then confirm a repeat call stays stable (cache hit).
+        app.Driver!.Force16Colors = true;
+        Assert.Equal(new TgColor(TgName.BrightYellow), view.AttributeFor(TranscriptRole.Tool).Foreground);
+        Assert.Equal(new TgColor(TgName.BrightYellow), view.AttributeFor(TranscriptRole.Tool).Foreground);
+
+        // A true-color capability flip must drop the memo, not serve the stale 16-color fallback.
+        app.Driver.Force16Colors = false;
+        Assert.Equal(
+            TuiTheme.WarmEmber.TranscriptTool.TrueColor,
+            view.AttributeFor(TranscriptRole.Tool).Foreground);
+    }
+
     [Theory]
     [InlineData(TranscriptRole.ContextSystemPrompt, 240, 190, 84)]
     [InlineData(TranscriptRole.ContextSystemTools, 222, 146, 74)]
