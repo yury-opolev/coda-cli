@@ -1,4 +1,6 @@
+using System.Buffers;
 using System.Text;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace Coda.JsonRpc;
@@ -30,6 +32,11 @@ public static class JsonRpcMessageCodec
     /// single flush instead of one per message. Each message keeps its own Content-Length frame, so the
     /// wire output is byte-identical to writing them individually — only the flush boundary changes.
     /// </summary>
+    /// <remarks>
+    /// Each message is serialized straight to UTF-8 through a reused <see cref="ArrayBufferWriter{T}"/> and
+    /// <see cref="Utf8JsonWriter"/>, avoiding the intermediate JSON string (and its separate re-encode to
+    /// UTF-8) that a per-message <c>ToJsonString()</c> would allocate on the streaming hot path.
+    /// </remarks>
     public static async Task WriteMessagesAsync(Stream stream, IReadOnlyList<JsonNode> messages, CancellationToken ct)
     {
         if (messages.Count == 0)
@@ -37,12 +44,28 @@ public static class JsonRpcMessageCodec
             return;
         }
 
-        foreach (var message in messages)
+        var buffer = new ArrayBufferWriter<byte>(1024);
+        var writer = new Utf8JsonWriter(buffer);
+        try
         {
-            var body = utf8NoBom.GetBytes(message.ToJsonString());
-            var header = Encoding.ASCII.GetBytes($"Content-Length: {body.Length}\r\n\r\n");
-            await stream.WriteAsync(header, ct).ConfigureAwait(false);
-            await stream.WriteAsync(body, ct).ConfigureAwait(false);
+            foreach (var message in messages)
+            {
+                buffer.ResetWrittenCount();
+                writer.Reset(buffer);
+                message.WriteTo(writer);
+                writer.Flush();
+
+                var body = buffer.WrittenMemory;
+                var header = Encoding.ASCII.GetBytes($"Content-Length: {body.Length}\r\n\r\n");
+                await stream.WriteAsync(header, ct).ConfigureAwait(false);
+
+                // The body is fully written before the next iteration resets the shared buffer.
+                await stream.WriteAsync(body, ct).ConfigureAwait(false);
+            }
+        }
+        finally
+        {
+            await writer.DisposeAsync().ConfigureAwait(false);
         }
 
         await stream.FlushAsync(ct).ConfigureAwait(false);
