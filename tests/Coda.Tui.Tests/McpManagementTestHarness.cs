@@ -592,12 +592,15 @@ internal sealed class SuccessfulOAuthReauthenticator : IMcpOAuthReauthenticator
 {
     public int Calls { get; private set; }
 
+    public Action<McpHttpServerConfig>? BeforeReturn { get; set; }
+
     public Task<McpAuthResult> ReauthenticateAsync(
         McpHttpServerConfig config,
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         this.Calls++;
+        this.BeforeReturn?.Invoke(config);
         return Task.FromResult(new McpAuthResult(true, null));
     }
 }

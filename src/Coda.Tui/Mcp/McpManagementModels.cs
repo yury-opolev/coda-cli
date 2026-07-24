@@ -185,7 +185,8 @@ internal sealed record McpReauthenticationPlan(
     McpReauthenticationKind Kind,
     string Confirmation,
     ImmutableArray<string> ManagedFields,
-    string? DisabledReason);
+    string? DisabledReason,
+    string? OAuthCanonicalResource = null);
 
 internal sealed record McpMutationResult(
     McpMutationStatus Status,

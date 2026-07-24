@@ -269,23 +269,23 @@ internal sealed partial class McpManagementService : IMcpManagementService
         this.SetEnabledCoreAsync(key, enabled, ct);
 
     public Task<McpDeletePreview> PrepareDeleteAsync(McpServerKey key, CancellationToken ct) =>
-        MutationUnavailable<McpDeletePreview>(ct);
+        Task.FromResult(this.PrepareDelete(key, ct));
 
     public Task<McpMutationResult> CommitDeleteAsync(
         McpDeletePreview confirmedPreview,
         CancellationToken ct) =>
-        MutationUnavailable<McpMutationResult>(ct);
+        this.CommitDeleteCoreAsync(confirmedPreview, ct);
 
     public Task<McpReauthenticationPlan> PrepareReauthenticationAsync(
         McpServerKey key,
         CancellationToken ct) =>
-        MutationUnavailable<McpReauthenticationPlan>(ct);
+        Task.FromResult(this.PrepareReauthentication(key, ct));
 
     public Task<McpMutationResult> ReauthenticateAsync(
         McpReauthenticationPlan plan,
         IReadOnlyDictionary<string, McpSecretReplacement> replacements,
         CancellationToken ct) =>
-        MutationUnavailable<McpMutationResult>(ct);
+        this.ReauthenticateCoreAsync(plan, replacements, ct);
 
     public Task<McpMutationResult> StartAsync(string name, CancellationToken ct) =>
         MutationUnavailable<McpMutationResult>(ct);
@@ -377,6 +377,112 @@ internal sealed partial class McpManagementService : IMcpManagementService
             normalized,
             prepared.Revision,
             CreateScopeWarnings(entries, original, normalized));
+    }
+
+    internal McpDeletePreview PrepareDelete(McpServerKey key, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        this.ValidateScopeAvailable(key.Scope);
+        var prepared = this.LoadStablePreparationEntries(ct);
+        var entry = prepared.Entries.FirstOrDefault(candidate => candidate.Key == key)
+            ?? throw new McpException("The selected MCP server no longer exists in the selected scope.");
+        var revealsLowerScope = key.Scope == McpConfigScope.Project
+            && prepared.Entries.Any(candidate =>
+                candidate.Key == new McpServerKey(McpConfigScope.User, key.Name));
+        var scope = key.Scope == McpConfigScope.Project ? "project" : "user";
+        var confirmation = revealsLowerScope
+            ? $"Delete {scope}-scope MCP server '{SanitizeVisibleText(key.Name)}'? The user-scope server with the same name will be revealed."
+            : $"Delete {scope}-scope MCP server '{SanitizeVisibleText(key.Name)}'?";
+        return new McpDeletePreview(
+            Guid.NewGuid(),
+            entry.Key,
+            prepared.Revision,
+            confirmation,
+            revealsLowerScope);
+    }
+
+    internal McpReauthenticationPlan PrepareReauthentication(McpServerKey key, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        this.ValidateScopeAvailable(key.Scope);
+        var prepared = this.LoadStablePreparationEntries(ct);
+        var entry = prepared.Entries.FirstOrDefault(candidate => candidate.Key == key)
+            ?? throw new McpException("The selected MCP server no longer exists in the selected scope.");
+        var safeName = SanitizeVisibleText(key.Name);
+
+        if (entry.Config is not McpHttpServerConfig http)
+        {
+            return new McpReauthenticationPlan(
+                Guid.NewGuid(),
+                key,
+                prepared.Revision,
+                McpReauthenticationKind.Unavailable,
+                $"Reauthenticate MCP server '{safeName}'?",
+                [],
+                "Stdio MCP servers use command and environment credentials. Use Edit to change them.");
+        }
+
+        var managedFields = McpSecretStore.References(http)
+            .Select(static binding => binding.Field)
+            .OrderBy(static field => field, StringComparer.Ordinal)
+            .ToImmutableArray();
+        if (HasEnvironmentCredentials(http))
+        {
+            return new McpReauthenticationPlan(
+                Guid.NewGuid(),
+                key,
+                prepared.Revision,
+                McpReauthenticationKind.EnvironmentOwned,
+                $"Reauthenticate MCP server '{safeName}'?",
+                [],
+                "This MCP server uses environment-owned credentials. Update the referenced environment variable instead.");
+        }
+
+        if (!managedFields.IsDefaultOrEmpty)
+        {
+            return new McpReauthenticationPlan(
+                Guid.NewGuid(),
+                key,
+                prepared.Revision,
+                McpReauthenticationKind.StoredSecret,
+                $"Replace the managed credentials for MCP server '{safeName}'?",
+                managedFields,
+                null);
+        }
+
+        if (HasLiteralCredentials(http))
+        {
+            return new McpReauthenticationPlan(
+                Guid.NewGuid(),
+                key,
+                prepared.Revision,
+                McpReauthenticationKind.Unavailable,
+                $"Reauthenticate MCP server '{safeName}'?",
+                [],
+                "This MCP server uses literal credentials. Use Edit to replace them safely.");
+        }
+
+        if (http.Auth.Mode == McpAuthMode.OAuth)
+        {
+            return new McpReauthenticationPlan(
+                Guid.NewGuid(),
+                key,
+                prepared.Revision,
+                McpReauthenticationKind.OAuth,
+                $"Reauthenticate OAuth for MCP server '{safeName}'? The shared token for this server URL will be replaced; its dynamic client registration will be retained.",
+                [],
+                null,
+                CanonicalResourceUri.From(http.Url));
+        }
+
+        return new McpReauthenticationPlan(
+            Guid.NewGuid(),
+            key,
+            prepared.Revision,
+            McpReauthenticationKind.Unavailable,
+            $"Reauthenticate MCP server '{safeName}'?",
+            [],
+            "This MCP server does not have reauthenticatable credentials.");
     }
 
     private void ValidateScopeAvailable(McpConfigScope scope)
@@ -960,6 +1066,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 }
             }
 
+
             await lease.DisposeAsync().ConfigureAwait(false);
             lease = null;
             if (!isAdd)
@@ -1037,6 +1144,432 @@ internal sealed partial class McpManagementService : IMcpManagementService
         }
     }
 
+    private async Task<McpMutationResult> CommitDeleteCoreAsync(
+        McpDeletePreview preview,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(preview);
+        await this.mutationGate.WaitAsync(ct).ConfigureAwait(false);
+        McpMutationResult result;
+        var notify = false;
+        try
+        {
+            result = await this.CommitDeleteUnderGateAsync(preview, ct).ConfigureAwait(false);
+            if (result.Status is McpMutationStatus.Succeeded or McpMutationStatus.SavedWithRuntimeError)
+            {
+                this.completedOperations.Add(preview.OperationId);
+                notify = true;
+            }
+        }
+        finally
+        {
+            this.mutationGate.Release();
+        }
+
+        if (notify)
+        {
+            this.RaiseChanged();
+        }
+
+        return result;
+    }
+
+    private async Task<McpMutationResult> CommitDeleteUnderGateAsync(
+        McpDeletePreview preview,
+        CancellationToken ct)
+    {
+        McpConfigMutationLease? lease = null;
+        var writeSucceeded = false;
+        try
+        {
+            this.ValidateScopeAvailable(preview.Key.Scope);
+            lease = await McpConfigMutationLease
+                .AcquireAsync(this.workingDirectory, this.userMcpDir, ct)
+                .ConfigureAwait(false);
+            if (preview.OperationId == Guid.Empty || this.completedOperations.Contains(preview.OperationId))
+            {
+                return await this.CreateRejectedResultAsync(
+                    "This MCP delete confirmation has already been committed or is invalid.").ConfigureAwait(false);
+            }
+
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != preview.Revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP configuration changed after this delete was prepared. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            var entries = this.LoadPhysicalEntriesForMutation(ct);
+            var entry = entries.FirstOrDefault(candidate => candidate.Key == preview.Key);
+            if (entry is null)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "The selected MCP server no longer exists in the selected scope.").ConfigureAwait(false);
+            }
+
+            var before = this.LoadEffectiveConfigsForMutation();
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != preview.Revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP configuration changed while this delete was being saved. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            if (!this.RemoveWithExpectedRevision(
+                    preview.Key.Scope,
+                    preview.Key.Name,
+                    this.workingDirectory,
+                    this.userMcpDir,
+                    RevisionForScope(preview.Revision, preview.Key.Scope)))
+            {
+                return await this.CreateRejectedResultAsync(
+                    "The selected MCP server no longer exists in the selected scope.").ConfigureAwait(false);
+            }
+
+            writeSucceeded = true;
+            var cleanupWarning = await this.DeleteUnreferencedOldSecretsAsync(
+                preview.Key.Name,
+                entry.Config,
+                ownedOnly: false).ConfigureAwait(false);
+            IReadOnlyDictionary<string, McpServerConfig>? after;
+            IReadOnlyList<McpPhysicalServerEntry>? afterEntries;
+            try
+            {
+                after = this.LoadEffectiveConfigsForMutation();
+                afterEntries = this.LoadPhysicalEntriesForMutation(CancellationToken.None);
+            }
+            catch
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+                var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+                return new McpMutationResult(
+                    McpMutationStatus.Succeeded,
+                    null,
+                    CreateSavedMessage(EmptyRuntimeReconcileResult().Errors, cleanupWarning
+                        ?? "Prior MCP credentials were retained because post-save cleanup could not be verified."),
+                    snapshot);
+            }
+
+            var selected = SelectNearestKey(entries, afterEntries, preview.Key);
+            await lease.DisposeAsync().ConfigureAwait(false);
+            lease = null;
+            var forceStart = after.ContainsKey(preview.Key.Name)
+                ? new HashSet<string>(StringComparer.Ordinal) { preview.Key.Name }
+                : new HashSet<string>(StringComparer.Ordinal);
+            var reconcile = await this.ReconcileAsync(
+                before,
+                after,
+                new HashSet<string>(StringComparer.Ordinal) { preview.Key.Name },
+                new HashSet<string>(StringComparer.Ordinal),
+                forceStart,
+                ct).ConfigureAwait(false);
+            var refreshed = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+            return new McpMutationResult(
+                reconcile.Errors.IsDefaultOrEmpty
+                    ? McpMutationStatus.Succeeded
+                    : McpMutationStatus.SavedWithRuntimeError,
+                selected,
+                CreateSavedMessage(reconcile.Errors, cleanupWarning),
+                refreshed);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!writeSucceeded)
+            {
+                throw;
+            }
+
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                preview.Key,
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            if (!writeSucceeded)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP server could not be deleted. Review the configuration and try again.").ConfigureAwait(false);
+            }
+
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                preview.Key,
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
+        }
+        finally
+        {
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private async Task<McpMutationResult> ReauthenticateCoreAsync(
+        McpReauthenticationPlan plan,
+        IReadOnlyDictionary<string, McpSecretReplacement> replacements,
+        CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(plan);
+        ArgumentNullException.ThrowIfNull(replacements);
+        await this.mutationGate.WaitAsync(ct).ConfigureAwait(false);
+        McpMutationResult result;
+        var notify = false;
+        try
+        {
+            result = await this.ReauthenticateUnderGateAsync(plan, replacements, ct).ConfigureAwait(false);
+            if (result.Status is McpMutationStatus.Succeeded or McpMutationStatus.SavedWithRuntimeError)
+            {
+                this.completedOperations.Add(plan.OperationId);
+                notify = true;
+            }
+        }
+        finally
+        {
+            this.mutationGate.Release();
+        }
+
+        if (notify)
+        {
+            this.RaiseChanged();
+        }
+
+        return result;
+    }
+
+    private async Task<McpMutationResult> ReauthenticateUnderGateAsync(
+        McpReauthenticationPlan plan,
+        IReadOnlyDictionary<string, McpSecretReplacement> replacements,
+        CancellationToken ct)
+    {
+        McpConfigMutationLease? lease = null;
+        var stagedKeys = new List<string>();
+        var writeSucceeded = false;
+        try
+        {
+            this.ValidateScopeAvailable(plan.Key.Scope);
+            lease = await McpConfigMutationLease
+                .AcquireAsync(this.workingDirectory, this.userMcpDir, ct)
+                .ConfigureAwait(false);
+            if (plan.OperationId == Guid.Empty || this.completedOperations.Contains(plan.OperationId))
+            {
+                return await this.CreateRejectedResultAsync(
+                    "This MCP reauthentication confirmation has already been committed or is invalid.").ConfigureAwait(false);
+            }
+
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != plan.Revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP configuration changed after reauthentication was prepared. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            var entries = this.LoadPhysicalEntriesForMutation(ct);
+            var entry = entries.FirstOrDefault(candidate => candidate.Key == plan.Key);
+            if (entry?.Config is not McpHttpServerConfig http)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "The selected MCP server no longer supports HTTP reauthentication.").ConfigureAwait(false);
+            }
+
+            if (plan.Kind == McpReauthenticationKind.EnvironmentOwned)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "This MCP server uses environment-owned credentials. Update the referenced environment variable instead.")
+                    .ConfigureAwait(false);
+            }
+
+            if (plan.Kind == McpReauthenticationKind.Unavailable)
+            {
+                return await this.CreateRejectedResultAsync(
+                    plan.DisabledReason ?? "This MCP server cannot be reauthenticated from this screen.")
+                    .ConfigureAwait(false);
+            }
+
+            var before = this.LoadEffectiveConfigsForMutation();
+            if (plan.Kind == McpReauthenticationKind.OAuth)
+            {
+                if (http.Auth.Mode != McpAuthMode.OAuth)
+                {
+                    return await this.CreateRejectedResultAsync(
+                        "MCP authentication changed after reauthentication was prepared. Review the current configuration and try again.")
+                        .ConfigureAwait(false);
+                }
+
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+                var authResult = await this.oauth.ReauthenticateAsync(http, ct).ConfigureAwait(false);
+                if (!authResult.Succeeded)
+                {
+                    return await this.CreateRejectedResultAsync(
+                        authResult.Error ?? "MCP OAuth reauthentication did not complete.").ConfigureAwait(false);
+                }
+
+                lease = await McpConfigMutationLease
+                    .AcquireAsync(this.workingDirectory, this.userMcpDir, ct)
+                    .ConfigureAwait(false);
+                var revalidationRevision = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+                var revalidationEntries = this.LoadPhysicalEntriesForMutation(ct);
+                var revalidated = revalidationEntries.FirstOrDefault(candidate => candidate.Key == plan.Key);
+                var after = this.LoadEffectiveConfigsForMutation();
+                var revalidationStable = revalidationRevision
+                    == CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+                if (!revalidationStable
+                    || revalidated?.Config is not McpHttpServerConfig revalidatedHttp
+                    || !revalidated.IsEffective
+                    || revalidatedHttp.Disabled
+                    || revalidatedHttp.Auth.Mode != McpAuthMode.OAuth
+                    || plan.OAuthCanonicalResource is null
+                    || !string.Equals(
+                        plan.OAuthCanonicalResource,
+                        CanonicalResourceUri.From(revalidatedHttp.Url),
+                        StringComparison.Ordinal)
+                    || !after.TryGetValue(plan.Key.Name, out var effective)
+                    || !EffectiveConfigsEqual(revalidated.Config, effective))
+                {
+                    await lease.DisposeAsync().ConfigureAwait(false);
+                    lease = null;
+                    return await this.CreateOAuthTokenSavedConfigurationChangedResultAsync(plan.Key)
+                        .ConfigureAwait(false);
+                }
+
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+                return await this.ReconcileReauthenticatedServerAsync(
+                    plan.Key,
+                    entry.IsEffective,
+                    before,
+                    ct,
+                    after: after).ConfigureAwait(false);
+            }
+
+            if (plan.Kind != McpReauthenticationKind.StoredSecret
+                || !ReplacementSetMatches(plan.ManagedFields, replacements))
+            {
+                return await this.CreateRejectedResultAsync(
+                    "Provide a masked replacement value for every managed MCP credential.").ConfigureAwait(false);
+            }
+
+            var currentFields = McpSecretStore.References(http)
+                .Select(static binding => binding.Field)
+                .OrderBy(static field => field, StringComparer.Ordinal)
+                .ToImmutableArray();
+            if (!currentFields.SequenceEqual(plan.ManagedFields, StringComparer.Ordinal)
+                || HasEnvironmentCredentials(http))
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP credentials changed after reauthentication was prepared. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            var references = new Dictionary<string, string>(StringComparer.Ordinal);
+            foreach (var field in plan.ManagedFields)
+            {
+                references.Add(
+                    field,
+                    await this.StageReplacementAsync(
+                        replacements[field],
+                        plan.Key.Name,
+                        field,
+                        stagedKeys,
+                        ct).ConfigureAwait(false));
+            }
+
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != plan.Revision)
+            {
+                return await this.CreateRejectedAfterStagedCleanupAsync(
+                    "MCP configuration changed while reauthentication was being saved. Review the current configuration and try again.",
+                    stagedKeys).ConfigureAwait(false);
+            }
+
+            var updated = ReplaceManagedReferences(http, references);
+            this.ReplaceWithExpectedRevision(
+                plan.Key.Scope,
+                plan.Key.Name,
+                plan.Key.Name,
+                updated,
+                disabled: updated.Disabled,
+                this.workingDirectory,
+                this.userMcpDir,
+                RevisionForScope(plan.Revision, plan.Key.Scope));
+            writeSucceeded = true;
+            var cleanupWarning = await this.DeleteUnreferencedOldSecretsAsync(
+                plan.Key.Name,
+                http,
+                ownedOnly: false).ConfigureAwait(false);
+
+            await lease.DisposeAsync().ConfigureAwait(false);
+            lease = null;
+            return await this.ReconcileReauthenticatedServerAsync(
+                plan.Key,
+                entry.IsEffective,
+                before,
+                ct,
+                cleanupWarning).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!writeSucceeded)
+            {
+                if (await this.CleanupStagedKeysAsync(stagedKeys).ConfigureAwait(false))
+                {
+                    throw new OperationCanceledException("MCP operation was cancelled; cleanup incomplete.", ct);
+                }
+
+                throw;
+            }
+
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                plan.Key,
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            if (!writeSucceeded)
+            {
+                return await this.CreateRejectedAfterStagedCleanupAsync(
+                    "MCP credentials could not be saved. Review the configuration and try again.",
+                    stagedKeys).ConfigureAwait(false);
+            }
+
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                plan.Key,
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
+        }
+        finally
+        {
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+
     private static McpPhysicalServerEntry? ValidateCommitEntries(
         IReadOnlyList<McpPhysicalServerEntry> entries,
         McpEditPreview preview,
@@ -1081,6 +1614,101 @@ internal sealed partial class McpManagementService : IMcpManagementService
         }
 
         return original;
+    }
+
+    private async Task<McpMutationResult> ReconcileReauthenticatedServerAsync(
+        McpServerKey key,
+        bool wasEffective,
+        IReadOnlyDictionary<string, McpServerConfig> before,
+        CancellationToken ct,
+        string? cleanupWarning = null,
+        IReadOnlyDictionary<string, McpServerConfig>? after = null)
+    {
+        after ??= this.LoadEffectiveConfigsForMutation();
+        var shouldReconnect = wasEffective && after.ContainsKey(key.Name);
+        var names = new HashSet<string>(StringComparer.Ordinal) { key.Name };
+        var reconcile = await this.ReconcileAsync(
+            before,
+            after,
+            names,
+            shouldReconnect ? names : new HashSet<string>(StringComparer.Ordinal),
+            shouldReconnect ? names : new HashSet<string>(StringComparer.Ordinal),
+            ct).ConfigureAwait(false);
+        var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        return new McpMutationResult(
+            reconcile.Errors.IsDefaultOrEmpty
+                ? McpMutationStatus.Succeeded
+                : McpMutationStatus.SavedWithRuntimeError,
+            key,
+            CreateSavedMessage(reconcile.Errors, cleanupWarning),
+            snapshot);
+    }
+
+    private static bool ReplacementSetMatches(
+        ImmutableArray<string> fields,
+        IReadOnlyDictionary<string, McpSecretReplacement> replacements)
+    {
+        if (fields.Length != replacements.Count)
+        {
+            return false;
+        }
+
+        return fields.All(field =>
+            replacements.TryGetValue(field, out var replacement) && replacement is not null);
+    }
+
+    private static bool HasEnvironmentCredentials(McpHttpServerConfig config) =>
+        config.Headers.Values.Any(value => ClassifySecret(value) == McpSecretSource.Environment)
+        || ClassifySecret(config.Auth.BearerToken) == McpSecretSource.Environment;
+
+    private static bool HasLiteralCredentials(McpHttpServerConfig config) =>
+        config.Headers.Values.Any(value => ClassifySecret(value) == McpSecretSource.Literal)
+        || ClassifySecret(config.Auth.BearerToken) == McpSecretSource.Literal;
+
+    private static McpHttpServerConfig ReplaceManagedReferences(
+        McpHttpServerConfig config,
+        IReadOnlyDictionary<string, string> references)
+    {
+        var headers = new Dictionary<string, string>(config.Headers, StringComparer.Ordinal);
+        foreach (var (field, reference) in references)
+        {
+            if (field.StartsWith("header/", StringComparison.Ordinal))
+            {
+                headers[field["header/".Length..]] = reference;
+            }
+        }
+
+        var bearer = references.TryGetValue("auth/token", out var bearerReference)
+            ? bearerReference
+            : config.Auth.BearerToken;
+        return new McpHttpServerConfig(
+            config.Url,
+            headers,
+            new McpAuthConfig(
+                config.Auth.Mode,
+                config.Auth.ClientId,
+                config.Auth.Scopes,
+                bearer))
+        {
+            Disabled = config.Disabled,
+        };
+    }
+
+    private static McpServerKey? SelectNearestKey(
+        IReadOnlyList<McpPhysicalServerEntry> before,
+        IReadOnlyList<McpPhysicalServerEntry> after,
+        McpServerKey deleted)
+    {
+        if (after.Count == 0)
+        {
+            return null;
+        }
+
+        var deletedIndex = before
+            .Select(static entry => entry.Key)
+            .ToList()
+            .IndexOf(deleted);
+        return after[Math.Clamp(deletedIndex, 0, after.Count - 1)].Key;
     }
 
     private void UpsertWithExpectedRevision(
@@ -1322,6 +1950,26 @@ internal sealed partial class McpManagementService : IMcpManagementService
     {
         this.ValidatePhysicalConfiguration(CancellationToken.None);
         return McpConfig.Load(this.workingDirectory, this.userMcpDir);
+    }
+
+    private bool RemoveWithExpectedRevision(
+        McpConfigScope scope,
+        string name,
+        string workingDirectory,
+        string? userDirectory,
+        string expectedRevision)
+    {
+        if (this.configMutator is IRevisionedMcpConfigMutator revisioned)
+        {
+        return revisioned.Remove(
+            scope,
+            name,
+            workingDirectory,
+            userDirectory,
+            expectedRevision);
+        }
+
+        return this.configMutator.Remove(scope, name, workingDirectory, userDirectory);
     }
 
     private async Task<McpRuntimeReconcileResult> ReconcileAsync(
@@ -1772,7 +2420,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
     private async Task<string?> DeleteUnreferencedOldSecretsAsync(
         string? originalServerName,
-        McpServerConfig? original)
+        McpServerConfig? original,
+        bool ownedOnly = true)
     {
         if (original is null || originalServerName is null)
         {
@@ -1780,7 +2429,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         }
 
         var oldKeys = McpSecretStore.References(original)
-            .Where(binding => McpSecretStore.IsOwnedKey(
+            .Where(binding => !ownedOnly || McpSecretStore.IsOwnedKey(
                 originalServerName,
                 binding.Field,
                 binding.StoreKey))
@@ -1870,6 +2519,18 @@ internal sealed partial class McpManagementService : IMcpManagementService
             McpMutationStatus.SavedWithRuntimeError,
             key,
             CreateSavedMessage([SanitizeError(runtimeError)], cleanupWarning: null),
+            snapshot);
+    }
+
+    private async Task<McpMutationResult> CreateOAuthTokenSavedConfigurationChangedResultAsync(
+        McpServerKey key)
+    {
+        var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+        McpServerKey? selected = snapshot.Servers.Any(server => server.Key == key) ? key : null;
+        return new McpMutationResult(
+            McpMutationStatus.SavedWithRuntimeError,
+            selected,
+            "The OAuth token was replaced, but the MCP server definition changed before it could be reconnected. Review the current configuration and reconnect it if appropriate.",
             snapshot);
     }
 
