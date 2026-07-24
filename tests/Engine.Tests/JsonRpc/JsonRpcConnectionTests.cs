@@ -167,6 +167,69 @@ public sealed class JsonRpcConnectionTests
             () => connection.SendNotificationAsync("any/method", null, CancellationToken.None).WaitAsync(Timeout));
     }
 
+    // ── WS4: bounded single-writer FIFO transport ────────────────────────────
+
+    /// <summary>
+    /// Fire-and-forget notifications (as the wire sinks send them) are written in the exact order they were
+    /// enqueued, guaranteed by the single FIFO writer loop rather than racing on a shared write lock.
+    /// </summary>
+    [Fact]
+    public async Task Notifications_are_written_in_fifo_order()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var connection = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        const int count = 200;
+
+        // Drain the server side concurrently so the pipe never blocks the writer loop.
+        var reader = Task.Run(async () =>
+        {
+            var seen = new List<int>(count);
+            for (var i = 0; i < count; i++)
+            {
+                var msg = await JsonRpcMessageCodec.ReadMessageAsync(pair.ServerReads, CancellationToken.None);
+                seen.Add(msg!["params"]!["n"]!.GetValue<int>());
+            }
+
+            return seen;
+        });
+
+        for (var i = 0; i < count; i++)
+        {
+            _ = connection.SendNotificationAsync("event/tick", new JsonObject { ["n"] = i }, CancellationToken.None);
+        }
+
+        var order = await reader.WaitAsync(Timeout);
+        Assert.Equal(Enumerable.Range(0, count).ToList(), order);
+    }
+
+    /// <summary>
+    /// Every notification accepted before disposal is flushed to the wire during DisposeAsync, in order,
+    /// so a shutdown never silently drops already-queued output.
+    /// </summary>
+    [Fact]
+    public async Task Accepted_notifications_are_drained_on_dispose()
+    {
+        using var pair = new DuplexStreamPair();
+        var connection = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+
+        const int count = 20;
+        for (var i = 0; i < count; i++)
+        {
+            _ = connection.SendNotificationAsync("event/tick", new JsonObject { ["n"] = i }, CancellationToken.None);
+        }
+
+        await connection.DisposeAsync().AsTask().WaitAsync(Timeout);
+
+        for (var i = 0; i < count; i++)
+        {
+            var msg = await JsonRpcMessageCodec
+                .ReadMessageAsync(pair.ServerReads, CancellationToken.None)
+                .WaitAsync(Timeout);
+            Assert.Equal(i, msg!["params"]!["n"]!.GetValue<int>());
+        }
+    }
+
     // ── Start() after dispose is a no-op (Start L70 disposed branch) ─────────
 
     /// <summary>

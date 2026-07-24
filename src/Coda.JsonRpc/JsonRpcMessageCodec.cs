@@ -26,6 +26,29 @@ public static class JsonRpcMessageCodec
     }
 
     /// <summary>
+    /// Writes several JSON-RPC messages back-to-back and flushes once, so a burst of notifications costs a
+    /// single flush instead of one per message. Each message keeps its own Content-Length frame, so the
+    /// wire output is byte-identical to writing them individually — only the flush boundary changes.
+    /// </summary>
+    public static async Task WriteMessagesAsync(Stream stream, IReadOnlyList<JsonNode> messages, CancellationToken ct)
+    {
+        if (messages.Count == 0)
+        {
+            return;
+        }
+
+        foreach (var message in messages)
+        {
+            var body = utf8NoBom.GetBytes(message.ToJsonString());
+            var header = Encoding.ASCII.GetBytes($"Content-Length: {body.Length}\r\n\r\n");
+            await stream.WriteAsync(header, ct).ConfigureAwait(false);
+            await stream.WriteAsync(body, ct).ConfigureAwait(false);
+        }
+
+        await stream.FlushAsync(ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
     /// Reads a single Content-Length-framed JSON-RPC message from <paramref name="stream"/>.
     /// Returns <c>null</c> on clean EOF (zero bytes before the first header byte).
     /// Throws <see cref="InvalidDataException"/> if the Content-Length header is missing or malformed.
