@@ -44,6 +44,34 @@ public sealed class TerminalInputCompatibilityTests
     }
 
     [Fact]
+    public void Driver_override_forces_named_driver_over_windows_terminal_default()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["WT_SESSION"] = "abc-123",
+            ["CODA_TUI_DRIVER"] = "windows",
+        };
+
+        var driver = TerminalInputCompatibility.SelectDriverName(env.GetValueOrDefault, isWindows: true);
+
+        Assert.Equal(DriverRegistry.Names.WINDOWS, driver);
+    }
+
+    [Fact]
+    public void Driver_override_default_forces_platform_default()
+    {
+        var env = new Dictionary<string, string?>
+        {
+            ["WT_SESSION"] = "abc-123",
+            ["CODA_TUI_DRIVER"] = "  default  ",
+        };
+
+        var driver = TerminalInputCompatibility.SelectDriverName(env.GetValueOrDefault, isWindows: true);
+
+        Assert.Null(driver);
+    }
+
+    [Fact]
     public void Csi_13_2u_is_decoded_as_shift_enter_by_the_ansi_parser()
     {
         const string sequence = "\u001b[13;2u";

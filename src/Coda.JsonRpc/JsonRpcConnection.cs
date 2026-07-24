@@ -1,6 +1,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics.CodeAnalysis;
 using System.Text.Json.Nodes;
+using System.Threading.Channels;
 
 namespace Coda.JsonRpc;
 
@@ -18,7 +19,23 @@ public sealed class JsonRpcConnection : IJsonRpcConnection
 {
     private readonly Stream input;
     private readonly Stream output;
-    private readonly SemaphoreSlim writeLock = new(1, 1);
+
+    // All outbound frames (requests, responses, notifications) go through one bounded FIFO queue drained
+    // by a single writer loop. This replaces racing fire-and-forget writes behind a semaphore: it
+    // guarantees FIFO ordering, bounds memory when the reader is slow (producers await on a full queue),
+    // batches a burst of frames into one flush, and lets DisposeAsync drain accepted frames deterministically.
+    private const int OutboundCapacity = 4096;
+    private readonly Channel<JsonNode> outbound = Channel.CreateBounded<JsonNode>(
+        new BoundedChannelOptions(OutboundCapacity)
+        {
+            SingleReader = true,
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.Wait,
+        });
+
+    private readonly Task writeLoopTask;
+    private volatile bool writeFailed;
+
     private readonly ConcurrentDictionary<int, TaskCompletionSource<JsonNode?>> pendingRequests = new();
     private readonly ConcurrentDictionary<string, Action<JsonNode?>> notificationHandlers = new();
     private readonly ConcurrentDictionary<string, Func<JsonNode?, JsonNode?>> requestHandlers = new();
@@ -50,6 +67,11 @@ public sealed class JsonRpcConnection : IJsonRpcConnection
     {
         this.input = input;
         this.output = output;
+
+        // The writer loop runs for the life of the connection, independent of the read loop, so a
+        // notification or response can be enqueued before Start() is ever called.
+        this.writeLoopTask = Task.Run(this.RunWriteLoopAsync);
+
         if (startListening)
         {
             this.Start();
@@ -177,11 +199,21 @@ public sealed class JsonRpcConnection : IJsonRpcConnection
         }
 
         // I4: wait (bounded) for any in-flight server-request response writes
-        // before disposing the write lock, to avoid unobserved exceptions from
-        // late writes racing against the semaphore disposal.
+        // before completing the outbound queue, so their responses are enqueued.
         await this.DrainServerResponsesQuietly().ConfigureAwait(false);
 
-        this.writeLock.Dispose();
+        // Complete the outbound queue and let the writer loop flush every accepted frame, then exit.
+        // Bounded so a blocked reader cannot hang shutdown.
+        this.outbound.Writer.TryComplete();
+        try
+        {
+            await this.writeLoopTask.WaitAsync(TimeSpan.FromSeconds(2)).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Bounded timeout expired (a blocked reader) — acceptable at shutdown time.
+        }
+
         this.cts.Dispose();
     }
 
@@ -456,14 +488,64 @@ public sealed class JsonRpcConnection : IJsonRpcConnection
 
     private async Task WriteMessageAsync(JsonNode message, CancellationToken ct)
     {
-        await this.writeLock.WaitAsync(ct).ConfigureAwait(false);
+        if (this.disposed)
+        {
+            throw new ObjectDisposedException(nameof(JsonRpcConnection));
+        }
+
         try
         {
-            await JsonRpcMessageCodec.WriteMessageAsync(this.output, message, ct).ConfigureAwait(false);
+            // Enqueue for the single writer loop. On a full queue this awaits (backpressure), which bounds
+            // memory; the caller (a fire-and-forget sink, or a request awaiting its response) is unaffected.
+            await this.outbound.Writer.WriteAsync(message, ct).ConfigureAwait(false);
         }
-        finally
+        catch (ChannelClosedException)
         {
-            this.writeLock.Release();
+            // The queue was completed by DisposeAsync between the flag check and the enqueue.
+            throw new ObjectDisposedException(nameof(JsonRpcConnection));
+        }
+    }
+
+    private async Task RunWriteLoopAsync()
+    {
+        var reader = this.outbound.Reader;
+        var batch = new List<JsonNode>();
+        try
+        {
+            while (await reader.WaitToReadAsync().ConfigureAwait(false))
+            {
+                batch.Clear();
+                while (reader.TryRead(out var message))
+                {
+                    batch.Add(message);
+                }
+
+                if (this.writeFailed)
+                {
+                    // The pipe is already dead; keep draining so producers unblock and the loop can exit
+                    // once the queue is completed, but never touch the broken stream again.
+                    continue;
+                }
+
+                try
+                {
+                    // Frames are written with CancellationToken.None so a shutdown (which cancels the read
+                    // loop) still flushes already-accepted frames; DisposeAsync bounds the overall drain.
+                    await JsonRpcMessageCodec
+                        .WriteMessagesAsync(this.output, batch, CancellationToken.None)
+                        .ConfigureAwait(false);
+                }
+                catch
+                {
+                    // A dead or blocked pipe: stop writing. Remaining and future frames are discarded — a
+                    // sink must never crash the agent, and a dropped notification on a dead pipe is expected.
+                    this.writeFailed = true;
+                }
+            }
+        }
+        catch
+        {
+            // Defensive: the writer loop must never fault (it is awaited by DisposeAsync).
         }
     }
 
