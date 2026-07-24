@@ -44,6 +44,13 @@ public sealed class WireAgentSink : IAgentSink
 
     public void OnAssistantText(string delta) => this.CoalesceText(delta);
 
+    /// <summary>
+    /// Flushes any buffered assistant text immediately. The host calls this when a turn ends on a path that
+    /// bypasses the sink (an interrupt/cancellation, where <see cref="OnAssistantTextComplete"/> is not
+    /// raised), so a trailing coalesced fragment is never dropped.
+    /// </summary>
+    public void Flush() => this.FlushPendingText();
+
     public void OnAssistantTextComplete()
     {
         _ = this.SendAsync(ServeMethods.EventAssistantTextComplete, new JsonObject());

@@ -87,6 +87,20 @@ public sealed class WireAssistantTextCoalescingTests
     }
 
     [Fact]
+    public void Flush_sends_buffered_text_for_the_interrupt_path()
+    {
+        var conn = new CapturingConnection();
+        var now = 1000L;
+        var sink = new WireAgentSink(conn, () => now);
+
+        sink.OnAssistantText("a");   // flushes immediately
+        sink.OnAssistantText("b");   // buffered
+        sink.Flush();                // interrupt teardown must not drop "b"
+
+        Assert.Equal(new[] { "a", "b" }, TextDeltas(conn));
+    }
+
+    [Fact]
     public void Completion_flushes_remaining_buffered_text_first()
     {
         var conn = new CapturingConnection();
