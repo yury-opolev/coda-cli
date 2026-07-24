@@ -124,7 +124,7 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         try
         {
             app = this.applicationFactory();
-            app.AppModel = mode == TuiRunMode.Inline ? AppModel.Inline : AppModel.FullScreen;
+            TerminalGuiShellComposition.ConfigureApplication(app, mode);
             var mouseService = app.Mouse;
             if (mouseService is not null)
             {

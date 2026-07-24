@@ -446,21 +446,17 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             var composerController = new ComposerController(new SlashCommandCompletion(registry));
             composerController.Restore(composer);
 
-            TerminalGuiShellBase shell = shellMode == TuiRunMode.Fullscreen
-                ? new FullscreenTuiShell(
-                    tgApp, composerController, mailbox, controller.CurrentSnapshot,
-                    hasActiveWork: () => controller.HasActiveWork,
-                    transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
-                    taskBrowserProvider: taskBrowserProvider,
-                    mcpBrowserProvider: mcpBrowserProvider,
-                    toolDisplayMode: toolDisplayMode)
-                : new InlineTuiShell(
-                    tgApp, composerController, mailbox, controller.CurrentSnapshot,
-                    hasActiveWork: () => controller.HasActiveWork,
-                    transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
-                    taskBrowserProvider: taskBrowserProvider,
-                    mcpBrowserProvider: mcpBrowserProvider,
-                    toolDisplayMode: toolDisplayMode);
+            var shell = TerminalGuiShellComposition.Create(
+                shellMode,
+                tgApp,
+                composerController,
+                mailbox,
+                controller.CurrentSnapshot,
+                hasActiveWork: () => controller.HasActiveWork,
+                transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
+                taskBrowserProvider: taskBrowserProvider,
+                mcpBrowserProvider: mcpBrowserProvider,
+                toolDisplayMode: toolDisplayMode);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);
