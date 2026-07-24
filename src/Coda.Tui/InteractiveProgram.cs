@@ -1,4 +1,6 @@
 using Coda.Agent;
+using Coda.Mcp.Auth;
+using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -264,6 +266,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         context.ExtraToolsProvider = agentToolsProvider;
         context.Mcp = mcp;
         context.CredentialStore = store;
+        context.McpManagement = new McpManagementService(
+            cwd,
+            userMcpDir: null,
+            mcp,
+            store,
+            new DefaultMcpOAuthReauthenticator(mcpHttp, store),
+            mailbox);
 
         // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
         // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only

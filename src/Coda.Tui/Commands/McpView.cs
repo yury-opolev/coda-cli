@@ -1,11 +1,86 @@
 using System.Text;
 using Coda.Mcp;
+using Coda.Tui.Mcp;
+using Coda.Tui.Ui.Rendering;
 
 namespace Coda.Tui.Commands;
 
 /// <summary>Pure text rendering of the <c>/mcp</c> list and info views (no console dependency).</summary>
 public static class McpView
 {
+    public static string FormatList(McpManagementSnapshot snapshot)
+    {
+        ArgumentNullException.ThrowIfNull(snapshot);
+        if (snapshot.Servers.IsDefaultOrEmpty)
+        {
+            return snapshot.ReadError is { Length: > 0 }
+                ? $"Unable to read MCP servers: {Safe(snapshot.ReadError)}"
+                : "No MCP servers configured. Add one with /mcp add, or edit ~/.coda/.mcp.json or ./.mcp.json.";
+        }
+
+        var builder = new StringBuilder();
+        builder.AppendLine($"MCP servers ({snapshot.Servers.Length}):");
+        foreach (var server in snapshot.Servers)
+        {
+            builder.Append("  ")
+                .Append(Safe(server.Key.Name))
+                .Append("  [").Append(ScopeLabel(server.Key.Scope)).Append(']')
+                .Append("  ").Append(TransportShort(server.Transport))
+                .Append("  ").Append(SummaryStatus(server))
+                .Append("  ").Append(server.IsEffective ? "effective" : "overridden")
+                .Append("  ").Append(Safe(server.SourceFile));
+            if (server.LastError is { Length: > 0 } error)
+            {
+                builder.Append("  error: ").Append(Safe(error));
+            }
+
+            builder.AppendLine();
+        }
+
+        return builder.ToString().TrimEnd();
+    }
+
+    public static string FormatInfo(McpServerDetail detail)
+    {
+        ArgumentNullException.ThrowIfNull(detail);
+        var summary = detail.Summary;
+        var builder = new StringBuilder();
+        builder.AppendLine($"{Safe(summary.Key.Name)}  [{ScopeLabel(summary.Key.Scope)}]");
+        builder.AppendLine($"  source:      {Safe(summary.SourceFile)}");
+        builder.AppendLine($"  state:       {SummaryStatus(summary)} ({(summary.IsEffective ? "effective" : "overridden")})");
+        if (summary.LastError is { Length: > 0 } error)
+        {
+            builder.AppendLine($"  error:       {Safe(error)}");
+        }
+
+        builder.Append("  transport:   ").Append(TransportDetail(detail)).AppendLine();
+        AppendSecretDescriptors(builder, "env", detail.Environment);
+        AppendSecretDescriptors(builder, "headers", detail.Headers);
+        if (detail.AuthMode != McpAuthMode.None)
+        {
+            builder.AppendLine($"  auth:        {Safe(detail.AuthMode.ToString().ToLowerInvariant())}");
+            if (detail.ClientId is { } clientId)
+            {
+                builder.AppendLine($"  client id:   {Safe(clientId)}");
+            }
+
+            if (!detail.Scopes.IsDefaultOrEmpty)
+            {
+                builder.AppendLine($"  scopes:       {string.Join(", ", detail.Scopes.Select(Safe))}");
+            }
+
+            if (detail.BearerToken is { } token)
+            {
+                builder.AppendLine($"    token = {Safe(token.DisplayValue)}");
+            }
+        }
+
+        AppendCapabilities(builder, "tools", detail.Tools);
+        AppendCapabilities(builder, "prompts", detail.Prompts);
+        AppendCapabilities(builder, "resources", detail.Resources);
+        return builder.ToString().TrimEnd();
+    }
+
     /// <summary>Render the server table. Empty input yields a "no servers" hint.</summary>
     public static string FormatList(IReadOnlyList<McpServerStatus> servers)
     {
@@ -118,6 +193,71 @@ public static class McpView
     }
 
     private static string ScopeLabel(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
+
+    private static string Safe(string? value) =>
+        TerminalTextSanitizer.SanitizeSingleLine(value);
+
+    private static string TransportShort(McpTransportKind transport) =>
+        transport == McpTransportKind.Http ? "http" : "stdio";
+
+    private static string TransportDetail(McpServerDetail detail) =>
+        detail.Summary.Transport switch
+        {
+            McpTransportKind.Stdio =>
+                $"stdio — {Safe(detail.Command)} {string.Join(' ', detail.Args.Select(Safe))}".TrimEnd(),
+            McpTransportKind.Http => $"http — {Safe(detail.Url)}",
+            _ => "unknown",
+        };
+
+    private static string SummaryStatus(McpServerSummary summary) =>
+        !summary.Enabled
+            ? summary.Connection == McpConnectionState.Connected ? "disabled (running)" : "disabled"
+            : summary.Connection switch
+            {
+                McpConnectionState.Connected => "connected",
+                McpConnectionState.Error => "error",
+                McpConnectionState.Overridden => "overridden",
+                _ => "not connected",
+            };
+
+    private static void AppendSecretDescriptors(
+        StringBuilder builder,
+        string label,
+        IEnumerable<McpSecretDescriptor> descriptors)
+    {
+        var values = descriptors.ToList();
+        if (values.Count == 0)
+        {
+            return;
+        }
+
+        builder.AppendLine($"  {label}:");
+        foreach (var descriptor in values)
+        {
+            builder.AppendLine($"    {Safe(descriptor.Name)} = {Safe(descriptor.DisplayValue)}");
+        }
+    }
+
+    private static void AppendCapabilities(
+        StringBuilder builder,
+        string label,
+        IEnumerable<McpCapabilitySummary> capabilities)
+    {
+        var values = capabilities.ToList();
+        if (values.Count == 0)
+        {
+            return;
+        }
+
+        builder.AppendLine($"  {label} ({values.Count}):");
+        foreach (var capability in values)
+        {
+            var description = string.IsNullOrWhiteSpace(capability.Description)
+                ? "(no description)"
+                : Safe(capability.Description);
+            builder.AppendLine($"    {Safe(capability.Name)} — {description}");
+        }
+    }
 
     private static string StatusLabel(McpServerStatus s)
     {

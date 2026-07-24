@@ -288,13 +288,202 @@ internal sealed partial class McpManagementService : IMcpManagementService
         this.ReauthenticateCoreAsync(plan, replacements, ct);
 
     public Task<McpMutationResult> StartAsync(string name, CancellationToken ct) =>
-        MutationUnavailable<McpMutationResult>(ct);
+        this.StartCoreAsync(name, ct);
 
     public Task<McpMutationResult> StopAsync(string name, CancellationToken ct) =>
-        MutationUnavailable<McpMutationResult>(ct);
+        this.StopCoreAsync(name, ct);
 
     public Task<McpMutationResult> RestartAsync(string? name, CancellationToken ct) =>
-        MutationUnavailable<McpMutationResult>(ct);
+        this.RestartCoreAsync(name, ct);
+
+    private async Task<McpMutationResult> StartCoreAsync(string name, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ct.ThrowIfCancellationRequested();
+        if (this.runtime is null)
+        {
+            return await this.CreateRejectedResultAsync("MCP runtime is not available in this session.").ConfigureAwait(false);
+        }
+
+        if (this.runtime.IsServerConnected(name))
+        {
+            return await this.CreateLifecycleResultAsync(
+                McpMutationStatus.NoOp,
+                new McpServerKey(McpConfigScope.Project, name),
+                $"'{SanitizeVisibleText(name)}' is already running.").ConfigureAwait(false);
+        }
+
+        var entries = this.LoadPhysicalEntries(ct);
+        var entry = entries.FirstOrDefault(candidate => candidate.IsEffective
+            && string.Equals(candidate.Key.Name, name, StringComparison.Ordinal));
+        if (entry is null)
+        {
+            return await this.CreateRejectedResultAsync(
+                $"'{SanitizeVisibleText(name)}' is not configured.").ConfigureAwait(false);
+        }
+
+        try
+        {
+            var config = await McpSecretResolver.ResolveAsync(entry.Config, this.credentials, ct).ConfigureAwait(false);
+            var result = await this.runtime.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
+            return await this.CreateLifecycleResultAsync(
+                result.Connected ? McpMutationStatus.Succeeded : McpMutationStatus.SavedWithRuntimeError,
+                entry.Key,
+                result.Connected
+                    ? $"Started '{SanitizeVisibleText(name)}'."
+                    : $"Failed to start '{SanitizeVisibleText(name)}': {SanitizeError(result.Error)}").ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception exception)
+        {
+            return await this.CreateLifecycleResultAsync(
+                McpMutationStatus.SavedWithRuntimeError,
+                entry.Key,
+                $"Failed to start '{SanitizeVisibleText(name)}': {SanitizeError(exception.Message)}").ConfigureAwait(false);
+        }
+    }
+
+    private async Task<McpMutationResult> StopCoreAsync(string name, CancellationToken ct)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(name);
+        ct.ThrowIfCancellationRequested();
+        if (this.runtime is null)
+        {
+            return await this.CreateRejectedResultAsync("MCP runtime is not available in this session.").ConfigureAwait(false);
+        }
+
+        var stopped = await this.runtime.DisconnectServerAsync(name).ConfigureAwait(false);
+        return await this.CreateLifecycleResultAsync(
+            stopped ? McpMutationStatus.Succeeded : McpMutationStatus.NoOp,
+            new McpServerKey(McpConfigScope.Project, name),
+            stopped
+                ? $"Stopped '{SanitizeVisibleText(name)}'."
+                : $"'{SanitizeVisibleText(name)}' is not running.").ConfigureAwait(false);
+    }
+
+    private async Task<McpMutationResult> RestartCoreAsync(string? name, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (this.runtime is null)
+        {
+            return await this.CreateRejectedResultAsync("MCP runtime is not available in this session.").ConfigureAwait(false);
+        }
+
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            var entries = this.LoadPhysicalEntries(ct);
+            var entry = entries.FirstOrDefault(candidate => candidate.IsEffective
+                && string.Equals(candidate.Key.Name, name, StringComparison.Ordinal));
+            if (entry is null)
+            {
+                return await this.CreateRejectedResultAsync(
+                    $"'{SanitizeVisibleText(name)}' is not configured.").ConfigureAwait(false);
+            }
+
+            try
+            {
+                var config = await McpSecretResolver.ResolveAsync(entry.Config, this.credentials, ct).ConfigureAwait(false);
+                await this.runtime.DisconnectServerAsync(name).ConfigureAwait(false);
+                var result = await this.runtime.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
+                return await this.CreateLifecycleResultAsync(
+                    result.Connected ? McpMutationStatus.Succeeded : McpMutationStatus.SavedWithRuntimeError,
+                    entry.Key,
+                    result.Connected
+                        ? $"Restarted '{SanitizeVisibleText(name)}'."
+                        : $"Failed to restart '{SanitizeVisibleText(name)}': {SanitizeError(result.Error)}").ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                return await this.CreateLifecycleResultAsync(
+                    McpMutationStatus.SavedWithRuntimeError,
+                    entry.Key,
+                    $"Failed to restart '{SanitizeVisibleText(name)}': {SanitizeError(exception.Message)}").ConfigureAwait(false);
+            }
+        }
+
+        var servers = McpConfig.Load(this.workingDirectory, this.userMcpDir);
+        var resolvedServers = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
+        var errors = new List<string>();
+        foreach (var (serverName, rawConfig) in servers)
+        {
+            ct.ThrowIfCancellationRequested();
+            try
+            {
+                resolvedServers.Add(
+                    serverName,
+                    await McpSecretResolver.ResolveAsync(rawConfig, this.credentials, ct).ConfigureAwait(false));
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception exception)
+            {
+                errors.Add($"{SanitizeVisibleText(serverName)}: {SanitizeError(exception.Message)}");
+            }
+        }
+
+        if (errors.Count == 0)
+        {
+            foreach (var serverName in this.runtime.Clients.Select(client => client.ServerName).ToList())
+            {
+                await this.runtime.DisconnectServerAsync(serverName).ConfigureAwait(false);
+            }
+
+            foreach (var (serverName, config) in resolvedServers)
+            {
+                try
+                {
+                    var result = await this.runtime.ConnectServerAsync(serverName, config, ct).ConfigureAwait(false);
+                    if (!result.Connected)
+                    {
+                        errors.Add($"{SanitizeVisibleText(serverName)}: {SanitizeError(result.Error)}");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception exception)
+                {
+                    errors.Add($"{SanitizeVisibleText(serverName)}: {SanitizeError(exception.Message)}");
+                }
+            }
+        }
+
+        var message = errors.Count == 0
+            ? $"Reconnected MCP servers ({this.runtime.Clients.Count} connected)."
+            : $"MCP servers reconnected with errors: {errors[0]}";
+        return await this.CreateLifecycleResultAsync(
+            errors.Count == 0 ? McpMutationStatus.Succeeded : McpMutationStatus.SavedWithRuntimeError,
+            null,
+            message).ConfigureAwait(false);
+    }
+
+    private async Task<McpMutationResult> CreateLifecycleResultAsync(
+        McpMutationStatus status,
+        McpServerKey? key,
+        string message)
+    {
+        if (this.runtime is not null)
+        {
+            this.events.Publish(new McpRuntimeChangedEvent(this.runtime.GetSnapshot()));
+        }
+
+        this.RaiseChanged();
+        return new McpMutationResult(
+            status,
+            key,
+            SanitizeError(message),
+            await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false));
+    }
 
     internal static McpConfigRevision CaptureRevision(
         string workingDirectory,
@@ -1230,7 +1419,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             var cleanupWarning = await this.DeleteUnreferencedOldSecretsAsync(
                 preview.Key.Name,
                 entry.Config,
-                ownedOnly: false).ConfigureAwait(false);
+                ownedOnly: true).ConfigureAwait(false);
             IReadOnlyDictionary<string, McpServerConfig>? after;
             IReadOnlyList<McpPhysicalServerEntry>? afterEntries;
             try
@@ -2403,6 +2592,17 @@ internal sealed partial class McpManagementService : IMcpManagementService
         string? value = replacement.RevealForCommit();
         try
         {
+            if (value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal)
+                || (value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}')))
+            {
+                return value;
+            }
+
+            if (!replacement.StoreInCredentialStore)
+            {
+                return value;
+            }
+
             var staged = await McpSecretStore.StageAsync(
                 this.credentials,
                 finalServerName,

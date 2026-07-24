@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Linq;
 using Spectre.Console;
+using Coda.Tui.Ui.Rendering;
 
 namespace Coda.Tui.Ui.Prompts;
 
@@ -46,15 +47,15 @@ public sealed class SpectreUiPromptService : IUiPromptService
     private async Task<UiPromptResponse> ConfirmAsync(UiPromptRequest request, CancellationToken cancellationToken)
     {
         var defaultYes = string.Equals(request.DefaultValue, "yes", StringComparison.OrdinalIgnoreCase);
-        var confirmed = await _console.ConfirmAsync(request.Title, defaultYes, cancellationToken).ConfigureAwait(false);
+        var confirmed = await _console.ConfirmAsync(Render(request.Title), defaultYes, cancellationToken).ConfigureAwait(false);
         return new UiPromptResponse(false, [confirmed ? "yes" : "no"], null);
     }
 
     private async Task<UiPromptResponse> SelectOneAsync(UiPromptRequest request, CancellationToken cancellationToken)
     {
         var prompt = new SelectionPrompt<UiPromptOption>()
-            .Title(request.Title)
-            .UseConverter(o => Markup.Escape(UiPromptOptionFormatter.Format(o)))
+            .Title(Render(request.Title))
+            .UseConverter(o => Render(UiPromptOptionFormatter.Format(o)))
             .AddChoices(request.Options);
 
         if (request.DefaultValue is { Length: > 0 } defaultId)
@@ -73,8 +74,8 @@ public sealed class SpectreUiPromptService : IUiPromptService
     private async Task<UiPromptResponse> SelectManyAsync(UiPromptRequest request, CancellationToken cancellationToken)
     {
         var prompt = new MultiSelectionPrompt<UiPromptOption>()
-            .Title(request.Title)
-            .UseConverter(o => Markup.Escape(UiPromptOptionFormatter.Format(o)))
+            .Title(Render(request.Title))
+            .UseConverter(o => Render(UiPromptOptionFormatter.Format(o)))
             .NotRequired()
             .AddChoices(request.Options);
 
@@ -87,10 +88,10 @@ public sealed class SpectreUiPromptService : IUiPromptService
 
     private async Task<UiPromptResponse> TextAsync(UiPromptRequest request, CancellationToken cancellationToken)
     {
-        var prompt = new TextPrompt<string>(request.Title);
+        var prompt = new TextPrompt<string>(Render(request.Title));
         if (request.DefaultValue is not null)
         {
-            prompt.DefaultValue(request.DefaultValue);
+            prompt.DefaultValue(Render(request.DefaultValue));
         }
 
         if (!request.Required)
@@ -106,4 +107,7 @@ public sealed class SpectreUiPromptService : IUiPromptService
         var text = await _console.PromptAsync(prompt, cancellationToken).ConfigureAwait(false);
         return new UiPromptResponse(false, [], text);
     }
+
+    private static string Render(string? value) =>
+        Markup.Escape(TerminalTextSanitizer.SanitizeSingleLine(value));
 }

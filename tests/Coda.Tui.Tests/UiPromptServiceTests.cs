@@ -76,6 +76,24 @@ public sealed class UiPromptServiceTests
     }
 
     [Fact]
+    public async Task Spectre_prompts_escape_markup_and_strip_terminal_controls()
+    {
+        using var console = new TestConsole();
+        console.Profile.Capabilities.Interactive = true;
+        console.Input.PushKey(ConsoleKey.Enter);
+        var service = new SpectreUiPromptService(console);
+
+        await service.RequestAsync(UiPromptRequest.Select(
+            "[title]\u001b[31m\r\n",
+            [new("a", "[option]\u001b[2J\u0007")]));
+
+        Assert.DoesNotContain("\u001b", console.Output, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u0007", console.Output, StringComparison.Ordinal);
+        Assert.Contains("[title]", console.Output, StringComparison.Ordinal);
+        Assert.Contains("[option]", console.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Actor_cancellation_cancels_only_the_cancelled_prompt()
     {
         using var mailbox = new UiEventMailbox(8);

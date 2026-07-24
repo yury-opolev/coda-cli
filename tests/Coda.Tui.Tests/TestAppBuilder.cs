@@ -1,8 +1,11 @@
 using Coda.Tui;
 using Coda.Tui.Commands;
+using Coda.Tui.Mcp;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
+using Coda.Mcp.Auth;
+using Coda.Mcp;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -48,7 +51,80 @@ internal static class TestAppBuilder
         });
 
         var context = new CommandContext(console, credentials, session, providers, registry, prompts, events);
+        context.CredentialStore = store;
+        context.McpManagement = new CurrentContextMcpManagementService(context, store);
         return (new TuiApp(context), context, console, credentials);
+    }
+
+    private sealed class CurrentContextMcpManagementService : IMcpManagementService
+    {
+        private static readonly HttpClient http = new();
+        private readonly CommandContext context;
+        private readonly ITokenStore fallbackStore;
+
+        public CurrentContextMcpManagementService(CommandContext context, ITokenStore fallbackStore)
+        {
+            this.context = context;
+            this.fallbackStore = fallbackStore;
+        }
+
+        public event Action? Changed
+        {
+            add { }
+            remove { }
+        }
+
+        private IMcpManagementService Create() => new McpManagementService(
+            this.context.Session.WorkingDirectory,
+            userMcpDir: null,
+            this.context.Mcp,
+            this.context.CredentialStore ?? this.fallbackStore,
+            new DefaultMcpOAuthReauthenticator(http, this.context.CredentialStore ?? this.fallbackStore),
+            this.context.Events);
+
+        public Task<McpManagementSnapshot> RefreshAsync(CancellationToken ct) => this.Create().RefreshAsync(ct);
+
+        public Task<McpServerDetail?> GetDetailAsync(McpServerKey key, CancellationToken ct) =>
+            this.Create().GetDetailAsync(key, ct);
+
+        public Task<McpServerDraft?> CreateEditDraftAsync(McpServerKey key, CancellationToken ct) =>
+            this.Create().CreateEditDraftAsync(key, ct);
+
+        public Task<McpEditPreview> PrepareAddAsync(McpServerDraft draft, CancellationToken ct) =>
+            this.Create().PrepareAddAsync(draft, ct);
+
+        public Task<McpEditPreview> PrepareEditAsync(McpServerKey original, McpServerDraft draft, CancellationToken ct) =>
+            this.Create().PrepareEditAsync(original, draft, ct);
+
+        public Task<McpMutationResult> CommitAddAsync(McpEditPreview preview, CancellationToken ct) =>
+            this.Create().CommitAddAsync(preview, ct);
+
+        public Task<McpMutationResult> CommitEditAsync(McpEditPreview preview, CancellationToken ct) =>
+            this.Create().CommitEditAsync(preview, ct);
+
+        public Task<McpMutationResult> SetEnabledAsync(McpServerKey key, bool enabled, CancellationToken ct) =>
+            this.Create().SetEnabledAsync(key, enabled, ct);
+
+        public Task<McpDeletePreview> PrepareDeleteAsync(McpServerKey key, CancellationToken ct) =>
+            this.Create().PrepareDeleteAsync(key, ct);
+
+        public Task<McpMutationResult> CommitDeleteAsync(McpDeletePreview preview, CancellationToken ct) =>
+            this.Create().CommitDeleteAsync(preview, ct);
+
+        public Task<McpReauthenticationPlan> PrepareReauthenticationAsync(McpServerKey key, CancellationToken ct) =>
+            this.Create().PrepareReauthenticationAsync(key, ct);
+
+        public Task<McpMutationResult> ReauthenticateAsync(
+            McpReauthenticationPlan plan,
+            IReadOnlyDictionary<string, McpSecretReplacement> replacements,
+            CancellationToken ct) =>
+            this.Create().ReauthenticateAsync(plan, replacements, ct);
+
+        public Task<McpMutationResult> StartAsync(string name, CancellationToken ct) => this.Create().StartAsync(name, ct);
+
+        public Task<McpMutationResult> StopAsync(string name, CancellationToken ct) => this.Create().StopAsync(name, ct);
+
+        public Task<McpMutationResult> RestartAsync(string? name, CancellationToken ct) => this.Create().RestartAsync(name, ct);
     }
 
     /// <summary>A fake OAuth credential for the given provider, valid for one hour.</summary>

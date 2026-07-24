@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Mcp;
 using Coda.Tui.Commands;
+using Coda.Tui.Mcp;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
 using LlmAuth;
@@ -13,6 +14,46 @@ namespace Coda.Tui.Tests;
 [Collection("McpDirEnv")]
 public sealed class McpCommandTests
 {
+    [Fact]
+    public async Task Bare_textual_mcp_lists_both_physical_scopes()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteUser("""{"mcpServers":{"shared":{"command":"user"}}}""");
+        harness.WriteProject("""{"mcpServers":{"shared":{"command":"project"}}}""");
+        var (_, context, console, _) = TestAppBuilder.BuildApp(
+            store: harness.Store,
+            workingDirectory: harness.Project);
+        context.Mcp = harness.Runtime;
+        context.CredentialStore = harness.Store;
+        context.McpManagement = harness.Service;
+
+        await new McpCommand().ExecuteAsync(context, [], CancellationToken.None);
+
+        Assert.Equal(2, console.Output.Split("shared", StringSplitOptions.None).Length - 1);
+        Assert.Contains("[user]", console.Output, StringComparison.Ordinal);
+        Assert.Contains("[project]", console.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Noninteractive_remove_refuses_without_confirmation()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject("""{"mcpServers":{"server":{"command":"x"}}}""");
+        var (_, context, console, _) = TestAppBuilder.BuildApp(
+            store: harness.Store,
+            workingDirectory: harness.Project);
+        context.Mcp = harness.Runtime;
+        context.CredentialStore = harness.Store;
+        context.McpManagement = harness.Service;
+        context.Prompts = PlainUiPromptService.Instance;
+
+        await new McpCommand().ExecuteAsync(context, ["remove", "server"], CancellationToken.None);
+
+        Assert.Contains("Cancelled", console.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.True(McpConfig.Parse(
+            File.ReadAllText(Path.Combine(harness.Project, ".mcp.json"))).ContainsKey("server"));
+    }
+
     [Fact]
     public async Task List_no_config_reports_none()
     {
@@ -74,7 +115,7 @@ public sealed class McpCommandTests
 
         await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx", "--args", "-y srv"], CancellationToken.None);
 
-        Assert.Contains("Added", console.Output);
+        Assert.Contains("saved", console.Output, StringComparison.OrdinalIgnoreCase);
         Assert.True(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("github"));
     }
 
@@ -113,7 +154,8 @@ public sealed class McpCommandTests
             new UiPromptResponse(false, [], string.Empty),
             new UiPromptResponse(false, [], "TOKEN=wizard-secret"),
             new UiPromptResponse(false, ["yes"], null),
-            new UiPromptResponse(false, [], string.Empty));
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, ["yes"], null));
         var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
@@ -143,7 +185,8 @@ public sealed class McpCommandTests
             new UiPromptResponse(false, [], string.Empty),
             new UiPromptResponse(false, [], "TOKEN=replacement-secret"),
             new UiPromptResponse(false, ["yes"], null),
-            new UiPromptResponse(false, [], string.Empty));
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, ["yes"], null));
         var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
@@ -172,7 +215,8 @@ public sealed class McpCommandTests
             new UiPromptResponse(false, ["yes"], null),
             new UiPromptResponse(false, [], "TOKEN=second-literal"),
             new UiPromptResponse(false, ["no"], null),
-            new UiPromptResponse(false, [], string.Empty));
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, ["yes"], null));
         var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
         context.Session.WorkingDirectory = dirs.Project;
         context.CredentialStore = new InMemoryStore();
@@ -194,7 +238,8 @@ public sealed class McpCommandTests
             new UiPromptResponse(false, [], string.Empty),
             new UiPromptResponse(false, [], "TOKEN=staged-secret"),
             new UiPromptResponse(false, ["yes"], null),
-            new UiPromptResponse(false, [], string.Empty));
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, ["yes"], null));
         var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
@@ -219,7 +264,8 @@ public sealed class McpCommandTests
             new UiPromptResponse(false, [], string.Empty),
             new UiPromptResponse(false, [], "TOKEN=staged-secret"),
             new UiPromptResponse(false, ["yes"], null),
-            new UiPromptResponse(false, [], string.Empty));
+            new UiPromptResponse(false, [], string.Empty),
+            new UiPromptResponse(false, ["yes"], null));
         var (_, context, console, _) = TestAppBuilder.BuildApp(prompts: prompts);
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore
@@ -249,7 +295,8 @@ public sealed class McpCommandTests
     public async Task Subcommand_without_name_prints_usage_without_markup_error(string sub)
     {
         using var dirs = new McpTestDirs();
-        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        var (_, context, console, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
 
         await new McpCommand().ExecuteAsync(context, [sub], CancellationToken.None);
@@ -261,7 +308,8 @@ public sealed class McpCommandTests
     public async Task Add_user_scope_writes_user_file_not_project()
     {
         using var dirs = new McpTestDirs();
-        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
 
         await new McpCommand().ExecuteAsync(context, ["add", "github", "--user", "--command", "npx"], CancellationToken.None);
@@ -292,8 +340,49 @@ public sealed class McpCommandTests
 
         await new McpCommand().ExecuteAsync(context, ["edit", "s", "--command", "new"], CancellationToken.None);
 
-        Assert.Contains("Updated", console.Output);
+        Assert.Contains("saved", console.Output, StringComparison.OrdinalIgnoreCase);
         Assert.Equal("new", ((McpStdioServerConfig)McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json")))["s"]).Command);
+    }
+
+    [Fact]
+    public async Task Explicit_args_matching_a_redacted_display_value_persist_the_literal()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject("""{"mcpServers":{"demo":{"command":"node","args":["red\u001b[31macted"]}}}""");
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            store: harness.Store,
+            workingDirectory: harness.Project);
+        context.Mcp = harness.Runtime;
+        context.CredentialStore = harness.Store;
+        context.McpManagement = harness.Service;
+
+        await new McpCommand().ExecuteAsync(
+            context, ["edit", "demo", "--args", "redacted"], CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            McpConfig.Parse(File.ReadAllText(Path.Combine(harness.Project, ".mcp.json")))["demo"]);
+        Assert.Equal(["redacted"], config.Args);
+    }
+
+    [Fact]
+    public async Task Explicit_scopes_matching_a_redacted_display_value_persist_the_literal()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"demo":{"type":"http","url":"https://example.test/mcp","auth":{"scopes":["red\u001b[31macted"]}}}}""");
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            store: harness.Store,
+            workingDirectory: harness.Project);
+        context.Mcp = harness.Runtime;
+        context.CredentialStore = harness.Store;
+        context.McpManagement = harness.Service;
+
+        await new McpCommand().ExecuteAsync(
+            context, ["edit", "demo", "--scopes", "redacted"], CancellationToken.None);
+
+        var config = Assert.IsType<McpHttpServerConfig>(
+            McpConfig.Parse(File.ReadAllText(Path.Combine(harness.Project, ".mcp.json")))["demo"]);
+        Assert.Equal(["redacted"], config.Auth.Scopes);
     }
 
     [Fact]
@@ -301,12 +390,13 @@ public sealed class McpCommandTests
     {
         using var dirs = new McpTestDirs();
         dirs.WriteProjectConfig("""{ "mcpServers": { "s": { "command": "x" } } }""");
-        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        var (_, context, console, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
 
         await new McpCommand().ExecuteAsync(context, ["remove", "s"], CancellationToken.None);
 
-        Assert.Contains("Removed", console.Output);
+        Assert.Contains("saved", console.Output, StringComparison.OrdinalIgnoreCase);
         Assert.False(McpConfig.Parse(File.ReadAllText(Path.Combine(dirs.Project, ".mcp.json"))).ContainsKey("s"));
     }
 
@@ -315,7 +405,8 @@ public sealed class McpCommandTests
     {
         using var dirs = new McpTestDirs();
         dirs.WriteProjectConfig("""{ "mcpServers": { "github": { "command": "npx", "env": { "TOKEN": "coda-secret:mcp:github/env/TOKEN" } } } }""");
-        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
         await store.SetAsync("mcp:github/env/TOKEN", "ghp_x");
@@ -333,7 +424,8 @@ public sealed class McpCommandTests
         using var dirs = new McpTestDirs();
         dirs.WriteProjectConfig(
             """{ "mcpServers": { "github": { "command": "npx", "env": { "TOKEN": "coda-secret:llmauth:provider" } } } }""");
-        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
         await store.SetAsync("llmauth:provider", "foreign-value");
@@ -357,7 +449,8 @@ public sealed class McpCommandTests
               "Z": "coda-secret:mcp:github/env/Z"
             } } } }
             """);
-        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
         await store.SetAsync(key, "owned-value");
@@ -379,7 +472,8 @@ public sealed class McpCommandTests
               "other": { "command": "node", "env": { "TOKEN": "coda-secret:mcp:github/env/TOKEN" } }
             } }
             """);
-        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var (_, context, _, _) = TestAppBuilder.BuildApp(
+            prompts: new RecordingPromptService(new UiPromptResponse(false, ["yes"], null)));
         context.Session.WorkingDirectory = dirs.Project;
         var store = new InMemoryStore();
         await store.SetAsync("mcp:github/env/TOKEN", "shared-value");
@@ -419,7 +513,7 @@ public sealed class McpCommandTests
 
         await new McpCommand().ExecuteAsync(context, ["disable", "nope"], CancellationToken.None);
 
-        Assert.Contains("not configured", console.Output);
+        Assert.Contains("no longer exists", console.Output);
     }
 
     [Fact]
@@ -543,7 +637,7 @@ public sealed class McpCommandTests
 
         await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx", "--args", "-y srv"], CancellationToken.None);
 
-        Assert.Single(events.Events.OfType<McpRuntimeChangedEvent>());
+        Assert.DoesNotContain(events.Events, e => e is McpRuntimeChangedEvent);
     }
 
     [Fact]
@@ -559,6 +653,24 @@ public sealed class McpCommandTests
         await new McpCommand().ExecuteAsync(context, ["add", "github", "--command", "npx"], CancellationToken.None);
 
         Assert.DoesNotContain(events.Events, e => e is McpRuntimeChangedEvent);
+    }
+
+    [Fact]
+    public async Task Restart_all_connection_failure_publishes_a_fresh_runtime_snapshot_and_change_notification()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject("""{"mcpServers":{"remote":{"type":"http","url":"https://example.test/mcp"}}}""");
+        await harness.ConnectEffectiveAsync("remote");
+        var changes = 0;
+        harness.Service.Changed += () => changes++;
+        harness.RuntimeFactory.FailNext("restart failed");
+
+        var result = await harness.Service.RestartAsync(null, CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.SavedWithRuntimeError, result.Status);
+        Assert.Equal(1, changes);
+        var runtimeEvent = Assert.IsType<McpRuntimeChangedEvent>(Assert.Single(harness.Events.Events));
+        Assert.Empty(runtimeEvent.Snapshot.Servers);
     }
 
     private sealed class StubHttpFactory : IMcpHttpClientFactory

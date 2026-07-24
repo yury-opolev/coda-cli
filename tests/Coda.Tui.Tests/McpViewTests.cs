@@ -1,10 +1,29 @@
 using Coda.Mcp;
 using Coda.Tui.Commands;
+using Coda.Tui.Mcp;
 
 namespace Coda.Tui.Tests;
 
 public sealed class McpViewTests
 {
+    [Fact]
+    public void Management_view_sanitizes_control_and_ansi_sequences()
+    {
+        var summary = new McpServerSummary(
+            new McpServerKey(McpConfigScope.Project, "safe\u001b[31m\nspoof"),
+            @"C:\project\.mcp.json",
+            Enabled: true,
+            IsEffective: true,
+            Transport: McpTransportKind.Stdio,
+            Connection: McpConnectionState.Disconnected,
+            LastError: null);
+
+        var text = McpView.FormatList(new McpManagementSnapshot(true, [summary]));
+
+        Assert.DoesNotContain("\u001b", text, StringComparison.Ordinal);
+        Assert.Equal(2, text.Split(Environment.NewLine).Length);
+    }
+
     private static McpServerEntry Stdio(string name, McpConfigScope scope) =>
         new(name, new McpStdioServerConfig("npx", ["-y", "@mcp/server"], new Dictionary<string, string>()), scope);
 
