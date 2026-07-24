@@ -1,6 +1,12 @@
 using System.Text.Json.Nodes;
 using Coda.Agent;
+using Coda.Agent.Goals;
+using Coda.JsonRpc;
 using Coda.Sdk;
+using Coda.Sdk.Serve;
+using Coda.Sdk.Serve.Messages;
+using Engine.Tests.TestSupport;
+using LlmAuth.Providers.ClaudeAi;
 using LlmClient;
 
 namespace Engine.Tests;
@@ -161,6 +167,302 @@ public sealed class CliTuiMcpEngineIntegrationTests
         finally
         {
             Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Theory]
+    [InlineData(null, "persisted")]
+    [InlineData("", "")]
+    [InlineData("startup", "startup")]
+    public async Task Resume_precedence_resolves_every_root_prompt_and_keeps_each_root_activity_correlated(
+        string? startupOverride,
+        string expectedOverride)
+    {
+        var root = Directory.CreateTempSubdirectory("coda_cli_tui_mcp_").FullName;
+        try
+        {
+            var factory = new CapturingActivityLoopFactory();
+            using var http = new HttpClient(new SseTestHandler(SseTestHandler.MessageStopOnly));
+            using var session = new CodaSession(
+                CredentialFixtures.SignedInClaude(),
+                new SessionOptions
+                {
+                    ProviderId = ClaudeAiProvider.Id,
+                    Model = "claude-sonnet-4-6",
+                    WorkingDirectory = root,
+                    PermissionMode = PermissionMode.BypassPermissions,
+                    SystemPromptOverride = startupOverride,
+                },
+                httpClient: http,
+                agentLoopFactory: factory);
+            session.Resume(
+                "resumed",
+                [ChatMessage.UserText("history")],
+                new SessionMetadata { SystemPromptOverride = "persisted" });
+
+            var sink = new CorrelationSink();
+            var first = await session.RunAsync("one", sink);
+            var second = await session.RunAsync("two", sink);
+
+            Assert.Equal(expectedOverride, session.Options.SystemPromptOverride);
+            Assert.Equal(2, factory.Specs.Count);
+            Assert.All(factory.Specs, spec => Assert.Equal(expectedOverride, spec.Options.SystemPrompt));
+            Assert.NotEqual(first.RootTurnId, second.RootTurnId);
+            Assert.Equal(2, sink.Completions.Count);
+
+            foreach (var rootIdentity in new[] { first.RootTurnId, second.RootTurnId })
+            {
+                var callbacks = sink.Identities
+                    .Where(identity => identity.RootTurnId == rootIdentity)
+                    .ToArray();
+                var identity = Assert.Single(callbacks.Distinct());
+                var summary = Assert.Single(sink.Completions, item => item.RootTurnId == rootIdentity);
+                Assert.Equal(identity.ActivityId, summary.ActivityId);
+                Assert.Equal($"root:{rootIdentity}", identity.SourceId);
+            }
+        }
+        finally
+        {
+            Directory.Delete(root, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Serve_resume_applies_metadata_before_initialization_and_emits_run_result_correlation()
+    {
+        await using var fixture = await ServeIntegrationFixture.CreateAsync(
+            startupOverride: null,
+            persistedOverride: "persisted");
+
+        var initialize = await fixture.InitializeAsync("session1");
+        var prompt = await fixture.PromptAsync("go");
+        var completed = fixture.Notifications
+            .Where(item => item.Method == ServeMethods.EventTurnComplete)
+            .Select(item => ServeJson.FromNode<TurnCompleteEvent>(item.Params))
+            .Last();
+        var identity = Assert.Single(fixture.LoopFactory.Identities);
+
+        Assert.Equal("persisted", fixture.OverrideObservedAtInitialize);
+        Assert.Equal(ServeMethods.ProtocolVersion, initialize.ProtocolVersion);
+        Assert.Equal("session1", initialize.SessionId);
+        Assert.True(prompt.Ok);
+        Assert.NotNull(completed);
+        Assert.Equal(identity.RootTurnId, completed!.RootTurnId);
+        Assert.Equal(identity.ActivityId, completed.ActivityId);
+    }
+
+    private sealed class CapturingActivityLoopFactory : IAgentLoopFactory
+    {
+        public List<AgentLoopSpec> Specs { get; } = [];
+
+        public List<ToolCallIdentity> Identities { get; } = [];
+
+        public IAgentLoop Create(AgentLoopSpec spec)
+        {
+            this.Specs.Add(spec);
+            return new CapturingActivityLoop(
+                spec.ToolActivity ?? throw new InvalidOperationException("Expected root activity."),
+                this.Identities);
+        }
+    }
+
+    private sealed class CapturingActivityLoop(
+        ToolActivityContext root,
+        List<ToolCallIdentity> identities) : IAgentLoop
+    {
+        public GoalStatus? LastGoalStatus => null;
+
+        public Task RunAsync(
+            List<ChatMessage> history,
+            IAgentSink sink,
+            CancellationToken cancellationToken = default)
+        {
+            var identity = root.EnsureActivity().ForCall("call-1");
+            identities.Add(identity);
+            sink.OnToolQueued(identity, "read_file", """{"path":"a.txt"}""");
+            sink.OnToolCall(identity, "read_file", """{"path":"a.txt"}""");
+            sink.OnToolStatus(identity, "read_file", ToolCallStatus.Running);
+            sink.OnToolResult(
+                identity,
+                "read_file",
+                new ToolResult("content"),
+                ToolCallStatus.Succeeded);
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class CorrelationSink : IAgentSink
+    {
+        public List<ToolCallIdentity> Identities { get; } = [];
+
+        public List<ToolActivitySummary> Completions { get; } = [];
+
+        public void OnAssistantText(string delta) { }
+
+        public void OnAssistantTextComplete() { }
+
+        public void OnToolCall(string toolName, string inputPreview) { }
+
+        public void OnToolResult(string toolName, ToolResult result) { }
+
+        public void OnError(string message) { }
+
+        public void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) =>
+            this.Identities.Add(identity);
+
+        public void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) =>
+            this.Identities.Add(identity);
+
+        public void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) =>
+            this.Identities.Add(identity);
+
+        public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) =>
+            this.Identities.Add(identity);
+
+        public void OnToolActivityCompleted(ToolActivitySummary summary) =>
+            this.Completions.Add(summary);
+    }
+
+    private sealed record RecordedNotification(string Method, JsonNode? Params);
+
+    private sealed class ServeIntegrationFixture : IAsyncDisposable
+    {
+        private static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(5);
+
+        private readonly string root;
+        private readonly DuplexStreamPair pair;
+        private readonly CancellationTokenSource cancellation;
+        private readonly ServeHost host;
+        private readonly JsonRpcConnection orchestrator;
+        private readonly Task hostTask;
+        private readonly TaskCompletionSource turnComplete =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private readonly object notificationsGate = new();
+        private readonly List<RecordedNotification> notifications = [];
+
+        private ServeIntegrationFixture(
+            string root,
+            DuplexStreamPair pair,
+            CancellationTokenSource cancellation,
+            ServeHost host,
+            JsonRpcConnection orchestrator,
+            Task hostTask,
+            CapturingActivityLoopFactory loopFactory)
+        {
+            this.root = root;
+            this.pair = pair;
+            this.cancellation = cancellation;
+            this.host = host;
+            this.orchestrator = orchestrator;
+            this.hostTask = hostTask;
+            this.LoopFactory = loopFactory;
+        }
+
+        public CapturingActivityLoopFactory LoopFactory { get; }
+
+        public string? OverrideObservedAtInitialize { get; private set; }
+
+        public IReadOnlyList<RecordedNotification> Notifications
+        {
+            get
+            {
+                lock (this.notificationsGate)
+                {
+                    return [.. this.notifications];
+                }
+            }
+        }
+
+        public static async Task<ServeIntegrationFixture> CreateAsync(
+            string? startupOverride,
+            string? persistedOverride)
+        {
+            var root = Directory.CreateTempSubdirectory("coda_cli_tui_mcp_").FullName;
+            await new SessionTranscriptStore(root).SaveAsync(
+                "session1",
+                [ChatMessage.UserText("history")],
+                new SessionMetadata { SystemPromptOverride = persistedOverride });
+
+            var pair = new DuplexStreamPair();
+            var cancellation = new CancellationTokenSource();
+            var factory = new CapturingActivityLoopFactory();
+            ServeIntegrationFixture? fixture = null;
+            var host = new ServeHost(
+                pair.ServerReads,
+                pair.ServerWrites,
+                (permission, question, plan) => new CodaSession(
+                    CredentialFixtures.SignedInClaude(),
+                    new SessionOptions
+                    {
+                        ProviderId = ClaudeAiProvider.Id,
+                        Model = "claude-sonnet-4-6",
+                        WorkingDirectory = root,
+                        PermissionMode = PermissionMode.BypassPermissions,
+                        SystemPromptOverride = startupOverride,
+                        InteractivePrompt = permission,
+                        UserQuestionPrompt = question,
+                        PlanApprover = plan,
+                    },
+                    httpClient: new HttpClient(new SseTestHandler(SseTestHandler.MessageStopOnly)),
+                    agentLoopFactory: factory),
+                expectedApiKey: null,
+                initializeSession: (session, cancellationToken) =>
+                {
+                    fixture!.OverrideObservedAtInitialize = session.Options.SystemPromptOverride;
+                    return session.InitializeAsync(cancellationToken);
+                });
+            var hostTask = host.RunAsync(cancellation.Token);
+            var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+            fixture = new ServeIntegrationFixture(root, pair, cancellation, host, orchestrator, hostTask, factory);
+            orchestrator.OnNotification(ServeMethods.EventTurnComplete, node =>
+            {
+                lock (fixture.notificationsGate)
+                {
+                    fixture.notifications.Add(new RecordedNotification(ServeMethods.EventTurnComplete, node));
+                }
+
+                fixture.turnComplete.TrySetResult();
+            });
+
+            return fixture;
+        }
+
+        public async Task<InitializeResult> InitializeAsync(string sessionId)
+        {
+            var node = await this.orchestrator.SendRequestAsync(
+                ServeMethods.Initialize,
+                ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null, SessionId: sessionId)),
+                CancellationToken.None).WaitAsync(WaitTimeout);
+            return Assert.IsType<InitializeResult>(ServeJson.FromNode<InitializeResult>(node));
+        }
+
+        public async Task<PromptResult> PromptAsync(string text)
+        {
+            var node = await this.orchestrator.SendRequestAsync(
+                ServeMethods.Prompt,
+                ServeJson.ToNode(new PromptParams { Text = text }),
+                CancellationToken.None).WaitAsync(WaitTimeout);
+            await this.turnComplete.Task.WaitAsync(WaitTimeout);
+            return Assert.IsType<PromptResult>(ServeJson.FromNode<PromptResult>(node));
+        }
+
+        public async ValueTask DisposeAsync()
+        {
+            this.cancellation.Cancel();
+            try
+            {
+                await this.hostTask.WaitAsync(WaitTimeout);
+            }
+            catch
+            {
+                // Shutdown closes the in-memory transport while pending reads unwind.
+            }
+
+            await this.orchestrator.DisposeAsync();
+            await this.host.DisposeAsync();
+            this.cancellation.Dispose();
+            this.pair.Dispose();
+            try { Directory.Delete(this.root, recursive: true); } catch { /* best effort */ }
         }
     }
 
