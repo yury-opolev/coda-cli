@@ -1403,6 +1403,179 @@ public sealed class McpManagementEditTests
     }
 
     [Fact]
+    public async Task Commit_edit_honors_argument_items_when_switching_from_http_to_stdio()
+    {
+        const string urlSecret = "never-show-http-transport-secret";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp?token=never-show-http-transport-secret"}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with
+            {
+                Transport = McpTransportKind.Stdio,
+                Command = "node",
+                ArgumentItems =
+                [
+                    McpDraftListItem.New("--flag"),
+                    McpDraftListItem.New("[redacted URL]"),
+                ],
+            },
+            CancellationToken.None);
+        var result = await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.Equal(["--flag", "[redacted URL]"], config.Args);
+        Assert.DoesNotContain(urlSecret, draft.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(urlSecret, preview.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Commit_edit_honors_scope_items_when_switching_from_stdio_to_http()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject("""{"mcpServers":{"server":{"command":"node","args":["server.js"]}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with
+            {
+                Transport = McpTransportKind.Http,
+                Url = "https://example.test/mcp",
+                AuthMode = McpAuthMode.OAuth,
+                ScopeItems =
+                [
+                    McpDraftListItem.New("openid"),
+                    McpDraftListItem.New("https://scope.example.test/resource/.default"),
+                ],
+            },
+            CancellationToken.None);
+        var result = await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.Equal(["openid", "https://scope.example.test/resource/.default"], config.Auth.Scopes);
+    }
+
+    [Fact]
+    public async Task Commit_add_uses_provided_argument_and_scope_items()
+    {
+        await using var stdioHarness = await McpManagementTestHarness.CreateAsync();
+        var stdioPreview = await stdioHarness.Service.PrepareAddAsync(
+            StdioDraft("stdio") with
+            {
+                ArgumentItems = [McpDraftListItem.New("--from-item")],
+            },
+            CancellationToken.None);
+        var stdioResult = await stdioHarness.Service.CommitAddAsync(stdioPreview, CancellationToken.None);
+        var stdioConfig = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(stdioHarness.Project, stdioHarness.User)).Config);
+
+        Assert.Equal(McpMutationStatus.Succeeded, stdioResult.Status);
+        Assert.Equal(["--from-item"], stdioConfig.Args);
+
+        await using var httpHarness = await McpManagementTestHarness.CreateAsync();
+        var httpPreview = await httpHarness.Service.PrepareAddAsync(
+            HttpDraft("http") with
+            {
+                ScopeItems =
+                [
+                    McpDraftListItem.New("openid"),
+                    McpDraftListItem.New("https://scope.example.test/resource/.default"),
+                ],
+            },
+            CancellationToken.None);
+        var httpResult = await httpHarness.Service.CommitAddAsync(httpPreview, CancellationToken.None);
+        var httpConfig = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(httpHarness.Project, httpHarness.User)).Config);
+
+        Assert.Equal(McpMutationStatus.Succeeded, httpResult.Status);
+        Assert.Equal(["openid", "https://scope.example.test/resource/.default"], httpConfig.Auth.Scopes);
+    }
+
+    [Fact]
+    public async Task Commit_transport_switch_keeps_legacy_args_and_scopes_compatible()
+    {
+        await using var stdioHarness = await McpManagementTestHarness.CreateAsync();
+        stdioHarness.WriteProject("""{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp"}}}""");
+        var stdioOriginal = new McpServerKey(McpConfigScope.Project, "server");
+        var stdioDraft = await stdioHarness.Service.CreateEditDraftAsync(stdioOriginal, CancellationToken.None);
+        Assert.NotNull(stdioDraft);
+        var stdioPreview = await stdioHarness.Service.PrepareEditAsync(
+            stdioOriginal,
+            stdioDraft with
+            {
+                Transport = McpTransportKind.Stdio,
+                Command = "node",
+                Args = ["--legacy-arg"],
+                ArgumentItems = default,
+            },
+            CancellationToken.None);
+        await stdioHarness.Service.CommitEditAsync(stdioPreview, CancellationToken.None);
+        var stdioConfig = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(stdioHarness.Project, stdioHarness.User)).Config);
+
+        Assert.Equal(["--legacy-arg"], stdioConfig.Args);
+
+        await using var httpHarness = await McpManagementTestHarness.CreateAsync();
+        httpHarness.WriteProject("""{"mcpServers":{"server":{"command":"node","args":["server.js"]}}}""");
+        var httpOriginal = new McpServerKey(McpConfigScope.Project, "server");
+        var httpDraft = await httpHarness.Service.CreateEditDraftAsync(httpOriginal, CancellationToken.None);
+        Assert.NotNull(httpDraft);
+        var httpPreview = await httpHarness.Service.PrepareEditAsync(
+            httpOriginal,
+            httpDraft with
+            {
+                Transport = McpTransportKind.Http,
+                Url = "https://example.test/mcp",
+                AuthMode = McpAuthMode.OAuth,
+                Scopes = ["legacy-scope"],
+                ScopeItems = default,
+            },
+            CancellationToken.None);
+        await httpHarness.Service.CommitEditAsync(httpPreview, CancellationToken.None);
+        var httpConfig = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(httpHarness.Project, httpHarness.User)).Config);
+
+        Assert.Equal(["legacy-scope"], httpConfig.Auth.Scopes);
+    }
+
+    [Fact]
+    public async Task Prepare_transport_switch_preview_does_not_expose_raw_original_values()
+    {
+        const string argSecret = "never-show-stdio-transport-secret";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","args":["https://example.test/mcp?token=never-show-stdio-transport-secret"]}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with
+            {
+                Transport = McpTransportKind.Http,
+                Url = "https://example.test/mcp",
+                AuthMode = McpAuthMode.None,
+            },
+            CancellationToken.None);
+
+        Assert.DoesNotContain(argSecret, draft.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(argSecret, preview.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
     public async Task Commit_edit_honors_explicit_url_dirty_state_when_display_is_unchanged()
     {
         const string rawUrl = "https://example.test/mcp?token=hidden-value#hidden-fragment";

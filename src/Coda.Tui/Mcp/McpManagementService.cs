@@ -432,7 +432,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         ValidateSafeText(draft.Command, "The MCP command contains unsafe characters.");
         var args = NormalizeArgs(draft.Args);
         var argumentItems = NormalizeArgumentItems(draft.ArgumentItems);
-        if (isAdd && HasAuthoritativeItems(draft.DraftId, argumentItems))
+        if (isAdd && !argumentItems.IsDefault)
         {
             args = argumentItems.Select(static item => item.Value).ToImmutableArray();
         }
@@ -488,7 +488,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         var clientId = NormalizeOptionalText(draft.ClientId, "The OAuth client ID contains unsafe characters.");
         var scopes = NormalizeScopes(draft.Scopes);
         var scopeItems = NormalizeScopeItems(draft.ScopeItems);
-        if (isAdd && HasAuthoritativeItems(draft.DraftId, scopeItems))
+        if (isAdd && !scopeItems.IsDefault)
         {
             scopes = scopeItems.Select(static item => item.Value).ToImmutableArray();
         }
@@ -1932,41 +1932,52 @@ internal sealed partial class McpManagementService : IMcpManagementService
         McpServerDraft baseline,
         McpServerConfig original)
     {
-        if (draft.Transport != baseline.Transport)
+        var originalStdio = original as McpStdioServerConfig;
+        var originalHttp = original as McpHttpServerConfig;
+        return draft.Transport switch
         {
-            return draft;
-        }
-
-        return original switch
-        {
-            McpStdioServerConfig stdio => draft with
+            McpTransportKind.Stdio => draft with
             {
-                Command = string.Equals(draft.Command, baseline.Command, StringComparison.Ordinal)
-                    ? stdio.Command
+                Command = originalStdio is not null
+                    && baseline.Transport == McpTransportKind.Stdio
+                    && string.Equals(draft.Command, baseline.Command, StringComparison.Ordinal)
+                    ? originalStdio.Command
                     : draft.Command,
                 Args = MergeDraftListValues(
-                    stdio.Args,
-                    baseline.Args,
+                    originalStdio?.Args ?? [],
+                    originalStdio is not null && baseline.Transport == McpTransportKind.Stdio
+                        ? baseline.Args
+                        : [],
                     draft.Args,
                     draft.DraftId,
-                    baseline.ArgumentItems,
+                    originalStdio is not null && baseline.Transport == McpTransportKind.Stdio
+                        ? baseline.ArgumentItems
+                        : ImmutableArray<McpDraftListItem>.Empty,
                     draft.ArgumentItems),
             },
-            McpHttpServerConfig http => draft with
+            McpTransportKind.Http => draft with
             {
-                Url = !draft.UrlChanged
+                Url = originalHttp is not null
+                    && baseline.Transport == McpTransportKind.Http
+                    && !draft.UrlChanged
                     && string.Equals(draft.Url, baseline.Url, StringComparison.Ordinal)
-                    ? http.Url.OriginalString
+                    ? originalHttp.Url.OriginalString
                     : draft.Url,
-                ClientId = string.Equals(draft.ClientId, baseline.ClientId, StringComparison.Ordinal)
-                    ? http.Auth.ClientId
+                ClientId = originalHttp is not null
+                    && baseline.Transport == McpTransportKind.Http
+                    && string.Equals(draft.ClientId, baseline.ClientId, StringComparison.Ordinal)
+                    ? originalHttp.Auth.ClientId
                     : draft.ClientId,
                 Scopes = MergeDraftListValues(
-                    http.Auth.Scopes ?? [],
-                    baseline.Scopes,
+                    originalHttp?.Auth.Scopes ?? [],
+                    originalHttp is not null && baseline.Transport == McpTransportKind.Http
+                        ? baseline.Scopes
+                        : [],
                     draft.Scopes,
                     draft.DraftId,
-                    baseline.ScopeItems,
+                    originalHttp is not null && baseline.Transport == McpTransportKind.Http
+                        ? baseline.ScopeItems
+                        : ImmutableArray<McpDraftListItem>.Empty,
                     draft.ScopeItems),
             },
             _ => throw new McpException("MCP configuration has an unsupported transport."),
