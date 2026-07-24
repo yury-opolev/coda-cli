@@ -9,6 +9,7 @@ using Coda.Tui.Ui;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
@@ -266,13 +267,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         context.ExtraToolsProvider = agentToolsProvider;
         context.Mcp = mcp;
         context.CredentialStore = store;
-        context.McpManagement = new McpManagementService(
+        var mcpManagement = new McpManagementService(
             cwd,
             userMcpDir: null,
             mcp,
             store,
             new DefaultMcpOAuthReauthenticator(mcpHttp, store),
             mailbox);
+        context.McpManagement = mcpManagement;
 
         // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
         // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only
@@ -307,6 +309,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 : null;
 
         using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
+        Func<McpBrowserProvider?> mcpBrowserProvider = () =>
+            new McpBrowserProvider(mcpManagement, actorPrompts, controller);
 
         // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
         // Terminal.Gui shells own their own Esc/Ctrl+C chords). The explicit exit action is wired
@@ -448,11 +452,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                     hasActiveWork: () => controller.HasActiveWork,
                     transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
                     taskBrowserProvider: taskBrowserProvider,
+                    mcpBrowserProvider: mcpBrowserProvider,
                     toolDisplayMode: toolDisplayMode)
                 : new InlineTuiShell(
                     tgApp, composerController, mailbox, controller.CurrentSnapshot,
                     hasActiveWork: () => controller.HasActiveWork,
                     transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
+                    taskBrowserProvider: taskBrowserProvider,
+                    mcpBrowserProvider: mcpBrowserProvider,
                     toolDisplayMode: toolDisplayMode);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);

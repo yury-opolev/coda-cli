@@ -5,6 +5,7 @@ using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
+using Coda.Tui.Ui.Mcp;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -40,6 +41,7 @@ internal class FullscreenTuiShell(
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
+    Func<McpBrowserProvider?>? mcpBrowserProvider = null,
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
     : TerminalGuiShellBase(
         app,
@@ -55,6 +57,7 @@ internal class FullscreenTuiShell(
         theme,
         statusProjection,
         taskBrowserProvider: taskBrowserProvider,
+        mcpBrowserProvider: mcpBrowserProvider,
         toolDisplayMode: toolDisplayMode)
 {
     /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
@@ -188,6 +191,15 @@ internal class FullscreenTuiShell(
             taskOverlay.Width = Dim.Fill();
             taskOverlay.Height = Dim.Fill();
             this.Add(taskOverlay);
+        }
+
+        if (this.McpOverlay is { } mcpOverlay)
+        {
+            mcpOverlay.X = 0;
+            mcpOverlay.Y = 0;
+            mcpOverlay.Width = Dim.Fill();
+            mcpOverlay.Height = Dim.Fill();
+            this.Add(mcpOverlay);
         }
 
         this.Add(this.PromptOverlay);

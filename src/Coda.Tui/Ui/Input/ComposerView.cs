@@ -81,6 +81,12 @@ internal sealed class ComposerView : TextView
     /// <summary>Raised when the user submits the composer; carries the submitted text.</summary>
     public event EventHandler<string>? Submitted;
 
+    /// <summary>
+    /// Raised when the user submits the composer; preserves the original draft so shell interceptors can
+    /// distinguish typed intent from text produced by case-insensitive completion.
+    /// </summary>
+    internal event EventHandler<ComposerSubmissionEventArgs>? SubmissionSubmitted;
+
     /// <summary>Raised for shell-level actions (interrupt, exit, toggle mode, transcript scrolling, ...).</summary>
     public event EventHandler<UiAction>? ActionRequested;
 
@@ -858,12 +864,16 @@ internal sealed class ComposerView : TextView
                 // Submit (and, for CompleteAndSubmit, first accept the selected completion) replaces the whole
                 // draft, so re-place the caret and remeasure. Exactly one Submitted fires — CompleteAndSubmit
                 // returns a single submission result, never a separate completion then submission.
+                var originalDraft = this.controller.State.Draft;
                 var result = this.controller.Apply(action);
                 this.SyncTextView();
                 this.RaiseLayoutInvalidated();
                 if (result.SubmittedText is { } submitted)
                 {
                     this.Submitted?.Invoke(this, submitted);
+                    this.SubmissionSubmitted?.Invoke(
+                        this,
+                        new ComposerSubmissionEventArgs(submitted, originalDraft));
                 }
 
                 return true;

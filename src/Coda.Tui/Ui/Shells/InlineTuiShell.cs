@@ -3,6 +3,7 @@ using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
+using Coda.Tui.Ui.Mcp;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -35,6 +36,7 @@ internal sealed class InlineTuiShell(
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
+    Func<McpBrowserProvider?>? mcpBrowserProvider = null,
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
     : FullscreenTuiShell(
         app,
@@ -51,6 +53,7 @@ internal sealed class InlineTuiShell(
         statusProjection,
         transcriptFormatter,
         taskBrowserProvider: taskBrowserProvider,
+        mcpBrowserProvider: mcpBrowserProvider,
         toolDisplayMode: toolDisplayMode)
 {
     /// <summary>

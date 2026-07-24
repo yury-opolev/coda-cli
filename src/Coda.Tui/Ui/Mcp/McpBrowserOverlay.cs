@@ -14,6 +14,8 @@ internal sealed class McpBrowserOverlay : View
 {
     private readonly IApplication app;
     private readonly McpBrowserController controller;
+    private readonly TuiTheme theme;
+    private readonly Action? onChanged;
     private readonly Label header;
     private readonly Label body;
     private readonly Label status;
@@ -27,10 +29,16 @@ internal sealed class McpBrowserOverlay : View
     private int detailOffset;
     private int editorOffset;
 
-    internal McpBrowserOverlay(IApplication app, McpBrowserController controller)
+    internal McpBrowserOverlay(
+        IApplication app,
+        McpBrowserController controller,
+        TuiTheme? theme = null,
+        Action? onChanged = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
+        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.onChanged = onChanged;
 
         this.Visible = false;
         this.CanFocus = true;
@@ -113,6 +121,7 @@ internal sealed class McpBrowserOverlay : View
         }
 
         this.lifetime = new CancellationTokenSource();
+        this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.active = true;
         this.Visible = true;
         this.controller.Changed += this.OnControllerChanged;
@@ -152,14 +161,7 @@ internal sealed class McpBrowserOverlay : View
         this.lifetime?.Dispose();
         this.lifetime = null;
         this.controller.Close();
-        try
-        {
-            this.SuperView?.SetFocus();
-        }
-        catch
-        {
-            // Focus restoration is best effort while the parent/application is shutting down.
-        }
+        this.onChanged?.Invoke();
     }
 
     protected override bool OnKeyDown(Key key)

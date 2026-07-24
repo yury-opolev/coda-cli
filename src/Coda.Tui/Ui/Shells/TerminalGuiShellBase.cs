@@ -3,6 +3,7 @@ using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Agent;
+using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -53,6 +54,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private bool composerLockedByAttachment;
     private readonly TaskBrowserController? taskController;
     private readonly TaskBrowserOverlay? taskOverlay;
+    private readonly McpBrowserController? mcpController;
+    private readonly McpBrowserOverlay? mcpOverlay;
     private bool disposed;
 
     /// <summary>
@@ -77,6 +80,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         TuiTheme? theme = null,
         Func<UiSessionSnapshot, int, string>? statusProjection = null,
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
+        Func<McpBrowserProvider?>? mcpBrowserProvider = null,
         ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
@@ -116,11 +120,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.taskOverlay = new TaskBrowserOverlay(this.app, this.taskController, this.Theme, this.OnTaskBrowserChanged);
         }
 
+        if (mcpBrowserProvider is not null)
+        {
+            this.mcpController = new McpBrowserController(mcpBrowserProvider);
+            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged);
+        }
+
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
         // composer's own printable/action mapping regardless of which view currently holds focus.
         this.Composer.ShellKeyHandler = this.TryHandleShellKey;
 
-        this.Composer.Submitted += this.OnComposerSubmitted;
+        this.Composer.SubmissionSubmitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
         this.Composer.PointerActionRequested += this.OnComposerPointerActionRequested;
         this.Composer.CompletionChanged += this.OnCompletionChanged;
@@ -190,6 +200,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The browser's headless controller (test/diagnostic seam), or null when no provider was wired.</summary>
     internal TaskBrowserController? TaskController => this.taskController;
 
+    /// <summary>The hosted <c>/mcp</c> browser overlay, or null when no provider was wired.</summary>
+    internal McpBrowserOverlay? McpOverlay => this.mcpOverlay;
+
+    /// <summary>The MCP browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
+    internal McpBrowserController? McpController => this.mcpController;
+
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
     /// position it (via <see cref="PlaceCompletion"/>) and add it to their view tree; it stays hidden with
@@ -234,6 +250,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(outcome);
         this.ResetChordOverride();
         this.ClearTransientOperationalOverride();
+        this.taskOverlay?.Hide();
+        this.mcpOverlay?.Hide();
         this.RequestedExit = outcome;
         this.app.RequestStop();
     }
@@ -379,7 +397,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.ClearTransientOperationalOverride();
             this.CancelScheduledComposerLayoutRecalc();
             this.Composer.ShellKeyHandler = null;
-            this.Composer.Submitted -= this.OnComposerSubmitted;
+            this.Composer.SubmissionSubmitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
             this.Composer.PointerActionRequested -= this.OnComposerPointerActionRequested;
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
@@ -390,6 +408,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             // agent), and closes the controller — so a mode switch or shutdown never leaves the agent paused.
             // The overlay View itself is disposed by base.Dispose below.
             this.taskOverlay?.Hide();
+            this.mcpOverlay?.Hide();
         }
 
         base.Dispose(disposing);
@@ -403,7 +422,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         if (!this.composerDisabled &&
             this.Snapshot.PendingPrompt is null &&
-            !this.PromptOverlay.Visible)
+            !this.PromptOverlay.Visible &&
+            !this.HasVisibleBrowserOverlay())
         {
             this.Composer.SetFocus();
         }
@@ -534,7 +554,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     private bool HasVisibleModalOverlay() =>
-        this.PromptOverlay.Visible || this.taskOverlay?.Visible == true;
+        this.PromptOverlay.Visible || this.HasVisibleBrowserOverlay();
+
+    private bool HasVisibleBrowserOverlay() =>
+        this.taskOverlay?.Visible == true || this.mcpOverlay?.Visible == true;
+
+    private View? VisibleBrowserOverlay() =>
+        this.mcpOverlay?.Visible == true
+            ? this.mcpOverlay
+            : this.taskOverlay?.Visible == true
+                ? this.taskOverlay
+                : null;
 
     private bool TryHandleTranscriptNavigationKey(Key key)
     {
@@ -1091,7 +1121,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // browser is open: the modal prompt overlay stays topmost and keeps focus, and an open browser owns
         // the keyboard — a composer unlock (e.g. an attachment auto-releasing on shell completion) must not
         // steal focus out from under either.
-        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible && this.taskOverlay?.Visible != true)
+        if (snapshot.PendingPrompt is null && !this.PromptOverlay.Visible && !this.HasVisibleBrowserOverlay())
         {
             this.Composer.SetFocus();
         }
@@ -1115,10 +1145,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
 
         this.PromptOverlay.Update(null);
-        if (this.taskOverlay?.Visible == true)
+        if (this.VisibleBrowserOverlay() is { } browser)
         {
             // The browser was open behind the prompt: return focus to it, not the composer.
-            this.taskOverlay.SetFocus();
+            browser.SetFocus();
         }
         else if (!this.composerDisabled)
         {
@@ -1132,7 +1162,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // /tasks never re-Opens (which would rebind the subscription and dispose the live pump under it).
         // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
         // was built once; before the first turn the provider returns null and the browser opens empty.
+        this.mcpOverlay?.Hide();
         this.taskOverlay?.Show();
+    }
+
+    private void OpenMcpBrowser()
+    {
+        this.taskOverlay?.Hide();
+        this.mcpOverlay?.Show();
     }
 
     private void SetComposerAttachmentLock(bool locked)
@@ -1182,18 +1219,49 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         {
             this.PromptOverlay.SetFocus();
         }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
         else if (!this.composerDisabled && !this.composerLockedByAttachment)
         {
             this.Composer.SetFocus();
         }
     }
 
-    private void OnComposerSubmitted(object? sender, string text)
+    private void OnMcpBrowserChanged()
     {
+        if (this.mcpOverlay is null || this.disposed)
+        {
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
+    private void OnComposerSubmitted(object? sender, ComposerSubmissionEventArgs submission)
+    {
+        if (this.mcpOverlay is not null && McpBrowserController.IsOpenRequest(submission.OriginalDraft))
+        {
+            this.OpenMcpBrowser();
+            return;
+        }
+
         // An exact `/tasks` submission is intercepted locally BEFORE PromptSubmitted fires (which is what
         // feeds TuiController.OnSubmitted's dispatch guard), so it opens the browser even while the agent is
         // busy and never dispatches a turn. The composer already cleared the draft/completion on submit.
-        if (this.taskOverlay is not null && TaskBrowserController.IsOpenRequest(text))
+        if (this.taskOverlay is not null && TaskBrowserController.IsOpenRequest(submission.OriginalDraft))
         {
             this.OpenTaskBrowser();
             return;
@@ -1203,7 +1271,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // back to the newest row before forwarding so the response the user just asked for is visible even
         // when they had scrolled up. Background output alone never forces this — only an explicit submit.
         this.TranscriptView.JumpToNewest();
-        this.PromptSubmitted?.Invoke(this, text);
+        this.PromptSubmitted?.Invoke(this, submission.Text);
     }
 
     private void OnComposerActionRequested(object? sender, UiAction action)
