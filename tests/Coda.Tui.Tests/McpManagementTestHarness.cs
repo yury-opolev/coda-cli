@@ -20,6 +20,7 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
         CountingHttpFactory runtimeFactory,
         McpClientManager runtime,
         SuccessfulOAuthReauthenticator oauth,
+        RecordingUiEvents events,
         IMcpManagementService service)
     {
         this.root = root;
@@ -29,6 +30,7 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
         this.RuntimeFactory = runtimeFactory;
         this.Runtime = runtime;
         this.OAuth = oauth;
+        this.Events = events;
         this.Service = service;
     }
 
@@ -43,6 +45,8 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
     public McpClientManager Runtime { get; }
 
     public SuccessfulOAuthReauthenticator OAuth { get; }
+
+    public RecordingUiEvents Events { get; }
 
     public IMcpManagementService Service { get; }
 
@@ -89,13 +93,14 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
             var runtimeFactory = new CountingHttpFactory();
             var runtime = new McpClientManager(runtimeFactory);
             var oauth = new SuccessfulOAuthReauthenticator();
+            var events = new RecordingUiEvents();
             IMcpManagementService service = new McpManagementService(
                 project,
                 user,
                 runtime,
                 store,
                 oauth,
-                new RecordingUiEvents(),
+                events,
                 mutator,
                 afterPreparationEntriesRead);
 
@@ -107,6 +112,7 @@ internal sealed class McpManagementTestHarness : IAsyncDisposable
                 runtimeFactory,
                 runtime,
                 oauth,
+                events,
                 service));
         }
         catch
@@ -182,6 +188,8 @@ internal sealed class TestTokenStore : ITokenStore
 
     public CancellationTokenSource? CancelAndThrowAfterNextSet { get; set; }
 
+    public CancellationTokenSource? CancelAndThrowAfterNextGet { get; set; }
+
     public Exception? WriteThenThrowException { get; set; }
 
     public int? WriteThenThrowOnSetCall { get; set; }
@@ -201,6 +209,14 @@ internal sealed class TestTokenStore : ITokenStore
         cancellationToken.ThrowIfCancellationRequested();
         this.GetCalls++;
         this.ReadKeys.Add(key);
+        var cancelAndThrow = this.CancelAndThrowAfterNextGet;
+        this.CancelAndThrowAfterNextGet = null;
+        if (cancelAndThrow is not null)
+        {
+            cancelAndThrow.Cancel();
+            throw new OperationCanceledException(cancelAndThrow.Token);
+        }
+
         return Task.FromResult(this.values.GetValueOrDefault(key));
     }
 
@@ -432,6 +448,10 @@ internal sealed class TestMcpServerBehavior
 
     public TimeSpan ResourceDelay { get; set; }
 
+    public TaskCompletionSource<bool>? InitializeEntered { get; set; }
+
+    public TaskCompletionSource<bool>? InitializeRelease { get; set; }
+
     public McpServerInfo? ServerInfo { get; set; }
 }
 
@@ -442,6 +462,8 @@ internal sealed class CountingHttpFactory : IMcpHttpClientFactory
     private readonly Queue<string?> nextInitializationFailures = new();
 
     public int ConnectCalls { get; private set; }
+
+    public McpHttpServerConfig? LastConfig { get; private set; }
 
     public TestMcpServerBehavior ConfigureServer(string serverName)
     {
@@ -464,6 +486,7 @@ internal sealed class CountingHttpFactory : IMcpHttpClientFactory
 
     public IMcpClient Create(string serverName, McpHttpServerConfig config)
     {
+        this.LastConfig = config;
         var behavior = this.ConfigureServer(serverName);
         var initializeFailure = this.nextInitializationFailures.Count > 0
             ? this.nextInitializationFailures.Dequeue()
@@ -492,17 +515,23 @@ internal sealed class TestMcpClient(
 
     public int ResourceCalls { get; private set; }
 
-    public Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(
+    public async Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(
         CancellationToken cancellationToken = default)
     {
         cancellationToken.ThrowIfCancellationRequested();
         onInitialize();
+        behavior.InitializeEntered?.TrySetResult(true);
+        if (behavior.InitializeRelease is { } release)
+        {
+            await release.Task.WaitAsync(cancellationToken).ConfigureAwait(false);
+        }
+
         if (initializeFailure is not null)
         {
             throw new InvalidOperationException(initializeFailure);
         }
 
-        return Task.FromResult(behavior.Tools);
+        return behavior.Tools;
     }
 
     public Task<(string Text, bool IsError)> CallToolAsync(

@@ -266,7 +266,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         McpServerKey key,
         bool enabled,
         CancellationToken ct) =>
-        MutationUnavailable<McpMutationResult>(ct);
+        this.SetEnabledCoreAsync(key, enabled, ct);
 
     public Task<McpDeletePreview> PrepareDeleteAsync(McpServerKey key, CancellationToken ct) =>
         MutationUnavailable<McpDeletePreview>(ct);
@@ -818,7 +818,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         try
         {
             result = await this.CommitUnderGateAsync(preview, isAdd, ct).ConfigureAwait(false);
-            if (result.Status == McpMutationStatus.Succeeded)
+            if (result.Status is McpMutationStatus.Succeeded or McpMutationStatus.SavedWithRuntimeError)
             {
                 this.completedOperations.Add(preview.OperationId);
                 notify = true;
@@ -876,6 +876,9 @@ internal sealed partial class McpManagementService : IMcpManagementService
             var draft = ValidateAndNormalizeDraft(preview.Draft, isAdd);
             this.ValidateScopeAvailable(draft.Scope);
             var original = ValidateCommitEntries(entries, preview, draft, isAdd);
+            var before = isAdd
+                ? null
+                : this.LoadEffectiveConfigsForMutation();
             ValidateBearerTokenAvailability(draft, original?.Config);
             if (!isAdd && draft.BaseRevision != preview.Revision)
             {
@@ -936,13 +939,51 @@ internal sealed partial class McpManagementService : IMcpManagementService
             var cleanupWarning = await this.DeleteUnreferencedOldSecretsAsync(
                 original?.Key.Name,
                 original?.Config).ConfigureAwait(false);
+            var runtimeReconcile = EmptyRuntimeReconcileResult();
+            IReadOnlyDictionary<string, McpServerConfig>? after = null;
+            if (!isAdd)
+            {
+                try
+                {
+                    after = this.LoadEffectiveConfigsForMutation();
+                }
+                catch when (cleanupWarning is not null)
+                {
+                    await lease.DisposeAsync().ConfigureAwait(false);
+                    lease = null;
+                    var failedSnapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+                    return new McpMutationResult(
+                        McpMutationStatus.Succeeded,
+                        new McpServerKey(finalDraft.Scope, finalDraft.Name),
+                        CreateSavedMessage(runtimeReconcile.Errors, cleanupWarning),
+                        failedSnapshot);
+                }
+            }
+
+            await lease.DisposeAsync().ConfigureAwait(false);
+            lease = null;
+            if (!isAdd)
+            {
+                runtimeReconcile = await this.ReconcileAsync(
+                    before!,
+                    after!,
+                    CreateTouchedNames(original!.Key.Name, finalDraft.Name),
+                    original.IsEffective
+                        ? CreateTouchedNames(original.Key.Name, finalDraft.Name)
+                        : new HashSet<string>(StringComparer.Ordinal),
+                    original.Config.Disabled && finalDraft.Enabled
+                        ? CreateTouchedNames(original.Key.Name, finalDraft.Name)
+                        : new HashSet<string>(StringComparer.Ordinal),
+                    ct).ConfigureAwait(false);
+            }
+
             var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
             return new McpMutationResult(
-                McpMutationStatus.Succeeded,
+                runtimeReconcile.Errors.IsDefaultOrEmpty
+                    ? McpMutationStatus.Succeeded
+                    : McpMutationStatus.SavedWithRuntimeError,
                 new McpServerKey(finalDraft.Scope, finalDraft.Name),
-                cleanupWarning is null
-                    ? "MCP server saved."
-                    : $"MCP server saved. Warning: {cleanupWarning}",
+                CreateSavedMessage(runtimeReconcile.Errors, cleanupWarning),
                 snapshot);
         }
         catch (OperationCanceledException)
@@ -957,9 +998,15 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 throw;
             }
 
-            return await this.CreateSavedWithWarningAsync(
-                "Credential cleanup could not be confirmed after saving.",
-                preview.Draft).ConfigureAwait(false);
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                new McpServerKey(preview.Draft.Scope, preview.Draft.Name),
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
         }
         catch (Exception)
         {
@@ -971,9 +1018,15 @@ internal sealed partial class McpManagementService : IMcpManagementService
                     .ConfigureAwait(false);
             }
 
-            return await this.CreateSavedWithWarningAsync(
-                "Credential cleanup could not be confirmed after saving.",
-                preview.Draft).ConfigureAwait(false);
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                new McpServerKey(preview.Draft.Scope, preview.Draft.Name),
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
         }
         finally
         {
@@ -1087,6 +1140,337 @@ internal sealed partial class McpManagementService : IMcpManagementService
             disabled,
             workingDirectory,
             userDirectory);
+    }
+
+    private async Task<McpMutationResult> SetEnabledCoreAsync(
+        McpServerKey key,
+        bool enabled,
+        CancellationToken ct)
+    {
+        await this.mutationGate.WaitAsync(ct).ConfigureAwait(false);
+        McpMutationResult result;
+        var notify = false;
+        try
+        {
+            result = await this.SetEnabledUnderGateAsync(key, enabled, ct).ConfigureAwait(false);
+            notify = result.Status is McpMutationStatus.Succeeded or McpMutationStatus.SavedWithRuntimeError;
+        }
+        finally
+        {
+            this.mutationGate.Release();
+        }
+
+        if (notify)
+        {
+            this.RaiseChanged();
+        }
+
+        return result;
+    }
+
+    private async Task<McpMutationResult> SetEnabledUnderGateAsync(
+        McpServerKey key,
+        bool enabled,
+        CancellationToken ct)
+    {
+        McpConfigMutationLease? lease = null;
+        var writeSucceeded = false;
+        try
+        {
+            this.ValidateScopeAvailable(key.Scope);
+            lease = await McpConfigMutationLease
+                .AcquireAsync(this.workingDirectory, this.userMcpDir, ct)
+                .ConfigureAwait(false);
+            var revision = CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
+            var entries = this.LoadPhysicalEntriesForMutation(ct);
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP configuration changed while this update was being prepared. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            var entry = entries.FirstOrDefault(candidate => candidate.Key == key);
+            if (entry is null)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "The selected MCP server no longer exists in the selected scope.")
+                    .ConfigureAwait(false);
+            }
+
+            if (entry.Config.Disabled == !enabled)
+            {
+                var unchanged = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+                return new McpMutationResult(
+                    McpMutationStatus.NoOp,
+                    key,
+                    "MCP server is already in the requested state.",
+                    unchanged);
+            }
+
+            var before = this.LoadEffectiveConfigsForMutation();
+            if (CaptureRevision(this.workingDirectory, this.userMcpDir, ct) != revision)
+            {
+                return await this.CreateRejectedResultAsync(
+                    "MCP configuration changed while this update was being saved. Review the current configuration and try again.")
+                    .ConfigureAwait(false);
+            }
+
+            this.SetDisabledWithExpectedRevision(
+                key.Scope,
+                key.Name,
+                disabled: !enabled,
+                this.workingDirectory,
+                this.userMcpDir,
+                RevisionForScope(revision, key.Scope));
+            writeSucceeded = true;
+            var after = this.LoadEffectiveConfigsForMutation();
+            await lease.DisposeAsync().ConfigureAwait(false);
+            lease = null;
+            var reconcile = await this.ReconcileAsync(
+                before,
+                after,
+                new HashSet<string>(StringComparer.Ordinal) { key.Name },
+                new HashSet<string>(StringComparer.Ordinal),
+                enabled
+                    ? new HashSet<string>(StringComparer.Ordinal) { key.Name }
+                    : new HashSet<string>(StringComparer.Ordinal),
+                ct).ConfigureAwait(false);
+            var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
+            return new McpMutationResult(
+                reconcile.Errors.IsDefaultOrEmpty
+                    ? McpMutationStatus.Succeeded
+                    : McpMutationStatus.SavedWithRuntimeError,
+                key,
+                CreateSavedMessage(reconcile.Errors, cleanupWarning: null),
+                snapshot);
+        }
+        catch (OperationCanceledException)
+        {
+            if (!writeSucceeded)
+            {
+                throw;
+            }
+
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+                lease = null;
+            }
+
+            return await this.CreateSavedWithRuntimeErrorAsync(
+                key,
+                "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
+        }
+        catch (Exception)
+        {
+            if (writeSucceeded)
+            {
+                if (lease is not null)
+                {
+                    await lease.DisposeAsync().ConfigureAwait(false);
+                    lease = null;
+                }
+
+                return await this.CreateSavedWithRuntimeErrorAsync(
+                    key,
+                    "The saved MCP configuration could not be reconciled with the runtime.").ConfigureAwait(false);
+            }
+
+            return await this.CreateRejectedResultAsync(
+                "MCP server could not be saved. Review the configuration and try again.")
+                .ConfigureAwait(false);
+        }
+        finally
+        {
+            if (lease is not null)
+            {
+                await lease.DisposeAsync().ConfigureAwait(false);
+            }
+        }
+    }
+
+    private void SetDisabledWithExpectedRevision(
+        McpConfigScope scope,
+        string name,
+        bool disabled,
+        string workingDirectory,
+        string? userDirectory,
+        string expectedRevision)
+    {
+        if (this.configMutator is IRevisionedMcpConfigMutator revisioned)
+        {
+            _ = revisioned.SetDisabled(
+                scope,
+                name,
+                disabled,
+                workingDirectory,
+                userDirectory,
+                expectedRevision);
+            return;
+        }
+
+        _ = this.configMutator.SetDisabled(
+            scope,
+            name,
+            disabled,
+            workingDirectory,
+            userDirectory);
+    }
+
+    private IReadOnlyDictionary<string, McpServerConfig> LoadEffectiveConfigsForMutation()
+    {
+        this.ValidatePhysicalConfiguration(CancellationToken.None);
+        return McpConfig.Load(this.workingDirectory, this.userMcpDir);
+    }
+
+    private async Task<McpRuntimeReconcileResult> ReconcileAsync(
+        IReadOnlyDictionary<string, McpServerConfig> before,
+        IReadOnlyDictionary<string, McpServerConfig> after,
+        IReadOnlySet<string> touchedNames,
+        IReadOnlySet<string> forceRestartNames,
+        IReadOnlySet<string> forceStartNames,
+        CancellationToken ct)
+    {
+        if (this.runtime is null)
+        {
+            return EmptyRuntimeReconcileResult();
+        }
+
+        var stopped = ImmutableArray.CreateBuilder<string>();
+        var started = ImmutableArray.CreateBuilder<string>();
+        var errors = ImmutableArray.CreateBuilder<string>();
+        var names = touchedNames.OrderBy(static name => name, StringComparer.Ordinal).ToArray();
+        var runtimeHasIntent = names.ToDictionary(
+            static name => name,
+            name => this.runtime.IsServerConnected(name)
+                || RuntimeErrorFor(this.runtime, name) is not null,
+            StringComparer.Ordinal);
+        var forcedRuntimeHasIntent = forceRestartNames.Any(
+            name => runtimeHasIntent.GetValueOrDefault(name));
+
+        try
+        {
+            foreach (var name in names)
+            {
+                before.TryGetValue(name, out var oldConfig);
+                after.TryGetValue(name, out var newConfig);
+                if (oldConfig is not null
+                    && (newConfig is null
+                        || !EffectiveConfigsEqual(oldConfig, newConfig)
+                        || forceRestartNames.Contains(name)))
+                {
+                    if (await this.runtime.DisconnectServerAsync(name).ConfigureAwait(false))
+                    {
+                        stopped.Add(name);
+                    }
+                }
+            }
+
+            foreach (var name in names)
+            {
+                before.TryGetValue(name, out var oldConfig);
+                after.TryGetValue(name, out var newConfig);
+                if (newConfig is null
+                    || (oldConfig is not null
+                        && EffectiveConfigsEqual(oldConfig, newConfig)
+                        && !forceRestartNames.Contains(name)))
+                {
+                    continue;
+                }
+
+                var shouldStart = forceStartNames.Contains(name)
+                    || runtimeHasIntent.GetValueOrDefault(name)
+                    || (forceRestartNames.Contains(name) && forcedRuntimeHasIntent);
+                if (!shouldStart)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    var resolved = await McpSecretResolver
+                        .ResolveAsync(newConfig, this.credentials, ct)
+                        .ConfigureAwait(false);
+                    var result = await this.runtime
+                        .ConnectServerAsync(name, resolved, ct)
+                        .ConfigureAwait(false);
+                    if (result.Connected)
+                    {
+                        started.Add(name);
+                    }
+                    else
+                    {
+                        errors.Add(SanitizeError(result.Error));
+                        if (ct.IsCancellationRequested)
+                        {
+                            break;
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    errors.Add("The runtime update was cancelled.");
+                    break;
+                }
+                catch (Exception exception)
+                {
+                    errors.Add(SanitizeError(exception.Message));
+                }
+            }
+        }
+        finally
+        {
+            this.events.Publish(new McpRuntimeChangedEvent(this.runtime.GetSnapshot()));
+        }
+
+        return new McpRuntimeReconcileResult(
+            stopped.ToImmutable(),
+            started.ToImmutable(),
+            errors.ToImmutable());
+    }
+
+    private static HashSet<string> CreateTouchedNames(string originalName, string finalName) =>
+        new(StringComparer.Ordinal) { originalName, finalName };
+
+    private static bool EffectiveConfigsEqual(McpServerConfig left, McpServerConfig right) =>
+        (left, right) switch
+        {
+            (McpStdioServerConfig leftStdio, McpStdioServerConfig rightStdio) =>
+                leftStdio.Disabled == rightStdio.Disabled
+                && string.Equals(leftStdio.Command, rightStdio.Command, StringComparison.Ordinal)
+                && leftStdio.Args.SequenceEqual(rightStdio.Args, StringComparer.Ordinal)
+                && StringMapsEqual(leftStdio.Env, rightStdio.Env),
+            (McpHttpServerConfig leftHttp, McpHttpServerConfig rightHttp) =>
+                leftHttp.Disabled == rightHttp.Disabled
+                && string.Equals(leftHttp.Url.OriginalString, rightHttp.Url.OriginalString, StringComparison.Ordinal)
+                && StringMapsEqual(leftHttp.Headers, rightHttp.Headers)
+                && leftHttp.Auth.Mode == rightHttp.Auth.Mode
+                && string.Equals(leftHttp.Auth.ClientId, rightHttp.Auth.ClientId, StringComparison.Ordinal)
+                && string.Equals(leftHttp.Auth.BearerToken, rightHttp.Auth.BearerToken, StringComparison.Ordinal)
+                && (leftHttp.Auth.Scopes ?? []).SequenceEqual(rightHttp.Auth.Scopes ?? [], StringComparer.Ordinal),
+            _ => false,
+        };
+
+    private static bool StringMapsEqual(
+        IReadOnlyDictionary<string, string> left,
+        IReadOnlyDictionary<string, string> right) =>
+        left.Count == right.Count
+        && left.All(pair =>
+            right.TryGetValue(pair.Key, out var rightValue)
+            && string.Equals(pair.Value, rightValue, StringComparison.Ordinal));
+
+    private static McpRuntimeReconcileResult EmptyRuntimeReconcileResult() =>
+        new([], [], []);
+
+    private static string CreateSavedMessage(
+        ImmutableArray<string> runtimeErrors,
+        string? cleanupWarning)
+    {
+        var message = runtimeErrors.IsDefaultOrEmpty
+            ? "MCP server saved."
+            : $"MCP server saved, but the runtime could not be updated: {runtimeErrors[0]}";
+        return cleanupWarning is null ? message : $"{message} Warning: {cleanupWarning}";
     }
 
     private static string RevisionForScope(McpConfigRevision revision, McpConfigScope scope) =>
@@ -1472,15 +1856,20 @@ internal sealed partial class McpManagementService : IMcpManagementService
             snapshot);
     }
 
-    private async Task<McpMutationResult> CreateSavedWithWarningAsync(
-        string warning,
-        McpServerDraft draft)
+    private async Task<McpMutationResult> CreateSavedWithRuntimeErrorAsync(
+        McpServerKey key,
+        string runtimeError)
     {
+        if (this.runtime is not null)
+        {
+            this.events.Publish(new McpRuntimeChangedEvent(this.runtime.GetSnapshot()));
+        }
+
         var snapshot = await this.RefreshAsync(CancellationToken.None).ConfigureAwait(false);
         return new McpMutationResult(
-            McpMutationStatus.Succeeded,
-            new McpServerKey(draft.Scope, draft.Name),
-            $"MCP server saved. Warning: {SanitizeError(warning)}",
+            McpMutationStatus.SavedWithRuntimeError,
+            key,
+            CreateSavedMessage([SanitizeError(runtimeError)], cleanupWarning: null),
             snapshot);
     }
 
