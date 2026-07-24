@@ -17,6 +17,7 @@
     <Project Path="src/LlmClient/LlmClient.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Coda.Tui.Benchmarks/Coda.Tui.Benchmarks.csproj" />
     <Project Path="tests/Coda.Tui.Tests/Coda.Tui.Tests.csproj" />
     <Project Path="tests/Engine.Tests/Engine.Tests.csproj" />
     <Project Path="tests/LlmAuth.Tests/LlmAuth.Tests.csproj" />
