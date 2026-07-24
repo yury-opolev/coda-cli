@@ -3,16 +3,17 @@ using Coda.Mcp;
 namespace Coda.Tui.Mcp;
 
 /// <summary>
-/// Cooperative, cross-process lease for MCP configuration transactions. The sibling lock files
-/// are acquired in normalized path order so services that share either scope cannot deadlock.
+/// Cooperative, cross-process lease for MCP configuration transactions. A user-scoped lock file
+/// conservatively serializes every transaction, including configurations reached through filesystem aliases.
 /// </summary>
 internal sealed class McpConfigMutationLease : IAsyncDisposable
 {
     private const int maxAcquireAttempts = 200;
+    private const string lockFileName = "mcp-mutation.lock";
     private static readonly TimeSpan retryDelay = TimeSpan.FromMilliseconds(25);
-    private readonly IReadOnlyList<FileStream> streams;
+    private readonly FileStream stream;
 
-    private McpConfigMutationLease(IReadOnlyList<FileStream> streams) => this.streams = streams;
+    private McpConfigMutationLease(FileStream stream) => this.stream = stream;
 
     public static async Task<McpConfigMutationLease> AcquireAsync(
         string workingDirectory,
@@ -20,38 +21,36 @@ internal sealed class McpConfigMutationLease : IAsyncDisposable
         CancellationToken ct)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
-        var lockPaths = new[]
-            {
-                McpConfig.FilePath(McpConfigScope.User, workingDirectory, userMcpDir),
-                McpConfig.FilePath(McpConfigScope.Project, workingDirectory, userMcpDir),
-            }
-            .Select(Path.GetFullPath)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .OrderBy(static path => path, StringComparer.OrdinalIgnoreCase)
-            .Select(static path => path + ".lock")
-            .ToArray();
-        var streams = new List<FileStream>(lockPaths.Length);
+        return await AcquireAsync(
+            ct,
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                ".coda",
+                "mcp-locks")).ConfigureAwait(false);
+    }
 
-        try
-        {
-            foreach (var lockPath in lockPaths)
-            {
-                ct.ThrowIfCancellationRequested();
-                streams.Add(await AcquireFileAsync(lockPath, ct).ConfigureAwait(false));
-            }
-
-            return new McpConfigMutationLease(streams);
-        }
-        catch
-        {
-            DisposeStreams(streams);
-            throw;
-        }
+    internal static async Task<McpConfigMutationLease> AcquireAsync(
+        CancellationToken ct,
+        string lockDirectory)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(lockDirectory);
+        var stream = await AcquireFileAsync(
+            Path.Combine(lockDirectory, lockFileName),
+            ct).ConfigureAwait(false);
+        return new McpConfigMutationLease(stream);
     }
 
     public ValueTask DisposeAsync()
     {
-        DisposeStreams(this.streams);
+        try
+        {
+            this.stream.Dispose();
+        }
+        catch (IOException)
+        {
+            // DeleteOnClose is best effort; a failed cleanup must not strand the mutation gate.
+        }
+
         return ValueTask.CompletedTask;
     }
 
@@ -92,19 +91,4 @@ internal sealed class McpConfigMutationLease : IAsyncDisposable
 
     private static McpException LockAcquireFailed() =>
         new("MCP configuration lock could not be acquired. Check access to the configuration directory and try again.");
-
-    private static void DisposeStreams(IEnumerable<FileStream> streams)
-    {
-        foreach (var stream in streams.Reverse())
-        {
-            try
-            {
-                stream.Dispose();
-            }
-            catch (IOException)
-            {
-                // DeleteOnClose is best effort; a failed cleanup must not strand the mutation gate.
-            }
-        }
-    }
 }

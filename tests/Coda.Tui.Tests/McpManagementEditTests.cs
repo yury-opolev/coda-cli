@@ -1794,6 +1794,65 @@ public sealed class McpManagementEditTests
     }
 
     [Fact]
+    public async Task Lease_does_not_create_or_open_project_or_user_sibling_lock_files()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        const string projectConfig = """{"mcpServers":{"project":{"command":"node"}}}""";
+        const string userConfig = """{"mcpServers":{"user":{"command":"node"}}}""";
+        harness.WriteProject(projectConfig);
+        harness.WriteUser(userConfig);
+        var projectPath = Path.Combine(harness.Project, ".mcp.json");
+        var userPath = Path.Combine(harness.User, ".mcp.json");
+        var projectBytes = File.ReadAllBytes(projectPath);
+        var userBytes = File.ReadAllBytes(userPath);
+
+        await using var lease = await McpConfigMutationLease.AcquireAsync(
+            harness.Project,
+            harness.User,
+            CancellationToken.None);
+
+        Assert.Equal(projectBytes, File.ReadAllBytes(projectPath));
+        Assert.Equal(userBytes, File.ReadAllBytes(userPath));
+        Assert.Empty(Directory.EnumerateFiles(harness.Project, "*.lock", SearchOption.TopDirectoryOnly));
+        Assert.Empty(Directory.EnumerateFiles(harness.User, "*.lock", SearchOption.TopDirectoryOnly));
+    }
+
+    [Fact]
+    public async Task Lease_serializes_unrelated_configuration_paths()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        var secondProject = harness.CreateProjectDirectory();
+        var secondUser = harness.CreateProjectDirectory();
+
+        await using var first = await McpConfigMutationLease.AcquireAsync(
+            harness.Project,
+            harness.User,
+            CancellationToken.None);
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        var contender = McpConfigMutationLease.AcquireAsync(
+            secondProject,
+            secondUser,
+            cts.Token);
+
+        try
+        {
+            await Task.Delay(TimeSpan.FromMilliseconds(50));
+            Assert.False(contender.IsCompletedSuccessfully);
+        }
+        finally
+        {
+            cts.Cancel();
+            try
+            {
+                await (await contender).DisposeAsync();
+            }
+            catch (OperationCanceledException)
+            {
+            }
+        }
+    }
+
+    [Fact]
     public async Task Lease_can_be_immediately_reacquired_after_release_repeatedly()
     {
         await using var harness = await McpManagementTestHarness.CreateAsync();
@@ -1855,11 +1914,13 @@ public sealed class McpManagementEditTests
     public async Task Lease_reports_a_safe_error_when_its_lock_directory_cannot_be_created()
     {
         await using var harness = await McpManagementTestHarness.CreateAsync();
-        var blockedDirectory = Path.Combine(harness.Project, "not-a-directory");
-        await File.WriteAllTextAsync(blockedDirectory, "blocked");
+        var blockedLockDirectory = Path.Combine(harness.Project, "not-a-directory");
+        await File.WriteAllTextAsync(blockedLockDirectory, "blocked");
 
         var exception = await Assert.ThrowsAsync<McpException>(() =>
-            McpConfigMutationLease.AcquireAsync(blockedDirectory, harness.User, CancellationToken.None));
+            McpConfigMutationLease.AcquireAsync(
+                CancellationToken.None,
+                blockedLockDirectory));
 
         Assert.Equal(
             "MCP configuration lock could not be acquired. Check access to the configuration directory and try again.",
