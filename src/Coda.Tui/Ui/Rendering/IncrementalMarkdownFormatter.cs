@@ -206,12 +206,14 @@ internal sealed class IncrementalMarkdownFormatter
             }
 
             if (leading >= 4
+                || (content.Length > 0 && content[0] == '\t')
                 || IsListMarker(content)
                 || IsBlockQuote(content)
                 || IsHtmlStart(content)
                 || HasReferenceSyntax(line))
             {
-                // A construct whose extent/rendering can change as more text arrives. Never seal past it.
+                // A construct whose extent/rendering can change as more text arrives (a list, block quote,
+                // indented/tab code block, HTML block, or reference syntax). Never seal past it.
                 return (seal, true);
             }
 
@@ -289,9 +291,23 @@ internal sealed class IncrementalMarkdownFormatter
 
     private static bool IsFenceClose(ReadOnlySpan<char> line, char marker, int minLength)
     {
-        var trimmed = line.TrimStart(' ');
+        // A closing fence may be indented at most three spaces; a line indented four or more spaces (or by a
+        // tab) is code content that does NOT close the fence. Stripping all leading whitespace here would let
+        // a seal land inside an open fenced code block.
+        var spaces = 0;
+        while (spaces < line.Length && line[spaces] == ' ')
+        {
+            spaces++;
+        }
+
+        if (spaces > 3)
+        {
+            return false;
+        }
+
+        var rest = line[spaces..];
         var run = 0;
-        while (run < trimmed.Length && trimmed[run] == marker)
+        while (run < rest.Length && rest[run] == marker)
         {
             run++;
         }
@@ -302,7 +318,7 @@ internal sealed class IncrementalMarkdownFormatter
         }
 
         // A closing fence carries no info string: only trailing spaces may follow the marker run.
-        return trimmed[run..].TrimEnd(' ').IsEmpty;
+        return rest[run..].TrimEnd(' ').IsEmpty;
     }
 
     private static bool IsListMarker(ReadOnlySpan<char> content)

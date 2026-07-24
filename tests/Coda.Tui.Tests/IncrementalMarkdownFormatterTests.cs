@@ -64,6 +64,9 @@ public sealed class IncrementalMarkdownFormatterTests
     [InlineData("<div>raw html</div>\n\nfollowing paragraph")]
     [InlineData("    indented code line\n    second line\n\nplain paragraph")]
     [InlineData("Para one.\n\n- a list appears\n\nPara two.\n\n- another list\n\nPara three.")]
+    [InlineData("```\ncode\n    ```\nstill code because indented close\n```\n\nafter the real close")]
+    [InlineData("```\ncode\n\tmore code with a leading tab\n```\n\nafter")]
+    [InlineData("intro\n\n```\na\n    ```\nb\n```\n\nc\n\nd")]
     public void Complex_content_streams_identically(string finalText)
     {
         AssertStreamMatchesFull(finalText);
