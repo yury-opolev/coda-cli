@@ -1,6 +1,8 @@
 using System.Collections.Concurrent;
 using System.Text.Json;
 using Coda.Agent;
+using Coda.Agent.Scheduling;
+using Coda.Agent.Tasks;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui;
 using Coda.Tui.Ui.Events;
@@ -14,6 +16,139 @@ namespace Coda.Tui.Tests;
 
 public sealed class TuiControllerTests
 {
+    [Fact]
+    public async Task Submission_cannot_start_while_an_idle_lease_is_held()
+    {
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await Task.CompletedTask;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+        var gate = Assert.IsAssignableFrom<IExclusiveIdleGate>(controller);
+        using var lease = Assert.IsAssignableFrom<IDisposable>(gate.TryAcquire());
+
+        controller.OnSubmitted("queued");
+        Assert.False(started.Task.IsCompleted);
+
+        lease.Dispose();
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Lease_cannot_overlap_an_in_flight_dispatch()
+    {
+        var release = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var started = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (_, _) =>
+            {
+                started.TrySetResult();
+                await release.Task;
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("running");
+        await started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var gate = Assert.IsAssignableFrom<IExclusiveIdleGate>(controller);
+        Assert.Null(gate.TryAcquire());
+
+        release.TrySetResult();
+        await controller.WaitForDispatchAsync();
+    }
+
+    [Fact]
+    public async Task Lease_cannot_overlap_an_active_side_band_dispatch()
+    {
+        var mainStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var mainRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sideBandStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var sideBandRelease = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var controller = new TuiController(
+            dispatch: async (text, _) =>
+            {
+                if (CommandParser.Parse(text).Kind == ParsedInputKind.Prompt)
+                {
+                    mainStarted.TrySetResult();
+                    await mainRelease.Task;
+                }
+                else
+                {
+                    sideBandStarted.TrySetResult();
+                    await sideBandRelease.Task;
+                }
+            },
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty);
+
+        controller.OnSubmitted("running");
+        await mainStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        controller.OnSubmitted("/yolo");
+        await sideBandStarted.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var main = controller.CurrentDispatch;
+        Assert.NotNull(main);
+        mainRelease.TrySetResult();
+        await main!.WaitAsync(TimeSpan.FromSeconds(1));
+
+        var gate = Assert.IsAssignableFrom<IExclusiveIdleGate>(controller);
+        Assert.Null(gate.TryAcquire());
+
+        sideBandRelease.TrySetResult();
+        await controller.CurrentSideband.WaitAsync(TimeSpan.FromSeconds(1));
+    }
+
+    [Fact]
+    public async Task Idle_gate_tracks_managed_scheduled_task_activity_and_notifies_on_boundaries()
+    {
+        using var manager = new TaskManager(sessionId: "controller-idle-gate", logRoot: null);
+        var controller = new TuiController(
+            dispatch: (_, _) => Task.FromResult(CommandResult.Continue),
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty,
+            taskManagerProvider: () => manager);
+        var gate = Assert.IsAssignableFrom<IExclusiveIdleGate>(controller);
+        var busyChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var idleChanged = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        gate.Changed += () =>
+        {
+            if (gate.IsBusy)
+            {
+                busyChanged.TrySetResult();
+            }
+            else
+            {
+                idleChanged.TrySetResult();
+            }
+        };
+
+        Assert.False(gate.IsBusy);
+
+        var host = new BlockingScheduledHost();
+        var taskId = manager.StartScheduledBackground(host, "prompt", "scheduled", _ => { });
+        await host.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+        await busyChanged.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.True(gate.IsBusy);
+        Assert.Null(gate.TryAcquire());
+
+        host.Release.TrySetResult();
+        await manager.WaitForTerminalAsync(taskId).WaitAsync(TimeSpan.FromSeconds(1));
+        await idleChanged.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        Assert.False(gate.IsBusy);
+        using var lease = Assert.IsAssignableFrom<IDisposable>(gate.TryAcquire());
+    }
+
     [Fact]
     public async Task Interrupt_action_calls_interrupt_without_requesting_exit()
     {
@@ -912,6 +1047,28 @@ public sealed class TuiControllerTests
             {
                 this.events.Add(uiEvent);
             }
+        }
+    }
+
+    private sealed class BlockingScheduledHost : IScheduledAgentHost
+    {
+        public TaskCompletionSource Started { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public TaskCompletionSource Release { get; } =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        public async Task<string> RunScheduledAsync(
+            string prompt,
+            IAgentSink sink,
+            SteeringInbox steering,
+            string taskId,
+            int depth,
+            CancellationToken cancellationToken)
+        {
+            this.Started.TrySetResult();
+            await this.Release.Task.WaitAsync(cancellationToken);
+            return "done";
         }
     }
 

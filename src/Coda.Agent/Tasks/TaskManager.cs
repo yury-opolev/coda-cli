@@ -27,6 +27,7 @@ public sealed partial class TaskManager : IDisposable
     private readonly long _outputRingBytes;
     private readonly int _maxRetainedTerminalTasks;
     private int _nextId;
+    private bool _idleLeaseHeld;
 
     /// <summary>
     /// Test-only barrier invoked inside <see cref="Register"/> after its pre-lock validation but
@@ -35,6 +36,12 @@ public sealed partial class TaskManager : IDisposable
     /// of the shutdown/registration recheck. Null (and therefore free) in production.
     /// </summary>
     internal Action? RegisterBarrier { get; set; }
+
+    /// <summary>
+    /// Test-only notification raised under <see cref="_gate"/> immediately before a registration waits
+    /// for an idle lease to release. Null in production.
+    /// </summary>
+    internal Action? IdleLeaseWaitBarrier { get; set; }
 
     public TaskManager(
         string sessionId,
@@ -68,6 +75,24 @@ public sealed partial class TaskManager : IDisposable
 
     /// <summary>Root directory for persistent task logs.</summary>
     public string LogRoot { get; }
+
+    /// <summary>
+    /// Raised after a transition changes whether <see cref="TryAcquireIdleLease"/> can succeed. The
+    /// callback always runs outside the manager's registry lock.
+    /// </summary>
+    public event Action? IdleStateChanged;
+
+    /// <summary>Whether an idle lease can currently be acquired.</summary>
+    public bool IsIdle
+    {
+        get
+        {
+            lock (_gate)
+            {
+                return IsIdleLocked();
+            }
+        }
+    }
 
     public static string DefaultLogRoot =>
         Path.Combine(
@@ -125,8 +150,15 @@ public sealed partial class TaskManager : IDisposable
         ManagedTask task;
         long createdVersion;
         TaskSubscription[] subs;
+        bool becameBusy;
         lock (_gate)
         {
+            while (_idleLeaseHeld && !_shuttingDown && !_disposed)
+            {
+                IdleLeaseWaitBarrier?.Invoke();
+                Monitor.Wait(_gate);
+            }
+
             // Authoritative recheck under the SAME lock that ShutdownAsync uses to set
             // _shuttingDown and snapshot the task set. This closes the race where a registration
             // passed the pre-lock check and then committed a task after shutdown had already
@@ -139,6 +171,7 @@ public sealed partial class TaskManager : IDisposable
                     "Task manager is shutting down; no new tasks may be registered.");
             }
 
+            becameBusy = IsIdleLocked();
             var id = $"task-{++_nextId:D4}";
             // This runtime issues `task-NNNN` ids and is now the single owner of all subagent
             // and shell tasks; the legacy background-task runner (and its `bgNNNN` id space) has
@@ -175,7 +208,62 @@ public sealed partial class TaskManager : IDisposable
             }
         }
 
+        if (becameBusy)
+        {
+            RaiseIdleStateChanged();
+        }
+
         return task;
+    }
+
+    /// <summary>
+    /// Atomically reserves a task-free interval. New registrations wait until the returned lease is
+    /// released, and acquisition fails when any managed task is running or shutdown has begun.
+    /// </summary>
+    public IDisposable? TryAcquireIdleLease()
+    {
+        IDisposable? lease;
+        lock (_gate)
+        {
+            if (!IsIdleLocked())
+            {
+                return null;
+            }
+
+            _idleLeaseHeld = true;
+            lease = new IdleLease(this);
+        }
+
+        RaiseIdleStateChanged();
+        return lease;
+    }
+
+    private void ReleaseIdleLease()
+    {
+        bool becameIdle;
+        lock (_gate)
+        {
+            if (!_idleLeaseHeld)
+            {
+                return;
+            }
+
+            _idleLeaseHeld = false;
+            Monitor.PulseAll(_gate);
+            becameIdle = IsIdleLocked();
+        }
+
+        if (becameIdle)
+        {
+            RaiseIdleStateChanged();
+        }
+    }
+
+    private sealed class IdleLease(TaskManager owner) : IDisposable
+    {
+        private TaskManager? owner = owner;
+
+        public void Dispose() => Interlocked.Exchange(ref this.owner, null)?.ReleaseIdleLease();
     }
 
     /// <summary>
@@ -404,6 +492,7 @@ public sealed partial class TaskManager : IDisposable
     {
         if (Find(id) is not { } t || !t.TryComplete(result, out var version)) return false;
         Publish(id, version, TaskChangeKind.Status);
+        RaiseIdleStateChangedIfIdle();
         return true;
     }
 
@@ -412,6 +501,7 @@ public sealed partial class TaskManager : IDisposable
     {
         if (Find(id) is not { } t || !t.TryFail(error, out var version)) return false;
         Publish(id, version, TaskChangeKind.Status);
+        RaiseIdleStateChangedIfIdle();
         return true;
     }
 
@@ -420,6 +510,7 @@ public sealed partial class TaskManager : IDisposable
     {
         if (Find(id) is not { } t || !t.TryStop(out var version)) return false;
         Publish(id, version, TaskChangeKind.Status);
+        RaiseIdleStateChangedIfIdle();
         return true;
     }
 
@@ -444,6 +535,28 @@ public sealed partial class TaskManager : IDisposable
         }
     }
 
+    private bool IsIdleLocked() =>
+        !_idleLeaseHeld &&
+        !_shuttingDown &&
+        !_disposed &&
+        !_order.Any(task => task.Status == TaskRunStatus.Running);
+
+    private void RaiseIdleStateChanged() => IdleStateChanged?.Invoke();
+
+    private void RaiseIdleStateChangedIfIdle()
+    {
+        bool idle;
+        lock (_gate)
+        {
+            idle = IsIdleLocked();
+        }
+
+        if (idle)
+        {
+            RaiseIdleStateChanged();
+        }
+    }
+
     public void Dispose()
     {
         // Snapshot the task set under the lock, then dispose outside it. Disposing a
@@ -453,17 +566,25 @@ public sealed partial class TaskManager : IDisposable
         // they must also be closed outside the lock (no disk I/O under the registry lock).
         ManagedTask[] tasks;
         TaskSubscription[] subs;
+        bool becameBusy;
         lock (_gate)
         {
             // Idempotent: a second Dispose (e.g. after ShutdownAsync already disposed) is a no-op.
             if (_disposed) return;
+            becameBusy = IsIdleLocked();
             _disposed = true;
+            Monitor.PulseAll(_gate);
 
             tasks = _order.ToArray();
             // Snapshot AND clear subscriptions under the lock so no late publish reaches a
             // subscription after this point, then close them outside the lock (below).
             subs = _subs.ToArray();
             _subs.Clear();
+        }
+
+        if (becameBusy)
+        {
+            RaiseIdleStateChanged();
         }
 
         // Close subscriptions outside the lock: Close() takes each subscription's own gate

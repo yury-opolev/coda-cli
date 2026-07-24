@@ -306,7 +306,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 ? new TaskBrowserProvider(tasks, gate)
                 : null;
 
-        var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
+        using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
 
         // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
         // Terminal.Gui shells own their own Esc/Ctrl+C chords). The explicit exit action is wired

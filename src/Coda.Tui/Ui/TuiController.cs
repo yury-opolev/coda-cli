@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Tasks;
 using Coda.Tui.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
@@ -33,7 +34,7 @@ internal interface ITuiShellHandle
 /// shared with this controller through <see cref="AgentRunner"/>, <see cref="UiEventMailbox"/>, and
 /// <see cref="ActorUiPromptService"/> so that a mode switch never rebuilds them.
 /// </summary>
-public sealed class TuiController
+public sealed class TuiController : IExclusiveIdleGate, IDisposable
 {
     /// <summary>The label shown in the status bar while the interactive startup is running.</summary>
     internal const string StartingLabel = "Starting…";
@@ -43,10 +44,15 @@ public sealed class TuiController
     private readonly Func<bool> hasActiveTurn;
     private readonly Func<string, string?>? steer;
     private readonly Func<IReadOnlyList<SteeringEntry>> recallSteering;
+    private readonly Func<TaskManager?>? taskManagerProvider;
     private readonly IUiEventPublisher publisher;
     private readonly CancellationToken hostToken;
     private readonly object gate = new();
     private readonly AsyncLocal<bool> inDispatch = new();
+    private CancellationTokenRegistration taskManagerSubscriptionRegistration;
+    private TaskManager? subscribedTaskManager;
+    private Action? taskManagerIdleStateChanged;
+    private bool disposed;
 
     private ITuiShellHandle? shell;
     private TuiRunMode currentMode = TuiRunMode.Inline;
@@ -55,6 +61,8 @@ public sealed class TuiController
     private Task? dispatchTask;
     private readonly Queue<string> nextPrompts = new();
     private bool shutdownDrainRequested;
+    private bool idleLeasePending;
+    private bool idleLeaseHeld;
 
     // The FIFO chain of out-of-band permission commands (see OnSubmitted). It only ever grows by
     // appending a continuation that awaits the previous tail, so multiple mid-turn permission commands
@@ -87,7 +95,8 @@ public sealed class TuiController
             recallSteering: runner.RecallSteering,
             publisher: mailbox,
             initialSnapshot: initialSnapshot,
-            hostCancellationToken: hostCancellationToken)
+            hostCancellationToken: hostCancellationToken,
+            taskManagerProvider: () => runner.Tasks)
     {
         this.App = app ?? throw new ArgumentNullException(nameof(app));
         this.Runner = runner;
@@ -106,7 +115,8 @@ public sealed class TuiController
         UiSessionSnapshot initialSnapshot,
         CancellationToken hostCancellationToken = default,
         Func<string, string?>? steer = null,
-        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null)
+        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null,
+        Func<TaskManager?>? taskManagerProvider = null)
         : this(
             dispatch,
             tryInterrupt,
@@ -115,7 +125,8 @@ public sealed class TuiController
             initialSnapshot,
             hostCancellationToken,
             steer,
-            recallSteering)
+            recallSteering,
+            taskManagerProvider: taskManagerProvider)
     {
     }
 
@@ -143,18 +154,28 @@ public sealed class TuiController
         UiSessionSnapshot initialSnapshot,
         CancellationToken hostCancellationToken,
         Func<string, string?>? steer = null,
-        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null)
+        Func<IReadOnlyList<SteeringEntry>>? recallSteering = null,
+        Func<TaskManager?>? taskManagerProvider = null)
     {
         this.dispatch = dispatch ?? throw new ArgumentNullException(nameof(dispatch));
         this.tryInterrupt = tryInterrupt ?? throw new ArgumentNullException(nameof(tryInterrupt));
         this.hasActiveTurn = hasActiveTurn ?? throw new ArgumentNullException(nameof(hasActiveTurn));
         this.steer = steer;
         this.recallSteering = recallSteering ?? (static () => (IReadOnlyList<SteeringEntry>)[]);
+        this.taskManagerProvider = taskManagerProvider;
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
         this.hostToken = hostCancellationToken;
         this.CurrentSnapshot = initialSnapshot ?? throw new ArgumentNullException(nameof(initialSnapshot));
         this.CurrentComposer = ComposerState.Empty;
         this.SessionIdentity = new object();
+        if (hostCancellationToken.CanBeCanceled)
+        {
+            this.taskManagerSubscriptionRegistration = hostCancellationToken.Register(
+                static state => ((TuiController)state!).UnsubscribeTaskManager(),
+                this);
+        }
+
+        this.GetTaskManager();
     }
 
     /// <summary>The shared REPL host; null when constructed through the test seam.</summary>
@@ -191,7 +212,10 @@ public sealed class TuiController
         {
             lock (this.gate)
             {
-                if (this.dispatchInFlight)
+                if (this.dispatchInFlight ||
+                    !this.sidebandChain.IsCompleted ||
+                    this.idleLeasePending ||
+                    this.idleLeaseHeld)
                 {
                     return true;
                 }
@@ -199,6 +223,88 @@ public sealed class TuiController
 
             return this.hasActiveTurn();
         }
+    }
+
+    /// <inheritdoc />
+    public bool IsBusy
+    {
+        get
+        {
+            bool locallyBusy;
+            lock (this.gate)
+            {
+                locallyBusy = this.startupPending ||
+                    this.dispatchInFlight ||
+                    !this.sidebandChain.IsCompleted ||
+                    this.nextPrompts.Count > 0 ||
+                    this.shutdownDrainRequested ||
+                    this.exitRequested ||
+                    this.idleLeasePending ||
+                    this.idleLeaseHeld;
+            }
+
+            var taskManagerBusy = this.IsTaskManagerBusy();
+            return locallyBusy || this.hasActiveTurn() || taskManagerBusy;
+        }
+    }
+
+    /// <inheritdoc />
+    public event Action? Changed;
+
+    /// <summary>
+    /// Reserves both the interactive dispatcher and its managed-task boundary. The controller gate is
+    /// marked first, but never held while acquiring the task-manager lease, preventing lock inversion.
+    /// </summary>
+    public IDisposable? TryAcquire()
+    {
+        lock (this.gate)
+        {
+            if (this.IsLocallyBusyLocked())
+            {
+                return null;
+            }
+
+            this.idleLeasePending = true;
+        }
+
+        if (this.hasActiveTurn())
+        {
+            this.RollbackIdleLease();
+            return null;
+        }
+
+        var taskManager = this.GetTaskManager();
+        var taskLease = taskManager?.TryAcquireIdleLease();
+        if (this.taskManagerProvider is not null && taskLease is null)
+        {
+            this.RollbackIdleLease();
+            return null;
+        }
+
+        var accepted = false;
+        lock (this.gate)
+        {
+            if (!this.startupPending &&
+                !this.dispatchInFlight &&
+                !this.shutdownDrainRequested &&
+                !this.exitRequested &&
+                !this.hostToken.IsCancellationRequested)
+            {
+                this.idleLeasePending = false;
+                this.idleLeaseHeld = true;
+                accepted = true;
+            }
+        }
+
+        if (!accepted)
+        {
+            taskLease?.Dispose();
+            this.RollbackIdleLease();
+            return null;
+        }
+
+        this.RaiseChanged();
+        return new CompositeIdleLease(this, taskLease);
     }
 
     /// <summary>Test seam: the in-flight dispatch task, or null when idle.</summary>
@@ -258,6 +364,7 @@ public sealed class TuiController
 
         // Surface a generic "Starting…" active-operation indicator; the status projector renders it.
         this.publisher.Publish(new ActiveOperationChangedEvent(new ActiveOperation("startup", StartingLabel, null)));
+        this.RaiseChanged();
     }
 
     /// <summary>Re-enable submission once the interactive startup callback has finished.</summary>
@@ -268,7 +375,9 @@ public sealed class TuiController
             this.startupPending = false;
         }
 
+        this.GetTaskManager();
         this.publisher.Publish(new ActiveOperationChangedEvent(null));
+        this.RaiseChanged();
     }
 
     /// <summary>Whether startup is still running and submission is therefore blocked.</summary>
@@ -307,6 +416,8 @@ public sealed class TuiController
             this.nextPrompts.Clear();
         }
 
+        this.RaiseChanged();
+
         if (interrupt)
         {
             this.TryInterruptActiveTurn();
@@ -341,6 +452,7 @@ public sealed class TuiController
     public void RequestExit()
     {
         Volatile.Write(ref this.exitRequested, true);
+        this.RaiseChanged();
         this.RemovePendingRows();
         this.CurrentShell()?.RequestStop(TuiShellExit.Exited);
     }
@@ -375,11 +487,18 @@ public sealed class TuiController
             return;
         }
 
+        var dispatchStarted = false;
         lock (this.gate)
         {
             // Exit/startup always reject every submission, including permission commands.
             if (Volatile.Read(ref this.exitRequested) || this.shutdownDrainRequested || this.startupPending)
             {
+                return;
+            }
+
+            if (this.idleLeasePending || this.idleLeaseHeld)
+            {
+                this.nextPrompts.Enqueue(text);
                 return;
             }
 
@@ -416,6 +535,12 @@ public sealed class TuiController
             }
 
             this.StartDispatchLocked(text);
+            dispatchStarted = true;
+        }
+
+        if (dispatchStarted)
+        {
+            this.RaiseChanged();
         }
     }
 
@@ -435,7 +560,13 @@ public sealed class TuiController
     private void QueueSidebandCommand(string text)
     {
         var previous = this.sidebandChain;
-        this.sidebandChain = Task.Run(() => this.RunSidebandAsync(previous, text));
+        var scheduled = Task.Run(() => this.RunSidebandAsync(previous, text));
+        this.sidebandChain = scheduled;
+        _ = scheduled.ContinueWith(
+            _ => this.RaiseChanged(),
+            CancellationToken.None,
+            TaskContinuationOptions.None,
+            TaskScheduler.Default);
     }
 
     /// <summary>
@@ -526,6 +657,7 @@ public sealed class TuiController
         }
         finally
         {
+            var changed = false;
             lock (this.gate)
             {
                 this.dispatchInFlight = false;
@@ -539,6 +671,13 @@ public sealed class TuiController
                 {
                     this.StartDispatchLocked(this.nextPrompts.Dequeue());
                 }
+
+                changed = true;
+            }
+
+            if (changed)
+            {
+                this.RaiseChanged();
             }
         }
     }
@@ -664,6 +803,187 @@ public sealed class TuiController
         if (ids.Length > 0)
         {
             this.publisher.Publish(new PendingSteeringRecalledEvent(ids));
+        }
+    }
+
+    private bool IsLocallyBusyLocked() =>
+        this.startupPending ||
+        this.dispatchInFlight ||
+        !this.sidebandChain.IsCompleted ||
+        this.nextPrompts.Count > 0 ||
+        this.shutdownDrainRequested ||
+        this.exitRequested ||
+        this.idleLeasePending ||
+        this.idleLeaseHeld ||
+        this.hostToken.IsCancellationRequested;
+
+    private void RollbackIdleLease()
+    {
+        var changed = false;
+        lock (this.gate)
+        {
+            if (!this.idleLeasePending)
+            {
+                return;
+            }
+
+            this.idleLeasePending = false;
+            this.StartQueuedDispatchIfSafeLocked();
+            changed = true;
+        }
+
+        if (changed)
+        {
+            this.RaiseChanged();
+        }
+    }
+
+    private void ReleaseIdleLease()
+    {
+        var changed = false;
+        lock (this.gate)
+        {
+            if (!this.idleLeaseHeld)
+            {
+                return;
+            }
+
+            this.idleLeaseHeld = false;
+            this.StartQueuedDispatchIfSafeLocked();
+            changed = true;
+        }
+
+        if (changed)
+        {
+            this.RaiseChanged();
+        }
+    }
+
+    private void StartQueuedDispatchIfSafeLocked()
+    {
+        if (!this.idleLeasePending &&
+            !this.idleLeaseHeld &&
+            !this.startupPending &&
+            !this.dispatchInFlight &&
+            !this.exitRequested &&
+            !this.shutdownDrainRequested &&
+            !this.hostToken.IsCancellationRequested &&
+            this.nextPrompts.Count > 0)
+        {
+            this.StartDispatchLocked(this.nextPrompts.Dequeue());
+        }
+    }
+
+    private void RaiseChanged() => this.Changed?.Invoke();
+
+    /// <summary>Unsubscribes from task-manager idle notifications for the controller lifetime.</summary>
+    public void Dispose()
+    {
+        this.UnsubscribeTaskManager();
+        this.taskManagerSubscriptionRegistration.Dispose();
+    }
+
+    private void UnsubscribeTaskManager()
+    {
+        TaskManager? manager;
+        Action? handler;
+        lock (this.gate)
+        {
+            if (this.disposed)
+            {
+                return;
+            }
+
+            this.disposed = true;
+            manager = this.subscribedTaskManager;
+            handler = this.taskManagerIdleStateChanged;
+            this.subscribedTaskManager = null;
+            this.taskManagerIdleStateChanged = null;
+        }
+
+        if (manager is not null && handler is not null)
+        {
+            manager.IdleStateChanged -= handler;
+        }
+    }
+
+    private bool IsTaskManagerBusy()
+    {
+        if (this.taskManagerProvider is null)
+        {
+            return false;
+        }
+
+        return this.GetTaskManager() is not { } manager || !manager.IsIdle;
+    }
+
+    private TaskManager? GetTaskManager()
+    {
+        var manager = this.taskManagerProvider?.Invoke();
+        this.UpdateTaskManagerSubscription(manager);
+        return manager;
+    }
+
+    private void UpdateTaskManagerSubscription(TaskManager? manager)
+    {
+        TaskManager? previous;
+        Action? previousHandler;
+        Action? newHandler;
+        lock (this.gate)
+        {
+            if (this.disposed || ReferenceEquals(this.subscribedTaskManager, manager))
+            {
+                return;
+            }
+
+            previous = this.subscribedTaskManager;
+            previousHandler = this.taskManagerIdleStateChanged;
+            newHandler = manager is null
+                ? null
+                : () => this.OnTaskManagerIdleStateChanged(manager);
+            this.subscribedTaskManager = manager;
+            this.taskManagerIdleStateChanged = newHandler;
+        }
+
+        if (previous is not null && previousHandler is not null)
+        {
+            previous.IdleStateChanged -= previousHandler;
+        }
+
+        if (manager is not null && newHandler is not null)
+        {
+            manager.IdleStateChanged += newHandler;
+        }
+    }
+
+    private void OnTaskManagerIdleStateChanged(TaskManager source)
+    {
+        lock (this.gate)
+        {
+            if (this.disposed || !ReferenceEquals(this.subscribedTaskManager, source))
+            {
+                return;
+            }
+        }
+
+        this.RaiseChanged();
+    }
+
+    private sealed class CompositeIdleLease(TuiController controller, IDisposable? taskLease) : IDisposable
+    {
+        private TuiController? controller = controller;
+        private IDisposable? taskLease = taskLease;
+
+        public void Dispose()
+        {
+            var owner = Interlocked.Exchange(ref this.controller, null);
+            if (owner is null)
+            {
+                return;
+            }
+
+            Interlocked.Exchange(ref this.taskLease, null)?.Dispose();
+            owner.ReleaseIdleLease();
         }
     }
 }
