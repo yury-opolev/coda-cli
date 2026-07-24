@@ -33,3 +33,6 @@ TestResults/
 
 # Local Git worktrees
 .worktrees/
+
+# BenchmarkDotNet output
+BenchmarkDotNet.Artifacts/

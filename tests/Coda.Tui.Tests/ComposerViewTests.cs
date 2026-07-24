@@ -56,6 +56,41 @@ public sealed class ComposerViewTests
     }
 
     [Fact]
+    public void Measure_layout_reuses_cached_layout_until_draft_or_width_changes()
+    {
+        var controller = CreateController();
+        using var view = CreateLaidOutView(controller, width: 40, height: 5);
+
+        var calls = 0;
+        var inner = view.LayoutFactory;
+        view.LayoutFactory = (text, width) =>
+        {
+            calls++;
+            return inner(text, width);
+        };
+
+        // First measurement computes; a second at the same draft and width reuses the same instance.
+        var first = view.MeasureLayout(40);
+        var second = view.MeasureLayout(40);
+        Assert.Same(first, second);
+        Assert.Equal(1, calls);
+
+        // A caret-only move keeps the same draft string instance, so the layout is still reused.
+        controller.MoveCursorTo(0);
+        Assert.Same(first, view.MeasureLayout(40));
+        Assert.Equal(1, calls);
+
+        // A width change recomputes.
+        view.MeasureLayout(20);
+        Assert.Equal(2, calls);
+
+        // A content change recomputes.
+        controller.ReplaceDraft("hello world", 11);
+        view.MeasureLayout(20);
+        Assert.Equal(3, calls);
+    }
+
+    [Fact]
     public void Single_visual_line_draft_desires_one_content_row()
     {
         var controller = CreateController();

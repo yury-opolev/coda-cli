@@ -32,6 +32,12 @@ internal sealed class ComposerView : TextView
     private IReadOnlyList<ISlashCommand> lastSuggestions = [];
     private int lastSelectedIndex = -1;
 
+    // Memoized visual layout for the last measured (draft, width). See MeasureLayout for why draft
+    // reference identity is an exact validity key.
+    private ComposerVisualLayout? cachedLayout;
+    private string? cachedLayoutDraft;
+    private int cachedLayoutWidth = -1;
+
     /// <summary>
     /// Number of times the whole <see cref="TextView.Text"/> was reassigned. Only programmatic draft
     /// replacement (initial sync, SetDraft, Restore, history/completion swaps) should bump this; native
@@ -234,9 +240,37 @@ internal sealed class ComposerView : TextView
     internal static int MaximumHeight(int screenHeight) =>
         Math.Max(3, Math.Min(8, (int)Math.Floor(Math.Max(0, screenHeight) * 0.35)));
 
-    /// <summary>Measures the current draft's visual layout at <paramref name="width"/> display cells.</summary>
-    internal ComposerVisualLayout MeasureLayout(int width) =>
-        this.LayoutFactory(this.controller.State.Draft, Math.Max(1, width));
+    /// <summary>
+    /// Measures the current draft's visual layout at <paramref name="width"/> display cells, reusing the
+    /// last result when neither the draft content nor the wrap width changed.
+    /// </summary>
+    /// <remarks>
+    /// A single keystroke used to wrap the whole draft several times over — once to build the key-context,
+    /// once for the shell's desired-height, and once more for the internal viewport — because each caller
+    /// recomputed the layout independently. The controller replaces the <see cref="ComposerState.Draft"/>
+    /// string instance on every content edit and keeps the same instance across caret-only and
+    /// completion-only changes, so reference identity is an exact, O(1) validity key: a content or width
+    /// change misses and recomputes, while a caret move or completion selection hits and reuses the prior
+    /// layout. That collapses the per-keystroke wrapping to a single pass. A failed measurement (the
+    /// factory throws) propagates before the cache is updated, so the previous valid layout is retained.
+    /// </remarks>
+    internal ComposerVisualLayout MeasureLayout(int width)
+    {
+        var draft = this.controller.State.Draft;
+        var effectiveWidth = Math.Max(1, width);
+        if (this.cachedLayout is { } cached
+            && this.cachedLayoutWidth == effectiveWidth
+            && ReferenceEquals(this.cachedLayoutDraft, draft))
+        {
+            return cached;
+        }
+
+        var layout = this.LayoutFactory(draft, effectiveWidth);
+        this.cachedLayout = layout;
+        this.cachedLayoutDraft = draft;
+        this.cachedLayoutWidth = effectiveWidth;
+        return layout;
+    }
 
     /// <summary>
     /// The composer's desired height for the given content width and screen height: the wrapped visual line
