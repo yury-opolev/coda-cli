@@ -26,7 +26,9 @@ internal static class TestAppBuilder
         ITokenStore? store = null,
         IUiPromptService? prompts = null,
         IUiEventPublisher? events = null,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        McpClientManager? mcp = null,
+        string? userMcpDir = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -54,10 +56,11 @@ internal static class TestAppBuilder
 
         var context = new CommandContext(console, credentials, session, providers, registry, prompts, events);
         context.CredentialStore = store;
+        context.Mcp = mcp;
         context.McpManagement = new McpManagementService(
             context.Session.WorkingDirectory,
-            userMcpDir: null,
-            context.Mcp,
+            userMcpDir,
+            mcp,
             store,
             new DefaultMcpOAuthReauthenticator(mcpHttp, store),
             context.Events);

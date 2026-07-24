@@ -3,6 +3,8 @@ using System.Text.Json;
 using Coda.Agent;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Tasks;
+using Coda.Mcp;
+using Coda.Tui.Commands;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui;
 using Coda.Tui.Ui.Events;
@@ -147,6 +149,56 @@ public sealed class TuiControllerTests
 
         Assert.False(gate.IsBusy);
         using var lease = Assert.IsAssignableFrom<IDisposable>(gate.TryAcquire());
+    }
+
+    [Fact]
+    public async Task Textual_mcp_mutation_rejects_managed_task_then_succeeds_after_completion()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject("""{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp"}}}""");
+        await harness.ConnectEffectiveAsync("server");
+        using var manager = new TaskManager(sessionId: "textual-mcp-idle-boundary", logRoot: null);
+        var (_, context, console, _) = TestAppBuilder.BuildApp(
+            store: harness.Store,
+            workingDirectory: harness.Project,
+            mcp: harness.Runtime,
+            userMcpDir: harness.User);
+        context.TaskManagerProvider = () => manager;
+        var command = new McpCommand();
+        using var controller = new TuiController(
+            dispatch: (text, ct) => command.ExecuteAsync(context, CommandParser.Parse(text).Args, ct),
+            tryInterrupt: () => false,
+            publisher: new RecordingUiEvents(),
+            initialSnapshot: UiSessionSnapshot.Empty,
+            taskManagerProvider: () => manager);
+        var host = new BlockingScheduledHost();
+        var taskId = manager.StartScheduledBackground(host, "prompt", "scheduled", _ => { });
+        await host.Started.Task.WaitAsync(TimeSpan.FromSeconds(1));
+
+        foreach (var mutation in new[]
+                 {
+                     "/mcp disable server",
+                     "/mcp start server",
+                     "/mcp stop server",
+                     "/mcp restart server",
+                 })
+        {
+            controller.OnSubmitted(mutation);
+            await controller.WaitForDispatchAsync();
+        }
+
+        Assert.False(McpConfig.Parse(File.ReadAllText(Path.Combine(harness.Project, ".mcp.json")))["server"].Disabled);
+        Assert.True(harness.Runtime.IsServerConnected("server"));
+        Assert.Contains("managed task", console.Output, StringComparison.OrdinalIgnoreCase);
+
+        host.Release.TrySetResult();
+        await manager.WaitForTerminalAsync(taskId).WaitAsync(TimeSpan.FromSeconds(1));
+
+        controller.OnSubmitted("/mcp disable server");
+        await controller.WaitForDispatchAsync();
+
+        Assert.True(McpConfig.Parse(File.ReadAllText(Path.Combine(harness.Project, ".mcp.json")))["server"].Disabled);
+        Assert.False(harness.Runtime.IsServerConnected("server"));
     }
 
     [Fact]

@@ -611,7 +611,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 "Stdio MCP servers use command and environment credentials. Use Edit to change them.");
         }
 
-        var managedFields = McpSecretStore.References(http)
+        var managedFields = OwnedSecretReferences(key.Name, http)
             .Select(static binding => binding.Field)
             .OrderBy(static field => field, StringComparer.Ordinal)
             .ToImmutableArray();
@@ -1236,11 +1236,17 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 original?.Config).ConfigureAwait(false);
             var runtimeReconcile = EmptyRuntimeReconcileResult();
             IReadOnlyDictionary<string, McpServerConfig>? after = null;
+            var finalDefinitionIsNewlyEffective = false;
             if (!isAdd)
             {
                 try
                 {
                     after = this.LoadEffectiveConfigsForMutation();
+                    finalDefinitionIsNewlyEffective = !original!.IsEffective
+                        && finalDraft.Enabled
+                        && this.LoadPhysicalEntriesForMutation(CancellationToken.None).Any(
+                            entry => entry.Key == new McpServerKey(finalDraft.Scope, finalDraft.Name)
+                                && entry.IsEffective);
                 }
                 catch when (cleanupWarning is not null)
                 {
@@ -1269,7 +1275,9 @@ internal sealed partial class McpManagementService : IMcpManagementService
                         : new HashSet<string>(StringComparer.Ordinal),
                     original.Config.Disabled && finalDraft.Enabled
                         ? CreateTouchedNames(original.Key.Name, finalDraft.Name)
-                        : new HashSet<string>(StringComparer.Ordinal),
+                        : finalDefinitionIsNewlyEffective
+                            ? CreateTouchedNames(original.Key.Name, finalDraft.Name)
+                            : new HashSet<string>(StringComparer.Ordinal),
                     ct).ConfigureAwait(false);
             }
 
@@ -1418,8 +1426,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             writeSucceeded = true;
             var cleanupWarning = await this.DeleteUnreferencedOldSecretsAsync(
                 preview.Key.Name,
-                entry.Config,
-                ownedOnly: true).ConfigureAwait(false);
+                entry.Config).ConfigureAwait(false);
             IReadOnlyDictionary<string, McpServerConfig>? after;
             IReadOnlyList<McpPhysicalServerEntry>? afterEntries;
             try
@@ -1613,20 +1620,16 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 var revalidationEntries = this.LoadPhysicalEntriesForMutation(ct);
                 var revalidated = revalidationEntries.FirstOrDefault(candidate => candidate.Key == plan.Key);
                 var after = this.LoadEffectiveConfigsForMutation();
-                var revalidationStable = revalidationRevision
-                    == CaptureRevision(this.workingDirectory, this.userMcpDir, ct);
-                if (!revalidationStable
+                if (revalidationRevision
+                    != CaptureRevision(this.workingDirectory, this.userMcpDir, ct)
                     || revalidated?.Config is not McpHttpServerConfig revalidatedHttp
-                    || !revalidated.IsEffective
-                    || revalidatedHttp.Disabled
                     || revalidatedHttp.Auth.Mode != McpAuthMode.OAuth
                     || plan.OAuthCanonicalResource is null
                     || !string.Equals(
                         plan.OAuthCanonicalResource,
                         CanonicalResourceUri.From(revalidatedHttp.Url),
                         StringComparison.Ordinal)
-                    || !after.TryGetValue(plan.Key.Name, out var effective)
-                    || !EffectiveConfigsEqual(revalidated.Config, effective))
+                    || !EffectiveConfigsEqual(entry.Config, revalidated.Config))
                 {
                     await lease.DisposeAsync().ConfigureAwait(false);
                     lease = null;
@@ -1638,7 +1641,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 lease = null;
                 return await this.ReconcileReauthenticatedServerAsync(
                     plan.Key,
-                    entry.IsEffective,
+                    revalidated.IsEffective && !revalidatedHttp.Disabled,
                     before,
                     ct,
                     after: after).ConfigureAwait(false);
@@ -1651,7 +1654,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                     "Provide a masked replacement value for every managed MCP credential.").ConfigureAwait(false);
             }
 
-            var currentFields = McpSecretStore.References(http)
+            var currentFields = OwnedSecretReferences(plan.Key.Name, http)
                 .Select(static binding => binding.Field)
                 .OrderBy(static field => field, StringComparer.Ordinal)
                 .ToImmutableArray();
@@ -1696,8 +1699,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             writeSucceeded = true;
             var cleanupWarning = await this.DeleteUnreferencedOldSecretsAsync(
                 plan.Key.Name,
-                http,
-                ownedOnly: false).ConfigureAwait(false);
+                http).ConfigureAwait(false);
 
             await lease.DisposeAsync().ConfigureAwait(false);
             lease = null;
@@ -2620,19 +2622,14 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
     private async Task<string?> DeleteUnreferencedOldSecretsAsync(
         string? originalServerName,
-        McpServerConfig? original,
-        bool ownedOnly = true)
+        McpServerConfig? original)
     {
         if (original is null || originalServerName is null)
         {
             return null;
         }
 
-        var oldKeys = McpSecretStore.References(original)
-            .Where(binding => !ownedOnly || McpSecretStore.IsOwnedKey(
-                originalServerName,
-                binding.Field,
-                binding.StoreKey))
+        var oldKeys = OwnedSecretReferences(originalServerName, original)
             .Select(binding => binding.StoreKey)
             .Distinct(StringComparer.Ordinal)
             .ToArray();
@@ -2694,6 +2691,12 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
         return incomplete;
     }
+
+    private static IEnumerable<McpSecretBinding> OwnedSecretReferences(
+        string serverName,
+        McpServerConfig config) =>
+        McpSecretStore.References(config).Where(binding =>
+            McpSecretStore.IsOwnedKey(serverName, binding.Field, binding.StoreKey));
 
     private async Task<McpMutationResult> CreateRejectedResultAsync(string message)
     {

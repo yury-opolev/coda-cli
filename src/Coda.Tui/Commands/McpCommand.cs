@@ -109,7 +109,7 @@ public sealed class McpCommand : ISlashCommand
                 await RenderLifecycleAsync(context, management, tail, "stop", ct).ConfigureAwait(false);
                 return;
             case "restart":
-                await RenderManagedMutationAsync(context, management.RestartAsync(tail.FirstOrDefault(), ct)).ConfigureAwait(false);
+                await RenderManagedMutationAsync(context, () => management.RestartAsync(tail.FirstOrDefault(), ct)).ConfigureAwait(false);
                 return;
             default:
                 context.Console.MarkupLine(Markup.Escape(
@@ -191,7 +191,7 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        await RenderManagedMutationAsync(context, management.CommitAddAsync(preview, ct)).ConfigureAwait(false);
+        await RenderManagedMutationAsync(context, () => management.CommitAddAsync(preview, ct)).ConfigureAwait(false);
     }
 
     private static async Task HandleEditAsync(
@@ -256,7 +256,7 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        await RenderManagedMutationAsync(context, management.CommitEditAsync(preview, ct)).ConfigureAwait(false);
+        await RenderManagedMutationAsync(context, () => management.CommitEditAsync(preview, ct)).ConfigureAwait(false);
     }
 
     private static async Task HandleRemoveAsync(
@@ -278,7 +278,7 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        await RenderManagedMutationAsync(context, management.CommitDeleteAsync(preview, ct)).ConfigureAwait(false);
+        await RenderManagedMutationAsync(context, () => management.CommitDeleteAsync(preview, ct)).ConfigureAwait(false);
     }
 
     private static async Task HandleToggleAsync(
@@ -297,7 +297,7 @@ public sealed class McpCommand : ISlashCommand
 
         await RenderManagedMutationAsync(
             context,
-            management.SetEnabledAsync(new McpServerKey(scope, tail[0]), enabled, ct)).ConfigureAwait(false);
+            () => management.SetEnabledAsync(new McpServerKey(scope, tail[0]), enabled, ct)).ConfigureAwait(false);
     }
 
     private static async Task HandleReauthAsync(
@@ -333,7 +333,7 @@ public sealed class McpCommand : ISlashCommand
             replacements[field] = new McpSecretReplacement(response.Text);
         }
 
-        await RenderManagedMutationAsync(context, management.ReauthenticateAsync(plan, replacements, ct)).ConfigureAwait(false);
+        await RenderManagedMutationAsync(context, () => management.ReauthenticateAsync(plan, replacements, ct)).ConfigureAwait(false);
     }
 
     private static async Task RenderLifecycleAsync(
@@ -349,9 +349,9 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        var operation = verb == "start"
-            ? management.StartAsync(tail[0], ct)
-            : management.StopAsync(tail[0], ct);
+        Func<Task<McpMutationResult>> operation = verb == "start"
+            ? () => management.StartAsync(tail[0], ct)
+            : () => management.StopAsync(tail[0], ct);
         await RenderManagedMutationAsync(context, operation).ConfigureAwait(false);
     }
 
@@ -371,11 +371,21 @@ public sealed class McpCommand : ISlashCommand
         return true;
     }
 
-    private static async Task RenderManagedMutationAsync(CommandContext context, Task<McpMutationResult> operation)
+    private static async Task RenderManagedMutationAsync(
+        CommandContext context,
+        Func<Task<McpMutationResult>> operation)
     {
+        var taskManager = context.TaskManagerProvider?.Invoke();
+        using var idleLease = taskManager?.TryAcquireIdleLease();
+        if (taskManager is not null && idleLease is null)
+        {
+            context.Console.MarkupLine("MCP changes are unavailable while managed tasks are running. Wait for them to finish and try again.");
+            return;
+        }
+
         try
         {
-            var result = await operation.ConfigureAwait(false);
+            var result = await operation().ConfigureAwait(false);
             context.Console.MarkupLine(Markup.Escape(result.Message));
         }
         catch (McpException exception)

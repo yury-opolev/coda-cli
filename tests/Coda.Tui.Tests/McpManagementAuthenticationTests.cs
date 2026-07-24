@@ -87,6 +87,51 @@ public sealed class McpManagementAuthenticationTests
         Assert.True(harness.Runtime.IsServerConnected("server"));
     }
 
+    [Theory]
+    [InlineData(
+        """{"type":"http","url":"https://x.test/mcp","headers":{"Owned":"coda-secret:mcp:server/header/Owned","Foreign":"coda-secret:llmauth:provider"}}""",
+        "header/Owned",
+        "header/Foreign")]
+    [InlineData(
+        """{"type":"http","url":"https://x.test/mcp","headers":{"Owned":"coda-secret:mcp:server/header/Owned"},"auth":{"mode":"bearer","token":"coda-secret:llmauth:provider"}}""",
+        "header/Owned",
+        "auth/token")]
+    public async Task Managed_reauthentication_replaces_owned_field_without_claiming_or_deleting_foreign_reference(
+        string serverJson,
+        string ownedField,
+        string foreignField)
+    {
+        const string ownedKey = "mcp:server/header/Owned";
+        const string foreignKey = "llmauth:provider";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        await harness.Store.SetAsync(ownedKey, "old-owned");
+        await harness.Store.SetAsync(foreignKey, "foreign-value");
+        harness.WriteProject("""{"mcpServers":{"server":""" + serverJson + "}}");
+        var plan = await harness.Service.PrepareReauthenticationAsync(
+            new McpServerKey(McpConfigScope.Project, "server"),
+            CancellationToken.None);
+
+        Assert.Equal(McpReauthenticationKind.StoredSecret, plan.Kind);
+        Assert.Collection(plan.ManagedFields, field => Assert.Equal(ownedField, field));
+        var result = await harness.Service.ReauthenticateAsync(
+            plan,
+            new Dictionary<string, McpSecretReplacement>(StringComparer.Ordinal)
+            {
+                [ownedField] = new("new-owned"),
+            },
+            CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            McpConfig.LoadPhysicalEntries(harness.Project, harness.User).Single().Config);
+        var foreignReference = foreignField.StartsWith("header/", StringComparison.Ordinal)
+            ? config.Headers[foreignField["header/".Length..]]
+            : config.Auth.BearerToken;
+        Assert.Equal("coda-secret:" + foreignKey, foreignReference);
+        Assert.Equal("foreign-value", harness.Store.ValueFor(foreignKey));
+        Assert.DoesNotContain(foreignKey, harness.Store.DeletedKeys);
+    }
+
     [Fact]
     public async Task Environment_owned_reauthentication_rejects_without_writes()
     {
@@ -128,6 +173,61 @@ public sealed class McpManagementAuthenticationTests
         Assert.Equal(McpMutationStatus.Succeeded, result.Status);
         Assert.Equal(1, harness.OAuth.Calls);
         Assert.True(harness.Runtime.IsServerConnected("server"));
+    }
+
+    [Fact]
+    public async Task OAuth_reauthentication_of_disabled_project_row_succeeds_without_reconnecting()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://x.test/mcp","disabled":true,"auth":{"mode":"oauth"}}}}""");
+        var plan = await harness.Service.PrepareReauthenticationAsync(
+            new McpServerKey(McpConfigScope.Project, "server"),
+            CancellationToken.None);
+        var connectsBefore = harness.RuntimeFactory.ConnectCalls;
+
+        var result = await harness.Service.ReauthenticateAsync(
+            plan,
+            new Dictionary<string, McpSecretReplacement>(),
+            CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.Equal(1, harness.OAuth.Calls);
+        Assert.Equal(connectsBefore, harness.RuntimeFactory.ConnectCalls);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            McpConfig.LoadPhysicalEntries(harness.Project, harness.User).Single().Config);
+        Assert.True(config.Disabled);
+    }
+
+    [Fact]
+    public async Task OAuth_reauthentication_of_overridden_user_row_succeeds_without_reconnecting()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteUser(
+            """{"mcpServers":{"server":{"type":"http","url":"https://user.test/mcp","auth":{"mode":"oauth"}}}}""");
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://project.test/mcp"}}}""");
+        var plan = await harness.Service.PrepareReauthenticationAsync(
+            new McpServerKey(McpConfigScope.User, "server"),
+            CancellationToken.None);
+        var connectsBefore = harness.RuntimeFactory.ConnectCalls;
+
+        var result = await harness.Service.ReauthenticateAsync(
+            plan,
+            new Dictionary<string, McpSecretReplacement>(),
+            CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.Equal(1, harness.OAuth.Calls);
+        Assert.Equal(connectsBefore, harness.RuntimeFactory.ConnectCalls);
+        var config = Assert.IsType<McpHttpServerConfig>(
+            McpConfig.LoadPhysicalEntries(harness.Project, harness.User)
+                .Single(entry => entry.Key == new McpServerKey(McpConfigScope.User, "server"))
+                .Config);
+        Assert.False(config.Disabled);
+        Assert.False(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)
+            .Single(entry => entry.Key == new McpServerKey(McpConfigScope.User, "server"))
+            .IsEffective);
     }
 
     [Fact]

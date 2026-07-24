@@ -52,6 +52,37 @@ public sealed class McpManagementRuntimeTests
     }
 
     [Fact]
+    public async Task Renaming_an_enabled_overridden_row_starts_its_newly_effective_definition()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteUser(
+            """{"mcpServers":{"shared":{"type":"http","url":"https://user.test/mcp"}}}""");
+        harness.WriteProject(
+            """{"mcpServers":{"shared":{"type":"http","url":"https://project.test/mcp"}}}""");
+        await harness.ConnectEffectiveAsync("shared");
+        var connectsBefore = harness.RuntimeFactory.ConnectCalls;
+        var key = new McpServerKey(McpConfigScope.User, "shared");
+        var draft = (await harness.Service.CreateEditDraftAsync(key, CancellationToken.None))!
+            with { Name = "unique" };
+        var preview = await harness.Service.PrepareEditAsync(key, draft, CancellationToken.None);
+
+        var result = await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.Equal(connectsBefore + 1, harness.RuntimeFactory.ConnectCalls);
+        Assert.True(harness.Runtime.IsServerConnected("shared"));
+        Assert.True(harness.Runtime.IsServerConnected("unique"));
+        Assert.Equal(
+            McpConnectionState.Connected,
+            result.Snapshot.Servers.Single(
+                server => server.Key == new McpServerKey(McpConfigScope.Project, "shared")).Connection);
+        Assert.Equal(
+            McpConnectionState.Connected,
+            result.Snapshot.Servers.Single(
+                server => server.Key == new McpServerKey(McpConfigScope.User, "unique")).Connection);
+    }
+
+    [Fact]
     public async Task Enabling_an_effective_server_starts_it_immediately_and_publishes_runtime_change()
     {
         await using var harness = await McpManagementTestHarness.CreateAsync();
