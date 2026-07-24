@@ -41,6 +41,14 @@ internal sealed class VirtualizedTranscriptView : View
     private bool scrollbarVisible;
     private TranscriptCellPosition pressPosition;
 
+    // Role -> resolved attribute memo. DrawRow resolves an attribute for every visible row on every
+    // frame, but the mapping depends only on the (immutable) theme and the driver's true-color support,
+    // so it is computed once per role and reused until the true-color capability changes.
+    private readonly Dictionary<TranscriptRole, TgAttribute> roleAttributeCache = new();
+    private readonly Dictionary<TranscriptRole, TgAttribute> annotationAttributeCache = new();
+    private bool attributeCacheTrueColor;
+    private bool attributeCacheInitialized;
+
     public VirtualizedTranscriptView(
         IApplication app,
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null,
@@ -48,7 +56,9 @@ internal sealed class VirtualizedTranscriptView : View
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.theme = theme ?? TuiTheme.WarmEmber;
-        this.index = new TranscriptLayoutIndex(formatter ?? TranscriptBlockFormatter.Format);
+        this.index = new TranscriptLayoutIndex(
+            formatter ?? TranscriptBlockFormatter.Format,
+            enableIncrementalAssistant: formatter is null);
         this.CanFocus = true;
         this.MousePositionTracking = true;
     }
@@ -769,6 +779,27 @@ internal sealed class VirtualizedTranscriptView : View
 
     internal TgAttribute AttributeFor(TranscriptRole role, bool? trueColor = null)
     {
+        // Tests pass an explicit true-color flag to assert both palettes; that path bypasses the cache so
+        // it never pollutes or reads the driver-derived production memo.
+        if (trueColor is { } forced)
+        {
+            return this.ComputeAttributeFor(role, forced);
+        }
+
+        var useTrueColor = TuiTheme.SupportsTrueColor(this.app.Driver);
+        this.EnsureAttributeCacheFresh(useTrueColor);
+        if (this.roleAttributeCache.TryGetValue(role, out var cached))
+        {
+            return cached;
+        }
+
+        var attribute = this.ComputeAttributeFor(role, useTrueColor);
+        this.roleAttributeCache[role] = attribute;
+        return attribute;
+    }
+
+    private TgAttribute ComputeAttributeFor(TranscriptRole role, bool useTrueColor)
+    {
         var foreground = role switch
         {
             TranscriptRole.User => this.theme.TranscriptUser,
@@ -793,7 +824,6 @@ internal sealed class VirtualizedTranscriptView : View
         // User message rows sit on a subtly different full-width background block; every other role keeps the
         // global shell background so non-user rows are unchanged.
         var background = role == TranscriptRole.User ? this.theme.TranscriptUserBackground : this.theme.Background;
-        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
         return new TgAttribute(
             TuiTheme.Resolve(foreground, useTrueColor),
             TuiTheme.Resolve(background, useTrueColor));
@@ -803,10 +833,43 @@ internal sealed class VirtualizedTranscriptView : View
     /// drawn over the same background as the row so it blends into the block.</summary>
     private TgAttribute AnnotationAttributeFor(TranscriptRole role, bool? trueColor = null)
     {
+        if (trueColor is { } forced)
+        {
+            return this.ComputeAnnotationAttributeFor(role, forced);
+        }
+
+        var useTrueColor = TuiTheme.SupportsTrueColor(this.app.Driver);
+        this.EnsureAttributeCacheFresh(useTrueColor);
+        if (this.annotationAttributeCache.TryGetValue(role, out var cached))
+        {
+            return cached;
+        }
+
+        var attribute = this.ComputeAnnotationAttributeFor(role, useTrueColor);
+        this.annotationAttributeCache[role] = attribute;
+        return attribute;
+    }
+
+    private TgAttribute ComputeAnnotationAttributeFor(TranscriptRole role, bool useTrueColor)
+    {
         var background = role == TranscriptRole.User ? this.theme.TranscriptUserBackground : this.theme.Background;
-        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
         return new TgAttribute(
             TuiTheme.Resolve(this.theme.TranscriptUserTime, useTrueColor),
             TuiTheme.Resolve(background, useTrueColor));
+    }
+
+    /// <summary>Drops the memoized attributes when the driver's true-color capability changes (or on first
+    /// use), so a driver swap can never serve a stale palette.</summary>
+    private void EnsureAttributeCacheFresh(bool useTrueColor)
+    {
+        if (this.attributeCacheInitialized && this.attributeCacheTrueColor == useTrueColor)
+        {
+            return;
+        }
+
+        this.roleAttributeCache.Clear();
+        this.annotationAttributeCache.Clear();
+        this.attributeCacheTrueColor = useTrueColor;
+        this.attributeCacheInitialized = true;
     }
 }

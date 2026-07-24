@@ -1,7 +1,6 @@
 using BenchmarkDotNet.Attributes;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
-
 namespace Coda.Tui.Benchmarks;
 
 /// <summary>
@@ -46,5 +45,20 @@ public class StreamingBenchmarks
     {
         var block = new AssistantTranscriptBlock(Guid.NewGuid(), this.fullBody, Complete: true);
         return TranscriptBlockFormatter.Format(block, Width).Count;
+    }
+
+    [Benchmark(Description = "Incremental: reuse completed blocks every frame (O(L))")]
+    public int StreamIncremental()
+    {
+        var formatter = new IncrementalMarkdownFormatter();
+        var id = Guid.NewGuid();
+        var lines = 0;
+        for (var length = DeltaChars; length <= this.fullBody.Length; length += DeltaChars)
+        {
+            var text = this.fullBody[..Math.Min(length, this.fullBody.Length)];
+            lines = formatter.Update(id, text, Width).Count;
+        }
+
+        return lines;
     }
 }
