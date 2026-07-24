@@ -1,18 +1,23 @@
 # `coda serve` — Orchestrator Protocol
 
-`coda serve` runs Coda as a **JSON-RPC 2.0 agent server over stdio**, so an external
-orchestrator can drive it as a coding subagent: send prompts, stream back results, answer
-permission/question/plan-approval requests, interrupt turns, and read history.
+`coda serve` runs Coda as a **JSON-RPC 2.0 agent server** over either stdio or an
+API-key-authenticated local named pipe/Unix socket, so an external orchestrator can drive it as a
+coding subagent: send prompts, stream back results, answer permission/question/plan-approval
+requests, interrupt turns, and read history.
 
 ```
-orchestrator ──spawn──► coda serve
-        │  stdin  : requests + replies to server-requests
-        └─ stdout : event notifications + server-initiated requests
+orchestrator ──spawn/connect──► coda serve
+        │  stdio or local pipe/Unix socket: bidirectional JSON-RPC
+        └─ stdout (stdio/readiness): protocol bytes or endpoint discovery
 ```
 
-- **Transport:** newline/Content-Length-framed JSON-RPC 2.0 over the child process's stdin/stdout
-  (same framing as LSP). **stdout carries only protocol bytes**; human/debug logs go to stderr.
-- **Trust:** local-spawn only (no auth). Networked transports are a future additive layer.
+- **Transport:** Content-Length-framed JSON-RPC 2.0 (same framing as LSP). Stdio uses the spawned
+  process's stdin/stdout; API-key mode uses a local named pipe on Windows or Unix domain socket on
+  other OSes. Stdio carries protocol bytes only; socket mode prints one readiness line to stdout,
+  then carries protocol bytes on the connected endpoint. Human/debug logs go to stderr.
+- **Authentication:** stdio is process-local and does not require an API key. Local pipe/socket mode
+  requires the API key supplied by `--api-key` or `CODA_SERVE_API_KEY`; no unauthenticated socket
+  is served. Networked transports are a future additive layer.
 - **Versioning:** normally call `initialize` first; current `protocolVersion` is `"1"`. A first
   `session/prompt` can initialize when `initialize` is omitted.
 
@@ -27,11 +32,18 @@ orchestrator ──spawn──► coda serve
    budget (e.g. `30m`, `2h`, `1d`); `--goal-max-continuations <n>` overrides the turn budget;
    `--session-memory` enables the background session-memory watcher; `--max-continuations <n>`
    bounds stop-hook continuations per run (default 10).
-2. Normally send `initialize` → get `{ protocolVersion, sessionId, serverInfo }`.
+2. Normally send `initialize` → get `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }`.
 3. Send `session/prompt` to run a turn. While it runs you receive `event/*` notifications and may
    receive server-initiated `request/*` you must answer. The `session/prompt` response resolves
    when the turn completes (or is interrupted).
 4. Repeat. `session/interrupt` cancels the in-flight turn. `shutdown` (or closing stdin) stops the server.
+
+Startup ordering is deterministic: Coda starts the selected transport first and emits the local
+pipe/socket readiness line after bind. It then connects configured MCP servers sequentially and
+accepts the JSON-RPC connection only after MCP setup completes. On the `initialize` request, serve
+authenticates when required, loads or resumes the requested transcript and metadata, and then starts
+session initialization; the initialize result waits for that readiness before later prompts run.
+MCP connection and provider warnings are written to `stderr`, while protocol stdout remains clean.
 
 ### Exact startup system prompt
 
@@ -45,8 +57,7 @@ and `coda serve`; `coda run` has no system-prompt option.
 The supplied text is the exact complete root prompt, including explicit empty and whitespace-only
 values: Coda's built-in prompt, project/`CLAUDE.md` context, output style, and provider prefix are
 not added. Anthropic must omit an empty optional `system` block, while OpenAI serializes empty
-values; that transport difference does not reinstate defaults. Claude.ai OAuth may warn
-non-blockingly about compatibility, without mutating the prompt.
+values; that transport difference does not reinstate defaults.
 
 The root override applies to scheduled root work and `/context`; subagents keep their role prompts.
 For resumes, startup override wins over transcript metadata, which wins over the ordinary generated
@@ -73,18 +84,20 @@ interactive TUI and `coda run`, exposing each server's tools to the session as
 - **Auth is non-interactive.** stdio servers launch normally; HTTP servers with a valid stored
   token are reused; an HTTP server needing a fresh OAuth sign-in is **skipped and logged to
   stderr** — serve never opens a browser and never blocks the handshake. Pre-authorize such
-  servers once via the TUI or `coda run`.
+  servers once via the interactive TUI.
 - **stdout stays pure.** All MCP connect/skip diagnostics go to **stderr**; no MCP output is ever
   written to stdout (the JSON-RPC protocol channel).
-- **Startup timing.** Servers connect sequentially before the JSON-RPC connection is accepted, each
-  with a 20s connect cap. Many slow/hanging servers can therefore delay the handshake (bounded by
-  server count × 20s, and by shutdown/cancellation). Keep the curated set small, or use `--no-mcp`
-  when a session needs no external tools.
+- **Startup timing.** Servers connect sequentially before the JSON-RPC connection is accepted. Each
+  connection uses `CODA_MCP_CONNECT_TIMEOUT` in seconds (default **60**; missing, blank, or invalid
+  values use the default; zero or negative disables the timeout). Many slow/hanging servers can
+  therefore delay the handshake (bounded by server count × the configured timeout, and by
+  shutdown/cancellation). Keep the curated set small, or use `--no-mcp` when a session needs no
+  external tools.
 
 ## Orchestrator → Coda (requests)
 | Method | Params | Result |
 |---|---|---|
-| `initialize` | `{ protocolVersion, clientInfo?, apiKey?, sessionId? }` | `{ protocolVersion, sessionId, serverInfo }` |
+| `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }` |
 | `session/prompt` | `{ text?, images?: [{ mediaType, base64 }] }` | `{ ok, stopReason?, interrupted, goalStatus? }` |
 | `session/interrupt` | `{}` | `{ ok }` |
 | `session/history` | `{}` | `{ messages: [{ role, content }] }` |
@@ -150,7 +163,8 @@ a `goalStatus` object:
 - `escalated`: true when the budget was exhausted and an escalation question was sent.
 - `extensionUsed`: true when the one bounded extension was granted.
 
-**Resume:** pass `sessionId` to `initialize` to resume a prior conversation. If a transcript
+**Resume:** pass `sessionId` to `initialize` to resume a prior conversation. On that request, serve
+loads the transcript and persisted metadata before session initialization. If a transcript
 exists at `<cwd>/.coda/sessions/<sessionId>.json`, its history is loaded and the session adopts
 that id (subsequent turns persist back to the same file). If no transcript exists for that id,
 `initialize` fails with `-32002` "session not found" rather than silently starting fresh — omit

@@ -63,6 +63,38 @@ public sealed class ImmediateCliTests
     }
 
     [Fact]
+    public void Help_documents_the_integrated_startup_display_transcript_and_mcp_contract()
+    {
+        var (_, output) = Run("--help");
+
+        Assert.Contains($"Usage: {Branding.CliName} [options] [--system-prompt <text> | --system-prompt-file <path>]", output);
+        Assert.Contains($"       {Branding.CliName} serve [serve options] [--system-prompt <text> | --system-prompt-file <path>]", output);
+        Assert.Contains("mutually exclusive", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("strict UTF-8", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("startup override > transcript metadata > generated prompt", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("verbose | compact | summary | tiny", output);
+        Assert.Contains("default: summary", output);
+        Assert.Contains("one cumulative root activity block per root turn", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("spanning all model/root/subagent batches", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("groups each root batch", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("plain output is final-only", output);
+        Assert.Contains("Following", output); // the public modes are documented below the help contract
+        Assert.Contains("exact bare /mcp", output);
+        Assert.Contains("list shows name, scope, transport, enabled/disabled state, connection state", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("source path appears in detail", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("add/edit save directly", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("toggle does not confirm", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("delete and reauthenticate prompt with default No", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("newly added servers persist enabled", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("do not connect until an explicit", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("effective/overridden", output);
+        Assert.Contains("Ctrl+N/Ctrl+R", output);
+        Assert.Contains("stdio or an API-key-authenticated", output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("local named pipe/Unix socket", output, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("default: tiny", output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public void Help_says_auto_defaults_to_fullscreen_and_inline_is_optional()
     {
         var (_, output) = Run("--help");
