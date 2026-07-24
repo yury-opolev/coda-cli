@@ -12,7 +12,7 @@ internal static class ToolActivityPreview
     public static string Create(string? toolName, string? inputJson)
     {
         var safeToolName = TruncateToCells(
-            TerminalTextSanitizer.SanitizeSingleLine(SecretRedactor.Redact(toolName)),
+            TerminalTextSanitizer.SanitizeSingleLine(toolName),
             ToolDisplayModeResolver.CompactInputPreviewMax);
         if (safeToolName.Length == 0)
         {
@@ -25,7 +25,7 @@ internal static class ToolActivityPreview
         var objectRoot = root as JsonObject;
         var argumentPreview = root is null
             ? "[invalid arguments]"
-            : ToolDisplayModeText.ArgumentPreview(root.ToJsonString());
+            : ToolDisplayModeText.ArgumentPreview(SanitizeFreeText(root.ToJsonString()));
 
         var preview = safeToolName switch
         {
@@ -115,7 +115,7 @@ internal static class ToolActivityPreview
             var value = root?[name]?.GetValue<string>();
             return string.IsNullOrWhiteSpace(value)
                 ? fallback
-                : TruncateToCells(value, ToolDisplayModeResolver.CompactInputPreviewMax);
+                : TruncateToCells(SanitizeFreeText(value), ToolDisplayModeResolver.CompactInputPreviewMax);
         }
         catch (InvalidOperationException)
         {
@@ -154,4 +154,7 @@ internal static class ToolActivityPreview
     private static bool IsAdditionalSecretKey(string key) =>
         SecretRedactor.IsSecretHeader(key) ||
         key.Equals("token", StringComparison.OrdinalIgnoreCase);
+
+    private static string SanitizeFreeText(string? value) =>
+        SecretRedactor.Redact(TerminalTextSanitizer.SanitizeSingleLine(SecretRedactor.Redact(value)));
 }

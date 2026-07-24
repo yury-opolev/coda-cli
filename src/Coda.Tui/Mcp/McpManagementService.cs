@@ -310,7 +310,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             return await this.CreateLifecycleResultAsync(
                 McpMutationStatus.NoOp,
                 new McpServerKey(McpConfigScope.Project, name),
-                $"'{SanitizeVisibleText(name)}' is already running.").ConfigureAwait(false);
+                $"'{SanitizeIdentifier(name)}' is already running.").ConfigureAwait(false);
         }
 
         var entries = this.LoadPhysicalEntries(ct);
@@ -319,7 +319,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         if (entry is null)
         {
             return await this.CreateRejectedResultAsync(
-                $"'{SanitizeVisibleText(name)}' is not configured.").ConfigureAwait(false);
+                $"'{SanitizeIdentifier(name)}' is not configured.").ConfigureAwait(false);
         }
 
         try
@@ -330,8 +330,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 result.Connected ? McpMutationStatus.Succeeded : McpMutationStatus.SavedWithRuntimeError,
                 entry.Key,
                 result.Connected
-                    ? $"Started '{SanitizeVisibleText(name)}'."
-                    : $"Failed to start '{SanitizeVisibleText(name)}': {SanitizeError(result.Error)}").ConfigureAwait(false);
+                    ? $"Started '{SanitizeIdentifier(name)}'."
+                    : $"Failed to start '{SanitizeIdentifier(name)}': {SanitizeError(result.Error)}").ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -342,7 +342,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             return await this.CreateLifecycleResultAsync(
                 McpMutationStatus.SavedWithRuntimeError,
                 entry.Key,
-                $"Failed to start '{SanitizeVisibleText(name)}': {SanitizeError(exception.Message)}").ConfigureAwait(false);
+                $"Failed to start '{SanitizeIdentifier(name)}': {SanitizeError(exception.Message)}").ConfigureAwait(false);
         }
     }
 
@@ -360,8 +360,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
             stopped ? McpMutationStatus.Succeeded : McpMutationStatus.NoOp,
             new McpServerKey(McpConfigScope.Project, name),
             stopped
-                ? $"Stopped '{SanitizeVisibleText(name)}'."
-                : $"'{SanitizeVisibleText(name)}' is not running.").ConfigureAwait(false);
+                ? $"Stopped '{SanitizeIdentifier(name)}'."
+                : $"'{SanitizeIdentifier(name)}' is not running.").ConfigureAwait(false);
     }
 
     private async Task<McpMutationResult> RestartCoreAsync(string? name, CancellationToken ct)
@@ -380,7 +380,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             if (entry is null)
             {
                 return await this.CreateRejectedResultAsync(
-                    $"'{SanitizeVisibleText(name)}' is not configured.").ConfigureAwait(false);
+                    $"'{SanitizeIdentifier(name)}' is not configured.").ConfigureAwait(false);
             }
 
             try
@@ -392,8 +392,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                     result.Connected ? McpMutationStatus.Succeeded : McpMutationStatus.SavedWithRuntimeError,
                     entry.Key,
                     result.Connected
-                        ? $"Restarted '{SanitizeVisibleText(name)}'."
-                        : $"Failed to restart '{SanitizeVisibleText(name)}': {SanitizeError(result.Error)}").ConfigureAwait(false);
+                        ? $"Restarted '{SanitizeIdentifier(name)}'."
+                        : $"Failed to restart '{SanitizeIdentifier(name)}': {SanitizeError(result.Error)}").ConfigureAwait(false);
             }
             catch (OperationCanceledException)
             {
@@ -404,7 +404,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 return await this.CreateLifecycleResultAsync(
                     McpMutationStatus.SavedWithRuntimeError,
                     entry.Key,
-                    $"Failed to restart '{SanitizeVisibleText(name)}': {SanitizeError(exception.Message)}").ConfigureAwait(false);
+                    $"Failed to restart '{SanitizeIdentifier(name)}': {SanitizeError(exception.Message)}").ConfigureAwait(false);
             }
         }
 
@@ -426,7 +426,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             }
             catch (Exception exception)
             {
-                errors.Add($"{SanitizeVisibleText(serverName)}: {SanitizeError(exception.Message)}");
+                errors.Add($"{SanitizeIdentifier(serverName)}: {SanitizeError(exception.Message)}");
             }
         }
 
@@ -444,7 +444,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                     var result = await this.runtime.ConnectServerAsync(serverName, config, ct).ConfigureAwait(false);
                     if (!result.Connected)
                     {
-                        errors.Add($"{SanitizeVisibleText(serverName)}: {SanitizeError(result.Error)}");
+                        errors.Add($"{SanitizeIdentifier(serverName)}: {SanitizeError(result.Error)}");
                     }
                 }
                 catch (OperationCanceledException)
@@ -453,7 +453,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 }
                 catch (Exception exception)
                 {
-                    errors.Add($"{SanitizeVisibleText(serverName)}: {SanitizeError(exception.Message)}");
+                    errors.Add($"{SanitizeIdentifier(serverName)}: {SanitizeError(exception.Message)}");
                 }
             }
         }
@@ -580,8 +580,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 candidate.Key == new McpServerKey(McpConfigScope.User, key.Name));
         var scope = key.Scope == McpConfigScope.Project ? "project" : "user";
         var confirmation = revealsLowerScope
-            ? $"Delete {scope}-scope MCP server '{SanitizeVisibleText(key.Name)}'? The user-scope server with the same name will be revealed."
-            : $"Delete {scope}-scope MCP server '{SanitizeVisibleText(key.Name)}'?";
+            ? $"Delete {scope}-scope MCP server '{SanitizeIdentifier(key.Name)}'? The user-scope server with the same name will be revealed."
+            : $"Delete {scope}-scope MCP server '{SanitizeIdentifier(key.Name)}'?";
         return new McpDeletePreview(
             Guid.NewGuid(),
             entry.Key,
@@ -597,7 +597,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         var prepared = this.LoadStablePreparationEntries(ct);
         var entry = prepared.Entries.FirstOrDefault(candidate => candidate.Key == key)
             ?? throw new McpException("The selected MCP server no longer exists in the selected scope.");
-        var safeName = SanitizeVisibleText(key.Name);
+        var safeName = SanitizeIdentifier(key.Name);
 
         if (entry.Config is not McpHttpServerConfig http)
         {
@@ -1083,7 +1083,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             && entries.Any(entry => entry.Key.Scope == oppositeScope
             && string.Equals(entry.Key.Name, draft.Name, StringComparison.Ordinal)))
         {
-            var safeName = SanitizeVisibleText(draft.Name);
+            var safeName = SanitizeIdentifier(draft.Name);
             warnings.Add(draft.Scope == McpConfigScope.Project
                 ? $"The project MCP server '{safeName}' will override the user-scope server with the same name."
                 : $"The user-scope MCP server '{safeName}' will be overridden by the project-scope server with the same name.");
@@ -1095,7 +1095,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 && string.Equals(entry.Key.Name, oldKey.Name, StringComparison.Ordinal)))
         {
             warnings.Add(
-                $"Renaming '{SanitizeVisibleText(oldKey.Name)}' will reveal the user-scope server with that name.");
+                $"Renaming '{SanitizeIdentifier(oldKey.Name)}' will reveal the user-scope server with that name.");
         }
 
         return warnings.ToImmutable();
@@ -3032,7 +3032,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
         return new McpServerSummary(
             entry.Key,
-            SanitizeVisibleText(entry.SourceFile),
+            SanitizeIdentifier(entry.SourceFile),
             !entry.Config.Disabled,
             entry.IsEffective,
             TransportFor(entry.Config),
@@ -3047,8 +3047,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
         {
             McpStdioServerConfig stdio => new McpServerDetail(
                 summary,
-                SanitizeVisibleText(stdio.Command),
-                stdio.Args.Select(SanitizeVisibleText).ToImmutableArray(),
+                SanitizeCredentialBearingText(stdio.Command),
+                stdio.Args.Select(SanitizeCredentialBearingText).ToImmutableArray(),
                 null,
                 CreateSecretDescriptors(stdio.Env, "env"),
                 ImmutableArray<McpSecretDescriptor>.Empty,
@@ -3067,8 +3067,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 ImmutableArray<McpSecretDescriptor>.Empty,
                 CreateSecretDescriptors(http.Headers, "header"),
                 http.Auth.Mode,
-                SanitizeOptionalVisibleText(http.Auth.ClientId),
-                (http.Auth.Scopes ?? []).Select(SanitizeVisibleText).ToImmutableArray(),
+                SanitizeOptionalIdentifier(http.Auth.ClientId),
+                (http.Auth.Scopes ?? []).Select(SanitizeScopeLabel).ToImmutableArray(),
                 CreateBearerDescriptor(http.Auth.BearerToken),
                 ImmutableArray<McpCapabilitySummary>.Empty,
                 ImmutableArray<McpCapabilitySummary>.Empty,
@@ -3086,12 +3086,12 @@ internal sealed partial class McpManagementService : IMcpManagementService
         return entry.Config switch
         {
             McpStdioServerConfig stdio => new McpServerDraft(
-                entry.Key.Name,
+                SanitizeIdentifier(entry.Key.Name),
                 entry.Key.Scope,
                 !stdio.Disabled,
                 McpTransportKind.Stdio,
-                SanitizeVisibleText(stdio.Command),
-                stdio.Args.Select(SanitizeVisibleText).ToImmutableArray(),
+                SanitizeCredentialBearingText(stdio.Command),
+                stdio.Args.Select(SanitizeCredentialBearingText).ToImmutableArray(),
                 null,
                 CreateSecretDrafts(stdio.Env, "env"),
                 ImmutableArray<McpNamedSecretDraft>.Empty,
@@ -3107,7 +3107,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 UrlChanged = false,
             },
             McpHttpServerConfig http => new McpServerDraft(
-                entry.Key.Name,
+                SanitizeIdentifier(entry.Key.Name),
                 entry.Key.Scope,
                 !http.Disabled,
                 McpTransportKind.Http,
@@ -3117,8 +3117,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 ImmutableArray<McpNamedSecretDraft>.Empty,
                 CreateSecretDrafts(http.Headers, "header"),
                 http.Auth.Mode,
-                SanitizeOptionalVisibleText(http.Auth.ClientId),
-                (http.Auth.Scopes ?? []).Select(SanitizeVisibleText).ToImmutableArray(),
+                SanitizeOptionalIdentifier(http.Auth.ClientId),
+                (http.Auth.Scopes ?? []).Select(SanitizeScopeLabel).ToImmutableArray(),
                 UnchangedBearerToken(),
                 baseRevision)
             {
@@ -3146,7 +3146,12 @@ internal sealed partial class McpManagementService : IMcpManagementService
         {
             items.Add(new McpDraftListItem(
                 StableDraftItemId(draftId, kind, index),
-                SanitizeVisibleText(values[index])));
+                kind switch
+                {
+                    "argument" => SanitizeCredentialBearingText(values[index]),
+                    "scope" => SanitizeScopeLabel(values[index]),
+                    _ => SanitizeIdentifier(values[index]),
+                }));
         }
 
         return items.MoveToImmutable();
@@ -3403,8 +3408,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
         var manager = this.runtime!;
         var tools = manager.ServerTools(serverName)
             .Select(tool => new McpCapabilitySummary(
-                SanitizeVisibleText(DisplayToolName(tool)),
-                SanitizeOptionalVisibleText(tool.Description)))
+                SanitizeIdentifier(DisplayToolName(tool)),
+                SanitizeOptionalCredentialBearingText(tool.Description)))
             .OrderBy(tool => tool.Name, StringComparer.Ordinal)
             .ToImmutableArray();
 
@@ -3420,8 +3425,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
             prompts = promptEntries
                 .Where(prompt => string.Equals(prompt.ServerName, serverName, StringComparison.Ordinal))
                 .Select(prompt => new McpCapabilitySummary(
-                    SanitizeVisibleText(prompt.Name),
-                    SanitizeOptionalVisibleText(prompt.Description)))
+                    SanitizeIdentifier(prompt.Name),
+                    SanitizeOptionalCredentialBearingText(prompt.Description)))
                 .OrderBy(prompt => prompt.Name, StringComparer.Ordinal)
                 .ToImmutableArray();
             lastError = RuntimeErrorFor(manager, serverName);
@@ -3430,7 +3435,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             resources = resourceEntries
                 .Where(resource => string.Equals(resource.ServerName, serverName, StringComparison.Ordinal))
                 .Select(resource => new McpCapabilitySummary(
-                    SanitizeVisibleText(resource.Name),
+                    SanitizeIdentifier(resource.Name),
                     DisplayUri(resource.Uri)))
                 .OrderBy(resource => resource.Name, StringComparer.Ordinal)
                 .ToImmutableArray();
@@ -3472,7 +3477,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 var source = ClassifySecret(pair.Value);
                 return new McpSecretDescriptor(
                     $"{fieldPrefix}/{pair.Key}",
-                    SanitizeVisibleText(pair.Key),
+                    SanitizeIdentifier(pair.Key),
                     source,
                     DisplayValueFor(source));
             })
@@ -3486,7 +3491,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         return values
             .OrderBy(pair => pair.Key, StringComparer.Ordinal)
             .Select(pair => new McpNamedSecretDraft(
-                SanitizeVisibleText(pair.Key),
+                SanitizeIdentifier(pair.Key),
                 ClassifySecret(pair.Value),
                 new McpSecretChange(
                     $"{fieldPrefix}/{pair.Key}",
@@ -3556,8 +3561,11 @@ internal sealed partial class McpManagementService : IMcpManagementService
         _ => string.Empty,
     };
 
-    private static string? SanitizeOptionalVisibleText(string? value) =>
-        value is null ? null : SanitizeVisibleText(value);
+    private static string? SanitizeOptionalIdentifier(string? value) =>
+        value is null ? null : SanitizeIdentifier(value);
+
+    private static string? SanitizeOptionalCredentialBearingText(string? value) =>
+        value is null ? null : SanitizeCredentialBearingText(value);
 
     private static string DisplayUrl(Uri url)
     {
@@ -3571,7 +3579,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             : url.Host;
         var port = url.IsDefaultPort ? string.Empty : $":{url.Port}";
         var path = url.AbsolutePath;
-        return SanitizePlainText($"{url.Scheme}://{host}{port}{path}");
+        return SanitizeFreeText($"{url.Scheme}://{host}{port}{path}");
     }
 
     private static string DisplayUri(string value)
@@ -3587,27 +3595,28 @@ internal sealed partial class McpManagementService : IMcpManagementService
             return DisplayUrl(uri);
         }
 
-        return SanitizeVisibleText(withoutQueryOrFragment);
+        return SanitizeCredentialBearingText(withoutQueryOrFragment);
     }
 
-    private static string SanitizeVisibleText(string? value)
+    private static string SanitizeIdentifier(string? value) => SanitizeSingleLine(value);
+
+    private static string SanitizeFreeText(string? value)
     {
-        var safe = SanitizePlainText(value);
-        return NetworkUriPattern().Replace(safe, "[redacted URL]");
+        var redacted = RedactSecrets(value);
+        return RedactSecrets(SanitizeSingleLine(redacted));
     }
 
-    private static string SanitizePlainText(string? value)
-    {
-        var safe = SanitizeSingleLine(value);
-        safe = SecretRedactor.Redact(safe);
-        return SecretAssignmentPattern().Replace(safe, RedactSecretAssignment);
-    }
+    private static string SanitizeCredentialBearingText(string? value) =>
+        NetworkUriPattern().Replace(SanitizeFreeText(value), "[redacted URL]");
+
+    private static string SanitizeScopeLabel(string? value) =>
+        NetworkUriPattern().Replace(SanitizeIdentifier(value), "[redacted URL]");
 
     private static string SanitizeError(string? value)
     {
         try
         {
-            var safe = SanitizeVisibleText(value);
+            var safe = SanitizeCredentialBearingText(value);
             return string.IsNullOrEmpty(safe) ? "MCP operation failed." : safe;
         }
         catch (RegexMatchTimeoutException)
@@ -3633,8 +3642,11 @@ internal sealed partial class McpManagementService : IMcpManagementService
         }
 
         var path = pathStart < 0 ? string.Empty : value[pathStart..];
-        return SanitizePlainText($"//{authority}{path}");
+        return SanitizeFreeText($"//{authority}{path}");
     }
+
+    private static string RedactSecrets(string? value) =>
+        SecretAssignmentPattern().Replace(SecretRedactor.Redact(value), RedactSecretAssignment);
 
     private static string SanitizeSingleLine(string? value)
     {

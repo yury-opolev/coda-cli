@@ -1,4 +1,5 @@
 using System.Text;
+using Coda.Common;
 using Coda.Mcp;
 using Coda.Tui.Mcp;
 using Coda.Tui.Ui.Rendering;
@@ -14,7 +15,7 @@ public static class McpView
         if (snapshot.Servers.IsDefaultOrEmpty)
         {
             return snapshot.ReadError is { Length: > 0 }
-                ? $"Unable to read MCP servers: {Safe(snapshot.ReadError)}"
+                ? $"Unable to read MCP servers: {FreeText(snapshot.ReadError)}"
                 : "No MCP servers configured. Add one with /mcp add, or edit ~/.coda/.mcp.json or ./.mcp.json.";
         }
 
@@ -23,15 +24,15 @@ public static class McpView
         foreach (var server in snapshot.Servers)
         {
             builder.Append("  ")
-                .Append(Safe(server.Key.Name))
+                .Append(Identifier(server.Key.Name))
                 .Append("  [").Append(ScopeLabel(server.Key.Scope)).Append(']')
                 .Append("  ").Append(TransportShort(server.Transport))
                 .Append("  ").Append(SummaryStatus(server))
                 .Append("  ").Append(server.IsEffective ? "effective" : "overridden")
-                .Append("  ").Append(Safe(server.SourceFile));
+                .Append("  ").Append(Identifier(server.SourceFile));
             if (server.LastError is { Length: > 0 } error)
             {
-                builder.Append("  error: ").Append(Safe(error));
+                builder.Append("  error: ").Append(FreeText(error));
             }
 
             builder.AppendLine();
@@ -45,12 +46,12 @@ public static class McpView
         ArgumentNullException.ThrowIfNull(detail);
         var summary = detail.Summary;
         var builder = new StringBuilder();
-        builder.AppendLine($"{Safe(summary.Key.Name)}  [{ScopeLabel(summary.Key.Scope)}]");
-        builder.AppendLine($"  source:      {Safe(summary.SourceFile)}");
+        builder.AppendLine($"{Identifier(summary.Key.Name)}  [{ScopeLabel(summary.Key.Scope)}]");
+        builder.AppendLine($"  source:      {Identifier(summary.SourceFile)}");
         builder.AppendLine($"  state:       {SummaryStatus(summary)} ({(summary.IsEffective ? "effective" : "overridden")})");
         if (summary.LastError is { Length: > 0 } error)
         {
-            builder.AppendLine($"  error:       {Safe(error)}");
+            builder.AppendLine($"  error:       {FreeText(error)}");
         }
 
         builder.Append("  transport:   ").Append(TransportDetail(detail)).AppendLine();
@@ -58,20 +59,20 @@ public static class McpView
         AppendSecretDescriptors(builder, "headers", detail.Headers);
         if (detail.AuthMode != McpAuthMode.None)
         {
-            builder.AppendLine($"  auth:        {Safe(detail.AuthMode.ToString().ToLowerInvariant())}");
+            builder.AppendLine($"  auth:        {Identifier(detail.AuthMode.ToString().ToLowerInvariant())}");
             if (detail.ClientId is { } clientId)
             {
-                builder.AppendLine($"  client id:   {Safe(clientId)}");
+                builder.AppendLine($"  client id:   {Identifier(clientId)}");
             }
 
             if (!detail.Scopes.IsDefaultOrEmpty)
             {
-                builder.AppendLine($"  scopes:       {string.Join(", ", detail.Scopes.Select(Safe))}");
+                builder.AppendLine($"  scopes:       {string.Join(", ", detail.Scopes.Select(Identifier))}");
             }
 
             if (detail.BearerToken is { } token)
             {
-                builder.AppendLine($"    token = {Safe(token.DisplayValue)}");
+                builder.AppendLine($"    token = {FreeText(token.DisplayValue)}");
             }
         }
 
@@ -95,7 +96,7 @@ public static class McpView
         foreach (var s in servers)
         {
             builder.Append("  ")
-                .Append(s.Entry.Name)
+                .Append(Identifier(s.Entry.Name))
                 .Append("  [").Append(ScopeLabel(s.Entry.Scope)).Append(']')
                 .Append("  ").Append(TransportShort(s.Entry.Config))
                 .Append("  ").Append(StatusLabel(s))
@@ -110,7 +111,7 @@ public static class McpView
     {
         ArgumentNullException.ThrowIfNull(server);
         var builder = new StringBuilder();
-        builder.AppendLine($"{server.Entry.Name}  [{ScopeLabel(server.Entry.Scope)}]");
+        builder.AppendLine($"{Identifier(server.Entry.Name)}  [{ScopeLabel(server.Entry.Scope)}]");
         builder.AppendLine($"  description: {Description(server.Info)}");
         builder.AppendLine($"  transport:   {TransportDetail(server.Entry.Config)}");
         builder.AppendLine($"  status:      {StatusLabel(server)}");
@@ -127,8 +128,8 @@ public static class McpView
                 builder.AppendLine($"  tools ({server.Tools.Count}):");
                 foreach (var tool in server.Tools)
                 {
-                    var desc = string.IsNullOrWhiteSpace(tool.Description) ? "(no description)" : tool.Description.Trim();
-                    builder.AppendLine($"    {tool.Name} — {desc}");
+                    var desc = string.IsNullOrWhiteSpace(tool.Description) ? "(no description)" : FreeText(tool.Description);
+                    builder.AppendLine($"    {Identifier(tool.Name)} — {desc}");
                 }
             }
         }
@@ -151,7 +152,7 @@ public static class McpView
 
             case McpHttpServerConfig http:
                 AppendMaskedMap(builder, "headers", http.Headers);
-                builder.AppendLine($"  auth:        {http.Auth.Mode.ToString().ToLowerInvariant()}");
+                builder.AppendLine($"  auth:        {Identifier(http.Auth.Mode.ToString().ToLowerInvariant())}");
                 if (http.Auth.BearerToken is { } token)
                 {
                     builder.AppendLine($"    token = {MaskValue(token)}");
@@ -171,7 +172,7 @@ public static class McpView
         builder.AppendLine($"  {label}:");
         foreach (var (key, value) in map)
         {
-            builder.AppendLine($"    {key} = {MaskValue(value)}");
+            builder.AppendLine($"    {Identifier(key)} = {MaskValue(value)}");
         }
     }
 
@@ -186,7 +187,7 @@ public static class McpView
 
         if (value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}'))
         {
-            return $"***** (from {value})";
+            return $"***** (from {Identifier(value)})";
         }
 
         return "*****";
@@ -194,8 +195,11 @@ public static class McpView
 
     private static string ScopeLabel(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
 
-    private static string Safe(string? value) =>
+    private static string Identifier(string? value) =>
         TerminalTextSanitizer.SanitizeSingleLine(value);
+
+    private static string FreeText(string? value) =>
+        SecretRedactor.Redact(TerminalTextSanitizer.SanitizeSingleLine(SecretRedactor.Redact(value)));
 
     private static string TransportShort(McpTransportKind transport) =>
         transport == McpTransportKind.Http ? "http" : "stdio";
@@ -204,8 +208,8 @@ public static class McpView
         detail.Summary.Transport switch
         {
             McpTransportKind.Stdio =>
-                $"stdio — {Safe(detail.Command)} {string.Join(' ', detail.Args.Select(Safe))}".TrimEnd(),
-            McpTransportKind.Http => $"http — {Safe(detail.Url)}",
+                $"stdio — {FreeText(detail.Command)} {string.Join(' ', detail.Args.Select(FreeText))}".TrimEnd(),
+            McpTransportKind.Http => $"http — {FreeText(detail.Url)}",
             _ => "unknown",
         };
 
@@ -234,7 +238,7 @@ public static class McpView
         builder.AppendLine($"  {label}:");
         foreach (var descriptor in values)
         {
-            builder.AppendLine($"    {Safe(descriptor.Name)} = {Safe(descriptor.DisplayValue)}");
+            builder.AppendLine($"    {Identifier(descriptor.Name)} = {FreeText(descriptor.DisplayValue)}");
         }
     }
 
@@ -254,8 +258,8 @@ public static class McpView
         {
             var description = string.IsNullOrWhiteSpace(capability.Description)
                 ? "(no description)"
-                : Safe(capability.Description);
-            builder.AppendLine($"    {Safe(capability.Name)} — {description}");
+                : FreeText(capability.Description);
+            builder.AppendLine($"    {Identifier(capability.Name)} — {description}");
         }
     }
 
@@ -278,12 +282,14 @@ public static class McpView
 
         if (!string.IsNullOrWhiteSpace(info.Instructions))
         {
-            return info.Instructions.Trim();
+            return FreeText(info.Instructions);
         }
 
         if (!string.IsNullOrWhiteSpace(info.Name))
         {
-            return string.IsNullOrWhiteSpace(info.Version) ? info.Name! : $"{info.Name} {info.Version}";
+            return string.IsNullOrWhiteSpace(info.Version)
+                ? Identifier(info.Name)
+                : $"{Identifier(info.Name)} {Identifier(info.Version)}";
         }
 
         return "(no description provided)";
@@ -298,8 +304,8 @@ public static class McpView
 
     private static string TransportDetail(McpServerConfig config) => config switch
     {
-        McpStdioServerConfig stdio => $"stdio — {stdio.Command} {string.Join(' ', stdio.Args)}".TrimEnd(),
-        McpHttpServerConfig http => $"http — {http.Url}",
+        McpStdioServerConfig stdio => $"stdio — {FreeText(stdio.Command)} {string.Join(' ', stdio.Args.Select(FreeText))}".TrimEnd(),
+        McpHttpServerConfig http => $"http — {FreeText(http.Url.ToString())}",
         _ => "unknown",
     };
 }

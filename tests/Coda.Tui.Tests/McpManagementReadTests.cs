@@ -4,6 +4,8 @@ using System.Text;
 using Coda.Mcp;
 using Coda.Tui.Mcp;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui;
+using Coda.Tui.Ui.Mcp;
 
 namespace Coda.Tui.Tests;
 
@@ -631,14 +633,40 @@ public sealed class McpManagementReadTests
     }
 
     [Fact]
-    public async Task Command_context_exposes_a_cacheable_management_service_without_constructor_changes()
+    public void Command_and_browser_share_one_stable_management_service()
     {
-        await using var harness = await McpManagementTestHarness.CreateAsync();
         var (_, context, _, _) = TestAppBuilder.BuildApp();
+        var management = context.McpManagement;
+        var providerFactory = InteractiveProgram.CreateMcpBrowserProvider(
+            management!,
+            new RecordingPromptService(),
+            new PassiveIdleGate());
+        var firstProvider = Assert.IsType<McpBrowserProvider>(providerFactory());
+        var secondProvider = Assert.IsType<McpBrowserProvider>(providerFactory());
 
-        Assert.Null(context.McpManagement);
-        context.McpManagement = harness.Service;
+        Assert.NotNull(management);
+        Assert.IsType<McpManagementService>(management);
+        Assert.Same(management, context.McpManagement);
+        Assert.Same(firstProvider, secondProvider);
+        Assert.Same(management, firstProvider.Management);
+        Assert.Same(firstProvider.Management, secondProvider.Management);
+    }
 
-        Assert.Same(harness.Service, context.McpManagement);
+    private sealed class PassiveIdleGate : IExclusiveIdleGate
+    {
+        public bool IsBusy => false;
+
+        public event Action? Changed
+        {
+            add { }
+            remove { }
+        }
+
+        public IDisposable TryAcquire() => new Lease();
+
+        private sealed class Lease : IDisposable
+        {
+            public void Dispose() { }
+        }
     }
 }

@@ -86,6 +86,19 @@ public static class InteractiveProgram
             analyze ?? (ct => Commands.ContextCommand.AnalyzeOnceAsync(context, ct)));
     }
 
+    internal static Func<McpBrowserProvider?> CreateMcpBrowserProvider(
+        IMcpManagementService management,
+        IUiPromptService prompts,
+        IExclusiveIdleGate idleGate)
+    {
+        ArgumentNullException.ThrowIfNull(management);
+        ArgumentNullException.ThrowIfNull(prompts);
+        ArgumentNullException.ThrowIfNull(idleGate);
+
+        var provider = new McpBrowserProvider(management, prompts, idleGate);
+        return () => provider;
+    }
+
     /// <summary>
     /// Parse <paramref name="args"/>, select the initial mode from <paramref name="capabilities"/>, and
     /// run it. Returns the process exit code; a bad launch request returns <c>2</c> after writing a
@@ -309,8 +322,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 : null;
 
         using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
-        Func<McpBrowserProvider?> mcpBrowserProvider = () =>
-            new McpBrowserProvider(mcpManagement, actorPrompts, controller);
+        var mcpBrowserProvider = InteractiveProgram.CreateMcpBrowserProvider(
+            mcpManagement, actorPrompts, controller);
 
         // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
         // Terminal.Gui shells own their own Esc/Ctrl+C chords). The explicit exit action is wired

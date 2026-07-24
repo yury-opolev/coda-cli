@@ -24,6 +24,23 @@ public sealed class McpViewTests
         Assert.Equal(2, text.Split(Environment.NewLine).Length);
     }
 
+    [Fact]
+    public void Management_view_preserves_safe_sk_prefixed_identifiers()
+    {
+        var summary = new McpServerSummary(
+            new McpServerKey(McpConfigScope.Project, "sk-integration-server"),
+            @"C:\project\.mcp.json",
+            Enabled: true,
+            IsEffective: true,
+            Transport: McpTransportKind.Stdio,
+            Connection: McpConnectionState.Disconnected,
+            LastError: null);
+
+        var text = McpView.FormatList(new McpManagementSnapshot(true, [summary]));
+
+        Assert.Contains("sk-integration-server", text);
+    }
+
     private static McpServerEntry Stdio(string name, McpConfigScope scope) =>
         new(name, new McpStdioServerConfig("npx", ["-y", "@mcp/server"], new Dictionary<string, string>()), scope);
 
@@ -132,5 +149,34 @@ public sealed class McpViewTests
 
         Assert.Contains("not connected", text);
         Assert.Contains("/mcp start", text);
+    }
+
+    [Fact]
+    public void Legacy_status_formatters_redact_obfuscated_free_text_without_redacting_identifiers()
+    {
+        const string secret = "sk-abcdefghijklmnopqrstuvwxyz012345";
+        var obfuscated = string.Concat(secret[..6], "\u001b[31m", secret[6..]);
+        var entry = new McpServerEntry(
+            "sk-integration-server",
+            new McpStdioServerConfig(
+                $"node {obfuscated}",
+                [$"--token={obfuscated}"],
+                new Dictionary<string, string>()),
+            McpConfigScope.Project);
+        var status = new McpServerStatus(
+            entry,
+            Connected: true,
+            Info: new McpServerInfo("sk-remote-identity", "1.0", $"Instructions {obfuscated}"),
+            Tools: [new McpToolLine("sk-safe-tool", $"Description {obfuscated}")]);
+
+        var list = McpView.FormatList([status]);
+        var info = McpView.FormatInfo(status);
+
+        Assert.Contains("sk-integration-server", list);
+        Assert.Contains("sk-integration-server", info);
+        Assert.Contains("sk-safe-tool", info);
+        Assert.Contains("***redacted***", info);
+        Assert.DoesNotContain(secret, info, StringComparison.Ordinal);
+        Assert.DoesNotContain('\u001b', info);
     }
 }
