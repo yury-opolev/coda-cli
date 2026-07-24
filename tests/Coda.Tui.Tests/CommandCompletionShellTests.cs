@@ -345,7 +345,8 @@ public sealed class CommandCompletionShellTests
         Assert.True(shell.Completion.Visible);
         Assert.True(shell.PromptOverlay.Visible);
         Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         var order = shell.SubViews.ToList();
@@ -375,25 +376,28 @@ public sealed class CommandCompletionShellTests
         app.LayoutAndDraw();
 
         // A slash draft shows the completion menu; its bottom hugs the operational row and every
-        // retained row stays adjacent (completion → operational → chrome[composer] → status).
+        // retained row stays adjacent (completion → operational → navigation → chrome[composer] → status).
         shell.Composer.SetDraft("/he", 3);
         app.LayoutAndDraw();
         Assert.True(shell.Completion.Visible);
         Assert.Equal(shell.Operational.Frame.Y, shell.Completion.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         // A dynamic-height (multi-line) draft grows the composer without breaking row adjacency.
         shell.Composer.SetDraft("a\nb\nc\nd", 7);
         app.LayoutAndDraw();
         Assert.True(shell.Composer.Frame.Height >= 4);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
-        // A driver resize re-flows every row but the operational/composer/status adjacency survives.
+        // A driver resize re-flows every row but the operational/navigation/composer/status adjacency survives.
         app.Driver.SetScreenSize(60, 18);
         app.LayoutAndDraw();
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
 
         if (token is not null)

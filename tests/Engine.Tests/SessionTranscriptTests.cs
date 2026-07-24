@@ -29,10 +29,21 @@ public sealed class SessionTranscriptTests : IDisposable
             new(ChatRole.User, [new TextBlock("What is 2+2?")]),
             new(ChatRole.Assistant, [
                 new TextBlock("Let me calculate that."),
-                new ToolUseBlock("tool-id-1", "calculator", "{\"expression\":\"2+2\"}"),
+                new ToolUseBlock("tool-id-1", "calculator", "{\"expression\":\"2+2\"}")
+                {
+                    RootTurnId = "root-1",
+                    ActivityId = "activity-1",
+                    SourceId = "root:root-1",
+                },
             ]),
             new(ChatRole.User, [
-                new ToolResultBlock("tool-id-1", "4", IsError: false),
+                new ToolResultBlock("tool-id-1", "4", IsError: false)
+                {
+                    RootTurnId = "root-1",
+                    ActivityId = "activity-1",
+                    SourceId = "root:root-1",
+                    ToolStatus = "Succeeded",
+                },
             ]),
         };
 
@@ -57,6 +68,9 @@ public sealed class SessionTranscriptTests : IDisposable
         Assert.Equal("tool-id-1", tub.Id);
         Assert.Equal("calculator", tub.Name);
         Assert.Equal("{\"expression\":\"2+2\"}", tub.InputJson);
+        Assert.Equal("root-1", tub.RootTurnId);
+        Assert.Equal("activity-1", tub.ActivityId);
+        Assert.Equal("root:root-1", tub.SourceId);
 
         // Message 2: user ToolResultBlock
         Assert.Equal(ChatRole.User, loaded[2].Role);
@@ -65,6 +79,115 @@ public sealed class SessionTranscriptTests : IDisposable
         Assert.Equal("tool-id-1", trb.ToolUseId);
         Assert.Equal("4", trb.Content);
         Assert.False(trb.IsError);
+        Assert.Equal("root-1", trb.RootTurnId);
+        Assert.Equal("activity-1", trb.ActivityId);
+        Assert.Equal("root:root-1", trb.SourceId);
+        Assert.Equal("Succeeded", trb.ToolStatus);
+    }
+
+    [Fact]
+    public async Task SaveAsync_omits_null_correlation_metadata_and_loads_legacy_blocks()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        await store.SaveAsync(
+            "legacy-correlation",
+            [
+                new(ChatRole.Assistant, [new ToolUseBlock("call-1", "probe", "{}")]),
+                new(ChatRole.User, [new ToolResultBlock("call-1", "ok")]),
+            ]);
+
+        var file = Path.Combine(this.tempDir, ".coda", "sessions", "legacy-correlation.json");
+        var document = Assert.IsType<JsonObject>(JsonNode.Parse(await File.ReadAllTextAsync(file)));
+        var blocks = document["messages"]!.AsArray()[0]!["blocks"]!.AsArray();
+        var toolUse = Assert.IsType<JsonObject>(blocks[0]);
+        var toolResult = Assert.IsType<JsonObject>(document["messages"]!.AsArray()[1]!["blocks"]!.AsArray()[0]);
+        Assert.False(toolUse.ContainsKey("rootTurnId"));
+        Assert.False(toolUse.ContainsKey("activityId"));
+        Assert.False(toolUse.ContainsKey("sourceId"));
+        Assert.False(toolResult.ContainsKey("rootTurnId"));
+        Assert.False(toolResult.ContainsKey("activityId"));
+        Assert.False(toolResult.ContainsKey("sourceId"));
+        Assert.False(toolResult.ContainsKey("toolStatus"));
+
+        var loaded = await store.LoadAsync("legacy-correlation");
+
+        var loadedUse = Assert.IsType<ToolUseBlock>(loaded![0].Content[0]);
+        var loadedResult = Assert.IsType<ToolResultBlock>(loaded[1].Content[0]);
+        Assert.Null(loadedUse.RootTurnId);
+        Assert.Null(loadedUse.ActivityId);
+        Assert.Null(loadedUse.SourceId);
+        Assert.Null(loadedResult.RootTurnId);
+        Assert.Null(loadedResult.ActivityId);
+        Assert.Null(loadedResult.SourceId);
+        Assert.Null(loadedResult.ToolStatus);
+    }
+
+    [Fact]
+    public async Task LoadAsync_treats_missing_or_invalid_correlation_metadata_as_null()
+    {
+        var sessionsDir = Path.Combine(this.tempDir, ".coda", "sessions");
+        Directory.CreateDirectory(sessionsDir);
+        var document = new JsonObject
+        {
+            ["id"] = "invalid-correlation",
+            ["createdUtc"] = DateTime.UtcNow.ToString("O"),
+            ["messages"] = new JsonArray
+            {
+                new JsonObject
+                {
+                    ["role"] = "assistant",
+                    ["blocks"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["type"] = "tool_use",
+                            ["id"] = "call-1",
+                            ["name"] = "probe",
+                            ["input"] = "{}",
+                            ["rootTurnId"] = 42,
+                            ["activityId"] = new JsonObject { ["unexpected"] = true },
+                            ["sourceId"] = false,
+                            ["futureCorrelationField"] = "ignored",
+                        },
+                    },
+                },
+                new JsonObject
+                {
+                    ["role"] = "user",
+                    ["blocks"] = new JsonArray
+                    {
+                        new JsonObject
+                        {
+                            ["type"] = "tool_result",
+                            ["toolUseId"] = "call-1",
+                            ["content"] = "ok",
+                            ["isError"] = false,
+                            ["rootTurnId"] = new JsonArray("unexpected"),
+                            ["activityId"] = 7,
+                            ["sourceId"] = true,
+                            ["toolStatus"] = new JsonObject { ["unexpected"] = true },
+                            ["futureCorrelationField"] = "ignored",
+                        },
+                    },
+                },
+            },
+        };
+        await File.WriteAllTextAsync(
+            Path.Combine(sessionsDir, "invalid-correlation.json"),
+            document.ToJsonString());
+        var store = new SessionTranscriptStore(this.tempDir);
+
+        var loaded = await store.LoadAsync("invalid-correlation");
+
+        var toolUse = Assert.IsType<ToolUseBlock>(loaded![0].Content[0]);
+        var toolResult = Assert.IsType<ToolResultBlock>(loaded[1].Content[0]);
+        Assert.Null(toolUse.RootTurnId);
+        Assert.Null(toolUse.ActivityId);
+        Assert.Null(toolUse.SourceId);
+        Assert.Null(toolResult.RootTurnId);
+        Assert.Null(toolResult.ActivityId);
+        Assert.Null(toolResult.SourceId);
+        Assert.Null(toolResult.ToolStatus);
     }
 
     [Fact]
@@ -360,6 +483,110 @@ public sealed class SessionTranscriptTests : IDisposable
         var secondJson = JsonNode.Parse(await File.ReadAllTextAsync(filePath))!;
         var secondCreated = secondJson["createdUtc"]!.GetValue<string>();
 
+        Assert.Equal(firstCreated, secondCreated);
+    }
+
+    // ── Optional live-session metadata ───────────────────────────────────────────
+
+    [Fact]
+    public async Task SaveSessionAsync_then_LoadSessionAsync_round_trips_exact_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var messages = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("hello")]) };
+
+        await store.SaveAsync("metadata-exact", messages, new SessionMetadata { SystemPromptOverride = "exact\n" });
+
+        var stored = await store.LoadSessionAsync("metadata-exact");
+
+        Assert.NotNull(stored);
+        Assert.Equal("exact\n", stored.Metadata.SystemPromptOverride);
+        Assert.Single(stored.Messages);
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_with_empty_metadata_omits_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var messages = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("hello")]) };
+
+        await store.SaveAsync("metadata-default", messages, SessionMetadata.Empty);
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", "metadata-default.json");
+        var json = JsonNode.Parse(await File.ReadAllTextAsync(path))!;
+        Assert.Null(json["systemPromptOverride"]);
+    }
+
+    [Fact]
+    public async Task SaveSessionAsync_with_empty_override_serializes_and_round_trips_it()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var messages = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("hello")]) };
+
+        await store.SaveAsync("metadata-empty", messages, new SessionMetadata { SystemPromptOverride = string.Empty });
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", "metadata-empty.json");
+        var json = JsonNode.Parse(await File.ReadAllTextAsync(path))!;
+        Assert.Equal(string.Empty, json["systemPromptOverride"]!.GetValue<string>());
+        var stored = await store.LoadSessionAsync("metadata-empty");
+        Assert.Equal(string.Empty, stored!.Metadata.SystemPromptOverride);
+    }
+
+    [Fact]
+    public async Task Legacy_SaveAsync_preserves_existing_empty_system_prompt_override()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var initial = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("first")]) };
+        await store.SaveAsync("metadata-legacy", initial, new SessionMetadata { SystemPromptOverride = string.Empty });
+
+        await store.SaveAsync("metadata-legacy", [new(ChatRole.User, [new TextBlock("second")])]);
+
+        var stored = await store.LoadSessionAsync("metadata-legacy");
+        Assert.Equal(string.Empty, stored!.Metadata.SystemPromptOverride);
+        Assert.Equal("second", Assert.IsType<TextBlock>(stored.Messages[0].Content[0]).Text);
+    }
+
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task LoadSessionAsync_accepts_legacy_or_non_string_metadata_and_unknown_fields(bool nonStringMetadata)
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        var sessionId = nonStringMetadata ? "metadata-non-string" : "metadata-legacy-json";
+        await store.SaveAsync(sessionId, [new(ChatRole.User, [new TextBlock("hello")])]);
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", $"{sessionId}.json");
+        var json = JsonNode.Parse(await File.ReadAllTextAsync(path))!.AsObject();
+        json["unknownFutureField"] = new JsonObject { ["ignored"] = true };
+        if (nonStringMetadata)
+        {
+            json["systemPromptOverride"] = new JsonObject { ["invalid"] = true };
+        }
+
+        await File.WriteAllTextAsync(path, json.ToJsonString());
+
+        var stored = await store.LoadSessionAsync(sessionId);
+
+        Assert.NotNull(stored);
+        Assert.Null(stored.Metadata.SystemPromptOverride);
+        Assert.Single(stored.Messages);
+        Assert.Equal("hello", Assert.IsType<TextBlock>(stored.Messages[0].Content[0]).Text);
+    }
+
+    [Fact]
+    public async Task Metadata_aware_and_legacy_saves_preserve_original_createdUtc()
+    {
+        var store = new SessionTranscriptStore(this.tempDir);
+        const string sessionId = "metadata-created-utc";
+        var first = new List<ChatMessage> { new(ChatRole.User, [new TextBlock("first")]) };
+        await store.SaveAsync(sessionId, first, new SessionMetadata { SystemPromptOverride = "override" });
+
+        var path = Path.Combine(this.tempDir, ".coda", "sessions", $"{sessionId}.json");
+        var firstCreated = JsonNode.Parse(await File.ReadAllTextAsync(path))!["createdUtc"]!.GetValue<string>();
+        await Task.Delay(50);
+
+        await store.SaveAsync(sessionId, [new(ChatRole.User, [new TextBlock("second")])]);
+
+        var secondCreated = JsonNode.Parse(await File.ReadAllTextAsync(path))!["createdUtc"]!.GetValue<string>();
         Assert.Equal(firstCreated, secondCreated);
     }
 

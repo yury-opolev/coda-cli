@@ -17,10 +17,37 @@ public static class SessionForking
     public static async Task<string> ForkAsync(
         string workingDirectory, string? sourceId, IReadOnlyList<ChatMessage> messages, CancellationToken ct = default)
     {
+        ArgumentNullException.ThrowIfNull(messages);
+
+        var source = sourceId is null
+            ? null
+            : await new SessionTranscriptStore(workingDirectory).LoadSessionAsync(sourceId, ct).ConfigureAwait(false);
+        return await ForkAsync(
+            workingDirectory,
+            sourceId,
+            messages,
+            source?.Metadata ?? SessionMetadata.Empty,
+            ct).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Forks <paramref name="sourceId"/> into a fresh session id under <paramref name="workingDirectory"/>
+    /// with the supplied live-session <paramref name="metadata"/>.
+    /// </summary>
+    public static async Task<string> ForkAsync(
+        string workingDirectory,
+        string? sourceId,
+        IReadOnlyList<ChatMessage> messages,
+        SessionMetadata metadata,
+        CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(messages);
+        ArgumentNullException.ThrowIfNull(metadata);
+
         var newId = SessionIds.NewId();
         try
         {
-            await new SessionTranscriptStore(workingDirectory).SaveAsync(newId, messages, ct).ConfigureAwait(false);
+            await new SessionTranscriptStore(workingDirectory).SaveAsync(newId, messages, metadata, ct).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

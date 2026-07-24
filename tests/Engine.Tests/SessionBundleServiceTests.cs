@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+using Coda.Agent;
 using Coda.Sdk;
 using LlmClient;
 
@@ -13,14 +15,15 @@ public sealed class SessionBundleServiceTests : IDisposable
         try { Directory.Delete(this.tempDir, recursive: true); } catch { /* ignore */ }
     }
 
-    private async Task SeedSessionAsync(string id)
+    private async Task SeedSessionAsync(string id, string? systemPromptOverride = null)
     {
         var transcript = new SessionTranscriptStore(this.tempDir);
         await transcript.SaveAsync(id,
         [
             new(ChatRole.User, [new TextBlock("hello")]),
             new(ChatRole.Assistant, [new TextBlock("hi there")]),
-        ]);
+        ],
+        new SessionMetadata { SystemPromptOverride = systemPromptOverride });
         var audit = new SessionAuditStore(this.tempDir);
         await audit.AppendTurnAsync(id, new SessionAuditTurn
         {
@@ -106,6 +109,115 @@ public sealed class SessionBundleServiceTests : IDisposable
         {
             try { Directory.Delete(otherDir, recursive: true); } catch { /* ignore */ }
         }
+    }
+
+    [Fact]
+    public async Task ExportAsync_keeps_stored_override_separate_from_audited_effective_prompt_and_import_restores_it()
+    {
+        await this.SeedSessionAsync("override-session", "OVERRIDE");
+        var svc = new SessionBundleService(this.tempDir, "0.1.63");
+
+        var bundle = await svc.ExportAsync("override-session", FixedExport);
+
+        Assert.NotNull(bundle);
+        Assert.Equal("coda.session/1", bundle.Schema);
+        Assert.Equal("OVERRIDE", bundle.SystemPromptOverride);
+        Assert.Equal("SYSTEM-PROMPT-TEXT", bundle.SystemPrompt);
+
+        var bundlePath = Path.Combine(this.tempDir, "override-session.coda-session.json");
+        await svc.WriteAsync(bundle, bundlePath, pretty: false);
+        var destination = Directory.CreateTempSubdirectory("coda_bundle_dst_").FullName;
+        try
+        {
+            var importedId = await new SessionBundleService(destination, "0.1.63").ImportAsync(bundlePath);
+
+            var stored = await new SessionTranscriptStore(destination).LoadSessionAsync(importedId);
+            Assert.NotNull(stored);
+            Assert.Equal("OVERRIDE", stored.Metadata.SystemPromptOverride);
+        }
+        finally
+        {
+            try { Directory.Delete(destination, recursive: true); } catch { /* ignore */ }
+        }
+    }
+
+    [Fact]
+    public async Task WriteAsync_emits_an_explicit_empty_override_but_omits_an_absent_override()
+    {
+        await this.SeedSessionAsync("empty-override", string.Empty);
+        await this.SeedSessionAsync("absent-override");
+        var svc = new SessionBundleService(this.tempDir, "0.1.63");
+
+        var emptyBundle = await svc.ExportAsync("empty-override", FixedExport);
+        var absentBundle = await svc.ExportAsync("absent-override", FixedExport);
+        var emptyPath = Path.Combine(this.tempDir, "empty.coda-session.json");
+        var absentPath = Path.Combine(this.tempDir, "absent.coda-session.json");
+        await svc.WriteAsync(emptyBundle!, emptyPath, pretty: false);
+        await svc.WriteAsync(absentBundle!, absentPath, pretty: false);
+
+        var emptyRoot = JsonNode.Parse(await File.ReadAllTextAsync(emptyPath))!.AsObject();
+        var absentRoot = JsonNode.Parse(await File.ReadAllTextAsync(absentPath))!.AsObject();
+        Assert.Equal(string.Empty, emptyRoot["systemPromptOverride"]!.GetValue<string>());
+        Assert.False(absentRoot.ContainsKey("systemPromptOverride"));
+    }
+
+    [Fact]
+    public async Task ImportAsync_old_bundle_without_override_saves_null_metadata()
+    {
+        var bundlePath = Path.Combine(this.tempDir, "old-bundle.json");
+        await File.WriteAllTextAsync(bundlePath,
+            """{"schema":"coda.session/1","id":"old-bundle","turns":[{"role":"user","blocks":[{"type":"text","text":"hi"}]}]}""");
+
+        var importedId = await new SessionBundleService(this.tempDir, "0.1.63").ImportAsync(bundlePath);
+
+        var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(importedId);
+        Assert.NotNull(stored);
+        Assert.Null(stored.Metadata.SystemPromptOverride);
+    }
+
+    [Fact]
+    public async Task ImportAsync_tolerates_unknown_additive_fields()
+    {
+        var bundlePath = Path.Combine(this.tempDir, "unknown-fields.json");
+        await File.WriteAllTextAsync(bundlePath,
+            """{"schema":"coda.session/1","id":"unknown-fields","futureField":{"nested":true},"turns":[{"role":"user","blocks":[{"type":"text","text":"hi"}],"futureTurnField":42}]}""");
+
+        var importedId = await new SessionBundleService(this.tempDir, "0.1.63").ImportAsync(bundlePath);
+
+        var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(importedId);
+        Assert.NotNull(stored);
+        Assert.Single(stored.Messages);
+    }
+
+    [Fact]
+    public async Task ImportAsync_treats_a_non_string_override_as_absent_without_corrupting_the_transcript()
+    {
+        var bundlePath = Path.Combine(this.tempDir, "non-string-override.json");
+        await File.WriteAllTextAsync(bundlePath,
+            """{"schema":"coda.session/1","id":"non-string-override","systemPromptOverride":42,"turns":[{"role":"user","blocks":[{"type":"text","text":"hi"}]}]}""");
+
+        var importedId = await new SessionBundleService(this.tempDir, "0.1.63").ImportAsync(bundlePath);
+
+        var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(importedId);
+        Assert.NotNull(stored);
+        Assert.Null(stored.Metadata.SystemPromptOverride);
+        Assert.Equal("hi", Assert.IsType<TextBlock>(Assert.Single(stored.Messages).Content.Single()).Text);
+    }
+
+    [Fact]
+    public async Task ImportAsync_collision_minted_id_preserves_override_metadata()
+    {
+        await this.SeedSessionAsync("collision-override", "OVERRIDE");
+        var svc = new SessionBundleService(this.tempDir, "0.1.63");
+        var bundlePath = Path.Combine(this.tempDir, "collision-override.coda-session.json");
+        await svc.WriteAsync((await svc.ExportAsync("collision-override", FixedExport))!, bundlePath, pretty: false);
+
+        var importedId = await svc.ImportAsync(bundlePath);
+
+        Assert.NotEqual("collision-override", importedId);
+        var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(importedId);
+        Assert.NotNull(stored);
+        Assert.Equal("OVERRIDE", stored.Metadata.SystemPromptOverride);
     }
 
     [Fact]
@@ -250,5 +362,67 @@ public sealed class SessionBundleServiceTests : IDisposable
         var loaded = await new SessionTranscriptStore(this.tempDir).LoadAsync(importedId);
         Assert.NotNull(loaded);
         Assert.Single(loaded);
+    }
+
+    [Fact]
+    public async Task Export_import_round_trips_correlated_tool_calls_without_changing_schema()
+    {
+        var transcript = new SessionTranscriptStore(this.tempDir);
+        await transcript.SaveAsync("correlated",
+        [
+            new(ChatRole.User, [new TextBlock("go")]),
+            new(ChatRole.Assistant, [new TextBlock("done")]),
+        ]);
+        var audit = new SessionAuditStore(this.tempDir);
+        await audit.AppendTurnAsync("correlated", new SessionAuditTurn
+        {
+            TurnIndex = 0,
+            TsUtc = new DateTime(2026, 7, 13, 9, 0, 0, DateTimeKind.Utc),
+            Provider = "github-copilot",
+            Model = "claude-opus-4.8",
+            InputTokens = 200,
+            OutputTokens = 20,
+            StopReason = "end_turn",
+            ToolCalls =
+            [
+                new ToolCallRecord("grep", """{"pattern":"a"}""", "ok", false)
+                {
+                    RootTurnId = "root",
+                    ActivityId = "activity",
+                    CallId = "call-1",
+                    SourceId = "subagent:research",
+                    Status = ToolCallStatus.Succeeded,
+                },
+            ],
+            SystemPrompt = "SYSTEM-PROMPT-TEXT",
+            ToolDefs = [new ToolDefinition("grep", "searches", "{}")],
+        });
+        var service = new SessionBundleService(this.tempDir, "0.1.63");
+        var bundle = await service.ExportAsync("correlated", FixedExport);
+        var path = Path.Combine(this.tempDir, "correlated.coda-session.json");
+
+        Assert.NotNull(bundle);
+        Assert.Equal("coda.session/1", bundle.Schema);
+        var exported = Assert.Single(bundle.AuditTurns).ToolCalls.Single();
+        Assert.Equal("call-1", exported.CallId);
+        Assert.Equal("subagent:research", exported.SourceId);
+
+        await service.WriteAsync(bundle, path, pretty: false);
+        var destination = Directory.CreateTempSubdirectory("coda_bundle_dst_").FullName;
+        try
+        {
+            var importedId = await new SessionBundleService(destination, "0.1.63").ImportAsync(path);
+            var imported = Assert.Single((await new SessionAuditStore(destination).LoadAsync(importedId)).Single().ToolCalls);
+
+            Assert.Equal("root", imported.RootTurnId);
+            Assert.Equal("activity", imported.ActivityId);
+            Assert.Equal("call-1", imported.CallId);
+            Assert.Equal("subagent:research", imported.SourceId);
+            Assert.Equal(ToolCallStatus.Succeeded, imported.Status);
+        }
+        finally
+        {
+            try { Directory.Delete(destination, recursive: true); } catch { /* ignore */ }
+        }
     }
 }

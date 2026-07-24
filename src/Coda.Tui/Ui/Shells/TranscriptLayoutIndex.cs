@@ -11,8 +11,11 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
     /// <summary>Whether the row paints its background across the full viewport width (user message blocks).</summary>
     public bool FillWidth { get; init; }
 
-    /// <summary>An optional right-aligned annotation (e.g. a sent-time HH:mm) drawn at the row's right edge.</summary>
+    /// <summary>An optional right-aligned annotation (e.g. a sent-time HH:mm) drawn near the row's trailing edge.</summary>
     public string? RightText { get; init; }
+
+    /// <summary>Cells intentionally left blank after <see cref="RightText"/>.</summary>
+    public int RightTextTrailingCells { get; init; }
 
     /// <summary>Whether this is the synthetic, inert blank row after a visible semantic block.</summary>
     public bool IsSeparator { get; init; }
@@ -46,6 +49,7 @@ internal sealed class TranscriptLayoutIndex
     private readonly Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> formatter;
     private readonly Dictionary<Guid, LinkedListNode<CacheEntry>> cacheMap = new();
     private readonly LinkedList<CacheEntry> cacheOrder = new();
+    private readonly Dictionary<Guid, int> blockPositions = new();
 
     private ImmutableArray<TranscriptBlock> blocks = ImmutableArray<TranscriptBlock>.Empty;
     private readonly List<int> rowCounts = new();
@@ -75,8 +79,16 @@ internal sealed class TranscriptLayoutIndex
     /// </summary>
     public void ReplaceAll(ImmutableArray<TranscriptBlock> newBlocks, int width)
     {
-        this.blocks = newBlocks.IsDefault ? ImmutableArray<TranscriptBlock>.Empty : newBlocks;
+        var replacement = newBlocks.IsDefault ? ImmutableArray<TranscriptBlock>.Empty : newBlocks;
+        var positions = BuildBlockPositions(replacement);
+        this.blocks = replacement;
         this.width = width > 0 ? width : 1;
+        this.blockPositions.Clear();
+        foreach (var pair in positions)
+        {
+            this.blockPositions.Add(pair.Key, pair.Value);
+        }
+
         this.ClearCache();
         this.RebuildRowCounts();
     }
@@ -85,6 +97,11 @@ internal sealed class TranscriptLayoutIndex
     public void Append(TranscriptBlock block, int width)
     {
         ArgumentNullException.ThrowIfNull(block);
+        if (this.blockPositions.ContainsKey(block.Id))
+        {
+            throw new InvalidOperationException($"Transcript block ID '{block.Id}' is already present.");
+        }
+
         if (width > 0 && width != this.width)
         {
             this.Reflow(width);
@@ -95,6 +112,7 @@ internal sealed class TranscriptLayoutIndex
         var count = EffectiveRowCount(lines.Count);
         this.rowCounts.Add(count);
         this.prefix.Add(this.prefix[^1] + count);
+        this.blockPositions.Add(block.Id, this.blocks.Length - 1);
         this.Cache(block.Id, lines);
     }
 
@@ -123,16 +141,24 @@ internal sealed class TranscriptLayoutIndex
             return;
         }
 
+        var oldBlock = this.blocks[position];
+        if (block.Id != oldBlock.Id && this.blockPositions.ContainsKey(block.Id))
+        {
+            throw new InvalidOperationException($"Transcript block ID '{block.Id}' is already present.");
+        }
+
         if (width > 0 && width != this.width)
         {
             this.Reflow(width);
         }
 
-        this.Evict(this.blocks[position].Id);
+        this.Evict(oldBlock.Id);
         var lines = this.Format(block);
         var count = EffectiveRowCount(lines.Count);
         var delta = count - this.rowCounts[position];
         this.blocks = this.blocks.SetItem(position, block);
+        this.blockPositions.Remove(oldBlock.Id);
+        this.blockPositions[block.Id] = position;
         this.rowCounts[position] = count;
         if (delta != 0)
         {
@@ -243,6 +269,7 @@ internal sealed class TranscriptLayoutIndex
                 {
                     FillWidth = line.FillWidth,
                     RightText = line.RightText,
+                    RightTextTrailingCells = line.RightTextTrailingCells,
                 });
             }
 
@@ -264,6 +291,34 @@ internal sealed class TranscriptLayoutIndex
         return blockIndex < this.blocks.Length ? this.blocks[blockIndex].Id : null;
     }
 
+    public TranscriptViewportAnchor? AnchorAt(int globalRow)
+    {
+        if (globalRow < 0 || globalRow >= this.TotalRows)
+        {
+            return null;
+        }
+
+        var blockIndex = this.FindBlock(globalRow);
+        return new TranscriptViewportAnchor(
+            this.blocks[blockIndex].Id,
+            globalRow - this.prefix[blockIndex]);
+    }
+
+    public int? ResolveAnchor(TranscriptViewportAnchor anchor)
+    {
+        if (!this.blockPositions.TryGetValue(anchor.BlockId, out var blockIndex)
+            || this.rowCounts[blockIndex] == 0)
+        {
+            return null;
+        }
+
+        var local = Math.Clamp(
+            anchor.WrappedRowOffset,
+            0,
+            this.rowCounts[blockIndex] - 1);
+        return this.prefix[blockIndex] + local;
+    }
+
     private void RebuildRowCounts()
     {
         this.rowCounts.Clear();
@@ -275,6 +330,20 @@ internal sealed class TranscriptLayoutIndex
             this.rowCounts.Add(count);
             this.prefix.Add(this.prefix[^1] + count);
         }
+    }
+
+    private static Dictionary<Guid, int> BuildBlockPositions(ImmutableArray<TranscriptBlock> blocks)
+    {
+        var positions = new Dictionary<Guid, int>(blocks.Length);
+        for (var i = 0; i < blocks.Length; i++)
+        {
+            if (!positions.TryAdd(blocks[i].Id, i))
+            {
+                throw new InvalidOperationException($"Transcript block ID '{blocks[i].Id}' is duplicated.");
+            }
+        }
+
+        return positions;
     }
 
     /// <summary>Largest block index whose prefix offset is &lt;= <paramref name="globalRow"/>.</summary>

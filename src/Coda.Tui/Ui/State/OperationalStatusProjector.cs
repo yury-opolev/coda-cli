@@ -1,3 +1,4 @@
+using Coda.Agent;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 
@@ -27,12 +28,15 @@ internal static class OperationalStatusProjector
             return new("Initializing…", OperationalTone.Initializing, true);
         }
 
-        var tool = LastIncompleteTool(snapshot);
-        if (tool is not null)
+        if (LastActiveTool(snapshot) is { } tool)
         {
             return toolDisplayMode == ToolDisplayMode.Tiny
                 ? new("Working", OperationalTone.Working, true)
-                : new($"Working · {tool.ToolName}", OperationalTone.Working, true);
+                : tool.IsActivity && toolDisplayMode == ToolDisplayMode.Summary
+                    ? new($"Working · {tool.ActivityCallCount} tools", OperationalTone.Working, true)
+                    : string.IsNullOrWhiteSpace(tool.ToolName)
+                        ? new("Working", OperationalTone.Working, true)
+                        : new($"Working · {SingleLine(tool.ToolName)}", OperationalTone.Working, true);
         }
 
         if (snapshot.ActiveOperation is { } operation)
@@ -69,22 +73,37 @@ internal static class OperationalStatusProjector
         return new("Ready", OperationalTone.Ready, false);
     }
 
-    private static ToolTranscriptBlock? LastIncompleteTool(UiSessionSnapshot snapshot)
+    private static ActiveTool? LastActiveTool(UiSessionSnapshot snapshot)
     {
         for (var index = snapshot.Transcript.Length - 1; index >= 0; index--)
         {
-            if (snapshot.Transcript[index] is ToolTranscriptBlock { Complete: false } tool)
+            switch (snapshot.Transcript[index])
             {
-                return tool;
+                case ToolActivityTranscriptBlock { CompletionState: ToolActivityCompletionState.Active } activity:
+                    for (var callIndex = activity.Calls.Length - 1; callIndex >= 0; callIndex--)
+                    {
+                        var call = activity.Calls[callIndex];
+                        if (call.Status is ToolCallStatus.Pending or ToolCallStatus.AwaitingApproval or ToolCallStatus.Running)
+                        {
+                            return new ActiveTool(call.ToolName, activity.Calls.Length, IsActivity: true);
+                        }
+                    }
+
+                    return new ActiveTool(null, activity.Calls.Length, IsActivity: true);
+                case ToolTranscriptBlock { Complete: false } legacy:
+                    return new ActiveTool(legacy.ToolName, ActivityCallCount: 1, IsActivity: false);
             }
         }
 
         return null;
     }
 
+    private readonly record struct ActiveTool(string? ToolName, int ActivityCallCount, bool IsActivity);
+
     private static string SingleLine(string value)
     {
-        var newline = value.IndexOfAny(['\r', '\n']);
-        return (newline < 0 ? value : value[..newline]).Trim();
+        var sanitized = TerminalTextSanitizer.Sanitize(value);
+        var newline = sanitized.IndexOf('\n');
+        return (newline < 0 ? sanitized : sanitized[..newline]).Trim();
     }
 }

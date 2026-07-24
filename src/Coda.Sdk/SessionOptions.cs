@@ -76,6 +76,11 @@ public sealed record SessionOptions
     /// <summary>Named output style persona (e.g. "concise", "explanatory", "code-reviewer"). Null or "default" = no change.</summary>
     public string? OutputStyle { get; init; }
 
+    /// <summary>
+    /// Complete exact root system prompt. Null uses normal Coda construction; empty and whitespace are exact values.
+    /// </summary>
+    public string? SystemPromptOverride { get; init; }
+
     /// <summary>Reasoning effort level (low/medium/high/max), or null for the model default. Honored only by models that support effort.</summary>
     public string? Effort { get; init; }
 

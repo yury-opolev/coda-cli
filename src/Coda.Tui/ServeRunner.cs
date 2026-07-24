@@ -36,6 +36,11 @@ public static class ServeRunner
     public static ServeOptions Parse(IReadOnlyList<string> args, string? userSettingsDir)
     {
         var raw = ServeOptions.Parse(args);
+        if (raw.Error is not null)
+        {
+            return raw;
+        }
+
         var workingDirectory = raw.WorkingDirectory ?? Directory.GetCurrentDirectory();
 
         // When no explicit --provider/--model is given, fall back to the SAME merged
@@ -267,12 +272,35 @@ public static class ServeRunner
                 return 1;
             }
 
+            var startupWorkingDirectory = Directory.GetCurrentDirectory();
+            var raw = ServeOptions.Parse(args);
+            if (raw.Error is not null)
+            {
+                Console.Error.WriteLine($"coda serve: {raw.Error}");
+                return 1;
+            }
+
+            try
+            {
+                raw = raw with
+                {
+                    SystemPromptOverride = await SystemPromptSourceResolver.ResolveAsync(
+                        raw.SystemPromptSource,
+                        startupWorkingDirectory,
+                        cancellationToken).ConfigureAwait(false),
+                };
+            }
+            catch (SystemPromptSourceException ex)
+            {
+                Console.Error.WriteLine($"coda serve: {ex.Message}");
+                return 1;
+            }
+
             // Load the merged settings ONCE and reuse it for both the provider/model defaults
             // (ApplyDefaults) and the telemetry block (BuildSessionOptions) — the on-disk file is
             // never written. (Parse() loads internally too, but it is the hermetic test seam;
             // here we avoid reading the same files twice on startup.)
-            var raw = ServeOptions.Parse(args);
-            var workingDirectory = raw.WorkingDirectory ?? Directory.GetCurrentDirectory();
+            var workingDirectory = raw.WorkingDirectory ?? startupWorkingDirectory;
             var settings = SettingsLoader.Load(workingDirectory);
             // ApplyDefaults resolves the provider/model from flags+settings ALONE (no credential I/O),
             // so with no --provider the model is not yet known; it is re-resolved for the effective
@@ -450,6 +478,7 @@ public static class ServeRunner
             InteractivePrompt = null,
             Goal = options.Goal,
             EnableSessionMemory = options.EnableSessionMemory,
+            SystemPromptOverride = options.SystemPromptOverride,
             MaxStopContinuations = options.MaxStopContinuations,
             GoalMaxDuration = options.GoalMaxDuration,
             GoalMaxContinuations = options.GoalMaxContinuations,

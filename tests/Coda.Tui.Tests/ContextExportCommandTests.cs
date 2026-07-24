@@ -65,6 +65,17 @@ public sealed class ContextExportCommandTests
         Assert.Contains("%", console.Output);
     }
 
+    [Fact]
+    public void Context_session_options_preserve_the_live_empty_system_prompt_override()
+    {
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.SystemPromptOverride = "";
+
+        var options = ContextCommand.BuildSessionOptions(context);
+
+        Assert.Equal("", options.SystemPromptOverride);
+    }
+
     // ── /export tests ────────────────────────────────────────────────────────
 
     [Fact]

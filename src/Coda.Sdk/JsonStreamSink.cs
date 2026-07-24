@@ -28,16 +28,16 @@ public sealed class JsonStreamSink : IAgentSink
     }
 
     public void OnToolCall(string toolName, string inputJson) =>
-        this.Emit(new JsonObject { ["type"] = "tool_use", ["name"] = toolName, ["input"] = ParseInput(inputJson) });
+        this.EmitToolCall(toolName, inputJson, null);
 
     public void OnToolResult(string toolName, ToolResult result) =>
-        this.Emit(new JsonObject
-        {
-            ["type"] = "tool_result",
-            ["name"] = toolName,
-            ["content"] = result.Content,
-            ["is_error"] = result.IsError,
-        });
+        this.EmitToolResult(toolName, result, null, null);
+
+    void IAgentSink.OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) =>
+        this.EmitToolCall(toolName, inputJson, identity);
+
+    void IAgentSink.OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) =>
+        this.EmitToolResult(toolName, result, identity, status);
 
     public void OnError(string message) =>
         this.Emit(new JsonObject { ["type"] = "error", ["message"] = message });
@@ -80,6 +80,44 @@ public sealed class JsonStreamSink : IAgentSink
         {
             return JsonValue.Create(inputJson);
         }
+    }
+
+    private void EmitToolCall(string toolName, string inputJson, ToolCallIdentity? identity)
+    {
+        var obj = new JsonObject { ["type"] = "tool_use", ["name"] = toolName, ["input"] = ParseInput(inputJson) };
+        AddIdentity(obj, identity);
+        this.Emit(obj);
+    }
+
+    private void EmitToolResult(string toolName, ToolResult result, ToolCallIdentity? identity, ToolCallStatus? status)
+    {
+        var obj = new JsonObject
+        {
+            ["type"] = "tool_result",
+            ["name"] = toolName,
+            ["content"] = result.Content,
+            ["is_error"] = result.IsError,
+        };
+        AddIdentity(obj, identity);
+        if (status is not null)
+        {
+            obj["status"] = status.ToString();
+        }
+
+        this.Emit(obj);
+    }
+
+    private static void AddIdentity(JsonObject obj, ToolCallIdentity? identity)
+    {
+        if (identity is not { } value)
+        {
+            return;
+        }
+
+        obj["root_turn_id"] = value.RootTurnId;
+        obj["activity_id"] = value.ActivityId;
+        obj["call_id"] = value.CallId;
+        obj["source_id"] = value.SourceId;
     }
 
     private void Emit(JsonObject obj)

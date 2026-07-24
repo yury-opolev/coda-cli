@@ -39,10 +39,18 @@ public sealed partial class TaskManager : IAsyncDisposable
         // that arrives after sees _shuttingDown under the lock and is rejected — never a task that
         // shutdown misses, and never a worker/log starting after teardown.
         List<ManagedTask> running;
+        bool becameBusy;
         lock (_gate)
         {
+            becameBusy = IsIdleLocked();
             _shuttingDown = true;
+            Monitor.PulseAll(_gate);
             running = _order.Where(t => t.Status == TaskRunStatus.Running).ToList();
+        }
+
+        if (becameBusy)
+        {
+            RaiseIdleStateChanged();
         }
 
         // Cancel every running task's token AND explicitly tree-kill its attached shell process (if

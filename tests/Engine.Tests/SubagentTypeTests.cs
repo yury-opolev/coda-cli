@@ -312,4 +312,25 @@ public sealed class SubagentTypeTests
         Assert.NotNull(client.LastSystem);
         Assert.DoesNotContain(AnthropicModels.AnthropicSystemPrefix, client.LastSystem);
     }
+
+    [Fact]
+    public async Task Subagent_role_prompt_does_not_inherit_the_root_exact_override()
+    {
+        const string rootExactOverride = "ROOT-EXACT-OVERRIDE";
+        var endTurn = new[]
+        {
+            AssistantStreamEvent.Delta("done"),
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+        var client = new CapturingScriptedClient(endTurn);
+        var options = Options() with { SystemPrompt = rootExactOverride };
+        var host = new SubagentHost(client, new ToolRegistry([]), new AllowAllPermissionPrompt(), options, new TaskManager(sessionId: "type-sub", logRoot: null), includeAnthropicSystemPrefix: false);
+
+        await host.RunSubagentAsync("general-purpose", "hello", new NullSink(), new SteeringInbox(), "task-0001", 1, CancellationToken.None);
+
+        Assert.NotNull(client.LastSystem);
+        Assert.DoesNotContain(rootExactOverride, client.LastSystem);
+        Assert.Contains("You are a subagent launched to complete a single, self-contained task", client.LastSystem);
+        Assert.Contains("# Environment", client.LastSystem);
+    }
 }

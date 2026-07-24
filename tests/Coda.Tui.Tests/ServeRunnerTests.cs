@@ -112,6 +112,60 @@ public sealed class ServeRunnerTests
         Assert.Equal("/tmp", options.WorkingDirectory);
     }
 
+    [Fact]
+    public void Parse_remains_permissive_for_unknown_flags_but_extracts_system_prompt()
+    {
+        var parsed = ServeOptions.Parse(
+            ["--future-flag", "future-value", "--system-prompt", "exact"]);
+
+        Assert.Null(parsed.Error);
+        Assert.Equal("exact", Assert.IsType<SystemPromptSource.Inline>(parsed.SystemPromptSource).Text);
+    }
+
+    [Theory]
+    [InlineData("--system-prompt", "--system-prompt requires a value.")]
+    [InlineData("--system-prompt-file", "--system-prompt-file requires a value.")]
+    [InlineData("--system-prompt=exact", "System prompt options require separate arguments for the flag and value.")]
+    [InlineData("--system-prompt-file=prompt.txt", "System prompt options require separate arguments for the flag and value.")]
+    public void Parse_rejects_missing_or_equals_prompt_sources(string argument, string expectedError)
+    {
+        var parsed = ServeOptions.Parse([argument]);
+
+        Assert.Equal(expectedError, parsed.Error);
+    }
+
+    [Fact]
+    public void Parse_rejects_duplicate_prompt_sources()
+    {
+        var parsed = ServeOptions.Parse(
+            ["--system-prompt", "one", "--system-prompt-file", "prompt.txt"]);
+
+        Assert.Equal("Specify only one of --system-prompt or --system-prompt-file, once.", parsed.Error);
+    }
+
+    [Fact]
+    public async Task RunAsync_reports_missing_system_prompt_file_before_startup()
+    {
+        const string missingFile = "does-not-exist-serve-system-prompt.txt";
+        var error = new StringWriter();
+        var originalError = Console.Error;
+        Console.SetError(error);
+        try
+        {
+            var exitCode = await ServeRunner.RunAsync(
+                ["--system-prompt-file", missingFile],
+                CancellationToken.None);
+
+            Assert.Equal(1, exitCode);
+            Assert.StartsWith("coda serve:", error.ToString());
+            Assert.Contains(missingFile, error.ToString());
+        }
+        finally
+        {
+            Console.SetError(originalError);
+        }
+    }
+
     // ── MCP enable/disable parsing ────────────────────────────────────────
 
     [Fact]
@@ -428,6 +482,16 @@ public sealed class ServeRunnerTests
         var so = ServeRunner.BuildSessionOptions(options);
 
         Assert.Empty(so.ExtraTools);
+    }
+
+    [Fact]
+    public void BuildSessionOptions_preserves_an_explicit_empty_system_prompt_override()
+    {
+        var options = new ServeOptions { SystemPromptOverride = "" };
+
+        var sessionOptions = ServeRunner.BuildSessionOptions(options);
+
+        Assert.Equal("", sessionOptions.SystemPromptOverride);
     }
 
     [Fact]

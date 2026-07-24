@@ -53,6 +53,24 @@ public sealed class SubagentHost : ISubagentHost
     /// </summary>
     internal IPermissionPrompt Permissions => this.permissions;
 
+    public Task<string> RunSubagentAsync(
+        string subagentType,
+        string prompt,
+        IAgentSink sink,
+        SteeringInbox steering,
+        string taskId,
+        int depth,
+        CancellationToken cancellationToken = default) =>
+        this.RunSubagentAsync(
+            subagentType,
+            prompt,
+            sink,
+            steering,
+            taskId,
+            depth,
+            parentActivity: null,
+            cancellationToken: cancellationToken);
+
     public async Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,
@@ -60,6 +78,7 @@ public sealed class SubagentHost : ISubagentHost
         SteeringInbox steering,
         string taskId,
         int depth,
+        ToolActivityContext? parentActivity,
         CancellationToken cancellationToken = default)
     {
         var definition = BuiltInAgents.Resolve(subagentType);
@@ -83,6 +102,9 @@ public sealed class SubagentHost : ISubagentHost
         // the output/cancellation tools (task_output/task_stop) — and no subagent host, so they
         // can neither spawn children nor read or stop any task in the session. A depth-1
         // general-purpose child keeps them to manage its own descendants. See ResolveChildTools.
+        var childActivity = parentActivity is null
+            ? ToolActivityContext.CreateRoot()
+            : parentActivity.ForSubagent(taskId);
         var readOnlyDefinition = definition.ReadOnlyToolsOnly;
         var tools = ResolveChildTools(this.subagentTools, readOnlyDefinition, depth);
 
@@ -105,7 +127,8 @@ public sealed class SubagentHost : ISubagentHost
             currentTaskId: taskId,
             currentDepth: depth,
             steering: steering,
-            toolProgressInterval: this.toolProgressInterval);
+            toolProgressInterval: this.toolProgressInterval,
+            toolActivity: childActivity);
 
         var collecting = new CollectingSink(sink);
         var history = new List<ChatMessage> { ChatMessage.UserText(prompt) };
@@ -156,9 +179,8 @@ public sealed class SubagentHost : ISubagentHost
 
     /// <summary>
     /// Forwards every event to the parent sink while collecting the subagent's text. Forwarding is
-    /// total: the optional default-interface pulses (<see cref="IAgentSink.OnToolProgress"/> and
-    /// <see cref="IAgentSink.OnUsage"/>, plus limit/stop) are overridden here so they reach the
-    /// parent — a sink that leaves them as the interface no-op would silently swallow them.
+    /// total: identity-bearing tool events and the optional default-interface pulses are overridden
+    /// here so they reach the parent without falling back to legacy callbacks that discard identity.
     /// </summary>
     private sealed class CollectingSink : IAgentSink
     {
@@ -182,9 +204,27 @@ public sealed class SubagentHost : ISubagentHost
 
         public void OnToolCall(string toolName, string inputPreview) => this.parent.OnToolCall(toolName, inputPreview);
 
+        public void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) =>
+            this.parent.OnToolQueued(identity, toolName, inputJson);
+
+        public void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) =>
+            this.parent.OnToolCall(identity, toolName, inputJson);
+
+        public void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) =>
+            this.parent.OnToolStatus(identity, toolName, status);
+
         public void OnToolResult(string toolName, ToolResult result) => this.parent.OnToolResult(toolName, result);
 
         public void OnToolProgress(string toolName, long elapsedMs) => this.parent.OnToolProgress(toolName, elapsedMs);
+
+        public void OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs) =>
+            this.parent.OnToolProgress(identity, toolName, elapsedMs);
+
+        public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) =>
+            this.parent.OnToolResult(identity, toolName, result, status);
+
+        public void OnToolActivityCompleted(ToolActivitySummary summary) =>
+            this.parent.OnToolActivityCompleted(summary);
 
         public void OnError(string message) => this.parent.OnError(message);
 

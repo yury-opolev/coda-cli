@@ -72,4 +72,11 @@ public sealed record AgentLoopSpec(
     AgentExecutionGate? Gate = null,
     IScheduleRuntimeView? ScheduleRuntime = null,
     string? CurrentTaskId = null,
-    int CurrentDepth = 0);
+    int CurrentDepth = 0)
+{
+    /// <summary>
+    /// Root tool-activity identity owned by the host for this loop invocation. The loop derives
+    /// a single activity id from it when it executes the first tool batch.
+    /// </summary>
+    public ToolActivityContext? ToolActivity { get; init; }
+}

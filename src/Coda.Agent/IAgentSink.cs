@@ -14,8 +14,22 @@ public interface IAgentSink
     /// <summary>The model requested a tool call. <paramref name="inputJson"/> is the raw JSON arguments.</summary>
     void OnToolCall(string toolName, string inputJson);
 
+    /// <summary>A tool call was queued for execution. Optional.</summary>
+    void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) { }
+
+    /// <summary>The model requested a correlated tool call.</summary>
+    void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) =>
+        OnToolCall(toolName, inputJson);
+
+    /// <summary>A correlated tool call changed status. Optional.</summary>
+    void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) { }
+
     /// <summary>A tool finished.</summary>
     void OnToolResult(string toolName, ToolResult result);
+
+    /// <summary>A correlated tool call finished.</summary>
+    void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) =>
+        OnToolResult(toolName, result);
 
     /// <summary>
     /// A liveness pulse emitted periodically while a tool is still executing, so an
@@ -24,6 +38,13 @@ public interface IAgentSink
     /// name="elapsedMs"/> is how long the tool has been running so far. Optional.
     /// </summary>
     void OnToolProgress(string toolName, long elapsedMs) { }
+
+    /// <summary>A liveness pulse for a correlated tool call.</summary>
+    void OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs) =>
+        OnToolProgress(toolName, elapsedMs);
+
+    /// <summary>A correlated tool activity completed. Optional.</summary>
+    void OnToolActivityCompleted(ToolActivitySummary summary) { }
 
     /// <summary>A non-fatal error occurred during the turn.</summary>
     void OnError(string message);

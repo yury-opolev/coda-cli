@@ -1,4 +1,6 @@
+using System.Collections.Immutable;
 using Coda.Mcp;
+using Coda.Tui.Mcp;
 
 namespace Coda.Tui.Commands;
 
@@ -8,6 +10,13 @@ public sealed record McpFlagParseResult(bool Ok, string? Error, McpServerConfig?
     public static McpFlagParseResult Fail(string error) => new(false, error, null);
 
     public static McpFlagParseResult Success(McpServerConfig config) => new(true, null, config);
+}
+
+public sealed record McpEditFlagParseResult(bool Ok, string? Error, McpServerDraft? Draft)
+{
+    public static McpEditFlagParseResult Fail(string error) => new(false, error, null);
+
+    public static McpEditFlagParseResult Success(McpServerDraft draft) => new(true, null, draft);
 }
 
 /// <summary>
@@ -88,6 +97,185 @@ public static class McpFlagParser
             null => McpFlagParseResult.Fail("Specify a transport: --command <cmd> (stdio) or --url <url> (http)."),
             _ => McpFlagParseResult.Fail($"Unknown transport '{kind}' (use stdio or http)."),
         };
+    }
+
+    public static McpEditFlagParseResult ParseEdit(
+        McpServerDraft current,
+        IReadOnlyList<string> flags)
+    {
+        ArgumentNullException.ThrowIfNull(current);
+        ArgumentNullException.ThrowIfNull(flags);
+
+        var name = current.Name;
+        var transport = current.Transport;
+        var command = current.Command;
+        var args = current.Args;
+        var url = current.Url;
+        var environment = current.Environment.ToList();
+        var headers = current.Headers.ToList();
+        var auth = current.AuthMode;
+        var clientId = current.ClientId;
+        var scopes = current.Scopes;
+        var bearer = current.BearerToken;
+        var argumentItems = current.ArgumentItems;
+        var scopeItems = current.ScopeItems;
+        var argsSpecified = false;
+        var scopesSpecified = false;
+        var urlChanged = current.UrlChanged;
+
+        for (var i = 0; i < flags.Count; i++)
+        {
+            var flag = flags[i];
+            string? Next() => ++i < flags.Count ? flags[i] : null;
+
+            switch (flag)
+            {
+                case "--name":
+                    name = Next();
+                    break;
+                case "--transport":
+                    var rawTransport = Next()?.ToLowerInvariant();
+                    if (rawTransport is not ("stdio" or "http"))
+                    {
+                        return McpEditFlagParseResult.Fail($"Unknown transport '{rawTransport}' (use stdio or http).");
+                    }
+
+                    transport = rawTransport == "stdio" ? McpTransportKind.Stdio : McpTransportKind.Http;
+                    break;
+                case "--command":
+                    command = Next();
+                    transport = McpTransportKind.Stdio;
+                    break;
+                case "--args":
+                    argsSpecified = true;
+                    args = SplitItems(Next());
+                    argumentItems = args.Select(McpDraftListItem.New).ToImmutableArray();
+                    transport = McpTransportKind.Stdio;
+                    break;
+                case "--env":
+                    if (SplitPair(Next()) is not { } envPair)
+                    {
+                        return McpEditFlagParseResult.Fail("--env expects KEY=VALUE.");
+                    }
+
+                    environment = ReplaceSecret(environment, envPair.Key, envPair.Value, "env");
+                    transport = McpTransportKind.Stdio;
+                    break;
+                case "--url":
+                    url = Next();
+                    urlChanged = true;
+                    transport = McpTransportKind.Http;
+                    break;
+                case "--header":
+                    if (SplitPair(Next()) is not { } headerPair)
+                    {
+                        return McpEditFlagParseResult.Fail("--header expects NAME=VALUE.");
+                    }
+
+                    headers = ReplaceSecret(headers, headerPair.Key, headerPair.Value, "header");
+                    transport = McpTransportKind.Http;
+                    break;
+                case "--auth":
+                    var rawAuth = Next()?.ToLowerInvariant();
+                    if (rawAuth is not ("none" or "bearer" or "oauth"))
+                    {
+                        return McpEditFlagParseResult.Fail($"Unknown --auth '{rawAuth}' (use none, bearer, or oauth).");
+                    }
+
+                    auth = rawAuth switch
+                    {
+                        "none" => McpAuthMode.None,
+                        "bearer" => McpAuthMode.Bearer,
+                        _ => McpAuthMode.OAuth,
+                    };
+                    transport = McpTransportKind.Http;
+                    break;
+                case "--token":
+                    var token = Next();
+                    if (string.IsNullOrWhiteSpace(token))
+                    {
+                        return McpEditFlagParseResult.Fail("--token requires a value.");
+                    }
+
+                    bearer = new McpSecretChange("auth/token", McpSecretChangeKind.Replace, new McpSecretReplacement(token));
+                    auth = McpAuthMode.Bearer;
+                    transport = McpTransportKind.Http;
+                    break;
+                case "--client-id":
+                    clientId = Next();
+                    transport = McpTransportKind.Http;
+                    break;
+                case "--scopes":
+                    scopesSpecified = true;
+                    scopes = SplitItems(Next());
+                    scopeItems = scopes.Select(McpDraftListItem.New).ToImmutableArray();
+                    transport = McpTransportKind.Http;
+                    break;
+                default:
+                    return McpEditFlagParseResult.Fail($"Unknown flag '{flag}'.");
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(name))
+        {
+            return McpEditFlagParseResult.Fail("--name requires a non-empty value.");
+        }
+
+        if (transport == McpTransportKind.Stdio && string.IsNullOrWhiteSpace(command))
+        {
+            return McpEditFlagParseResult.Fail("--command is required for a stdio server.");
+        }
+
+        if (transport == McpTransportKind.Http && !Uri.TryCreate(url, UriKind.Absolute, out _))
+        {
+            return McpEditFlagParseResult.Fail("--url must be a valid absolute URL for an http server.");
+        }
+
+        return McpEditFlagParseResult.Success(current with
+        {
+            Name = name,
+            Transport = transport,
+            Command = command,
+            Args = argsSpecified ? args : current.Args,
+            ArgumentItems = argsSpecified ? argumentItems : current.ArgumentItems,
+            Url = url,
+            UrlChanged = urlChanged,
+            Environment = environment.ToImmutableArray(),
+            Headers = headers.ToImmutableArray(),
+            AuthMode = auth,
+            ClientId = clientId,
+            Scopes = scopesSpecified ? scopes : current.Scopes,
+            ScopeItems = scopesSpecified ? scopeItems : current.ScopeItems,
+            BearerToken = bearer,
+        });
+    }
+
+    private static ImmutableArray<string> SplitItems(string? raw) =>
+        raw is null
+            ? ImmutableArray<string>.Empty
+            : raw.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToImmutableArray();
+
+    private static List<McpNamedSecretDraft> ReplaceSecret(
+        List<McpNamedSecretDraft> values,
+        string name,
+        string value,
+        string prefix)
+    {
+        var index = values.FindIndex(item => string.Equals(item.Name, name, StringComparison.Ordinal));
+        var replacement = new McpNamedSecretDraft(
+            name,
+            index >= 0 ? values[index].ExistingSource : McpSecretSource.None,
+            new McpSecretChange($"{prefix}/{name}", McpSecretChangeKind.Replace, new McpSecretReplacement(value)));
+        if (index >= 0)
+        {
+            values[index] = replacement;
+        }
+        else
+        {
+            values.Add(replacement);
+        }
+
+        return values;
     }
 
     private static McpFlagParseResult BuildStdio(string? command, List<string> args, Dictionary<string, string> env)

@@ -51,6 +51,7 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly TimeSpan toolMaxDuration;
     private readonly TimeSpan? transportRetryDelay;
     private readonly Func<CancellationToken, Task>? persistTurn;
+    private readonly ToolActivityContext initialToolActivity;
 
     /// <summary>
     /// How often <see cref="IAgentSink.OnToolProgress"/> pulses while a tool executes. Kept
@@ -115,7 +116,8 @@ public sealed partial class AgentLoop : IAgentLoop
         Func<CancellationToken, Task>? persistTurnAsync = null,
         TimeSpan? toolMaxDuration = null,
         TimeSpan? transportRetryDelay = null,
-        AgentExecutionGate? gate = null)
+        AgentExecutionGate? gate = null,
+        ToolActivityContext? toolActivity = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -150,6 +152,7 @@ public sealed partial class AgentLoop : IAgentLoop
         // don't sleep the real 0.5s/2s ladder. Production leaves it null → the real backoff.
         this.transportRetryDelay = transportRetryDelay;
         this.persistTurn = persistTurnAsync;
+        this.initialToolActivity = toolActivity ?? ToolActivityContext.CreateRoot();
     }
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "turn start: iteration={iteration}, model={model}, historyMessages={messageCount}, tools={toolCount}")]
@@ -242,6 +245,7 @@ public sealed partial class AgentLoop : IAgentLoop
         var stopContinuations = 0;
         var stopHookActive = false;
         string? lastInjectedReminder = null;
+        var activity = this.initialToolActivity;
 
         try
         {
@@ -433,6 +437,22 @@ public sealed partial class AgentLoop : IAgentLoop
                     assistantContent.Add(new TextBlock(text.ToString()));
                 }
 
+                if (toolUses.Count > 0)
+                {
+                    activity = activity.EnsureActivity();
+                    for (var index = 0; index < toolUses.Count; index++)
+                    {
+                        var toolUse = toolUses[index];
+                        var identity = activity.ForCall(toolUse.Id);
+                        toolUses[index] = toolUse with
+                        {
+                            RootTurnId = identity.RootTurnId,
+                            ActivityId = identity.ActivityId,
+                            SourceId = identity.SourceId,
+                        };
+                    }
+                }
+
                 assistantContent.AddRange(toolUses);
                 history.Add(new ChatMessage(ChatRole.Assistant, assistantContent));
 
@@ -558,7 +578,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 // direct result of a prior stop-hook continuation. Reset so stop hooks
                 // treat the next natural stop correctly.
                 stopHookActive = false;
-                var resultBlocks = await this.RunToolsAsync(toolUses, sink, cancellationToken).ConfigureAwait(false);
+                var resultBlocks = await this.RunToolsAsync(toolUses, activity, sink, cancellationToken).ConfigureAwait(false);
                 history.Add(new ChatMessage(ChatRole.User, resultBlocks));
 
                 // Persist again once tool results are in history, so a kill in the gap before
@@ -598,13 +618,16 @@ public sealed partial class AgentLoop : IAgentLoop
 
     private async Task<List<ContentBlock>> RunToolsAsync(
         IReadOnlyList<ToolUseBlock> toolUses,
+        ToolActivityContext activity,
         IAgentSink sink,
         CancellationToken cancellationToken)
     {
         var results = new List<ContentBlock>();
+        var identities = toolUses.Select(toolUse => activity.ForCall(toolUse.Id)).ToArray();
         var context = new ToolContext(this.options.WorkingDirectory)
         {
             Sink = sink,
+            ToolActivity = activity,
             Subagents = this.subagents,
             Todos = this.todos,
             Schedules = this.schedules,
@@ -623,17 +646,25 @@ public sealed partial class AgentLoop : IAgentLoop
         for (var i = 0; i < toolUses.Count; i++)
         {
             var toolUse = toolUses[i];
+            sink.OnToolQueued(identities[i], toolUse.Name, toolUse.InputJson);
+        }
+
+        for (var i = 0; i < toolUses.Count; i++)
+        {
+            var toolUse = toolUses[i];
+            var identity = identities[i];
             var delivered = this.steering?.TakeAllForDelivery() ?? [];
             if (delivered.Count > 0)
             {
                 for (var skippedIndex = i; skippedIndex < toolUses.Count; skippedIndex++)
                 {
                     var skipped = toolUses[skippedIndex];
+                    var skippedIdentity = identities[skippedIndex];
                     var skippedResult = new ToolResult(
                         "Skipped: not executed because new operator steering arrived before this tool started.",
                         IsError: true);
-                    sink.OnToolResult(skipped.Name, skippedResult);
-                    results.Add(new ToolResultBlock(skipped.Id, skippedResult.Content, skippedResult.IsError));
+                    sink.OnToolResult(skippedIdentity, skipped.Name, skippedResult, ToolCallStatus.Skipped);
+                    results.Add(CreateToolResultBlock(skippedIdentity, skippedResult, ToolCallStatus.Skipped));
                 }
 
                 results.Add(new TextBlock(string.Join("\n\n", delivered.Select(entry => entry.Text))));
@@ -641,15 +672,15 @@ public sealed partial class AgentLoop : IAgentLoop
                 break;
             }
 
-            sink.OnToolCall(toolUse.Name, toolUse.InputJson);
+            sink.OnToolCall(identity, toolUse.Name, toolUse.InputJson);
             this.LogToolCall(toolUse.Name, SummarizeToolInput(toolUse.InputJson));
 
             var tool = this.tools.Resolve(toolUse.Name);
             if (tool is null)
             {
                 var unknown = new ToolResult($"Unknown tool '{toolUse.Name}'.", IsError: true);
-                sink.OnToolResult(toolUse.Name, unknown);
-                results.Add(new ToolResultBlock(toolUse.Id, unknown.Content, unknown.IsError));
+                sink.OnToolResult(identity, toolUse.Name, unknown, ToolCallStatus.Failed);
+                results.Add(CreateToolResultBlock(identity, unknown, ToolCallStatus.Failed));
                 continue;
             }
 
@@ -666,20 +697,39 @@ public sealed partial class AgentLoop : IAgentLoop
                     var blocked = new ToolResult(
                         $"Blocked by hook: {hookResult.Message}",
                         IsError: true);
-                    sink.OnToolResult(toolUse.Name, blocked);
-                    results.Add(new ToolResultBlock(toolUse.Id, blocked.Content, blocked.IsError));
+                    sink.OnToolResult(identity, toolUse.Name, blocked, ToolCallStatus.Failed);
+                    results.Add(CreateToolResultBlock(identity, blocked, ToolCallStatus.Failed));
                     continue;
                 }
             }
 
             if (!tool.IsReadOnly)
             {
-                var allowed = await this.permissions.RequestAsync(tool, toolUse.InputJson, cancellationToken).ConfigureAwait(false);
+                sink.OnToolStatus(identity, toolUse.Name, ToolCallStatus.AwaitingApproval);
+                bool allowed;
+                try
+                {
+                    allowed = await this.permissions
+                        .RequestAsync(tool, toolUse.InputJson, cancellationToken)
+                        .ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    var promptError = new ToolResult($"Permission prompt error: {ex.Message}", IsError: true);
+                    sink.OnToolResult(identity, toolUse.Name, promptError, ToolCallStatus.Failed);
+                    results.Add(CreateToolResultBlock(identity, promptError, ToolCallStatus.Failed));
+                    continue;
+                }
+
                 if (!allowed)
                 {
                     var denied = new ToolResult("Permission denied by the user.", IsError: true);
-                    sink.OnToolResult(toolUse.Name, denied);
-                    results.Add(new ToolResultBlock(toolUse.Id, denied.Content, denied.IsError));
+                    sink.OnToolResult(identity, toolUse.Name, denied, ToolCallStatus.Failed);
+                    results.Add(CreateToolResultBlock(identity, denied, ToolCallStatus.Failed));
                     continue;
                 }
             }
@@ -691,7 +741,13 @@ public sealed partial class AgentLoop : IAgentLoop
             // rethrow path — so it can never outlive the tool call.
             var toolStartedAt = Stopwatch.GetTimestamp();
             using var heartbeatCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-            var heartbeat = PumpToolProgressAsync(sink, toolUse.Name, this.toolProgressInterval, toolStartedAt, heartbeatCts.Token);
+            var heartbeat = PumpToolProgressAsync(
+                sink,
+                identity,
+                toolUse.Name,
+                this.toolProgressInterval,
+                toolStartedAt,
+                heartbeatCts.Token);
 
             // Last-resort wall-clock ceiling: the token handed to the tool is cancelled if it runs
             // past toolMaxDuration, so no single tool can wedge the session forever (the backstop the
@@ -716,6 +772,7 @@ public sealed partial class AgentLoop : IAgentLoop
                     AllowOutsideWorkingDirectory =
                         (this.options.PermissionModeState?.Mode ?? this.options.PermissionMode) == PermissionMode.BypassPermissions,
                 };
+                sink.OnToolStatus(identity, toolUse.Name, ToolCallStatus.Running);
                 result = await tool.ExecuteAsync(doc.RootElement, toolContext, toolCts.Token).ConfigureAwait(false);
             }
             catch (OperationCanceledException) when (toolCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
@@ -763,9 +820,10 @@ public sealed partial class AgentLoop : IAgentLoop
                 }
             }
 
-            sink.OnToolResult(toolUse.Name, result);
+            var terminalStatus = result.IsError ? ToolCallStatus.Failed : ToolCallStatus.Succeeded;
+            sink.OnToolResult(identity, toolUse.Name, result, terminalStatus);
             this.LogToolResult(toolUse.Name, result.IsError, result.Content.Length);
-            results.Add(new ToolResultBlock(toolUse.Id, result.Content, result.IsError));
+            results.Add(CreateToolResultBlock(identity, result, terminalStatus));
 
             // EDIT SEAM: when a mutating file tool succeeds, notify the LSP server
             // about the new file content (change + save) so it can publish diagnostics.
@@ -778,6 +836,18 @@ public sealed partial class AgentLoop : IAgentLoop
 
         return results;
     }
+
+    private static ToolResultBlock CreateToolResultBlock(
+        ToolCallIdentity identity,
+        ToolResult result,
+        ToolCallStatus status) =>
+        new(identity.CallId, result.Content, result.IsError)
+        {
+            RootTurnId = identity.RootTurnId,
+            ActivityId = identity.ActivityId,
+            SourceId = identity.SourceId,
+            ToolStatus = status.ToString(),
+        };
 
     /// <summary>
     /// Best-effort incremental transcript persist ("record on the go"). Invoked after each
@@ -826,13 +896,41 @@ public sealed partial class AgentLoop : IAgentLoop
         long startTimestamp,
         CancellationToken ct)
     {
+        await PumpToolProgressAsync(
+            interval,
+            startTimestamp,
+            ct,
+            elapsedMs => sink.OnToolProgress(toolName, elapsedMs)).ConfigureAwait(false);
+    }
+
+    internal static async Task PumpToolProgressAsync(
+        IAgentSink sink,
+        ToolCallIdentity identity,
+        string toolName,
+        TimeSpan interval,
+        long startTimestamp,
+        CancellationToken ct)
+    {
+        await PumpToolProgressAsync(
+            interval,
+            startTimestamp,
+            ct,
+            elapsedMs => sink.OnToolProgress(identity, toolName, elapsedMs)).ConfigureAwait(false);
+    }
+
+    private static async Task PumpToolProgressAsync(
+        TimeSpan interval,
+        long startTimestamp,
+        CancellationToken ct,
+        Action<long> emit)
+    {
         try
         {
             using var timer = new PeriodicTimer(interval);
             while (await timer.WaitForNextTickAsync(ct).ConfigureAwait(false))
             {
                 var elapsedMs = (long)Stopwatch.GetElapsedTime(startTimestamp).TotalMilliseconds;
-                sink.OnToolProgress(toolName, elapsedMs);
+                emit(elapsedMs);
             }
         }
         catch (OperationCanceledException)

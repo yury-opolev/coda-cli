@@ -9,6 +9,27 @@ public sealed partial class TaskManager
     /// streams its output into the task ring/log, and returns its final report. Foreground means
     /// the caller awaits the result; the task is registered exactly like a background one.
     /// </summary>
+    public Task<string> RunSubagentForegroundAsync(
+        ISubagentHost host,
+        string subagentType,
+        string prompt,
+        string description,
+        IAgentSink parentSink,
+        string? parentTaskId,
+        CancellationToken cancellationToken = default) =>
+        this.RunSubagentForegroundAsync(
+            host,
+            subagentType,
+            prompt,
+            description,
+            parentSink,
+            parentTaskId,
+            parentActivity: null,
+            cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// Registers and runs a foreground subagent while preserving its parent tool-activity identity.
+    /// </summary>
     public async Task<string> RunSubagentForegroundAsync(
         ISubagentHost host,
         string subagentType,
@@ -16,6 +37,7 @@ public sealed partial class TaskManager
         string description,
         IAgentSink parentSink,
         string? parentTaskId,
+        ToolActivityContext? parentActivity,
         CancellationToken cancellationToken = default)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Foreground);
@@ -27,7 +49,7 @@ public sealed partial class TaskManager
         try
         {
             var result = await host
-                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, linked.Token)
+                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity, linked.Token)
                 .ConfigureAwait(false);
             Complete(task.Id, result);
             return result;
@@ -290,6 +312,18 @@ public sealed partial class TaskManager
             _parent.OnToolCall(toolName, inputPreview);
         }
 
+        public void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) =>
+            _parent.OnToolQueued(identity, toolName, inputJson);
+
+        public void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson)
+        {
+            _manager.AppendOutput(_taskId, $"\n[tool: {toolName}]\n");
+            _parent.OnToolCall(identity, toolName, inputJson);
+        }
+
+        public void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) =>
+            _parent.OnToolStatus(identity, toolName, status);
+
         public void OnToolResult(string toolName, ToolResult result)
         {
             _manager.AppendOutput(_taskId, $"[/{toolName}]\n");
@@ -300,6 +334,18 @@ public sealed partial class TaskManager
         // out of the ring/log because it fires repeatedly and would flood the transcript.
         public void OnToolProgress(string toolName, long elapsedMs) =>
             _parent.OnToolProgress(toolName, elapsedMs);
+
+        public void OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs) =>
+            _parent.OnToolProgress(identity, toolName, elapsedMs);
+
+        public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status)
+        {
+            _manager.AppendOutput(_taskId, $"[/{toolName}]\n");
+            _parent.OnToolResult(identity, toolName, result, status);
+        }
+
+        public void OnToolActivityCompleted(ToolActivitySummary summary) =>
+            _parent.OnToolActivityCompleted(summary);
 
         public void OnError(string message)
         {
@@ -340,8 +386,14 @@ public sealed partial class TaskManager
         public void OnAssistantText(string delta) { }
         public void OnAssistantTextComplete() { }
         public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) { }
+        public void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) { }
+        public void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnToolProgress(string toolName, long elapsedMs) { }
+        public void OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs) { }
+        public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) { }
+        public void OnToolActivityCompleted(ToolActivitySummary summary) { }
         public void OnError(string message) { }
         public void OnLimitReached(string kind, string message) { }
         public void OnStopReason(string? stopReason) { }

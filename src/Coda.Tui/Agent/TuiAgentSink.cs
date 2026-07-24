@@ -25,11 +25,29 @@ public sealed class TuiAgentSink : IAgentSink
     public void OnToolCall(string toolName, string inputJson) =>
         this.publisher.Publish(new ToolStartedEvent(toolName, inputJson));
 
+    public void OnToolQueued(ToolCallIdentity identity, string toolName, string inputJson) =>
+        this.publisher.Publish(new ToolQueuedEvent(identity, toolName, inputJson));
+
+    public void OnToolCall(ToolCallIdentity identity, string toolName, string inputJson) =>
+        this.publisher.Publish(new ToolStartedEvent(toolName, inputJson, identity));
+
+    public void OnToolStatus(ToolCallIdentity identity, string toolName, ToolCallStatus status) =>
+        this.publisher.Publish(new ToolStateChangedEvent(identity, toolName, status));
+
     public void OnToolProgress(string toolName, long elapsedMs) =>
         this.publisher.Publish(new ToolProgressEvent(toolName, elapsedMs));
 
+    public void OnToolProgress(ToolCallIdentity identity, string toolName, long elapsedMs) =>
+        this.publisher.Publish(new ToolProgressEvent(toolName, elapsedMs, identity));
+
     public void OnToolResult(string toolName, ToolResult result) =>
         this.publisher.Publish(new ToolCompletedEvent(toolName, result));
+
+    public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) =>
+        this.publisher.Publish(new ToolCompletedEvent(toolName, result, identity, status));
+
+    public void OnToolActivityCompleted(ToolActivitySummary summary) =>
+        this.publisher.Publish(new ToolActivityCompletedEvent(summary));
 
     public void OnUsage(TokenUsage usage) => this.publisher.Publish(new UsageEvent(usage));
 

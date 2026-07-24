@@ -14,7 +14,7 @@ public static class OpenAiRequest
     public static JsonObject Build(ChatRequest request)
     {
         var messages = new JsonArray();
-        if (!string.IsNullOrEmpty(request.System))
+        if (request.System is not null)
         {
             messages.Add(new JsonObject { ["role"] = "system", ["content"] = request.System });
         }

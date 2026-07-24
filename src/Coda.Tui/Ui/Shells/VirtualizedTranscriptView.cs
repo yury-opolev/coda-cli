@@ -37,6 +37,7 @@ internal sealed class VirtualizedTranscriptView : View
     private readonly TranscriptSelection selection = new();
     private bool dragging;
     private bool scrollbarDragging;
+    private int scrollbarDragOffset;
     private bool scrollbarVisible;
     private TranscriptCellPosition pressPosition;
 
@@ -97,11 +98,23 @@ internal sealed class VirtualizedTranscriptView : View
 
     internal int ContentWidthForTest => this.ContentWidth;
 
+    internal int? LastRightAnnotationEndColumnForTest { get; private set; }
+
     internal int ContentRowsForTest => this.viewport.ContentRows;
 
     internal int ViewportHeightForTest => this.viewport.ViewportHeight;
 
     internal bool ScrollbarDraggingForTest => this.scrollbarDragging;
+
+    internal bool MouseCaptureActiveForTest => this.dragging || this.scrollbarDragging;
+
+    internal void ScrollToRowForTest(int row) =>
+        this.viewport.ScrollToRow(row, this.index.AnchorAt(row));
+
+    internal TranscriptViewportAnchor? TopAnchorForTest =>
+        this.index.AnchorAt(this.viewport.TopRow);
+
+    internal TranscriptFollowMode FollowModeForTest => this.viewport.Mode;
 
     /// <summary>Number of times the transcript was fully rebuilt (initial/reseed/resize).</summary>
     internal int ReplaceAllCount { get; private set; }
@@ -119,8 +132,9 @@ internal sealed class VirtualizedTranscriptView : View
     internal void ReplaceAll(ImmutableArray<TranscriptBlock> blocks)
     {
         this.ReplaceAllCount++;
+        var anchor = this.CaptureViewportAnchor();
         this.index.ReplaceAll(blocks, this.currentWidth);
-        this.viewport.SetContentRows(this.index.TotalRows);
+        this.ApplyContentLayout(anchor);
         this.UpdateScrollbarLayout();
         this.selectedBlockId = blocks.IsDefaultOrEmpty ? null : blocks[^1].Id;
         this.PruneExpanded(blocks);
@@ -131,18 +145,19 @@ internal sealed class VirtualizedTranscriptView : View
     internal void Append(TranscriptBlock block)
     {
         this.AppendCount++;
+        var anchor = this.CaptureViewportAnchor();
         var before = this.index.TotalRows;
         this.index.Append(block, this.currentWidth);
         var delta = this.index.TotalRows - before;
-        this.viewport.OnRowsAppended(delta);
+        this.ApplyContentLayout(anchor);
         if (delta > 0)
         {
-            this.viewport.OnBlockAppended();
+            this.viewport.RecordAppendedRows(delta);
+            this.viewport.OnVisibleBlockInserted();
         }
 
         this.UpdateScrollbarLayout();
         this.selectedBlockId = block.Id;
-        this.UpdateScrollbarLayout();
         this.SetNeedsDraw();
     }
 
@@ -162,6 +177,7 @@ internal sealed class VirtualizedTranscriptView : View
 
     private void ReplaceBlock(int position, TranscriptBlock block, bool tail)
     {
+        var anchor = this.CaptureViewportAnchor();
         var before = this.index.TotalRows;
         if (tail)
         {
@@ -173,25 +189,24 @@ internal sealed class VirtualizedTranscriptView : View
         }
 
         var delta = this.index.TotalRows - before;
+        this.ApplyContentLayout(anchor);
         if (tail && delta > 0)
         {
-            this.viewport.OnRowsAppended(delta);
-        }
-        else if (delta != 0)
-        {
-            this.viewport.SetContentRows(this.index.TotalRows);
+            this.viewport.RecordAppendedRows(delta);
         }
 
         this.selectedBlockId = block.Id;
+        this.UpdateScrollbarLayout();
         this.SetNeedsDraw();
     }
 
     /// <summary>Re-wraps the transcript for a new content width (called on resize).</summary>
     internal void Reflow(int width)
     {
+        var anchor = this.CaptureViewportAnchor();
         this.currentWidth = width > 0 ? width : 1;
         this.index.Reflow(this.currentWidth);
-        this.viewport.SetContentRows(this.index.TotalRows);
+        this.ApplyContentLayout(anchor);
     }
 
     /// <summary>Sets the viewport height in rows (called on layout).</summary>
@@ -206,9 +221,14 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>Scrolls the transcript by a number of rows (negative scrolls up).</summary>
     public void ScrollBy(int rows)
     {
-        this.viewport.ScrollBy(rows);
-        this.SetNeedsDraw();
-        this.TranscriptScrolled?.Invoke();
+        if (rows == 0)
+        {
+            this.SetNeedsDraw();
+            this.TranscriptScrolled?.Invoke();
+            return;
+        }
+
+        this.MoveToRow(this.viewport.TopRow + rows);
     }
 
     /// <summary>Jumps to the newest row and resumes auto-following.</summary>
@@ -257,7 +277,7 @@ internal sealed class VirtualizedTranscriptView : View
     internal void ClearSelection()
     {
         this.selection.Clear();
-        this.dragging = false;
+        this.ReleaseMouseCapture();
         this.SetNeedsDraw();
     }
 
@@ -283,6 +303,7 @@ internal sealed class VirtualizedTranscriptView : View
     /// <inheritdoc />
     protected override bool OnDrawingContent(DrawContext? context)
     {
+        this.LastRightAnnotationEndColumnForTest = null;
         this.SyncViewportMetrics();
         if (context is not null)
         {
@@ -313,8 +334,8 @@ internal sealed class VirtualizedTranscriptView : View
     /// role color; where the selection covers part (or all) of the row, the text is drawn in three cell-sliced
     /// segments — role-colored prefix, Warm Ember selection-highlighted middle, role-colored suffix — so the
     /// highlight is segmented exactly over the selected cells and survives redraw/scroll. Finally, a
-    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute at
-    /// the row's right edge; the row text was wrapped to reserve those cells, so it never overlaps.
+    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute
+    /// near the row's trailing edge; the row text was wrapped to reserve its cells, so it never overlaps.
     /// </summary>
     private void DrawRow(TranscriptRow row, int screenRow)
     {
@@ -379,13 +400,14 @@ internal sealed class VirtualizedTranscriptView : View
         if (row.RightText is { Length: > 0 } annotation && viewWidth > 0)
         {
             var annotationWidth = TerminalCellText.Width(annotation);
-            var column = viewWidth - annotationWidth;
-            if (column >= 0)
+            var column = viewWidth - row.RightTextTrailingCells - annotationWidth;
+            if (annotationWidth > 0 && column >= rowWidth)
             {
                 this.SetAttribute(this.AnnotationAttributeFor(row.Role));
                 this.Move(column, screenRow);
                 this.AddStr(annotation);
                 this.RightAnnotationDrawCount++;
+                this.LastRightAnnotationEndColumnForTest = column + annotationWidth - 1;
             }
         }
     }
@@ -393,11 +415,34 @@ internal sealed class VirtualizedTranscriptView : View
     /// <inheritdoc />
     protected override bool OnMouseEvent(Mouse mouse) => this.ProcessMouse(mouse);
 
+    /// <summary>Ends any active transcript mouse interaction and releases this view's capture if it owns it.</summary>
+    internal void CancelMouseInteraction() => this.ReleaseMouseCapture();
+
     /// <summary>Handles a mouse event; returns false (unhandled) when the host has disabled the mouse.</summary>
     internal bool ProcessMouse(Mouse mouse)
     {
         ArgumentNullException.ThrowIfNull(mouse);
         var mouseService = this.app.Mouse;
+        var releasingInteraction =
+            mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased) &&
+            (this.scrollbarDragging || this.dragging);
+        if (releasingInteraction)
+        {
+            var selectionWasDragging = this.dragging;
+            var position = selectionWasDragging ? this.ToTranscriptPosition(mouse) : default;
+            this.ReleaseMouseCapture();
+
+            if (selectionWasDragging &&
+                mouseService is { IsMouseDisabled: false } &&
+                !mouse.Flags.HasFlag(MouseFlags.Shift) &&
+                !this.selection.HasSelection)
+            {
+                this.ToggleExpansionAt(position.GlobalRow);
+            }
+
+            return true;
+        }
+
         if (mouseService is null ||
             mouseService.IsMouseDisabled ||
             mouse.Flags.HasFlag(MouseFlags.Shift))
@@ -408,21 +453,12 @@ internal sealed class VirtualizedTranscriptView : View
         var local = mouse.Position ?? System.Drawing.Point.Empty;
         if (this.scrollbarDragging)
         {
-            if (mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
-            {
-                this.scrollbarDragging = false;
-                mouseService.UngrabMouse();
-                return true;
-            }
-
             if (mouse.Flags.HasFlag(MouseFlags.PositionReport) || mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed))
             {
-                this.viewport.ScrollToRow(ScrollbarMetrics.TopRowForPointer(
-                    local.Y,
+                this.MoveToRow(ScrollbarMetrics.TopRowForPointer(
+                    local.Y - this.scrollbarDragOffset,
                     this.viewport.ViewportHeight,
                     this.viewport.ContentRows));
-                this.SetNeedsDraw();
-                this.TranscriptScrolled?.Invoke();
                 return true;
             }
         }
@@ -445,6 +481,7 @@ internal sealed class VirtualizedTranscriptView : View
             else
             {
                 this.scrollbarDragging = true;
+                this.scrollbarDragOffset = local.Y - metrics.ThumbTop;
                 mouseService.GrabMouse(this);
             }
 
@@ -499,20 +536,20 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        if (this.dragging && mouse.Flags.HasFlag(MouseFlags.LeftButtonReleased))
-        {
-            var position = this.ToTranscriptPosition(mouse);
-            mouseService.UngrabMouse();
-            this.dragging = false;
-            if (!this.selection.HasSelection)
-            {
-                this.ToggleExpansionAt(position.GlobalRow);
-            }
-
-            return true;
-        }
-
         return false;
+    }
+
+    private void ReleaseMouseCapture()
+    {
+        this.scrollbarDragging = false;
+        this.scrollbarDragOffset = 0;
+        this.dragging = false;
+
+        var mouseService = this.app.Mouse;
+        if (mouseService?.IsGrabbed(this) == true)
+        {
+            mouseService.UngrabMouse();
+        }
     }
 
     /// <summary>
@@ -547,6 +584,16 @@ internal sealed class VirtualizedTranscriptView : View
         this.ToggleExpansion(id);
     }
 
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing)
+        {
+            this.ReleaseMouseCapture();
+        }
+
+        base.Dispose(disposing);
+    }
+
     /// <inheritdoc />
     protected override bool OnKeyDown(Key key)
     {
@@ -579,15 +626,13 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        if (key == Key.Home.WithCtrl)
+        if (key == Key.Home || key == Key.Home.WithCtrl)
         {
-            this.viewport.ScrollToTop();
-            this.SetNeedsDraw();
-            this.TranscriptScrolled?.Invoke();
+            this.MoveToRow(0);
             return true;
         }
 
-        if (key == Key.End.WithCtrl)
+        if (key == Key.End || key == Key.End.WithCtrl)
         {
             this.JumpToNewest();
             return true;
@@ -639,6 +684,35 @@ internal sealed class VirtualizedTranscriptView : View
     {
         var height = this.viewport.ViewportHeight;
         return height > 1 ? height - 1 : 10;
+    }
+
+    private void MoveToRow(int row)
+    {
+        var target = Math.Clamp(row, 0, this.viewport.MaxTopRow);
+        this.viewport.ScrollToRow(target, this.index.AnchorAt(target));
+        this.SetNeedsDraw();
+        this.TranscriptScrolled?.Invoke();
+    }
+
+    private TranscriptViewportAnchor? CaptureViewportAnchor() =>
+        this.viewport.DetachedAnchor ?? this.index.AnchorAt(this.viewport.TopRow);
+
+    private void ApplyContentLayout(TranscriptViewportAnchor? previousAnchor)
+    {
+        var resolvedAnchorRow = previousAnchor is { } anchor
+            ? this.index.ResolveAnchor(anchor)
+            : null;
+        var fallbackTopRow = Math.Clamp(
+            this.viewport.TopRow,
+            0,
+            Math.Max(0, this.index.TotalRows - this.viewport.ViewportHeight));
+        var detachedAnchor = resolvedAnchorRow is { } resolvedRow
+            ? this.index.AnchorAt(resolvedRow)
+            : this.index.AnchorAt(fallbackTopRow);
+        this.viewport.ApplyContentLayout(
+            this.index.TotalRows,
+            detachedAnchor,
+            resolvedAnchorRow);
     }
 
     private void SyncViewportMetrics()

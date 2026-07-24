@@ -163,9 +163,7 @@ public sealed class PromptDrivenCommandTests : IDisposable
             await McpCommand.RunWizardAsync(built.Context, "demo", CancellationToken.None));
 
         Assert.Equal(new Uri("https://example.com/mcp"), config.Url);
-        var token = Assert.IsType<string>(config.Auth.BearerToken);
-        Assert.StartsWith(McpSecretResolver.SecretRefPrefix, token);
-        Assert.DoesNotContain("super-secret", token);
+        Assert.Equal("super-secret", config.Auth.BearerToken);
     }
 
     [Fact]

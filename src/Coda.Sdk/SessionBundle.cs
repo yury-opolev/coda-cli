@@ -40,6 +40,8 @@ public sealed record SessionBundle
 
     public string? SystemPrompt { get; init; }
 
+    public string? SystemPromptOverride { get; init; }
+
     public IReadOnlyList<ToolDefinition> ToolDefs { get; init; } = [];
 
     public required IReadOnlyList<SessionBundleTurn> Turns { get; init; }

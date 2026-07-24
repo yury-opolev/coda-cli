@@ -100,7 +100,7 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   history **compaction**, output-style personas, and a plugin/skills marketplace.
 - **Programmatic & embeddable** — `coda serve` exposes the agent over JSON-RPC
   (bidirectional: it streams progress and can ask the caller permission/clarification
-  questions), over stdio or an **API-key-authenticated local socket**; or embed the
+  questions), over stdio or an **API-key-authenticated local named pipe/Unix socket**; or embed the
   engine directly via `Coda.Sdk`.
 
 Coda is its own product, independent of any vendor's official CLI.
@@ -112,8 +112,8 @@ Coda is its own product, independent of any vendor's official CLI.
 ## Coda — the interactive TUI
 
 The terminal front-end targets **Terminal.Gui v2** and follows the **Warm Ember** interaction model.
-After the compatibility matrix and acceptance thresholds pass, **full-screen mode is the default
-interactive engine on a supported terminal**: a scrollable, virtualized transcript fills the **full
+**Full-screen mode is the default interactive engine on a supported terminal**: a scrollable,
+virtualized transcript fills the **full
 width** of the screen, an **operational status row** (turn, tool, waiting, approval, and key-hint state) sits
 **directly above** the composer, and a **dynamic composer** starts at **three rows** and grows up to a
 **capped height** as you type while staying pinned near the bottom. A separate, **stable metadata row**
@@ -137,6 +137,37 @@ dotnet run --project src/Coda.Tui -- --plain            # plain output (screen r
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
 ```
 
+### Exact startup system prompts
+
+The interactive TUI and `coda serve` accept one exact root-prompt source:
+
+```text
+coda [interactive options] [--system-prompt <text> | --system-prompt-file <path>]
+coda serve [serve options] [--system-prompt <text> | --system-prompt-file <path>]
+```
+
+The options are mutually exclusive and accepted once only; a missing value, duplicate, or
+`--system-prompt=<text>` / `--system-prompt-file=<path>` form fails before startup. `coda run`
+does **not** accept either option. A file path relative to the process startup directory is
+resolved there, not relative to `--cwd`; it is read once, before session or transport side effects,
+as strict UTF-8 (an optional UTF-8 BOM is removed). Its whitespace, line endings, and trailing
+newline are otherwise preserved.
+
+An explicit value is a complete replacement for the root system prompt: Coda's built-in prompt,
+`CLAUDE.md`/project context, output-style suffix, and provider prefix are not appended. Empty and
+whitespace-only values are valid exact replacements. Anthropic omits an explicitly empty optional
+`system` field because its empty text blocks are invalid; OpenAI request shapes serialize the empty
+value. Neither provider behavior restores Coda defaults. Interactive paths using Claude.ai OAuth may show
+a non-blocking compatibility warning, but the supplied text is not changed; serve does not promise
+that warning.
+
+The replacement is used for the root conversation and scheduled root turns (including `/context`);
+subagents retain their role prompts. On resume, precedence is startup override, then the persisted
+override, then the normal generated prompt. Persisted metadata is distinct from the audited
+effective `systemPrompt`; audit data is never a resume source. Forks preserve the override for
+interactive, headless, and slash-command flows. Export/import carries it as the optional
+`systemPromptOverride` field while keeping the `coda.session/1` bundle schema unchanged.
+
 **Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda ·
@@ -157,6 +188,17 @@ native to the terminal, and every action stays reachable from the keyboard. Full
 and uses a **virtualized transcript** (context, pickers, permissions, help, and diffs all use
 keyboard-driven overlays). **Plain mode** is recommended for screen readers, CI, output/input
 redirection, and terminals that Terminal.Gui does not support.
+
+The transcript is either **Following** (pinned to the newest row) or **Detached**. Detaching stores a
+stable `(blockId, wrappedRowOffset)` anchor, so reflow and replacement do not create false unseen counts.
+While detached, streaming growth contributes to an unseen-row counter; each new visible top-level block
+increments the unseen-message count once. Reaching the bottom atomically clears both counters and returns
+to Following. The centered labels are `Jump to bottom (Ctrl+End) v`, or `1 new message (Ctrl+End) v`
+with pluralization; only the rendered label cells are clickable. `Ctrl+End` is shell-global, but modal
+prompt/task/MCP overlays own the key and block the jump. The scrollbar supports track paging and thumb
+dragging, and is inert when mouse input is disabled. User timestamps use local `HH:mm`; the layout
+reserves one cell before the timestamp and one trailing cell before the scrollbar. Resumed messages
+without a timestamp omit the annotation.
 
 > **Compatibility:** the terminal matrix is a *reproducible checklist*, not a claim that every terminal
 > has already passed. See [`docs/terminal-gui-compatibility.md`](docs/terminal-gui-compatibility.md)
@@ -334,15 +376,35 @@ Coda connects MCP servers declared in `.mcp.json` and exposes their tools to the
 user entries by name). All three entry points — the interactive TUI, `coda run`, and
 `coda serve` — load the same merged config.
 
-**Manage servers from the TUI with `/mcp`** — no hand-editing or restart required:
+**Manage servers from the TUI with `/mcp`** — no hand-editing or restart required. In Terminal.Gui
+fullscreen and inline shells, the exact bare `/mcp` is intercepted before dispatch (even while a turn
+is busy) and opens the browser without starting a prompt. `/MCP`, `/mcp list`, and `/mcp x` are not
+intercepted. When no MCP browser provider exists, bare `/mcp` remains textual. Plain and Spectre
+surfaces use the textual list/detail fallback (`/mcp`, `/mcp info <name>`, and the existing add/edit/
+remove/start/stop/restart/enable/disable forms).
 
-| Command | Action |
-|---|---|
-| `/mcp` · `/mcp info <name>` | list servers (scope, transport, status) · inspect one (description + tools) |
-| `/mcp add <name> [flags]` · `/mcp edit <name>` | add/change a server via a wizard, or inline flags (`--command`, `--args`, `--env`, `--url`, `--header`, `--auth`) |
-| `/mcp remove <name>` | delete a server from its config file |
-| `/mcp start\|stop\|restart <name>` | connect/disconnect **live** — tools appear/disappear from the next turn |
-| `/mcp enable\|disable <name>` | persistently toggle a server (`"disabled": true`, survives restart) |
+The browser lists both physical scopes — user `~/.coda/.mcp.json` and project `<cwd>/.mcp.json` —
+separately. Each list row shows the name, scope, stdio/HTTP transport, enabled/disabled state,
+connection state, effective/overridden state, and any error; the source path appears in detail.
+Effective project entries remain visible alongside the overridden user entry. List keys are arrows,
+`PageUp`/`PageDown`, `Home`/`End`, `Enter` (detail), `a` (add), `e` (edit), `Space` (toggle),
+`u` (reauthenticate), `Delete` (remove), and `Esc` (close). Detail keys scroll with arrows/
+PageUp/PageDown/Home/End and support `e`, `Space`, `u`, `Delete`, and `Esc`. Editor keys are
+`Tab`/`Shift+Tab`, focus-sensitive `Enter`, `Esc`, Backspace/Delete, `Ctrl+N`/`Ctrl+R` for
+collection rows, `Ctrl+Up`/`Ctrl+Down` for item navigation, and `Ctrl+Left`/`Ctrl+Right` for
+item-part navigation; printable action letters insert text in fields.
+
+In the browser, add/edit save directly, toggle does not confirm, and delete/reauthenticate prompt
+with a default of No. A newly added server persists enabled but is deliberately not connected until
+an explicit start/restart or other reconciliation-triggering action. A busy turn leaves browsing
+and detail available, but management mutations are read-only until an idle/configuration lease is
+available.
+
+Reauthentication is ownership-aware: OAuth starts the browser flow, managed stored secrets prompt for
+replacement, environment-owned credentials must be changed in the referenced variable, and literal or
+unmanaged credentials are unavailable from this screen. After persistence, runtime state is reconciled
+immediately. Renames stop the old runtime identity and start/reconcile the new one. If reconnect/start/
+stop fails, the saved configuration remains authoritative and is reported as saved with a runtime error.
 
 Writes default to the project file; add `--user` to target `~/.coda/.mcp.json`. Secret values
 (tokens, keys) the wizard collects can be **stored encrypted** in coda's credential store — only a
@@ -378,8 +440,8 @@ with an `auth` block:
 
 `mode` is `oauth` (default), `bearer` (static `"token"`), or `none`. Headless runs
 (`coda run` and `coda serve`) reuse stored tokens but never open a browser; a server needing
-fresh sign-in is skipped with a note to stderr. Pre-authorize such servers once via the TUI or
-`coda run`; the encrypted token is then reused by every process automatically.
+fresh sign-in is skipped with a note to stderr. Pre-authorize such servers once via the interactive
+TUI; the encrypted token is then reused by every process automatically.
 
 **Client id for direct HTTP OAuth.** The flow needs a client id from one of two places: a
 configured `auth.clientId`, or RFC 7591 dynamic client registration when the authorization server
@@ -734,8 +796,8 @@ the record survives and reruns on the next startup, and it is **removed only aft
 it reaches a terminal state. Failures are also written to the telemetry log when
 logging is enabled.
 
-In `coda serve`, a stdio peer is authenticated immediately so the runtime starts at
-startup; an **API-key** peer's runtime does **not** start until a valid key
+In `coda serve`, the stdio runtime starts immediately; an **API-key** peer's runtime does
+**not** start until a valid key
 completes an authenticated `initialize`. Headless `coda run` does **not** keep the
 scheduler alive — the runtime is disabled outside interactive and serve sessions.
 
@@ -761,14 +823,23 @@ project files if they exist (it never writes to them).
 ### Tool display mode
 
 Set `toolDisplayMode` only in the user settings file (`~/.coda/settings.json`); project settings cannot
-override it. The default is `"tiny"` (tool details are hidden), `"compact"` shows concise activity, and
-`"verbose"` shows tool inputs and results:
+override it. Existing explicit values remain honored. Manual changes take effect when you start the next
+interactive session; Coda does not rewrite or migrate this setting. The default is `"summary"`:
 
 ```json
-{ "toolDisplayMode": "compact" }
+{ "toolDisplayMode": "summary" }
 ```
 
-An invalid nonblank value is reported safely at startup and falls back to `"tiny"`.
+| Mode | Display |
+|---|---|
+| `"verbose"` | All tool details and results. |
+| `"compact"` | Per-call status without full results. |
+| `"summary"` (default) | One cumulative root activity block per root turn, spanning all model/root/subagent batches, with up to five running leaves, then one final line. Plain interactive output is final-only. |
+| `"tiny"` | Tool activity is hidden. |
+
+Each root turn has one activity block. The full underlying engine, history, audit, serve, task, and telemetry
+data is retained regardless of display mode. An invalid nonblank value is reported safely at startup and falls
+back to `"summary"`.
 
 **Shared (read-only) with the Claude CLI:** `CLAUDE.md` project instructions
 (including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and

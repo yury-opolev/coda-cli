@@ -1,17 +1,14 @@
+using System.Collections.Immutable;
 using Coda.Mcp;
+using Coda.Tui.Mcp;
 using Coda.Tui.Repl;
-using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
+using Coda.Tui.Ui.Rendering;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
 
-/// <summary>
-/// Manages configured MCP servers: <c>list</c>/<c>info</c> (inspect), <c>add</c>/<c>edit</c>/
-/// <c>remove</c> (write <c>.mcp.json</c>), and <c>enable</c>/<c>disable</c> (persisted). Live
-/// <c>start</c>/<c>stop</c> arrive in a later phase. Scope defaults to project; <c>--user</c>
-/// targets <c>~/.coda/.mcp.json</c>.
-/// </summary>
+/// <summary>Manages configured MCP servers through the revision-aware MCP management service.</summary>
 public sealed class McpCommand : ISlashCommand
 {
     public string Name => "mcp";
@@ -21,221 +18,112 @@ public sealed class McpCommand : ISlashCommand
     public string Summary => "List, inspect, and manage MCP servers";
 
     public CommandHelp Help => new(
-        "/mcp [list | info <name> | add <name> [flags] | edit <name> [flags] | remove <name> | enable <name> | disable <name>] [--user]",
+        "/mcp [list | info <name> | add <name> [flags] | edit <name> [flags] | remove <name> | enable <name> | disable <name> | reauth <name> | start <name> | stop <name> | restart [name]] [--user]",
         Description: "Inspect and manage MCP servers. Writes default to ./.mcp.json; --user targets ~/.coda/.mcp.json.",
         Options:
         [
             ("(no args) / list", "list configured servers (name, scope, transport, status)"),
             ("info <name>", "show a server's description, transport, status, and tools"),
-            ("add <name> [flags]", "add a server (wizard when no flags); see stdio/http flags below"),
+            ("add <name> [flags]", "add a server (wizard when no flags)"),
             ("edit <name> [flags]", "change an existing server (wizard when no flags)"),
             ("remove <name>", "delete a server from its config file"),
-            ("enable/disable <name>", "persistently enable/disable a server (survives restart)"),
-            ("stdio flags", "--command <exe>  --args \"a b c\"  --env KEY=VALUE (repeat for each var)"),
-            ("http flags", "--url <url>  --header NAME=VALUE (repeatable)  --auth none|bearer|oauth  --token <t>"),
+            ("enable/disable <name>", "persistently enable/disable a server"),
+            ("reauth <name>", "reauthenticate an HTTP server or replace managed credentials"),
+            ("start/stop/restart", "control live MCP connections"),
+            ("stdio flags", "--command <exe>  --args \"a b c\"  --env KEY=VALUE"),
+            ("http flags", "--url <url>  --header NAME=VALUE  --auth none|bearer|oauth  --token <t>"),
             ("--user", "target the user file (~/.coda/.mcp.json) instead of the project file"),
-        ],
-        Examples:
-        [
-            "/mcp",
-            "/mcp info github",
-            "/mcp add github --command npx --args \"-y @modelcontextprotocol/server-github\"",
-            "/mcp add memory --command C:\\path\\to\\server.exe --env DATA_DIR=C:\\data",
-            "/mcp disable github",
         ]);
 
-    public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
+    public async Task<CommandResult> ExecuteAsync(
+        CommandContext context,
+        IReadOnlyList<string> args,
+        CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
         ArgumentNullException.ThrowIfNull(args);
 
-        var (scope, rest) = ExtractScope(args);
-        var sub = rest.Count > 0 ? rest[0].ToLowerInvariant() : "list";
-        var tail = rest.Skip(1).ToList();
-
-        switch (sub)
+        if (context.McpManagement is not { } management)
         {
-            case "list":
-                context.Console.MarkupLine(Markup.Escape(McpView.FormatList(BuildStatuses(context))));
-                break;
-            case "info":
-                RenderInfo(context, tail);
-                break;
-            case "add":
-                await HandleAddOrEdit(context, scope, tail, isEdit: false, cancellationToken).ConfigureAwait(false);
-                break;
-            case "edit":
-                await HandleAddOrEdit(context, scope, tail, isEdit: true, cancellationToken).ConfigureAwait(false);
-                break;
-            case "remove" or "rm" or "delete":
-                await HandleRemove(context, scope, tail, cancellationToken).ConfigureAwait(false);
-                break;
-            case "enable":
-                HandleToggle(context, scope, tail, disabled: false);
-                break;
-            case "disable":
-                HandleToggle(context, scope, tail, disabled: true);
-                break;
-            case "start":
-                await HandleStart(context, tail, cancellationToken).ConfigureAwait(false);
-                break;
-            case "stop":
-                await HandleStop(context, tail).ConfigureAwait(false);
-                break;
-            case "restart":
-                await HandleRestart(context, tail, cancellationToken).ConfigureAwait(false);
-                break;
-            default:
-                context.Console.MarkupLine(Markup.Escape($"Unknown /mcp subcommand '{sub}'. Try /mcp, /mcp info <name>, /mcp add <name>, /mcp start <name>, or /mcp remove <name>."));
-                break;
+            context.Console.MarkupLine("MCP management is unavailable in this command context.");
+            return CommandResult.Continue;
+        }
+
+        var (scope, rest) = ExtractScope(args);
+        var subcommand = rest.Count > 0 ? rest[0].ToLowerInvariant() : "list";
+        try
+        {
+            await ExecuteThroughManagementAsync(
+                context,
+                management,
+                scope,
+                subcommand,
+                rest.Skip(1).ToArray(),
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (McpException exception)
+        {
+            context.Console.MarkupLine(Markup.Escape(TerminalTextSanitizer.SanitizeSingleLine(exception.Message)));
         }
 
         return CommandResult.Continue;
     }
 
-    // ── live lifecycle: start / stop / restart ────────────────────────────
-
-    private static async Task HandleStart(CommandContext context, IReadOnlyList<string> tail, CancellationToken ct)
+    private static async Task ExecuteThroughManagementAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        string subcommand,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
     {
-        if (tail.Count == 0)
+        switch (subcommand)
         {
-            context.Console.MarkupLine("Usage: /mcp start <name>");
-            return;
-        }
-
-        if (context.Mcp is null)
-        {
-            context.Console.MarkupLine("MCP is not available in this session.");
-            return;
-        }
-
-        var name = tail[0];
-        if (context.Mcp.IsServerConnected(name))
-        {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' is already running."));
-            return;
-        }
-
-        var entry = McpConfig.LoadEntries(context.Session.WorkingDirectory)
-            .FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.Ordinal));
-        if (entry is null)
-        {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured. Add it with /mcp add {name} …"));
-            return;
-        }
-
-        var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
-        var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
-        if (result.Connected)
-        {
-            context.Console.MarkupLine(Markup.Escape($"Started '{name}' — {result.ToolCount} tool(s) available from the next turn."));
-            PublishSnapshot(context);
-        }
-        else
-        {
-            context.Console.MarkupLine(Markup.Escape($"Failed to start '{name}': {result.Error}"));
-        }
-    }
-
-    private static async Task HandleStop(CommandContext context, IReadOnlyList<string> tail)
-    {
-        if (tail.Count == 0)
-        {
-            context.Console.MarkupLine("Usage: /mcp stop <name>");
-            return;
-        }
-
-        if (context.Mcp is null)
-        {
-            context.Console.MarkupLine("MCP is not available in this session.");
-            return;
-        }
-
-        var name = tail[0];
-        var stopped = await context.Mcp.DisconnectServerAsync(name).ConfigureAwait(false);
-        if (stopped)
-        {
-            context.Console.MarkupLine(Markup.Escape($"Stopped '{name}' — its tools are removed from the next turn."));
-            PublishSnapshot(context);
-        }
-        else
-        {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' is not running."));
-        }
-    }
-
-    private static async Task HandleRestart(CommandContext context, IReadOnlyList<string> tail, CancellationToken ct)
-    {
-        if (context.Mcp is null)
-        {
-            context.Console.MarkupLine("MCP is not available in this session.");
-            return;
-        }
-
-        if (tail.Count > 0)
-        {
-            var name = tail[0];
-            await context.Mcp.DisconnectServerAsync(name).ConfigureAwait(false);
-            var entry = McpConfig.LoadEntries(context.Session.WorkingDirectory)
-                .FirstOrDefault(e => string.Equals(e.Name, name, StringComparison.Ordinal));
-            if (entry is null)
-            {
-                context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured."));
+            case "list":
+                context.Console.MarkupLine(Markup.Escape(
+                    McpView.FormatList(await management.RefreshAsync(ct).ConfigureAwait(false))));
                 return;
-            }
-
-            var config = await ResolveSecrets(context, entry.Config, ct).ConfigureAwait(false);
-            var result = await context.Mcp.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
-            if (result.Connected)
-            {
-                context.Console.MarkupLine(Markup.Escape($"Restarted '{name}' — {result.ToolCount} tool(s)."));
-                PublishSnapshot(context);
-            }
-            else
-            {
-                context.Console.MarkupLine(Markup.Escape($"Failed to restart '{name}': {result.Error}"));
-            }
-
-            return;
-        }
-
-        // No name → reconnect everything, picking up external .mcp.json edits.
-        foreach (var serverName in context.Mcp.Clients.Select(c => c.ServerName).ToList())
-        {
-            await context.Mcp.DisconnectServerAsync(serverName).ConfigureAwait(false);
-        }
-
-        var servers = McpConfig.Load(context.Session.WorkingDirectory);
-        if (context.CredentialStore is { } store)
-        {
-            servers = await McpSecretResolver.ResolveAsync(servers, store, ct,
-                msg => context.Console.MarkupLine(Markup.Escape(msg))).ConfigureAwait(false);
-        }
-
-        await context.Mcp.ConnectAllAsync(servers, cancellationToken: ct).ConfigureAwait(false);
-        context.Console.MarkupLine(Markup.Escape($"Reconnected MCP servers ({context.Mcp.Clients.Count} connected)."));
-        PublishSnapshot(context);
-    }
-
-    /// <summary>Publish the live MCP runtime snapshot after a successful mutation (no-op when no manager).</summary>
-    private static void PublishSnapshot(CommandContext context)
-    {
-        if (context.Mcp is { } mcp)
-        {
-            context.Events.Publish(new McpRuntimeChangedEvent(mcp.GetSnapshot()));
+            case "info":
+                await HandleInfoAsync(context, management, scope, tail, ct).ConfigureAwait(false);
+                return;
+            case "add":
+                await HandleAddAsync(context, management, scope, tail, ct).ConfigureAwait(false);
+                return;
+            case "edit":
+                await HandleEditAsync(context, management, scope, tail, ct).ConfigureAwait(false);
+                return;
+            case "remove" or "rm" or "delete":
+                await HandleRemoveAsync(context, management, scope, tail, ct).ConfigureAwait(false);
+                return;
+            case "enable":
+            case "disable":
+                await HandleToggleAsync(context, management, scope, subcommand == "enable", tail, ct).ConfigureAwait(false);
+                return;
+            case "reauth":
+                await HandleReauthAsync(context, management, scope, tail, ct).ConfigureAwait(false);
+                return;
+            case "start":
+                await RenderLifecycleAsync(context, management, tail, "start", ct).ConfigureAwait(false);
+                return;
+            case "stop":
+                await RenderLifecycleAsync(context, management, tail, "stop", ct).ConfigureAwait(false);
+                return;
+            case "restart":
+                await RenderManagedMutationAsync(context, () => management.RestartAsync(tail.FirstOrDefault(), ct)).ConfigureAwait(false);
+                return;
+            default:
+                context.Console.MarkupLine(Markup.Escape(
+                    $"Unknown /mcp subcommand '{SafePromptText(subcommand)}'. Try /mcp, /mcp info <name>, /mcp add <name>, /mcp reauth <name>, or /mcp remove <name>."));
+                return;
         }
     }
 
-    /// <summary>Resolve <c>coda-secret:</c> / <c>${VAR}</c> references before a live connect (parity with startup).</summary>
-    private static async Task<McpServerConfig> ResolveSecrets(CommandContext context, McpServerConfig config, CancellationToken ct)
-        => context.CredentialStore is { } store
-            ? await McpSecretResolver.ResolveAsync(config, store, ct,
-                msg => context.Console.MarkupLine(Markup.Escape(msg))).ConfigureAwait(false)
-            : config;
-
-    // ── Inspect ───────────────────────────────────────────────────────────
-
-    private static void RenderInfo(CommandContext context, IReadOnlyList<string> tail)
+    private static async Task HandleInfoAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
     {
         if (tail.Count == 0)
         {
@@ -243,40 +131,49 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        var status = BuildStatuses(context).FirstOrDefault(s => string.Equals(s.Entry.Name, tail[0], StringComparison.Ordinal));
-        context.Console.MarkupLine(status is null
-            ? Markup.Escape($"Unknown MCP server '{tail[0]}'. Run /mcp to list configured servers.")
-            : Markup.Escape(McpView.FormatInfo(status)));
+        var snapshot = await management.RefreshAsync(ct).ConfigureAwait(false);
+        var summary = snapshot.Servers.FirstOrDefault(server =>
+            server.Key.Scope == scope && string.Equals(server.Key.Name, tail[0], StringComparison.Ordinal));
+        var detail = summary is null ? null : await management.GetDetailAsync(summary.Key, ct).ConfigureAwait(false);
+        context.Console.MarkupLine(Markup.Escape(
+            detail is null
+                ? $"Unknown MCP server '{SafePromptText(tail[0])}'. Run /mcp to list configured servers."
+                : McpView.FormatInfo(detail)));
     }
 
-    // ── add / edit ────────────────────────────────────────────────────────
-
-    private static async Task HandleAddOrEdit(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool isEdit, CancellationToken cancellationToken)
+    private static async Task HandleAddAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
     {
-        var verb = isEdit ? "edit" : "add";
         if (tail.Count == 0)
         {
-            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {verb} <name> [--command <cmd> --args \"…\" --env KEY=VALUE | --url <url> --header NAME=VALUE] [--user]"));
+            context.Console.MarkupLine(Markup.Escape("Usage: /mcp add <name> [flags]"));
             return;
         }
 
         var name = tail[0];
-        var exists = ExistsInScope(scope, name, context);
-        if (isEdit && !exists)
+        var flags = tail.Skip(1).ToArray();
+        McpServerDraft draft;
+        if (flags.Length == 0)
         {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file. Use /mcp add to create it."));
-            return;
-        }
+            if (!context.Prompts.IsInteractive)
+            {
+                ExplainNoninteractiveWizard(context, "add", name);
+                return;
+            }
 
-        if (!isEdit && exists)
-        {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' already exists in the {ScopeName(scope)} file. Use /mcp edit to change it."));
-            return;
-        }
+            var wizard = await RunWizardDraftAsync(context, name, ct).ConfigureAwait(false);
+            if (wizard is null)
+            {
+                return;
+            }
 
-        var flags = tail.Skip(1).ToList();
-        McpServerConfig? config;
-        if (flags.Count > 0)
+            draft = DraftFromWizard(name, scope, wizard);
+        }
+        else
         {
             var parsed = McpFlagParser.Parse(flags);
             if (!parsed.Ok)
@@ -285,49 +182,89 @@ public sealed class McpCommand : ISlashCommand
                 return;
             }
 
-            config = parsed.Config;
+            draft = DraftFromConfig(name, scope, parsed.Config!);
         }
-        else if (context.Prompts.IsInteractive)
+
+        var preview = await management.PrepareAddAsync(draft, ct).ConfigureAwait(false);
+        if (!await ConfirmIfInteractiveAsync(context, $"Add MCP server '{SafePromptText(name)}'?", ct).ConfigureAwait(false))
         {
-            config = await RunWizardAsync(context, name, cancellationToken).ConfigureAwait(false);
-            if (config is null)
+            return;
+        }
+
+        await RenderManagedMutationAsync(context, () => management.CommitAddAsync(preview, ct)).ConfigureAwait(false);
+    }
+
+    private static async Task HandleEditAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
+    {
+        if (tail.Count == 0)
+        {
+            context.Console.MarkupLine(Markup.Escape("Usage: /mcp edit <name> [flags]"));
+            return;
+        }
+
+        var key = new McpServerKey(scope, tail[0]);
+        var current = await management.CreateEditDraftAsync(key, ct).ConfigureAwait(false);
+        if (current is null)
+        {
+            context.Console.MarkupLine(Markup.Escape(
+                $"'{SafePromptText(tail[0])}' is not configured in the {ScopeName(scope)} file."));
+            return;
+        }
+
+        var flags = tail.Skip(1).ToArray();
+        McpServerDraft draft;
+        if (flags.Length == 0)
+        {
+            if (!context.Prompts.IsInteractive)
             {
-                return; // wizard reported the problem / was cancelled
+                ExplainNoninteractiveWizard(context, "edit", tail[0]);
+                return;
             }
+
+            var wizard = await RunWizardDraftAsync(context, tail[0], ct).ConfigureAwait(false);
+            if (wizard is null)
+            {
+                return;
+            }
+
+            draft = DraftFromWizard(tail[0], scope, wizard) with
+            {
+                Enabled = current.Enabled,
+                BaseRevision = current.BaseRevision,
+            };
         }
         else
         {
-            context.Console.MarkupLine(Markup.Escape($"Provide flags (e.g. --command <cmd> [--env KEY=VALUE] or --url <url>), or run /mcp {verb} {name} interactively."));
+            var parsed = McpFlagParser.ParseEdit(current, flags);
+            if (!parsed.Ok)
+            {
+                context.Console.MarkupLine(Markup.Escape(parsed.Error!));
+                return;
+            }
+
+            draft = parsed.Draft!;
+        }
+
+        var preview = await management.PrepareEditAsync(key, draft, ct).ConfigureAwait(false);
+        if (!await ConfirmIfInteractiveAsync(context, $"Update MCP server '{SafePromptText(tail[0])}'?", ct).ConfigureAwait(false))
+        {
             return;
         }
 
-        try
-        {
-            McpConfigWriter.Upsert(scope, name, config!, disabled: false, context.Session.WorkingDirectory);
-        }
-        catch (McpException ex)
-        {
-            context.Console.MarkupLine(Markup.Escape(ex.Message));
-            return;
-        }
-
-        var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
-        context.Console.MarkupLine(Markup.Escape(
-            $"{(isEdit ? "Updated" : "Added")} '{name}' in {path}. Run /mcp start {name} to connect it, or it loads on next launch."));
-        PublishSnapshot(context);
-
-        // The flag path writes values verbatim (unlike the wizard, which offers encryption). Warn if
-        // a literal secret-looking value was persisted so the user can move it out of the file.
-        if (flags.Count > 0 && HasLiteralSecret(config!))
-        {
-            context.Console.MarkupLine(Markup.Escape(
-                "Note: values were stored as plaintext. Use the wizard (/mcp add with no flags) or a ${ENV_VAR} reference to keep secrets out of .mcp.json."));
-        }
+        await RenderManagedMutationAsync(context, () => management.CommitEditAsync(preview, ct)).ConfigureAwait(false);
     }
 
-    // ── remove ────────────────────────────────────────────────────────────
-
-    private static async Task HandleRemove(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, CancellationToken ct)
+    private static async Task HandleRemoveAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
     {
         if (tail.Count == 0)
         {
@@ -335,101 +272,176 @@ public sealed class McpCommand : ISlashCommand
             return;
         }
 
-        var name = tail[0];
-        var config = GetConfigInScope(scope, name, context);
-        if (config is null)
+        var preview = await management.PrepareDeleteAsync(new McpServerKey(scope, tail[0]), ct).ConfigureAwait(false);
+        if (!await ConfirmRequiredAsync(context, preview.Confirmation, ct).ConfigureAwait(false))
         {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file."));
             return;
         }
 
-        if (context.Prompts.IsInteractive)
+        await RenderManagedMutationAsync(context, () => management.CommitDeleteAsync(preview, ct)).ConfigureAwait(false);
+    }
+
+    private static async Task HandleToggleAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        bool enabled,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
+    {
+        if (tail.Count == 0)
+        {
+            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {(enabled ? "enable" : "disable")} <name> [--user]"));
+            return;
+        }
+
+        await RenderManagedMutationAsync(
+            context,
+            () => management.SetEnabledAsync(new McpServerKey(scope, tail[0]), enabled, ct)).ConfigureAwait(false);
+    }
+
+    private static async Task HandleReauthAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        McpConfigScope scope,
+        IReadOnlyList<string> tail,
+        CancellationToken ct)
+    {
+        if (tail.Count == 0)
+        {
+            context.Console.MarkupLine("Usage: /mcp reauth <name> [--user]");
+            return;
+        }
+
+        var plan = await management.PrepareReauthenticationAsync(new McpServerKey(scope, tail[0]), ct).ConfigureAwait(false);
+        if (!await ConfirmRequiredAsync(context, plan.Confirmation, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        var replacements = new Dictionary<string, McpSecretReplacement>(StringComparer.Ordinal);
+        foreach (var field in plan.ManagedFields)
         {
             var response = await context.Prompts.RequestAsync(
-                UiPromptRequest.Confirm($"Remove MCP server '{Markup.Escape(name)}' from the {ScopeName(scope)} file?", defaultValue: true),
-                ct).ConfigureAwait(false);
-            if (response.Cancelled || !response.SelectedIds.Contains("yes"))
+                UiPromptRequest.Text($"Replacement for {SafePromptText(field)}", required: true, secret: true), ct).ConfigureAwait(false);
+            if (response.Cancelled || string.IsNullOrEmpty(response.Text))
             {
                 context.Console.MarkupLine("Cancelled.");
                 return;
             }
+
+            replacements[field] = new McpSecretReplacement(response.Text);
         }
 
-        McpConfigWriter.Remove(scope, name, context.Session.WorkingDirectory);
-
-        // Delete the server's encrypted secrets (derived from its coda-secret: refs) AFTER the entry
-        // is gone, so a failed write never orphans the config against already-deleted secrets.
-        if (context.CredentialStore is { } store)
-        {
-            await McpSecretStore.DeleteSecretsAsync(store, config, ct).ConfigureAwait(false);
-        }
-
-        context.Console.MarkupLine(Markup.Escape($"Removed '{name}' from the {ScopeName(scope)} file. Stop it now with /mcp stop {name} if it is running."));
-        PublishSnapshot(context);
+        await RenderManagedMutationAsync(context, () => management.ReauthenticateAsync(plan, replacements, ct)).ConfigureAwait(false);
     }
 
-    // ── enable / disable ──────────────────────────────────────────────────
-
-    private static void HandleToggle(CommandContext context, McpConfigScope scope, IReadOnlyList<string> tail, bool disabled)
+    private static async Task RenderLifecycleAsync(
+        CommandContext context,
+        IMcpManagementService management,
+        IReadOnlyList<string> tail,
+        string verb,
+        CancellationToken ct)
     {
-        var verb = disabled ? "disable" : "enable";
         if (tail.Count == 0)
         {
-            context.Console.MarkupLine(Markup.Escape($"Usage: /mcp {verb} <name> [--user]"));
+            context.Console.MarkupLine($"Usage: /mcp {verb} <name>");
             return;
         }
 
-        var name = tail[0];
-        if (!McpConfigWriter.SetDisabled(scope, name, disabled, context.Session.WorkingDirectory))
-        {
-            context.Console.MarkupLine(Markup.Escape($"'{name}' is not configured in the {ScopeName(scope)} file."));
-            return;
-        }
-
-        context.Console.MarkupLine(Markup.Escape(disabled
-            ? $"Disabled '{name}' — it will not load on next launch. Stop it now with /mcp stop {name} if it is running."
-            : $"Enabled '{name}' — it will load on next launch. Connect it now with /mcp start {name}."));
-        PublishSnapshot(context);
+        Func<Task<McpMutationResult>> operation = verb == "start"
+            ? () => management.StartAsync(tail[0], ct)
+            : () => management.StopAsync(tail[0], ct);
+        await RenderManagedMutationAsync(context, operation).ConfigureAwait(false);
     }
 
-    // ── interactive wizard ────────────────────────────────────────────────
+    private static async Task<bool> ConfirmIfInteractiveAsync(CommandContext context, string title, CancellationToken ct) =>
+        !context.Prompts.IsInteractive || await ConfirmRequiredAsync(context, title, ct).ConfigureAwait(false);
 
-    internal static async Task<McpServerConfig?> RunWizardAsync(CommandContext context, string name, CancellationToken cancellationToken)
+    private static async Task<bool> ConfirmRequiredAsync(CommandContext context, string title, CancellationToken ct)
     {
-        var transport = await SelectAsync(context, $"Transport for '{Markup.Escape(name)}'?", cancellationToken, "stdio", "http").ConfigureAwait(false);
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Confirm(SafePromptText(title), defaultValue: false), ct).ConfigureAwait(false);
+        if (response.Cancelled || !response.SelectedIds.Contains("yes"))
+        {
+            context.Console.MarkupLine("Cancelled.");
+            return false;
+        }
+
+        return true;
+    }
+
+    private static async Task RenderManagedMutationAsync(
+        CommandContext context,
+        Func<Task<McpMutationResult>> operation)
+    {
+        var taskManager = context.TaskManagerProvider?.Invoke();
+        using var idleLease = taskManager?.TryAcquireIdleLease();
+        if (taskManager is not null && idleLease is null)
+        {
+            context.Console.MarkupLine("MCP changes are unavailable while managed tasks are running. Wait for them to finish and try again.");
+            return;
+        }
+
+        try
+        {
+            var result = await operation().ConfigureAwait(false);
+            context.Console.MarkupLine(Markup.Escape(result.Message));
+        }
+        catch (McpException exception)
+        {
+            context.Console.MarkupLine(Markup.Escape(TerminalTextSanitizer.SanitizeSingleLine(exception.Message)));
+        }
+    }
+
+    internal static async Task<McpServerConfig?> RunWizardAsync(
+        CommandContext context,
+        string name,
+        CancellationToken cancellationToken) =>
+        (await RunWizardDraftAsync(context, name, cancellationToken).ConfigureAwait(false))?.Config;
+
+    private static async Task<McpWizardDraft?> RunWizardDraftAsync(
+        CommandContext context,
+        string name,
+        CancellationToken ct)
+    {
+        var encrypted = new Dictionary<string, McpSecretReplacement>(StringComparer.Ordinal);
+        var safeName = SafePromptText(name);
+        var transport = await SelectAsync(context, $"Transport for '{safeName}'?", ct, "stdio", "http").ConfigureAwait(false);
         if (transport is null)
         {
-            return null; // cancelled — nothing collected, nothing written
+            return null;
         }
 
         if (transport == "stdio")
         {
-            var command = await AskAsync(context, "Command", required: true, cancellationToken).ConfigureAwait(false);
+            var command = await AskAsync(context, "Command", required: true, ct).ConfigureAwait(false);
             if (command is null)
             {
                 return null;
             }
 
-            var argsLine = await AskAsync(context, "Args (space-separated)", required: false, cancellationToken).ConfigureAwait(false) ?? string.Empty;
-            var args = argsLine.Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries).ToList();
-            var env = await PromptPairs(context, name, "env", "Env (KEY=VALUE, blank to finish)", cancellationToken).ConfigureAwait(false);
-            return new McpStdioServerConfig(command, args, env);
+            var args = (await AskAsync(context, "Args (space-separated)", required: false, ct).ConfigureAwait(false) ?? string.Empty)
+                .Split(' ', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            var environment = await PromptPairsAsync(context, safeName, "env", "Env (KEY=VALUE, blank to finish)", encrypted, ct)
+                .ConfigureAwait(false);
+            return new McpWizardDraft(new McpStdioServerConfig(command, args, environment), encrypted);
         }
 
-        var url = await AskAsync(context, "URL", required: true, cancellationToken).ConfigureAwait(false);
-        if (url is null)
+        var url = await AskAsync(context, "URL", required: true, ct).ConfigureAwait(false);
+        if (url is null || !Uri.TryCreate(url, UriKind.Absolute, out var uri))
         {
+            if (url is not null)
+            {
+                context.Console.MarkupLine(Markup.Escape($"'{SafePromptText(url)}' is not a valid absolute URL."));
+            }
+
             return null;
         }
 
-        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri))
-        {
-            context.Console.MarkupLine(Markup.Escape($"'{url}' is not a valid absolute URL."));
-            return null;
-        }
-
-        var headers = await PromptPairs(context, name, "header", "Headers (NAME=VALUE, blank to finish)", cancellationToken).ConfigureAwait(false);
-        var authMode = await SelectAsync(context, "Auth?", cancellationToken, "oauth", "bearer", "none").ConfigureAwait(false);
+        var headers = await PromptPairsAsync(context, safeName, "header", "Headers (NAME=VALUE, blank to finish)", encrypted, ct)
+            .ConfigureAwait(false);
+        var authMode = await SelectAsync(context, "Auth?", ct, "oauth", "bearer", "none").ConfigureAwait(false);
         if (authMode is null)
         {
             return null;
@@ -438,13 +450,13 @@ public sealed class McpCommand : ISlashCommand
         McpAuthConfig auth;
         if (authMode == "bearer")
         {
-            var token = await AskSecretAsync(context, "Bearer token", cancellationToken).ConfigureAwait(false);
+            var token = await AskSecretAsync(context, "Token", ct).ConfigureAwait(false);
             if (token is null)
             {
                 return null;
             }
 
-            token = await MaybeEncrypt(context, name, "auth/token", token, cancellationToken).ConfigureAwait(false);
+            await MaybeEncryptAsync(context, safeName, "auth/token", token, encrypted, ct).ConfigureAwait(false);
             auth = new McpAuthConfig(McpAuthMode.Bearer, BearerToken: token);
         }
         else
@@ -452,146 +464,187 @@ public sealed class McpCommand : ISlashCommand
             auth = authMode == "none" ? new McpAuthConfig(McpAuthMode.None) : McpAuthConfig.Default;
         }
 
-        return new McpHttpServerConfig(uri, headers, auth);
+        return new McpWizardDraft(new McpHttpServerConfig(uri, headers, auth), encrypted);
     }
 
-    /// <summary>Single-choice selection over stable lowercase ids, returning the id or null when dismissed.</summary>
-    private static async Task<string?> SelectAsync(CommandContext context, string title, CancellationToken cancellationToken, params string[] ids)
+    private static async Task<Dictionary<string, string>> PromptPairsAsync(
+        CommandContext context,
+        string server,
+        string prefix,
+        string title,
+        Dictionary<string, McpSecretReplacement> encrypted,
+        CancellationToken ct)
     {
-        var options = ids.Select(id => new UiPromptOption(id, id));
-        var response = await context.Prompts.RequestAsync(UiPromptRequest.Select(title, options), cancellationToken).ConfigureAwait(false);
-        return response.Cancelled || response.SelectedIds.Length == 0 ? null : response.SelectedIds[0];
-    }
-
-    /// <summary>Free-text entry, returning the text (empty when blank) or null when dismissed.</summary>
-    private static async Task<string?> AskAsync(CommandContext context, string title, bool required, CancellationToken cancellationToken)
-    {
-        var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: required), cancellationToken).ConfigureAwait(false);
-        return response.Cancelled ? null : response.Text ?? string.Empty;
-    }
-
-    /// <summary>Masked, mandatory secret entry, returning the text or null when dismissed.</summary>
-    private static async Task<string?> AskSecretAsync(CommandContext context, string title, CancellationToken cancellationToken)
-    {
-        var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: true, secret: true), cancellationToken).ConfigureAwait(false);
-        return response.Cancelled ? null : response.Text ?? string.Empty;
-    }
-
-    private static async Task<Dictionary<string, string>> PromptPairs(CommandContext context, string server, string fieldPrefix, string title, CancellationToken cancellationToken)
-    {
-        var map = new Dictionary<string, string>(StringComparer.Ordinal);
+        var values = new Dictionary<string, string>(StringComparer.Ordinal);
         while (true)
         {
-            var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: false), cancellationToken).ConfigureAwait(false);
+            var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(title, required: false), ct).ConfigureAwait(false);
             if (response.Cancelled || string.IsNullOrWhiteSpace(response.Text))
             {
-                break;
+                return values;
             }
 
-            var line = response.Text;
-            var index = line.IndexOf('=', StringComparison.Ordinal);
-            if (index <= 0)
+            var separator = response.Text.IndexOf('=', StringComparison.Ordinal);
+            if (separator <= 0)
             {
                 context.Console.MarkupLine("  (expected KEY=VALUE)");
                 continue;
             }
 
-            var key = line[..index];
-            map[key] = await MaybeEncrypt(context, server, $"{fieldPrefix}/{key}", line[(index + 1)..], cancellationToken).ConfigureAwait(false);
+            var key = response.Text[..separator];
+            var field = $"{prefix}/{key}";
+            var value = response.Text[(separator + 1)..];
+            encrypted.Remove(field);
+            await MaybeEncryptAsync(context, server, field, value, encrypted, ct).ConfigureAwait(false);
+            values[key] = value;
         }
-
-        return map;
     }
 
-    /// <summary>
-    /// Offer to store <paramref name="value"/> encrypted (when a store is available and a prompt surface
-    /// can answer) and return a <c>coda-secret:</c> reference instead of the plaintext; otherwise return
-    /// the literal value.
-    /// </summary>
-    private static async Task<string> MaybeEncrypt(CommandContext context, string server, string field, string value, CancellationToken cancellationToken)
+    private static async Task MaybeEncryptAsync(
+        CommandContext context,
+        string server,
+        string field,
+        string value,
+        Dictionary<string, McpSecretReplacement> encrypted,
+        CancellationToken ct)
     {
-        if (context.CredentialStore is { } store
-            && !string.IsNullOrEmpty(value)
-            && context.Prompts.IsInteractive)
+        if (context.CredentialStore is null || string.IsNullOrEmpty(value) || !context.Prompts.IsInteractive)
         {
-            var response = await context.Prompts.RequestAsync(
-                UiPromptRequest.Confirm("  Store this value encrypted (recommended)?", defaultValue: true),
-                cancellationToken).ConfigureAwait(false);
-            if (!response.Cancelled && response.SelectedIds.Contains("yes"))
-            {
-                return await McpSecretStore.StoreAsync(store, server, field, value, cancellationToken).ConfigureAwait(false);
-            }
+            return;
         }
 
-        return value;
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Confirm("Store this value encrypted (recommended)?", defaultValue: true), ct).ConfigureAwait(false);
+        if (!response.Cancelled && response.SelectedIds.Contains("yes"))
+        {
+            encrypted[field] = new McpSecretReplacement(value);
+        }
     }
 
-    // ── shared helpers ────────────────────────────────────────────────────
+    private static async Task<string?> SelectAsync(
+        CommandContext context,
+        string title,
+        CancellationToken ct,
+        params string[] ids)
+    {
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Select(SafePromptText(title), ids.Select(id => new UiPromptOption(id, id)), defaultValue: ids[0]), ct)
+            .ConfigureAwait(false);
+        return response.Cancelled || response.SelectedIds.Length == 0 ? null : response.SelectedIds[0];
+    }
+
+    private static async Task<string?> AskAsync(CommandContext context, string title, bool required, CancellationToken ct)
+    {
+        var response = await context.Prompts.RequestAsync(UiPromptRequest.Text(SafePromptText(title), required: required), ct)
+            .ConfigureAwait(false);
+        return response.Cancelled ? null : response.Text ?? string.Empty;
+    }
+
+    private static async Task<string?> AskSecretAsync(CommandContext context, string title, CancellationToken ct)
+    {
+        var response = await context.Prompts.RequestAsync(
+            UiPromptRequest.Text(SafePromptText(title), required: true, secret: true), ct).ConfigureAwait(false);
+        return response.Cancelled ? null : response.Text ?? string.Empty;
+    }
+
+    private static McpServerDraft DraftFromWizard(string name, McpConfigScope scope, McpWizardDraft wizard)
+    {
+        var draft = DraftFromConfig(name, scope, wizard.Config);
+        return wizard.Config switch
+        {
+            McpStdioServerConfig => draft with
+            {
+                Environment = draft.Environment.Select(item => item with
+                {
+                    Change = new McpSecretChange(
+                        item.Change.Field,
+                        McpSecretChangeKind.Replace,
+                        wizard.EncryptedValues.GetValueOrDefault(item.Change.Field)
+                            ?? McpSecretReplacement.Literal(item.Change.Replacement!.RevealForCommit())),
+                }).ToImmutableArray(),
+            },
+            McpHttpServerConfig => draft with
+            {
+                Headers = draft.Headers.Select(item => item with
+                {
+                    Change = new McpSecretChange(
+                        item.Change.Field,
+                        McpSecretChangeKind.Replace,
+                        wizard.EncryptedValues.GetValueOrDefault(item.Change.Field)
+                            ?? McpSecretReplacement.Literal(item.Change.Replacement!.RevealForCommit())),
+                }).ToImmutableArray(),
+                BearerToken = draft.BearerToken.Replacement is { } bearer
+                    ? new McpSecretChange(
+                        "auth/token",
+                        McpSecretChangeKind.Replace,
+                        wizard.EncryptedValues.GetValueOrDefault("auth/token")
+                            ?? McpSecretReplacement.Literal(bearer.RevealForCommit()))
+                    : draft.BearerToken,
+            },
+            _ => throw new McpException("The selected MCP transport is not supported."),
+        };
+    }
+
+    private static McpServerDraft DraftFromConfig(string name, McpConfigScope scope, McpServerConfig config) =>
+        config switch
+        {
+            McpStdioServerConfig stdio => new McpServerDraft(
+                name, scope, !stdio.Disabled, McpTransportKind.Stdio, stdio.Command,
+                stdio.Args.ToImmutableArray(), null, SecretDrafts(stdio.Env, "env"),
+                ImmutableArray<McpNamedSecretDraft>.Empty, McpAuthMode.None, null,
+                ImmutableArray<string>.Empty, new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged)),
+            McpHttpServerConfig http => new McpServerDraft(
+                name, scope, !http.Disabled, McpTransportKind.Http, null, ImmutableArray<string>.Empty,
+                http.Url.OriginalString, ImmutableArray<McpNamedSecretDraft>.Empty, SecretDrafts(http.Headers, "header"),
+                http.Auth.Mode, http.Auth.ClientId, (http.Auth.Scopes ?? []).ToImmutableArray(),
+                http.Auth.BearerToken is { } token
+                    ? new McpSecretChange("auth/token", McpSecretChangeKind.Replace, McpSecretReplacement.Literal(token))
+                    : new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged)),
+            _ => throw new McpException("The selected MCP transport is not supported."),
+        };
+
+    private static ImmutableArray<McpNamedSecretDraft> SecretDrafts(
+        IReadOnlyDictionary<string, string> values,
+        string prefix) =>
+        values.Select(pair => new McpNamedSecretDraft(
+                pair.Key,
+                McpSecretSource.Literal,
+                new McpSecretChange(
+                    $"{prefix}/{pair.Key}",
+                    McpSecretChangeKind.Replace,
+                    McpSecretReplacement.Literal(pair.Value))))
+            .ToImmutableArray();
+
+    private static void ExplainNoninteractiveWizard(CommandContext context, string verb, string name) =>
+        context.Console.MarkupLine(Markup.Escape(
+            $"Provide flags (e.g. --command <cmd> [--env KEY=VALUE] or --url <url>), or run /mcp {verb} {SafePromptText(name)} interactively."));
 
     private static (McpConfigScope Scope, List<string> Remaining) ExtractScope(IReadOnlyList<string> args)
     {
         var scope = McpConfigScope.Project;
-        var rest = new List<string>(args.Count);
-        foreach (var arg in args)
+        var remaining = new List<string>(args.Count);
+        foreach (var argument in args)
         {
-            if (string.Equals(arg, "--user", StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(argument, "--user", StringComparison.OrdinalIgnoreCase))
             {
                 scope = McpConfigScope.User;
             }
             else
             {
-                rest.Add(arg);
+                remaining.Add(argument);
             }
         }
 
-        return (scope, rest);
+        return (scope, remaining);
     }
 
-    private static string ScopeName(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
+    private static string ScopeName(McpConfigScope scope) =>
+        scope == McpConfigScope.User ? "user" : "project";
 
-    /// <summary>True when the config carries a literal (non-reference) value in a secret-bearing field.</summary>
-    private static bool HasLiteralSecret(McpServerConfig config) => config switch
-    {
-        McpStdioServerConfig stdio => stdio.Env.Values.Any(IsLiteralSecret),
-        McpHttpServerConfig http => (http.Auth.BearerToken is { } t && IsLiteralSecret(t)) || http.Headers.Values.Any(IsLiteralSecret),
-        _ => false,
-    };
+    private static string SafePromptText(string? value) =>
+        TerminalTextSanitizer.SanitizeSingleLine(value);
 
-    private static bool IsLiteralSecret(string value) =>
-        !string.IsNullOrEmpty(value)
-        && !value.StartsWith(McpSecretResolver.SecretRefPrefix, StringComparison.Ordinal)
-        && !(value.StartsWith("${", StringComparison.Ordinal) && value.EndsWith('}'));
-
-    private static bool ExistsInScope(McpConfigScope scope, string name, CommandContext context) =>
-        GetConfigInScope(scope, name, context) is not null;
-
-    /// <summary>The raw (unresolved) config for <paramref name="name"/> in the given scope's file, or null.</summary>
-    private static McpServerConfig? GetConfigInScope(McpConfigScope scope, string name, CommandContext context)
-    {
-        var path = McpConfig.FilePath(scope, context.Session.WorkingDirectory);
-        return File.Exists(path) && McpConfig.Parse(File.ReadAllText(path)).TryGetValue(name, out var config)
-            ? config
-            : null;
-    }
-
-    /// <summary>Gather the display snapshot from the configured entries + the live MCP manager.</summary>
-    private static IReadOnlyList<McpServerStatus> BuildStatuses(CommandContext context)
-    {
-        var entries = McpConfig.LoadEntries(context.Session.WorkingDirectory);
-        var manager = context.Mcp;
-        var result = new List<McpServerStatus>(entries.Count);
-        foreach (var entry in entries)
-        {
-            var tools = (manager?.ServerTools(entry.Name) ?? [])
-                .Select(t => new McpToolLine(t.Name, t.Description))
-                .ToList();
-            result.Add(new McpServerStatus(
-                entry,
-                Connected: manager?.IsServerConnected(entry.Name) ?? false,
-                Info: manager?.ServerInfoFor(entry.Name),
-                Tools: tools));
-        }
-
-        return result;
-    }
+    private sealed record McpWizardDraft(
+        McpServerConfig Config,
+        IReadOnlyDictionary<string, McpSecretReplacement> EncryptedValues);
 }

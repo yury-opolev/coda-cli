@@ -1,8 +1,11 @@
 using Coda.Tui;
 using Coda.Tui.Commands;
+using Coda.Tui.Mcp;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
+using Coda.Mcp.Auth;
+using Coda.Mcp;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -17,11 +20,15 @@ namespace Coda.Tui.Tests;
 /// </summary>
 internal static class TestAppBuilder
 {
+    private static readonly HttpClient mcpHttp = new();
+
     public static (TuiApp App, CommandContext Context, TestConsole Console, CredentialManager Credentials) BuildApp(
         ITokenStore? store = null,
         IUiPromptService? prompts = null,
         IUiEventPublisher? events = null,
-        string? workingDirectory = null)
+        string? workingDirectory = null,
+        McpClientManager? mcp = null,
+        string? userMcpDir = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -48,6 +55,15 @@ internal static class TestAppBuilder
         });
 
         var context = new CommandContext(console, credentials, session, providers, registry, prompts, events);
+        context.CredentialStore = store;
+        context.Mcp = mcp;
+        context.McpManagement = new McpManagementService(
+            context.Session.WorkingDirectory,
+            userMcpDir,
+            mcp,
+            store,
+            new DefaultMcpOAuthReauthenticator(mcpHttp, store),
+            context.Events);
         return (new TuiApp(context), context, console, credentials);
     }
 

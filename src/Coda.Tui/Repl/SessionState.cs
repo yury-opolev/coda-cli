@@ -25,6 +25,12 @@ public sealed class SessionState
     /// <summary>The model id used for chat (settable via /model).</summary>
     public string Model { get; set; } = AnthropicModels.DefaultModel;
 
+    /// <summary>The CLI override supplied when this process started; authoritative over resumed metadata.</summary>
+    public string? StartupSystemPromptOverride { get; init; }
+
+    /// <summary>The exact override currently applied to root turns; null uses normal construction.</summary>
+    public string? SystemPromptOverride { get; set; }
+
     /// <summary>
     /// Stable, shared live permission state for this session. The same instance is passed into every
     /// turn's <see cref="SessionOptions.PermissionModeState"/>, so a <c>/yolo</c> or <c>/permissions</c>

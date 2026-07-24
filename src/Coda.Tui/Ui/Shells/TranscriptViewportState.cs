@@ -1,5 +1,11 @@
 namespace Coda.Tui.Ui.Shells;
 
+internal enum TranscriptFollowMode
+{
+    Following,
+    Detached,
+}
+
 /// <summary>
 /// Shell-local scroll bookkeeping for the virtualized transcript: the top visible row, whether the view
 /// auto-follows new output, and how many appended rows have not yet been seen while scrolled away. It is
@@ -11,8 +17,14 @@ internal sealed class TranscriptViewportState
     /// <summary>The first content row rendered at the top of the viewport.</summary>
     public int TopRow { get; private set; }
 
+    /// <summary>Whether the viewport is following the newest output or detached from it.</summary>
+    public TranscriptFollowMode Mode { get; private set; } = TranscriptFollowMode.Following;
+
     /// <summary>Whether the viewport pins to the newest output as rows are appended.</summary>
-    public bool AutoFollow { get; private set; } = true;
+    public bool AutoFollow => this.Mode == TranscriptFollowMode.Following;
+
+    /// <summary>The stable content anchor captured when the viewport detached.</summary>
+    public TranscriptViewportAnchor? DetachedAnchor { get; private set; }
 
     /// <summary>Rows appended while scrolled away that the user has not seen yet.</summary>
     public int UnseenRows { get; private set; }
@@ -39,8 +51,45 @@ internal sealed class TranscriptViewportState
     /// <summary>Updates the content row count and re-clamps (following the bottom while auto-following).</summary>
     public void SetContentRows(int rows)
     {
-        this.ContentRows = Math.Max(0, rows);
-        this.Reclamp();
+        this.ApplyContentLayout(
+            rows,
+            this.DetachedAnchor,
+            this.Mode == TranscriptFollowMode.Detached ? this.TopRow : null);
+    }
+
+    /// <summary>
+    /// Applies a completed content-layout mutation without exposing an intermediate clamped position. A detached
+    /// anchor that still resolves wins over its previous global row; when it no longer resolves, the current row
+    /// is clamped and the caller-provided replacement anchor is retained when possible.
+    /// </summary>
+    public void ApplyContentLayout(
+        int contentRows,
+        TranscriptViewportAnchor? detachedAnchor,
+        int? resolvedAnchorRow)
+    {
+        this.ContentRows = Math.Max(0, contentRows);
+        if (this.AutoFollow)
+        {
+            this.FollowNewest();
+            return;
+        }
+
+        if (resolvedAnchorRow is { } anchorRow)
+        {
+            this.TopRow = Math.Clamp(anchorRow, 0, this.MaxTopRow);
+        }
+        else
+        {
+            this.TopRow = Math.Clamp(this.TopRow, 0, this.MaxTopRow);
+        }
+
+        if (this.TopRow >= this.MaxTopRow)
+        {
+            this.FollowNewest();
+            return;
+        }
+
+        this.DetachedAnchor = detachedAnchor;
     }
 
     /// <summary>
@@ -49,32 +98,39 @@ internal sealed class TranscriptViewportState
     /// </summary>
     public void ScrollBy(int deltaRows)
     {
+        this.ScrollBy(deltaRows, null);
+    }
+
+    /// <summary>Scrolls by rows while capturing the supplied stable anchor when detaching.</summary>
+    public void ScrollBy(int deltaRows, TranscriptViewportAnchor? anchor)
+    {
         if (deltaRows == 0)
         {
             return;
         }
 
-        if (deltaRows < 0)
+        var nextTopRow = Math.Clamp(this.TopRow + deltaRows, 0, this.MaxTopRow);
+        if (nextTopRow >= this.MaxTopRow)
         {
-            this.AutoFollow = false;
-            this.TopRow = Math.Clamp(this.TopRow + deltaRows, 0, this.MaxTopRow);
+            this.FollowNewest();
             return;
         }
 
-        this.TopRow = Math.Clamp(this.TopRow + deltaRows, 0, this.MaxTopRow);
-        if (this.TopRow >= this.MaxTopRow)
-        {
-            this.AutoFollow = true;
-            this.UnseenRows = 0;
-            this.UnseenBlocks = 0;
-        }
+        this.TopRow = nextTopRow;
+        this.Mode = TranscriptFollowMode.Detached;
+        this.DetachedAnchor = anchor;
     }
 
     /// <summary>Jumps to the top of the transcript and stops auto-following.</summary>
     public void ScrollToTop()
     {
-        this.AutoFollow = false;
-        this.TopRow = 0;
+        this.ScrollToTop(null);
+    }
+
+    /// <summary>Jumps to the top while capturing the supplied stable anchor.</summary>
+    public void ScrollToTop(TranscriptViewportAnchor? anchor)
+    {
+        this.ScrollToRow(0, anchor);
     }
 
     /// <summary>
@@ -83,28 +139,25 @@ internal sealed class TranscriptViewportState
     /// </summary>
     public void OnRowsAppended(int rows)
     {
-        if (rows <= 0)
-        {
-            this.ContentRows = Math.Max(0, this.ContentRows + rows);
-            this.Reclamp();
-            return;
-        }
+        var wasDetached = this.Mode == TranscriptFollowMode.Detached;
+        this.ApplyContentLayout(
+            this.ContentRows + rows,
+            this.DetachedAnchor,
+            wasDetached ? this.TopRow : null);
+        this.RecordAppendedRows(rows);
+    }
 
-        this.ContentRows += rows;
-        if (this.AutoFollow)
-        {
-            this.TopRow = this.MaxTopRow;
-            this.UnseenRows = 0;
-            this.UnseenBlocks = 0;
-        }
-        else
+    /// <summary>Records newly appended rows after their content layout has already been applied atomically.</summary>
+    public void RecordAppendedRows(int rows)
+    {
+        if (rows > 0 && this.Mode == TranscriptFollowMode.Detached)
         {
             this.UnseenRows += rows;
         }
     }
 
-    /// <summary>Records one complete visible block append without treating streaming row growth as a message.</summary>
-    public void OnBlockAppended()
+    /// <summary>Records one newly inserted visible block without treating streaming row growth as a message.</summary>
+    public void OnVisibleBlockInserted()
     {
         if (!this.AutoFollow)
         {
@@ -112,25 +165,48 @@ internal sealed class TranscriptViewportState
         }
     }
 
+    /// <summary>Compatibility alias for callers that already distinguish complete block appends.</summary>
+    public void OnBlockAppended() => this.OnVisibleBlockInserted();
+
     /// <summary>Moves to an absolute content row, resuming follow when that reaches the bottom.</summary>
     public void ScrollToRow(int row)
     {
-        this.TopRow = Math.Clamp(row, 0, this.MaxTopRow);
-        this.AutoFollow = this.TopRow >= this.MaxTopRow;
-        if (this.AutoFollow)
+        this.ScrollToRow(row, null);
+    }
+
+    /// <summary>Moves to an absolute row while capturing the supplied stable anchor when detaching.</summary>
+    public void ScrollToRow(int row, TranscriptViewportAnchor? anchor)
+    {
+        var nextTopRow = Math.Clamp(row, 0, this.MaxTopRow);
+        if (nextTopRow >= this.MaxTopRow)
         {
-            this.UnseenRows = 0;
-            this.UnseenBlocks = 0;
+            this.FollowNewest();
+            return;
         }
+
+        this.TopRow = nextTopRow;
+        this.Mode = TranscriptFollowMode.Detached;
+        this.DetachedAnchor = anchor;
+    }
+
+    /// <summary>
+    /// Restores a detached viewport row and anchor without changing its mode or unseen counters.
+    /// </summary>
+    public void RestoreDetachedPosition(int row, TranscriptViewportAnchor anchor)
+    {
+        if (this.Mode != TranscriptFollowMode.Detached)
+        {
+            return;
+        }
+
+        this.TopRow = Math.Clamp(row, 0, this.MaxTopRow);
+        this.DetachedAnchor = anchor;
     }
 
     /// <summary>Jumps to the newest row, resumes auto-following, and clears the unseen count.</summary>
     public void JumpToNewest()
     {
-        this.AutoFollow = true;
-        this.UnseenRows = 0;
-        this.UnseenBlocks = 0;
-        this.TopRow = this.MaxTopRow;
+        this.FollowNewest();
     }
 
     private void Reclamp()
@@ -144,10 +220,17 @@ internal sealed class TranscriptViewportState
             this.TopRow = Math.Clamp(this.TopRow, 0, this.MaxTopRow);
             if (this.TopRow >= this.MaxTopRow)
             {
-                this.AutoFollow = true;
-                this.UnseenRows = 0;
-                this.UnseenBlocks = 0;
+                this.FollowNewest();
             }
         }
+    }
+
+    private void FollowNewest()
+    {
+        this.Mode = TranscriptFollowMode.Following;
+        this.DetachedAnchor = null;
+        this.UnseenRows = 0;
+        this.UnseenBlocks = 0;
+        this.TopRow = this.MaxTopRow;
     }
 }

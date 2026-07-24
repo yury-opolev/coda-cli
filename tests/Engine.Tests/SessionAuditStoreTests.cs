@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+using Coda.Agent;
 using Coda.Sdk;
 using LlmClient;
 
@@ -109,5 +111,115 @@ public sealed class SessionAuditStoreTests : IDisposable
         var store = new SessionAuditStore(this.tempDir);
         await store.AppendTurnAsync("../escape", Turn(0, "SYS-A", ["read_file"]));
         Assert.False(Directory.Exists(Path.Combine(this.tempDir, ".coda", "sessions")));
+    }
+
+    [Fact]
+    public void AuditJson_round_trips_all_optional_correlation_fields_and_status()
+    {
+        var original = new ToolCallRecord("grep", "{}", "ok", false)
+        {
+            RootTurnId = "root",
+            ActivityId = "activity",
+            CallId = "call-1",
+            SourceId = "root:root",
+            Status = ToolCallStatus.Succeeded,
+        };
+
+        var json = AuditJson.SerializeToolCalls([original]);
+        var loaded = Assert.Single(AuditJson.DeserializeToolCalls(json));
+
+        Assert.Equal(original.RootTurnId, loaded.RootTurnId);
+        Assert.Equal(original.ActivityId, loaded.ActivityId);
+        Assert.Equal(original.CallId, loaded.CallId);
+        Assert.Equal(original.SourceId, loaded.SourceId);
+        Assert.Equal(original.Status, loaded.Status);
+        Assert.Equal("Succeeded", json[0]!["status"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void AuditJson_omits_null_optional_fields_and_loads_legacy_calls_with_null_correlation()
+    {
+        var serialized = Assert.IsType<JsonObject>(
+            Assert.Single(AuditJson.SerializeToolCalls([new ToolCallRecord("grep", "{}", "ok", false)])));
+
+        Assert.False(serialized.ContainsKey("rootTurnId"));
+        Assert.False(serialized.ContainsKey("activityId"));
+        Assert.False(serialized.ContainsKey("callId"));
+        Assert.False(serialized.ContainsKey("sourceId"));
+        Assert.False(serialized.ContainsKey("status"));
+
+        var legacy = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "grep",
+                ["input"] = "{}",
+                ["result"] = "ok",
+                ["isError"] = false,
+            },
+        };
+
+        var loaded = Assert.Single(AuditJson.DeserializeToolCalls(legacy));
+
+        Assert.Null(loaded.RootTurnId);
+        Assert.Null(loaded.ActivityId);
+        Assert.Null(loaded.CallId);
+        Assert.Null(loaded.SourceId);
+        Assert.Null(loaded.Status);
+    }
+
+    [Fact]
+    public void AuditJson_tolerates_unknown_or_non_string_status_as_null()
+    {
+        var json = new JsonArray
+        {
+            new JsonObject
+            {
+                ["name"] = "grep",
+                ["input"] = "{}",
+                ["isError"] = false,
+                ["status"] = "future_status",
+            },
+            new JsonObject
+            {
+                ["name"] = "read_file",
+                ["input"] = "{}",
+                ["isError"] = false,
+                ["status"] = 999,
+            },
+        };
+
+        var loaded = AuditJson.DeserializeToolCalls(json);
+
+        Assert.All(loaded, call => Assert.Null(call.Status));
+    }
+
+    [Fact]
+    public async Task AppendThenLoad_preserves_correlated_tool_calls()
+    {
+        var store = new SessionAuditStore(this.tempDir);
+        var turn = Turn(0, "SYS-A", ["read_file"]) with
+        {
+            ToolCalls =
+            [
+                new ToolCallRecord("read_file", """{"path":"a"}""", "ok", false)
+                {
+                    RootTurnId = "root",
+                    ActivityId = "activity",
+                    CallId = "call-1",
+                    SourceId = "root:root",
+                    Status = ToolCallStatus.Succeeded,
+                },
+            ],
+        };
+
+        await store.AppendTurnAsync("s1", turn);
+
+        var loaded = Assert.Single((await store.LoadAsync("s1")).Single().ToolCalls);
+        Assert.Equal("root", loaded.RootTurnId);
+        Assert.Equal("activity", loaded.ActivityId);
+        Assert.Equal("call-1", loaded.CallId);
+        Assert.Equal("root:root", loaded.SourceId);
+        Assert.Equal(ToolCallStatus.Succeeded, loaded.Status);
     }
 }

@@ -20,8 +20,8 @@ namespace Coda.Sdk.Scheduling;
 /// <remarks>
 /// The live options source (<c>currentOptions</c>) is evaluated on every firing, not once at
 /// construction, so a mid-session provider/model/effort/output-style/tool/permission change is
-/// observed by the next scheduled run. Cancellation and exceptions propagate unchanged so the task
-/// manager records Stopped/Failed authoritatively — there is no broad catch here.
+/// observed by the next scheduled run. Cancellation and exceptions propagate unchanged after tool
+/// activity is finalized, so the task manager records Stopped/Failed authoritatively.
 /// </remarks>
 public sealed class ScheduledAgentHost : IScheduledAgentHost
 {
@@ -81,30 +81,47 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         ArgumentNullException.ThrowIfNull(steering);
         ArgumentException.ThrowIfNullOrEmpty(taskId);
 
-        // Snapshot the live options AT ENTRY so a mid-firing mutation cannot tear the run.
-        var options = this.currentOptions();
+        var rootToolActivity = ToolActivityContext.CreateRoot();
+        var recording = new RecordingSink(sink);
+        var toolActivityFinalized = false;
 
-        var client = this.clientFactory.Create(
-            options.ProviderId,
-            this.credentials,
-            this.fingerprint,
-            this.http,
-            this.loggerFactory,
-            options.LlmHttpTimeoutOverride,
-            this.streamProgressSink);
-        if (client is null)
+        void CompleteToolActivity(bool interrupted)
         {
-            throw new InvalidOperationException($"No chat client for provider '{options.ProviderId}'.");
+            if (toolActivityFinalized)
+            {
+                return;
+            }
+
+            toolActivityFinalized = true;
+            recording.CompleteActivity(interrupted);
         }
 
+        ILlmClient? client = null;
         try
         {
+            // Snapshot the live options AT ENTRY so a mid-firing mutation cannot tear the run.
+            var options = this.currentOptions();
+
+            client = this.clientFactory.Create(
+                options.ProviderId,
+                this.credentials,
+                this.fingerprint,
+                this.http,
+                this.loggerFactory,
+                options.LlmHttpTimeoutOverride,
+                this.streamProgressSink);
+            if (client is null)
+            {
+                throw new InvalidOperationException($"No chat client for provider '{options.ProviderId}'.");
+            }
+
             var settings = SettingsLoader.Load(options.WorkingDirectory);
 
             var spec = this.pipeline.BuildScheduledSpec(options, client, settings, taskId, depth) with
             {
                 // Apply the task's steering inbox so task_send can redirect the scheduled run.
                 Steering = steering,
+                ToolActivity = rootToolActivity,
             };
 
             var loop = this.loopFactory.Create(spec);
@@ -112,12 +129,17 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
             // The scheduled run is ISOLATED: its history is exactly the firing's prompt. The session's
             // main history is never referenced or mutated here.
             var history = new List<ChatMessage> { ChatMessage.UserText(prompt) };
-            var recording = new RecordingSink(sink);
 
             await loop.RunAsync(history, recording, cancellationToken).ConfigureAwait(false);
 
+            CompleteToolActivity(interrupted: false);
             var text = recording.FinalText;
             return string.IsNullOrWhiteSpace(text) ? "(scheduled task completed)" : text;
+        }
+        catch
+        {
+            CompleteToolActivity(interrupted: true);
+            throw;
         }
         finally
         {

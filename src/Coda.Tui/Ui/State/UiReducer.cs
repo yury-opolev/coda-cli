@@ -31,11 +31,32 @@ public static class UiReducer
         AssistantTextDeltaEvent e => AppendOrExtendAssistant(state, e.Delta),
         AssistantTextCompletedEvent => CompleteAssistant(state),
 
-        ToolStartedEvent e => Append(
+        ToolQueuedEvent e => ReduceActivity(
+            state,
+            e.Identity,
+            activity => ToolActivityState.Queue(activity, e.Identity, e.ToolName, e.InputJson)),
+        ToolStartedEvent { Identity: null } e => Append(
             state,
             new ToolTranscriptBlock(Guid.NewGuid(), e.ToolName, e.InputJson, null, null, false, false)),
-        ToolProgressEvent e => UpdateActiveTool(state, e.ToolName, t => t with { ElapsedMs = e.ElapsedMs }),
-        ToolCompletedEvent e => CompleteTool(state, e.ToolName, e.Result),
+        ToolStartedEvent { Identity: { } identity } e => ReduceActivity(
+            state,
+            identity,
+            activity => ToolActivityState.Start(activity, identity, e.ToolName, e.InputJson)),
+        ToolStateChangedEvent e => ReduceActivity(
+            state,
+            e.Identity,
+            activity => ToolActivityState.SetStatus(activity, e.Identity, e.ToolName, e.Status)),
+        ToolProgressEvent { Identity: null } e => UpdateActiveTool(state, e.ToolName, t => t with { ElapsedMs = e.ElapsedMs }),
+        ToolProgressEvent { Identity: { } identity } e => ReduceActivity(
+            state,
+            identity,
+            activity => ToolActivityState.SetProgress(activity, identity, e.ToolName, e.ElapsedMs)),
+        ToolCompletedEvent { Identity: null } e => CompleteTool(state, e.ToolName, e.Result),
+        ToolCompletedEvent { Identity: { } identity } e => ReduceActivity(
+            state,
+            identity,
+            activity => ToolActivityState.Complete(activity, identity, e.ToolName, e.Result, e.Status)),
+        ToolActivityCompletedEvent e => FinalizeActivity(state, e.Summary),
 
         UsageEvent e => state with { SessionUsage = state.SessionUsage.Add(e.Usage) },
         StopReasonEvent e => state with { StopReason = e.StopReason },
@@ -141,6 +162,51 @@ public static class UiReducer
 
     private static UiSessionSnapshot Append(UiSessionSnapshot state, TranscriptBlock block) =>
         state with { Transcript = state.Transcript.Add(block) };
+
+    private static UiSessionSnapshot ReduceActivity(
+        UiSessionSnapshot state,
+        ToolCallIdentity identity,
+        Func<ToolActivityTranscriptBlock?, ToolActivityTranscriptBlock> reduce)
+    {
+        var index = ActivityIndex(state.Transcript, identity.RootTurnId, identity.ActivityId);
+        if (index < 0)
+        {
+            return Append(state, reduce(null));
+        }
+
+        var existing = (ToolActivityTranscriptBlock)state.Transcript[index];
+        return state with { Transcript = state.Transcript.SetItem(index, reduce(existing)) };
+    }
+
+    private static UiSessionSnapshot FinalizeActivity(UiSessionSnapshot state, ToolActivitySummary summary)
+    {
+        var index = ActivityIndex(state.Transcript, summary.RootTurnId, summary.ActivityId);
+        if (index < 0)
+        {
+            return state;
+        }
+
+        var existing = (ToolActivityTranscriptBlock)state.Transcript[index];
+        var finalized = ToolActivityState.Finalize(existing, summary);
+        return ReferenceEquals(existing, finalized)
+            ? state
+            : state with { Transcript = state.Transcript.SetItem(index, finalized!) };
+    }
+
+    private static int ActivityIndex(ImmutableArray<TranscriptBlock> transcript, string rootTurnId, string activityId)
+    {
+        for (var index = 0; index < transcript.Length; index++)
+        {
+            if (transcript[index] is ToolActivityTranscriptBlock activity
+                && string.Equals(activity.RootTurnId, rootTurnId, StringComparison.Ordinal)
+                && string.Equals(activity.ActivityId, activityId, StringComparison.Ordinal))
+            {
+                return index;
+            }
+        }
+
+        return -1;
+    }
 
     private static UiSessionSnapshot DeliverPendingSteering(UiSessionSnapshot state, IReadOnlyList<string> ids)
     {

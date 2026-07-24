@@ -1,4 +1,8 @@
 using Coda.Agent;
+using Coda.Common;
+using System.Globalization;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace Coda.Mcp;
 
@@ -13,7 +17,7 @@ namespace Coda.Mcp;
 /// lock is used. A future background mutator would need synchronization here.
 /// </para>
 /// </summary>
-public sealed class McpClientManager : IAsyncDisposable
+public sealed partial class McpClientManager : IAsyncDisposable
 {
     /// <summary>
     /// Phase attributed to a startup failure that cannot be pinned to a single JSON-RPC method
@@ -24,6 +28,8 @@ public sealed class McpClientManager : IAsyncDisposable
 
     private readonly List<IMcpClient> clients = [];
     private readonly List<ITool> tools = [];
+    private readonly Dictionary<string, string> lastConnectionErrors = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, RuntimeErrorSource> lastConnectionErrorSources = new(StringComparer.Ordinal);
     private readonly bool ownsClients;
     private readonly IMcpHttpClientFactory? httpFactory;
 
@@ -79,6 +85,16 @@ public sealed class McpClientManager : IAsyncDisposable
     public McpServerInfo? ServerInfoFor(string serverName) =>
         this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal))?.ServerInfo;
 
+    /// <summary>
+    /// The last safe, actionable runtime error for <paramref name="serverName"/>, or null when the
+    /// server has not failed since its last successful operation.
+    /// </summary>
+    public string? LastConnectionErrorFor(string serverName)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        return this.lastConnectionErrors.GetValueOrDefault(serverName);
+    }
+
     /// <summary>The connected tools that belong to <paramref name="serverName"/> (empty when not connected).</summary>
     public IReadOnlyList<McpTool> ServerTools(string serverName) => McpServerTools.ForServer(this.tools, serverName);
 
@@ -133,9 +149,14 @@ public sealed class McpClientManager : IAsyncDisposable
         }
 
         var client = this.CreateClient(name, config);
-        return client is null
-            ? McpConnectResult.Failure("HTTP transport is not available.")
-            : await this.ConnectClientAsync(client, cancellationToken).ConfigureAwait(false);
+        if (client is not null)
+        {
+            return await this.ConnectClientAsync(client, cancellationToken).ConfigureAwait(false);
+        }
+
+        const string error = "HTTP transport is not available.";
+        this.SetLastConnectionError(name, error);
+        return McpConnectResult.Failure(error);
     }
 
     /// <summary>Initialize a pre-built client and adopt its tools (a test seam + the shared connect core).</summary>
@@ -165,15 +186,26 @@ public sealed class McpClientManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            await client.DisposeAsync().ConfigureAwait(false);
+            try
+            {
+                await client.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // The failed client was never adopted; preserve the original connection failure.
+            }
+
             var callerCanceled = cancellationToken.IsCancellationRequested;
             var timedOut = !callerCanceled && linkedCts.IsCancellationRequested;
-            return McpConnectResult.Failure(this.ClassifyFailure(ex, client.ServerName, callerCanceled, timedOut));
+            var error = this.SanitizeRuntimeError(this.ClassifyFailure(ex, client.ServerName, callerCanceled, timedOut));
+            this.SetLastConnectionError(client.ServerName, error);
+            return McpConnectResult.Failure(error);
         }
 
         // Atomic adoption: only after initialize and every wrapper succeeded.
         this.clients.Add(client);
         this.tools.AddRange(newTools);
+        this.ClearLastConnectionError(client.ServerName);
         this.Version++;
         return McpConnectResult.Success(serverTools.Count);
     }
@@ -228,8 +260,17 @@ public sealed class McpClientManager : IAsyncDisposable
 
         this.clients.Remove(client);
         this.tools.RemoveAll(t => t is McpTool mcpTool && string.Equals(mcpTool.ServerName, name, StringComparison.Ordinal));
-        await client.DisposeAsync().ConfigureAwait(false);
         this.Version++;
+        try
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+            this.ClearLastConnectionError(name);
+        }
+        catch (Exception ex)
+        {
+            this.SetLastConnectionError(name, this.SanitizeRuntimeError(ex.Message));
+        }
+
         return true;
     }
 
@@ -288,6 +329,36 @@ public sealed class McpClientManager : IAsyncDisposable
     }
 
     /// <summary>
+    /// List prompts from exactly the connected server named <paramref name="serverName"/>.
+    /// Returns an empty list when it is absent or cannot list prompts.
+    /// </summary>
+    public async Task<IReadOnlyList<McpPromptInfo>> ServerPromptsAsync(string serverName, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        var client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal));
+        if (client is null)
+        {
+            return [];
+        }
+
+        try
+        {
+            var prompts = await client.ListPromptsAsync(ct).ConfigureAwait(false);
+            this.ClearCapabilityError(serverName);
+            return prompts;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability);
+            return [];
+        }
+    }
+
+    /// <summary>
     /// Get a rendered prompt from the named server.
     /// Returns an informational message if no client with that server name is connected.
     /// </summary>
@@ -300,6 +371,36 @@ public sealed class McpClientManager : IAsyncDisposable
         }
 
         return await client.GetPromptAsync(promptName, null, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// List resources from exactly the connected server named <paramref name="serverName"/>.
+    /// Returns an empty list when it is absent or cannot list resources.
+    /// </summary>
+    public async Task<IReadOnlyList<McpResourceInfo>> ServerResourcesAsync(string serverName, CancellationToken ct = default)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        var client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal));
+        if (client is null)
+        {
+            return [];
+        }
+
+        try
+        {
+            var resources = await client.ListResourcesAsync(ct).ConfigureAwait(false);
+            this.ClearCapabilityError(serverName);
+            return resources;
+        }
+        catch (OperationCanceledException) when (ct.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability);
+            return [];
+        }
     }
 
     private async Task<IReadOnlyList<McpPromptInfo>> TryListPromptsAsync(IMcpClient client, CancellationToken cancellationToken)
@@ -324,6 +425,143 @@ public sealed class McpClientManager : IAsyncDisposable
         {
             return [];
         }
+    }
+
+    private void SetLastConnectionError(string serverName, string error, RuntimeErrorSource source = RuntimeErrorSource.Connection)
+    {
+        this.lastConnectionErrors[serverName] = error;
+        this.lastConnectionErrorSources[serverName] = source;
+    }
+
+    private void ClearLastConnectionError(string serverName)
+    {
+        this.lastConnectionErrors.Remove(serverName);
+        this.lastConnectionErrorSources.Remove(serverName);
+    }
+
+    private void ClearCapabilityError(string serverName)
+    {
+        if (this.lastConnectionErrorSources.GetValueOrDefault(serverName) == RuntimeErrorSource.Capability)
+        {
+            this.ClearLastConnectionError(serverName);
+        }
+    }
+
+    /// <summary>
+    /// Creates a bounded, single-line user-visible error after redacting secrets and removing terminal
+    /// control sequences plus Unicode control and format characters.
+    /// </summary>
+    private string SanitizeRuntimeError(string error)
+    {
+        try
+        {
+            var safe = TerminalEscapePattern().Replace(error, string.Empty);
+            safe = ObfuscatedSecretAssignmentPattern().Replace(safe, RedactObfuscatedSecretAssignment);
+            safe = SanitizeSingleLine(safe);
+            safe = SecretRedactor.Redact(safe);
+            safe = SecretAssignmentPattern().Replace(safe, $"$1$2{SecretRedactor.Placeholder}");
+            safe = UrlPattern().Replace(safe, "[redacted URL]");
+            return TelemetryText.Truncate(safe);
+        }
+        catch (RegexMatchTimeoutException)
+        {
+            return "MCP operation failed.";
+        }
+    }
+
+    private static string SanitizeSingleLine(string text)
+    {
+        var stripped = TerminalEscapePattern().Replace(text, string.Empty);
+        var builder = new StringBuilder(stripped.Length);
+        var pendingSpace = false;
+
+        foreach (var rune in stripped.EnumerateRunes())
+        {
+            if (Rune.IsWhiteSpace(rune))
+            {
+                pendingSpace = builder.Length > 0;
+                continue;
+            }
+
+            if (IsControlOrFormat(rune))
+            {
+                continue;
+            }
+
+            if (pendingSpace)
+            {
+                builder.Append(' ');
+                pendingSpace = false;
+            }
+
+            builder.Append(rune.ToString());
+        }
+
+        return builder.ToString();
+    }
+
+    private static bool IsControlOrFormat(Rune rune)
+    {
+        var category = Rune.GetUnicodeCategory(rune);
+        return category is UnicodeCategory.Control or UnicodeCategory.Format;
+    }
+
+    private static string RedactObfuscatedSecretAssignment(Match match) =>
+        IsSecretAssignmentKey(match.Groups[1].Value)
+            ? $"{match.Groups[1].Value}{match.Groups[2].Value}{SecretRedactor.Placeholder}"
+            : match.Value;
+
+    private static bool IsSecretAssignmentKey(string key)
+    {
+        var normalized = new StringBuilder(key.Length);
+        foreach (var rune in key.EnumerateRunes())
+        {
+            if (!IsControlOrFormat(rune))
+            {
+                normalized.Append(rune.ToString());
+            }
+        }
+
+        var name = normalized.ToString().ToLowerInvariant();
+        return name.Equals("authorization", StringComparison.Ordinal) ||
+               name.Equals("proxy-authorization", StringComparison.Ordinal) ||
+               name.Equals("x-api-key", StringComparison.Ordinal) ||
+               name.Equals("cookie", StringComparison.Ordinal) ||
+               name.Equals("set-cookie", StringComparison.Ordinal) ||
+               name.Equals("token", StringComparison.Ordinal) ||
+               name.Equals("secret", StringComparison.Ordinal) ||
+               name.Equals("password", StringComparison.Ordinal) ||
+               name.Equals("api_key", StringComparison.Ordinal) ||
+               name.Equals("api-key", StringComparison.Ordinal) ||
+               name.Equals("apikey", StringComparison.Ordinal) ||
+               name.Contains("token", StringComparison.Ordinal) ||
+               name.Contains("secret", StringComparison.Ordinal) ||
+               name.Contains("password", StringComparison.Ordinal) ||
+               name.Contains("api_key", StringComparison.Ordinal) ||
+               name.Contains("api-key", StringComparison.Ordinal) ||
+               name.Contains("apikey", StringComparison.Ordinal);
+    }
+
+    [GeneratedRegex(@"\x1B(?:[@-Z\\_]|\[[0-?]*[ -/]*[@-~]|\][^\x07\x1B\x9C]*(?:\x07|\x1B\\|\x9C))|\x9B[0-?]*[ -/]*[@-~]|\x9D[^\x07\x9C]*(?:\x07|\x9C)", RegexOptions.Compiled | RegexOptions.NonBacktracking, 1000)]
+    private static partial Regex TerminalEscapePattern();
+
+    [GeneratedRegex(@"(?x)
+        \b(authorization|proxy-authorization|x-api-key|cookie|set-cookie|
+        token|secret|password|api[_-]?key|apikey|
+        [a-z_][a-z0-9_-]*(?:token|secret|password|api[_-]?key)[a-z0-9_-]*)
+        (\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
+    private static partial Regex SecretAssignmentPattern();
+
+    [GeneratedRegex(@"\b([a-z_][a-z0-9_\-\p{Cc}\p{Cf}]*)(\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
+    private static partial Regex ObfuscatedSecretAssignmentPattern();
+
+    [GeneratedRegex(@"https?://\S+", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
+    private static partial Regex UrlPattern();
+
+    private enum RuntimeErrorSource
+    {
+        Connection,
+        Capability,
     }
 
     public async ValueTask DisposeAsync()

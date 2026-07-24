@@ -162,4 +162,10 @@ public sealed class SettingsDefaultsTests : IDisposable
         Assert.Same(CodaSettings.Empty, settings);
         Assert.Null(settings.ToolDisplayMode);
     }
+
+    [Fact]
+    public void Default_settings_keep_tool_display_mode_raw_value_absent()
+    {
+        Assert.Null(CodaSettings.Empty.ToolDisplayMode);
+    }
 }

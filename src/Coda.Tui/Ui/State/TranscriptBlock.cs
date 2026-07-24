@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Coda.Agent;
 
 namespace Coda.Tui.Ui.State;
@@ -50,6 +51,35 @@ public sealed record AssistantTranscriptBlock(Guid Id, string Text, bool Complet
 public sealed record ToolTranscriptBlock(
     Guid Id, string ToolName, string InputJson, long? ElapsedMs, string? Result, bool IsError, bool Complete)
     : TranscriptBlock(Id);
+
+/// <summary>Whether a correlated tool activity is active or has reached a terminal summary.</summary>
+public enum ToolActivityCompletionState
+{
+    Active,
+    Completed,
+    Cancelled,
+}
+
+/// <summary>A correlated tool invocation within a root-turn activity.</summary>
+public sealed record ToolActivityCall(
+    string CallId,
+    string SourceId,
+    string ToolName,
+    string InputJson,
+    string SafePreview,
+    ToolCallStatus Status,
+    long? ElapsedMs,
+    string? Result,
+    string? Error,
+    bool IsOrphan = false);
+
+/// <summary>One immutable, correlated activity block containing every tool call for an activity.</summary>
+public sealed record ToolActivityTranscriptBlock(
+    Guid Id,
+    string RootTurnId,
+    string ActivityId,
+    ImmutableArray<ToolActivityCall> Calls,
+    ToolActivityCompletionState CompletionState) : TranscriptBlock(Id);
 
 /// <summary>Raw command output emitted to the transcript.</summary>
 public sealed record CommandOutputTranscriptBlock(Guid Id, string Text) : TranscriptBlock(Id);

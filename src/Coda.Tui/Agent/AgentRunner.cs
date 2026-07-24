@@ -401,6 +401,7 @@ public sealed class AgentRunner : IDisposable
             ? new TuiPlanApprover(context.Prompts, context.Events, context.Session)
             : null,
         OutputStyle = context.Session.OutputStyle,
+        SystemPromptOverride = context.Session.SystemPromptOverride,
         Effort = context.Session.Effort,
         Goal = context.Session.Goal,
         GoalMaxDuration = context.Session.GoalMaxDuration,

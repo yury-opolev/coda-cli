@@ -1,10 +1,80 @@
 using Coda.Mcp;
 using Coda.Tui.Commands;
+using Coda.Tui.Mcp;
 
 namespace Coda.Tui.Tests;
 
 public sealed class McpFlagParserTests
 {
+    [Fact]
+    public void Edit_flags_accept_a_new_name_without_resetting_other_fields()
+    {
+        var current = new McpServerDraft(
+            Name: "old",
+            Scope: McpConfigScope.Project,
+            Enabled: false,
+            Transport: McpTransportKind.Http,
+            Command: null,
+            Args: [],
+            Url: "https://example.test/mcp",
+            Environment: [],
+            Headers: [],
+            AuthMode: McpAuthMode.OAuth,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+
+        var parsed = McpFlagParser.ParseEdit(current, ["--name", "renamed"]);
+
+        Assert.True(parsed.Ok, parsed.Error);
+        Assert.Equal("renamed", parsed.Draft!.Name);
+        Assert.False(parsed.Draft.Enabled);
+        Assert.Equal("https://example.test/mcp", parsed.Draft.Url);
+        Assert.Equal(current.BearerToken, parsed.Draft.BearerToken);
+    }
+
+    [Fact]
+    public void Explicit_args_replace_service_created_item_identities()
+    {
+        var originalItem = new McpDraftListItem(Guid.NewGuid(), "redacted");
+        var current = new McpServerDraft(
+            "server", McpConfigScope.Project, true, McpTransportKind.Stdio, "node",
+            ["redacted"], null, [], [], McpAuthMode.None, null, [],
+            new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged))
+        {
+            DraftId = Guid.NewGuid(),
+            ArgumentItems = [originalItem],
+        };
+
+        var parsed = McpFlagParser.ParseEdit(current, ["--args", "redacted"]);
+
+        Assert.True(parsed.Ok, parsed.Error);
+        var item = Assert.Single(parsed.Draft!.ArgumentItems);
+        Assert.Equal("redacted", item.Value);
+        Assert.NotEqual(originalItem.Id, item.Id);
+    }
+
+    [Fact]
+    public void Explicit_scopes_replace_service_created_item_identities()
+    {
+        var originalItem = new McpDraftListItem(Guid.NewGuid(), "redacted");
+        var current = new McpServerDraft(
+            "server", McpConfigScope.Project, true, McpTransportKind.Http, null,
+            [], "https://example.test/mcp", [], [], McpAuthMode.OAuth, null, ["redacted"],
+            new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged))
+        {
+            DraftId = Guid.NewGuid(),
+            ScopeItems = [originalItem],
+        };
+
+        var parsed = McpFlagParser.ParseEdit(current, ["--scopes", "redacted"]);
+
+        Assert.True(parsed.Ok, parsed.Error);
+        var item = Assert.Single(parsed.Draft!.ScopeItems);
+        Assert.Equal("redacted", item.Value);
+        Assert.NotEqual(originalItem.Id, item.Id);
+    }
+
     [Fact]
     public void Stdio_inferred_from_command_with_args_and_env()
     {

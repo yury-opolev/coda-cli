@@ -1,4 +1,6 @@
 using Coda.Agent;
+using Coda.Mcp.Auth;
+using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -7,6 +9,7 @@ using Coda.Tui.Ui;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
@@ -83,6 +86,19 @@ public static class InteractiveProgram
             analyze ?? (ct => Commands.ContextCommand.AnalyzeOnceAsync(context, ct)));
     }
 
+    internal static Func<McpBrowserProvider?> CreateMcpBrowserProvider(
+        IMcpManagementService management,
+        IUiPromptService prompts,
+        IExclusiveIdleGate idleGate)
+    {
+        ArgumentNullException.ThrowIfNull(management);
+        ArgumentNullException.ThrowIfNull(prompts);
+        ArgumentNullException.ThrowIfNull(idleGate);
+
+        var provider = new McpBrowserProvider(management, prompts, idleGate);
+        return () => provider;
+    }
+
     /// <summary>
     /// Parse <paramref name="args"/>, select the initial mode from <paramref name="capabilities"/>, and
     /// run it. Returns the process exit code; a bad launch request returns <c>2</c> after writing a
@@ -103,7 +119,30 @@ public static class InteractiveProgram
         ArgumentNullException.ThrowIfNull(error);
         ArgumentNullException.ThrowIfNull(capabilities);
 
+        var startupWorkingDirectory = Directory.GetCurrentDirectory();
         var options = TuiLaunchOptions.Parse(args);
+        if (options.Error is not null)
+        {
+            error.WriteLine(options.Error);
+            return 2;
+        }
+
+        try
+        {
+            options = options with
+            {
+                SystemPromptOverride = await SystemPromptSourceResolver.ResolveAsync(
+                    options.SystemPromptSource,
+                    startupWorkingDirectory,
+                    cancellationToken).ConfigureAwait(false),
+            };
+        }
+        catch (SystemPromptSourceException ex)
+        {
+            error.WriteLine(ex.Message);
+            return 2;
+        }
+
         var caps = capabilities.Get();
         var decision = TuiModePolicy.SelectInitial(options, caps);
         if (decision.Error is not null || decision.Mode is not { } mode)
@@ -196,7 +235,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var startupProvider = StartupProviderResolver.Resolve(
             Environment.GetEnvironmentVariable("CODA_PROVIDER"), connectedProviderId, providers);
 
-        var session = new SessionState(startupProvider.Id);
+        var session = CreateSessionState(startupProvider.Id, options);
         var (_, resolvedStartupModel) = Coda.Sdk.Providers.ProviderModelResolver.Resolve(
             startupProvider.Id,
             Environment.GetEnvironmentVariable("CODA_MODEL"),
@@ -214,7 +253,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         {
             Publish(mailbox, new DiagnosticEvent(
                 "settings",
-                $"Invalid toolDisplayMode '{toolDisplayResolution.RawValue}'; using tiny.",
+                ToolDisplayModeResolver.InvalidValueWarning(toolDisplayResolution.RawValue),
                 UiNotificationLevel.Warning));
         }
 
@@ -241,6 +280,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         context.ExtraToolsProvider = agentToolsProvider;
         context.Mcp = mcp;
         context.CredentialStore = store;
+        var mcpManagement = new McpManagementService(
+            cwd,
+            userMcpDir: null,
+            mcp,
+            store,
+            new DefaultMcpOAuthReauthenticator(mcpHttp, store),
+            mailbox);
+        context.McpManagement = mcpManagement;
 
         // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
         // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only
@@ -274,7 +321,9 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 ? new TaskBrowserProvider(tasks, gate)
                 : null;
 
-        var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
+        using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
+        var mcpBrowserProvider = InteractiveProgram.CreateMcpBrowserProvider(
+            mcpManagement, actorPrompts, controller);
 
         // Ctrl-C on the plain/Spectre console: interrupt the active turn as a legacy path (the retained
         // Terminal.Gui shells own their own Esc/Ctrl+C chords). The explicit exit action is wired
@@ -305,7 +354,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             {
                 await SeedSessionAsync(context, options, mailbox, hostToken).ConfigureAwait(false);
                 await ConnectMcpAsync(context, mcp, store, mailbox, hostToken).ConfigureAwait(false);
-                await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
+                var ranSetup = await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
+                if (!ranSetup)
+                {
+                    SystemPromptCompatibilityWarning.Publish(context);
+                }
 
                 // Eagerly create + initialize the session BEFORE ready metadata/banner/composer
                 // enablement: this starts the schedule runtime so persisted schedules resume before the
@@ -406,18 +459,17 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             var composerController = new ComposerController(new SlashCommandCompletion(registry));
             composerController.Restore(composer);
 
-            TerminalGuiShellBase shell = shellMode == TuiRunMode.Fullscreen
-                ? new FullscreenTuiShell(
-                    tgApp, composerController, mailbox, controller.CurrentSnapshot,
-                    hasActiveWork: () => controller.HasActiveWork,
-                    transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
-                    taskBrowserProvider: taskBrowserProvider,
-                    toolDisplayMode: toolDisplayMode)
-                : new InlineTuiShell(
-                    tgApp, composerController, mailbox, controller.CurrentSnapshot,
-                    hasActiveWork: () => controller.HasActiveWork,
-                    transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
-                    toolDisplayMode: toolDisplayMode);
+            var shell = TerminalGuiShellComposition.Create(
+                shellMode,
+                tgApp,
+                composerController,
+                mailbox,
+                controller.CurrentSnapshot,
+                hasActiveWork: () => controller.HasActiveWork,
+                transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
+                taskBrowserProvider: taskBrowserProvider,
+                mcpBrowserProvider: mcpBrowserProvider,
+                toolDisplayMode: toolDisplayMode);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);
@@ -476,6 +528,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             hostToken,
             cancellationToken).ConfigureAwait(false);
     }
+
+    internal static SessionState CreateSessionState(string providerId, TuiLaunchOptions options) =>
+        new(providerId)
+        {
+            StartupSystemPromptOverride = options.SystemPromptOverride,
+            SystemPromptOverride = options.SystemPromptOverride,
+        };
 
     /// <summary>
     /// Drive the host to a clean exit, then — once and only after the terminal is restored and the UI
@@ -621,22 +680,32 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             return;
         }
 
-        context.Session.History.AddRange(target.Messages);
         if (startupIntent.Fork)
         {
+            context.Session.History.AddRange(target.Messages);
+            var systemPromptOverride = context.Session.StartupSystemPromptOverride ?? target.Metadata.SystemPromptOverride;
+            context.Session.SystemPromptOverride = systemPromptOverride;
             context.Session.SessionId = await Coda.Sdk.SessionForking.ForkAsync(
-                context.Session.WorkingDirectory, target.Id, target.Messages, ct).ConfigureAwait(false);
+                context.Session.WorkingDirectory,
+                target.Id,
+                target.Messages,
+                new Coda.Sdk.SessionMetadata { SystemPromptOverride = systemPromptOverride },
+                ct).ConfigureAwait(false);
             Publish(mailbox, new DiagnosticEvent(
                 "session", $"Forked from {target.Id} into a new session ({target.Messages.Count} messages).", UiNotificationLevel.Information));
         }
         else
         {
-            context.Session.SessionId = target.Id;
+            SessionCli.ApplyResumeTarget(context.Session, target);
             Publish(mailbox, new DiagnosticEvent(
                 "session", $"Resumed session {target.Id} ({target.Messages.Count} messages).", UiNotificationLevel.Information));
         }
 
-        Publish(mailbox, new TranscriptSeededEvent(SessionHistoryProjector.Project(context.Session.History)));
+        var auditSessionId = context.Session.SessionId ?? target.Id;
+        var auditTurns = await new Coda.Sdk.SessionAuditStore(context.Session.WorkingDirectory)
+            .LoadAsync(auditSessionId, ct)
+            .ConfigureAwait(false);
+        Publish(mailbox, new TranscriptSeededEvent(SessionHistoryProjector.Project(context.Session.History, auditTurns)));
     }
 
     /// <summary>Connect configured MCP servers, routing status through MCP diagnostics.</summary>
@@ -657,12 +726,15 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
     }
 
     /// <summary>First run with no credentials → guide the user through connecting, in the mode's environment.</summary>
-    private static async Task MaybeRunFirstRunSetupAsync(CommandContext context, CancellationToken ct)
+    private static async Task<bool> MaybeRunFirstRunSetupAsync(CommandContext context, CancellationToken ct)
     {
-        if (await FirstRunDetector.IsFirstRunAsync(context, ct).ConfigureAwait(false))
+        if (!await FirstRunDetector.IsFirstRunAsync(context, ct).ConfigureAwait(false))
         {
-            await new SetupWizard().RunAsync(context, ct).ConfigureAwait(false);
+            return false;
         }
+
+        await new SetupWizard().RunAsync(context, ct).ConfigureAwait(false);
+        return true;
     }
 
     private static void RequestStopSafely(IApplication app, TerminalGuiShellBase shell, Exception error)

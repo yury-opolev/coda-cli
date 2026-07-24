@@ -1,6 +1,8 @@
 using Coda.Sdk;
 using Coda.Tui.Commands;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Mode;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmClient;
@@ -58,6 +60,58 @@ public sealed class ForkCommandTests : IDisposable
         Assert.Single(await new SessionAuditStore(dir).LoadAsync("source-aaaa")); // source untouched
     }
 
+    [Theory]
+    [InlineData("current override")]
+    [InlineData("")]
+    public async Task Fork_persists_the_current_system_prompt_override(string systemPromptOverride)
+    {
+        var (_, context) = this.BuildContext();
+        context.Session.SessionId = "source-aaaa";
+        context.Session.SystemPromptOverride = systemPromptOverride;
+        context.Session.History.Add(new ChatMessage(ChatRole.User, [new TextBlock("q")]));
+
+        await new ForkCommand().ExecuteAsync(context, Array.Empty<string>());
+
+        var stored = await new SessionTranscriptStore(context.Session.WorkingDirectory)
+            .LoadSessionAsync(context.Session.SessionId!);
+        Assert.NotNull(stored);
+        Assert.Equal(systemPromptOverride, stored!.Metadata.SystemPromptOverride);
+    }
+
+    [Theory]
+    [InlineData(null, "source exact", "source exact")]
+    [InlineData("", "source exact", "")]
+    [InlineData("startup exact", "source other", "startup exact")]
+    public async Task Interactive_startup_fork_uses_the_resolved_system_prompt_override(
+        string? startupSystemPromptOverride,
+        string sourceSystemPromptOverride,
+        string expectedSystemPromptOverride)
+    {
+        var (_, context) = this.BuildContext(startupSystemPromptOverride);
+        var messages = new[] { new ChatMessage(ChatRole.User, [new TextBlock("q")]) };
+        await new SessionTranscriptStore(this.tempDir).SaveAsync(
+            "aaaaaaaaaaaa",
+            messages,
+            new SessionMetadata { SystemPromptOverride = sourceSystemPromptOverride });
+
+        using var mailbox = new UiEventMailbox(8);
+        var seed = typeof(DefaultInteractiveSessionRunner).GetMethod(
+            "SeedSessionAsync",
+            System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Static);
+        Assert.NotNull(seed);
+
+        var task = Assert.IsAssignableFrom<Task>(seed!.Invoke(
+            null,
+            [context, new TuiLaunchOptions(TuiPreference.Auto, false, ["--fork", "aaaaaaaaaaaa"], null), mailbox, CancellationToken.None]));
+        await task;
+
+        Assert.NotEqual("aaaaaaaaaaaa", context.Session.SessionId);
+        Assert.Equal(expectedSystemPromptOverride, context.Session.SystemPromptOverride);
+        var stored = await new SessionTranscriptStore(this.tempDir).LoadSessionAsync(context.Session.SessionId!);
+        Assert.NotNull(stored);
+        Assert.Equal(expectedSystemPromptOverride, stored!.Metadata.SystemPromptOverride);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────────
 
     private static SessionAuditTurn MakeTurn() => new()
@@ -73,7 +127,7 @@ public sealed class ForkCommandTests : IDisposable
         ToolDefs = [],
     };
 
-    private (TestConsole Console, CommandContext Context) BuildContext()
+    private (TestConsole Console, CommandContext Context) BuildContext(string? startupSystemPromptOverride = null)
     {
         var console = new TestConsole();
         console.Profile.Width = 200;
@@ -87,7 +141,11 @@ public sealed class ForkCommandTests : IDisposable
             new("claude-ai", "Claude.ai", LoginKind.OAuthLoopback, "claude-sonnet-4-6"),
         };
 
-        var session = new SessionState("claude-ai", this.tempDir);
+        var session = new SessionState("claude-ai", this.tempDir)
+        {
+            StartupSystemPromptOverride = startupSystemPromptOverride,
+            SystemPromptOverride = startupSystemPromptOverride,
+        };
         var registry = new SlashCommandRegistry(new ISlashCommand[]
         {
             new HelpCommand(), new ForkCommand(), new ExitCommand(),

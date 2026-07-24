@@ -3,6 +3,7 @@ using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
+using Coda.Tui.Ui.Mcp;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -35,7 +36,8 @@ internal sealed class InlineTuiShell(
     Func<UiSessionSnapshot, int, string>? statusProjection = null,
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
-    ToolDisplayMode toolDisplayMode = ToolDisplayMode.Tiny)
+    Func<McpBrowserProvider?>? mcpBrowserProvider = null,
+    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
     : FullscreenTuiShell(
         app,
         controller,
@@ -51,13 +53,14 @@ internal sealed class InlineTuiShell(
         statusProjection,
         transcriptFormatter,
         taskBrowserProvider: taskBrowserProvider,
+        mcpBrowserProvider: mcpBrowserProvider,
         toolDisplayMode: toolDisplayMode)
 {
     /// <summary>
-    /// The fewest rows the inline region can occupy: header (1), operational (1), the chrome region
-    /// (composer 1 + a half-block edge above and below = 3), and status (1).
+    /// The fewest rows the inline region can occupy: header (1), operational (1), navigation (1),
+    /// composer chrome (3), and status (1).
     /// </summary>
-    private const int MinimumInlineHeight = 6;
+    private const int MinimumInlineHeight = 7;
 
     protected override Dim ResolveShellHeight() => Dim.Func(InlineRegionHeight, this);
 

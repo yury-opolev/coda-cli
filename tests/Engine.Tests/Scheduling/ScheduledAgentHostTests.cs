@@ -41,12 +41,15 @@ public sealed class ScheduledAgentHostTests : IDisposable
 
         public bool Disposed { get; private set; }
 
+        public List<ChatRequest> Requests { get; } = [];
+
         public void Dispose() => this.Disposed = true;
 
         public async IAsyncEnumerable<AssistantStreamEvent> StreamAsync(
             ChatRequest request,
             [EnumeratorCancellation] CancellationToken cancellationToken = default)
         {
+            this.Requests.Add(request);
             var events = turns[this.turn++];
             foreach (var e in events)
             {
@@ -98,6 +101,33 @@ public sealed class ScheduledAgentHostTests : IDisposable
             this.Specs.Add(spec);
             return loop;
         }
+    }
+
+    private sealed class CorrelatedLoopFactory(
+        Func<int, IAgentSink, ToolCallIdentity, Task> body) : IAgentLoopFactory
+    {
+        private int firing;
+
+        public List<AgentLoopSpec> Specs { get; } = [];
+
+        public IAgentLoop Create(AgentLoopSpec spec)
+        {
+            this.Specs.Add(spec);
+            var currentFiring = this.firing++;
+            return new CorrelatedLoop(
+                spec.ToolActivity ?? throw new InvalidOperationException("Expected a root tool activity."),
+                (sink, identity) => body(currentFiring, sink, identity));
+        }
+    }
+
+    private sealed class CorrelatedLoop(
+        ToolActivityContext activity,
+        Func<IAgentSink, ToolCallIdentity, Task> body) : IAgentLoop
+    {
+        public GoalStatus? LastGoalStatus => null;
+
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default) =>
+            body(sink, activity.EnsureActivity().ForCall("scheduled-call"));
     }
 
     /// <summary>A loop whose body is a supplied delegate; captures the history it is run against.</summary>
@@ -176,6 +206,19 @@ public sealed class ScheduledAgentHostTests : IDisposable
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+    }
+
+    private sealed class CompletionSink : IAgentSink
+    {
+        public List<ToolActivitySummary> Completions { get; } = [];
+
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+
+        public void OnToolActivityCompleted(ToolActivitySummary summary) => this.Completions.Add(summary);
     }
 
     // ---- Builders --------------------------------------------------------------------------
@@ -429,6 +472,60 @@ public sealed class ScheduledAgentHostTests : IDisposable
     }
 
     [Fact]
+    public async Task RunScheduledAsync_uses_fresh_roots_and_finalizes_success_cancellation_and_fault_once()
+    {
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        using var http = new HttpClient();
+        var factory = new CorrelatedLoopFactory((firing, sink, identity) =>
+        {
+            sink.OnToolQueued(identity, "probe", "{}");
+            sink.OnToolCall(identity, "probe", "{}");
+
+            if (firing == 0)
+            {
+                sink.OnToolStatus(identity, "probe", ToolCallStatus.Running);
+                sink.OnToolResult(identity, "probe", new ToolResult("ok"), ToolCallStatus.Succeeded);
+                return Task.CompletedTask;
+            }
+
+            if (firing == 1)
+            {
+                sink.OnToolStatus(identity, "probe", ToolCallStatus.Running);
+                return Task.FromException(new OperationCanceledException());
+            }
+
+            return Task.FromException(new InvalidOperationException("boom"));
+        });
+        var sink = new CompletionSink();
+        var host = this.NewHost(
+            () => this.Options(),
+            new FakeClientFactory(new InertClient()),
+            factory,
+            builder,
+            http);
+
+        await host.RunScheduledAsync("success", sink, new SteeringInbox(), "task-1", 1, CancellationToken.None);
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() =>
+            host.RunScheduledAsync("cancel", sink, new SteeringInbox(), "task-2", 1, CancellationToken.None));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            host.RunScheduledAsync("fault", sink, new SteeringInbox(), "task-3", 1, CancellationToken.None));
+
+        Assert.Equal(3, factory.Specs.Count);
+        Assert.Equal(3, sink.Completions.Count);
+        Assert.Equal(
+            factory.Specs.Select(spec => spec.ToolActivity!.RootTurnId),
+            sink.Completions.Select(summary => summary.RootTurnId));
+        Assert.Equal(3, factory.Specs.Select(spec => spec.ToolActivity!.RootTurnId).Distinct().Count());
+        Assert.Equal(0, sink.Completions[0].CancelledCalls);
+        Assert.Equal(0, sink.Completions[0].SkippedCalls);
+        Assert.Equal(1, sink.Completions[1].CancelledCalls);
+        Assert.Equal(0, sink.Completions[1].SkippedCalls);
+        Assert.Equal(0, sink.Completions[2].CancelledCalls);
+        Assert.Equal(1, sink.Completions[2].SkippedCalls);
+    }
+
+    [Fact]
     public async Task RunScheduledAsync_history_stays_isolated_on_failure()
     {
         var tasks = this.NewTaskManager();
@@ -541,6 +638,41 @@ public sealed class ScheduledAgentHostTests : IDisposable
         Assert.NotEqual(first.Options.SystemPrompt, second.Options.SystemPrompt); // output style changed
         Assert.DoesNotContain(FakeMcpTool.ToolName, first.Tools.All.Select(t => t.Name));
         Assert.Contains(FakeMcpTool.ToolName, second.Tools.All.Select(t => t.Name));
+    }
+
+    [Fact]
+    public async Task Scheduled_root_after_resume_uses_persisted_override_while_subagent_stays_isolated()
+    {
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        using var http = new HttpClient();
+        var client = new ScriptedClient(
+            [AssistantStreamEvent.Tool(new ToolUseBlock(
+                "root-task",
+                "task",
+                """{"description":"child","prompt":"work"}""")), AssistantStreamEvent.Finished("tool_use")],
+            [AssistantStreamEvent.Delta("child done"), AssistantStreamEvent.Finished("end_turn")],
+            [AssistantStreamEvent.Delta("root done"), AssistantStreamEvent.Finished("end_turn")]);
+
+        using var session = new CodaSession(SignedInClaude(), this.Options(mode: PermissionMode.BypassPermissions));
+        session.Resume(
+            "resumed-session",
+            [],
+            new SessionMetadata { SystemPromptOverride = "persisted root prompt" });
+
+        var host = this.NewHost(
+            () => session.Options,
+            new FakeClientFactory(client),
+            new DefaultAgentLoopFactory(),
+            builder,
+            http);
+
+        var snapshot = await RunScheduledToTerminalAsync(tasks, host);
+
+        Assert.Equal(TaskRunStatus.Completed, snapshot.Status);
+        Assert.True(client.Requests.Count >= 2);
+        Assert.Equal("persisted root prompt", client.Requests[0].System);
+        Assert.NotEqual("persisted root prompt", client.Requests[1].System);
     }
 
     [Fact]

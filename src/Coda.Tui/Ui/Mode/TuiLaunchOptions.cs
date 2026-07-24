@@ -7,14 +7,22 @@ public sealed record TuiLaunchOptions(
     string? Error,
     bool MouseDisabled = false)
 {
+    public SystemPromptSource? SystemPromptSource { get; init; }
+    public string? SystemPromptOverride { get; init; }
+
     public static TuiLaunchOptions Parse(IReadOnlyList<string> args)
     {
+        if (!SystemPromptSourceResolver.TryExtract(args, out var remainingArgs, out var systemPromptSource, out var error))
+        {
+            return new(TuiPreference.Auto, false, remainingArgs, error);
+        }
+
         var preference = TuiPreference.Auto;
         var plain = false;
         var mouseDisabled = false;
         var remaining = new List<string>();
 
-        foreach (var arg in args)
+        foreach (var arg in remainingArgs)
         {
             if (arg == "--plain")
             {
@@ -41,7 +49,10 @@ public sealed record TuiLaunchOptions(
 
                 if (value is not ("auto" or "inline" or "fullscreen"))
                 {
-                    return new(preference, plain, remaining, $"Invalid --tui value '{value}'. Expected auto, inline, or fullscreen.", mouseDisabled);
+                    return new(preference, plain, remaining, $"Invalid --tui value '{value}'. Expected auto, inline, or fullscreen.", mouseDisabled)
+                    {
+                        SystemPromptSource = systemPromptSource,
+                    };
                 }
 
                 continue;
@@ -50,6 +61,9 @@ public sealed record TuiLaunchOptions(
             remaining.Add(arg);
         }
 
-        return new(preference, plain, remaining, null, mouseDisabled);
+        return new(preference, plain, remaining, null, mouseDisabled)
+        {
+            SystemPromptSource = systemPromptSource,
+        };
     }
 }

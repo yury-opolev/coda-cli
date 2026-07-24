@@ -152,6 +152,90 @@ public sealed class InteractiveProgramTests
     }
 
     [Fact]
+    public async Task Startup_resolves_exact_system_prompt_before_invoking_runner()
+    {
+        var error = new StringWriter();
+        var runner = new RecordingInteractiveSessionRunner(TextWriter.Null);
+
+        var exitCode = await InteractiveProgram.RunAsync(
+            ["--system-prompt", " \r\nexact\n", "--resume", "abc", "--plain"],
+            TextReader.Null,
+            TextWriter.Null,
+            error,
+            new FixedCapabilitiesProvider(new TerminalCapabilities(false, true, 120, 40, true)),
+            CancellationToken.None,
+            runner);
+
+        Assert.Equal(0, exitCode);
+        Assert.Equal(" \r\nexact\n", runner.Options!.SystemPromptOverride);
+        Assert.Equal(["--resume", "abc"], runner.Options.RemainingArgs);
+    }
+
+    [Fact]
+    public void Startup_initialization_copies_the_exact_override_to_both_session_authorities()
+    {
+        var options = new TuiLaunchOptions(TuiPreference.Auto, false, [], null)
+        {
+            SystemPromptOverride = " \r\nexact\n",
+        };
+
+        var session = DefaultInteractiveSessionRunner.CreateSessionState("claude-ai", options);
+
+        Assert.Equal(" \r\nexact\n", session.StartupSystemPromptOverride);
+        Assert.Equal(" \r\nexact\n", session.SystemPromptOverride);
+    }
+
+    [Fact]
+    public void Claude_ai_compatibility_warning_is_non_blocking_and_never_rewrites_the_override()
+    {
+        const string prompt = " \r\nexact\n";
+
+        var warning = SystemPromptCompatibilityWarning.For("claude-ai", prompt);
+
+        Assert.Contains("exact supplied prompt", warning!);
+        Assert.Equal(prompt, " \r\nexact\n");
+        Assert.Null(SystemPromptCompatibilityWarning.For("github-copilot", prompt));
+        Assert.Null(SystemPromptCompatibilityWarning.For("api-key", prompt));
+        Assert.Null(SystemPromptCompatibilityWarning.For("claude-ai", null));
+    }
+
+    [Fact]
+    public void Claude_ai_compatibility_warning_publishes_through_the_diagnostic_ui_path()
+    {
+        var events = new RecordingUiEvents();
+        var built = TestAppBuilder.BuildApp(events: events);
+        built.Context.Session.SystemPromptOverride = "";
+
+        SystemPromptCompatibilityWarning.Publish(built.Context);
+
+        var diagnostic = Assert.Single(events.Events.OfType<DiagnosticEvent>());
+        Assert.Equal("system prompt", diagnostic.Source);
+        Assert.Equal(UiNotificationLevel.Warning, diagnostic.Level);
+        Assert.Contains("sent unchanged", diagnostic.Message);
+    }
+
+    [Fact]
+    public async Task Missing_system_prompt_file_returns_usage_error_without_invoking_runner()
+    {
+        var error = new StringWriter();
+        var runner = new RecordingInteractiveSessionRunner(TextWriter.Null);
+        const string missingFile = "does-not-exist-system-prompt.txt";
+
+        var exitCode = await InteractiveProgram.RunAsync(
+            ["--system-prompt-file", missingFile, "--plain"],
+            TextReader.Null,
+            TextWriter.Null,
+            error,
+            new FixedCapabilitiesProvider(new TerminalCapabilities(false, true, 120, 40, true)),
+            CancellationToken.None,
+            runner);
+
+        Assert.Equal(2, exitCode);
+        Assert.Contains(missingFile, error.ToString());
+        Assert.Null(runner.Options);
+    }
+
+    [Fact]
     public async Task Plain_composition_serializes_dispatched_command_output_without_escapes()
     {
         // Exercises the real plain-mode composition wiring: the command console publishes into the
@@ -258,6 +342,7 @@ public sealed class InteractiveProgramTests
         : IInteractiveSessionRunner
     {
         public TuiRunMode? Mode { get; private set; }
+        public TuiLaunchOptions? Options { get; private set; }
 
         public async Task<int> RunAsync(
             TuiRunMode mode,
@@ -267,6 +352,7 @@ public sealed class InteractiveProgramTests
             CancellationToken cancellationToken)
         {
             this.Mode = mode;
+            this.Options = options;
             var line = await input.ReadLineAsync(cancellationToken);
             output.WriteLine($"{mode.ToString().ToLowerInvariant()} {line}");
             return 0;

@@ -16,4 +16,20 @@ public interface ISubagentHost
         string taskId,
         int depth,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Runs a nested subagent with the parent turn's tool-activity correlation context. Existing
+    /// hosts need only implement the original overload; this compatibility bridge preserves that
+    /// contract while hosts that understand activity identity can override the enriched overload.
+    /// </summary>
+    Task<string> RunSubagentAsync(
+        string subagentType,
+        string prompt,
+        IAgentSink sink,
+        SteeringInbox steering,
+        string taskId,
+        int depth,
+        ToolActivityContext? parentActivity,
+        CancellationToken cancellationToken = default) =>
+        RunSubagentAsync(subagentType, prompt, sink, steering, taskId, depth, cancellationToken);
 }

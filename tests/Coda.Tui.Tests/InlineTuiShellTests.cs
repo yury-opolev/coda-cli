@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Coda.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
@@ -19,12 +20,16 @@ namespace Coda.Tui.Tests;
 /// </summary>
 internal static class ShellTestFactory
 {
-    public static InlineTuiShell CreateInline(IApplication app, IUiEventPublisher? publisher = null) =>
+    public static InlineTuiShell CreateInline(
+        IApplication app,
+        IUiEventPublisher? publisher = null,
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null) =>
         new(
             app,
             new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
             publisher ?? new RecordingUiEvents(),
-            UiSessionSnapshot.Empty);
+            UiSessionSnapshot.Empty,
+            transcriptFormatter: transcriptFormatter);
 
     public static InlineTuiShell CreateInline(
         IApplication app, IEnumerable<ISlashCommand> commands, IUiEventPublisher? publisher = null) =>
@@ -34,12 +39,16 @@ internal static class ShellTestFactory
             publisher ?? new RecordingUiEvents(),
             UiSessionSnapshot.Empty);
 
-    public static FullscreenTuiShell CreateFullscreen(IApplication app, IUiEventPublisher? publisher = null) =>
+    public static FullscreenTuiShell CreateFullscreen(
+        IApplication app,
+        IUiEventPublisher? publisher = null,
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null) =>
         new(
             app,
             new ComposerController(new SlashCommandCompletion(new SlashCommandRegistry([]))),
             publisher ?? new RecordingUiEvents(),
-            UiSessionSnapshot.Empty);
+            UiSessionSnapshot.Empty,
+            transcriptFormatter: transcriptFormatter);
 
     public static FullscreenTuiShell CreateFullscreen(
         IApplication app, IEnumerable<ISlashCommand> commands, IUiEventPublisher? publisher = null) =>
@@ -56,6 +65,33 @@ public sealed class InlineTuiShellTests
         Enumerable.Range(0, count)
             .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"line {index}"))
             .ToImmutableArray();
+
+    private static IReadOnlyList<TranscriptRenderLine> PipeFormatter(TranscriptBlock block, int _) =>
+        ((CommandOutputTranscriptBlock)block).Text
+            .Split('|')
+            .Select(text => new TranscriptRenderLine(text, TranscriptRole.Code))
+            .ToArray();
+
+    private static ToolActivityTranscriptBlock Activity(
+        ToolActivityCompletionState completionState,
+        params ToolCallStatus[] statuses) =>
+        new(
+            Guid.NewGuid(),
+            "root",
+            "activity",
+            statuses
+                .Select((status, index) => new ToolActivityCall(
+                    $"call-{index}",
+                    "root",
+                    "read_file",
+                    $$"""{"path":"file-{{index}}"}""",
+                    "unsafe",
+                    status,
+                    null,
+                    status == ToolCallStatus.Succeeded ? "done" : null,
+                    status == ToolCallStatus.Failed ? "failed" : null))
+                .ToImmutableArray(),
+            completionState);
 
     /// <summary>
     /// The inline shell reuses the retained-transcript shell layout, so it must expose the same header
@@ -90,8 +126,8 @@ public sealed class InlineTuiShellTests
         var token = app.Begin(shell);
         app.LayoutAndDraw();
 
-        // Retained row order: header, transcript, operational row, chrome (top edge + composer + bottom
-        // edge), metadata (status).
+        // Retained row order: header, transcript, operational row, navigation chrome, composer chrome
+        // (top edge + composer + bottom edge), metadata (status).
         Assert.Equal(shell.Frame.Y, shell.Header.Frame.Y);
         Assert.Equal(1, shell.Header.Frame.Height);
         Assert.Equal(1, shell.Operational.Frame.Height);
@@ -101,7 +137,8 @@ public sealed class InlineTuiShellTests
         // above and below, so the chrome is two rows taller than the composer.
         Assert.Equal(1, shell.Composer.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
 
         // Transcript fills every row between the header and the operational row.
@@ -109,6 +146,34 @@ public sealed class InlineTuiShellTests
         Assert.Equal(width, shell.Transcript.Frame.Width);
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
         Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Inline_layout_at_minimum_height_keeps_navigation_rows_non_overlapping()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 6);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        Assert.Equal(7, shell.Frame.Height);
+        Assert.True(shell.Header.Frame.Bottom <= shell.Operational.Frame.Y);
+        Assert.Equal(shell.Operational.Frame.Bottom, shell.JumpHint.Frame.Y);
+        Assert.Equal(shell.JumpHint.Frame.Bottom, shell.Chrome.Frame.Y);
+        Assert.Equal(shell.Frame.Bottom, shell.Status.Frame.Bottom);
+        Assert.True(shell.Transcript.Frame.Height >= 0);
+        Assert.True(shell.Transcript.Frame.Bottom <= shell.Operational.Frame.Y);
 
         if (token is not null)
         {
@@ -262,6 +327,107 @@ public sealed class InlineTuiShellTests
     }
 
     [Fact]
+    public async Task Inline_summary_activity_matches_fullscreen_insertion_and_completion_behavior()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(
+            app,
+            transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(
+                block,
+                width,
+                ToolDisplayMode.Summary));
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var seed = Lines(50);
+        var active = Activity(
+            ToolActivityCompletionState.Active,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running,
+            ToolCallStatus.Running);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollBy(-10);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(shell.Transcript.TopAnchorForTest);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = seed.Add(active) },
+            CancellationToken.None);
+        var activeRows = shell.Transcript.ContentRowsForTest;
+        Assert.Equal(1, shell.Transcript.UnseenBlocks);
+
+        var completed = active with
+        {
+            Calls = active.Calls.Select(call => call with { Status = ToolCallStatus.Succeeded }).ToImmutableArray(),
+            CompletionState = ToolActivityCompletionState.Completed,
+        };
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with { Transcript = seed.Add(completed) },
+            CancellationToken.None);
+
+        Assert.Equal(activeRows - 5, shell.Transcript.ContentRowsForTest);
+        Assert.Equal(1, shell.Transcript.UnseenBlocks);
+        Assert.Equal(anchor, shell.Transcript.TopAnchorForTest);
+        Assert.Equal(1, shell.Transcript.ReplaceLastCount);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public async Task Inline_streaming_snapshot_preserves_the_detached_anchor()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app, transcriptFormatter: PipeFormatter);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+
+        var first = new CommandOutputTranscriptBlock(Guid.NewGuid(), "one|two");
+        var anchored = new CommandOutputTranscriptBlock(Guid.NewGuid(), "three|four|five");
+        var tail = new CommandOutputTranscriptBlock(
+            Guid.NewGuid(),
+            string.Join('|', Enumerable.Range(0, 20).Select(index => $"tail {index}")));
+        var seed = ImmutableArray.Create<TranscriptBlock>(first, anchored, tail);
+        await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = seed }, CancellationToken.None);
+        shell.Transcript.ScrollToRowForTest(4);
+        var anchor = Assert.IsType<TranscriptViewportAnchor>(shell.Transcript.TopAnchorForTest);
+
+        await shell.ApplyAsync(
+            UiSessionSnapshot.Empty with
+            {
+                Transcript = seed.SetItem(
+                    2,
+                    tail with
+                    {
+                        Text = string.Join('|', Enumerable.Range(0, 30).Select(index => $"tail {index}")),
+                    }),
+            },
+            CancellationToken.None);
+
+        Assert.Equal(anchor, shell.Transcript.TopAnchorForTest);
+        Assert.Equal(TranscriptFollowMode.Detached, shell.Transcript.FollowModeForTest);
+
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
     public async Task Inline_scrolled_away_transcript_shows_the_jump_hint()
     {
         using IApplication app = Application.Create();
@@ -286,6 +452,31 @@ public sealed class InlineTuiShellTests
         Assert.True(shell.JumpHint.Visible);
         Assert.DoesNotContain("Ctrl+End", shell.Header.Text, StringComparison.Ordinal);
 
+        if (token is not null)
+        {
+            app.End(token);
+        }
+    }
+
+    [Fact]
+    public void Inline_composer_ctrl_end_jumps_to_newest()
+    {
+        using IApplication app = Application.Create();
+        app.AppModel = AppModel.Inline;
+        app.ForceInlinePosition = new Point(0, 0);
+        app.Init(DriverRegistry.Names.ANSI);
+        app.Driver!.SetScreenSize(80, 24);
+        app.Driver.InlinePosition = new Point(0, 0);
+        using var shell = ShellTestFactory.CreateInline(app);
+        var token = app.Begin(shell);
+        app.LayoutAndDraw();
+        shell.Transcript.ReplaceAll(Lines(50));
+        shell.Transcript.ScrollBy(-10);
+        shell.Composer.SetFocus();
+
+        shell.Composer.NewKeyDownEvent(Key.End.WithCtrl);
+
+        Assert.True(shell.Transcript.AutoFollow);
         if (token is not null)
         {
             app.End(token);
@@ -589,13 +780,14 @@ public sealed class InlineTuiShellTests
         Assert.NotEqual(screenCap, shell.Composer.Frame.Height);
 
         // Status and transcript geometry are preserved: the status row is one row pinned to the region
-        // bottom, the operational row and composer stack above it, and the transcript fills every row
-        // between the header and the operational row.
+        // bottom, the operational row, navigation row, and composer stack above it, and the transcript
+        // fills every row between the header and the operational row.
         Assert.Equal(1, shell.Status.Frame.Height);
         Assert.Equal(shell.Frame.Height, shell.Status.Frame.Bottom);
         Assert.Equal(1, shell.Operational.Frame.Height);
         Assert.Equal(shell.Status.Frame.Y, shell.Chrome.Frame.Bottom);
-        Assert.Equal(shell.Chrome.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.JumpHint.Frame.Y, shell.Operational.Frame.Bottom);
+        Assert.Equal(shell.Chrome.Frame.Y, shell.JumpHint.Frame.Bottom);
         Assert.Equal(shell.Composer.Frame.Y, shell.Chrome.Frame.Y + 1);
         Assert.Equal(shell.Header.Frame.Bottom, shell.Transcript.Frame.Y);
         Assert.Equal(shell.Operational.Frame.Y, shell.Transcript.Frame.Bottom);

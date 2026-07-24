@@ -233,6 +233,7 @@ public sealed class AgentRunnerTests : IDisposable
     {
         var events = new RecordingUiEvents();
         var context = this.BuildContext(events, out var session);
+        session.SystemPromptOverride = "";
         SessionOptions? captured = null;
         using var runner = new AgentRunner(
             extraToolsProvider: null,
@@ -254,6 +255,7 @@ public sealed class AgentRunnerTests : IDisposable
 
         Assert.NotNull(captured);
         Assert.Same(session.PermissionModes, captured!.PermissionModeState);
+        Assert.Equal("", captured.SystemPromptOverride);
     }
 
     // ── Eager session initialization (Task 8) ─────────────────────────────────
@@ -335,6 +337,7 @@ public sealed class AgentRunnerTests : IDisposable
         session.Effort = "high";
         session.OutputStyle = "explanatory";
         session.PermissionMode = PermissionMode.BypassPermissions;
+        session.SystemPromptOverride = " \r\nexact\n";
         tools.Add(new FakeTool("mcp__server__do"));
 
         var live = probe.LiveOptions!();
@@ -345,6 +348,7 @@ public sealed class AgentRunnerTests : IDisposable
         Assert.Equal("explanatory", live.OutputStyle);
         Assert.Equal(PermissionMode.BypassPermissions, live.PermissionMode);
         Assert.Same(session.PermissionModes, live.PermissionModeState);
+        Assert.Equal(" \r\nexact\n", live.SystemPromptOverride);
         Assert.Contains(live.ExtraTools, t => t.Name == "mcp__server__do");
     }
 

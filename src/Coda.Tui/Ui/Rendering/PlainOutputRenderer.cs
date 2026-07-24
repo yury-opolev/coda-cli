@@ -39,7 +39,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolStartedEvent e:
-                if (this._toolDisplayMode != ToolDisplayMode.Tiny)
+                if (this._toolDisplayMode is not (ToolDisplayMode.Tiny or ToolDisplayMode.Summary))
                 {
                     var input = this._toolDisplayMode == ToolDisplayMode.Compact
                         ? ToolDisplayModeText.ArgumentPreview(e.InputJson)
@@ -50,7 +50,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolProgressEvent e:
-                if (this._toolDisplayMode != ToolDisplayMode.Tiny)
+                if (this._toolDisplayMode is not (ToolDisplayMode.Tiny or ToolDisplayMode.Summary))
                 {
                     var seconds = (e.ElapsedMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture);
                     this.WriteLine($"[tool-progress] {e.ToolName} {seconds}s");
@@ -58,7 +58,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolCompletedEvent e:
-                if (this._toolDisplayMode != ToolDisplayMode.Tiny)
+                if (this._toolDisplayMode is not (ToolDisplayMode.Tiny or ToolDisplayMode.Summary))
                 {
                     if (this._toolDisplayMode == ToolDisplayMode.Compact)
                     {
@@ -70,6 +70,10 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                         this.WriteLine($"[tool-result] {e.ToolName}: {e.Result.Content}");
                     }
                 }
+                break;
+
+            case ToolActivityCompletedEvent e when this._toolDisplayMode == ToolDisplayMode.Summary:
+                this.WriteLine(ToolActivityPreview.CompletedText(e.Summary));
                 break;
 
             case WarningEvent e:

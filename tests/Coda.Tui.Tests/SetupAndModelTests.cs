@@ -105,3 +105,21 @@ public sealed class FreeTextWithoutCredentialsTests
         Assert.Contains("signed in", console.Output, StringComparison.OrdinalIgnoreCase);
     }
 }
+
+public sealed class SetupWizardSystemPromptTests
+{
+    [Theory]
+    [InlineData("")]
+    [InlineData(" \r\nexact\n")]
+    public void ResolveVerificationSystemPrompt_preserves_the_explicit_live_override(string systemPromptOverride)
+    {
+        var session = new SessionState("claude-ai")
+        {
+            SystemPromptOverride = systemPromptOverride,
+        };
+
+        var result = SetupWizard.ResolveVerificationSystemPrompt(session);
+
+        Assert.Equal(systemPromptOverride, result);
+    }
+}

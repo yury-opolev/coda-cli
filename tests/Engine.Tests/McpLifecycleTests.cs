@@ -1,5 +1,10 @@
+using System.Diagnostics;
+using System.Globalization;
+using System.Reflection;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Text.RegularExpressions;
 using Coda.Mcp;
 
 namespace Engine.Tests;
@@ -87,6 +92,222 @@ public sealed class McpLifecycleTests
         Assert.Equal("boom", result.Error);
         Assert.False(manager.IsServerConnected("bad"));
         Assert.True(client.Disposed);
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_records_safe_error_and_a_later_success_clears_it()
+    {
+        var manager = new McpClientManager();
+        const string secret = "Bearer abcdefghijklmnopqrstuvwxyz123456";
+        var failed = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = $"upstream rejected https://user:password@example.test/mcp?token=raw-secret; {secret}; MCP_TOKEN=env-secret",
+        };
+
+        var result = await manager.ConnectClientAsync(failed, default);
+
+        Assert.False(result.Connected);
+        Assert.False(manager.IsServerConnected("bad"));
+        Assert.Empty(manager.ServerTools("bad"));
+        Assert.NotNull(manager.LastConnectionErrorFor("bad"));
+        Assert.DoesNotContain("raw-secret", result.Error!);
+        Assert.DoesNotContain("env-secret", result.Error!);
+        Assert.DoesNotContain(secret, result.Error!);
+        Assert.DoesNotContain("raw-secret", manager.LastConnectionErrorFor("bad")!);
+        Assert.DoesNotContain("env-secret", manager.LastConnectionErrorFor("bad")!);
+        Assert.DoesNotContain(secret, manager.LastConnectionErrorFor("bad")!);
+
+        var recovered = new FakeMcpClient("bad") { ThrowOnPromptList = "prompt list failed" };
+        Assert.True((await manager.ConnectClientAsync(recovered, default)).Connected);
+        Assert.Null(manager.LastConnectionErrorFor("bad"));
+        Assert.Empty(await manager.ServerPromptsAsync("bad"));
+        Assert.NotNull(manager.LastConnectionErrorFor("bad"));
+        Assert.True(await manager.DisconnectServerAsync("bad"));
+        Assert.Null(manager.LastConnectionErrorFor("bad"));
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_redacts_bare_secret_assignments()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = "connection failed: token=bare-token-value secret:bare-secret-value password=\"bare password value\" api_key:bare-api-key-value apikey=bare-apikey-value",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Contains("connection failed", result.Error!);
+        Assert.DoesNotContain("bare-token-value", result.Error!);
+        Assert.DoesNotContain("bare-secret-value", result.Error!);
+        Assert.DoesNotContain("bare password value", result.Error!);
+        Assert.DoesNotContain("password value", result.Error!);
+        Assert.DoesNotContain("bare-api-key-value", result.Error!);
+        Assert.DoesNotContain("bare-apikey-value", result.Error!);
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_redacts_prefixed_secret_assignments()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = "connection failed: MCP_TOKEN=prefixed-mcp-token github_token:prefixed-github-token mySecret=prefixed-secret client_secret:prefixed-client-secret",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.DoesNotContain("prefixed-mcp-token", result.Error!);
+        Assert.DoesNotContain("prefixed-github-token", result.Error!);
+        Assert.DoesNotContain("prefixed-secret", result.Error!);
+        Assert.DoesNotContain("prefixed-client-secret", result.Error!);
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_sanitizes_controls_to_a_single_line_before_storing()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = "first line\r\n\u001b[31msecond\tline\u001b]0;spoofed title\u009C\u0001 to\rken=multiline-token-value\u202E",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Equal("first line second line to ken=***redacted***", result.Error);
+        Assert.DoesNotContain("multiline-token-value", result.Error!);
+        Assert.All(result.Error!, ch => Assert.False(char.IsControl(ch)));
+        Assert.DoesNotContain('\u202E', result.Error!);
+    }
+
+    [Theory]
+    [InlineData("authoriz\u200Bation", "=", "zwsp")]
+    [InlineData("to\u200Cken", "=", "zwnj")]
+    [InlineData("pass\u200Dword", ":", "zwj")]
+    [InlineData("api\u2060_key", "=", "word-joiner")]
+    [InlineData("authoriz\uFEFFation", "=", "bom")]
+    [InlineData("to\u202Eken", "=", "bidi")]
+    [InlineData("to\U000E0001ken", "=", "supplementary-format")]
+    [InlineData("pass\tword", ":", "tab-control")]
+    [InlineData("api\r_key", "=", "cr-control")]
+    [InlineData("to\nken", "=", "lf-control")]
+    public async Task ConnectClientAsync_failure_redacts_secret_assignments_with_format_or_control_key_splits(
+        string key,
+        string delimiter,
+        string identifier)
+    {
+        var secret = $"unicode-{identifier}-secret";
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            ThrowOnInit = $"connection failed: caf\u00E9 {key}{delimiter}{secret}",
+        };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Contains("connection failed: caf\u00E9", result.Error!);
+        Assert.Contains("***redacted***", result.Error!);
+        Assert.DoesNotContain(secret, result.Error!);
+        Assert.DoesNotContain(key, result.Error!, StringComparison.Ordinal);
+        Assert.All(result.Error!.EnumerateRunes(), rune =>
+        {
+            var category = Rune.GetUnicodeCategory(rune);
+            Assert.NotEqual(UnicodeCategory.Control, category);
+            Assert.NotEqual(UnicodeCategory.Format, category);
+        });
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_handles_large_unterminated_obfuscated_key_candidate_without_hanging()
+    {
+        const int repetitions = 50_000;
+        var hostile = "a" + string.Concat(Enumerable.Repeat("\t\u200B", repetitions));
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad") { ThrowOnInit = hostile };
+
+        var stopwatch = Stopwatch.StartNew();
+        var result = await manager.ConnectClientAsync(client, default);
+        stopwatch.Stop();
+
+        Assert.False(result.Connected);
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(10),
+            $"Sanitizing an unterminated obfuscated key candidate took {stopwatch.Elapsed}.");
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_bounds_all_regex_stages_for_large_undelimited_secret_like_text()
+    {
+        AssertBoundedNonBacktrackingRegex("TerminalEscapePattern");
+        AssertBoundedNonBacktrackingRegex("SecretAssignmentPattern");
+        AssertBoundedNonBacktrackingRegex("ObfuscatedSecretAssignmentPattern");
+        AssertBoundedNonBacktrackingRegex("UrlPattern");
+        Assert.True(
+            GetGeneratedRegex("SecretAssignmentPattern").Options.HasFlag(RegexOptions.IgnoreCase),
+            "SecretAssignmentPattern must use case-insensitive matching.");
+
+        var hostile = string.Concat(Enumerable.Repeat("secretapi_key", 100_000));
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad") { ThrowOnInit = hostile };
+
+        var stopwatch = Stopwatch.StartNew();
+        var result = await manager.ConnectClientAsync(client, default);
+        stopwatch.Stop();
+
+        Assert.False(result.Connected);
+        Assert.True(
+            stopwatch.Elapsed < TimeSpan.FromSeconds(5),
+            $"Sanitizing 1.3 MB of undelimited secret-like text took {stopwatch.Elapsed}.");
+    }
+
+    [Fact]
+    public async Task ConnectClientAsync_failure_preserves_non_secret_token_words()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad") { ThrowOnInit = "tokenization failed" };
+
+        var result = await manager.ConnectClientAsync(client, default);
+
+        Assert.Equal("tokenization failed", result.Error);
+    }
+
+    [Fact]
+    public async Task DisconnectServerAsync_dispose_failure_removes_server_bumps_version_and_records_safe_error()
+    {
+        var manager = new McpClientManager();
+        var client = new FakeMcpClient("bad")
+        {
+            Tools = [new McpToolInfo("echo", "d", "{}", true)],
+            ThrowOnDispose = "failed to close https://example.test/mcp?access_token=dispose-secret",
+        };
+        Assert.True((await manager.ConnectClientAsync(client, default)).Connected);
+        var before = manager.Version;
+
+        var removed = await manager.DisconnectServerAsync("bad");
+
+        Assert.True(removed);
+        Assert.False(manager.IsServerConnected("bad"));
+        Assert.Empty(manager.ServerTools("bad"));
+        Assert.Equal(before + 1, manager.Version);
+        Assert.DoesNotContain("dispose-secret", manager.LastConnectionErrorFor("bad")!);
+
+        Assert.True((await manager.ConnectClientAsync(new FakeMcpClient("bad"), default)).Connected);
+        Assert.Null(manager.LastConnectionErrorFor("bad"));
+    }
+
+    [Fact]
+    public async Task LastConnectionErrorFor_is_isolated_by_exact_server_name_and_absent_disconnect_does_not_create_an_error()
+    {
+        var manager = new McpClientManager();
+
+        await manager.ConnectClientAsync(new FakeMcpClient("one") { ThrowOnInit = "one failed" }, default);
+        await manager.ConnectClientAsync(new FakeMcpClient("two") { ThrowOnInit = "two failed" }, default);
+
+        Assert.Contains("one failed", manager.LastConnectionErrorFor("one")!);
+        Assert.Contains("two failed", manager.LastConnectionErrorFor("two")!);
+        Assert.Null(manager.LastConnectionErrorFor("ONE"));
+        Assert.False(await manager.DisconnectServerAsync("absent"));
+        Assert.Null(manager.LastConnectionErrorFor("absent"));
     }
 
     [Fact]
@@ -308,6 +529,10 @@ public sealed class McpLifecycleTests
 
         public string? ThrowOnInit { get; init; }
 
+        public string? ThrowOnDispose { get; init; }
+
+        public string? ThrowOnPromptList { get; init; }
+
         /// <summary>When set, drives initialize so tests can script cancellation/timeout/typed failures.</summary>
         public Func<CancellationToken, Task<IReadOnlyList<McpToolInfo>>>? InitOverride { get; init; }
 
@@ -333,15 +558,33 @@ public sealed class McpLifecycleTests
 
         public Task<string> ReadResourceAsync(string uri, CancellationToken ct = default) => Task.FromResult(string.Empty);
 
-        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken ct = default)
-            => Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
+        public Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken ct = default) =>
+            this.ThrowOnPromptList is { } message
+                ? throw new McpException(message)
+                : Task.FromResult<IReadOnlyList<McpPromptInfo>>([]);
 
         public Task<string> GetPromptAsync(string name, JsonNode? arguments, CancellationToken ct = default) => Task.FromResult(string.Empty);
 
         public ValueTask DisposeAsync()
         {
             this.DisposeCount++;
-            return ValueTask.CompletedTask;
+            return this.ThrowOnDispose is { } message
+                ? ValueTask.FromException(new McpException(message))
+                : ValueTask.CompletedTask;
         }
+    }
+
+    private static void AssertBoundedNonBacktrackingRegex(string methodName)
+    {
+        var regex = GetGeneratedRegex(methodName);
+
+        Assert.True(regex.Options.HasFlag(RegexOptions.NonBacktracking), $"{methodName} must use non-backtracking matching.");
+        Assert.InRange(regex.MatchTimeout, TimeSpan.Zero, TimeSpan.FromMilliseconds(1000));
+    }
+
+    private static Regex GetGeneratedRegex(string methodName)
+    {
+        var method = typeof(McpClientManager).GetMethod(methodName, BindingFlags.Static | BindingFlags.NonPublic);
+        return Assert.IsAssignableFrom<Regex>(method?.Invoke(null, null));
     }
 }

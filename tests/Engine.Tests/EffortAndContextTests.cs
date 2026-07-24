@@ -165,8 +165,13 @@ public sealed class EffortAndContextTests
     {
         private int index;
 
+        public List<string> Bodies { get; } = [];
+
         protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            this.Bodies.Add(request.Content is null
+                ? string.Empty
+                : request.Content.ReadAsStringAsync(cancellationToken).GetAwaiter().GetResult());
             var value = counts[Math.Min(this.index, counts.Length - 1)];
             this.index++;
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
@@ -201,6 +206,26 @@ public sealed class EffortAndContextTests
         Assert.Equal(680, report.UsedTokens);
         Assert.Equal(CodaSession.ContextWindowTokens, report.MaxTokens);
         Assert.Contains(report.Categories, c => c.Name == "Free space");
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_sends_the_exact_system_prompt_override_to_count_tokens()
+    {
+        const string exact = "CONTEXT-EXACT-OVERRIDE";
+        var handler = new CountSeqHandler(10, 20, 30);
+        using var http = new HttpClient(handler);
+        var options = new SessionOptions
+        {
+            ProviderId = ClaudeAiProvider.Id,
+            Model = "test-only-unknown-model",
+            WorkingDirectory = this.root,
+            SystemPromptOverride = exact,
+        };
+        using var session = new CodaSession(SignedInClaude(), options, httpClient: http);
+
+        await session.AnalyzeContextAsync();
+
+        Assert.Contains(handler.Bodies, body => body.Contains(exact, StringComparison.Ordinal));
     }
 
     [Fact]

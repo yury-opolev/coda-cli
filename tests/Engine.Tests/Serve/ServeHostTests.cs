@@ -368,7 +368,12 @@ public sealed class ServeHostTests : IDisposable
         Assert.True(pr!.Ok);
         Assert.False(pr.Interrupted);
 
-        await turnCompleteTcs.Task.WaitAsync(WaitTimeout);
+        var turnComplete = await turnCompleteTcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(turnComplete);
+        Assert.Equal(pr.StopReason, turnComplete!["stopReason"]!.GetValue<string>());
+        Assert.Equal(pr.Interrupted, turnComplete["interrupted"]!.GetValue<bool>());
+        Assert.False(string.IsNullOrWhiteSpace(turnComplete["rootTurnId"]?.GetValue<string>()));
+        Assert.Null(turnComplete["activityId"]);
         Assert.Equal("hi there", string.Join("", deltas));
 
         cts.Cancel();
@@ -651,9 +656,15 @@ public sealed class ServeHostTests : IDisposable
         orchestrator.OnRequest(ServeMethods.RequestPermission, _ =>
             ServeJson.ToNode(new PermissionResponse(true)));
 
+        var toolCallTcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var toolResultTcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var turnCompleteTcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        orchestrator.OnNotification(ServeMethods.EventToolCall, node =>
+            toolCallTcs.TrySetResult(node));
         orchestrator.OnNotification(ServeMethods.EventToolResult, node =>
             toolResultTcs.TrySetResult(node));
+        orchestrator.OnNotification(ServeMethods.EventTurnComplete, node =>
+            turnCompleteTcs.TrySetResult(node));
 
         // Send prompt and wait.
         var promptResult = await orchestrator
@@ -668,10 +679,29 @@ public sealed class ServeHostTests : IDisposable
         Assert.NotNull(pr);
         Assert.True(pr!.Ok);
 
-        // Tool result must have been observed.
+        // The complete tool loop must preserve a single correlation through turn completion.
+        var toolCallNode = await toolCallTcs.Task.WaitAsync(WaitTimeout);
         var toolResultNode = await toolResultTcs.Task.WaitAsync(WaitTimeout);
+        var turnCompleteNode = await turnCompleteTcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(toolCallNode);
         Assert.NotNull(toolResultNode);
+        Assert.NotNull(turnCompleteNode);
+        Assert.Equal("run_command", toolCallNode!["toolName"]!.GetValue<string>());
         Assert.Equal("run_command", toolResultNode!["toolName"]!.GetValue<string>());
+
+        var rootTurnId = toolCallNode["rootTurnId"]!.GetValue<string>();
+        var activityId = toolCallNode["activityId"]!.GetValue<string>();
+        Assert.False(string.IsNullOrWhiteSpace(rootTurnId));
+        Assert.False(string.IsNullOrWhiteSpace(activityId));
+        Assert.Equal(rootTurnId, toolResultNode["rootTurnId"]!.GetValue<string>());
+        Assert.Equal(rootTurnId, turnCompleteNode!["rootTurnId"]!.GetValue<string>());
+        Assert.Equal(activityId, toolResultNode["activityId"]!.GetValue<string>());
+        Assert.Equal(activityId, turnCompleteNode["activityId"]!.GetValue<string>());
+        foreach (var toolEvent in new[] { toolCallNode, toolResultNode })
+        {
+            Assert.False(string.IsNullOrWhiteSpace(toolEvent!["callId"]?.GetValue<string>()));
+            Assert.False(string.IsNullOrWhiteSpace(toolEvent["sourceId"]?.GetValue<string>()));
+        }
 
         cts.Cancel();
         try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }
@@ -918,10 +948,11 @@ public sealed class ServeHostTests : IDisposable
     // ── Schedule runtime lifecycle over serve (Task 9) ──────────────────────────
     //
     // These exercise the serve enablement path: ServeHost sets the schedule-lifecycle sink,
-    // starts the JSON-RPC read loop BEFORE driving CodaSession.InitializeAsync (so a scheduled
-    // firing can round-trip a server→client request), and gates initialize/prompt on a shared
-    // initialization task. A fake IScheduleRuntimeHandle (ProbeHandle) stands in for the real
-    // ScheduleRuntime so the wiring can be asserted deterministically without real schedules.
+    // starts the JSON-RPC read loop BEFORE initialize or the first authenticated prompt drives
+    // CodaSession.InitializeAsync (so a scheduled firing can round-trip a server→client request),
+    // and gates initialize/prompt on a shared initialization task. A fake IScheduleRuntimeHandle
+    // (ProbeHandle) stands in for the real ScheduleRuntime so the wiring can be asserted
+    // deterministically without real schedules.
 
     /// <summary>Captures the CodaSession and its injected fake runtime handle from the factory closure.</summary>
     private sealed class ScheduleProbe
@@ -1005,11 +1036,17 @@ public sealed class ServeHostTests : IDisposable
         lifecycle.Register(orchestrator);
         orchestrator.OnRequest(ServeMethods.RequestPermission, _ => ServeJson.ToNode(new PermissionResponse(true)));
 
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
+            CancellationToken.None);
+
         // Wait until the runtime start is entered (and blocked), so the orchestrator handlers are
         // registered before the permission request is issued, then release the start.
         await WaitForStartEnteredAsync(probe, WaitTimeout);
         startGate.TrySetResult();
 
+        await initTask.WaitAsync(WaitTimeout);
         var started = await lifecycle.WaitForStateAsync("started", WaitTimeout);
         Assert.Equal("def-serve", started["definitionId"]!.GetValue<string>());
         Assert.True(probe.Handle!.PermissionGranted);
@@ -1037,12 +1074,12 @@ public sealed class ServeHostTests : IDisposable
 
         await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
 
-        await WaitForStartEnteredAsync(probe, WaitTimeout);
-
         var initTask = orchestrator.SendRequestAsync(
             ServeMethods.Initialize,
             ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
             CancellationToken.None);
+
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
 
         // Initialization is still blocked → initialize must not have returned yet.
         await Task.Delay(150);
@@ -1076,8 +1113,6 @@ public sealed class ServeHostTests : IDisposable
 
         await using var orchestrator = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
 
-        await WaitForStartEnteredAsync(probe, WaitTimeout);
-
         // Both handlers arrive while init is blocked; both await the SAME shared task. Neither drives
         // a second InitializeAsync.
         var initTask = orchestrator.SendRequestAsync(
@@ -1089,6 +1124,7 @@ public sealed class ServeHostTests : IDisposable
             ServeJson.ToNode(new PromptParams { Text = "hi" }),
             CancellationToken.None);
 
+        await WaitForStartEnteredAsync(probe, WaitTimeout);
         await Task.Delay(150);
 
         // Both await the shared gate: neither returns while initialization is still blocked.
@@ -1160,8 +1196,13 @@ public sealed class ServeHostTests : IDisposable
         lifecycle.Register(orchestrator);
 
         // Bring the runtime up deterministically (orchestrator ready before the "started" publish).
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
+            CancellationToken.None);
         await WaitForStartEnteredAsync(probe, WaitTimeout);
         startGate.TrySetResult();
+        await initTask.WaitAsync(WaitTimeout);
         await lifecycle.WaitForStateAsync("started", WaitTimeout);
 
         // Start a prompt; the blocking HTTP handler keeps the turn in-flight.
@@ -1213,8 +1254,13 @@ public sealed class ServeHostTests : IDisposable
         var lifecycle = new LifecycleCollector();
         lifecycle.Register(orchestrator);
 
+        var initTask = orchestrator.SendRequestAsync(
+            ServeMethods.Initialize,
+            ServeJson.ToNode(new InitializeParams(ServeMethods.ProtocolVersion, null)),
+            CancellationToken.None);
         await WaitForStartEnteredAsync(probe, WaitTimeout);
         startGate.TrySetResult();
+        await initTask.WaitAsync(WaitTimeout);
         await lifecycle.WaitForStateAsync("started", WaitTimeout);
 
         cts.Cancel();
@@ -1420,10 +1466,10 @@ public sealed class ServeHostTests : IDisposable
     }
 
     [Fact]
-    public async Task Stdio_drives_initialization_immediately_after_start()
+    public async Task Stdio_prompt_without_initialize_drives_initialization_once()
     {
-        // Regression: with no expectedApiKey (stdio), the shared initialization is driven immediately
-        // after connection.Start — no `initialize` is required for an overdue schedule to run.
+        // With no expected API key, the first prompt remains a valid startup path when a peer omits
+        // initialize, but RunAsync must not eagerly start the runtime before that prompt.
         using var pair = new DuplexStreamPair();
         var probe = new ScheduleProbe();
         var startGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1440,10 +1486,19 @@ public sealed class ServeHostTests : IDisposable
         var lifecycle = new LifecycleCollector();
         lifecycle.Register(orchestrator);
 
-        // Without sending initialize, StartAsync is entered because stdio drives init at Start.
+        await Task.Delay(150);
+        Assert.Null(probe.Handle);
+
+        var promptTask = orchestrator.SendRequestAsync(
+            ServeMethods.Prompt,
+            ServeJson.ToNode(new PromptParams { Text = "hi" }),
+            CancellationToken.None);
+
         await WaitForStartEnteredAsync(probe, WaitTimeout);
         startGate.TrySetResult();
         await lifecycle.WaitForStateAsync("started", WaitTimeout);
+        await promptTask.WaitAsync(WaitTimeout);
+        Assert.Equal(1, probe.Handle!.StartCount);
 
         cts.Cancel();
         try { await hostTask.WaitAsync(WaitTimeout); } catch { /* shutdown */ }

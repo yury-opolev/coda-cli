@@ -14,7 +14,7 @@ public static class OpenAiResponsesRequest
             ["input"] = BuildInput(request.Messages),
         };
 
-        if (!string.IsNullOrEmpty(request.System))
+        if (request.System is not null)
         {
             body["instructions"] = request.System;
         }

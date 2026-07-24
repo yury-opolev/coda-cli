@@ -38,6 +38,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             persistTurnAsync: spec.PersistTurnAsync,
             gate: spec.Gate,
             currentTaskId: spec.CurrentTaskId,
-            currentDepth: spec.CurrentDepth);
+            currentDepth: spec.CurrentDepth,
+            toolActivity: spec.ToolActivity);
     }
 }

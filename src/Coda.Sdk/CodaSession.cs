@@ -4,7 +4,6 @@ using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Lsp;
-using Coda.Agent.OutputStyles;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
 using Coda.Agent.ToolSearch;
@@ -14,7 +13,6 @@ using Coda.Common;
 using Coda.Sdk.Telemetry;
 using Coda.Sdk.Turns;
 using LlmAuth;
-using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
 using Microsoft.Extensions.Logging;
 
@@ -55,6 +53,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
+    private readonly string? startupSystemPromptOverride;
     private readonly ILoggerFactory loggerFactory;
     private readonly ILogger logger;
     private readonly TurnPipelineBuilder turnPipelineBuilder;
@@ -91,6 +90,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
+        this.startupSystemPromptOverride = options.SystemPromptOverride;
         this.fingerprint = fingerprint ?? new ClientFingerprint();
         this.llmClientFactory = llmClientFactory ?? new DefaultLlmClientFactory();
         this.agentLoopFactory = agentLoopFactory ?? new DefaultAgentLoopFactory();
@@ -304,14 +304,26 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// Replace the conversation with a persisted transcript and adopt its id, so subsequent
     /// transcript saves target the same file. Used to resume a session in a fresh process.
     /// </summary>
-    public void Resume(string sessionId, IReadOnlyList<ChatMessage> messages)
+    public void Resume(string sessionId, IReadOnlyList<ChatMessage> messages) =>
+        this.Resume(sessionId, messages, SessionMetadata.Empty);
+
+    /// <summary>
+    /// Replace the conversation with a persisted transcript and its metadata, preserving an explicit
+    /// startup system-prompt override over the stored one.
+    /// </summary>
+    public void Resume(string sessionId, IReadOnlyList<ChatMessage> messages, SessionMetadata metadata)
     {
         ArgumentException.ThrowIfNullOrEmpty(sessionId);
         ArgumentNullException.ThrowIfNull(messages);
+        ArgumentNullException.ThrowIfNull(metadata);
 
         this.SessionId = sessionId;
         this.history.Clear();
         this.history.AddRange(messages);
+        this.Options = this.Options with
+        {
+            SystemPromptOverride = this.startupSystemPromptOverride ?? metadata.SystemPromptOverride,
+        };
     }
 
     /// <summary>
@@ -373,30 +385,63 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // A previous natural turn seals its inbox. Reopen before publishing the next loop spec,
         // without dropping a steer that raced a serve host's transition into this turn.
         this.steeringInbox.OpenForTurn();
-        var options = this.ResolveEffectiveOptions();
-        var client = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
-        if (client is null)
+        var rootToolActivity = ToolActivityContext.CreateRoot();
+        var recording = new RecordingSink(sink);
+        ToolActivitySummary? completedToolActivity = null;
+        var toolActivityFinalized = false;
+
+        ToolActivitySummary? CompleteToolActivity(bool interrupted)
         {
-            return new RunResult(false, string.Empty, [], null, $"No chat client for provider '{options.ProviderId}'.");
+            if (toolActivityFinalized)
+            {
+                return completedToolActivity;
+            }
+
+            toolActivityFinalized = true;
+            completedToolActivity = recording.CompleteActivity(interrupted);
+            return completedToolActivity;
         }
 
-        // Load allow/deny rules, user hooks, and goal/LSP settings once for the turn, then delegate
-        // the per-turn assembly (agent options, permission stack, goal supervisor, tools, subagent
-        // host, and the loop spec) to the pipeline builder.
-        var settings = SettingsLoader.Load(options.WorkingDirectory);
-        var loopSpec = this.turnPipelineBuilder.BuildSpec(options, client, settings) with
+        SessionOptions options;
+        AgentLoopSpec loopSpec;
+        IAgentLoop loop;
+        ILlmClient client;
+        try
         {
-            Steering = this.steeringInbox,
-            // Record on the go: the loop persists the transcript after every turn/tool cycle, so a
-            // session killed mid-run still leaves a record (not just the once-at-the-end save below).
-            PersistTurnAsync = this.PersistTranscriptAsync,
-            // The stable per-session cooperative gate: lets an outside actor pause the loop at an
-            // iteration boundary. Inert unless a pause is requested, so serve/headless are unchanged.
-            Gate = this.ExecutionGate,
-        };
-        var loop = this.agentLoopFactory.Create(loopSpec);
+            options = this.ResolveEffectiveOptions();
+            var resolvedClient = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
+            if (resolvedClient is null)
+            {
+                return new RunResult(false, string.Empty, [], null, $"No chat client for provider '{options.ProviderId}'.")
+                {
+                    RootTurnId = rootToolActivity.RootTurnId,
+                    ToolActivity = CompleteToolActivity(interrupted: false),
+                };
+            }
 
-        var recording = new RecordingSink(sink);
+            client = resolvedClient;
+            // Load allow/deny rules, user hooks, and goal/LSP settings once for the turn, then delegate
+            // the per-turn assembly (agent options, permission stack, goal supervisor, tools, subagent
+            // host, and the loop spec) to the pipeline builder.
+            var settings = SettingsLoader.Load(options.WorkingDirectory);
+            loopSpec = this.turnPipelineBuilder.BuildSpec(options, client, settings) with
+            {
+                Steering = this.steeringInbox,
+                // Record on the go: the loop persists the transcript after every turn/tool cycle, so a
+                // session killed mid-run still leaves a record (not just the once-at-the-end save below).
+                PersistTurnAsync = this.PersistTranscriptAsync,
+                // The stable per-session cooperative gate: lets an outside actor pause the loop at an
+                // iteration boundary. Inert unless a pause is requested, so serve/headless are unchanged.
+                Gate = this.ExecutionGate,
+                ToolActivity = rootToolActivity,
+            };
+            loop = this.agentLoopFactory.Create(loopSpec);
+        }
+        catch
+        {
+            CompleteToolActivity(interrupted: true);
+            throw;
+        }
 
         // Snapshot BEFORE any agentic work. Reassigned after compaction so a turn failure rolls back
         // only the turn's own user message, never a successful compaction. If compaction itself
@@ -429,24 +474,31 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
             await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
+            var toolActivity = CompleteToolActivity(interrupted: false);
             return new RunResult(true, recording.FinalText, recording.ToolCalls, recording.StopReason, null)
             {
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
+                RootTurnId = rootToolActivity.RootTurnId,
+                ToolActivity = toolActivity,
             };
         }
         catch (OperationCanceledException)
         {
+            var toolActivity = CompleteToolActivity(interrupted: true);
             this.Rollback(snapshot);
             this.steeringInbox.Clear();
             return new RunResult(false, recording.FinalText, recording.ToolCalls, null, "Canceled.")
             {
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
+                RootTurnId = rootToolActivity.RootTurnId,
+                ToolActivity = toolActivity,
             };
         }
         catch (Exception ex)
         {
+            var toolActivity = CompleteToolActivity(interrupted: true);
             this.Rollback(snapshot);
             this.steeringInbox.Clear();
             this.LogTurnFailed(options.ProviderId, options.Model, ex.GetType().Name, ex.Message);
@@ -454,10 +506,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             {
                 Usage = recording.Usage,
                 Goal = loop.LastGoalStatus,
+                RootTurnId = rootToolActivity.RootTurnId,
+                ToolActivity = toolActivity,
             };
         }
         finally
         {
+            CompleteToolActivity(interrupted: true);
             // Remember the most recent goal outcome so GetRuntimeSnapshot can surface it between
             // turns. Only overwrite on a non-null result so a subsequent goal-less turn does not
             // erase the last real goal status.
@@ -511,13 +566,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         var options = this.ResolveEffectiveOptions();
         var client = this.llmClientFactory.Create(options.ProviderId, this.credentials, this.fingerprint, this.http, this.loggerFactory, options.LlmHttpTimeoutOverride, this.StreamProgressSink);
 
-        var includeAnthropicSystemPrefix = options.ProviderId != GitHubCopilotProvider.Id;
-        var outputStyle = BuiltInOutputStyles.Resolve(options.OutputStyle);
-        var systemPrompt = AgentSystemPrompt.Build(
-            options.WorkingDirectory,
-            includeAnthropicSystemPrefix,
-            ProjectContext.Load(options.WorkingDirectory),
-            outputStyle.SystemPromptSuffix);
+        var systemPrompt = EffectiveSystemPrompt.Resolve(options);
 
         var allDefs = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]).Definitions;
         // MCP tools are namespaced "mcp__<server>__<tool>"; everything else is built-in.
@@ -724,10 +773,15 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     {
         try
         {
+            var options = this.Options;
             this.transcriptStore ??= new SessionTranscriptStore(
-                this.Options.WorkingDirectory,
+                options.WorkingDirectory,
                 this.loggerFactory.CreateLogger<SessionTranscriptStore>());
-            await this.transcriptStore.SaveAsync(this.SessionId, this.history, cancellationToken).ConfigureAwait(false);
+            await this.transcriptStore.SaveAsync(
+                this.SessionId,
+                this.history,
+                new SessionMetadata { SystemPromptOverride = options.SystemPromptOverride },
+                cancellationToken).ConfigureAwait(false);
         }
         catch (Exception ex)
         {

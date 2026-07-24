@@ -38,7 +38,13 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
         this.http = http ?? throw new ArgumentNullException(nameof(http));
         this.metadata = new McpAuthMetadataClient(http);
         this.tokenStore = tokenStore ?? throw new ArgumentNullException(nameof(tokenStore));
-        this.canonicalResource = canonicalResource ?? throw new ArgumentNullException(nameof(canonicalResource));
+        ArgumentException.ThrowIfNullOrWhiteSpace(canonicalResource);
+        if (!Uri.TryCreate(canonicalResource, UriKind.Absolute, out var resourceUri))
+        {
+            throw new ArgumentException("The MCP OAuth resource must be an absolute URI.", nameof(canonicalResource));
+        }
+
+        this.canonicalResource = CanonicalResourceUri.From(resourceUri);
         this.config = config ?? throw new ArgumentNullException(nameof(config));
         this.interactive = interactive;
         this.openBrowser = openBrowser ?? SystemBrowser.OpenAsync;
@@ -48,7 +54,81 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
 
     private string TokenKey => $"mcp-token:{this.canonicalResource}";
 
+    private string DisplayResource => this.canonicalResource.Split('?', 2)[0];
+
     private static string ClientKey(string issuer) => $"mcp-client:{issuer}";
+
+    /// <summary>
+    /// Proactively replaces the stored token by running the normal discovery and authorization-code
+    /// flow, without waiting for a runtime 401 challenge. Cached DCR registrations are retained.
+    /// </summary>
+    public async Task<McpAuthResult> ForceReauthorizeAsync(CancellationToken cancellationToken = default)
+    {
+        if (this.config.Mode != McpAuthMode.OAuth)
+        {
+            return this.Failure("MCP OAuth reauthentication requires OAuth authentication mode.");
+        }
+
+        if (!this.interactive)
+        {
+            return this.Failure("MCP OAuth reauthentication requires an interactive session.");
+        }
+
+        cancellationToken.ThrowIfCancellationRequested();
+        try
+        {
+            await this.tokenStore.DeleteAsync(this.TokenKey, cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (Exception)
+        {
+            return this.Failure("MCP OAuth reauthentication could not clear the stored token. Please retry.");
+        }
+
+        try
+        {
+            return await this.AcquireTokenAsync(
+                challenge: null,
+                cancellationToken: cancellationToken,
+                redactMessages: true).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
+        }
+        catch (LoginCanceledException)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            return this.Failure("MCP OAuth reauthentication was canceled.");
+        }
+        catch (OAuthExchangeException)
+        {
+            return this.Failure("MCP OAuth token exchange failed. Please retry reauthentication.");
+        }
+        catch (HttpRequestException)
+        {
+            return this.Failure("MCP OAuth reauthentication could not reach the authorization server. Please retry.");
+        }
+        catch (JsonException)
+        {
+            return this.Failure("MCP OAuth reauthentication received an invalid response. Please retry.");
+        }
+        catch (OperationCanceledException)
+        {
+            return this.Failure("MCP OAuth reauthentication timed out. Please retry.");
+        }
+        catch (LlmAuthException)
+        {
+            return this.Failure("MCP OAuth reauthentication failed. Please retry.");
+        }
+        catch (Exception)
+        {
+            return this.Failure("MCP OAuth reauthentication failed. Please retry.");
+        }
+    }
 
     public async Task<string?> GetAccessTokenAsync(CancellationToken cancellationToken = default)
     {
@@ -79,45 +159,59 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
         if (!this.interactive)
         {
             this.log?.Invoke(
-                $"MCP server requires authorization. Run `coda` interactively to sign in to {this.canonicalResource}.");
+                $"MCP server requires authorization. Run `coda` interactively to sign in to {this.DisplayResource}.");
             return false;
         }
 
         try
         {
-            return await this.AcquireTokenAsync(challenge, cancellationToken).ConfigureAwait(false);
+            return (await this.AcquireTokenAsync(challenge, cancellationToken).ConfigureAwait(false)).Succeeded;
         }
         catch (LoginCanceledException)
         {
-            this.log?.Invoke($"Authorization canceled for {this.canonicalResource}.");
+            this.log?.Invoke($"Authorization canceled for {this.DisplayResource}.");
             return false;
         }
-        catch (LlmAuthException ex)
+        catch (LlmAuthException)
         {
-            this.log?.Invoke($"Authorization failed for {this.canonicalResource}: {ex.Message}");
+            this.log?.Invoke($"Authorization failed for {this.DisplayResource}.");
             return false;
         }
     }
 
-    private async Task<bool> AcquireTokenAsync(WwwAuthenticateChallenge? challenge, CancellationToken cancellationToken)
+    private async Task<McpAuthResult> AcquireTokenAsync(
+        WwwAuthenticateChallenge? challenge,
+        CancellationToken cancellationToken,
+        bool redactMessages = false)
     {
         // 1. Resource metadata: from the challenge, else the well-known origin path.
         var metadataUrl = ResolveResourceMetadataUrl(challenge, this.canonicalResource);
         var prm = await this.metadata.GetProtectedResourceMetadataAsync(metadataUrl, cancellationToken).ConfigureAwait(false);
+        if (prm is null)
+        {
+            return this.Failure(
+                redactMessages
+                    ? "Could not discover OAuth protected-resource metadata. Verify the MCP server URL and try again."
+                    : $"No authorization server advertised by {this.DisplayResource}.");
+        }
 
         var issuerCandidate = prm?.AuthorizationServers.FirstOrDefault();
         if (string.IsNullOrEmpty(issuerCandidate))
         {
-            this.log?.Invoke($"No authorization server advertised by {this.canonicalResource}.");
-            return false;
+            return this.Failure(
+                redactMessages
+                    ? "The MCP server did not advertise an OAuth authorization server."
+                    : $"No authorization server advertised by {this.DisplayResource}.");
         }
 
         // 2. Authorization-server metadata (RFC 8414, then OIDC).
         var asMeta = await this.metadata.GetAuthorizationServerMetadataAsync(issuerCandidate, cancellationToken).ConfigureAwait(false);
         if (asMeta is null)
         {
-            this.log?.Invoke($"Could not discover authorization-server metadata for {issuerCandidate}.");
-            return false;
+            return this.Failure(
+                redactMessages
+                    ? "Could not discover OAuth authorization-server metadata. Verify the server configuration and try again."
+                    : $"Could not discover authorization-server metadata for {issuerCandidate}.");
         }
 
         // 3. Loopback listener first, so DCR can register the exact redirect URI.
@@ -130,9 +224,11 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
         {
             // A well-formed resolution always carries an actionable Error here; the fallback
             // guards only against a malformed result (neither ClientId nor Error).
-            this.log?.Invoke(resolution.Error
-                ?? $"No client id available for {asMeta.Issuer}. Configure auth.clientId or use an authenticated stdio proxy.");
-            return false;
+            return this.Failure(
+                redactMessages
+                    ? "No OAuth client id is available. Configure auth.clientId or enable dynamic client registration."
+                    : resolution.Error
+                        ?? $"No client id available for {asMeta.Issuer}. Configure auth.clientId or use an authenticated stdio proxy.");
         }
 
         // 4. Scope selection per the spec priority order.
@@ -155,7 +251,9 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
             new("resource", this.canonicalResource),
         ]);
 
-        this.log?.Invoke($"Opening browser to authorize MCP server {this.canonicalResource}…");
+        this.log?.Invoke(redactMessages
+            ? "Opening browser to authorize MCP server…"
+            : $"Opening browser to authorize MCP server {this.DisplayResource}…");
         await this.openBrowser(authorizeUrl, cancellationToken).ConfigureAwait(false);
 
         var redirect = await listener.WaitForCallbackAsync(cancellationToken).ConfigureAwait(false);
@@ -174,13 +272,23 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
 
         if (token?.AccessToken is null)
         {
-            this.log?.Invoke($"Token exchange returned no access token for {this.canonicalResource}.");
-            return false;
+            return this.Failure(
+                redactMessages
+                    ? "OAuth authorization completed without an access token. Please retry."
+                    : $"Token exchange returned no access token for {this.DisplayResource}.");
         }
 
         await this.PersistAsync(token, asMeta.Issuer, clientId, string.Join(' ', scopes), cancellationToken).ConfigureAwait(false);
-        this.log?.Invoke($"Authorized MCP server {this.canonicalResource}.");
-        return true;
+        this.log?.Invoke(redactMessages
+            ? "Authorized MCP server."
+            : $"Authorized MCP server {this.DisplayResource}.");
+        return new McpAuthResult(true, null);
+    }
+
+    private McpAuthResult Failure(string error)
+    {
+        this.log?.Invoke(error);
+        return new McpAuthResult(false, error);
     }
 
     internal async Task<McpClientIdResolution> ResolveClientIdAsync(AuthorizationServerMetadata asMeta, string redirectUri, CancellationToken cancellationToken)

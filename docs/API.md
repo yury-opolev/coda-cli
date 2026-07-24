@@ -21,6 +21,7 @@ Message framing is `Content-Length`-delimited JSON-RPC 2.0 (the same framing as 
 
 ```
 coda serve [--provider id] [--model id] [--cwd path] [--permission-mode m] [--yolo]
+           [--system-prompt text | --system-prompt-file path]
            [--api-key key] [--endpoint name|path]
 ```
 
@@ -31,16 +32,42 @@ coda serve [--provider id] [--model id] [--cwd path] [--permission-mode m] [--yo
 | `--cwd` | working directory the agent operates in |
 | `--permission-mode` | `default` / `acceptedits` / `plan` / `bypass` |
 | `--yolo` | shorthand for `--permission-mode bypass` |
-| `--api-key` | **selects the authenticated local-socket transport** (see below). May also be supplied via the `CODA_SERVE_API_KEY` environment variable. |
+| `--system-prompt` | exact replacement root system prompt |
+| `--system-prompt-file` | read the exact replacement root system prompt from a file |
+| `--api-key` | **selects the API-key-authenticated local pipe/socket transport** (see below). May also be supplied via the `CODA_SERVE_API_KEY` environment variable. |
 | `--endpoint` | optional socket name/path; auto-generated if omitted |
+
+`--system-prompt` and `--system-prompt-file` are mutually exclusive and may occur only once.
+They require a separate following value: missing values, duplicates, and `--flag=value` forms fail
+before session or transport side effects. Relative files resolve from the process startup directory,
+not `--cwd`, are read once as strict UTF-8 (with an optional BOM removed), and preserve all remaining
+whitespace, line endings, and trailing newlines. `coda run` does not accept these flags. The exact
+interactive syntax is `coda [options] [--system-prompt <text> | --system-prompt-file <path>]`;
+the exact serve syntax is `coda serve [serve options] [--system-prompt <text> | --system-prompt-file <path>]`.
+
+The supplied value, including explicit empty or whitespace-only text, completely replaces the root
+prompt: no built-in Coda prompt, project/`CLAUDE.md` context, output-style suffix, or provider prefix
+is added. Anthropic omits explicit empty text from its optional `system` field because empty blocks
+are invalid; OpenAI shapes serialize it. This wire constraint does not restore Coda defaults.
+
+Serve starts the selected transport first; for a local pipe or Unix socket, its readiness line is
+written after bind. It then loads and connects MCP servers sequentially, and accepts the JSON-RPC
+connection only after MCP setup completes. On the `initialize` request, serve authenticates when
+required, loads or resumes the requested transcript and metadata, then performs session
+initialization; the initialize result waits for that readiness before later prompts run. MCP
+diagnostics and warnings go to `stderr`; `stdout` remains protocol-only.
 
 ### Transports & authentication
 
 The transport is chosen by whether an API key is present:
 
-- **stdio (default, unauthenticated).** With no `--api-key`, Coda speaks the protocol over its own stdin/stdout. Trust comes from the fact that the orchestrator spawned the process. `stdout` carries only protocol bytes; human/debug logs go to `stderr`.
+- **stdio (default, process-local).** With no `--api-key`, Coda speaks the protocol over its own
+  stdin/stdout and does not require a key. Trust comes from the fact that the orchestrator spawned
+  the process. `stdout` carries only protocol bytes; human/debug logs go to `stderr`.
 
-- **Local socket (authenticated).** When an API key is supplied (flag or `CODA_SERVE_API_KEY`), Coda listens on a **named pipe** (Windows) or **Unix domain socket** (other OSes) and requires the key. This is the path an orchestrator like Bridge/Cortex uses.
+- **Local pipe/socket (API-key authenticated).** When an API key is supplied (flag or
+  `CODA_SERVE_API_KEY`), Coda listens on a **named pipe** (Windows) or **Unix domain socket**
+  (other OSes) and requires the key. This is the path an orchestrator like Bridge/Cortex uses.
   - **The key selects the socket** — a socket is *never* served unauthenticated. `--endpoint` without a key, or a key that fails the strength check, exits non-zero with a message on `stderr` **before anything binds**.
   - **Endpoint discovery.** `--endpoint` is optional; if omitted Coda generates a unique one (`coda-serve-<id>`). After binding, Coda prints **one readiness line** to `stdout` so the caller knows where to connect, race-free:
     ```json
@@ -59,7 +86,7 @@ The transport is chosen by whether an API key is present:
 
 | Method | Params | Result |
 |---|---|---|
-| `initialize` | `{ protocolVersion, clientInfo?, apiKey? }` | `{ protocolVersion, sessionId, serverInfo }` |
+| `initialize` | `{ protocolVersion: string, clientInfo?: string, apiKey?: string, sessionId?: string }` | `{ protocolVersion: string, sessionId: string, serverInfo: string, telemetryLogPath?: string }` |
 | `session/prompt` | `{ text?, images?: [{ mediaType, base64 }] }` | `{ ok, stopReason?, interrupted, goalStatus? }` |
 | `session/interrupt` | `{}` | `{ ok }` |
 | `session/history` | `{}` | `{ messages: [{ role, content }] }` |
@@ -67,10 +94,35 @@ The transport is chosen by whether an API key is present:
 | `session/setGoal` | `{ goal?: string\|null, maxDuration?: string, maxContinuations?: int }` | `{ ok, goal?, maxDuration?, maxContinuations? }` |
 | `shutdown` | `{}` | `{ ok }` |
 
-`initialize` must be first. When the socket transport is used, it MUST carry `apiKey`. Only one turn runs at a time — a `session/prompt` while busy returns a JSON-RPC error. Images are input-only, base64, ≤ 5 MB each, of type `image/png|jpeg|gif|webp`.
+`initialize` normally occurs first and accepts an optional `sessionId` for resume. When the local
+pipe/socket transport is used, it MUST carry `apiKey`. Only one turn runs at a time — a `session/prompt` while
+busy returns a JSON-RPC error. Images are input-only, base64, ≤ 5 MB each, of type
+`image/png|jpeg|gif|webp`.
+
+#### Prompt persistence and scheduling
+
+On a resumed session, startup prompt metadata wins over persisted metadata, which wins over the
+normal generated prompt. Metadata is separate from the audited effective `systemPrompt`, and audit
+records are never resume input. The root override applies equally to scheduled root turns and
+context reporting; role prompts for subagents remain isolated. Session forks preserve it in
+interactive, headless, and slash-command flows. Export/import carries it in the optional
+`systemPromptOverride` field without changing the `coda.session/1` schema.
+
+During `initialize`, serve applies resumed metadata before it initializes the session. On local
+stdio, the first `session/prompt` can initialize a session when `initialize` is omitted.
+API-key-authenticated local pipe/socket transport requires `initialize` with `apiKey` first;
+prompt-first returns `-32001` and starts no agent work.
 
 **Coda → Orchestrator (notifications, streamed during a turn):**
-`event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson}` · `event/toolResult {toolName, content, isError}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` · `event/turnComplete {stopReason?, interrupted}`.
+`event/assistantText {delta}` · `event/assistantTextComplete {}` · `event/toolCall {toolName, inputJson, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolProgress {toolName, elapsedMs, rootTurnId?, activityId?, callId?, sourceId?}` · `event/toolResult {toolName, content, isError, rootTurnId?, activityId?, callId?, sourceId?, status?}` · `event/error {message}` · `event/stop {stopReason?}` · `event/usage {inputTokens, outputTokens}` · `event/turnComplete {stopReason?, interrupted, rootTurnId?, activityId?}`.
+
+Tool identity fields are optional and additive: `rootTurnId` identifies the root turn,
+`activityId` its tool batch, `callId` a single invocation, and `sourceId` the origin
+(`root:<rootTurnId>` or `subagent:<taskId>`). `event/turnComplete` carries `rootTurnId`; its
+`activityId` is omitted when no tools ran. A correlated `event/toolResult` includes `status` as
+the stable `ToolCallStatus` enum name (`Pending`, `AwaitingApproval`, `Running`, `Succeeded`,
+`Failed`, `Cancelled`, or `Skipped`). Clients can ignore absent or unknown optional fields.
+This does not change protocol version `"1"` or any JSON-RPC method name.
 
 **Coda → Orchestrator (server-initiated requests — the agent blocks until you answer):**
 

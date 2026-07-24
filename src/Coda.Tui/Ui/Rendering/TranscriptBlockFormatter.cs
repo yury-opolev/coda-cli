@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text;
+using Coda.Agent;
 using Coda.Tui.Ui.State;
 using Markdig;
 using Markdig.Syntax;
@@ -48,11 +49,14 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     public bool FillWidth { get; init; }
 
     /// <summary>
-    /// An optional right-aligned annotation (e.g. a sent-time <c>HH:mm</c>) drawn at the row's right edge in
-    /// a dim attribute. It is never part of <see cref="Text"/>, so it does not wrap and is excluded from
-    /// selection/copy; the row's text is wrapped to reserve these cells so the two never overlap.
+    /// An optional right-aligned annotation (e.g. a sent-time <c>HH:mm</c>) drawn near the row's trailing edge
+    /// in a dim attribute. It is never part of <see cref="Text"/>, so it does not wrap and is excluded from
+    /// selection/copy; the row's text and trailing cells are reserved so the two never overlap.
     /// </summary>
     public string? RightText { get; init; }
+
+    /// <summary>Cells intentionally left blank after <see cref="RightText"/>.</summary>
+    public int RightTextTrailingCells { get; init; }
 
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
@@ -105,6 +109,10 @@ public static class TranscriptBlockFormatter
                 {
                     AppendTool(lines, tool, safeWidth, toolDisplayMode);
                 }
+                break;
+
+            case ToolActivityTranscriptBlock activity:
+                AppendToolActivity(lines, activity, safeWidth, toolDisplayMode);
                 break;
 
             case CommandOutputTranscriptBlock command:
@@ -392,6 +400,187 @@ public static class TranscriptBlockFormatter
         }
     }
 
+    private static void AppendToolActivity(
+        List<TranscriptRenderLine> lines,
+        ToolActivityTranscriptBlock activity,
+        int width,
+        ToolDisplayMode toolDisplayMode)
+    {
+        switch (toolDisplayMode)
+        {
+            case ToolDisplayMode.Tiny:
+                return;
+            case ToolDisplayMode.Summary:
+                AppendToolActivitySummary(lines, activity, width);
+                return;
+            case ToolDisplayMode.Compact:
+                AppendToolActivityCompact(lines, activity, width);
+                return;
+            default:
+                AppendToolActivityVerbose(lines, activity, width);
+                return;
+        }
+    }
+
+    private static void AppendToolActivitySummary(
+        List<TranscriptRenderLine> lines,
+        ToolActivityTranscriptBlock activity,
+        int width)
+    {
+        var summary = ActivitySummary(activity);
+        if (activity.CompletionState != ToolActivityCompletionState.Active)
+        {
+            var role = summary.FailedCalls > 0
+                ? TranscriptRole.Error
+                : summary.Cancelled ? TranscriptRole.Warning : TranscriptRole.Tool;
+            AppendActivityLine(lines, ToolActivityPreview.CompletedText(summary), width, role);
+            return;
+        }
+
+        var shellCommands = activity.Calls.Length > 0 &&
+            activity.Calls.All(call => call.ToolName == "run_command");
+        var noun = shellCommands
+            ? activity.Calls.Length == 1 ? "shell command" : "shell commands"
+            : activity.Calls.Length == 1 ? "tool" : "tools";
+        AppendActivityLine(lines, $"Running {activity.Calls.Length} {noun}...", width, TranscriptRole.Tool);
+
+        var running = activity.Calls.Where(call => call.Status == ToolCallStatus.Running).ToArray();
+        if (running.Length <= 5)
+        {
+            for (var index = 0; index < running.Length; index++)
+            {
+                var prefix = index == running.Length - 1 ? "`-" : "|-";
+                AppendActivityLine(
+                    lines,
+                    $"{prefix} {ToolActivityPreview.Create(running[index].ToolName, running[index].InputJson)}",
+                    width,
+                    TranscriptRole.Tool);
+            }
+
+            return;
+        }
+
+        for (var index = 0; index < 4; index++)
+        {
+            AppendActivityLine(
+                lines,
+                $"|- {ToolActivityPreview.Create(running[index].ToolName, running[index].InputJson)}",
+                width,
+                TranscriptRole.Tool);
+        }
+
+        AppendActivityLine(lines, $"`- ...and {running.Length - 4} more", width, TranscriptRole.Tool);
+    }
+
+    private static void AppendToolActivityCompact(
+        List<TranscriptRenderLine> lines,
+        ToolActivityTranscriptBlock activity,
+        int width)
+    {
+        foreach (var call in activity.Calls)
+        {
+            var elapsed = call.ElapsedMs is { } milliseconds
+                ? $" ({milliseconds.ToString(CultureInfo.InvariantCulture)}ms)"
+                : string.Empty;
+            AppendActivityLine(
+                lines,
+                $"{ToolActivityPreview.Create(call.ToolName, call.InputJson)} [{ActivityStatusText(call.Status)}]{elapsed}",
+                width,
+                RoleFor(call));
+        }
+    }
+
+    private static void AppendToolActivityVerbose(
+        List<TranscriptRenderLine> lines,
+        ToolActivityTranscriptBlock activity,
+        int width)
+    {
+        foreach (var call in activity.Calls)
+        {
+            var header = new StringBuilder(ActivityToolName(call.ToolName));
+            var input = TerminalTextSanitizer.Sanitize(call.InputJson).Trim();
+            if (input.Length > 0)
+            {
+                header.Append(' ').Append(input);
+            }
+
+            header.Append(" [").Append(ActivityStatusText(call.Status)).Append(']');
+            if (call.ElapsedMs is { } milliseconds)
+            {
+                header.Append(" (").Append(milliseconds.ToString(CultureInfo.InvariantCulture)).Append("ms)");
+            }
+
+            var role = RoleFor(call);
+            AppendPreformatted(lines, header.ToString(), width, role);
+            if (!string.IsNullOrEmpty(call.Result))
+            {
+                AppendPreformatted(lines, TerminalTextSanitizer.Sanitize(call.Result), width, role);
+            }
+
+            if (!string.IsNullOrEmpty(call.Error))
+            {
+                AppendPreformatted(lines, $"Error: {TerminalTextSanitizer.Sanitize(call.Error)}", width, role);
+            }
+        }
+    }
+
+    private static void AppendActivityLine(
+        List<TranscriptRenderLine> lines,
+        string text,
+        int width,
+        TranscriptRole role) =>
+        lines.Add(new TranscriptRenderLine(ToolActivityPreview.TruncateToCells(text, width), role));
+
+    private static ToolActivitySummary ActivitySummary(ToolActivityTranscriptBlock activity)
+    {
+        var homogeneousToolName = activity.Calls.Length > 0 &&
+            activity.Calls.All(call => string.Equals(
+                call.ToolName,
+                activity.Calls[0].ToolName,
+                StringComparison.Ordinal))
+            ? activity.Calls[0].ToolName
+            : null;
+        var cancelledCalls = activity.Calls.Count(call => call.Status == ToolCallStatus.Cancelled);
+        if (activity.CompletionState == ToolActivityCompletionState.Cancelled)
+        {
+            cancelledCalls = Math.Max(1, cancelledCalls);
+        }
+
+        return new ToolActivitySummary(
+            activity.RootTurnId,
+            activity.ActivityId,
+            activity.Calls.Length,
+            activity.Calls.Count(call => call.Status == ToolCallStatus.Failed),
+            cancelledCalls,
+            activity.Calls.Count(call => call.Status == ToolCallStatus.Skipped),
+            homogeneousToolName);
+    }
+
+    private static string ActivityToolName(string toolName)
+    {
+        var sanitized = TerminalTextSanitizer.SanitizeSingleLine(toolName);
+        return sanitized.Length == 0 ? "tool" : sanitized;
+    }
+
+    private static string ActivityStatusText(ToolCallStatus status) => status switch
+    {
+        ToolCallStatus.Pending => "pending",
+        ToolCallStatus.AwaitingApproval => "awaiting approval",
+        ToolCallStatus.Running => "running",
+        ToolCallStatus.Succeeded => "success",
+        ToolCallStatus.Failed => "error",
+        ToolCallStatus.Cancelled => "cancelled",
+        ToolCallStatus.Skipped => "skipped",
+        _ => "unknown",
+    };
+
+    private static TranscriptRole RoleFor(ToolActivityCall call) => call.Status switch
+    {
+        ToolCallStatus.Failed => TranscriptRole.Error,
+        ToolCallStatus.Cancelled => TranscriptRole.Warning,
+        _ => TranscriptRole.Tool,
+    };
+
     private static void AppendPreformatted(List<TranscriptRenderLine> lines, string text, int width, TranscriptRole role)
     {
         foreach (var line in SplitLines(text))
@@ -417,8 +606,8 @@ public static class TranscriptBlockFormatter
 
     /// <summary>
     /// Projects a user message onto full-width background-block rows. When the block carries a send time it is
-    /// formatted as a local <c>HH:mm</c> annotation pinned to the top-right of the first row; the first source
-    /// line is wrapped into a narrower zone so the reserved time cells can never overlap the message text. The
+    /// formatted as a local <c>HH:mm</c> annotation on the first row; the first source line is wrapped into a
+    /// narrower zone so the reserved time and trailing cells can never overlap the message text. The
     /// time is carried as <see cref="TranscriptRenderLine.RightText"/> (never mixed into the copyable text) and
     /// every row is marked <see cref="TranscriptRenderLine.FillWidth"/> so the whole block paints its distinct
     /// background across the visible width.
@@ -429,12 +618,18 @@ public static class TranscriptBlockFormatter
             ? sentAt.ToString("HH:mm", CultureInfo.InvariantCulture)
             : null;
 
-        // Reserve the time's cells (plus a one-cell gap) on the first row so the annotation and the text never
-        // collide. Only narrow the first row when the reservation still leaves a usable text zone.
+        const int TextToTimestampGap = 1;
+        const int TimestampTrailingGap = 1;
+
+        // Reserve the timestamp's cells, its separation from the text, and a trailing blank cell so the
+        // annotation stays clear of both the message and a possible scrollbar. Only narrow the first row when
+        // the reservation still leaves a usable text zone.
         var firstRowWidth = width;
         if (time is not null)
         {
-            var reserved = TerminalCellText.Width(time) + 1;
+            var reserved = TerminalCellText.Width(time)
+                + TextToTimestampGap
+                + TimestampTrailingGap;
             if (width - reserved >= 1)
             {
                 firstRowWidth = width - reserved;
@@ -459,6 +654,7 @@ public static class TranscriptBlockFormatter
                 {
                     FillWidth = true,
                     RightText = right,
+                    RightTextTrailingCells = right is null ? 0 : TimestampTrailingGap,
                 });
             }
         }

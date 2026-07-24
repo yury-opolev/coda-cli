@@ -9,6 +9,9 @@ public sealed record ServeOptions
     public string? ProviderId { get; init; }
     public string? Model { get; init; }
     public string? WorkingDirectory { get; init; }
+    public SystemPromptSource? SystemPromptSource { get; init; }
+    public string? SystemPromptOverride { get; init; }
+    public string? Error { get; init; }
     public PermissionMode PermissionMode { get; init; } = PermissionMode.Default;
 
     /// <summary>When true (yolo-safe), bypass mode routes each mutating action through the
@@ -56,6 +59,11 @@ public sealed record ServeOptions
     /// </summary>
     public static ServeOptions Parse(IReadOnlyList<string> args)
     {
+        if (!SystemPromptSourceResolver.TryExtract(args, out var remainingArgs, out var systemPromptSource, out var error))
+        {
+            return new ServeOptions { Error = error };
+        }
+
         string? provider = null;
         string? model = null;
         string? cwd = null;
@@ -73,39 +81,39 @@ public sealed record ServeOptions
         var enableMcp = true;
         var enableProjectMcp = true;
 
-        for (var i = 0; i < args.Count; i++)
+        for (var i = 0; i < remainingArgs.Count; i++)
         {
-            var arg = args[i];
+            var arg = remainingArgs[i];
             switch (arg)
             {
                 case "--provider":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        provider = args[i];
+                        provider = remainingArgs[i];
                     }
 
                     break;
 
                 case "--model":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        model = args[i];
+                        model = remainingArgs[i];
                     }
 
                     break;
 
                 case "--cwd":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        cwd = args[i];
+                        cwd = remainingArgs[i];
                     }
 
                     break;
 
                 case "--permission-mode":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        var value = args[i];
+                        var value = remainingArgs[i];
                         if (string.Equals(value, "yolo-safe", StringComparison.OrdinalIgnoreCase)
                             || string.Equals(value, "yolosafe", StringComparison.OrdinalIgnoreCase))
                         {
@@ -130,25 +138,25 @@ public sealed record ServeOptions
                     break;
 
                 case "--api-key":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        apiKey = args[i];
+                        apiKey = remainingArgs[i];
                     }
 
                     break;
 
                 case "--endpoint":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        endpoint = args[i];
+                        endpoint = remainingArgs[i];
                     }
 
                     break;
 
                 case "--goal":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        goal = args[i];
+                        goal = remainingArgs[i];
                     }
 
                     break;
@@ -171,7 +179,7 @@ public sealed record ServeOptions
 
                 case "--max-continuations":
                     // Matches `coda run`: bounds non-goal stop-hooks AND sets the goal turn backstop.
-                    if (++i < args.Count && int.TryParse(args[i], out var parsedMax) && parsedMax > 0)
+                    if (++i < remainingArgs.Count && int.TryParse(remainingArgs[i], out var parsedMax) && parsedMax > 0)
                     {
                         maxStopContinuations = parsedMax;
                         goalMaxContinuations = parsedMax;
@@ -183,7 +191,7 @@ public sealed record ServeOptions
                 // back-compat alias. Both set the goal wall-clock budget.
                 case "--goal-timeout":
                 case "--goal-max-duration":
-                    if (++i < args.Count && Coda.Agent.Goals.DurationParser.TryParse(args[i], out var parsedGmd))
+                    if (++i < remainingArgs.Count && Coda.Agent.Goals.DurationParser.TryParse(remainingArgs[i], out var parsedGmd))
                     {
                         goalMaxDuration = parsedGmd;
                     }
@@ -191,7 +199,7 @@ public sealed record ServeOptions
                     break;
 
                 case "--goal-max-continuations":
-                    if (++i < args.Count && int.TryParse(args[i], out var parsedGmc) && parsedGmc > 0)
+                    if (++i < remainingArgs.Count && int.TryParse(remainingArgs[i], out var parsedGmc) && parsedGmc > 0)
                     {
                         goalMaxContinuations = parsedGmc;
                     }
@@ -206,9 +214,9 @@ public sealed record ServeOptions
                 // (trace|debug|info|warn|error|off). An invalid value is silently
                 // ignored — serve parsing is forward-compatible (matches the other cases).
                 case "--telemetry-level":
-                    if (++i < args.Count)
+                    if (++i < remainingArgs.Count)
                     {
-                        var levelArg = args[i].Trim().ToLowerInvariant();
+                        var levelArg = remainingArgs[i].Trim().ToLowerInvariant();
                         if (TelemetryResolver.IsOff(levelArg))
                         {
                             telemetryLevel = "off";
@@ -232,6 +240,7 @@ public sealed record ServeOptions
             ProviderId = provider,
             Model = model,
             WorkingDirectory = cwd,
+            SystemPromptSource = systemPromptSource,
             PermissionMode = mode,
             EnableClassifier = enableClassifier,
             ApiKey = apiKey,
