@@ -1,3 +1,4 @@
+using System.Collections;
 using Coda.Sdk;
 using LlmClient;
 
@@ -6,10 +7,14 @@ namespace Coda.Tui.Repl;
 /// <summary>Mutable per-session state (active provider, model, cwd, conversation).</summary>
 public sealed class SessionState
 {
+    private readonly List<(int Label, ImageBlock Block, bool TokenInserted)> pendingLabeledImages = [];
+    private readonly PendingImageAdapter pendingImages;
+
     public SessionState(string activeProviderId, string? workingDirectory = null)
     {
         this.ActiveProviderId = activeProviderId;
         this.WorkingDirectory = workingDirectory ?? Directory.GetCurrentDirectory();
+        this.pendingImages = new PendingImageAdapter(this);
     }
 
     public string ActiveProviderId { get; set; }
@@ -76,10 +81,40 @@ public sealed class SessionState
     public Dictionary<string, Coda.Sdk.ModelListResult> ModelListCache { get; } = new(StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
-    /// Images staged via /image that will be attached to the next user turn.
-    /// Cleared by <see cref="Agent.AgentRunner"/> after the turn is dispatched.
+    /// Images staged via /image or a clipboard paste that will be attached to the next user turn.
+    /// Backward-compatible <see cref="IReadOnlyList{T}"/> view (with Add/Clear) over the labeled staging
+    /// list; <see cref="Agent.AgentRunner"/> drains it after the turn is dispatched.
     /// </summary>
-    public List<ImageBlock> PendingImages { get; } = [];
+    public PendingImageAdapter PendingImages => this.pendingImages;
+
+    /// <summary>
+    /// The labeled staging list backing <see cref="PendingImages"/>. Each entry carries the display label
+    /// (e.g. <c>[Image 1]</c>), the image block, and whether a token was inserted into the draft for it.
+    /// </summary>
+    public IReadOnlyList<(int Label, ImageBlock Block, bool TokenInserted)> PendingLabeledImages =>
+        this.pendingLabeledImages;
+
+    /// <summary>The next label to assign; starts at 1 and resets when staging is cleared.</summary>
+    public int NextImageLabel { get; private set; } = 1;
+
+    /// <summary>
+    /// Stages an image, assigning the next sequential label. <paramref name="tokenInserted"/> records
+    /// whether an <c>[Image N]</c> token was written into the draft for it (paste and interactive /image),
+    /// which governs the token-scan attachment policy in <see cref="Agent.AgentRunner"/>. Returns the label.
+    /// </summary>
+    public int StageImage(ImageBlock block, bool tokenInserted = false)
+    {
+        var label = this.NextImageLabel++;
+        this.pendingLabeledImages.Add((label, block, tokenInserted));
+        return label;
+    }
+
+    /// <summary>Clears all staged images and resets the label counter to 1.</summary>
+    public void ClearStagedImages()
+    {
+        this.pendingLabeledImages.Clear();
+        this.NextImageLabel = 1;
+    }
 
     /// <summary>Active autonomous goal (settable via /goal); null = no goal. Persists across turns until cleared.</summary>
     public string? Goal { get; set; }
@@ -89,4 +124,36 @@ public sealed class SessionState
 
     /// <summary>Per-goal turn backstop override (/goal --max-turns); null = settings/default.</summary>
     public int? GoalMaxContinuations { get; set; }
+}
+
+/// <summary>
+/// Backward-compatible <see cref="IReadOnlyList{T}"/> facade over <see cref="SessionState"/>'s labeled image
+/// staging list. Preserves the historical <c>PendingImages.Add</c>/<c>.Clear</c>/indexer/enumeration surface
+/// while delegating to <see cref="SessionState.StageImage"/> and <see cref="SessionState.ClearStagedImages"/>.
+/// </summary>
+public sealed class PendingImageAdapter : IReadOnlyList<ImageBlock>
+{
+    private readonly SessionState owner;
+
+    internal PendingImageAdapter(SessionState owner) => this.owner = owner;
+
+    public int Count => this.owner.PendingLabeledImages.Count;
+
+    public ImageBlock this[int index] => this.owner.PendingLabeledImages[index].Block;
+
+    /// <summary>Stages an image with no draft token (legacy /image behaviour).</summary>
+    public void Add(ImageBlock block) => this.owner.StageImage(block, tokenInserted: false);
+
+    /// <summary>Clears all staged images and resets the label counter.</summary>
+    public void Clear() => this.owner.ClearStagedImages();
+
+    public IEnumerator<ImageBlock> GetEnumerator()
+    {
+        foreach (var entry in this.owner.PendingLabeledImages)
+        {
+            yield return entry.Block;
+        }
+    }
+
+    IEnumerator IEnumerable.GetEnumerator() => this.GetEnumerator();
 }

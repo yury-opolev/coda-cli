@@ -57,14 +57,6 @@ public sealed class ServeHost : IAsyncDisposable
     private readonly object turnLock = new();
     private bool interruptPending;
 
-    private static readonly HashSet<string> SupportedImageMediaTypes = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/webp",
-    };
-
     public ServeHost(
         Stream input,
         Stream output,
@@ -379,18 +371,17 @@ public sealed class ServeHost : IAsyncDisposable
             {
                 foreach (var img in images)
                 {
-                    if (!SupportedImageMediaTypes.Contains(img.MediaType))
+                    if (!ImageAttachmentValidation.IsAllowedMimeType(img.MediaType))
                     {
                         throw new InvalidOperationException($"unsupported image media type: {img.MediaType}");
                     }
 
-                    if (!TryDecodeBase64(img.Base64, out _))
+                    if (!ImageAttachmentValidation.TryDecodeBase64(img.Base64, out var decoded))
                     {
                         throw new InvalidOperationException("image base64 is empty or invalid");
                     }
 
-                    var decoded = Convert.FromBase64String(img.Base64);
-                    if (decoded.Length > 5 * 1024 * 1024)
+                    if (decoded.Length > ImageAttachmentValidation.MaxBytes)
                     {
                         throw new InvalidOperationException("image exceeds the 5 MB limit");
                     }
@@ -856,25 +847,6 @@ public sealed class ServeHost : IAsyncDisposable
         }
 
         return duration.ToString(@"hh\:mm\:ss");
-    }
-
-    private static bool TryDecodeBase64(string? value, out byte[] bytes)
-    {
-        bytes = [];
-        if (string.IsNullOrEmpty(value))
-        {
-            return false;
-        }
-
-        try
-        {
-            bytes = Convert.FromBase64String(value);
-            return true;
-        }
-        catch (FormatException)
-        {
-            return false;
-        }
     }
 
     private void EnsureAuthenticated()

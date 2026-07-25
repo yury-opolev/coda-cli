@@ -1,4 +1,5 @@
 using System.Text;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
@@ -44,6 +45,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<object, bool> removeTimeout;
     private readonly Func<string, bool> clipboardWriter;
     private readonly Func<ClipboardReadResult> clipboardReader;
+    private readonly IClipboardImageReader? imageReader;
+    private readonly Func<ClipboardImage, string?>? imagePaste;
     private object? chordTimeout;
     private object? transientOperationalTimeout;
     private object? composerLayoutTimeout;
@@ -95,7 +98,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
         IUrlOpener? urlOpener = null,
         IPrivateBrowserResolver? privateBrowserResolver = null,
-        IUiPromptService? linkPromptService = null)
+        IUiPromptService? linkPromptService = null,
+        IClipboardImageReader? imageReader = null,
+        Func<ClipboardImage, string?>? imagePaste = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -108,6 +113,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.clipboardWriter = clipboardWriter ??
             (text => this.app.Clipboard?.TrySetClipboardData(text) == true);
         this.clipboardReader = clipboardReader ?? this.ReadApplicationClipboard;
+        this.imageReader = imageReader;
+        this.imagePaste = imagePaste;
         this.Theme = theme ?? CodaThemes.Current.Tui;
         this.followsRegistryTheme = theme is null;
         this.urlOpener = urlOpener ?? DefaultUrlOpener.Instance;
@@ -746,6 +753,33 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// </summary>
     private void PasteComposerClipboard()
     {
+        // Prefer an image on the clipboard over text: read it through the injected reader, stage+validate it
+        // via the imagePaste callback, and insert its [Image N] token at the caret. A missing image falls
+        // through to the text-paste path; a present-but-rejected image pins a warning without pasting text.
+        if (this.imageReader is not null && this.imagePaste is not null)
+        {
+            var image = this.imageReader.TryRead();
+            if (image is not null)
+            {
+                var token = this.imagePaste(image);
+                if (token is not null)
+                {
+                    this.Composer.NewPasteEvent(token + " ");
+                    var kb = image.ByteLength / 1024.0;
+                    var mime = image.MediaType.Split('/').LastOrDefault()?.ToUpperInvariant() ?? image.MediaType;
+                    this.ShowTransientOperationalStatus(
+                        new OperationalStatus($"🖼 image attached · {mime} {kb:F0} KB", OperationalTone.Ready, false),
+                        TimeSpan.FromSeconds(1.5));
+                    return;
+                }
+
+                this.ShowTransientOperationalStatus(
+                    new OperationalStatus("Image not attached: unsupported type or too large", OperationalTone.Warning, false),
+                    TimeSpan.FromSeconds(1.5));
+                return;
+            }
+        }
+
         var result = this.clipboardReader();
         if (!result.Available)
         {

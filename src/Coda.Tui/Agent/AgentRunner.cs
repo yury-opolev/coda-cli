@@ -8,6 +8,7 @@ using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.State;
 using LlmClient;
 using Spectre.Console;
+using System.Text.RegularExpressions;
 
 namespace Coda.Tui.Agent;
 
@@ -294,22 +295,93 @@ public sealed class AgentRunner : IDisposable
     private async Task<RunResult> RunTurnAsync(CommandContext context, string prompt, CancellationToken cancellationToken)
     {
         var sink = new TuiAgentSink(context.Events);
-        if (context.Session.PendingImages.Count > 0)
+        var labeled = context.Session.PendingLabeledImages;
+        if (labeled.Count > 0)
         {
-            // Build a multimodal turn: staged images + the text prompt. PendingImages is cleared only
-            // AFTER a successful turn so a failed/cancelled request never silently discards the user's
-            // attachment (clear-on-success policy).
-            var userContent = new List<ContentBlock>(context.Session.PendingImages) { new TextBlock(prompt) };
-            var result = await this.session!.RunAsync(userContent, sink, cancellationToken).ConfigureAwait(false);
-            if (result.Success)
+            // Decide which staged images (if any) this turn attaches based on the [Image N] tokens in the
+            // prompt. A non-null result is a multimodal turn: staged images (in token order, or auto-included
+            // legacy images) followed by the text. Staging is cleared only AFTER a successful turn so a
+            // failed/cancelled request never silently discards the user's attachment (clear-on-success).
+            var content = BuildImageTurnContent(labeled, prompt);
+            if (content is not null)
             {
-                context.Session.PendingImages.Clear();
+                var result = await this.session!.RunAsync(content, sink, cancellationToken).ConfigureAwait(false);
+                if (result.Success)
+                {
+                    context.Session.ClearStagedImages();
+                }
+
+                return result;
             }
 
-            return result;
+            // Every staged image was token-inserted but its token was deleted from the draft (or no image
+            // applies): drop the orphaned attachments so they don't leak into a later turn.
+            context.Session.ClearStagedImages();
         }
 
         return await this.session!.RunAsync(prompt, sink, cancellationToken).ConfigureAwait(false);
+    }
+
+    private static readonly Regex ImageTokenPattern = new(@"\[Image (\d+)\]", RegexOptions.Compiled);
+
+    /// <summary>
+    /// Builds the multimodal content for a turn given the labeled staged images and the prompt text, or
+    /// null when the turn should be text-only. When the prompt references images by <c>[Image N]</c> token,
+    /// only those images are attached, in the order the tokens appear. Otherwise images staged without a
+    /// draft token (legacy /image) are auto-included in label order; token-inserted images whose token was
+    /// removed are dropped (null result).
+    /// </summary>
+    internal static List<ContentBlock>? BuildImageTurnContent(
+        IReadOnlyList<(int Label, ImageBlock Block, bool TokenInserted)> labeled, string prompt)
+    {
+        if (labeled.Count == 0)
+        {
+            return null;
+        }
+
+        var tokens = ScanForImageTokens(prompt);
+        if (tokens.Count > 0)
+        {
+            var ordered = tokens
+                .Select(label => labeled.FirstOrDefault(entry => entry.Label == label))
+                .Where(entry => entry.Block is not null)
+                .Select(entry => (ContentBlock)entry.Block)
+                .ToList();
+            if (ordered.Count > 0)
+            {
+                ordered.Add(new TextBlock(prompt));
+                return ordered;
+            }
+        }
+
+        var auto = labeled
+            .Where(entry => !entry.TokenInserted)
+            .OrderBy(entry => entry.Label)
+            .Select(entry => (ContentBlock)entry.Block)
+            .ToList();
+        if (auto.Count > 0)
+        {
+            auto.Add(new TextBlock(prompt));
+            return auto;
+        }
+
+        return null;
+    }
+
+    /// <summary>Returns the distinct image labels referenced by <c>[Image N]</c> tokens, in first-seen order.</summary>
+    private static IReadOnlyList<int> ScanForImageTokens(string text)
+    {
+        var result = new List<int>();
+        var seen = new HashSet<int>();
+        foreach (Match match in ImageTokenPattern.Matches(text))
+        {
+            if (int.TryParse(match.Groups[1].Value, out var label) && seen.Add(label))
+            {
+                result.Add(label);
+            }
+        }
+
+        return result;
     }
 
     /// <summary>

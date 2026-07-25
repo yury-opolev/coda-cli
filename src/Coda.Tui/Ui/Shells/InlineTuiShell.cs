@@ -1,3 +1,4 @@
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Prompts;
@@ -43,7 +44,9 @@ internal sealed class InlineTuiShell(
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
     IUrlOpener? urlOpener = null,
     IPrivateBrowserResolver? privateBrowserResolver = null,
-    IUiPromptService? linkPromptService = null)
+    IUiPromptService? linkPromptService = null,
+    IClipboardImageReader? imageReader = null,
+    Func<ClipboardImage, string?>? imagePaste = null)
     : FullscreenTuiShell(
         app,
         controller,
@@ -64,7 +67,9 @@ internal sealed class InlineTuiShell(
         toolDisplayMode: toolDisplayMode,
         urlOpener: urlOpener,
         privateBrowserResolver: privateBrowserResolver,
-        linkPromptService: linkPromptService)
+        linkPromptService: linkPromptService,
+        imageReader: imageReader,
+        imagePaste: imagePaste)
 {
     /// <summary>
     /// The fewest rows the inline region can occupy: header (1), operational (1), navigation (1),

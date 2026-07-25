@@ -1,5 +1,7 @@
 using Coda.Agent;
 using Coda.Mcp.Auth;
+using Coda.Sdk;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
@@ -406,6 +408,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         {
             var plainConsole = new UiAnsiConsoleAdapter(mailbox, this.OffscreenWidth(), this.OffscreenHeight());
             context.SetModeEnvironment(plainConsole, PlainUiPromptService.Instance, mailbox, semanticUiEnabled: true);
+            context.DraftInsertCallback = null;
             frameSink.Set(null, null);
             observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
@@ -436,6 +439,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             // without stealing Spectre's prompt input. Command output is not duplicated because commands
             // write straight to the real console rather than through the adapter.
             context.SetModeEnvironment(realConsole, new SpectreUiPromptService(realConsole), mailbox, semanticUiEnabled: false);
+            context.DraftInsertCallback = null;
             frameSink.Set(null, null);
             observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
@@ -457,6 +461,21 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
             return TuiShellExit.Exited;
         }
+
+        // The clipboard image reader + paste callback are created once at the composition root: the reader
+        // shells out to the per-OS tool, and imagePaste validates + stages a pasted image and returns its
+        // [Image N] token (or null to signal the shell that the image was rejected).
+        var clipboardImageReader = ClipboardImageReaderSelector.Create();
+        Func<ClipboardImage, string?> imagePaste = img =>
+        {
+            if (ImageAttachmentValidation.Validate(img.MediaType, img.Base64Data) is not null)
+            {
+                return null;
+            }
+
+            var label = context.Session.StageImage(new ImageBlock(img.MediaType, img.Base64Data), tokenInserted: true);
+            return $"[Image {label}]";
+        };
 
         // The Terminal.Gui shell factory: wire the composer to the controller, point the actor's frame
         // sink at the shell, and (once the loop is pumping) run startup and enable submission.
@@ -482,7 +501,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 scheduleBrowserProvider: scheduleBrowserProvider,
                 urlOpener: DefaultUrlOpener.Instance,
                 privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
-                linkPromptService: actorPrompts);
+                linkPromptService: actorPrompts,
+                imageReader: clipboardImageReader,
+                imagePaste: imagePaste);
+
+            // Route /image (and any command staging an image) into this shell's live composer draft. Dispatch
+            // is serialized by the controller, so a mode switch never leaves this pointing at a dead shell.
+            context.DraftInsertCallback = token => tgApp.Invoke(() => shell.Composer.NewPasteEvent(token + " "));
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);

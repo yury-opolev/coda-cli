@@ -67,6 +67,13 @@ public sealed class CommandContext
     public bool SemanticUiEnabled { get; internal set; }
 
     /// <summary>
+    /// Inserts text (an <c>[Image N]</c> token) into the live composer draft when interactive, so a staged
+    /// image references its position in the message. Null in non-interactive/plain contexts, in which case
+    /// staged images are auto-included on the next turn (legacy behaviour).
+    /// </summary>
+    public Action<string>? DraftInsertCallback { get; set; }
+
+    /// <summary>
     /// Swap the per-mode presentation environment (console, prompt surface, event publisher, and the
     /// semantic-UI flag) in place, so the shared command graph — the same
     /// <see cref="CommandContext"/>, <c>TuiApp</c>, <c>AgentRunner</c>, and <c>TuiController</c> — is

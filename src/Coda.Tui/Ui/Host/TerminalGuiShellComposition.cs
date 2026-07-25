@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Mcp;
@@ -34,7 +35,9 @@ internal static class TerminalGuiShellComposition
         Func<ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
         IUrlOpener? urlOpener = null,
         IPrivateBrowserResolver? privateBrowserResolver = null,
-        IUiPromptService? linkPromptService = null)
+        IUiPromptService? linkPromptService = null,
+        IClipboardImageReader? imageReader = null,
+        Func<ClipboardImage, string?>? imagePaste = null)
     {
         ArgumentNullException.ThrowIfNull(application);
         ArgumentNullException.ThrowIfNull(composer);
@@ -59,7 +62,9 @@ internal static class TerminalGuiShellComposition
                 toolDisplayMode: toolDisplayMode,
                 urlOpener: urlOpener,
                 privateBrowserResolver: privateBrowserResolver,
-                linkPromptService: linkPromptService)
+                linkPromptService: linkPromptService,
+                imageReader: imageReader,
+                imagePaste: imagePaste)
             : new InlineTuiShell(
                 application,
                 composer,
@@ -73,6 +78,8 @@ internal static class TerminalGuiShellComposition
                 toolDisplayMode: toolDisplayMode,
                 urlOpener: urlOpener,
                 privateBrowserResolver: privateBrowserResolver,
-                linkPromptService: linkPromptService);
+                linkPromptService: linkPromptService,
+                imageReader: imageReader,
+                imagePaste: imagePaste);
     }
 }

@@ -1,4 +1,5 @@
 using System.Collections.Immutable;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
@@ -48,7 +49,9 @@ internal class FullscreenTuiShell(
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
     IUrlOpener? urlOpener = null,
     IPrivateBrowserResolver? privateBrowserResolver = null,
-    IUiPromptService? linkPromptService = null)
+    IUiPromptService? linkPromptService = null,
+    IClipboardImageReader? imageReader = null,
+    Func<ClipboardImage, string?>? imagePaste = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -68,7 +71,9 @@ internal class FullscreenTuiShell(
         toolDisplayMode: toolDisplayMode,
         urlOpener: urlOpener,
         privateBrowserResolver: privateBrowserResolver,
-        linkPromptService: linkPromptService)
+        linkPromptService: linkPromptService,
+        imageReader: imageReader,
+        imagePaste: imagePaste)
 {
     /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
     /// visual line (the chrome adds the two half-block edge rows around it).</summary>

@@ -56,7 +56,9 @@ internal sealed class RetainedShellFixture : IDisposable
         Func<object, bool>? removeTimeout = null,
         Func<bool>? hasActiveWork = null,
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
-        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null)
+        Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
+        Coda.Tui.Clipboard.IClipboardImageReader? imageReader = null,
+        Func<Coda.Tui.Clipboard.ClipboardImage, string?>? imagePaste = null)
     {
         IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -77,7 +79,9 @@ internal sealed class RetainedShellFixture : IDisposable
             addTimeout: addTimeout,
             removeTimeout: removeTimeout,
             transcriptFormatter: transcriptFormatter,
-            taskBrowserProvider: taskBrowserProvider);
+            taskBrowserProvider: taskBrowserProvider,
+            imageReader: imageReader,
+            imagePaste: imagePaste);
         var token = app.Begin(shell);
         app.LayoutAndDraw();
         return new RetainedShellFixture(app, shell, token);
