@@ -1,9 +1,12 @@
 using Coda.Agent;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -28,7 +31,13 @@ internal static class TerminalGuiShellComposition
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> transcriptFormatter,
         Func<TaskBrowserProvider?> taskBrowserProvider,
         Func<McpBrowserProvider?> mcpBrowserProvider,
-        ToolDisplayMode toolDisplayMode)
+        ToolDisplayMode toolDisplayMode,
+        Func<ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
+        IUrlOpener? urlOpener = null,
+        IPrivateBrowserResolver? privateBrowserResolver = null,
+        IUiPromptService? linkPromptService = null,
+        IClipboardImageReader? imageReader = null,
+        Func<ClipboardImage, string?>? imagePaste = null)
     {
         ArgumentNullException.ThrowIfNull(application);
         ArgumentNullException.ThrowIfNull(composer);
@@ -49,7 +58,13 @@ internal static class TerminalGuiShellComposition
                 transcriptFormatter: transcriptFormatter,
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
-                toolDisplayMode: toolDisplayMode)
+                scheduleBrowserProvider: scheduleBrowserProvider,
+                toolDisplayMode: toolDisplayMode,
+                urlOpener: urlOpener,
+                privateBrowserResolver: privateBrowserResolver,
+                linkPromptService: linkPromptService,
+                imageReader: imageReader,
+                imagePaste: imagePaste)
             : new InlineTuiShell(
                 application,
                 composer,
@@ -59,6 +74,12 @@ internal static class TerminalGuiShellComposition
                 transcriptFormatter: transcriptFormatter,
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
-                toolDisplayMode: toolDisplayMode);
+                scheduleBrowserProvider: scheduleBrowserProvider,
+                toolDisplayMode: toolDisplayMode,
+                urlOpener: urlOpener,
+                privateBrowserResolver: privateBrowserResolver,
+                linkPromptService: linkPromptService,
+                imageReader: imageReader,
+                imagePaste: imagePaste);
     }
 }

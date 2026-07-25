@@ -180,7 +180,7 @@ public sealed class PlainOutputRendererTests
     public async Task Tiny_tool_output_is_suppressed_without_affecting_non_tool_events()
     {
         var writer = new StringWriter();
-        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Tiny);
+        var renderer = new PlainOutputRenderer(writer, ToolDisplayMode.Hidden);
 
         await renderer.ApplyEventAsync(new ToolStartedEvent("grep", "{}"), CancellationToken.None);
         await renderer.ApplyEventAsync(new ToolProgressEvent("grep", 1500), CancellationToken.None);

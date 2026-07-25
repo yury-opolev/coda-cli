@@ -26,7 +26,7 @@ internal sealed class VirtualizedTranscriptView : View
     private const int DefaultWidth = 80;
 
     private readonly IApplication app;
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
     private readonly TranscriptLayoutIndex index;
     private readonly TranscriptViewportState viewport = new();
     private readonly HashSet<Guid> expanded = new();
@@ -49,18 +49,33 @@ internal sealed class VirtualizedTranscriptView : View
     private bool attributeCacheTrueColor;
     private bool attributeCacheInitialized;
 
+    // Link attribute memos — cleared alongside roleAttributeCache on theme/driver changes.
+    private TgAttribute? linkAttributeCache;
+    private TgAttribute? linkDeceptiveAttributeCache;
+
     public VirtualizedTranscriptView(
         IApplication app,
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null,
         TuiTheme? theme = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.index = new TranscriptLayoutIndex(
             formatter ?? TranscriptBlockFormatter.Format,
             enableIncrementalAssistant: formatter is null);
         this.CanFocus = true;
         this.MousePositionTracking = true;
+    }
+
+    internal void ApplyTheme(TuiTheme theme)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.roleAttributeCache.Clear();
+        this.annotationAttributeCache.Clear();
+        this.linkAttributeCache = null;
+        this.linkDeceptiveAttributeCache = null;
+        this.attributeCacheInitialized = false;
+        this.SetNeedsDraw();
     }
 
     /// <summary>Whether the viewport is pinned to the newest output.</summary>
@@ -87,6 +102,20 @@ internal sealed class VirtualizedTranscriptView : View
     /// new selection or toggles tool/diff expansion.
     /// </summary>
     internal event Action? CopyRequested;
+
+    /// <summary>
+    /// Raised when a left-click (released without a drag, no active selection) lands on a link span.
+    /// The shell handles the honest/deceptive distinction and opens or confirms before opening.
+    /// A link hit takes precedence over expansion-toggle for the same position.
+    /// </summary>
+    internal event Action<LinkSpan>? LinkActivated;
+
+    /// <summary>
+    /// Raised when a right-click lands on a link span.
+    /// Carries the clicked <see cref="LinkSpan"/> and the Terminal.Gui screen-relative pointer
+    /// position so the shell can anchor the context menu at the pointer.
+    /// </summary>
+    internal event Action<LinkSpan, System.Drawing.Point>? LinkContextMenuRequested;
 
     /// <summary>Rows appended while scrolled away that have not been seen.</summary>
     public int UnseenRows => this.viewport.UnseenRows;
@@ -125,6 +154,10 @@ internal sealed class VirtualizedTranscriptView : View
         this.index.AnchorAt(this.viewport.TopRow);
 
     internal TranscriptFollowMode FollowModeForTest => this.viewport.Mode;
+
+    /// <summary>Counts segments drawn with a Link or LinkDeceptive attribute during <see cref="DrawRow"/>.
+    /// Used by tests to verify link coloring fires at draw time.</summary>
+    internal int LinkDrawCount { get; private set; }
 
     /// <summary>Number of times the transcript was fully rebuilt (initial/reseed/resize).</summary>
     internal int ReplaceAllCount { get; private set; }
@@ -292,6 +325,33 @@ internal sealed class VirtualizedTranscriptView : View
     }
 
     /// <summary>
+    /// Returns the <see cref="LinkSpan"/> at (<paramref name="globalRow"/>, <paramref name="column"/>) if one exists.
+    /// Column is the cell-column within the row (0-based, matches <see cref="TranscriptCellPosition.CellColumn"/>).
+    /// Uses the first span whose [StartColumn, EndColumn) range contains the column.
+    /// </summary>
+    internal bool TryGetLinkAt(int globalRow, int column, out LinkSpan link)
+    {
+        var rows = this.index.GetRows(globalRow, 1);
+        if (rows.Count == 0 || rows[0].IsSeparator || rows[0].Links is not { Count: > 0 } links)
+        {
+            link = default;
+            return false;
+        }
+
+        foreach (var l in links)
+        {
+            if (l.StartColumn <= column && column < l.EndColumn)
+            {
+                link = l;
+                return true;
+            }
+        }
+
+        link = default;
+        return false;
+    }
+
+    /// <summary>
     /// The plain text of the current selection across arbitrary global rows (row breaks preserved), or an
     /// empty string when nothing is selected. Materializes the selected range from the layout index even when
     /// it extends beyond the current viewport, since a copy needs the whole span.
@@ -340,12 +400,11 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>
     /// Paints one row at <paramref name="screenRow"/>. A <see cref="TranscriptRow.FillWidth"/> row first paints
     /// its role background across the whole visible width (the user-message block), then draws its text over it;
-    /// other rows keep the global background. Rows with no selection intersection draw their text once in their
-    /// role color; where the selection covers part (or all) of the row, the text is drawn in three cell-sliced
-    /// segments — role-colored prefix, Warm Ember selection-highlighted middle, role-colored suffix — so the
-    /// highlight is segmented exactly over the selected cells and survives redraw/scroll. Finally, a
-    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute
-    /// near the row's trailing edge; the row text was wrapped to reserve its cells, so it never overlaps.
+    /// other rows keep the global background. The text is segmented at boundary points collected from the active
+    /// selection, link spans, and the callout-prefix boundary — each segment is drawn with the attribute
+    /// determined by priority: selection wins, then link spans (honest or deceptive), then prefix, then row role.
+    /// A trailing <see cref="TranscriptRow.RightText"/> annotation (e.g. sent-time) is drawn over reserved cells
+    /// that the text was wrapped to avoid.
     /// </summary>
     private void DrawRow(TranscriptRow row, int screenRow)
     {
@@ -355,7 +414,6 @@ internal sealed class VirtualizedTranscriptView : View
         if (row.FillWidth && viewWidth > 0)
         {
             // Fill the full visible width with the row's background so the block reads as its own surface.
-            // Selected cells and the text are painted over this fill below; non-user rows never fill.
             this.SetAttribute(rowAttribute);
             this.Move(0, screenRow);
             this.AddStr(new string(' ', viewWidth));
@@ -364,8 +422,12 @@ internal sealed class VirtualizedTranscriptView : View
 
         var rowWidth = TerminalCellText.Width(row.Text);
         var range = row.IsSeparator ? null : this.selection.RangeForRow(row.GlobalRow, rowWidth);
-        if (range is null)
+        var hasLinks = row.Links is { Count: > 0 };
+        var hasPrefix = row.PrefixCells > 0;
+
+        if (range is null && !hasLinks && !hasPrefix)
         {
+            // Fast path: no segmentation needed — single attribute covers the whole row.
             this.SetAttribute(rowAttribute);
             this.Move(0, screenRow);
             this.AddStr(row.Text);
@@ -373,38 +435,95 @@ internal sealed class VirtualizedTranscriptView : View
         else
         {
             var useTrueColor = TuiTheme.SupportsTrueColor(this.app.Driver);
-            var selectedAttribute = new TgAttribute(
-                TuiTheme.Resolve(this.theme.SelectionText, useTrueColor),
-                TuiTheme.Resolve(this.theme.SelectionBackground, useTrueColor));
 
-            // Snap the selection range out to whole grapheme boundaries first: a wide glyph (CJK/emoji) whose
-            // trailing cell the selection starts or ends on must not straddle a segment boundary, or it would be
-            // sliced into two adjacent segments and drawn twice. Snapping makes the prefix/selected/suffix
-            // slices partition the row's graphemes exactly once.
-            var (selectStart, selectEnd) = TerminalCellText.SnapRangeToGraphemes(
-                row.Text,
-                range.Value.StartCell,
-                range.Value.EndCellExclusive);
-            var prefix = TerminalCellText.SliceByCells(row.Text, 0, selectStart);
-            var selected = TerminalCellText.SliceByCells(row.Text, selectStart, selectEnd);
-            var suffix = TerminalCellText.SliceByCells(row.Text, selectEnd, rowWidth);
-
-            this.SetAttribute(rowAttribute);
-            this.Move(0, screenRow);
-            this.AddStr(prefix);
-            var column = TerminalCellText.Width(prefix);
-            if (selected.Length > 0)
+            // Selection boundary points (selection wins over everything else).
+            var selectedAttribute = default(TgAttribute);
+            var selectStart = 0;
+            var selectEnd = 0;
+            if (range is not null)
             {
-                this.SetAttribute(selectedAttribute);
-                this.Move(column, screenRow);
-                this.AddStr(selected);
-                column += TerminalCellText.Width(selected);
-                this.SelectionDrawCount++;
+                selectedAttribute = new TgAttribute(
+                    TuiTheme.Resolve(this.theme.SelectionText, useTrueColor),
+                    TuiTheme.Resolve(this.theme.SelectionBackground, useTrueColor));
+                (selectStart, selectEnd) = TerminalCellText.SnapRangeToGraphemes(
+                    row.Text, range.Value.StartCell, range.Value.EndCellExclusive);
             }
 
-            this.SetAttribute(rowAttribute);
-            this.Move(column, screenRow);
-            this.AddStr(suffix);
+            // Prefix boundary (callout bar color covers [0, prefixEnd)).
+            var prefixEnd = 0;
+            var prefixAttribute = default(TgAttribute);
+            if (hasPrefix)
+            {
+                (_, prefixEnd) = TerminalCellText.SnapRangeToGraphemes(row.Text, 0, row.PrefixCells);
+                prefixAttribute = this.AttributeFor(row.PrefixRole);
+            }
+
+            // Collect all boundary points and sort them; duplicates collapse to zero-width segments (skipped below).
+            var bps = new List<int>(8 + (hasLinks ? row.Links!.Count * 2 : 0)) { 0, rowWidth };
+            if (range is not null) { bps.Add(selectStart); bps.Add(selectEnd); }
+            if (hasPrefix) { bps.Add(prefixEnd); }
+            if (hasLinks)
+            {
+                foreach (var link in row.Links!)
+                {
+                    bps.Add(link.StartColumn);
+                    bps.Add(link.EndColumn);
+                }
+            }
+
+            bps.Sort();
+
+            var column = 0;
+            var selectionDrawn = false;
+            for (var i = 0; i + 1 < bps.Count; i++)
+            {
+                var segStart = bps[i];
+                var segEnd = bps[i + 1];
+                if (segStart >= segEnd)
+                {
+                    continue;
+                }
+
+                var segText = TerminalCellText.SliceByCells(row.Text, segStart, segEnd);
+                if (segText.Length == 0)
+                {
+                    continue;
+                }
+
+                TgAttribute segAttr;
+                if (range is not null && segStart >= selectStart && segEnd <= selectEnd)
+                {
+                    // Priority 1: selection.
+                    segAttr = selectedAttribute;
+                    selectionDrawn = true;
+                }
+                else if (hasLinks && this.TryGetLinkAttribute(row.Links!, segStart, segEnd, useTrueColor, out var linkAttr))
+                {
+                    // Priority 2: link span (honest or deceptive).
+                    segAttr = linkAttr;
+                    this.LinkDrawCount++;
+                }
+                else if (hasPrefix && segStart < prefixEnd)
+                {
+                    // Priority 3: callout prefix bar.
+                    segAttr = prefixAttribute;
+                }
+                else
+                {
+                    // Priority 4: normal row role color.
+                    segAttr = rowAttribute;
+                }
+
+                this.SetAttribute(segAttr);
+                this.Move(column, screenRow);
+                this.AddStr(segText);
+                column += TerminalCellText.Width(segText);
+            }
+
+            if (selectionDrawn)
+            {
+                this.SelectionDrawCount++;
+            }
         }
 
         if (row.RightText is { Length: > 0 } annotation && viewWidth > 0)
@@ -420,6 +539,30 @@ internal sealed class VirtualizedTranscriptView : View
                 this.LastRightAnnotationEndColumnForTest = column + annotationWidth - 1;
             }
         }
+    }
+
+    /// <summary>
+    /// Searches <paramref name="links"/> for a span that fully contains the segment [<paramref name="segStart"/>,
+    /// <paramref name="segEnd"/>). Returns <see langword="true"/> and sets <paramref name="attr"/> when found.
+    /// </summary>
+    private bool TryGetLinkAttribute(
+        IReadOnlyList<LinkSpan> links,
+        int segStart,
+        int segEnd,
+        bool useTrueColor,
+        out TgAttribute attr)
+    {
+        foreach (var link in links)
+        {
+            if (segStart >= link.StartColumn && segEnd <= link.EndColumn)
+            {
+                attr = this.LinkAttributeFor(!link.TextMatchesUrl, useTrueColor);
+                return true;
+            }
+        }
+
+        attr = default;
+        return false;
     }
 
     /// <inheritdoc />
@@ -447,7 +590,15 @@ internal sealed class VirtualizedTranscriptView : View
                 !mouse.Flags.HasFlag(MouseFlags.Shift) &&
                 !this.selection.HasSelection)
             {
-                this.ToggleExpansionAt(position.GlobalRow);
+                // A link hit takes precedence over the expansion-toggle for the same position.
+                if (this.TryGetLinkAt(position.GlobalRow, position.CellColumn, out var link))
+                {
+                    this.LinkActivated?.Invoke(link);
+                }
+                else
+                {
+                    this.ToggleExpansionAt(position.GlobalRow);
+                }
             }
 
             return true;
@@ -544,6 +695,20 @@ internal sealed class VirtualizedTranscriptView : View
             }
 
             return true;
+        }
+
+        // Right-click on a link span opens the context menu anchored at the pointer.
+        if (mouse.Flags.HasFlag(MouseFlags.RightButtonClicked) &&
+            !mouse.Flags.HasFlag(MouseFlags.PositionReport))
+        {
+            var position = this.ToTranscriptPosition(mouse);
+            if (this.TryGetLinkAt(position.GlobalRow, position.CellColumn, out var link))
+            {
+                this.LinkContextMenuRequested?.Invoke(link, mouse.ScreenPosition);
+                return true;
+            }
+
+            return false;
         }
 
         return false;
@@ -803,6 +968,7 @@ internal sealed class VirtualizedTranscriptView : View
         var foreground = role switch
         {
             TranscriptRole.User => this.theme.TranscriptUser,
+            TranscriptRole.PendingUser => this.theme.PendingUser,
             TranscriptRole.Heading => this.theme.Heading,
             TranscriptRole.Code => this.theme.Code,
             TranscriptRole.Tool => this.theme.TranscriptTool,
@@ -818,12 +984,19 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.ContextMessages => this.theme.ContextMessages,
             TranscriptRole.ContextAutocompactBuffer => this.theme.ContextAutocompactBuffer,
             TranscriptRole.ContextFreeSpace => this.theme.ContextFreeSpace,
+            TranscriptRole.CalloutNote => this.theme.CalloutNote,
+            TranscriptRole.CalloutTip => this.theme.CalloutTip,
+            TranscriptRole.CalloutImportant => this.theme.CalloutImportant,
+            TranscriptRole.CalloutWarning => this.theme.CalloutWarning,
+            TranscriptRole.CalloutCaution => this.theme.CalloutCaution,
             _ => this.theme.TranscriptAssistant,
         };
 
-        // User message rows sit on a subtly different full-width background block; every other role keeps the
-        // global shell background so non-user rows are unchanged.
-        var background = role == TranscriptRole.User ? this.theme.TranscriptUserBackground : this.theme.Background;
+        // User and pending-user message rows sit on a subtly different full-width background block; every
+        // other role keeps the global shell background so non-user rows are unchanged.
+        var background = role is TranscriptRole.User or TranscriptRole.PendingUser
+            ? this.theme.TranscriptUserBackground
+            : this.theme.Background;
         return new TgAttribute(
             TuiTheme.Resolve(foreground, useTrueColor),
             TuiTheme.Resolve(background, useTrueColor));
@@ -858,6 +1031,50 @@ internal sealed class VirtualizedTranscriptView : View
             TuiTheme.Resolve(background, useTrueColor));
     }
 
+    /// <summary>
+    /// Returns the resolved attribute for an honest link (<paramref name="deceptive"/>=false)
+    /// or a deceptive link (<paramref name="deceptive"/>=true), using the driver's true-color support
+    /// unless overridden by the optional <paramref name="trueColor"/> flag (used by tests).
+    /// </summary>
+    internal TgAttribute LinkAttributeFor(bool deceptive, bool? trueColor = null)
+    {
+        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
+        if (deceptive)
+        {
+            if (this.linkDeceptiveAttributeCache is null || trueColor.HasValue)
+            {
+                var attr = new TgAttribute(
+                    TuiTheme.Resolve(this.theme.LinkDeceptive, useTrueColor),
+                    TuiTheme.Resolve(this.theme.Background, useTrueColor));
+                if (!trueColor.HasValue)
+                {
+                    this.linkDeceptiveAttributeCache = attr;
+                }
+
+                return attr;
+            }
+
+            return this.linkDeceptiveAttributeCache.Value;
+        }
+        else
+        {
+            if (this.linkAttributeCache is null || trueColor.HasValue)
+            {
+                var attr = new TgAttribute(
+                    TuiTheme.Resolve(this.theme.Link, useTrueColor),
+                    TuiTheme.Resolve(this.theme.Background, useTrueColor));
+                if (!trueColor.HasValue)
+                {
+                    this.linkAttributeCache = attr;
+                }
+
+                return attr;
+            }
+
+            return this.linkAttributeCache.Value;
+        }
+    }
+
     /// <summary>Drops the memoized attributes when the driver's true-color capability changes (or on first
     /// use), so a driver swap can never serve a stale palette.</summary>
     private void EnsureAttributeCacheFresh(bool useTrueColor)
@@ -869,6 +1086,8 @@ internal sealed class VirtualizedTranscriptView : View
 
         this.roleAttributeCache.Clear();
         this.annotationAttributeCache.Clear();
+        this.linkAttributeCache = null;
+        this.linkDeceptiveAttributeCache = null;
         this.attributeCacheTrueColor = useTrueColor;
         this.attributeCacheInitialized = true;
     }

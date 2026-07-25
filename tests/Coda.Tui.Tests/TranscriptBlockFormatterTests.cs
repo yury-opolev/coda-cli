@@ -138,12 +138,12 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
-    public void Tiny_tool_block_is_hidden_without_mutating_the_block()
+    public void Hidden_tool_block_is_hidden_without_mutating_the_block()
     {
         var block = new ToolTranscriptBlock(
             Guid.NewGuid(), "grep", "{\"pattern\":\"x\"}", 12, "result", IsError: false, Complete: true);
 
-        var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Tiny);
+        var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Hidden);
 
         Assert.Empty(lines);
         Assert.Equal("{\"pattern\":\"x\"}", block.InputJson);
@@ -562,9 +562,9 @@ public sealed class TranscriptBlockFormatterTests
             Call("run_command", """{"command":"echo \u001b[31mhello"}""", ToolCallStatus.Running, result: "line one\nline two"),
             Call("write_file", """{"path":"x"}""", ToolCallStatus.Failed, error: "\u001b[2Jdenied"));
 
-        var verbose = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Verbose);
+        var verbose = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Full);
         var compact = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Compact);
-        var tiny = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Tiny);
+        var tiny = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Hidden);
         var legacy = new ToolTranscriptBlock(
             Guid.NewGuid(), "grep", "{}", 1, "legacy result", IsError: false, Complete: true);
 
@@ -576,12 +576,12 @@ public sealed class TranscriptBlockFormatterTests
         Assert.DoesNotContain(compact, line => line.Text.Contains("line one", StringComparison.Ordinal));
         Assert.Empty(tiny);
         Assert.Contains(
-            TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Verbose),
+            TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Full),
             line => line.Text == "legacy result");
         Assert.Equal(
             "grep {} [success]",
             Assert.Single(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Compact)).Text);
-        Assert.Empty(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Tiny));
+        Assert.Empty(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Hidden));
     }
 
     [Fact]
@@ -593,6 +593,65 @@ public sealed class TranscriptBlockFormatterTests
         Assert.Equal(ToolDisplayMode.Summary, summary.Mode);
         Assert.True(summary.IsValid);
         Assert.Equal(ToolDisplayMode.Summary, fallback.Mode);
+    }
+
+    [Fact]
+    public void Pending_user_block_prefixes_first_wrapped_line_with_pending_marker()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "queued message", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        var line = Assert.Single(lines);
+        Assert.StartsWith("[pending] ", line.Text, StringComparison.Ordinal);
+        Assert.Contains("queued message", line.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Pending_user_block_all_lines_use_pending_user_role_and_fill_width()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "queued message", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.All(lines, line => Assert.Equal(TranscriptRole.PendingUser, line.Role));
+        Assert.All(lines, line => Assert.True(line.FillWidth));
+    }
+
+    [Fact]
+    public void Pending_user_block_has_no_right_annotation()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "queued", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.All(lines, line => Assert.Null(line.RightText));
+    }
+
+    [Fact]
+    public void Pending_user_multiline_message_has_marker_only_on_first_line()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "first line\nsecond line\nthird line", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.True(lines.Count >= 3, "multi-line message must produce at least three lines");
+        Assert.StartsWith("[pending] ", lines[0].Text, StringComparison.Ordinal);
+        Assert.All(lines.Skip(1), line => Assert.False(line.Text.StartsWith("[pending]", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void Delivered_user_block_renders_with_user_role_unchanged()
+    {
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "sent message");
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        var line = Assert.Single(lines);
+        Assert.Equal(TranscriptRole.User, line.Role);
+        Assert.Equal("sent message", line.Text);
+        Assert.True(line.FillWidth);
+        Assert.DoesNotContain("[pending]", line.Text, StringComparison.Ordinal);
     }
 
     private static void AssertContentInOrder(

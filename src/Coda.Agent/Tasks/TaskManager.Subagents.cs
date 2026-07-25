@@ -353,6 +353,12 @@ public sealed partial class TaskManager
             _parent.OnError(message);
         }
 
+        // Reasoning deltas: forwarded so the parent UI can render thinking blocks from subagents,
+        // but kept out of the ring/log to avoid flooding the readable task output with raw reasoning.
+        public void OnThinking(string delta) => _parent.OnThinking(delta);
+
+        public void OnThinkingComplete(int? thinkingTokens = null) => _parent.OnThinkingComplete();
+
         // A recoverable per-turn limit — a meaningful milestone, so it earns a ring marker.
         public void OnLimitReached(string kind, string message)
         {

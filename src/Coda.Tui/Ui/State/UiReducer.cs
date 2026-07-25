@@ -31,6 +31,9 @@ public static class UiReducer
         AssistantTextDeltaEvent e => AppendOrExtendAssistant(state, e.Delta),
         AssistantTextCompletedEvent => CompleteAssistant(state),
 
+        ThinkingDeltaEvent e => AppendOrExtendThinking(state, e.Delta, e.BurstStartedAt),
+        ThinkingCompleteEvent e => CompleteThinking(state, e.ElapsedMs, e.ThinkingTokens),
+
         ToolQueuedEvent e => ReduceActivity(
             state,
             e.Identity,
@@ -134,21 +137,8 @@ public static class UiReducer
         },
 
         TurnStartedEvent e => state with { ActiveOperation = new ActiveOperation("turn", e.Prompt, null) },
-        TurnCompletedEvent e => e.Success
-            ? RemoveAllPendingSteering(state) with { ActiveOperation = null }
-            : state with
-            {
-                ActiveOperation = null,
-                Notification = new UiNotification("Turn failed", UiNotificationLevel.Error),
-                Transcript = RemoveAllPendingSteering(state).Transcript,
-            },
-        TurnInterruptedEvent => state with
-        {
-            ActiveOperation = null,
-            Notification = new UiNotification("Turn interrupted", UiNotificationLevel.Warning),
-            PendingPrompt = null,
-            Transcript = RemoveAllPendingSteering(state).Transcript,
-        },
+        TurnCompletedEvent e => HandleTurnCompleted(state, e.Success),
+        TurnInterruptedEvent => HandleTurnInterrupted(state),
 
         UiPromptRequestedEvent e => state with { PendingPrompt = e.Request },
         UiPromptResponseSubmittedEvent e => state.PendingPrompt?.Id == e.RequestId
@@ -359,6 +349,50 @@ public static class UiReducer
         return state with { Transcript = state.Transcript.SetItem(index, existing with { Complete = true }) };
     }
 
+    private static UiSessionSnapshot AppendOrExtendThinking(
+        UiSessionSnapshot state,
+        string delta,
+        DateTimeOffset burstStartedAt)
+    {
+        var index = LastIndex(state.Transcript, b => b is ThinkingTranscriptBlock { Complete: false });
+        if (index < 0)
+        {
+            // First delta of a new burst: create the block.
+            return Append(
+                state,
+                new ThinkingTranscriptBlock(
+                    Guid.NewGuid(),
+                    delta,
+                    Complete: false,
+                    StartedAt: burstStartedAt,
+                    ElapsedMs: null,
+                    ThinkingTokens: null));
+        }
+
+        var existing = (ThinkingTranscriptBlock)state.Transcript[index];
+        return state with
+        {
+            Transcript = state.Transcript.SetItem(index, existing with { Text = existing.Text + delta }),
+        };
+    }
+
+    private static UiSessionSnapshot CompleteThinking(UiSessionSnapshot state, long elapsedMs, int? thinkingTokens)
+    {
+        var index = LastIndex(state.Transcript, b => b is ThinkingTranscriptBlock { Complete: false });
+        if (index < 0)
+        {
+            return state;
+        }
+
+        var existing = (ThinkingTranscriptBlock)state.Transcript[index];
+        return state with
+        {
+            Transcript = state.Transcript.SetItem(
+                index,
+                existing with { Complete = true, ElapsedMs = elapsedMs, ThinkingTokens = thinkingTokens }),
+        };
+    }
+
     private static UiSessionSnapshot UpdateActiveTool(
         UiSessionSnapshot state,
         string toolName,
@@ -422,8 +456,56 @@ public static class UiReducer
         return state with { Transcript = state.Transcript.SetItem(index, existing with { Answer = answer }) };
     }
 
-    private static int LastIndex(ImmutableArray<TranscriptBlock> transcript, Func<TranscriptBlock, bool> predicate)
+    private static UiSessionSnapshot HandleTurnCompleted(UiSessionSnapshot state, bool success)
     {
+        var finalized = FinalizeOpenThinking(state);
+        return success
+            ? RemoveAllPendingSteering(finalized) with { ActiveOperation = null }
+            : finalized with
+            {
+                ActiveOperation = null,
+                Notification = new UiNotification("Turn failed", UiNotificationLevel.Error),
+                Transcript = RemoveAllPendingSteering(finalized).Transcript,
+            };
+    }
+
+    private static UiSessionSnapshot HandleTurnInterrupted(UiSessionSnapshot state)
+    {
+        var finalized = FinalizeOpenThinking(state);
+        return finalized with
+        {
+            ActiveOperation = null,
+            Notification = new UiNotification("Turn interrupted", UiNotificationLevel.Warning),
+            PendingPrompt = null,
+            Transcript = RemoveAllPendingSteering(finalized).Transcript,
+        };
+    }
+
+    /// <summary>
+    /// Finds the last open (incomplete) <see cref="ThinkingTranscriptBlock"/> and seals it with a
+    /// wall-clock elapsed computed from <see cref="ThinkingTranscriptBlock.StartedAt"/>. Called on
+    /// turn completion and interruption so a burst never stays open indefinitely if the provider
+    /// stream ends or is cancelled before emitting its closing event. Safe no-op when absent.
+    /// </summary>
+    private static UiSessionSnapshot FinalizeOpenThinking(UiSessionSnapshot state)
+    {
+        var index = LastIndex(state.Transcript, b => b is ThinkingTranscriptBlock { Complete: false });
+        if (index < 0)
+        {
+            return state;
+        }
+
+        var existing = (ThinkingTranscriptBlock)state.Transcript[index];
+        var elapsedMs = (long)Math.Max(
+            0,
+            (DateTimeOffset.UtcNow - existing.StartedAt.ToUniversalTime()).TotalMilliseconds);
+        return state with
+        {
+            Transcript = state.Transcript.SetItem(index, existing with { Complete = true, ElapsedMs = elapsedMs }),
+        };
+    }
+
+    private static int LastIndex(ImmutableArray<TranscriptBlock> transcript, Func<TranscriptBlock, bool> predicate)    {
         for (var i = transcript.Length - 1; i >= 0; i--)
         {
             if (predicate(transcript[i]))

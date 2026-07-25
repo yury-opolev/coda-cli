@@ -1,9 +1,11 @@
 using System.Text;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Agent;
 using Coda.Tui.Ui.Mcp;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -43,6 +45,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Func<object, bool> removeTimeout;
     private readonly Func<string, bool> clipboardWriter;
     private readonly Func<ClipboardReadResult> clipboardReader;
+    private readonly IClipboardImageReader? imageReader;
+    private readonly Func<ClipboardImage, string?>? imagePaste;
     private object? chordTimeout;
     private object? transientOperationalTimeout;
     private object? composerLayoutTimeout;
@@ -56,7 +60,16 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly TaskBrowserOverlay? taskOverlay;
     private readonly McpBrowserController? mcpController;
     private readonly McpBrowserOverlay? mcpOverlay;
+    private readonly Coda.Tui.Ui.Schedule.ScheduleBrowserController? scheduleController;
+    private readonly Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay? scheduleOverlay;
+    private readonly bool followsRegistryTheme;
     private bool disposed;
+
+    // Link-interaction seams
+    private readonly IUrlOpener urlOpener;
+    private readonly IPrivateBrowserResolver? privateBrowserResolver;
+    private readonly IUiPromptService? linkPromptService;
+    private PopoverMenu? transcriptLinkMenu;
 
     /// <summary>
     /// The exact set of sub-views this shell adds in <see cref="BuildLayout"/>. Any sub-view outside this
@@ -81,7 +94,13 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<UiSessionSnapshot, int, string>? statusProjection = null,
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
         Func<McpBrowserProvider?>? mcpBrowserProvider = null,
-        ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
+        Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
+        ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
+        IUrlOpener? urlOpener = null,
+        IPrivateBrowserResolver? privateBrowserResolver = null,
+        IUiPromptService? linkPromptService = null,
+        IClipboardImageReader? imageReader = null,
+        Func<ClipboardImage, string?>? imagePaste = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -94,7 +113,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.clipboardWriter = clipboardWriter ??
             (text => this.app.Clipboard?.TrySetClipboardData(text) == true);
         this.clipboardReader = clipboardReader ?? this.ReadApplicationClipboard;
-        this.Theme = theme ?? TuiTheme.WarmEmber;
+        this.imageReader = imageReader;
+        this.imagePaste = imagePaste;
+        this.Theme = theme ?? CodaThemes.Current.Tui;
+        this.followsRegistryTheme = theme is null;
+        this.urlOpener = urlOpener ?? DefaultUrlOpener.Instance;
+        this.privateBrowserResolver = privateBrowserResolver;
+        this.linkPromptService = linkPromptService;
+        if (this.followsRegistryTheme)
+        {
+            CodaThemes.Changed += this.OnThemeChanged;
+        }
 
         // The chord clock and the timeout seams drive the deterministic Esc/Ctrl+C chords: the same
         // add/remove-timeout delegates the operational row uses (defaulting to the application's own timer)
@@ -108,7 +137,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Operational = new OperationalStatusView(app, this.Theme, addTimeout, removeTimeout);
         this.Status = new Label { CanFocus = false };
         this.PromptOverlay = new PromptOverlay(publisher, this.Theme);
-        this.PromptOverlay.ApplyTheme(app.Driver);
+        this.PromptOverlay.ApplyTheme(this.Theme, app.Driver);
         this.Completion = new CommandCompletionView(this.Theme);
 
         // Build the browser controller + hidden overlay before BuildLayout so the concrete shell can add the
@@ -124,6 +153,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         {
             this.mcpController = new McpBrowserController(mcpBrowserProvider);
             this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged);
+        }
+
+        if (scheduleBrowserProvider is not null)
+        {
+            this.scheduleController = new Coda.Tui.Ui.Schedule.ScheduleBrowserController(
+                () => scheduleBrowserProvider()?.Control?.Invoke(),
+                linkPromptService ?? PlainUiPromptService.Instance);
+            this.scheduleOverlay = new Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay(
+                this.app, this.scheduleController, this.Theme, this.OnScheduleBrowserChanged);
         }
 
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
@@ -178,8 +216,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The one-line stable-metadata label pinned to the shell's final row.</summary>
     internal Label Status { get; }
 
-    /// <summary>The Warm Ember theme shared by every view this shell constructs.</summary>
-    protected TuiTheme Theme { get; }
+    /// <summary>The theme shared by every view this shell constructs.</summary>
+    protected TuiTheme Theme { get; private set; }
 
     /// <summary>The clock used for the deterministic interrupt/exit chord windows.</summary>
     protected TimeProvider TimeSource { get; }
@@ -205,6 +243,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
     /// <summary>The MCP browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
     internal McpBrowserController? McpController => this.mcpController;
+
+    /// <summary>The hosted <c>/schedule</c> browser overlay, or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay? ScheduleOverlay => this.scheduleOverlay;
+
+    /// <summary>The schedule browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Schedule.ScheduleBrowserController? ScheduleController => this.scheduleController;
 
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
@@ -252,6 +296,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.ClearTransientOperationalOverride();
         this.taskOverlay?.Hide();
         this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
         this.RequestedExit = outcome;
         this.app.RequestStop();
     }
@@ -356,6 +401,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown += this.HandleUnhandledShellKey;
         transcript.CopyRequested += this.HandleTranscriptCopyRequested;
+        transcript.LinkActivated += this.HandleTranscriptLinkActivated;
+        transcript.LinkContextMenuRequested += this.HandleTranscriptLinkContextMenuRequested;
     }
 
     /// <summary>Unsubscribes a transcript previously bound with <see cref="BindTranscriptInput"/>.</summary>
@@ -364,6 +411,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown -= this.HandleUnhandledShellKey;
         transcript.CopyRequested -= this.HandleTranscriptCopyRequested;
+        transcript.LinkActivated -= this.HandleTranscriptLinkActivated;
+        transcript.LinkContextMenuRequested -= this.HandleTranscriptLinkContextMenuRequested;
     }
 
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
@@ -381,6 +430,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// internal scroll. Concrete shells recalculate their bottom-anchored geometry here.
     /// </summary>
     protected abstract void OnComposerLayoutInvalidated();
+
+    protected virtual void RebuildThemeSchemes()
+    {
+        this.TranscriptView.ApplyTheme(this.Theme);
+        this.Chrome.ApplyTheme(this.Theme);
+        this.Operational.ApplyTheme(this.Theme);
+        this.Completion.ApplyTheme(this.Theme);
+        this.PromptOverlay.ApplyTheme(this.Theme, this.HostApp.Driver);
+        this.TaskOverlay?.ApplyTheme(this.Theme);
+        this.McpOverlay?.ApplyTheme(this.Theme);
+        this.scheduleOverlay?.ApplyTheme(this.Theme);
+    }
 
     protected override void Dispose(bool disposing)
     {
@@ -403,12 +464,21 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
             this.Composer.LayoutInvalidated -= this.OnComposerLayoutInvalidatedHandler;
             this.Initialized -= this.OnShellInitialized;
+            if (this.followsRegistryTheme)
+            {
+                CodaThemes.Changed -= this.OnThemeChanged;
+            }
+
+            // Deregister the transcript link context menu if one was shown. Do this before
+            // base.Dispose so the app's Popovers are still accessible.
+            this.CleanupTranscriptLinkMenu();
 
             // Hide() cancels the pump, unsubscribes Changed, releases any pause lease (resuming the main
             // agent), and closes the controller — so a mode switch or shutdown never leaves the agent paused.
             // The overlay View itself is disposed by base.Dispose below.
             this.taskOverlay?.Hide();
             this.mcpOverlay?.Hide();
+            this.scheduleOverlay?.Hide();
         }
 
         base.Dispose(disposing);
@@ -557,14 +627,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.PromptOverlay.Visible || this.HasVisibleBrowserOverlay();
 
     private bool HasVisibleBrowserOverlay() =>
-        this.taskOverlay?.Visible == true || this.mcpOverlay?.Visible == true;
+        this.taskOverlay?.Visible == true ||
+        this.mcpOverlay?.Visible == true ||
+        this.scheduleOverlay?.Visible == true;
 
     private View? VisibleBrowserOverlay() =>
-        this.mcpOverlay?.Visible == true
-            ? this.mcpOverlay
-            : this.taskOverlay?.Visible == true
-                ? this.taskOverlay
-                : null;
+        this.scheduleOverlay?.Visible == true
+            ? this.scheduleOverlay
+            : this.mcpOverlay?.Visible == true
+                ? this.mcpOverlay
+                : this.taskOverlay?.Visible == true
+                    ? this.taskOverlay
+                    : null;
 
     private bool TryHandleTranscriptNavigationKey(Key key)
     {
@@ -679,6 +753,33 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// </summary>
     private void PasteComposerClipboard()
     {
+        // Prefer an image on the clipboard over text: read it through the injected reader, stage+validate it
+        // via the imagePaste callback, and insert its [Image N] token at the caret. A missing image falls
+        // through to the text-paste path; a present-but-rejected image pins a warning without pasting text.
+        if (this.imageReader is not null && this.imagePaste is not null)
+        {
+            var image = this.imageReader.TryRead();
+            if (image is not null)
+            {
+                var token = this.imagePaste(image);
+                if (token is not null)
+                {
+                    this.Composer.NewPasteEvent(token + " ");
+                    var kb = image.ByteLength / 1024.0;
+                    var mime = image.MediaType.Split('/').LastOrDefault()?.ToUpperInvariant() ?? image.MediaType;
+                    this.ShowTransientOperationalStatus(
+                        new OperationalStatus($"🖼 image attached · {mime} {kb:F0} KB", OperationalTone.Ready, false),
+                        TimeSpan.FromSeconds(1.5));
+                    return;
+                }
+
+                this.ShowTransientOperationalStatus(
+                    new OperationalStatus("Image not attached: unsupported type or too large", OperationalTone.Warning, false),
+                    TimeSpan.FromSeconds(1.5));
+                return;
+            }
+        }
+
         var result = this.clipboardReader();
         if (!result.Available)
         {
@@ -759,6 +860,230 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// same copy path as Ctrl+C.
     /// </summary>
     private void HandleTranscriptCopyRequested() => this.CopyTranscriptSelection();
+
+    // -----------------------------------------------------------------------
+    // Link activation (left-click) and context menu (right-click)
+    // -----------------------------------------------------------------------
+
+    /// <summary>Exposed for tests: the PopoverMenu shown on the last right-click link.</summary>
+    internal PopoverMenu? TranscriptLinkMenuForTest => this.transcriptLinkMenu;
+
+    /// <summary>Exposed for tests: the MenuItem list passed to the last transcript link context menu.</summary>
+    internal IReadOnlyList<MenuItem>? TranscriptLinkMenuItemsForTest { get; private set; }
+
+    /// <summary>
+    /// Handles a left-click on a link span. Honest links open immediately; deceptive links prompt
+    /// for confirmation through <see cref="linkPromptService"/> (if wired) then open on confirm.
+    /// URLs with non-empty <see cref="Uri.UserInfo"/> are always treated as deceptive regardless of
+    /// <see cref="LinkSpan.TextMatchesUrl"/>, because userinfo is a classic spoofing vector.
+    /// </summary>
+    private void HandleTranscriptLinkActivated(LinkSpan link)
+    {
+        if (link.TextMatchesUrl && !HasUserInfo(link.Url))
+        {
+            this.OpenLinkUrl(link.Url);
+        }
+        else
+        {
+            // Fire-and-forget: the prompt is async (routes through the actor mailbox), and the
+            // open happens back on the UI thread via app.Invoke when the user confirms.
+            _ = this.ConfirmAndOpenLinkAsync(link.Url);
+        }
+    }
+
+    /// <summary>
+    /// Shows a confirmation prompt for a deceptive link (whose visible text differs from its
+    /// destination URL), then opens the URL only when the user confirms.
+    /// </summary>
+    private async Task ConfirmAndOpenLinkAsync(string url)
+    {
+        try
+        {
+            if (this.linkPromptService is null)
+            {
+                this.ShowTransientOperationalStatus(
+                    new OperationalStatus("Cannot open: link confirmation unavailable", OperationalTone.Warning, false),
+                    TimeSpan.FromSeconds(3));
+                return;
+            }
+
+            var displayUrl = FormatUrlForDisplay(url);
+            var request = UiPromptRequest.Confirm($"Open: {displayUrl}", defaultValue: false);
+
+            UiPromptResponse response;
+            try
+            {
+                response = await this.linkPromptService.RequestAsync(request).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (!response.Cancelled && response.SelectedIds.Contains("yes"))
+            {
+                this.app.Invoke(() => this.OpenLinkUrl(url));
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            try
+            {
+                this.app.Invoke(() =>
+                    this.ShowTransientOperationalStatus(
+                        new OperationalStatus("Failed to open link", OperationalTone.Warning, false),
+                        TimeSpan.FromSeconds(3)));
+            }
+            catch
+            {
+                // Swallow: the app may already be disposed during teardown.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handles a right-click on a link span by building and showing a small PopoverMenu
+    /// anchored at the pointer. The menu contains a disabled URL header, Copy link, Open,
+    /// and optionally Open in private window (when <see cref="privateBrowserResolver"/> resolves
+    /// a private-capable browser).
+    /// </summary>
+    private void HandleTranscriptLinkContextMenuRequested(LinkSpan link, System.Drawing.Point screenPosition)
+    {
+        // Deregister any old menu so we never accumulate stale popovers.
+        this.CleanupTranscriptLinkMenu();
+
+        var urlDisplay = FormatUrlForDisplay(link.Url);
+
+        // Build the menu items.
+        var items = new List<MenuItem>
+        {
+            // Disabled header showing the real destination URL.
+            new MenuItem(urlDisplay, "", static () => { }, Key.Empty) { Enabled = false },
+            // Copy link — writes the URL through the clipboard writer.
+            new MenuItem("Copy link", "", () => this.CopyLinkUrl(link.Url), Key.Empty),
+            // Open — validates http/https and launches default browser; the header already shows the
+            // true URL so no extra deceptive confirmation is shown here.
+            new MenuItem("Open", "", () => this.OpenLinkUrl(link.Url), Key.Empty),
+        };
+
+        // Open in private window — only when a private-capable browser is resolved.
+        var privateBrowser = this.privateBrowserResolver?.Resolve();
+        if (privateBrowser is not null)
+        {
+            var browser = privateBrowser;
+            items.Add(new MenuItem("Open in private window", "", () => this.OpenLinkPrivate(link.Url, browser), Key.Empty));
+        }
+
+        var itemList = items.AsReadOnly();
+        this.TranscriptLinkMenuItemsForTest = itemList;
+        var menu = new PopoverMenu(items);
+        this.app.Popovers?.Register(menu);
+        this.transcriptLinkMenu = menu;
+        menu.MakeVisible(screenPosition);
+    }
+
+    /// <summary>
+    /// Opens <paramref name="url"/> in the OS default browser after http/https validation.
+    /// Shows a transient error status when the URL is invalid or the launch fails.
+    /// </summary>
+    private void OpenLinkUrl(string url)
+    {
+        if (!this.urlOpener.TryOpen(url, out var error))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(error ?? "Failed to open link", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(2));
+        }
+    }
+
+    /// <summary>
+    /// Opens <paramref name="url"/> in a private browser window. The URL is passed as a separate
+    /// process argument (no shell interpolation). Shows a transient error on failure.
+    /// </summary>
+    private void OpenLinkPrivate(string url, PrivateBrowserInfo browser)
+    {
+        if (!this.urlOpener.TryOpenPrivate(url, browser, out var error))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(error ?? "Failed to open in private window", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(2));
+        }
+    }
+
+    /// <summary>
+    /// Copies <paramref name="url"/> to the clipboard. Reports the standard "N symbols copied"
+    /// confirmation on success, or "Clipboard unavailable" on failure.
+    /// </summary>
+    private void CopyLinkUrl(string url)
+    {
+        if (this.clipboardWriter(url))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(ClipboardStatusText.Copied(url), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+        }
+        else
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+        }
+    }
+
+    /// <summary>
+    /// Formats <paramref name="url"/> for user-facing display: the scheme and authority (host) are
+    /// always shown in full so the true destination is never hidden by truncation. Only the path and
+    /// query are elided when they are long. Falls back to a capped raw string for non-parseable URLs.
+    /// </summary>
+    private static string FormatUrlForDisplay(string url)
+    {
+        const int MaxPathDisplay = 40;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
+        {
+            // Not a parseable absolute URI: cap from the front so at least something is shown.
+            const int MaxRaw = 60;
+            return url.Length > MaxRaw ? url[..MaxRaw] + "…" : url;
+        }
+
+        // Always show the full scheme + authority (includes userinfo and host) so the real host
+        // is never hidden. Elide only the path-and-query portion when it's long.
+        var origin = uri.GetLeftPart(UriPartial.Authority);
+        var pathAndQuery = uri.PathAndQuery;
+        if (pathAndQuery.Length <= MaxPathDisplay)
+        {
+            return origin + pathAndQuery;
+        }
+
+        return origin + pathAndQuery[..MaxPathDisplay] + "…";
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when the URL has a non-empty <see cref="Uri.UserInfo"/>
+    /// component, which is a classic spoofing vector and must always trigger confirmation.
+    /// </summary>
+    private static bool HasUserInfo(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.UserInfo);
+
+    /// <summary>Deregisters the transcript link context menu from the popover manager, if any.</summary>
+    private void CleanupTranscriptLinkMenu()
+    {
+        this.TranscriptLinkMenuItemsForTest = null;
+        if (this.transcriptLinkMenu is { } menu)
+        {
+            this.transcriptLinkMenu = null;
+            try
+            {
+                if (this.app.Popovers?.IsRegistered(menu) == true)
+                {
+                    this.app.Popovers.DeRegister(menu);
+                }
+            }
+            catch
+            {
+                // Swallow: the app may already be disposed during teardown.
+            }
+        }
+    }
 
     /// <summary>
     /// Copies the active transcript selection to the clipboard. On success the selection is cleared and a
@@ -1038,6 +1363,45 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.UpdateComposerAvailability(snapshot);
         this.UpdatePrompt(snapshot);
         this.ApplyTranscriptChanges(previous, snapshot);
+
+        // Notify the schedule browser when the runtime snapshot reference changes (TuiScheduleLifecycleSink
+        // always creates a new SessionRuntimeSnapshot instance on every lifecycle event). The narrow pattern
+        // swallows ObjectDisposedException in case a Notify arrives during shutdown.
+        if (!ReferenceEquals(previous.Runtime, snapshot.Runtime))
+        {
+            try
+            {
+                this.scheduleController?.NotifyScheduleChanged();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
+    }
+
+    private void OnThemeChanged()
+    {
+        void ApplyThemeChange()
+        {
+            this.Theme = CodaThemes.Current.Tui;
+            this.RebuildThemeSchemes();
+            this.SetNeedsDraw();
+        }
+
+        if (this.app.MainThreadId is null || this.IsOnUiThread())
+        {
+            ApplyThemeChange();
+            return;
+        }
+
+        try
+        {
+            this.app.Invoke(ApplyThemeChange);
+        }
+        catch (Terminal.Gui.App.NotInitializedException)
+        {
+            ApplyThemeChange();
+        }
     }
 
     private bool IsOnUiThread() =>
@@ -1163,13 +1527,23 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
         // was built once; before the first turn the provider returns null and the browser opens empty.
         this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
         this.taskOverlay?.Show();
     }
 
     private void OpenMcpBrowser()
     {
         this.taskOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
         this.mcpOverlay?.Show();
+    }
+
+    private void OpenScheduleBrowser()
+    {
+        // Show() is idempotent: a repeated /schedule never double-Opens or double-pumps.
+        this.taskOverlay?.Hide();
+        this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Show();
     }
 
     private void SetComposerAttachmentLock(bool locked)
@@ -1250,11 +1624,53 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
+    private void OnScheduleBrowserChanged()
+    {
+        if (this.scheduleOverlay is null || this.disposed)
+        {
+            return;
+        }
+
+        if (this.scheduleOverlay.Visible)
+        {
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.scheduleOverlay.SetFocus();
+            }
+
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
     private void OnComposerSubmitted(object? sender, ComposerSubmissionEventArgs submission)
     {
         if (this.mcpOverlay is not null && McpBrowserController.IsOpenRequest(submission.OriginalDraft))
         {
             this.OpenMcpBrowser();
+            return;
+        }
+
+        // An exact `/schedule` submission opens the browser overlay (same pattern as /tasks).
+        if (this.scheduleOverlay is not null && Coda.Tui.Ui.Schedule.ScheduleBrowserController.IsOpenRequest(submission.OriginalDraft))
+        {
+            this.OpenScheduleBrowser();
             return;
         }
 

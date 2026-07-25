@@ -17,7 +17,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
 
     /// <summary>Create a renderer that writes plain output to <paramref name="writer"/>.</summary>
     /// <param name="writer">The destination writer (e.g. redirected stdout).</param>
-    public PlainOutputRenderer(TextWriter writer, ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose)
+    public PlainOutputRenderer(TextWriter writer, ToolDisplayMode toolDisplayMode = ToolDisplayMode.Full)
     {
         this._writer = writer ?? throw new ArgumentNullException(nameof(writer));
         this._toolDisplayMode = toolDisplayMode;
@@ -39,7 +39,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolStartedEvent e:
-                if (this._toolDisplayMode is not (ToolDisplayMode.Tiny or ToolDisplayMode.Summary))
+                if (this._toolDisplayMode is not (ToolDisplayMode.Hidden or ToolDisplayMode.Summary))
                 {
                     var input = this._toolDisplayMode == ToolDisplayMode.Compact
                         ? ToolDisplayModeText.ArgumentPreview(e.InputJson)
@@ -50,7 +50,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolProgressEvent e:
-                if (this._toolDisplayMode is not (ToolDisplayMode.Tiny or ToolDisplayMode.Summary))
+                if (this._toolDisplayMode is not (ToolDisplayMode.Hidden or ToolDisplayMode.Summary))
                 {
                     var seconds = (e.ElapsedMs / 1000.0).ToString("0.0", CultureInfo.InvariantCulture);
                     this.WriteLine($"[tool-progress] {e.ToolName} {seconds}s");
@@ -58,7 +58,7 @@ public sealed class PlainOutputRenderer : IUiEventObserver
                 break;
 
             case ToolCompletedEvent e:
-                if (this._toolDisplayMode is not (ToolDisplayMode.Tiny or ToolDisplayMode.Summary))
+                if (this._toolDisplayMode is not (ToolDisplayMode.Hidden or ToolDisplayMode.Summary))
                 {
                     if (this._toolDisplayMode == ToolDisplayMode.Compact)
                     {

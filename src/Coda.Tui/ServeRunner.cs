@@ -440,7 +440,7 @@ public static class ServeRunner
                     msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null,
                     secretStore: mcpCredentialStore, includeProjectMcp: includeProjectMcp).ConfigureAwait(false);
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
-                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools);
+                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools, settings.EffortByModel);
 
                 var streams = await transport.AcceptAsync(cts.Token).ConfigureAwait(false);
                 await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey);
@@ -463,11 +463,16 @@ public static class ServeRunner
     /// <paramref name="baseTelemetry"/> (the loaded settings' telemetry block, or
     /// <see cref="TelemetrySettings.Disabled"/> when none) with <c>Enabled = true</c> and the
     /// parsed level applied. The on-disk settings file is never mutated.
+    /// When <paramref name="effortByModel"/> is provided, the starting model's persisted effort
+    /// is resolved through <see cref="ReasoningCapabilityResolver"/> and applied to
+    /// <see cref="SessionOptions.Effort"/>, so stale or unsupported stored levels are clamped or
+    /// dropped rather than sent verbatim.
     /// </summary>
     public static SessionOptions BuildSessionOptions(
         ServeOptions options,
         TelemetrySettings? baseTelemetry = null,
-        IReadOnlyList<ITool>? extraTools = null) =>
+        IReadOnlyList<ITool>? extraTools = null,
+        IReadOnlyDictionary<string, string>? effortByModel = null) =>
         new()
         {
             ProviderId = options.ProviderId!,
@@ -492,5 +497,34 @@ public static class ServeRunner
             // TelemetryResolver — the single authority. Serve only passes its inputs through.
             TelemetryOverride = TelemetryResolver.ResolveServeOverride(
                 options.ForceTelemetry, options.TelemetryLevel, baseTelemetry),
+            // Persisted effort for the starting model, resolved through the capability resolver so
+            // stale or unsupported stored levels are clamped/dropped, never sent verbatim.
+            Effort = ResolveInitialEffort(options.ProviderId!, options.Model!, effortByModel),
         };
+
+    /// <summary>
+    /// Looks up <c>"{providerId}/{model}"</c> in <paramref name="effortByModel"/> and resolves
+    /// the stored level through <see cref="ReasoningCapabilityResolver.ResolveAppliedLevel"/> so
+    /// an unsupported or stale value is clamped or dropped. Returns <c>null</c> when the dict is
+    /// null, the key is absent, or the stored level is not applicable to the model.
+    /// </summary>
+    private static string? ResolveInitialEffort(
+        string providerId,
+        string model,
+        IReadOnlyDictionary<string, string>? effortByModel)
+    {
+        if (effortByModel is null)
+        {
+            return null;
+        }
+
+        var key = $"{providerId}/{model}";
+        if (!effortByModel.TryGetValue(key, out var stored))
+        {
+            return null;
+        }
+
+        var capability = ReasoningCapabilityResolver.Resolve(providerId, model);
+        return ReasoningCapabilityResolver.ResolveAppliedLevel(capability, stored);
+    }
 }

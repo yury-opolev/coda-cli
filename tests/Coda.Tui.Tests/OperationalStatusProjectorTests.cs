@@ -90,7 +90,7 @@ public sealed class OperationalStatusProjectorTests
 
         Assert.Equal(
             new OperationalStatus("Working", OperationalTone.Working, Animated: true),
-            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Tiny));
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Hidden));
     }
 
     [Theory]
@@ -196,10 +196,10 @@ public sealed class OperationalStatusProjectorTests
             OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Summary));
         Assert.Equal(
             new OperationalStatus("Working", OperationalTone.Working, Animated: true),
-            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Tiny));
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Hidden));
         Assert.Equal(
             new OperationalStatus("Working · run_command", OperationalTone.Working, Animated: true),
-            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Verbose));
+            OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Full));
         Assert.Equal(
             new OperationalStatus("Working · run_command", OperationalTone.Working, Animated: true),
             OperationalStatusProjector.Project(snapshot, ToolDisplayMode.Compact));

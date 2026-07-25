@@ -31,67 +31,86 @@ internal sealed class TuiTheme
     /// <summary>The single shared Warm Ember theme instance.</summary>
     public static TuiTheme WarmEmber { get; } = new();
 
-    private TuiTheme()
+    public TuiTheme()
     {
     }
 
-    public TuiThemeColor Background { get; } = new(new TgColor(23, 19, 16), TgName.Black);
-    public TuiThemeColor TranscriptAssistant { get; } = new(new TgColor(242, 214, 179), TgName.White);
-    public TuiThemeColor TranscriptUser { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+    public TuiThemeColor Background { get; init; } = new(new TgColor(23, 19, 16), TgName.Black);
+    public TuiThemeColor TranscriptAssistant { get; init; } = new(new TgColor(242, 214, 179), TgName.White);
+    public TuiThemeColor TranscriptUser { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 
     /// <summary>A subtly different, slightly lighter warm near-black behind a submitted user message so it
     /// reads as its own full-width block. In 16-color mode it degrades to the shell background (no block).</summary>
-    public TuiThemeColor TranscriptUserBackground { get; } = new(new TgColor(38, 30, 24), TgName.Black);
+    public TuiThemeColor TranscriptUserBackground { get; init; } = new(new TgColor(38, 30, 24), TgName.Black);
 
     /// <summary>The dim warm tone of the right-aligned sent-time indicator on a user message block.</summary>
-    public TuiThemeColor TranscriptUserTime { get; } = new(new TgColor(150, 128, 104), TgName.Gray);
-    public TuiThemeColor Heading { get; } = new(new TgColor(240, 179, 91), TgName.BrightYellow);
-    public TuiThemeColor Code { get; } = new(new TgColor(200, 184, 166), TgName.Gray);
-    public TuiThemeColor TranscriptTool { get; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
-    public TuiThemeColor Diff { get; } = new(new TgColor(201, 138, 82), TgName.Yellow);
-    public TuiThemeColor PermissionApproval { get; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
-    public TuiThemeColor Question { get; } = new(new TgColor(240, 199, 94), TgName.BrightYellow);
-    public TuiThemeColor Warning { get; } = new(new TgColor(240, 199, 94), TgName.Yellow);
-    public TuiThemeColor Notification { get; } = new(new TgColor(191, 174, 156), TgName.Gray);
-    public TuiThemeColor Error { get; } = new(new TgColor(217, 104, 93), TgName.Red);
+    public TuiThemeColor TranscriptUserTime { get; init; } = new(new TgColor(150, 128, 104), TgName.Gray);
+    public TuiThemeColor Heading { get; init; } = new(new TgColor(240, 179, 91), TgName.BrightYellow);
+    public TuiThemeColor Code { get; init; } = new(new TgColor(200, 184, 166), TgName.Gray);
+    public TuiThemeColor TranscriptTool { get; init; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
+    public TuiThemeColor Diff { get; init; } = new(new TgColor(201, 138, 82), TgName.Yellow);
+    public TuiThemeColor PermissionApproval { get; init; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
+    public TuiThemeColor Question { get; init; } = new(new TgColor(240, 199, 94), TgName.BrightYellow);
+    public TuiThemeColor Warning { get; init; } = new(new TgColor(240, 199, 94), TgName.Yellow);
+    public TuiThemeColor Notification { get; init; } = new(new TgColor(191, 174, 156), TgName.Gray);
+    public TuiThemeColor Error { get; init; } = new(new TgColor(217, 104, 93), TgName.Red);
 
     // Six eye-friendly Warm Ember context-usage colors, one per /context category. Each is a distinct
     // warm hue (gold → amber → terracotta → rose → taupe → dim warm grey) with a distinct, warm-degrading
     // 16-color fallback so the categories stay legible by color even when the driver drops to 16 colors.
-    public TuiThemeColor ContextSystemPrompt { get; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
-    public TuiThemeColor ContextSystemTools { get; } = new(new TgColor(222, 146, 74), TgName.Yellow);
-    public TuiThemeColor ContextMcpTools { get; } = new(new TgColor(216, 122, 90), TgName.BrightRed);
-    public TuiThemeColor ContextMessages { get; } = new(new TgColor(214, 96, 96), TgName.Red);
-    public TuiThemeColor ContextAutocompactBuffer { get; } = new(new TgColor(168, 154, 134), TgName.Gray);
-    public TuiThemeColor ContextFreeSpace { get; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
+    public TuiThemeColor ContextSystemPrompt { get; init; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
+    public TuiThemeColor ContextSystemTools { get; init; } = new(new TgColor(222, 146, 74), TgName.Yellow);
+    public TuiThemeColor ContextMcpTools { get; init; } = new(new TgColor(216, 122, 90), TgName.BrightRed);
+    public TuiThemeColor ContextMessages { get; init; } = new(new TgColor(214, 96, 96), TgName.Red);
+    public TuiThemeColor ContextAutocompactBuffer { get; init; } = new(new TgColor(168, 154, 134), TgName.Gray);
+    public TuiThemeColor ContextFreeSpace { get; init; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
 
-    public TuiThemeColor ComposerText { get; } = new(new TgColor(242, 214, 179), TgName.White);
-    public TuiThemeColor ComposerPrompt { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+    // Five GitHub-style callout roles (Note/Tip/Important/Warning/Caution). Each pairs with a matching
+    // TranscriptRole so title rows resolve to the callout hue. Values here are the Warm Ember defaults;
+    // Default and CoolDark built-ins override all five to their own palette (enforced by the parity test).
+    public TuiThemeColor CalloutNote { get; init; } = new(new TgColor(150, 190, 230), TgName.BrightBlue);
+    public TuiThemeColor CalloutTip { get; init; } = new(new TgColor(120, 190, 100), TgName.BrightGreen);
+    public TuiThemeColor CalloutImportant { get; init; } = new(new TgColor(200, 140, 215), TgName.BrightMagenta);
+    public TuiThemeColor CalloutWarning { get; init; } = new(new TgColor(235, 165, 45), TgName.Yellow);
+    public TuiThemeColor CalloutCaution { get; init; } = new(new TgColor(220, 90, 70), TgName.BrightRed);
+
+    /// <summary>Dim user foreground for a queued/not-yet-delivered pending user message. A muted version of
+    /// the theme's user color so the whole pending block reads as unconfirmed until delivered.</summary>
+    public TuiThemeColor PendingUser { get; init; } = new(new TgColor(150, 128, 104), TgName.Gray);
+
+    /// <summary>Foreground color applied to honest link spans (display text identifies the destination).</summary>
+    public TuiThemeColor Link { get; init; } = new(new TgColor(110, 165, 215), TgName.BrightBlue);
+    /// <summary>Foreground color applied to deceptive link spans (display text hides the destination),
+    /// including the trailing ⚠ warning glyph. Chosen to visually warn without being aggressive.</summary>
+    public TuiThemeColor LinkDeceptive { get; init; } = new(new TgColor(215, 125, 55), TgName.Yellow);
+
+    public TuiThemeColor ComposerText { get; init; } = new(new TgColor(242, 214, 179), TgName.White);
+    public TuiThemeColor ComposerPrompt { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 
     /// <summary>A slightly lighter warm near-black than <see cref="Background"/> so the composer input
     /// region reads as its own panel rather than blending into the transcript surface.</summary>
-    public TuiThemeColor ComposerPanelBackground { get; } = new(new TgColor(34, 28, 23), TgName.Black);
+    public TuiThemeColor ComposerPanelBackground { get; init; } = new(new TgColor(34, 28, 23), TgName.Black);
 
     /// <summary>The half-block edge shading drawn along the composer panel's top and bottom rows: a warm
     /// tone a touch lighter than the panel so the seam between shell and panel is soft, not a hard border.</summary>
-    public TuiThemeColor ComposerPanelEdge { get; } = new(new TgColor(58, 47, 38), TgName.Black);
+    public TuiThemeColor ComposerPanelEdge { get; init; } = new(new TgColor(58, 47, 38), TgName.Black);
 
-    public TuiThemeColor OperationalReady { get; } = new(new TgColor(143, 136, 128), TgName.Gray);
-    public TuiThemeColor OperationalInitializing { get; } = new(new TgColor(179, 138, 80), TgName.Yellow);
-    public TuiThemeColor OperationalWorking { get; } = new(new TgColor(229, 139, 54), TgName.BrightYellow);
-    public TuiThemeColor OperationalThinking { get; } = new(new TgColor(216, 94, 94), TgName.BrightRed);
-    public TuiThemeColor OperationalWaiting { get; } = new(new TgColor(143, 136, 128), TgName.Gray);
+    public TuiThemeColor OperationalReady { get; init; } = new(new TgColor(143, 136, 128), TgName.Gray);
+    public TuiThemeColor OperationalInitializing { get; init; } = new(new TgColor(179, 138, 80), TgName.Yellow);
+    public TuiThemeColor OperationalWorking { get; init; } = new(new TgColor(229, 139, 54), TgName.BrightYellow);
+    public TuiThemeColor OperationalThinking { get; init; } = new(new TgColor(216, 94, 94), TgName.BrightRed);
+    public TuiThemeColor OperationalWaiting { get; init; } = new(new TgColor(143, 136, 128), TgName.Gray);
 
-    public TuiThemeColor CompletionNormal { get; } = new(new TgColor(215, 194, 168), TgName.White);
-    public TuiThemeColor CompletionSelectedText { get; } = new(new TgColor(23, 19, 16), TgName.Black);
-    public TuiThemeColor CompletionSelectedBackground { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+    public TuiThemeColor CompletionNormal { get; init; } = new(new TgColor(215, 194, 168), TgName.White);
+    public TuiThemeColor CompletionSelectedText { get; init; } = new(new TgColor(23, 19, 16), TgName.Black);
+    public TuiThemeColor CompletionSelectedBackground { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 
-    public TuiThemeColor PromptText { get; } = new(new TgColor(242, 214, 179), TgName.White);
-    public TuiThemeColor PromptAccent { get; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
-    public TuiThemeColor SelectionText { get; } = new(new TgColor(23, 19, 16), TgName.Black);
-    public TuiThemeColor SelectionBackground { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
-    public TuiThemeColor ScrollbarTrack { get; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
-    public TuiThemeColor ScrollbarThumb { get; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+    public TuiThemeColor PromptText { get; init; } = new(new TgColor(242, 214, 179), TgName.White);
+    public TuiThemeColor PromptAccent { get; init; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
+    public TuiThemeColor SelectionText { get; init; } = new(new TgColor(23, 19, 16), TgName.Black);
+    public TuiThemeColor SelectionBackground { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
+    public TuiThemeColor ScrollbarTrack { get; init; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
+    public TuiThemeColor ScrollbarThumb { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 
     /// <summary>Resolves a role to its exact RGB (true color) or its named 16-color fallback.</summary>
     public static TgColor Resolve(TuiThemeColor role, bool trueColor) =>

@@ -120,7 +120,8 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
 
                 // The effort parameter is gated behind a beta header; only add it when an
                 // effort level will actually be sent for this model.
-                if (EffortSupport.ResolveAppliedEffort(request.Model, request.Effort) is not null)
+                if (ReasoningCapabilityResolver.ResolveAppliedLevel(
+                    ReasoningCapabilityResolver.ResolveAnthropic(request.Model), request.Effort) is not null)
                 {
                     httpRequest.Headers.TryAddWithoutValidation("anthropic-beta", EffortSupport.EffortBetaHeader);
                 }
@@ -266,8 +267,9 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         }
 
         // Reasoning effort (output_config.effort), gated by model support. Honors
-        // the max→high clamp on non-Opus models via ResolveAppliedEffort.
-        var effort = EffortSupport.ResolveAppliedEffort(request.Model, request.Effort);
+        // the max→high clamp on non-Opus models via the resolver.
+        var effort = ReasoningCapabilityResolver.ResolveAppliedLevel(
+            ReasoningCapabilityResolver.ResolveAnthropic(request.Model), request.Effort);
         if (effort is not null)
         {
             body["output_config"] = new JsonObject { ["effort"] = effort };
@@ -444,6 +446,14 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         var content = new JsonArray();
         foreach (var block in message.Content)
         {
+            // ThinkingBlock without a signature cannot be round-tripped (Anthropic rejects them).
+            // Skip them silently so a turn with unsigned thinking blocks doesn't produce a 400 error.
+            // RedactedThinkingBlock is always included verbatim (it is self-contained and required).
+            if (block is ThinkingBlock { Signature: null })
+            {
+                continue;
+            }
+
             content.Add(SerializeBlock(block));
         }
 
@@ -475,6 +485,23 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
                 ["data"] = image.Base64Data,
             },
         },
+        // Thinking blocks must be returned verbatim in multi-step turns so Anthropic can
+        // verify the signature. Blocks without a signature (e.g. when the provider stream
+        // never delivered one) are silently dropped from history to avoid an invalid request.
+        ThinkingBlock thinking when thinking.Signature is not null => new JsonObject
+        {
+            ["type"] = "thinking",
+            ["thinking"] = thinking.Text,
+            ["signature"] = thinking.Signature,
+        },
+        RedactedThinkingBlock redacted => new JsonObject
+        {
+            ["type"] = "redacted_thinking",
+            ["data"] = redacted.Data,
+        },
+        ThinkingBlock => throw new InvalidOperationException(
+            "ThinkingBlock without a signature cannot be serialized for Anthropic history replay. " +
+            "Callers must exclude signature-less blocks before building the request."),
         _ => throw new InvalidOperationException($"Unknown content block: {block.GetType().Name}"),
     };
 

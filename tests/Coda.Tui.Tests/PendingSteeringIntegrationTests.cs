@@ -49,17 +49,18 @@ public sealed class PendingSteeringIntegrationTests
     }
 
     [Fact]
-    public void Pending_user_format_has_user_style_and_visible_annotation()
+    public void Pending_user_format_prefixes_first_line_with_marker_and_uses_pending_user_role()
     {
         var lines = TranscriptBlockFormatter.Format(
             new PendingUserTranscriptBlock(Guid.NewGuid(), "queued", "entry", DateTimeOffset.UtcNow),
             80);
 
         var line = Assert.Single(lines);
-        Assert.Equal(TranscriptRole.User, line.Role);
+        Assert.Equal(TranscriptRole.PendingUser, line.Role);
         Assert.True(line.FillWidth);
-        Assert.Contains("queued", line.Text);
-        Assert.Contains("pending", line.RightText ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.StartsWith("[pending] ", line.Text, StringComparison.Ordinal);
+        Assert.Contains("queued", line.Text, StringComparison.Ordinal);
+        Assert.Null(line.RightText);
     }
 
     [Fact]

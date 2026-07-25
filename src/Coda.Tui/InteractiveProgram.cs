@@ -1,5 +1,7 @@
 using Coda.Agent;
 using Coda.Mcp.Auth;
+using Coda.Sdk;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
@@ -13,6 +15,7 @@ using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -242,6 +245,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             startupSettings,
             connectedProviderId);
         session.Model = string.IsNullOrWhiteSpace(resolvedStartupModel) ? startupProvider.DefaultModel : resolvedStartupModel;
+        ApplyStartupEffort(session, startupProvider.Id, startupSettings);
 
         var registry = new SlashCommandRegistry(SlashCommandCatalog.CreateAll());
 
@@ -249,6 +253,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // switch never rebuilds them; only the actor's frame/observer sink and the command environment swap.
         using var mailbox = new UiEventMailbox(capacity: 512, hostToken);
         var actorPrompts = new ActorUiPromptService(mailbox);
+        ApplyStartupTheme(startupSettings, mailbox);
         if (!toolDisplayResolution.IsValid)
         {
             Publish(mailbox, new DiagnosticEvent(
@@ -315,10 +320,16 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // not a snapshot): before the first turn agentRunner.Tasks/ExecutionGate are null, so /tasks renders
         // an empty list and the browser opens empty; afterwards they observe the running session's registry.
         context.TaskManagerProvider = () => agentRunner.Tasks;
+        context.ScheduleControlProvider = () => agentRunner.ScheduleControl;
 
         Func<TaskBrowserProvider?> taskBrowserProvider = () =>
             agentRunner.Tasks is { } tasks && agentRunner.ExecutionGate is { } gate
                 ? new TaskBrowserProvider(tasks, gate)
+                : null;
+
+        Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?> scheduleBrowserProvider = () =>
+            agentRunner.ScheduleControl is { } sc
+                ? new Coda.Tui.Ui.Schedule.ScheduleBrowserProvider(() => sc, actorPrompts)
                 : null;
 
         using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
@@ -397,6 +408,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         {
             var plainConsole = new UiAnsiConsoleAdapter(mailbox, this.OffscreenWidth(), this.OffscreenHeight());
             context.SetModeEnvironment(plainConsole, PlainUiPromptService.Instance, mailbox, semanticUiEnabled: true);
+            context.DraftInsertCallback = null;
             frameSink.Set(null, null);
             observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
@@ -427,6 +439,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             // without stealing Spectre's prompt input. Command output is not duplicated because commands
             // write straight to the real console rather than through the adapter.
             context.SetModeEnvironment(realConsole, new SpectreUiPromptService(realConsole), mailbox, semanticUiEnabled: false);
+            context.DraftInsertCallback = null;
             frameSink.Set(null, null);
             observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
@@ -449,6 +462,21 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             return TuiShellExit.Exited;
         }
 
+        // The clipboard image reader + paste callback are created once at the composition root: the reader
+        // shells out to the per-OS tool, and imagePaste validates + stages a pasted image and returns its
+        // [Image N] token (or null to signal the shell that the image was rejected).
+        var clipboardImageReader = ClipboardImageReaderSelector.Create();
+        Func<ClipboardImage, string?> imagePaste = img =>
+        {
+            if (ImageAttachmentValidation.Validate(img.MediaType, img.Base64Data) is not null)
+            {
+                return null;
+            }
+
+            var label = context.Session.StageImage(new ImageBlock(img.MediaType, img.Base64Data), tokenInserted: true);
+            return $"[Image {label}]";
+        };
+
         // The Terminal.Gui shell factory: wire the composer to the controller, point the actor's frame
         // sink at the shell, and (once the loop is pumping) run startup and enable submission.
         TerminalGuiShellBase ShellFactory(TuiRunMode shellMode, IApplication tgApp, ComposerState composer)
@@ -469,7 +497,17 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
-                toolDisplayMode: toolDisplayMode);
+                toolDisplayMode: toolDisplayMode,
+                scheduleBrowserProvider: scheduleBrowserProvider,
+                urlOpener: DefaultUrlOpener.Instance,
+                privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
+                linkPromptService: actorPrompts,
+                imageReader: clipboardImageReader,
+                imagePaste: imagePaste);
+
+            // Route /image (and any command staging an image) into this shell's live composer draft. Dispatch
+            // is serialized by the controller, so a mode switch never leaves this pointing at a dead shell.
+            context.DraftInsertCallback = token => tgApp.Invoke(() => shell.Composer.NewPasteEvent(token + " "));
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);
@@ -535,6 +573,51 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             StartupSystemPromptOverride = options.SystemPromptOverride,
             SystemPromptOverride = options.SystemPromptOverride,
         };
+
+    /// <summary>
+    /// Seeds <paramref name="session"/>.<see cref="SessionState.EffortByModel"/> from
+    /// <paramref name="settings"/>, then resolves and applies the initial
+    /// <see cref="SessionState.Effort"/> for the current
+    /// <c>{providerId}/{session.Model}</c> key through
+    /// <see cref="ReasoningCapabilityResolver"/> so stale or unsupported stored levels
+    /// are clamped or dropped — never sent verbatim to the Copilot Responses endpoint.
+    /// Call this AFTER <see cref="SessionState.Model"/> is set to the resolved startup model.
+    /// </summary>
+    internal static void ApplyStartupEffort(
+        SessionState session,
+        string providerId,
+        Coda.Agent.Settings.CodaSettings settings)
+    {
+        foreach (var (key, level) in settings.EffortByModel)
+        {
+            session.EffortByModel[key] = level;
+        }
+
+        var effortKey = $"{providerId}/{session.Model}";
+        if (session.EffortByModel.TryGetValue(effortKey, out var storedEffort))
+        {
+            var capability = ReasoningCapabilityResolver.Resolve(providerId, session.Model);
+            session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, storedEffort);
+        }
+    }
+
+    internal static void ApplyStartupTheme(
+        Coda.Agent.Settings.CodaSettings settings,
+        IUiEventPublisher events)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(events);
+
+        var resolution = ThemeResolver.Resolve(settings.Theme);
+        CodaThemes.Set(resolution.Theme);
+        if (!resolution.IsValid)
+        {
+            events.Publish(new DiagnosticEvent(
+                "settings",
+                ThemeResolver.InvalidValueWarning(settings.Theme),
+                UiNotificationLevel.Warning));
+        }
+    }
 
     /// <summary>
     /// Drive the host to a clean exit, then — once and only after the terminal is restored and the UI
@@ -795,3 +878,5 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
     private int OffscreenHeight() => Math.Max(this.capabilities.Height, 24);
 }
+
+

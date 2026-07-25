@@ -228,6 +228,10 @@ public sealed class SubagentHost : ISubagentHost
 
         public void OnError(string message) => this.parent.OnError(message);
 
+        public void OnThinking(string delta) => this.parent.OnThinking(delta);
+
+        public void OnThinkingComplete(int? thinkingTokens = null) => this.parent.OnThinkingComplete();
+
         public void OnLimitReached(string kind, string message) => this.parent.OnLimitReached(kind, message);
 
         public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.parent.OnSteeringDelivered(ids);

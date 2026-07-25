@@ -3,6 +3,8 @@ using System.Text;
 using System.Text.Json.Nodes;
 using Coda.Agent;
 using Coda.Agent.Goals;
+using Coda.Agent.Scheduling;
+using Coda.Agent.Settings;
 using Coda.JsonRpc;
 using Coda.Sdk.Serve.Messages;
 using LlmClient;
@@ -54,14 +56,6 @@ public sealed class ServeHost : IAsyncDisposable
     // interrupt that races in before the turn publishes its CTS is never lost.
     private readonly object turnLock = new();
     private bool interruptPending;
-
-    private static readonly HashSet<string> SupportedImageMediaTypes = new(StringComparer.OrdinalIgnoreCase)
-    {
-        "image/png",
-        "image/jpeg",
-        "image/gif",
-        "image/webp",
-    };
 
     public ServeHost(
         Stream input,
@@ -377,18 +371,17 @@ public sealed class ServeHost : IAsyncDisposable
             {
                 foreach (var img in images)
                 {
-                    if (!SupportedImageMediaTypes.Contains(img.MediaType))
+                    if (!ImageAttachmentValidation.IsAllowedMimeType(img.MediaType))
                     {
                         throw new InvalidOperationException($"unsupported image media type: {img.MediaType}");
                     }
 
-                    if (!TryDecodeBase64(img.Base64, out _))
+                    if (!ImageAttachmentValidation.TryDecodeBase64(img.Base64, out var decoded))
                     {
                         throw new InvalidOperationException("image base64 is empty or invalid");
                     }
 
-                    var decoded = Convert.FromBase64String(img.Base64);
-                    if (decoded.Length > 5 * 1024 * 1024)
+                    if (decoded.Length > ImageAttachmentValidation.MaxBytes)
                     {
                         throw new InvalidOperationException("image exceeds the 5 MB limit");
                     }
@@ -634,6 +627,133 @@ public sealed class ServeHost : IAsyncDisposable
                 MaxContinuations: sess.Options.GoalMaxContinuations));
         });
 
+        // model/reasoningCapability → resolve the reasoning capability for the current (provider, model).
+        conn.OnRequestAsync(ServeMethods.ReasoningCapability, async (_, ct) =>
+        {
+            this.EnsureAuthenticated();
+            var result = await sess.ListModelsAsync(refresh: false, ct).ConfigureAwait(false);
+            var entry = result.Models.FirstOrDefault(m =>
+                string.Equals(m.Id, sess.Options.Model, StringComparison.OrdinalIgnoreCase));
+            var capability = ReasoningCapabilityResolver.Resolve(
+                sess.Options.ProviderId,
+                sess.Options.Model,
+                entry?.ReasoningLevels);
+            return ServeJson.ToNode(new ReasoningCapabilityResult(
+                capability.Supported,
+                capability.Supported ? [.. capability.Levels] : [],
+                capability.SupportsAuto));
+        });
+
+        // session/setEffort → validate + persist the reasoning effort for the current (provider, model).
+        conn.OnRequestAsync(ServeMethods.SetEffort, async (p, ct) =>
+        {
+            this.EnsureAuthenticated();
+            var sp = ServeJson.FromNode<SetEffortParams>(p);
+            var effort = string.IsNullOrWhiteSpace(sp?.Effort) ? null : sp!.Effort.Trim().ToLowerInvariant();
+
+            // "auto" or null both mean "clear the explicit level".
+            if (effort is "auto")
+            {
+                effort = null;
+            }
+
+            string? applied = effort;
+            string note = string.Empty;
+
+            if (effort is not null)
+            {
+                // Resolve capability and validate.
+                var result = await sess.ListModelsAsync(refresh: false, ct).ConfigureAwait(false);
+                var entry = result.Models.FirstOrDefault(m =>
+                    string.Equals(m.Id, sess.Options.Model, StringComparison.OrdinalIgnoreCase));
+                var capability = ReasoningCapabilityResolver.Resolve(
+                    sess.Options.ProviderId,
+                    sess.Options.Model,
+                    entry?.ReasoningLevels);
+
+                if (!capability.Supported)
+                {
+                    return ServeJson.ToNode(new SetEffortResult(
+                        Ok: false,
+                        Applied: null,
+                        Note: $"Reasoning effort is not supported for model '{sess.Options.Model}'."));
+                }
+
+                applied = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, effort);
+                if (applied is null)
+                {
+                    var valid = string.Join(", ", capability.Levels);
+                    return ServeJson.ToNode(new SetEffortResult(
+                        Ok: false,
+                        Applied: null,
+                        Note: $"Invalid effort level '{effort}'. Valid: {valid}, auto"));
+                }
+
+                if (!string.Equals(applied, effort, StringComparison.Ordinal))
+                {
+                    note = $"'{effort}' clamped to '{applied}'";
+                }
+            }
+
+            // Persist: null = remove key (auto).
+            SettingsWriter.SetUserEffortForModel(sess.Options.ProviderId, sess.Options.Model, effort);
+
+            // Update the live session options.
+            sess.Options = sess.Options with { Effort = applied };
+
+            return ServeJson.ToNode(new SetEffortResult(Ok: true, Applied: applied, Note: note));
+        });
+
+        // session/scheduleList → project all definitions with live runtime state.
+        conn.OnRequest(ServeMethods.ScheduleList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var items = sess.ScheduleControl.List();
+            var dtos = items.Select(MapToDto).ToArray();
+            return ServeJson.ToNode(new ScheduleListResult(dtos));
+        });
+
+        // session/scheduleCreate → validate + persist; validation failure → -32602 with parser
+        // message. Returns the created ScheduledTaskDto (state=idle for a brand-new definition).
+        conn.OnRequest(ServeMethods.ScheduleCreate, p =>
+        {
+            this.EnsureAuthenticated();
+            var cp = ServeJson.FromNode<ScheduleCreateParams>(p);
+            var request = new ScheduleCreateRequest(
+                cp?.Name,
+                cp?.Prompt ?? string.Empty,
+                cp?.Every,
+                cp?.At,
+                cp?.Cron,
+                cp?.TimeZone);
+            var result = sess.ScheduleControl.Create(request);
+            if (!result.IsSuccess)
+            {
+                throw new JsonRpcRequestException(-32602, result.Error!);
+            }
+
+            return ServeJson.ToNode(MapToDto(result.Task!));
+        });
+
+        // session/scheduleDelete → not-found → -32602; success → { ok, id }.
+        conn.OnRequest(ServeMethods.ScheduleDelete, p =>
+        {
+            this.EnsureAuthenticated();
+            var dp = ServeJson.FromNode<ScheduleDeleteParams>(p);
+            if (string.IsNullOrWhiteSpace(dp?.Id))
+            {
+                throw new JsonRpcRequestException(-32602, "id is required");
+            }
+
+            var found = sess.ScheduleControl.Delete(dp!.Id!);
+            if (!found)
+            {
+                throw new JsonRpcRequestException(-32602, $"schedule not found: {dp.Id}");
+            }
+
+            return ServeJson.ToNode(new ScheduleDeleteResult(true, dp.Id!));
+        });
+
         // shutdown → signal the run loop to exit.
         conn.OnRequest(ServeMethods.Shutdown, _ =>
         {
@@ -684,6 +804,30 @@ public sealed class ServeHost : IAsyncDisposable
             goal.ExtensionUsed);
     }
 
+    /// <summary>
+    /// Maps a <see cref="ScheduledTaskReadModel"/> to the wire <see cref="ScheduledTaskDto"/>,
+    /// converting enum values to their lowercase string forms.
+    /// </summary>
+    private static ScheduledTaskDto MapToDto(ScheduledTaskReadModel model) =>
+        new(
+            model.Id,
+            model.Name,
+            model.Kind.ToString().ToLowerInvariant(),
+            model.Prompt,
+            model.Rule,
+            model.TimeZone,
+            model.NextRunUtc,
+            model.State.ToString().ToLowerInvariant(),
+            model.ActiveTaskId,
+            FormatOutcome(model.LastOutcome));
+
+    private static string? FormatOutcome(ScheduleTerminalMetadata? meta) =>
+        meta is null
+            ? null
+            : string.IsNullOrWhiteSpace(meta.Summary)
+                ? $"{meta.Outcome} at {meta.CompletedAtUtc.UtcDateTime:yyyy-MM-dd HH:mm} UTC"
+                : $"{meta.Outcome} at {meta.CompletedAtUtc.UtcDateTime:yyyy-MM-dd HH:mm} UTC — {meta.Summary}";
+
     private static string FormatDuration(TimeSpan duration)
     {
         // Emit a human-readable form: prefer suffix shorthand for whole units, else hh:mm:ss.
@@ -703,25 +847,6 @@ public sealed class ServeHost : IAsyncDisposable
         }
 
         return duration.ToString(@"hh\:mm\:ss");
-    }
-
-    private static bool TryDecodeBase64(string? value, out byte[] bytes)
-    {
-        bytes = [];
-        if (string.IsNullOrEmpty(value))
-        {
-            return false;
-        }
-
-        try
-        {
-            bytes = Convert.FromBase64String(value);
-            return true;
-        }
-        catch (FormatException)
-        {
-            return false;
-        }
     }
 
     private void EnsureAuthenticated()

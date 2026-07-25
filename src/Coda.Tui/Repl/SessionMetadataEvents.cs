@@ -1,3 +1,4 @@
+using Coda.Tui.Commands;
 using Coda.Tui.Ui.Events;
 using LlmClient;
 
@@ -6,7 +7,7 @@ namespace Coda.Tui.Repl;
 /// <summary>
 /// Builds a <see cref="SessionMetadataChangedEvent"/> from the current <see cref="CommandContext"/>,
 /// so the agent runner and every state-mutating command construct the event identically (effective
-/// effort resolved via <see cref="EffortSupport.ResolveAppliedEffort"/>, falling back to "auto").
+/// effort resolved via <see cref="ReasoningCapabilityResolver"/>, falling back to "auto").
 /// </summary>
 public static class SessionMetadataEvents
 {
@@ -17,7 +18,12 @@ public static class SessionMetadataEvents
 
         var model = context.Session.Model;
         var requested = context.Session.Effort;
-        var effective = EffortSupport.ResolveAppliedEffort(model, requested) ?? "auto";
+
+        // Resolve the effective effort using the full capability resolver (handles provider- and
+        // model-specific rules, including the Anthropic max→high clamp for non-Opus models).
+        var capability = EffortCommand.ResolveCapability(context);
+        var effective = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, requested) ?? "auto";
+
         var connected = context.UiSnapshotProvider?.Invoke().Connected ?? false;
 
         return new SessionMetadataChangedEvent(

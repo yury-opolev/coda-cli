@@ -25,6 +25,12 @@ public static class AnthropicSseReader
     {
         // Accumulator for the in-flight tool_use block, keyed by content index.
         var toolUses = new Dictionary<int, (string Id, string Name, StringBuilder Input)>();
+        // Accumulator for the in-flight thinking block, keyed by content index.
+        var thinkingBlocks = new Dictionary<int, (StringBuilder Text, StringBuilder Signature)>();
+        // Data for in-flight redacted_thinking blocks (complete in content_block_start, no deltas).
+        var redactedThinkingData = new Dictionary<int, string>();
+        // Thinking/redacted-thinking events deferred until message_stop so output_tokens is available.
+        var pendingThinkingDones = new List<AssistantStreamEvent>();
         string? stopReason = null;
         var inputTokens = 0;
         var outputTokens = 0;
@@ -86,12 +92,29 @@ public static class AnthropicSseReader
                     {
                         var index = GetIndex(root);
                         if (root.TryGetProperty("content_block", out var block)
-                            && block.TryGetProperty("type", out var bt)
-                            && bt.GetString() == "tool_use")
+                            && block.TryGetProperty("type", out var bt))
                         {
-                            var id = block.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? string.Empty : string.Empty;
-                            var name = block.TryGetProperty("name", out var nm) ? nm.GetString() ?? string.Empty : string.Empty;
-                            toolUses[index] = (id, name, new StringBuilder());
+                            var blockType = bt.GetString();
+                            if (blockType == "tool_use")
+                            {
+                                var id = block.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? string.Empty : string.Empty;
+                                var name = block.TryGetProperty("name", out var nm) ? nm.GetString() ?? string.Empty : string.Empty;
+                                toolUses[index] = (id, name, new StringBuilder());
+                            }
+                            else if (blockType == "thinking")
+                            {
+                                // Register an accumulator for the thinking block at this index.
+                                thinkingBlocks[index] = (new StringBuilder(), new StringBuilder());
+                            }
+                            else if (blockType == "redacted_thinking")
+                            {
+                                // The opaque encrypted data is complete in content_block_start.
+                                // No deltas follow; capture verbatim for round-trip replay.
+                                var data = block.TryGetProperty("data", out var dataEl)
+                                    ? dataEl.GetString() ?? string.Empty
+                                    : string.Empty;
+                                redactedThinkingData[index] = data;
+                            }
                         }
 
                         break;
@@ -121,6 +144,27 @@ public static class AnthropicSseReader
                                     }
 
                                     break;
+
+                                case "thinking_delta":
+                                    // Emit a normalized thinking-text delta and accumulate in the block.
+                                    var thinkingText = delta.TryGetProperty("thinking", out var tt) ? tt.GetString() : null;
+                                    if (!string.IsNullOrEmpty(thinkingText) && thinkingBlocks.TryGetValue(index, out var thacc))
+                                    {
+                                        thacc.Text.Append(thinkingText);
+                                        yield return AssistantStreamEvent.ThinkingDelta(thinkingText!);
+                                    }
+
+                                    break;
+
+                                case "signature_delta":
+                                    // Accumulate the Anthropic signed-thinking signature (not streamed to the UI).
+                                    var sig = delta.TryGetProperty("signature", out var sv) ? sv.GetString() : null;
+                                    if (sig is not null && thinkingBlocks.TryGetValue(index, out var sigacc))
+                                    {
+                                        sigacc.Signature.Append(sig);
+                                    }
+
+                                    break;
                             }
                         }
 
@@ -134,6 +178,22 @@ public static class AnthropicSseReader
                         {
                             var input = finished.Input.Length > 0 ? finished.Input.ToString() : "{}";
                             yield return AssistantStreamEvent.Tool(new ToolUseBlock(finished.Id, finished.Name, input));
+                        }
+                        else if (thinkingBlocks.Remove(index, out var completedThinking))
+                        {
+                            // Defer ThinkingDone to message_stop so output_tokens from message_delta
+                            // can be attached as ThinkingTokens (Anthropic reports tokens at the end).
+                            var thinkingText = completedThinking.Text.ToString();
+                            var signature = completedThinking.Signature.Length > 0
+                                ? completedThinking.Signature.ToString()
+                                : null;
+                            pendingThinkingDones.Add(AssistantStreamEvent.ThinkingDone(new ThinkingBlock(thinkingText, signature)));
+                        }
+                        else if (redactedThinkingData.Remove(index, out var redactedData))
+                        {
+                            // Defer redacted-thinking to message_stop for consistency (tokens not applicable,
+                            // but emitting here and there would cause ordering differences).
+                            pendingThinkingDones.Add(AssistantStreamEvent.RedactedThinkingDone(new RedactedThinkingBlock(redactedData)));
                         }
 
                         break;
@@ -161,6 +221,23 @@ public static class AnthropicSseReader
                     break;
 
                 case "message_stop":
+                    // Emit all deferred thinking/redacted-thinking events now that output_tokens
+                    // (from message_delta) is available. Regular ThinkingDone events carry the count;
+                    // RedactedThinkingDone events do not (no user-visible burst to attribute).
+                    foreach (var pending in pendingThinkingDones)
+                    {
+                        if (pending.Thinking is { } block)
+                        {
+                            yield return AssistantStreamEvent.ThinkingDone(
+                                block,
+                                thinkingTokens: outputTokens > 0 ? outputTokens : null);
+                        }
+                        else
+                        {
+                            yield return pending;
+                        }
+                    }
+
                     var usage = (inputTokens > 0 || outputTokens > 0)
                         ? new TokenUsage(inputTokens, outputTokens)
                         : null;

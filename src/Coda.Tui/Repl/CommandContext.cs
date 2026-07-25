@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Scheduling;
 using Coda.Agent.Tasks;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
@@ -66,6 +67,13 @@ public sealed class CommandContext
     public bool SemanticUiEnabled { get; internal set; }
 
     /// <summary>
+    /// Inserts text (an <c>[Image N]</c> token) into the live composer draft when interactive, so a staged
+    /// image references its position in the message. Null in non-interactive/plain contexts, in which case
+    /// staged images are auto-included on the next turn (legacy behaviour).
+    /// </summary>
+    public Action<string>? DraftInsertCallback { get; set; }
+
+    /// <summary>
     /// Swap the per-mode presentation environment (console, prompt surface, event publisher, and the
     /// semantic-UI flag) in place, so the shared command graph — the same
     /// <see cref="CommandContext"/>, <c>TuiApp</c>, <c>AgentRunner</c>, and <c>TuiController</c> — is
@@ -96,11 +104,18 @@ public sealed class CommandContext
     public IReadOnlyList<ITool> ExtraTools => this.ExtraToolsProvider?.Invoke() ?? [];
 
     /// <summary>
-    /// Live source of the session's <see cref="TaskManager"/> (a provider, not a snapshot, so it reflects
-    /// the session that only exists after the first turn). Null in non-interactive/plain contexts that have
-    /// no running agent; the <c>/tasks</c> command then renders an empty list.
+    /// Live source of the session's <see cref="TaskManager"/> (a provider, not a snapshot, so it
+    /// reflects the session that only exists after the first turn). Null in non-interactive/plain
+    /// contexts that have no running agent; the <c>/tasks</c> command then renders an empty list.
     /// </summary>
     public Func<TaskManager?>? TaskManagerProvider { get; set; }
+
+    /// <summary>
+    /// Live source of the session's <see cref="IScheduleControl"/> (a provider, not a snapshot, so it
+    /// reflects the session that only exists after the first turn). Null in non-interactive/plain contexts
+    /// that have no running agent; the <c>/schedule</c> command then renders an empty list.
+    /// </summary>
+    public Func<IScheduleControl?>? ScheduleControlProvider { get; set; }
 
     /// <summary>
     /// The live MCP client manager, so <c>/mcp</c> can report connection status and tools.

@@ -45,12 +45,24 @@ public sealed record CodaSettings(
     /// <summary>Optional telemetry/logging config from the "telemetry" block. Null = off.</summary>
     public TelemetrySettings? Telemetry { get; init; }
 
+    /// <summary>Raw user-global theme name string; null when absent. Project settings cannot set this value.</summary>
+    public string? Theme { get; init; }
+
     /// <summary>
     /// Raw user-global tool-display mode string; null when absent. Project settings cannot set this value;
     /// interpretation belongs to the TUI layer.
     /// </summary>
     public string? ToolDisplayMode { get; init; }
 
+    /// <summary>
+    /// Persisted reasoning effort level keyed by <c>"{provider}/{model}"</c>
+    /// (e.g. <c>"github-copilot/gpt-5.6-sol"</c> → <c>"high"</c>). Default when a key
+    /// is absent is <c>"auto"</c> (no explicit level). Empty = none configured.
+    /// </summary>
+    public IReadOnlyDictionary<string, string> EffortByModel { get; init; } =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
 }
+

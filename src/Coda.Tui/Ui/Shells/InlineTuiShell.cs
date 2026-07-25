@@ -1,6 +1,9 @@
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
 using Coda.Tui.Ui.Mcp;
@@ -37,7 +40,13 @@ internal sealed class InlineTuiShell(
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
     Func<McpBrowserProvider?>? mcpBrowserProvider = null,
-    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
+    Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
+    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
+    IUrlOpener? urlOpener = null,
+    IPrivateBrowserResolver? privateBrowserResolver = null,
+    IUiPromptService? linkPromptService = null,
+    IClipboardImageReader? imageReader = null,
+    Func<ClipboardImage, string?>? imagePaste = null)
     : FullscreenTuiShell(
         app,
         controller,
@@ -54,7 +63,13 @@ internal sealed class InlineTuiShell(
         transcriptFormatter,
         taskBrowserProvider: taskBrowserProvider,
         mcpBrowserProvider: mcpBrowserProvider,
-        toolDisplayMode: toolDisplayMode)
+        scheduleBrowserProvider: scheduleBrowserProvider,
+        toolDisplayMode: toolDisplayMode,
+        urlOpener: urlOpener,
+        privateBrowserResolver: privateBrowserResolver,
+        linkPromptService: linkPromptService,
+        imageReader: imageReader,
+        imagePaste: imagePaste)
 {
     /// <summary>
     /// The fewest rows the inline region can occupy: header (1), operational (1), navigation (1),

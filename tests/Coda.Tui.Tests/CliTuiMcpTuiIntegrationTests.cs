@@ -160,7 +160,7 @@ public sealed class CliTuiMcpTuiIntegrationTests
         using var fixture = RetainedShellFixture.Create(
             activeWork: false,
             transcriptFormatter: (block, width) =>
-                TranscriptBlockFormatter.Format(block, width, ToolDisplayMode.Verbose));
+                TranscriptBlockFormatter.Format(block, width, ToolDisplayMode.Full));
         var before = Enumerable.Range(0, 6)
             .Select(index => (TranscriptBlock)new CommandOutputTranscriptBlock(Guid.NewGuid(), $"before {index}"))
             .ToImmutableArray();
@@ -199,8 +199,8 @@ public sealed class CliTuiMcpTuiIntegrationTests
         activity = Assert.Single(state.Transcript.OfType<ToolActivityTranscriptBlock>());
         Assert.Equal(activityId, activity.Id);
         Assert.True(
-            TranscriptBlockFormatter.Format(activity, 80, ToolDisplayMode.Verbose).Count
-            != TranscriptBlockFormatter.Format(activity, 40, ToolDisplayMode.Verbose).Count);
+            TranscriptBlockFormatter.Format(activity, 80, ToolDisplayMode.Full).Count
+            != TranscriptBlockFormatter.Format(activity, 40, ToolDisplayMode.Full).Count);
 
         var contentRowsBeforeReflow = fixture.Shell.Transcript.ContentRowsForTest;
         fixture.HostApplication.Driver!.SetScreenSize(40, 24);

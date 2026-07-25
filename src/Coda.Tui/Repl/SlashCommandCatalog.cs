@@ -18,12 +18,14 @@ public static class SlashCommandCatalog
         new LogoutCommand(),
         new StatusCommand(),
         new TasksCommand(),
+        new ScheduleCommand(),
         new ProviderCommand(),
         new ModelCommand(),
         new EffortCommand(),
         new LogCommand(),
         new GoalCommand(),
         new OutputStyleCommand(),
+        new ThemeCommand(),
         new PermissionsCommand(),
         new YoloCommand(),
         new HeadersCommand(),
@@ -51,3 +53,5 @@ public static class SlashCommandCatalog
         new ExitCommand(),
     ];
 }
+
+

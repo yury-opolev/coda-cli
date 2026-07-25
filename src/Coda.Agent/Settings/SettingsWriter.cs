@@ -86,6 +86,37 @@ public static class SettingsWriter
     /// and all other settings keys. This is what the <c>/model</c> command writes so a model belongs
     /// to its provider — there is no provider-agnostic default model. Atomic (temp file + move).
     /// </summary>
+
+    /// <summary>
+    /// Set the persisted theme name. A <see langword="null"/> value leaves it unchanged;
+    /// an empty string removes it. Atomic (temp file + move), preserving all other keys.
+    /// </summary>
+    public static void SetUserTheme(string? themeName, string? userSettingsDir = null)
+    {
+        var homeDir = userSettingsDir
+            ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var dir = Path.Combine(homeDir, ".coda");
+        var file = Path.Combine(dir, "settings.json");
+
+        JsonObject root;
+        try
+        {
+            root = (File.Exists(file) ? JsonNode.Parse(File.ReadAllText(file)) as JsonObject : null) ?? new JsonObject();
+        }
+        catch (JsonException)
+        {
+            root = new JsonObject();
+        }
+
+        ApplyKey(root, "theme", themeName);
+
+        Directory.CreateDirectory(dir);
+        var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, file, overwrite: true);
+    }
     public static void SetUserModelForProvider(string providerId, string model, string? userSettingsDir = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(providerId);
@@ -169,4 +200,60 @@ public static class SettingsWriter
 
         root[key] = value;
     }
+
+    /// <summary>
+    /// Persist the reasoning effort level <b>for a specific (provider, model) pair</b>
+    /// under the <c>effortByModel</c> object (e.g. <c>"github-copilot/gpt-5.6-sol"</c> →
+    /// <c>"high"</c>), preserving all other settings keys. A <see langword="null"/>
+    /// <paramref name="effort"/> removes the key (reverts to the "auto" default).
+    /// Atomic (temp file + move).
+    /// </summary>
+    public static void SetUserEffortForModel(string providerId, string model, string? effort, string? userSettingsDir = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(providerId);
+        ArgumentException.ThrowIfNullOrWhiteSpace(model);
+
+        var homeDir = userSettingsDir
+            ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var dir = Path.Combine(homeDir, ".coda");
+        var file = Path.Combine(dir, "settings.json");
+
+        JsonObject root;
+        try
+        {
+            root = (File.Exists(file) ? JsonNode.Parse(File.ReadAllText(file)) as JsonObject : null) ?? new JsonObject();
+        }
+        catch (JsonException)
+        {
+            root = new JsonObject();
+        }
+
+        var key = $"{providerId}/{model}";
+        var byModel = root["effortByModel"] as JsonObject ?? new JsonObject();
+        if (effort is null)
+        {
+            byModel.Remove(key);
+        }
+        else
+        {
+            byModel[key] = effort;
+        }
+
+        if (byModel.Count > 0)
+        {
+            root["effortByModel"] = byModel;
+        }
+        else
+        {
+            root.Remove("effortByModel");
+        }
+
+        Directory.CreateDirectory(dir);
+        var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, file, overwrite: true);
+    }
 }
+

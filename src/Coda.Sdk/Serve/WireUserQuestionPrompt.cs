@@ -29,7 +29,7 @@ public sealed class WireUserQuestionPrompt : IUserQuestionPrompt
             var node = await this.connection
                 .SendRequestAsync(
                     ServeMethods.RequestQuestion,
-                    ServeJson.ToNode(new QuestionRequest(question, options, multiSelect)),
+                    ServeJson.ToNode(new QuestionRequest(question, options, multiSelect, AllowFreeText: true)),
                     cancellationToken)
                 .ConfigureAwait(false);
 

@@ -34,3 +34,22 @@ public sealed record ToolResultBlock(string ToolUseId, string Content, bool IsEr
 /// <see cref="Base64Data"/> is the base-64-encoded image bytes.
 /// </summary>
 public sealed record ImageBlock(string MediaType, string Base64Data) : ContentBlock;
+
+/// <summary>
+/// Accumulated model reasoning emitted during extended-thinking / reasoning-summary modes.
+/// <see cref="Text"/> is the full reasoning text.
+/// <see cref="Signature"/> is the opaque provider token required for round-trip replay (Anthropic
+/// signed-thinking token, OpenAI encrypted reasoning content), or <see langword="null"/> when the
+/// provider requires no replay token. A block without a signature is still displayed but is excluded
+/// from subsequent assistant history to avoid sending an invalid request.
+/// </summary>
+public sealed record ThinkingBlock(string Text, string? Signature) : ContentBlock;
+
+/// <summary>
+/// An opaque encrypted block that Anthropic emits in place of a <see cref="ThinkingBlock"/> when
+/// extended thinking is enabled and the reasoning content is redacted (e.g. during tool-use turns).
+/// The <see cref="Data"/> field is the verbatim encrypted payload; it must be preserved and
+/// re-serialized on the next request so the turn is not rejected by Anthropic.
+/// Unlike <see cref="ThinkingBlock"/>, there is no user-readable text — the block is fully opaque.
+/// </summary>
+public sealed record RedactedThinkingBlock(string Data) : ContentBlock;

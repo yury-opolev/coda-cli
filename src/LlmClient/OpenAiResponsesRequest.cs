@@ -1,3 +1,4 @@
+using System.Text.Json;
 using System.Text.Json.Nodes;
 
 namespace LlmClient;
@@ -104,6 +105,44 @@ public static class OpenAiResponsesRequest
 
     private static void AppendAssistantInput(JsonArray input, IReadOnlyList<ContentBlock> content)
     {
+        // Reasoning blocks with a signature (encrypted_content from a prior stateless turn)
+        // must be replayed before text/tool-call items so the model retains reasoning state.
+        foreach (var thinking in content.OfType<ThinkingBlock>())
+        {
+            if (thinking.Signature is not { Length: > 0 } signatureJson)
+            {
+                continue;
+            }
+
+            // The signature is a JSON object with "id" and "encrypted_content" fields, stored
+            // by OpenAiResponsesSseReader when the Responses API returned an encrypted_content.
+            try
+            {
+                using var doc = JsonDocument.Parse(signatureJson);
+                var sig = doc.RootElement;
+                var id = sig.TryGetProperty("id", out var idEl) && idEl.ValueKind == JsonValueKind.String
+                    ? idEl.GetString() ?? string.Empty
+                    : string.Empty;
+                var encContent = sig.TryGetProperty("encrypted_content", out var encEl) && encEl.ValueKind == JsonValueKind.String
+                    ? encEl.GetString()
+                    : null;
+
+                if (encContent is not null)
+                {
+                    input.Add(new JsonObject
+                    {
+                        ["type"] = "reasoning",
+                        ["id"] = id,
+                        ["encrypted_content"] = encContent,
+                    });
+                }
+            }
+            catch (JsonException)
+            {
+                // Malformed signature: skip safely rather than send an invalid request.
+            }
+        }
+
         var textParts = new JsonArray(
             [.. content.OfType<TextBlock>().Select(text => (JsonNode)new JsonObject
             {

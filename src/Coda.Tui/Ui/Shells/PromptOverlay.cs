@@ -7,23 +7,10 @@ using Terminal.Gui.Drivers;
 
 namespace Coda.Tui.Ui.Shells;
 
-/// <summary>
-/// A self-contained, keyboard-only prompt surface embedded in a Terminal.Gui shell. It renders one
-/// <see cref="UiPromptRequest"/> at a time as a bordered child view — never a nested Spectre widget
-/// or a second <c>Application.Run</c> — and answers it by publishing exactly one
-/// <see cref="UiPromptResponseSubmittedEvent"/>.
-/// </summary>
-/// <remarks>
-/// The overlay owns its own selection model (highlighted row, checked rows for multi-select, and a
-/// text/secret buffer) rather than deriving the answer from focused child controls, which keeps key
-/// handling deterministic and unit-testable without a running application loop. A single
-/// <see cref="completed"/> latch prevents a duplicate Enter (or a repeated activation) from
-/// publishing a second response for the same request.
-/// </remarks>
 internal sealed class PromptOverlay : View
 {
     private readonly IUiEventPublisher publisher;
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
     private readonly Label titleLabel;
     private readonly Label bodyLabel;
     private readonly HashSet<int> checkedIndices = [];
@@ -32,11 +19,12 @@ internal sealed class PromptOverlay : View
     private UiPromptRequest? request;
     private int selectedIndex;
     private bool completed;
+    private bool freeTextMode;
 
     public PromptOverlay(IUiEventPublisher publisher, TuiTheme? theme = null)
     {
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.CanFocus = true;
         this.Visible = false;
         this.BorderStyle = LineStyle.Rounded;
@@ -47,21 +35,16 @@ internal sealed class PromptOverlay : View
         this.Add(this.bodyLabel);
     }
 
-    /// <summary>Applies the Warm Ember prompt scheme, resolved for the given driver's color depth.</summary>
-    internal void ApplyTheme(IDriver? driver) =>
+    internal void ApplyTheme(TuiTheme theme, IDriver? driver)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
         this.SetScheme(this.theme.PromptScheme(driver));
+        this.SetNeedsDraw();
+    }
 
-    /// <summary>The request currently displayed, or <see langword="null"/> when the overlay is hidden.</summary>
     public UiPromptRequest? Request => this.request;
-
-    /// <summary>The rendered body text, exposed so tests can assert masking and option state.</summary>
     internal string BodyText => this.bodyLabel.Text ?? string.Empty;
 
-    /// <summary>
-    /// Shows <paramref name="next"/> (resetting interaction state for a new request id) or, when it
-    /// is <see langword="null"/>, hides the overlay. Re-applying the same request id refreshes the
-    /// rendered content without discarding the user's in-progress selection or text.
-    /// </summary>
     public void Update(UiPromptRequest? next)
     {
         if (next is null)
@@ -82,6 +65,7 @@ internal sealed class PromptOverlay : View
 
         this.request = next;
         this.completed = false;
+        this.freeTextMode = false;
         this.selectedIndex = InitialSelection(next);
         this.checkedIndices.Clear();
         this.textBuffer.Clear();
@@ -92,6 +76,7 @@ internal sealed class PromptOverlay : View
 
         this.Visible = true;
         this.Render();
+        this.InvokeHighlight();
     }
 
     protected override bool OnKeyDown(Key key)
@@ -108,8 +93,22 @@ internal sealed class PromptOverlay : View
 
         if (key == Key.Esc)
         {
+            if (this.freeTextMode)
+            {
+                // Esc in text-entry: return to the list without cancelling.
+                this.freeTextMode = false;
+                this.textBuffer.Clear();
+                this.Render();
+                return true;
+            }
+
             this.Complete(new UiPromptResponse(true, [], null));
             return true;
+        }
+
+        if (this.freeTextMode)
+        {
+            return this.HandleTextKey(key);
         }
 
         return this.request.Kind switch
@@ -132,7 +131,7 @@ internal sealed class PromptOverlay : View
 
     private bool HandleChoiceKey(UiPromptRequest req, Key key, bool multiSelect)
     {
-        var count = req.Options.Length;
+        var count = req.Options.Length + (req.AllowFreeText ? 1 : 0);
 
         if (key == Key.CursorDown || key == Key.Tab || key == Key.CursorRight)
         {
@@ -148,18 +147,31 @@ internal sealed class PromptOverlay : View
 
         if (multiSelect && key == Key.Space)
         {
-            this.Toggle(this.selectedIndex);
-            this.Render();
+            // Space does not toggle the synthetic free-text row.
+            if (!req.AllowFreeText || this.selectedIndex < req.Options.Length)
+            {
+                this.Toggle(this.selectedIndex);
+                this.Render();
+            }
+
             return true;
         }
 
         if (key == Key.Enter || (!multiSelect && key == Key.Space))
         {
+            if (req.AllowFreeText && this.selectedIndex == req.Options.Length)
+            {
+                // The user chose the synthetic "✎ Type your own answer…" row.
+                this.freeTextMode = true;
+                this.textBuffer.Clear();
+                this.Render();
+                return true;
+            }
+
             this.Complete(this.BuildChoiceResponse(req, multiSelect));
             return true;
         }
 
-        // Swallow every other key so navigation never escapes the modal overlay.
         return true;
     }
 
@@ -236,6 +248,7 @@ internal sealed class PromptOverlay : View
         }
 
         this.selectedIndex = ((this.selectedIndex + delta) % count + count) % count;
+        this.InvokeHighlight();
         this.Render();
     }
 
@@ -244,6 +257,17 @@ internal sealed class PromptOverlay : View
         if (!this.checkedIndices.Add(index))
         {
             this.checkedIndices.Remove(index);
+        }
+    }
+
+    private void InvokeHighlight()
+    {
+        if (this.request is { OnHighlight: { } cb, Options.Length: > 0 } req
+            && req.Kind is not (UiPromptKind.Text or UiPromptKind.Secret)
+            && this.selectedIndex < req.Options.Length)
+        {
+            var idx = Math.Clamp(this.selectedIndex, 0, req.Options.Length - 1);
+            cb(req.Options[idx].Id);
         }
     }
 
@@ -262,6 +286,11 @@ internal sealed class PromptOverlay : View
 
     private string RenderBody(UiPromptRequest req)
     {
+        if (this.freeTextMode)
+        {
+            return this.textBuffer.ToString();
+        }
+
         switch (req.Kind)
         {
             case UiPromptKind.Text:
@@ -280,11 +309,18 @@ internal sealed class PromptOverlay : View
                         ? (this.checkedIndices.Contains(i) ? "[x] " : "[ ] ")
                         : string.Empty;
                     builder.Append(cursor).Append(' ').Append(mark).Append(UiPromptOptionFormatter.Format(option));
+                    builder.Append('\n');
+                }
 
-                    if (i < req.Options.Length - 1)
-                    {
-                        builder.Append('\n');
-                    }
+                if (req.AllowFreeText)
+                {
+                    var freeTextCursor = this.selectedIndex == req.Options.Length ? ">" : " ";
+                    builder.Append(freeTextCursor).Append(" \u270e Type your own answer\u2026");
+                }
+                else if (builder.Length > 0)
+                {
+                    // Remove the trailing newline added by the last option.
+                    builder.Remove(builder.Length - 1, 1);
                 }
 
                 return builder.ToString();

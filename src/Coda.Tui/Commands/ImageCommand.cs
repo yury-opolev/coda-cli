@@ -1,3 +1,4 @@
+using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using LlmClient;
@@ -76,13 +77,30 @@ public sealed class ImageCommand : ISlashCommand
 
         var bytes = await File.ReadAllBytesAsync(path, cancellationToken).ConfigureAwait(false);
         var base64 = Convert.ToBase64String(bytes);
+
+        var validationError = ImageAttachmentValidation.Validate(mediaType, base64);
+        if (validationError is not null)
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup(Markup.Escape(validationError)));
+            return CommandResult.Continue;
+        }
+
         var block = new ImageBlock(mediaType, base64);
-        context.Session.PendingImages.Add(block);
+
+        // When a live composer is available, insert an [Image N] token so the attachment is positioned in
+        // the message; the token-scan turn composer then attaches only referenced images. Without a composer
+        // (plain/non-interactive), stage without a token so the image is auto-included on the next turn.
+        var tokenInserted = context.DraftInsertCallback is not null;
+        var label = context.Session.StageImage(block, tokenInserted);
+        if (tokenInserted)
+        {
+            context.DraftInsertCallback!.Invoke($"[Image {label}]");
+        }
 
         var fileName = Path.GetFileName(path);
         var sizeKb = bytes.Length / 1024.0;
         context.Console.MarkupLine(Theme.DimMarkup(
-            $"Attached {Markup.Escape(fileName)} ({sizeKb:F1} KB). It will be sent with your next message."));
+            $"Attached {Markup.Escape(fileName)} as [Image {label}] ({sizeKb:F1} KB). It will be sent with your next message."));
 
         return CommandResult.Continue;
     }

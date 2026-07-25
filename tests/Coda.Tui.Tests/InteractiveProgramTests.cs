@@ -14,8 +14,49 @@ using Spectre.Console.Testing;
 
 namespace Coda.Tui.Tests;
 
+[Collection("ThemeState")]
 public sealed class InteractiveProgramTests
 {
+    [Fact]
+    public void Startup_theme_is_seeded_from_settings()
+    {
+        var events = new RecordingUiEvents();
+        var original = CodaThemes.Current;
+        try
+        {
+            DefaultInteractiveSessionRunner.ApplyStartupTheme(new Coda.Agent.Settings.CodaSettings([], [], []) { Theme = "cool-dark" }, events);
+
+            Assert.Equal("cool-dark", CodaThemes.Current.Name);
+            Assert.DoesNotContain(events.Events, e => e is DiagnosticEvent);
+        }
+        finally
+        {
+            CodaThemes.Set(original);
+        }
+    }
+
+    [Fact]
+    public void Startup_theme_falls_back_to_default_and_warns_for_invalid_setting()
+    {
+        var events = new RecordingUiEvents();
+        var original = CodaThemes.Current;
+        try
+        {
+            CodaThemes.Set(CodaThemes.CoolDark);
+
+            DefaultInteractiveSessionRunner.ApplyStartupTheme(new Coda.Agent.Settings.CodaSettings([], [], []) { Theme = "mystery" }, events);
+
+            Assert.Equal("default", CodaThemes.Current.Name);
+            var diagnostic = Assert.Single(events.Events.OfType<DiagnosticEvent>());
+            Assert.Equal("settings", diagnostic.Source);
+            Assert.Equal(UiNotificationLevel.Warning, diagnostic.Level);
+            Assert.Equal(ThemeResolver.InvalidValueWarning("mystery"), diagnostic.Message);
+        }
+        finally
+        {
+            CodaThemes.Set(original);
+        }
+    }
     [Fact]
     public void Semantic_startup_renders_the_helpful_banner_into_the_transcript()
     {
@@ -660,3 +701,6 @@ public sealed class DefaultInteractiveSessionRunnerExitSummaryTests
         public override DateTimeOffset GetUtcNow() => now;
     }
 }
+
+
+

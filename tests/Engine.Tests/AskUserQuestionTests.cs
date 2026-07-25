@@ -102,6 +102,35 @@ public sealed class AskUserQuestionTests
     }
 
     [Fact]
+    public async Task Tool_result_uses_user_answered_prefix()
+    {
+        var prompt = new FakeUserQuestionPrompt("Option B");
+        var ctx = new ToolContext(".") { UserQuestion = prompt };
+        var tool = new AskUserQuestionTool();
+
+        var result = await tool.ExecuteAsync(
+            Json("""{"question":"Which approach?","options":["Option A","Option B","Option C"]}"""),
+            ctx);
+
+        Assert.Contains("User answered:", result.Content);
+        Assert.DoesNotContain("User selected:", result.Content);
+    }
+
+    [Fact]
+    public async Task Tool_result_user_answered_carries_the_answer()
+    {
+        var prompt = new FakeUserQuestionPrompt("free typed answer");
+        var ctx = new ToolContext(".") { UserQuestion = prompt };
+        var tool = new AskUserQuestionTool();
+
+        var result = await tool.ExecuteAsync(
+            Json("""{"question":"Type anything","options":["A","B"]}"""),
+            ctx);
+
+        Assert.Equal("User answered: free typed answer", result.Content);
+    }
+
+    [Fact]
     public async Task Passes_question_and_options_to_prompt()
     {
         var prompt = new FakeUserQuestionPrompt("Yes");

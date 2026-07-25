@@ -8,7 +8,7 @@ internal static class OperationalStatusProjector
 {
     public static OperationalStatus Project(
         UiSessionSnapshot snapshot,
-        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose)
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Full)
     {
         ArgumentNullException.ThrowIfNull(snapshot);
 
@@ -30,7 +30,7 @@ internal static class OperationalStatusProjector
 
         if (LastActiveTool(snapshot) is { } tool)
         {
-            return toolDisplayMode == ToolDisplayMode.Tiny
+            return toolDisplayMode == ToolDisplayMode.Hidden
                 ? new("Working", OperationalTone.Working, true)
                 : tool.IsActivity && toolDisplayMode == ToolDisplayMode.Summary
                     ? new($"Working · {tool.ActivityCallCount} tools", OperationalTone.Working, true)

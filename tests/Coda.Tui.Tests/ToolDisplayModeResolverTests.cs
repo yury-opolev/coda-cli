@@ -29,10 +29,10 @@ public sealed class ToolDisplayModeResolverTests
     }
 
     [Theory]
-    [InlineData("  VeRbOsE  ", ToolDisplayMode.Verbose)]
+    [InlineData("  FuLl  ", ToolDisplayMode.Full)]
     [InlineData("  CoMpAcT  ", ToolDisplayMode.Compact)]
     [InlineData("  SuMmArY  ", ToolDisplayMode.Summary)]
-    [InlineData("  TiNy  ", ToolDisplayMode.Tiny)]
+    [InlineData("  HiDdEn  ", ToolDisplayMode.Hidden)]
     public void Explicit_values_are_case_insensitive_while_raw_value_is_preserved(
         string raw,
         ToolDisplayMode expected)
@@ -42,6 +42,17 @@ public sealed class ToolDisplayModeResolverTests
         Assert.Equal(expected, resolution.Mode);
         Assert.True(resolution.IsValid);
         Assert.Equal(raw, resolution.RawValue);
+    }
+
+    [Theory]
+    [InlineData("verbose")]
+    [InlineData("tiny")]
+    public void Old_values_verbose_and_tiny_are_now_invalid(string raw)
+    {
+        var resolution = ToolDisplayModeResolver.Resolve(raw);
+
+        Assert.Equal(ToolDisplayMode.Summary, resolution.Mode);
+        Assert.False(resolution.IsValid);
     }
 
     [Fact]

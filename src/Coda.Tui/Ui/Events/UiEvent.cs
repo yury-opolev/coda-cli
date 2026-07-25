@@ -38,6 +38,21 @@ public sealed record AssistantTextDeltaEvent(string Delta) : UiEvent;
 /// <summary>The assistant finished streaming text for the current turn.</summary>
 public sealed record AssistantTextCompletedEvent : UiEvent;
 
+/// <summary>
+/// A chunk of model reasoning text for the current burst. <see cref="BurstStartedAt"/> is the
+/// timestamp captured by the sink when the burst's first delta arrived — used by the reducer to set
+/// <see cref="ThinkingTranscriptBlock.StartedAt"/> on block creation (subsequent deltas ignore it).
+/// </summary>
+public sealed record ThinkingDeltaEvent(string Delta, DateTimeOffset BurstStartedAt) : UiEvent;
+
+/// <summary>
+/// The current reasoning burst completed. <see cref="ElapsedMs"/> is the wall-clock duration of the
+/// burst, computed by the <see cref="TuiAgentSink"/> from its injectable <see cref="TimeProvider"/>.
+/// <see cref="ThinkingTokens"/> is the provider-reported token count for the burst, or
+/// <see langword="null"/> when the provider does not report per-burst counts.
+/// </summary>
+public sealed record ThinkingCompleteEvent(long ElapsedMs, int? ThinkingTokens = null) : UiEvent;
+
 /// <summary>A tool invocation started.</summary>
 public sealed record ToolStartedEvent(
     string ToolName,

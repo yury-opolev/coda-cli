@@ -1,8 +1,11 @@
 using System.Collections.Immutable;
+using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
 using Coda.Tui.Ui.Mcp;
@@ -42,7 +45,13 @@ internal class FullscreenTuiShell(
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
     Func<McpBrowserProvider?>? mcpBrowserProvider = null,
-    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
+    Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
+    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
+    IUrlOpener? urlOpener = null,
+    IPrivateBrowserResolver? privateBrowserResolver = null,
+    IUiPromptService? linkPromptService = null,
+    IClipboardImageReader? imageReader = null,
+    Func<ClipboardImage, string?>? imagePaste = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -58,7 +67,13 @@ internal class FullscreenTuiShell(
         statusProjection,
         taskBrowserProvider: taskBrowserProvider,
         mcpBrowserProvider: mcpBrowserProvider,
-        toolDisplayMode: toolDisplayMode)
+        scheduleBrowserProvider: scheduleBrowserProvider,
+        toolDisplayMode: toolDisplayMode,
+        urlOpener: urlOpener,
+        privateBrowserResolver: privateBrowserResolver,
+        linkPromptService: linkPromptService,
+        imageReader: imageReader,
+        imagePaste: imagePaste)
 {
     /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
     /// visual line (the chrome adds the two half-block edge rows around it).</summary>
@@ -113,7 +128,7 @@ internal class FullscreenTuiShell(
         // after Application.Init) and before the first draw. Header, status, transcript, and completion
         // carry no explicit scheme, so they inherit this uniform background; the composer and prompt
         // overlay set their own schemes below and keep them.
-        this.SetScheme(TuiTheme.WarmEmber.SurfaceScheme(this.HostApp.Driver));
+        this.SetScheme(this.Theme.SurfaceScheme(this.HostApp.Driver));
 
         this.header = new Label { CanFocus = false };
         this.header.X = 0;
@@ -202,6 +217,15 @@ internal class FullscreenTuiShell(
             this.Add(mcpOverlay);
         }
 
+        if (this.ScheduleOverlay is { } scheduleOverlay)
+        {
+            scheduleOverlay.X = 0;
+            scheduleOverlay.Y = 0;
+            scheduleOverlay.Width = Dim.Fill();
+            scheduleOverlay.Height = Dim.Fill();
+            this.Add(scheduleOverlay);
+        }
+
         this.Add(this.PromptOverlay);
     }
 
@@ -245,6 +269,14 @@ internal class FullscreenTuiShell(
     /// overlaying the transcript. The chrome, composer, navigation and operational rows, and status stay
     /// pinned to the bottom, so the menu never displaces them.
     /// </summary>
+    protected override void RebuildThemeSchemes()
+    {
+        base.RebuildThemeSchemes();
+        this.SetScheme(this.Theme.SurfaceScheme(this.HostApp.Driver));
+        this.Composer.SetScheme(this.Chrome.CreateInputScheme(this.HostApp.Driver));
+        this.jumpHint?.ApplyTheme(this.Theme, this.HostApp.Driver);
+    }
+
     protected override void PlaceCompletion(int height, bool visible)
     {
         this.Completion.Y = Pos.AnchorEnd(this.composerHeight + height + NavigationChromeHeight + 4);

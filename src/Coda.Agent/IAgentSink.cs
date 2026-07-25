@@ -50,6 +50,20 @@ public interface IAgentSink
     void OnError(string message);
 
     /// <summary>
+    /// A chunk of model reasoning text for the current burst. The first delta implicitly starts a burst;
+    /// bursts interleave with tool calls in multi-step turns. Default: no-op.
+    /// </summary>
+    void OnThinking(string delta) { }
+
+    /// <summary>
+    /// The current reasoning burst is complete (its block is now fully accumulated and ready for
+    /// history replay). <paramref name="thinkingTokens"/> is the provider-reported token count for
+    /// the burst, or <see langword="null"/> when the provider does not report per-burst counts.
+    /// Default: no-op.
+    /// </summary>
+    void OnThinkingComplete(int? thinkingTokens = null) { }
+
+    /// <summary>
     /// A recoverable per-turn limit was hit and the turn ended early — this is NOT a crash.
     /// <paramref name="kind"/> is a stable machine-readable reason (e.g. "max_tokens",
     /// "max_tool_iterations"); the session returns to idle and the run can be continued. Optional.

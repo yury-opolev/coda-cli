@@ -12,15 +12,54 @@ namespace Coda.Tui.Agent;
 public sealed class TuiAgentSink : IAgentSink
 {
     private readonly IUiEventPublisher publisher;
+    private readonly TimeProvider timeProvider;
 
-    public TuiAgentSink(IUiEventPublisher publisher)
+    // Tracks the start of the currently active thinking burst using both a timestamp (for accurate
+    // elapsed measurement) and a wall-clock time (for display in the block). Reset to null on
+    // OnThinkingComplete so each burst gets its own StartedAt and ElapsedMs.
+    private long? currentBurstStartTick;
+    private DateTimeOffset currentBurstStartedAt;
+
+    public TuiAgentSink(IUiEventPublisher publisher, TimeProvider? timeProvider = null)
     {
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
+        this.timeProvider = timeProvider ?? TimeProvider.System;
     }
 
     public void OnAssistantText(string delta) => this.publisher.Publish(new AssistantTextDeltaEvent(delta));
 
     public void OnAssistantTextComplete() => this.publisher.Publish(new AssistantTextCompletedEvent());
+
+    /// <summary>
+    /// Publishes a <see cref="ThinkingDeltaEvent"/>. The <see cref="ThinkingDeltaEvent.BurstStartedAt"/>
+    /// is captured from the injected <see cref="TimeProvider"/> on the first delta of each burst and
+    /// reused for all subsequent deltas in the same burst, so the reducer can determine when the burst
+    /// started without a clock seam of its own.
+    /// </summary>
+    public void OnThinking(string delta)
+    {
+        if (this.currentBurstStartTick is null)
+        {
+            this.currentBurstStartTick = this.timeProvider.GetTimestamp();
+            this.currentBurstStartedAt = this.timeProvider.GetUtcNow();
+        }
+
+        this.publisher.Publish(new ThinkingDeltaEvent(delta, this.currentBurstStartedAt));
+    }
+
+    /// <summary>
+    /// Publishes a <see cref="ThinkingCompleteEvent"/> with the burst's wall-clock elapsed time computed
+    /// from the injected <see cref="TimeProvider"/>, then resets the burst start so the next burst is
+    /// tracked independently. Forwards <paramref name="thinkingTokens"/> to the event unchanged.
+    /// </summary>
+    public void OnThinkingComplete(int? thinkingTokens = null)
+    {
+        var elapsedMs = this.currentBurstStartTick is { } startTick
+            ? (long)this.timeProvider.GetElapsedTime(startTick).TotalMilliseconds
+            : 0L;
+        this.currentBurstStartTick = null;
+        this.publisher.Publish(new ThinkingCompleteEvent(elapsedMs, thinkingTokens));
+    }
 
     public void OnToolCall(string toolName, string inputJson) =>
         this.publisher.Publish(new ToolStartedEvent(toolName, inputJson));

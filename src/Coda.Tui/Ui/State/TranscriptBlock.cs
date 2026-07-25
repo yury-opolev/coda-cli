@@ -105,3 +105,19 @@ public sealed record NoticeTranscriptBlock(Guid Id, string Text, UiNotificationL
 
 /// <summary>A boundary marker inserted when a new session begins in the same transcript.</summary>
 public sealed record SessionBoundaryTranscriptBlock(Guid Id, string SessionId) : TranscriptBlock(Id);
+
+/// <summary>
+/// One contiguous model-reasoning burst. A turn with multiple thinking/tool interleaves produces
+/// multiple blocks in order. <see cref="StartedAt"/> is the timestamp of the first delta; while the
+/// burst is active <see cref="ElapsedMs"/> is <see langword="null"/> and renderers compute live
+/// elapsed from <see cref="StartedAt"/>; it is frozen on <see cref="Complete"/>. <see
+/// cref="ThinkingTokens"/> is the normalized token count from the provider usage stream when present.
+/// </summary>
+public sealed record ThinkingTranscriptBlock(
+    Guid Id,
+    string Text,
+    bool Complete,
+    DateTimeOffset StartedAt,
+    long? ElapsedMs,
+    int? ThinkingTokens)
+    : TranscriptBlock(Id);

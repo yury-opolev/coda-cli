@@ -9,6 +9,20 @@ using Markdig.Syntax.Inlines;
 
 namespace Coda.Tui.Ui.Rendering;
 
+/// <summary>
+/// A contiguous column range on a single rendered line that is a hyperlink. Part A carries the span
+/// metadata so the draw path can style it; Part B will use it for hit-testing and opening.
+/// </summary>
+/// <param name="StartColumn">Inclusive start cell column of the link (or sub-span) on this render line.</param>
+/// <param name="EndColumn">Exclusive end cell column of the link (or sub-span) on this render line.</param>
+/// <param name="Url">The destination URL (always http/https from markdown or autolinks).</param>
+/// <param name="TextMatchesUrl">
+/// <see langword="true"/> when the display text unambiguously identifies the destination (bare autolink,
+/// or display text equals the URL or its host/authority, case-insensitively). <see langword="false"/>
+/// (deceptive) when the visible text hides a different destination.
+/// </param>
+public readonly record struct LinkSpan(int StartColumn, int EndColumn, string Url, bool TextMatchesUrl);
+
 /// <summary>Visual role of a rendered transcript line, used to pick a color/attribute at draw time.</summary>
 public enum TranscriptRole
 {
@@ -32,6 +46,18 @@ public enum TranscriptRole
     ContextMessages,
     ContextAutocompactBuffer,
     ContextFreeSpace,
+
+    // Five GitHub-style admonition callout roles, one per type. Title rows use the callout role so they
+    // render in the type's hue; body text rows stay Assistant for readable neutral color.
+    CalloutNote,
+    CalloutTip,
+    CalloutImportant,
+    CalloutWarning,
+    CalloutCaution,
+
+    /// <summary>A queued user message that has not yet been delivered: rendered with a dim user foreground
+    /// and a <c>[pending]</c> prefix on the first line so it reads as muted until sent.</summary>
+    PendingUser,
 }
 
 /// <summary>A single rendered transcript line: display text plus the role that colors it.</summary>
@@ -58,8 +84,70 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     /// <summary>Cells intentionally left blank after <see cref="RightText"/>.</summary>
     public int RightTextTrailingCells { get; init; }
 
+    /// <summary>
+    /// When greater than zero, the first <c>PrefixCells</c> display cells of <see cref="Text"/> are painted
+    /// in <see cref="PrefixRole"/> rather than <see cref="Role"/>. The bar text (e.g. <c>│ </c>) stays in
+    /// <see cref="Text"/> so copy/selection still includes it; only its COLOR comes from the prefix role.
+    /// Selection highlight still wins over the prefix color within its range.
+    /// </summary>
+    public int PrefixCells { get; init; }
+
+    /// <summary>The role (and thus color) applied to the first <see cref="PrefixCells"/> cells of the row.</summary>
+    public TranscriptRole PrefixRole { get; init; }
+
+    /// <summary>
+    /// Zero or more hyperlink spans on this render line. Each span records the inclusive column range,
+    /// destination URL, and whether the display text honestly identifies the destination. Null when the
+    /// row has no links, keeping the common (non-link) path allocation-free.
+    /// A single logical link whose text wraps across multiple render lines contributes one
+    /// <see cref="LinkSpan"/> per line, all sharing the same <see cref="LinkSpan.Url"/>.
+    /// </summary>
+    public IReadOnlyList<LinkSpan>? Links { get; init; }
+
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
+
+    // The auto-generated record equality compares IReadOnlyList<LinkSpan>? by reference, which would
+    // break IncrementalMarkdownFormatterTests (two lists with identical content from separate renders
+    // would not be equal). Override to compare Links by content.
+    public bool Equals(TranscriptRenderLine other) =>
+        this.Text == other.Text &&
+        this.Role == other.Role &&
+        this.FillWidth == other.FillWidth &&
+        this.RightText == other.RightText &&
+        this.RightTextTrailingCells == other.RightTextTrailingCells &&
+        this.PrefixCells == other.PrefixCells &&
+        this.PrefixRole == other.PrefixRole &&
+        LinksContentEqual(this.Links, other.Links);
+
+    private static bool LinksContentEqual(IReadOnlyList<LinkSpan>? a, IReadOnlyList<LinkSpan>? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null) return false;
+        if (a.Count != b.Count) return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (a[i] != b[i]) return false;
+        }
+
+        return true;
+    }
+
+    public override int GetHashCode()
+    {
+        var hash = HashCode.Combine(
+            this.Text, (int)this.Role, this.FillWidth, this.RightText,
+            this.RightTextTrailingCells, this.PrefixCells, (int)this.PrefixRole);
+        if (this.Links is not null)
+        {
+            foreach (var link in this.Links)
+            {
+                hash = HashCode.Combine(hash, link);
+            }
+        }
+
+        return hash;
+    }
 }
 
 /// <summary>
@@ -73,17 +161,19 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
 /// </summary>
 public static class TranscriptBlockFormatter
 {
-    private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder().Build();
+    private static readonly MarkdownPipeline Pipeline =
+        new MarkdownPipelineBuilder().UseAutoLinks().Build();
 
     /// <summary>Projects <paramref name="block"/> onto wrapped, attributed lines for the given cell width.</summary>
     public static IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block, int width) =>
-        Format(block, width, ToolDisplayMode.Verbose);
+        Format(block, width, ToolDisplayMode.Full);
 
     /// <summary>Projects <paramref name="block"/> using the requested tool display mode.</summary>
     public static IReadOnlyList<TranscriptRenderLine> Format(
         TranscriptBlock block,
         int width,
-        ToolDisplayMode toolDisplayMode)
+        ToolDisplayMode toolDisplayMode,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(block);
 
@@ -105,7 +195,7 @@ public static class TranscriptBlockFormatter
                 break;
 
             case ToolTranscriptBlock tool:
-                if (toolDisplayMode != ToolDisplayMode.Tiny)
+                if (toolDisplayMode != ToolDisplayMode.Hidden)
                 {
                     AppendTool(lines, tool, safeWidth, toolDisplayMode);
                 }
@@ -142,6 +232,14 @@ public static class TranscriptBlockFormatter
             case SessionBoundaryTranscriptBlock boundary:
                 AppendWrapped(lines, $"── session {boundary.SessionId} ──", safeWidth, TranscriptRole.Notification);
                 break;
+
+            case ThinkingTranscriptBlock thinking:
+                if (toolDisplayMode != ToolDisplayMode.Hidden)
+                {
+                    AppendThinking(lines, thinking, safeWidth, toolDisplayMode, timeProvider);
+                }
+
+                break;
         }
 
         return lines;
@@ -151,7 +249,7 @@ public static class TranscriptBlockFormatter
     public static string FormatPlainText(
         TranscriptBlock block,
         int width,
-        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose) =>
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Full) =>
         string.Join('\n', Format(block, width, toolDisplayMode).Select(line => line.Text));
 
     /// <summary>
@@ -258,11 +356,11 @@ public static class TranscriptBlockFormatter
         switch (node)
         {
             case HeadingBlock heading:
-                AppendWrapped(lines, RenderInline(heading.Inline), width, TranscriptRole.Heading, indent);
+                AppendWrappedInline(lines, heading.Inline, width, TranscriptRole.Heading, indent);
                 break;
 
             case ParagraphBlock paragraph:
-                AppendWrapped(lines, RenderInline(paragraph.Inline), width, TranscriptRole.Assistant, indent);
+                AppendWrappedInline(lines, paragraph.Inline, width, TranscriptRole.Assistant, indent);
                 break;
 
             case Markdig.Syntax.CodeBlock code:
@@ -270,16 +368,24 @@ public static class TranscriptBlockFormatter
                 break;
 
             case QuoteBlock quote:
-                var innerFirst = true;
-                foreach (var child in quote)
+                var callout = DetectCallout(quote);
+                if (callout is { } type)
                 {
-                    if (!innerFirst)
+                    AppendCallout(lines, quote, type, width, indent);
+                }
+                else
+                {
+                    var innerFirst = true;
+                    foreach (var child in quote)
                     {
-                        lines.Add(new TranscriptRenderLine(indent, TranscriptRole.Assistant));
-                    }
+                        if (!innerFirst)
+                        {
+                            lines.Add(new TranscriptRenderLine(indent, TranscriptRole.Assistant));
+                        }
 
-                    innerFirst = false;
-                    AppendBlock(lines, child, width, indent);
+                        innerFirst = false;
+                        AppendBlock(lines, child, width, indent);
+                    }
                 }
 
                 break;
@@ -289,9 +395,217 @@ public static class TranscriptBlockFormatter
                 break;
 
             case LeafBlock leaf when leaf.Inline is not null:
-                AppendWrapped(lines, RenderInline(leaf.Inline), width, TranscriptRole.Assistant, indent);
+                AppendWrappedInline(lines, leaf.Inline, width, TranscriptRole.Assistant, indent);
                 break;
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Callout detection and rendering (GitHub-style > [!TYPE] blockquote syntax)
+    // ---------------------------------------------------------------------------
+
+    private enum CalloutType { Note, Tip, Important, Warning, Caution }
+
+    /// <summary>
+    /// Returns the unicode or ASCII glyph for a callout <see cref="TranscriptRole"/>.
+    /// Unicode is used in production; the ASCII form is the fallback for environments that cannot
+    /// display the unicode symbol (exposed <c>internal</c> so tests can verify both forms).
+    /// </summary>
+    internal static string CalloutGlyph(TranscriptRole role, bool ascii = false) => role switch
+    {
+        TranscriptRole.CalloutNote => ascii ? "i" : "ℹ",
+        TranscriptRole.CalloutTip => ascii ? "*" : "✦",
+        TranscriptRole.CalloutImportant => ascii ? "!!" : "‼",
+        TranscriptRole.CalloutWarning => ascii ? "!" : "⚠",
+        TranscriptRole.CalloutCaution => ascii ? "x" : "⊗",
+        _ => ascii ? "?" : "ℹ",
+    };
+
+    /// <summary>
+    /// Checks whether <paramref name="quote"/>'s first block is a paragraph whose leading inline text
+    /// is exactly <c>[!TYPE]</c> (case-insensitive, optional surrounding whitespace). Returns the
+    /// recognized <see cref="CalloutType"/>, or <c>null</c> when the blockquote is a plain quote.
+    /// GitHub semantics: the marker must be alone on the first line; trailing text or an unknown type
+    /// make this a plain blockquote (no false positives).
+    /// </summary>
+    private static CalloutType? DetectCallout(QuoteBlock quote)
+    {
+        if (quote.Count == 0 || quote[0] is not ParagraphBlock firstParagraph)
+        {
+            return null;
+        }
+
+        var container = firstParagraph.Inline;
+        if (container is null)
+        {
+            return null;
+        }
+
+        // Collect consecutive LiteralInline nodes from the start of the paragraph until the first
+        // non-literal. Per GitHub semantics, the marker must be ALONE on the first line: if anything
+        // other than a LineBreakInline (soft/hard break) immediately follows the leading literals, the
+        // marker has inline-formatted content on the same line (emphasis, code, link, …) and is NOT a
+        // callout. A LineBreakInline means the marker ends cleanly at a line boundary.
+        var firstLineText = new System.Text.StringBuilder();
+        foreach (var inline in container)
+        {
+            if (inline is LiteralInline literal)
+            {
+                firstLineText.Append(literal.Content.ToString());
+            }
+            else if (inline is LineBreakInline)
+            {
+                // Clean line break — the marker occupies the first line alone.
+                break;
+            }
+            else
+            {
+                // Inline-formatted content (emphasis, code span, link, image, …) on the same line
+                // as the marker → not a valid callout per GitHub spec.
+                return null;
+            }
+        }
+
+        return ParseCalloutType(firstLineText.ToString());
+    }
+
+    /// <summary>
+    /// Parses a trimmed first-line string as a callout marker (<c>[!TYPE]</c>). Returns the
+    /// <see cref="CalloutType"/> when the string is exactly <c>[!TYPE]</c> with no extra content;
+    /// returns <c>null</c> for unknown types, trailing text, or malformed markers.
+    /// </summary>
+    private static CalloutType? ParseCalloutType(string markerText)
+    {
+        var trimmed = markerText.Trim();
+        if (trimmed.Length < 4 || trimmed[0] != '[' || trimmed[1] != '!' || trimmed[^1] != ']')
+        {
+            return null;
+        }
+
+        // Inner text must match exactly (no interior whitespace); ToUpperInvariant gives case-insensitivity.
+        var type = trimmed[2..^1];
+        return type.ToUpperInvariant() switch
+        {
+            "NOTE" => CalloutType.Note,
+            "TIP" => CalloutType.Tip,
+            "IMPORTANT" => CalloutType.Important,
+            "WARNING" => CalloutType.Warning,
+            "CAUTION" => CalloutType.Caution,
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Returns the <see cref="TranscriptRole"/> and display label for a callout type.
+    /// </summary>
+    private static (TranscriptRole Role, string Label) CalloutRoleAndLabel(CalloutType type) => type switch
+    {
+        CalloutType.Note => (TranscriptRole.CalloutNote, "NOTE"),
+        CalloutType.Tip => (TranscriptRole.CalloutTip, "TIP"),
+        CalloutType.Important => (TranscriptRole.CalloutImportant, "IMPORTANT"),
+        CalloutType.Warning => (TranscriptRole.CalloutWarning, "WARNING"),
+        CalloutType.Caution => (TranscriptRole.CalloutCaution, "CAUTION"),
+        _ => (TranscriptRole.CalloutNote, "NOTE"),
+    };
+
+    /// <summary>
+    /// Renders a detected callout: a glyph+label title row in the callout's role, followed by body rows
+    /// each prefixed with <c>│ </c>. The bar glyph stays in the row text (so copy still includes it);
+    /// its color comes from <c>PrefixRole</c> set to the callout role while the body text uses the normal
+    /// <c>Role</c> (Assistant, Code, …).
+    /// </summary>
+    private static void AppendCallout(
+        List<TranscriptRenderLine> lines,
+        QuoteBlock quote,
+        CalloutType type,
+        int width,
+        string indent)
+    {
+        var (role, label) = CalloutRoleAndLabel(type);
+        var glyph = CalloutGlyph(role);
+
+        // Title row: "<glyph> LABEL" in the callout role.
+        AppendWrapped(lines, $"{glyph} {label}", width, role, indent);
+
+        // Body bar prefix: each body row is indented with "│ " so the bar is visible as the
+        // left boundary of the callout body, mirroring the list-indent discipline.
+        var barPrefix = indent + "│ ";
+        // The bar glyph and trailing space together occupy this many display cells; these cells
+        // are drawn in the callout role color via PrefixRole/PrefixCells on each body row.
+        var prefixCells = TerminalCellText.Width(barPrefix);
+        var firstParagraph = (ParagraphBlock)quote[0];
+
+        var bodyStart = lines.Count;
+        AppendCalloutFirstParagraphBody(lines, firstParagraph, width, barPrefix);
+
+        // Subsequent child blocks of the blockquote (second paragraph onward, code blocks, etc.).
+        var hadBody = lines.Count > bodyStart;
+        for (var i = 1; i < quote.Count; i++)
+        {
+            if (hadBody)
+            {
+                lines.Add(new TranscriptRenderLine(barPrefix, TranscriptRole.Assistant));
+            }
+
+            hadBody = true;
+            AppendBlock(lines, quote[i], width, barPrefix);
+        }
+
+        // Apply prefix coloring to all body rows: the first PrefixCells cells (the "│ " bar) draw in
+        // the callout role color; the remainder draws in the row's own Role (Assistant, Code, …).
+        // The `with` expression preserves all other properties including Links.
+        for (var j = bodyStart; j < lines.Count; j++)
+        {
+            lines[j] = lines[j] with { PrefixCells = prefixCells, PrefixRole = role };
+        }
+    }
+
+    /// <summary>
+    /// Renders the body portion of a callout's first paragraph (everything after the <c>[!TYPE]</c>
+    /// marker line) through the link-aware path so that URLs in the body produce
+    /// <see cref="LinkSpan"/>s exactly like subsequent paragraphs do.
+    /// </summary>
+    /// <remarks>
+    /// Markdig folds the marker line and the body line into a single <see cref="ParagraphBlock"/>
+    /// separated by a <see cref="LineBreakInline"/>. This method skips every inline up to and including
+    /// that break, then renders the remaining siblings with <see cref="AppendWrappedText"/>.
+    /// Does nothing when the paragraph contains only the marker (no body content).
+    /// </remarks>
+    private static void AppendCalloutFirstParagraphBody(
+        List<TranscriptRenderLine> lines,
+        ParagraphBlock firstParagraph,
+        int width,
+        string barPrefix)
+    {
+        // Walk the inline tree to find the LineBreakInline that ends the [!TYPE] marker.
+        Inline? bodyStart = null;
+        if (firstParagraph.Inline is not null)
+        {
+            foreach (var node in firstParagraph.Inline)
+            {
+                if (node is LineBreakInline)
+                {
+                    bodyStart = node.NextSibling;
+                    break;
+                }
+            }
+        }
+
+        if (bodyStart is null)
+        {
+            return; // marker-only paragraph — no body to render
+        }
+
+        // Render body inlines using the same per-node helper that RenderInlineWithLinks uses,
+        // but walking NextSibling rather than iterating a ContainerInline.
+        var linkRecords = new List<InlineLinkRecord>();
+        var builder = new StringBuilder();
+        for (var node = bodyStart; node is not null; node = node.NextSibling)
+        {
+            RenderInlineNodeWithLinks(node, builder, linkRecords);
+        }
+
+        AppendWrappedText(lines, builder.ToString(), linkRecords, width, TranscriptRole.Assistant, barPrefix);
     }
 
     private static void AppendList(List<TranscriptRenderLine> lines, ListBlock list, int width, string indent)
@@ -388,7 +702,7 @@ public static class TranscriptBlockFormatter
 
         AppendPreformatted(lines, header.ToString(), width, role);
 
-        if (toolDisplayMode == ToolDisplayMode.Verbose && tool.Result is { Length: > 0 } result)
+        if (toolDisplayMode == ToolDisplayMode.Full && tool.Result is { Length: > 0 } result)
         {
             foreach (var line in SplitLines(result))
             {
@@ -408,7 +722,7 @@ public static class TranscriptBlockFormatter
     {
         switch (toolDisplayMode)
         {
-            case ToolDisplayMode.Tiny:
+            case ToolDisplayMode.Hidden:
                 return;
             case ToolDisplayMode.Summary:
                 AppendToolActivitySummary(lines, activity, width);
@@ -417,9 +731,105 @@ public static class TranscriptBlockFormatter
                 AppendToolActivityCompact(lines, activity, width);
                 return;
             default:
-                AppendToolActivityVerbose(lines, activity, width);
+                AppendToolActivityFull(lines, activity, width);
                 return;
         }
+    }
+
+    /// <summary>
+    /// Projects a <see cref="ThinkingTranscriptBlock"/> per the requested display mode.
+    /// <list type="bullet">
+    /// <item><term>Full</term><description>Status line + full reasoning text (streamed tail while active).</description></item>
+    /// <item><term>Compact</term><description>Status line + last ~5 lines of reasoning (streamed tail).</description></item>
+    /// <item><term>Summary</term><description>Status one-liner only.</description></item>
+    /// </list>
+    /// Hidden is already guarded by the caller. Elapsed time is computed live from <see
+    /// cref="ThinkingTranscriptBlock.StartedAt"/> when the block is active and frozen from
+    /// <see cref="ThinkingTranscriptBlock.ElapsedMs"/> when complete.
+    /// </summary>
+    private static void AppendThinking(
+        List<TranscriptRenderLine> lines,
+        ThinkingTranscriptBlock thinking,
+        int width,
+        ToolDisplayMode displayMode,
+        TimeProvider? timeProvider = null)
+    {
+        var status = FormatThinkingStatus(thinking, timeProvider);
+        AppendWrapped(lines, status, width, TranscriptRole.Notification);
+
+        if (displayMode == ToolDisplayMode.Summary)
+        {
+            return;
+        }
+
+        if (string.IsNullOrEmpty(thinking.Text))
+        {
+            return;
+        }
+
+        if (displayMode == ToolDisplayMode.Full)
+        {
+            // Full: stream the entire reasoning; completed turns show all text.
+            AppendMarkdown(lines, thinking.Text, width);
+            return;
+        }
+
+        // Compact: show the last ~5 lines (streaming tail) without re-parsing the full markdown.
+        // We split the raw text, take the tail, and append as preformatted lines.
+        const int CompactTailLines = 5;
+        var allLines = SplitLines(thinking.Text).ToList();
+        // Remove trailing empty lines to avoid wasted blank rows at the tail.
+        while (allLines.Count > 0 && string.IsNullOrEmpty(allLines[^1]))
+        {
+            allLines.RemoveAt(allLines.Count - 1);
+        }
+
+        var tailStart = Math.Max(0, allLines.Count - CompactTailLines);
+        for (var i = tailStart; i < allLines.Count; i++)
+        {
+            foreach (var wrapped in WrapPreformatted(allLines[i], width))
+            {
+                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.Notification));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the one-line thinking status: "💭 Thinking… Xs · N tok" while active, or
+    /// "💭 Thought for Xs" when complete. Elapsed is computed live when the burst is active,
+    /// using the injected <paramref name="timeProvider"/> (defaults to <see cref="TimeProvider.System"/>).
+    /// </summary>
+    private static string FormatThinkingStatus(ThinkingTranscriptBlock thinking, TimeProvider? timeProvider = null)
+    {
+        long elapsedMs;
+        if (thinking.ElapsedMs is { } frozen)
+        {
+            elapsedMs = frozen;
+        }
+        else
+        {
+            // Live: compute from StartedAt via the injectable clock so tests are deterministic.
+            // The render loop drives periodic refresh so the elapsed ticks are decoupled from delta arrival.
+            var now = (timeProvider ?? TimeProvider.System).GetUtcNow();
+            elapsedMs = (long)Math.Max(0, (now - thinking.StartedAt.ToUniversalTime()).TotalMilliseconds);
+        }
+
+        var seconds = elapsedMs / 1000;
+        var sb = new StringBuilder();
+        if (thinking.Complete)
+        {
+            sb.Append("\U0001f4ad Thought for ").Append(seconds).Append('s');
+        }
+        else
+        {
+            sb.Append("\U0001f4ad Thinking\u2026 ").Append(seconds).Append('s');
+            if (thinking.ThinkingTokens is { } tokens)
+            {
+                sb.Append(" \u00b7 ").Append(tokens.ToString(CultureInfo.InvariantCulture)).Append(" tok");
+            }
+        }
+
+        return sb.ToString();
     }
 
     private static void AppendToolActivitySummary(
@@ -490,7 +900,7 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendToolActivityVerbose(
+    private static void AppendToolActivityFull(
         List<TranscriptRenderLine> lines,
         ToolActivityTranscriptBlock activity,
         int width)
@@ -604,6 +1014,449 @@ public static class TranscriptBlockFormatter
         }
     }
 
+    // ---------------------------------------------------------------------------
+    // Link-aware inline rendering (Part A — extraction + data model)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>A link span expressed as character offsets in the pre-wrap rendered string,
+    /// plus the destination URL and whether the display text honestly identifies it.</summary>
+    private readonly record struct InlineLinkRecord(int CharStart, int CharEnd, string Url, bool TextMatchesUrl);
+
+    /// <summary>
+    /// The deceptive-link warning glyph appended immediately after a deceptive link's display text.
+    /// ⚠ (U+26A0) is already used by the WARNING callout and verified to occupy exactly one terminal cell.
+    /// </summary>
+    private const char DeceptiveMarker = '\u26a0'; // ⚠
+
+    /// <summary>
+    /// Link-aware variant of <see cref="AppendWrapped"/> for blocks whose content comes from Markdig
+    /// inline trees (paragraphs, headings, generic leaf blocks). Records link spans in terms of
+    /// character positions in the rendered string, then threads them through <see cref="WrapLineWithLinks"/>
+    /// so each produced <see cref="TranscriptRenderLine"/> carries the <see cref="LinkSpan"/>s that
+    /// intersect its column range.
+    /// </summary>
+    private static void AppendWrappedInline(
+        List<TranscriptRenderLine> lines,
+        ContainerInline? container,
+        int width,
+        TranscriptRole role,
+        string indent = "")
+    {
+        var linkRecords = new List<InlineLinkRecord>();
+        var text = RenderInlineWithLinks(container, linkRecords);
+        AppendWrappedText(lines, text, linkRecords, width, role, indent);
+    }
+
+    /// <summary>
+    /// Wraps <paramref name="text"/> (with associated <paramref name="linkRecords"/>) into one or more
+    /// <see cref="TranscriptRenderLine"/> entries, applying <paramref name="indent"/> and shifting link
+    /// column spans by the indent's display-cell width. Shared between
+    /// <see cref="AppendWrappedInline"/> and <see cref="AppendCalloutFirstParagraphBody"/>.
+    /// </summary>
+    private static void AppendWrappedText(
+        List<TranscriptRenderLine> lines,
+        string text,
+        List<InlineLinkRecord> linkRecords,
+        int width,
+        TranscriptRole role,
+        string indent)
+    {
+        var contentWidth = EffectiveWidth(width, indent);
+
+        // WrapLineWithLinks produces LinkSpan columns relative to the wrapped text (column 0 = start of
+        // the wrapped text). When the line is stored as (indent + wrappedText) the indent cells sit before
+        // the text, so every link column must be shifted right by the indent's display-cell width.
+        var indentWidth = TerminalCellText.Width(indent);
+
+        // SplitLines may yield multiple source lines (e.g. from a hard line break inside an inline).
+        // Link records are relative to the full rendered text; adjust them per source line.
+        var lineCharOffset = 0;
+        foreach (var sourceLine in SplitLines(text))
+        {
+            var lineEnd = lineCharOffset + sourceLine.Length;
+
+            // Clip and shift link records to be relative to this source line.
+            List<InlineLinkRecord>? lineLinks = null;
+            foreach (var rec in linkRecords)
+            {
+                if (rec.CharEnd <= lineCharOffset || rec.CharStart >= lineEnd)
+                {
+                    continue;
+                }
+
+                var clipped = new InlineLinkRecord(
+                    Math.Max(0, rec.CharStart - lineCharOffset),
+                    Math.Min(sourceLine.Length, rec.CharEnd - lineCharOffset),
+                    rec.Url,
+                    rec.TextMatchesUrl);
+                (lineLinks ??= new List<InlineLinkRecord>()).Add(clipped);
+            }
+
+            foreach (var (wrappedText, links) in WrapLineWithLinks(sourceLine, contentWidth, lineLinks))
+            {
+                lines.Add(new TranscriptRenderLine(indent + wrappedText, role)
+                {
+                    Links = ShiftLinkSpans(links, indentWidth),
+                });
+            }
+
+            lineCharOffset += sourceLine.Length + 1; // +1 for the '\n' separator consumed by SplitLines
+        }
+    }
+
+    /// <summary>
+    /// Returns a new list with every span's <see cref="LinkSpan.StartColumn"/> and
+    /// <see cref="LinkSpan.EndColumn"/> increased by <paramref name="shift"/> cells. Returns the
+    /// original reference unchanged when <paramref name="shift"/> is zero or the list is empty.
+    /// </summary>
+    private static IReadOnlyList<LinkSpan>? ShiftLinkSpans(IReadOnlyList<LinkSpan>? links, int shift)
+    {
+        if (links is null || links.Count == 0 || shift == 0)
+        {
+            return links;
+        }
+
+        var shifted = new List<LinkSpan>(links.Count);
+        foreach (var span in links)
+        {
+            shifted.Add(span with { StartColumn = span.StartColumn + shift, EndColumn = span.EndColumn + shift });
+        }
+
+        return shifted;
+    }
+
+    /// <summary>
+    /// Renders an inline container to a string, collecting hyperlink spans as character-offset records.
+    /// Deceptive links (display text does not identify the destination) have ⚠ appended so the span
+    /// covers the marker. Non-link and image nodes are rendered identically to <see cref="RenderInline"/>.
+    /// </summary>
+    private static string RenderInlineWithLinks(ContainerInline? container, List<InlineLinkRecord> links)
+    {
+        if (container is null)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        RenderInlineWithLinks(container, builder, links);
+        return builder.ToString();
+    }
+
+    private static void RenderInlineWithLinks(ContainerInline container, StringBuilder builder, List<InlineLinkRecord> links)
+    {
+        foreach (var inline in container)
+        {
+            RenderInlineNodeWithLinks(inline, builder, links);
+        }
+    }
+
+    /// <summary>
+    /// Renders a single <see cref="Inline"/> node into <paramref name="builder"/>, recording any
+    /// hyperlink span into <paramref name="links"/>. Shared by
+    /// <see cref="RenderInlineWithLinks(ContainerInline,StringBuilder,List{InlineLinkRecord})"/> (which
+    /// iterates a container) and the callout body walker (which iterates <c>NextSibling</c> links).
+    /// </summary>
+    private static void RenderInlineNodeWithLinks(Inline inline, StringBuilder builder, List<InlineLinkRecord> links)
+    {
+        switch (inline)
+        {
+            case LiteralInline literal:
+                builder.Append(literal.Content.ToString());
+                break;
+
+            case CodeInline code:
+                builder.Append(code.Content);
+                break;
+
+            case LineBreakInline lineBreak:
+                builder.Append(lineBreak.IsHard ? '\n' : ' ');
+                break;
+
+            case LinkInline link:
+                var linkStart = builder.Length;
+                // Render the display text (recurse into children; for images this is the alt text).
+                RenderInlineWithLinks(link, builder, links);
+                var linkUrl = link.Url ?? string.Empty;
+                // If no children produced text and we have a URL, use the URL as fallback display text
+                // (handles links without explicit text in non-image links).
+                if (builder.Length == linkStart && linkUrl.Length > 0 && !link.IsImage)
+                {
+                    builder.Append(linkUrl);
+                }
+
+                // Record link spans only for actual hyperlinks (not images) with non-empty URLs.
+                if (!link.IsImage && linkUrl.Length > 0)
+                {
+                    var displayText = builder.ToString()[linkStart..];
+                    var textMatchesUrl = ComputeTextMatchesUrl(displayText, linkUrl);
+                    if (!textMatchesUrl)
+                    {
+                        builder.Append(DeceptiveMarker);
+                    }
+
+                    links.Add(new InlineLinkRecord(linkStart, builder.Length, linkUrl, textMatchesUrl));
+                }
+
+                break;
+
+            case ContainerInline nested:
+                RenderInlineWithLinks(nested, builder, links);
+                break;
+        }
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when <paramref name="displayText"/> (trimmed, case-insensitive)
+    /// equals the full URL or equals the URL's host/authority (e.g. "example.com" for an https URL).
+    /// </summary>
+    private static bool ComputeTextMatchesUrl(string displayText, string url)
+    {
+        if (string.IsNullOrEmpty(url))
+        {
+            return true;
+        }
+
+        var trimmed = displayText.Trim();
+        if (string.Equals(trimmed, url, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+            string.Equals(trimmed, uri.Authority, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Link-aware word wrapping
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Wraps a single pre-rendered logical line by display cells, threading link span records through so
+    /// each yielded wrapped line gets the <see cref="LinkSpan"/>s (with line-local column positions) that
+    /// fall on it. Functionally identical to <see cref="WrapLine"/> when <paramref name="linkRecords"/> is
+    /// null or empty.
+    /// </summary>
+    private static IEnumerable<(string Text, IReadOnlyList<LinkSpan>? Links)> WrapLineWithLinks(
+        string line,
+        int width,
+        IReadOnlyList<InlineLinkRecord>? linkRecords)
+    {
+        var cellWidth = width > 0 ? width : 1;
+        if (line.Length == 0)
+        {
+            yield return (string.Empty, null);
+            yield break;
+        }
+
+        var current = new StringBuilder();
+        var currentWidth = 0;
+        var currentPlacements = new List<(string Word, int WordCharStart, int LineCol)>();
+
+        foreach (var (word, wordCharStart) in SplitWordsWithCharPositions(line))
+        {
+            if (word.Length == 0)
+            {
+                continue;
+            }
+
+            var wordWidth = TerminalCellText.Width(word);
+
+            if (currentWidth == 0)
+            {
+                // Line is empty: place word or hard-break it.
+                if (wordWidth <= cellWidth)
+                {
+                    currentPlacements.Add((word, wordCharStart, 0));
+                    current.Append(word);
+                    currentWidth = wordWidth;
+                }
+                else
+                {
+                    foreach (var (chunk, chunkCharStart, chunkWidth, isLast) in BreakWordWithCharPositions(word, wordCharStart, cellWidth))
+                    {
+                        if (isLast)
+                        {
+                            currentPlacements.Add((chunk, chunkCharStart, 0));
+                            current.Append(chunk);
+                            currentWidth = chunkWidth;
+                        }
+                        else
+                        {
+                            var chunkPlacements = new List<(string, int, int)> { (chunk, chunkCharStart, 0) };
+                            yield return (chunk, ComputeLinkSpans(chunkPlacements, linkRecords));
+                        }
+                    }
+                }
+
+                continue;
+            }
+
+            if (currentWidth + 1 + wordWidth <= cellWidth)
+            {
+                // Word fits on the current line.
+                currentPlacements.Add((word, wordCharStart, currentWidth + 1));
+                current.Append(' ').Append(word);
+                currentWidth += 1 + wordWidth;
+                continue;
+            }
+
+            // Word does not fit: flush the current line and start a new one.
+            yield return (current.ToString(), ComputeLinkSpans(currentPlacements, linkRecords));
+            current.Clear();
+            currentPlacements.Clear();
+            currentWidth = 0;
+
+            if (wordWidth <= cellWidth)
+            {
+                currentPlacements.Add((word, wordCharStart, 0));
+                current.Append(word);
+                currentWidth = wordWidth;
+            }
+            else
+            {
+                foreach (var (chunk, chunkCharStart, chunkWidth, isLast) in BreakWordWithCharPositions(word, wordCharStart, cellWidth))
+                {
+                    if (isLast)
+                    {
+                        currentPlacements.Add((chunk, chunkCharStart, 0));
+                        current.Append(chunk);
+                        currentWidth = chunkWidth;
+                    }
+                    else
+                    {
+                        var chunkPlacements = new List<(string, int, int)> { (chunk, chunkCharStart, 0) };
+                        yield return (chunk, ComputeLinkSpans(chunkPlacements, linkRecords));
+                    }
+                }
+            }
+        }
+
+        yield return (current.ToString(), ComputeLinkSpans(currentPlacements, linkRecords));
+    }
+
+    /// <summary>
+    /// Splits <paramref name="line"/> at space boundaries, yielding each word and its inclusive
+    /// character start position within <paramref name="line"/>. Empty words (from consecutive spaces)
+    /// are included so the caller can skip them.
+    /// </summary>
+    private static IEnumerable<(string Word, int CharStart)> SplitWordsWithCharPositions(string line)
+    {
+        var start = 0;
+        for (var i = 0; i < line.Length; i++)
+        {
+            if (line[i] == ' ')
+            {
+                yield return (line[start..i], start);
+                start = i + 1;
+            }
+        }
+
+        yield return (line[start..], start);
+    }
+
+    /// <summary>
+    /// Breaks an over-long word into display-cell-bounded chunks, also tracking each chunk's absolute
+    /// character start position within the original source line (not just within the word).
+    /// </summary>
+    private static IEnumerable<(string Chunk, int ChunkAbsCharStart, int Width, bool IsLast)> BreakWordWithCharPositions(
+        string word,
+        int wordAbsCharStart,
+        int width)
+    {
+        var chunks = new List<(string Chunk, int ChunkAbsCharStart, int Width)>();
+        var builder = new StringBuilder();
+        var builderWidth = 0;
+        var chunkAbsStart = wordAbsCharStart;
+
+        foreach (var element in TerminalCellText.Enumerate(word))
+        {
+            var clusterWidth = element.CellWidth;
+
+            if (builderWidth > 0 && builderWidth + clusterWidth > width)
+            {
+                chunks.Add((builder.ToString(), chunkAbsStart, builderWidth));
+                builder.Clear();
+                builderWidth = 0;
+                chunkAbsStart = wordAbsCharStart + element.Utf16Start;
+            }
+
+            builder.Append(element.Text);
+            builderWidth += clusterWidth;
+        }
+
+        if (builder.Length > 0)
+        {
+            chunks.Add((builder.ToString(), chunkAbsStart, builderWidth));
+        }
+
+        for (var i = 0; i < chunks.Count; i++)
+        {
+            yield return (chunks[i].Chunk, chunks[i].ChunkAbsCharStart, chunks[i].Width, i == chunks.Count - 1);
+        }
+    }
+
+    /// <summary>
+    /// Given the word placements on one wrapped line and the full set of link records (already adjusted
+    /// to be relative to the source line), returns the <see cref="LinkSpan"/>s that fall on this wrapped
+    /// line with columns measured from the line's left edge (column 0).
+    /// </summary>
+    private static IReadOnlyList<LinkSpan>? ComputeLinkSpans(
+        IReadOnlyList<(string Word, int WordCharStart, int LineCol)> wordPlacements,
+        IReadOnlyList<InlineLinkRecord>? linkRecords)
+    {
+        if (linkRecords is null || linkRecords.Count == 0 || wordPlacements.Count == 0)
+        {
+            return null;
+        }
+
+        List<LinkSpan>? result = null;
+
+        foreach (var rec in linkRecords)
+        {
+            int? linkColStart = null;
+            int? linkColEnd = null;
+
+            foreach (var (word, wordCharStart, lineCol) in wordPlacements)
+            {
+                var wordCharEnd = wordCharStart + word.Length;
+                // Skip words that do not overlap with the link's char range.
+                if (wordCharEnd <= rec.CharStart || wordCharStart >= rec.CharEnd)
+                {
+                    continue;
+                }
+
+                // Compute the overlap within the word and convert to column offsets.
+                var overlapStart = Math.Max(rec.CharStart, wordCharStart) - wordCharStart;
+                var overlapEnd = Math.Min(rec.CharEnd, wordCharEnd) - wordCharStart;
+                var colStart = lineCol + TerminalCellText.Width(word[..overlapStart]);
+                var colEnd = lineCol + TerminalCellText.Width(word[..overlapEnd]);
+
+                if (!linkColStart.HasValue || colStart < linkColStart.Value)
+                {
+                    linkColStart = colStart;
+                }
+
+                if (!linkColEnd.HasValue || colEnd > linkColEnd.Value)
+                {
+                    linkColEnd = colEnd;
+                }
+            }
+
+            if (linkColStart.HasValue && linkColEnd.HasValue && linkColStart.Value < linkColEnd.Value)
+            {
+                (result ??= new List<LinkSpan>()).Add(
+                    new LinkSpan(linkColStart.Value, linkColEnd.Value, rec.Url, rec.TextMatchesUrl));
+            }
+        }
+
+        return result;
+    }
+
     /// <summary>
     /// Projects a user message onto full-width background-block rows. When the block carries a send time it is
     /// formatted as a local <c>HH:mm</c> annotation on the first row; the first source line is wrapped into a
@@ -662,17 +1515,17 @@ public static class TranscriptBlockFormatter
 
     private static void AppendPendingUser(List<TranscriptRenderLine> lines, PendingUserTranscriptBlock pending, int width)
     {
-        var annotationPending = true;
+        var firstLine = true;
         foreach (var sourceLine in SplitLines(pending.Text))
         {
             foreach (var wrapped in WrapLine(sourceLine, width))
             {
-                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.User)
+                var text = firstLine ? "[pending] " + wrapped : wrapped;
+                firstLine = false;
+                lines.Add(new TranscriptRenderLine(text, TranscriptRole.PendingUser)
                 {
                     FillWidth = true,
-                    RightText = annotationPending ? "pending" : null,
                 });
-                annotationPending = false;
             }
         }
     }

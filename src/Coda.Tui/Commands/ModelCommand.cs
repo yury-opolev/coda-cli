@@ -3,6 +3,7 @@ using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Prompts;
+using LlmClient;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -99,6 +100,14 @@ public sealed class ModelCommand : ISlashCommand
         }
 
         context.Session.Model = model;
+
+        // Restore the persisted effort for the new (provider, model) key, resolved through the
+        // capability resolver so a stale or unsupported stored level is clamped or dropped.
+        var effortKey = $"{context.ActiveProvider.Id}/{model}";
+        context.Session.EffortByModel.TryGetValue(effortKey, out var storedEffort);
+        var effortCapability = ReasoningCapabilityResolver.Resolve(context.ActiveProvider.Id, model);
+        context.Session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(effortCapability, storedEffort);
+
         var note = this.persistModel(context.ActiveProvider.Id, model);
         context.Console.MarkupLine($"Model set to {Theme.AccentMarkup(model)} {Theme.DimMarkup(note)}");
         SessionMetadataEvents.Publish(context);
