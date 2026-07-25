@@ -74,6 +74,13 @@ internal sealed class TuiTheme
     public TuiThemeColor CalloutWarning { get; init; } = new(new TgColor(235, 165, 45), TgName.Yellow);
     public TuiThemeColor CalloutCaution { get; init; } = new(new TgColor(220, 90, 70), TgName.BrightRed);
 
+    /// <summary>Foreground color applied to honest link spans (display text identifies the destination).</summary>
+    public TuiThemeColor Link { get; init; } = new(new TgColor(110, 165, 215), TgName.BrightBlue);
+
+    /// <summary>Foreground color applied to deceptive link spans (display text hides the destination),
+    /// including the trailing ⚠ warning glyph. Chosen to visually warn without being aggressive.</summary>
+    public TuiThemeColor LinkDeceptive { get; init; } = new(new TgColor(215, 125, 55), TgName.Yellow);
+
     public TuiThemeColor ComposerText { get; init; } = new(new TgColor(242, 214, 179), TgName.White);
     public TuiThemeColor ComposerPrompt { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 

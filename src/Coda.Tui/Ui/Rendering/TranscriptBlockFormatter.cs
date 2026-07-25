@@ -9,6 +9,20 @@ using Markdig.Syntax.Inlines;
 
 namespace Coda.Tui.Ui.Rendering;
 
+/// <summary>
+/// A contiguous column range on a single rendered line that is a hyperlink. Part A carries the span
+/// metadata so the draw path can style it; Part B will use it for hit-testing and opening.
+/// </summary>
+/// <param name="StartColumn">Inclusive start cell column of the link (or sub-span) on this render line.</param>
+/// <param name="EndColumn">Exclusive end cell column of the link (or sub-span) on this render line.</param>
+/// <param name="Url">The destination URL (always http/https from markdown or autolinks).</param>
+/// <param name="TextMatchesUrl">
+/// <see langword="true"/> when the display text unambiguously identifies the destination (bare autolink,
+/// or display text equals the URL or its host/authority, case-insensitively). <see langword="false"/>
+/// (deceptive) when the visible text hides a different destination.
+/// </param>
+public readonly record struct LinkSpan(int StartColumn, int EndColumn, string Url, bool TextMatchesUrl);
+
 /// <summary>Visual role of a rendered transcript line, used to pick a color/attribute at draw time.</summary>
 public enum TranscriptRole
 {
@@ -77,8 +91,59 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     /// <summary>The role (and thus color) applied to the first <see cref="PrefixCells"/> cells of the row.</summary>
     public TranscriptRole PrefixRole { get; init; }
 
+    /// <summary>
+    /// Zero or more hyperlink spans on this render line. Each span records the inclusive column range,
+    /// destination URL, and whether the display text honestly identifies the destination. Null when the
+    /// row has no links, keeping the common (non-link) path allocation-free.
+    /// A single logical link whose text wraps across multiple render lines contributes one
+    /// <see cref="LinkSpan"/> per line, all sharing the same <see cref="LinkSpan.Url"/>.
+    /// </summary>
+    public IReadOnlyList<LinkSpan>? Links { get; init; }
+
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
+
+    // The auto-generated record equality compares IReadOnlyList<LinkSpan>? by reference, which would
+    // break IncrementalMarkdownFormatterTests (two lists with identical content from separate renders
+    // would not be equal). Override to compare Links by content.
+    public bool Equals(TranscriptRenderLine other) =>
+        this.Text == other.Text &&
+        this.Role == other.Role &&
+        this.FillWidth == other.FillWidth &&
+        this.RightText == other.RightText &&
+        this.RightTextTrailingCells == other.RightTextTrailingCells &&
+        this.PrefixCells == other.PrefixCells &&
+        this.PrefixRole == other.PrefixRole &&
+        LinksContentEqual(this.Links, other.Links);
+
+    private static bool LinksContentEqual(IReadOnlyList<LinkSpan>? a, IReadOnlyList<LinkSpan>? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null) return false;
+        if (a.Count != b.Count) return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (a[i] != b[i]) return false;
+        }
+
+        return true;
+    }
+
+    public override int GetHashCode()
+    {
+        var hash = HashCode.Combine(
+            this.Text, (int)this.Role, this.FillWidth, this.RightText,
+            this.RightTextTrailingCells, this.PrefixCells, (int)this.PrefixRole);
+        if (this.Links is not null)
+        {
+            foreach (var link in this.Links)
+            {
+                hash = HashCode.Combine(hash, link);
+            }
+        }
+
+        return hash;
+    }
 }
 
 /// <summary>
@@ -92,7 +157,8 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
 /// </summary>
 public static class TranscriptBlockFormatter
 {
-    private static readonly MarkdownPipeline Pipeline = new MarkdownPipelineBuilder().Build();
+    private static readonly MarkdownPipeline Pipeline =
+        new MarkdownPipelineBuilder().UseAutoLinks().Build();
 
     /// <summary>Projects <paramref name="block"/> onto wrapped, attributed lines for the given cell width.</summary>
     public static IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block, int width) =>
@@ -286,11 +352,11 @@ public static class TranscriptBlockFormatter
         switch (node)
         {
             case HeadingBlock heading:
-                AppendWrapped(lines, RenderInline(heading.Inline), width, TranscriptRole.Heading, indent);
+                AppendWrappedInline(lines, heading.Inline, width, TranscriptRole.Heading, indent);
                 break;
 
             case ParagraphBlock paragraph:
-                AppendWrapped(lines, RenderInline(paragraph.Inline), width, TranscriptRole.Assistant, indent);
+                AppendWrappedInline(lines, paragraph.Inline, width, TranscriptRole.Assistant, indent);
                 break;
 
             case Markdig.Syntax.CodeBlock code:
@@ -325,7 +391,7 @@ public static class TranscriptBlockFormatter
                 break;
 
             case LeafBlock leaf when leaf.Inline is not null:
-                AppendWrapped(lines, RenderInline(leaf.Inline), width, TranscriptRole.Assistant, indent);
+                AppendWrappedInline(lines, leaf.Inline, width, TranscriptRole.Assistant, indent);
                 break;
         }
     }
@@ -905,6 +971,421 @@ public static class TranscriptBlockFormatter
                 lines.Add(new TranscriptRenderLine(indent + wrapped, role));
             }
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Link-aware inline rendering (Part A — extraction + data model)
+    // ---------------------------------------------------------------------------
+
+    /// <summary>A link span expressed as character offsets in the pre-wrap rendered string,
+    /// plus the destination URL and whether the display text honestly identifies it.</summary>
+    private readonly record struct InlineLinkRecord(int CharStart, int CharEnd, string Url, bool TextMatchesUrl);
+
+    /// <summary>
+    /// The deceptive-link warning glyph appended immediately after a deceptive link's display text.
+    /// ⚠ (U+26A0) is already used by the WARNING callout and verified to occupy exactly one terminal cell.
+    /// </summary>
+    private const char DeceptiveMarker = '\u26a0'; // ⚠
+
+    /// <summary>
+    /// Link-aware variant of <see cref="AppendWrapped"/> for blocks whose content comes from Markdig
+    /// inline trees (paragraphs, headings, generic leaf blocks). Records link spans in terms of
+    /// character positions in the rendered string, then threads them through <see cref="WrapLineWithLinks"/>
+    /// so each produced <see cref="TranscriptRenderLine"/> carries the <see cref="LinkSpan"/>s that
+    /// intersect its column range.
+    /// </summary>
+    private static void AppendWrappedInline(
+        List<TranscriptRenderLine> lines,
+        ContainerInline? container,
+        int width,
+        TranscriptRole role,
+        string indent = "")
+    {
+        var linkRecords = new List<InlineLinkRecord>();
+        var text = RenderInlineWithLinks(container, linkRecords);
+        var contentWidth = EffectiveWidth(width, indent);
+
+        // WrapLineWithLinks produces LinkSpan columns relative to the wrapped text (column 0 = start of
+        // the wrapped text). When the line is stored as (indent + wrappedText) the indent cells sit before
+        // the text, so every link column must be shifted right by the indent's display-cell width.
+        var indentWidth = TerminalCellText.Width(indent);
+
+        // SplitLines may yield multiple source lines (e.g. from a hard line break inside an inline).
+        // Link records are relative to the full rendered text; adjust them per source line.
+        var lineCharOffset = 0;
+        foreach (var sourceLine in SplitLines(text))
+        {
+            var lineEnd = lineCharOffset + sourceLine.Length;
+
+            // Clip and shift link records to be relative to this source line.
+            List<InlineLinkRecord>? lineLinks = null;
+            foreach (var rec in linkRecords)
+            {
+                if (rec.CharEnd <= lineCharOffset || rec.CharStart >= lineEnd)
+                {
+                    continue;
+                }
+
+                var clipped = new InlineLinkRecord(
+                    Math.Max(0, rec.CharStart - lineCharOffset),
+                    Math.Min(sourceLine.Length, rec.CharEnd - lineCharOffset),
+                    rec.Url,
+                    rec.TextMatchesUrl);
+                (lineLinks ??= new List<InlineLinkRecord>()).Add(clipped);
+            }
+
+            foreach (var (wrappedText, links) in WrapLineWithLinks(sourceLine, contentWidth, lineLinks))
+            {
+                lines.Add(new TranscriptRenderLine(indent + wrappedText, role)
+                {
+                    Links = ShiftLinkSpans(links, indentWidth),
+                });
+            }
+
+            lineCharOffset += sourceLine.Length + 1; // +1 for the '\n' separator consumed by SplitLines
+        }
+    }
+
+    /// <summary>
+    /// Returns a new list with every span's <see cref="LinkSpan.StartColumn"/> and
+    /// <see cref="LinkSpan.EndColumn"/> increased by <paramref name="shift"/> cells. Returns the
+    /// original reference unchanged when <paramref name="shift"/> is zero or the list is empty.
+    /// </summary>
+    private static IReadOnlyList<LinkSpan>? ShiftLinkSpans(IReadOnlyList<LinkSpan>? links, int shift)
+    {
+        if (links is null || links.Count == 0 || shift == 0)
+        {
+            return links;
+        }
+
+        var shifted = new List<LinkSpan>(links.Count);
+        foreach (var span in links)
+        {
+            shifted.Add(span with { StartColumn = span.StartColumn + shift, EndColumn = span.EndColumn + shift });
+        }
+
+        return shifted;
+    }
+
+    /// <summary>
+    /// Renders an inline container to a string, collecting hyperlink spans as character-offset records.
+    /// Deceptive links (display text does not identify the destination) have ⚠ appended so the span
+    /// covers the marker. Non-link and image nodes are rendered identically to <see cref="RenderInline"/>.
+    /// </summary>
+    private static string RenderInlineWithLinks(ContainerInline? container, List<InlineLinkRecord> links)
+    {
+        if (container is null)
+        {
+            return string.Empty;
+        }
+
+        var builder = new StringBuilder();
+        RenderInlineWithLinks(container, builder, links);
+        return builder.ToString();
+    }
+
+    private static void RenderInlineWithLinks(ContainerInline container, StringBuilder builder, List<InlineLinkRecord> links)
+    {
+        foreach (var inline in container)
+        {
+            switch (inline)
+            {
+                case LiteralInline literal:
+                    builder.Append(literal.Content.ToString());
+                    break;
+
+                case CodeInline code:
+                    builder.Append(code.Content);
+                    break;
+
+                case LineBreakInline lineBreak:
+                    builder.Append(lineBreak.IsHard ? '\n' : ' ');
+                    break;
+
+                case LinkInline link:
+                    var linkStart = builder.Length;
+                    // Render the display text (recurse into children; for images this is the alt text).
+                    RenderInlineWithLinks(link, builder, links);
+                    var linkUrl = link.Url ?? string.Empty;
+                    // If no children produced text and we have a URL, use the URL as fallback display text
+                    // (handles links without explicit text in non-image links).
+                    if (builder.Length == linkStart && linkUrl.Length > 0 && !link.IsImage)
+                    {
+                        builder.Append(linkUrl);
+                    }
+
+                    // Record link spans only for actual hyperlinks (not images) with non-empty URLs.
+                    if (!link.IsImage && linkUrl.Length > 0)
+                    {
+                        var displayText = builder.ToString()[linkStart..];
+                        var textMatchesUrl = ComputeTextMatchesUrl(displayText, linkUrl);
+                        if (!textMatchesUrl)
+                        {
+                            builder.Append(DeceptiveMarker);
+                        }
+
+                        links.Add(new InlineLinkRecord(linkStart, builder.Length, linkUrl, textMatchesUrl));
+                    }
+
+                    break;
+
+                case ContainerInline nested:
+                    RenderInlineWithLinks(nested, builder, links);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when <paramref name="displayText"/> (trimmed, case-insensitive)
+    /// equals the full URL or equals the URL's host/authority (e.g. "example.com" for an https URL).
+    /// </summary>
+    private static bool ComputeTextMatchesUrl(string displayText, string url)
+    {
+        if (string.IsNullOrEmpty(url))
+        {
+            return true;
+        }
+
+        var trimmed = displayText.Trim();
+        if (string.Equals(trimmed, url, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        if (Uri.TryCreate(url, UriKind.Absolute, out var uri) &&
+            string.Equals(trimmed, uri.Authority, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    // ---------------------------------------------------------------------------
+    // Link-aware word wrapping
+    // ---------------------------------------------------------------------------
+
+    /// <summary>
+    /// Wraps a single pre-rendered logical line by display cells, threading link span records through so
+    /// each yielded wrapped line gets the <see cref="LinkSpan"/>s (with line-local column positions) that
+    /// fall on it. Functionally identical to <see cref="WrapLine"/> when <paramref name="linkRecords"/> is
+    /// null or empty.
+    /// </summary>
+    private static IEnumerable<(string Text, IReadOnlyList<LinkSpan>? Links)> WrapLineWithLinks(
+        string line,
+        int width,
+        IReadOnlyList<InlineLinkRecord>? linkRecords)
+    {
+        var cellWidth = width > 0 ? width : 1;
+        if (line.Length == 0)
+        {
+            yield return (string.Empty, null);
+            yield break;
+        }
+
+        var current = new StringBuilder();
+        var currentWidth = 0;
+        var currentPlacements = new List<(string Word, int WordCharStart, int LineCol)>();
+
+        foreach (var (word, wordCharStart) in SplitWordsWithCharPositions(line))
+        {
+            if (word.Length == 0)
+            {
+                continue;
+            }
+
+            var wordWidth = TerminalCellText.Width(word);
+
+            if (currentWidth == 0)
+            {
+                // Line is empty: place word or hard-break it.
+                if (wordWidth <= cellWidth)
+                {
+                    currentPlacements.Add((word, wordCharStart, 0));
+                    current.Append(word);
+                    currentWidth = wordWidth;
+                }
+                else
+                {
+                    foreach (var (chunk, chunkCharStart, chunkWidth, isLast) in BreakWordWithCharPositions(word, wordCharStart, cellWidth))
+                    {
+                        if (isLast)
+                        {
+                            currentPlacements.Add((chunk, chunkCharStart, 0));
+                            current.Append(chunk);
+                            currentWidth = chunkWidth;
+                        }
+                        else
+                        {
+                            var chunkPlacements = new List<(string, int, int)> { (chunk, chunkCharStart, 0) };
+                            yield return (chunk, ComputeLinkSpans(chunkPlacements, linkRecords));
+                        }
+                    }
+                }
+
+                continue;
+            }
+
+            if (currentWidth + 1 + wordWidth <= cellWidth)
+            {
+                // Word fits on the current line.
+                currentPlacements.Add((word, wordCharStart, currentWidth + 1));
+                current.Append(' ').Append(word);
+                currentWidth += 1 + wordWidth;
+                continue;
+            }
+
+            // Word does not fit: flush the current line and start a new one.
+            yield return (current.ToString(), ComputeLinkSpans(currentPlacements, linkRecords));
+            current.Clear();
+            currentPlacements.Clear();
+            currentWidth = 0;
+
+            if (wordWidth <= cellWidth)
+            {
+                currentPlacements.Add((word, wordCharStart, 0));
+                current.Append(word);
+                currentWidth = wordWidth;
+            }
+            else
+            {
+                foreach (var (chunk, chunkCharStart, chunkWidth, isLast) in BreakWordWithCharPositions(word, wordCharStart, cellWidth))
+                {
+                    if (isLast)
+                    {
+                        currentPlacements.Add((chunk, chunkCharStart, 0));
+                        current.Append(chunk);
+                        currentWidth = chunkWidth;
+                    }
+                    else
+                    {
+                        var chunkPlacements = new List<(string, int, int)> { (chunk, chunkCharStart, 0) };
+                        yield return (chunk, ComputeLinkSpans(chunkPlacements, linkRecords));
+                    }
+                }
+            }
+        }
+
+        yield return (current.ToString(), ComputeLinkSpans(currentPlacements, linkRecords));
+    }
+
+    /// <summary>
+    /// Splits <paramref name="line"/> at space boundaries, yielding each word and its inclusive
+    /// character start position within <paramref name="line"/>. Empty words (from consecutive spaces)
+    /// are included so the caller can skip them.
+    /// </summary>
+    private static IEnumerable<(string Word, int CharStart)> SplitWordsWithCharPositions(string line)
+    {
+        var start = 0;
+        for (var i = 0; i < line.Length; i++)
+        {
+            if (line[i] == ' ')
+            {
+                yield return (line[start..i], start);
+                start = i + 1;
+            }
+        }
+
+        yield return (line[start..], start);
+    }
+
+    /// <summary>
+    /// Breaks an over-long word into display-cell-bounded chunks, also tracking each chunk's absolute
+    /// character start position within the original source line (not just within the word).
+    /// </summary>
+    private static IEnumerable<(string Chunk, int ChunkAbsCharStart, int Width, bool IsLast)> BreakWordWithCharPositions(
+        string word,
+        int wordAbsCharStart,
+        int width)
+    {
+        var chunks = new List<(string Chunk, int ChunkAbsCharStart, int Width)>();
+        var builder = new StringBuilder();
+        var builderWidth = 0;
+        var chunkAbsStart = wordAbsCharStart;
+
+        foreach (var element in TerminalCellText.Enumerate(word))
+        {
+            var clusterWidth = element.CellWidth;
+
+            if (builderWidth > 0 && builderWidth + clusterWidth > width)
+            {
+                chunks.Add((builder.ToString(), chunkAbsStart, builderWidth));
+                builder.Clear();
+                builderWidth = 0;
+                chunkAbsStart = wordAbsCharStart + element.Utf16Start;
+            }
+
+            builder.Append(element.Text);
+            builderWidth += clusterWidth;
+        }
+
+        if (builder.Length > 0)
+        {
+            chunks.Add((builder.ToString(), chunkAbsStart, builderWidth));
+        }
+
+        for (var i = 0; i < chunks.Count; i++)
+        {
+            yield return (chunks[i].Chunk, chunks[i].ChunkAbsCharStart, chunks[i].Width, i == chunks.Count - 1);
+        }
+    }
+
+    /// <summary>
+    /// Given the word placements on one wrapped line and the full set of link records (already adjusted
+    /// to be relative to the source line), returns the <see cref="LinkSpan"/>s that fall on this wrapped
+    /// line with columns measured from the line's left edge (column 0).
+    /// </summary>
+    private static IReadOnlyList<LinkSpan>? ComputeLinkSpans(
+        IReadOnlyList<(string Word, int WordCharStart, int LineCol)> wordPlacements,
+        IReadOnlyList<InlineLinkRecord>? linkRecords)
+    {
+        if (linkRecords is null || linkRecords.Count == 0 || wordPlacements.Count == 0)
+        {
+            return null;
+        }
+
+        List<LinkSpan>? result = null;
+
+        foreach (var rec in linkRecords)
+        {
+            int? linkColStart = null;
+            int? linkColEnd = null;
+
+            foreach (var (word, wordCharStart, lineCol) in wordPlacements)
+            {
+                var wordCharEnd = wordCharStart + word.Length;
+                // Skip words that do not overlap with the link's char range.
+                if (wordCharEnd <= rec.CharStart || wordCharStart >= rec.CharEnd)
+                {
+                    continue;
+                }
+
+                // Compute the overlap within the word and convert to column offsets.
+                var overlapStart = Math.Max(rec.CharStart, wordCharStart) - wordCharStart;
+                var overlapEnd = Math.Min(rec.CharEnd, wordCharEnd) - wordCharStart;
+                var colStart = lineCol + TerminalCellText.Width(word[..overlapStart]);
+                var colEnd = lineCol + TerminalCellText.Width(word[..overlapEnd]);
+
+                if (!linkColStart.HasValue || colStart < linkColStart.Value)
+                {
+                    linkColStart = colStart;
+                }
+
+                if (!linkColEnd.HasValue || colEnd > linkColEnd.Value)
+                {
+                    linkColEnd = colEnd;
+                }
+            }
+
+            if (linkColStart.HasValue && linkColEnd.HasValue && linkColStart.Value < linkColEnd.Value)
+            {
+                (result ??= new List<LinkSpan>()).Add(
+                    new LinkSpan(linkColStart.Value, linkColEnd.Value, rec.Url, rec.TextMatchesUrl));
+            }
+        }
+
+        return result;
     }
 
     /// <summary>

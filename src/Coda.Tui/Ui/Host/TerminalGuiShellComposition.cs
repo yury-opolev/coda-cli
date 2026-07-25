@@ -3,6 +3,7 @@ using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
@@ -28,7 +29,10 @@ internal static class TerminalGuiShellComposition
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> transcriptFormatter,
         Func<TaskBrowserProvider?> taskBrowserProvider,
         Func<McpBrowserProvider?> mcpBrowserProvider,
-        ToolDisplayMode toolDisplayMode)
+        ToolDisplayMode toolDisplayMode,
+        IUrlOpener? urlOpener = null,
+        IPrivateBrowserResolver? privateBrowserResolver = null,
+        IUiPromptService? linkPromptService = null)
     {
         ArgumentNullException.ThrowIfNull(application);
         ArgumentNullException.ThrowIfNull(composer);
@@ -49,7 +53,10 @@ internal static class TerminalGuiShellComposition
                 transcriptFormatter: transcriptFormatter,
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
-                toolDisplayMode: toolDisplayMode)
+                toolDisplayMode: toolDisplayMode,
+                urlOpener: urlOpener,
+                privateBrowserResolver: privateBrowserResolver,
+                linkPromptService: linkPromptService)
             : new InlineTuiShell(
                 application,
                 composer,
@@ -59,6 +66,9 @@ internal static class TerminalGuiShellComposition
                 transcriptFormatter: transcriptFormatter,
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
-                toolDisplayMode: toolDisplayMode);
+                toolDisplayMode: toolDisplayMode,
+                urlOpener: urlOpener,
+                privateBrowserResolver: privateBrowserResolver,
+                linkPromptService: linkPromptService);
     }
 }

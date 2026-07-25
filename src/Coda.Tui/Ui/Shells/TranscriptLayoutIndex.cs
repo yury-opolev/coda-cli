@@ -29,6 +29,12 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
 
     /// <summary>The role (and thus color) applied to the first <see cref="PrefixCells"/> cells of the row.</summary>
     public TranscriptRole PrefixRole { get; init; }
+
+    /// <summary>
+    /// Zero or more hyperlink spans on this render line, mirrored from the corresponding
+    /// <see cref="TranscriptRenderLine.Links"/>. Null when the row has no links.
+    /// </summary>
+    public IReadOnlyList<LinkSpan>? Links { get; init; }
 }
 
 /// <summary>
@@ -294,6 +300,7 @@ internal sealed class TranscriptLayoutIndex
                     RightTextTrailingCells = line.RightTextTrailingCells,
                     PrefixCells = line.PrefixCells,
                     PrefixRole = line.PrefixRole,
+                    Links = line.Links,
                 });
             }
 

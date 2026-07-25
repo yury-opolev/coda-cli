@@ -2,6 +2,7 @@ using System.Collections.Immutable;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -42,7 +43,10 @@ internal class FullscreenTuiShell(
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
     Func<McpBrowserProvider?>? mcpBrowserProvider = null,
-    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
+    ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
+    IUrlOpener? urlOpener = null,
+    IPrivateBrowserResolver? privateBrowserResolver = null,
+    IUiPromptService? linkPromptService = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -58,7 +62,10 @@ internal class FullscreenTuiShell(
         statusProjection,
         taskBrowserProvider: taskBrowserProvider,
         mcpBrowserProvider: mcpBrowserProvider,
-        toolDisplayMode: toolDisplayMode)
+        toolDisplayMode: toolDisplayMode,
+        urlOpener: urlOpener,
+        privateBrowserResolver: privateBrowserResolver,
+        linkPromptService: linkPromptService)
 {
     /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
     /// visual line (the chrome adds the two half-block edge rows around it).</summary>

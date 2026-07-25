@@ -471,7 +471,10 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
-                toolDisplayMode: toolDisplayMode);
+                toolDisplayMode: toolDisplayMode,
+                urlOpener: DefaultUrlOpener.Instance,
+                privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
+                linkPromptService: actorPrompts);
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);

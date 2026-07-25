@@ -4,6 +4,7 @@ using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Agent;
 using Coda.Tui.Ui.Mcp;
+using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -59,6 +60,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly bool followsRegistryTheme;
     private bool disposed;
 
+    // Link-interaction seams
+    private readonly IUrlOpener urlOpener;
+    private readonly IPrivateBrowserResolver? privateBrowserResolver;
+    private readonly IUiPromptService? linkPromptService;
+    private PopoverMenu? transcriptLinkMenu;
+
     /// <summary>
     /// The exact set of sub-views this shell adds in <see cref="BuildLayout"/>. Any sub-view outside this
     /// set (the base <see cref="TextView"/> autocomplete popup, which appends itself to the running
@@ -82,7 +89,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<UiSessionSnapshot, int, string>? statusProjection = null,
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
         Func<McpBrowserProvider?>? mcpBrowserProvider = null,
-        ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default)
+        ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
+        IUrlOpener? urlOpener = null,
+        IPrivateBrowserResolver? privateBrowserResolver = null,
+        IUiPromptService? linkPromptService = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -97,6 +107,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.clipboardReader = clipboardReader ?? this.ReadApplicationClipboard;
         this.Theme = theme ?? CodaThemes.Current.Tui;
         this.followsRegistryTheme = theme is null;
+        this.urlOpener = urlOpener ?? DefaultUrlOpener.Instance;
+        this.privateBrowserResolver = privateBrowserResolver;
+        this.linkPromptService = linkPromptService;
         if (this.followsRegistryTheme)
         {
             CodaThemes.Changed += this.OnThemeChanged;
@@ -362,6 +375,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown += this.HandleUnhandledShellKey;
         transcript.CopyRequested += this.HandleTranscriptCopyRequested;
+        transcript.LinkActivated += this.HandleTranscriptLinkActivated;
+        transcript.LinkContextMenuRequested += this.HandleTranscriptLinkContextMenuRequested;
     }
 
     /// <summary>Unsubscribes a transcript previously bound with <see cref="BindTranscriptInput"/>.</summary>
@@ -370,6 +385,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown -= this.HandleUnhandledShellKey;
         transcript.CopyRequested -= this.HandleTranscriptCopyRequested;
+        transcript.LinkActivated -= this.HandleTranscriptLinkActivated;
+        transcript.LinkContextMenuRequested -= this.HandleTranscriptLinkContextMenuRequested;
     }
 
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
@@ -424,6 +441,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             {
                 CodaThemes.Changed -= this.OnThemeChanged;
             }
+
+            // Deregister the transcript link context menu if one was shown. Do this before
+            // base.Dispose so the app's Popovers are still accessible.
+            this.CleanupTranscriptLinkMenu();
 
             // Hide() cancels the pump, unsubscribes Changed, releases any pause lease (resuming the main
             // agent), and closes the controller — so a mode switch or shutdown never leaves the agent paused.
@@ -780,6 +801,230 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// same copy path as Ctrl+C.
     /// </summary>
     private void HandleTranscriptCopyRequested() => this.CopyTranscriptSelection();
+
+    // -----------------------------------------------------------------------
+    // Link activation (left-click) and context menu (right-click)
+    // -----------------------------------------------------------------------
+
+    /// <summary>Exposed for tests: the PopoverMenu shown on the last right-click link.</summary>
+    internal PopoverMenu? TranscriptLinkMenuForTest => this.transcriptLinkMenu;
+
+    /// <summary>Exposed for tests: the MenuItem list passed to the last transcript link context menu.</summary>
+    internal IReadOnlyList<MenuItem>? TranscriptLinkMenuItemsForTest { get; private set; }
+
+    /// <summary>
+    /// Handles a left-click on a link span. Honest links open immediately; deceptive links prompt
+    /// for confirmation through <see cref="linkPromptService"/> (if wired) then open on confirm.
+    /// URLs with non-empty <see cref="Uri.UserInfo"/> are always treated as deceptive regardless of
+    /// <see cref="LinkSpan.TextMatchesUrl"/>, because userinfo is a classic spoofing vector.
+    /// </summary>
+    private void HandleTranscriptLinkActivated(LinkSpan link)
+    {
+        if (link.TextMatchesUrl && !HasUserInfo(link.Url))
+        {
+            this.OpenLinkUrl(link.Url);
+        }
+        else
+        {
+            // Fire-and-forget: the prompt is async (routes through the actor mailbox), and the
+            // open happens back on the UI thread via app.Invoke when the user confirms.
+            _ = this.ConfirmAndOpenLinkAsync(link.Url);
+        }
+    }
+
+    /// <summary>
+    /// Shows a confirmation prompt for a deceptive link (whose visible text differs from its
+    /// destination URL), then opens the URL only when the user confirms.
+    /// </summary>
+    private async Task ConfirmAndOpenLinkAsync(string url)
+    {
+        try
+        {
+            if (this.linkPromptService is null)
+            {
+                this.ShowTransientOperationalStatus(
+                    new OperationalStatus("Cannot open: link confirmation unavailable", OperationalTone.Warning, false),
+                    TimeSpan.FromSeconds(3));
+                return;
+            }
+
+            var displayUrl = FormatUrlForDisplay(url);
+            var request = UiPromptRequest.Confirm($"Open: {displayUrl}", defaultValue: false);
+
+            UiPromptResponse response;
+            try
+            {
+                response = await this.linkPromptService.RequestAsync(request).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                return;
+            }
+
+            if (!response.Cancelled && response.SelectedIds.Contains("yes"))
+            {
+                this.app.Invoke(() => this.OpenLinkUrl(url));
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            try
+            {
+                this.app.Invoke(() =>
+                    this.ShowTransientOperationalStatus(
+                        new OperationalStatus("Failed to open link", OperationalTone.Warning, false),
+                        TimeSpan.FromSeconds(3)));
+            }
+            catch
+            {
+                // Swallow: the app may already be disposed during teardown.
+            }
+        }
+    }
+
+    /// <summary>
+    /// Handles a right-click on a link span by building and showing a small PopoverMenu
+    /// anchored at the pointer. The menu contains a disabled URL header, Copy link, Open,
+    /// and optionally Open in private window (when <see cref="privateBrowserResolver"/> resolves
+    /// a private-capable browser).
+    /// </summary>
+    private void HandleTranscriptLinkContextMenuRequested(LinkSpan link, System.Drawing.Point screenPosition)
+    {
+        // Deregister any old menu so we never accumulate stale popovers.
+        this.CleanupTranscriptLinkMenu();
+
+        var urlDisplay = FormatUrlForDisplay(link.Url);
+
+        // Build the menu items.
+        var items = new List<MenuItem>
+        {
+            // Disabled header showing the real destination URL.
+            new MenuItem(urlDisplay, "", static () => { }, Key.Empty) { Enabled = false },
+            // Copy link — writes the URL through the clipboard writer.
+            new MenuItem("Copy link", "", () => this.CopyLinkUrl(link.Url), Key.Empty),
+            // Open — validates http/https and launches default browser; the header already shows the
+            // true URL so no extra deceptive confirmation is shown here.
+            new MenuItem("Open", "", () => this.OpenLinkUrl(link.Url), Key.Empty),
+        };
+
+        // Open in private window — only when a private-capable browser is resolved.
+        var privateBrowser = this.privateBrowserResolver?.Resolve();
+        if (privateBrowser is not null)
+        {
+            var browser = privateBrowser;
+            items.Add(new MenuItem("Open in private window", "", () => this.OpenLinkPrivate(link.Url, browser), Key.Empty));
+        }
+
+        var itemList = items.AsReadOnly();
+        this.TranscriptLinkMenuItemsForTest = itemList;
+        var menu = new PopoverMenu(items);
+        this.app.Popovers?.Register(menu);
+        this.transcriptLinkMenu = menu;
+        menu.MakeVisible(screenPosition);
+    }
+
+    /// <summary>
+    /// Opens <paramref name="url"/> in the OS default browser after http/https validation.
+    /// Shows a transient error status when the URL is invalid or the launch fails.
+    /// </summary>
+    private void OpenLinkUrl(string url)
+    {
+        if (!this.urlOpener.TryOpen(url, out var error))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(error ?? "Failed to open link", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(2));
+        }
+    }
+
+    /// <summary>
+    /// Opens <paramref name="url"/> in a private browser window. The URL is passed as a separate
+    /// process argument (no shell interpolation). Shows a transient error on failure.
+    /// </summary>
+    private void OpenLinkPrivate(string url, PrivateBrowserInfo browser)
+    {
+        if (!this.urlOpener.TryOpenPrivate(url, browser, out var error))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(error ?? "Failed to open in private window", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(2));
+        }
+    }
+
+    /// <summary>
+    /// Copies <paramref name="url"/> to the clipboard. Reports the standard "N symbols copied"
+    /// confirmation on success, or "Clipboard unavailable" on failure.
+    /// </summary>
+    private void CopyLinkUrl(string url)
+    {
+        if (this.clipboardWriter(url))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(ClipboardStatusText.Copied(url), OperationalTone.Ready, false),
+                TimeSpan.FromSeconds(1.5));
+        }
+        else
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+        }
+    }
+
+    /// <summary>
+    /// Formats <paramref name="url"/> for user-facing display: the scheme and authority (host) are
+    /// always shown in full so the true destination is never hidden by truncation. Only the path and
+    /// query are elided when they are long. Falls back to a capped raw string for non-parseable URLs.
+    /// </summary>
+    private static string FormatUrlForDisplay(string url)
+    {
+        const int MaxPathDisplay = 40;
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || string.IsNullOrEmpty(uri.Host))
+        {
+            // Not a parseable absolute URI: cap from the front so at least something is shown.
+            const int MaxRaw = 60;
+            return url.Length > MaxRaw ? url[..MaxRaw] + "…" : url;
+        }
+
+        // Always show the full scheme + authority (includes userinfo and host) so the real host
+        // is never hidden. Elide only the path-and-query portion when it's long.
+        var origin = uri.GetLeftPart(UriPartial.Authority);
+        var pathAndQuery = uri.PathAndQuery;
+        if (pathAndQuery.Length <= MaxPathDisplay)
+        {
+            return origin + pathAndQuery;
+        }
+
+        return origin + pathAndQuery[..MaxPathDisplay] + "…";
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when the URL has a non-empty <see cref="Uri.UserInfo"/>
+    /// component, which is a classic spoofing vector and must always trigger confirmation.
+    /// </summary>
+    private static bool HasUserInfo(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri) && !string.IsNullOrEmpty(uri.UserInfo);
+
+    /// <summary>Deregisters the transcript link context menu from the popover manager, if any.</summary>
+    private void CleanupTranscriptLinkMenu()
+    {
+        this.TranscriptLinkMenuItemsForTest = null;
+        if (this.transcriptLinkMenu is { } menu)
+        {
+            this.transcriptLinkMenu = null;
+            try
+            {
+                if (this.app.Popovers?.IsRegistered(menu) == true)
+                {
+                    this.app.Popovers.DeRegister(menu);
+                }
+            }
+            catch
+            {
+                // Swallow: the app may already be disposed during teardown.
+            }
+        }
+    }
 
     /// <summary>
     /// Copies the active transcript selection to the clipboard. On success the selection is cleared and a
