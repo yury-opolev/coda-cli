@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using Coda.Agent;
 using Coda.Agent.Goals;
+using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
 using Coda.JsonRpc;
 using Coda.Sdk.Serve.Messages;
@@ -712,6 +713,56 @@ public sealed class ServeHost : IAsyncDisposable
             return ServeJson.ToNode(new SetEffortResult(Ok: true, Applied: applied, Note: note));
         });
 
+        // session/scheduleList → project all definitions with live runtime state.
+        conn.OnRequest(ServeMethods.ScheduleList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var items = sess.ScheduleControl.List();
+            var dtos = items.Select(MapToDto).ToArray();
+            return ServeJson.ToNode(new ScheduleListResult(dtos));
+        });
+
+        // session/scheduleCreate → validate + persist; validation failure → -32602 with parser
+        // message. Returns the created ScheduledTaskDto (state=idle for a brand-new definition).
+        conn.OnRequest(ServeMethods.ScheduleCreate, p =>
+        {
+            this.EnsureAuthenticated();
+            var cp = ServeJson.FromNode<ScheduleCreateParams>(p);
+            var request = new ScheduleCreateRequest(
+                cp?.Name,
+                cp?.Prompt ?? string.Empty,
+                cp?.Every,
+                cp?.At,
+                cp?.Cron,
+                cp?.TimeZone);
+            var result = sess.ScheduleControl.Create(request);
+            if (!result.IsSuccess)
+            {
+                throw new JsonRpcRequestException(-32602, result.Error!);
+            }
+
+            return ServeJson.ToNode(MapToDto(result.Task!));
+        });
+
+        // session/scheduleDelete → not-found → -32602; success → { ok, id }.
+        conn.OnRequest(ServeMethods.ScheduleDelete, p =>
+        {
+            this.EnsureAuthenticated();
+            var dp = ServeJson.FromNode<ScheduleDeleteParams>(p);
+            if (string.IsNullOrWhiteSpace(dp?.Id))
+            {
+                throw new JsonRpcRequestException(-32602, "id is required");
+            }
+
+            var found = sess.ScheduleControl.Delete(dp!.Id!);
+            if (!found)
+            {
+                throw new JsonRpcRequestException(-32602, $"schedule not found: {dp.Id}");
+            }
+
+            return ServeJson.ToNode(new ScheduleDeleteResult(true, dp.Id!));
+        });
+
         // shutdown → signal the run loop to exit.
         conn.OnRequest(ServeMethods.Shutdown, _ =>
         {
@@ -761,6 +812,30 @@ public sealed class ServeHost : IAsyncDisposable
             goal.Escalated,
             goal.ExtensionUsed);
     }
+
+    /// <summary>
+    /// Maps a <see cref="ScheduledTaskReadModel"/> to the wire <see cref="ScheduledTaskDto"/>,
+    /// converting enum values to their lowercase string forms.
+    /// </summary>
+    private static ScheduledTaskDto MapToDto(ScheduledTaskReadModel model) =>
+        new(
+            model.Id,
+            model.Name,
+            model.Kind.ToString().ToLowerInvariant(),
+            model.Prompt,
+            model.Rule,
+            model.TimeZone,
+            model.NextRunUtc,
+            model.State.ToString().ToLowerInvariant(),
+            model.ActiveTaskId,
+            FormatOutcome(model.LastOutcome));
+
+    private static string? FormatOutcome(ScheduleTerminalMetadata? meta) =>
+        meta is null
+            ? null
+            : string.IsNullOrWhiteSpace(meta.Summary)
+                ? $"{meta.Outcome} at {meta.CompletedAtUtc.UtcDateTime:yyyy-MM-dd HH:mm} UTC"
+                : $"{meta.Outcome} at {meta.CompletedAtUtc.UtcDateTime:yyyy-MM-dd HH:mm} UTC — {meta.Summary}";
 
     private static string FormatDuration(TimeSpan duration)
     {

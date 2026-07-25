@@ -13,6 +13,7 @@ using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -317,10 +318,16 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // not a snapshot): before the first turn agentRunner.Tasks/ExecutionGate are null, so /tasks renders
         // an empty list and the browser opens empty; afterwards they observe the running session's registry.
         context.TaskManagerProvider = () => agentRunner.Tasks;
+        context.ScheduleControlProvider = () => agentRunner.ScheduleControl;
 
         Func<TaskBrowserProvider?> taskBrowserProvider = () =>
             agentRunner.Tasks is { } tasks && agentRunner.ExecutionGate is { } gate
                 ? new TaskBrowserProvider(tasks, gate)
+                : null;
+
+        Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?> scheduleBrowserProvider = () =>
+            agentRunner.ScheduleControl is { } sc
+                ? new Coda.Tui.Ui.Schedule.ScheduleBrowserProvider(() => sc, actorPrompts)
                 : null;
 
         using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
@@ -472,6 +479,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
                 toolDisplayMode: toolDisplayMode,
+                scheduleBrowserProvider: scheduleBrowserProvider,
                 urlOpener: DefaultUrlOpener.Instance,
                 privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
                 linkPromptService: actorPrompts);

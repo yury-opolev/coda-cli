@@ -2,6 +2,7 @@ using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
 using Coda.Tui.Ui.Mcp;
@@ -38,6 +39,7 @@ internal sealed class InlineTuiShell(
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
     Func<McpBrowserProvider?>? mcpBrowserProvider = null,
+    Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
     IUrlOpener? urlOpener = null,
     IPrivateBrowserResolver? privateBrowserResolver = null,
@@ -58,6 +60,7 @@ internal sealed class InlineTuiShell(
         transcriptFormatter,
         taskBrowserProvider: taskBrowserProvider,
         mcpBrowserProvider: mcpBrowserProvider,
+        scheduleBrowserProvider: scheduleBrowserProvider,
         toolDisplayMode: toolDisplayMode,
         urlOpener: urlOpener,
         privateBrowserResolver: privateBrowserResolver,

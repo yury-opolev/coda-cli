@@ -57,6 +57,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly TaskBrowserOverlay? taskOverlay;
     private readonly McpBrowserController? mcpController;
     private readonly McpBrowserOverlay? mcpOverlay;
+    private readonly Coda.Tui.Ui.Schedule.ScheduleBrowserController? scheduleController;
+    private readonly Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay? scheduleOverlay;
     private readonly bool followsRegistryTheme;
     private bool disposed;
 
@@ -89,6 +91,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<UiSessionSnapshot, int, string>? statusProjection = null,
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
         Func<McpBrowserProvider?>? mcpBrowserProvider = null,
+        Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
         ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
         IUrlOpener? urlOpener = null,
         IPrivateBrowserResolver? privateBrowserResolver = null,
@@ -143,6 +146,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         {
             this.mcpController = new McpBrowserController(mcpBrowserProvider);
             this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged);
+        }
+
+        if (scheduleBrowserProvider is not null)
+        {
+            this.scheduleController = new Coda.Tui.Ui.Schedule.ScheduleBrowserController(
+                () => scheduleBrowserProvider()?.Control?.Invoke(),
+                linkPromptService ?? PlainUiPromptService.Instance);
+            this.scheduleOverlay = new Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay(
+                this.app, this.scheduleController, this.Theme, this.OnScheduleBrowserChanged);
         }
 
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
@@ -225,6 +237,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The MCP browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
     internal McpBrowserController? McpController => this.mcpController;
 
+    /// <summary>The hosted <c>/schedule</c> browser overlay, or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay? ScheduleOverlay => this.scheduleOverlay;
+
+    /// <summary>The schedule browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Schedule.ScheduleBrowserController? ScheduleController => this.scheduleController;
+
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
     /// position it (via <see cref="PlaceCompletion"/>) and add it to their view tree; it stays hidden with
@@ -271,6 +289,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.ClearTransientOperationalOverride();
         this.taskOverlay?.Hide();
         this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
         this.RequestedExit = outcome;
         this.app.RequestStop();
     }
@@ -414,6 +433,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.PromptOverlay.ApplyTheme(this.Theme, this.HostApp.Driver);
         this.TaskOverlay?.ApplyTheme(this.Theme);
         this.McpOverlay?.ApplyTheme(this.Theme);
+        this.scheduleOverlay?.ApplyTheme(this.Theme);
     }
 
     protected override void Dispose(bool disposing)
@@ -451,6 +471,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             // The overlay View itself is disposed by base.Dispose below.
             this.taskOverlay?.Hide();
             this.mcpOverlay?.Hide();
+            this.scheduleOverlay?.Hide();
         }
 
         base.Dispose(disposing);
@@ -599,14 +620,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.PromptOverlay.Visible || this.HasVisibleBrowserOverlay();
 
     private bool HasVisibleBrowserOverlay() =>
-        this.taskOverlay?.Visible == true || this.mcpOverlay?.Visible == true;
+        this.taskOverlay?.Visible == true ||
+        this.mcpOverlay?.Visible == true ||
+        this.scheduleOverlay?.Visible == true;
 
     private View? VisibleBrowserOverlay() =>
-        this.mcpOverlay?.Visible == true
-            ? this.mcpOverlay
-            : this.taskOverlay?.Visible == true
-                ? this.taskOverlay
-                : null;
+        this.scheduleOverlay?.Visible == true
+            ? this.scheduleOverlay
+            : this.mcpOverlay?.Visible == true
+                ? this.mcpOverlay
+                : this.taskOverlay?.Visible == true
+                    ? this.taskOverlay
+                    : null;
 
     private bool TryHandleTranscriptNavigationKey(Key key)
     {
@@ -1304,6 +1329,20 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.UpdateComposerAvailability(snapshot);
         this.UpdatePrompt(snapshot);
         this.ApplyTranscriptChanges(previous, snapshot);
+
+        // Notify the schedule browser when the runtime snapshot reference changes (TuiScheduleLifecycleSink
+        // always creates a new SessionRuntimeSnapshot instance on every lifecycle event). The narrow pattern
+        // swallows ObjectDisposedException in case a Notify arrives during shutdown.
+        if (!ReferenceEquals(previous.Runtime, snapshot.Runtime))
+        {
+            try
+            {
+                this.scheduleController?.NotifyScheduleChanged();
+            }
+            catch (ObjectDisposedException)
+            {
+            }
+        }
     }
 
     private void OnThemeChanged()
@@ -1454,13 +1493,23 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
         // was built once; before the first turn the provider returns null and the browser opens empty.
         this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
         this.taskOverlay?.Show();
     }
 
     private void OpenMcpBrowser()
     {
         this.taskOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
         this.mcpOverlay?.Show();
+    }
+
+    private void OpenScheduleBrowser()
+    {
+        // Show() is idempotent: a repeated /schedule never double-Opens or double-pumps.
+        this.taskOverlay?.Hide();
+        this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Show();
     }
 
     private void SetComposerAttachmentLock(bool locked)
@@ -1541,11 +1590,53 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
+    private void OnScheduleBrowserChanged()
+    {
+        if (this.scheduleOverlay is null || this.disposed)
+        {
+            return;
+        }
+
+        if (this.scheduleOverlay.Visible)
+        {
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.scheduleOverlay.SetFocus();
+            }
+
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
     private void OnComposerSubmitted(object? sender, ComposerSubmissionEventArgs submission)
     {
         if (this.mcpOverlay is not null && McpBrowserController.IsOpenRequest(submission.OriginalDraft))
         {
             this.OpenMcpBrowser();
+            return;
+        }
+
+        // An exact `/schedule` submission opens the browser overlay (same pattern as /tasks).
+        if (this.scheduleOverlay is not null && Coda.Tui.Ui.Schedule.ScheduleBrowserController.IsOpenRequest(submission.OriginalDraft))
+        {
+            this.OpenScheduleBrowser();
             return;
         }
 

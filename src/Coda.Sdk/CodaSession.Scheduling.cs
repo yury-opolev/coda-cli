@@ -46,6 +46,8 @@ public sealed partial class CodaSession
 
     private IScheduleLifecycleSink scheduleLifecycleSink = NullScheduleLifecycleSink.Instance;
 
+    private ScheduleControlService? scheduleControlService;
+
     /// <summary>
     /// Sink that receives schedule lifecycle notifications. Interactive/serve hosts set this BEFORE
     /// <see cref="InitializeAsync"/> so runtime events reach the UI/JSON-RPC adapter; the default is
@@ -57,6 +59,21 @@ public sealed partial class CodaSession
         get => Volatile.Read(ref this.scheduleLifecycleSink);
         set => Volatile.Write(ref this.scheduleLifecycleSink, value ?? NullScheduleLifecycleSink.Instance);
     }
+
+    /// <summary>
+    /// Facade over the session-owned schedule store and live runtime view for list/create/delete
+    /// operations. Shared by the <c>schedule_*</c> tools, the serve RPCs, and the TUI browser through
+    /// identical semantics — a single control-surface implementation that cannot drift between hosts.
+    /// The runtime view is resolved lazily (via a closure over the session's volatile
+    /// <c>scheduleRuntime</c> field) so callers always observe the live view after
+    /// <see cref="InitializeAsync"/> completes.
+    /// </summary>
+    public IScheduleControl ScheduleControl =>
+        this.scheduleControlService ??= new ScheduleControlService(
+            this.schedules,
+            () => this.scheduleRuntime,
+            this.timeProvider,
+            () => TimeZoneInfo.Local);
 
     /// <summary>Test seam: the live runtime view, or null before init / when disabled.</summary>
     internal IScheduleRuntimeView? ScheduleRuntimeForTest => this.scheduleRuntime;

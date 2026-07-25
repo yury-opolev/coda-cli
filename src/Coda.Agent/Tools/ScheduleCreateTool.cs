@@ -4,11 +4,12 @@ using Coda.Agent.Scheduling;
 namespace Coda.Agent.Tools;
 
 /// <summary>
-/// Creates a new scheduled task from an <c>every</c>/<c>at</c>/<c>cron</c> selector. Validates and
-/// normalizes the request via <see cref="ScheduleDefinitionParser"/> and adds the resulting
-/// definition to the session's <see cref="ScheduledTaskStore"/>. The tool itself only mutates the
-/// schedule store (no file/system side effects), so it runs without a user permission prompt; the
-/// session's schedule runtime is what later executes each due definition as a background agent.
+/// Creates a new scheduled task from an <c>every</c>/<c>at</c>/<c>cron</c> selector. Delegates
+/// validation, parsing, and persistence to <see cref="ScheduleControlService.Create"/> so the
+/// parse→store→project flow is identical regardless of the calling surface. The tool itself only
+/// mutates the schedule store (no file/system side effects), so it runs without a user permission
+/// prompt; the session's schedule runtime is what later executes each due definition as a
+/// background agent.
 /// </summary>
 public sealed class ScheduleCreateTool : ITool
 {
@@ -66,39 +67,20 @@ public sealed class ScheduleCreateTool : ITool
             Cron: GetString(input, "cron"),
             TimeZoneId: GetString(input, "timeZone"));
 
-        var nowUtc = this.timeProvider.GetUtcNow();
-        var zone = this.localTimeZone();
+        var service = new ScheduleControlService(
+            context.Schedules,
+            context.ScheduleRuntime,
+            this.timeProvider,
+            this.localTimeZone);
 
-        if (!ScheduleDefinitionParser.TryParse(request, nowUtc, zone, out var draft, out var error))
+        var result = service.Create(request);
+
+        if (!result.IsSuccess)
         {
-            return Task.FromResult(new ToolResult(error ?? "Invalid schedule request.", IsError: true));
+            return Task.FromResult(new ToolResult(result.Error!, IsError: true));
         }
 
-        if (context.Schedules is null)
-        {
-            return Task.FromResult(new ToolResult(
-                "No schedule store is available in this context (e.g. running as a subagent); the " +
-                "task was not persisted.",
-                IsError: true));
-        }
-
-        var task = context.Schedules.Add(draft!, nowUtc);
-
-        // Prefer the injected zone for the local display when the definition was stored in it (the
-        // offset-less 'at' path); otherwise resolve from the stored id, which handles fixed offsets
-        // and system zones and falls back to UTC safely.
-        string localDisplay;
-        string zoneLabel;
-        if (string.Equals(task.TimeZoneId, zone.Id, StringComparison.Ordinal))
-        {
-            localDisplay = TimeZoneInfo.ConvertTime(task.NextRunUtc, zone).ToString("yyyy-MM-dd HH:mm");
-            zoneLabel = task.TimeZoneId;
-        }
-        else
-        {
-            localDisplay = ScheduleDisplay.FormatLocal(task.NextRunUtc, task.TimeZoneId, out zoneLabel);
-        }
-
+        var task = result.Task!;
         var lines = new List<string>
         {
             "Scheduled task created.",
@@ -109,9 +91,9 @@ public sealed class ScheduleCreateTool : ITool
             lines.Add($"  Name:      {task.Name}");
         }
 
-        lines.Add($"  Schedule:  {ScheduleDisplay.DescribeRule(task)}");
-        lines.Add($"  Timezone:  {task.TimeZoneId}");
-        lines.Add($"  Next run:  {localDisplay} ({zoneLabel})");
+        lines.Add($"  Schedule:  {task.Rule}");
+        lines.Add($"  Timezone:  {task.TimeZone}");
+        lines.Add($"  Next run:  {task.NextRunLocal} ({task.NextRunLocalLabel})");
         lines.Add($"  Next UTC:  {task.NextRunUtc.UtcDateTime:yyyy-MM-dd HH:mm} UTC");
         lines.Add($"  Prompt:    {task.Prompt}");
 

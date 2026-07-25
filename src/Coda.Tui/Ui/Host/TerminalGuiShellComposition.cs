@@ -5,6 +5,7 @@ using Coda.Tui.Ui.Mcp;
 using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
@@ -30,6 +31,7 @@ internal static class TerminalGuiShellComposition
         Func<TaskBrowserProvider?> taskBrowserProvider,
         Func<McpBrowserProvider?> mcpBrowserProvider,
         ToolDisplayMode toolDisplayMode,
+        Func<ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
         IUrlOpener? urlOpener = null,
         IPrivateBrowserResolver? privateBrowserResolver = null,
         IUiPromptService? linkPromptService = null)
@@ -53,6 +55,7 @@ internal static class TerminalGuiShellComposition
                 transcriptFormatter: transcriptFormatter,
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
+                scheduleBrowserProvider: scheduleBrowserProvider,
                 toolDisplayMode: toolDisplayMode,
                 urlOpener: urlOpener,
                 privateBrowserResolver: privateBrowserResolver,
@@ -66,6 +69,7 @@ internal static class TerminalGuiShellComposition
                 transcriptFormatter: transcriptFormatter,
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
+                scheduleBrowserProvider: scheduleBrowserProvider,
                 toolDisplayMode: toolDisplayMode,
                 urlOpener: urlOpener,
                 privateBrowserResolver: privateBrowserResolver,

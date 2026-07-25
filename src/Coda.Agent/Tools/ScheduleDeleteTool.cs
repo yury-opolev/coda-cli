@@ -1,11 +1,14 @@
 using System.Text.Json;
+using Coda.Agent.Scheduling;
 
 namespace Coda.Agent.Tools;
 
 /// <summary>
-/// Deletes a scheduled task by its Id. Removes the definition so no future or pending run starts;
-/// an already-running firing continues to its terminal state (stop it with <c>task_stop</c>). The
-/// tool only mutates the schedule store, so it runs without a user permission prompt.
+/// Deletes a scheduled task by its Id. Delegates to <see cref="ScheduleControlService.Delete"/>
+/// so removal semantics are identical across tools, serve, and TUI. Removes the definition so no
+/// future or pending run starts; an already-running firing continues to its terminal state (stop it
+/// with <c>task_stop</c>). The tool only mutates the schedule store, so it runs without a user
+/// permission prompt.
 /// </summary>
 public sealed class ScheduleDeleteTool : ITool
 {
@@ -43,7 +46,8 @@ public sealed class ScheduleDeleteTool : ITool
             return Task.FromResult(new ToolResult("No schedule store is available in this context."));
         }
 
-        var removed = context.Schedules.Remove(id);
+        var service = new ScheduleControlService(context.Schedules, context.ScheduleRuntime);
+        var removed = service.Delete(id);
         return removed
             ? Task.FromResult(new ToolResult(
                 $"Scheduled task '{id}' deleted. Any in-progress execution will continue to " +

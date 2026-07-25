@@ -16,6 +16,9 @@ public static class ServeMethods
     public const string SetGoal = "session/setGoal";
     public const string ReasoningCapability = "model/reasoningCapability";
     public const string SetEffort = "session/setEffort";
+    public const string ScheduleList = "session/scheduleList";
+    public const string ScheduleCreate = "session/scheduleCreate";
+    public const string ScheduleDelete = "session/scheduleDelete";
     public const string Shutdown = "shutdown";
 
     // Events / notifications (Coda → orchestrator)

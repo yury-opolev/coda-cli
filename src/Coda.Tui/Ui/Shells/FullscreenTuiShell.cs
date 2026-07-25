@@ -4,6 +4,7 @@ using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Tasks;
 using Coda.Tui.Ui.Mcp;
@@ -43,6 +44,7 @@ internal class FullscreenTuiShell(
     Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? transcriptFormatter = null,
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
     Func<McpBrowserProvider?>? mcpBrowserProvider = null,
+    Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
     IUrlOpener? urlOpener = null,
     IPrivateBrowserResolver? privateBrowserResolver = null,
@@ -62,6 +64,7 @@ internal class FullscreenTuiShell(
         statusProjection,
         taskBrowserProvider: taskBrowserProvider,
         mcpBrowserProvider: mcpBrowserProvider,
+        scheduleBrowserProvider: scheduleBrowserProvider,
         toolDisplayMode: toolDisplayMode,
         urlOpener: urlOpener,
         privateBrowserResolver: privateBrowserResolver,
@@ -207,6 +210,15 @@ internal class FullscreenTuiShell(
             mcpOverlay.Width = Dim.Fill();
             mcpOverlay.Height = Dim.Fill();
             this.Add(mcpOverlay);
+        }
+
+        if (this.ScheduleOverlay is { } scheduleOverlay)
+        {
+            scheduleOverlay.X = 0;
+            scheduleOverlay.Y = 0;
+            scheduleOverlay.Width = Dim.Fill();
+            scheduleOverlay.Height = Dim.Fill();
+            this.Add(scheduleOverlay);
         }
 
         this.Add(this.PromptOverlay);

@@ -565,4 +565,141 @@ public sealed class ServeProtocolTests
         var result = ServeJson.FromNode<StopEvent>(null);
         Assert.Null(result);
     }
+
+    // ── schedule RPC constants (session/schedule*) ──────────────────────────
+
+    [Fact]
+    public void ServeMethods_schedule_constants_have_expected_values()
+    {
+        Assert.Equal("session/scheduleList", ServeMethods.ScheduleList);
+        Assert.Equal("session/scheduleCreate", ServeMethods.ScheduleCreate);
+        Assert.Equal("session/scheduleDelete", ServeMethods.ScheduleDelete);
+    }
+
+    // ── ScheduledTaskDto round-trips ────────────────────────────────────────
+
+    [Fact]
+    public void ScheduledTaskDto_round_trips_all_fields()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-25T10:00:00+00:00");
+        var original = new ScheduledTaskDto(
+            "abc123", "nightly", "interval", "run backup", "interval (every 1d)",
+            "America/New_York", ts, "idle", null, null);
+        var result = RoundTrip(original);
+        Assert.Equal("abc123", result.Id);
+        Assert.Equal("nightly", result.Name);
+        Assert.Equal("interval", result.Kind);
+        Assert.Equal("run backup", result.Prompt);
+        Assert.Equal("interval (every 1d)", result.Rule);
+        Assert.Equal("America/New_York", result.TimeZone);
+        Assert.Equal(ts, result.NextRunUtc);
+        Assert.Equal("idle", result.State);
+        Assert.Null(result.ActiveTaskId);
+        Assert.Null(result.LastOutcome);
+    }
+
+    [Fact]
+    public void ScheduledTaskDto_wire_keys_are_camelCase_named_fields()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-25T10:00:00+00:00");
+        var node = ServeJson.ToNode(new ScheduledTaskDto(
+            "abc123", "nightly", "cron", "run backup", "cron (0 0 * * *)",
+            "UTC", ts, "running", "task-5", "Succeeded at 2026-07-24 00:00 UTC"))!;
+
+        Assert.Equal("abc123", node["id"]!.GetValue<string>());
+        Assert.Equal("nightly", node["name"]!.GetValue<string>());
+        Assert.Equal("cron", node["kind"]!.GetValue<string>());
+        Assert.Equal("run backup", node["prompt"]!.GetValue<string>());
+        Assert.Equal("cron (0 0 * * *)", node["rule"]!.GetValue<string>());
+        Assert.Equal("UTC", node["timeZone"]!.GetValue<string>());
+        Assert.NotNull(node["nextRunUtc"]);
+        Assert.Equal("running", node["state"]!.GetValue<string>());
+        Assert.Equal("task-5", node["activeTaskId"]!.GetValue<string>());
+        Assert.NotNull(node["lastOutcome"]);
+
+        // Must never serialize as ValueTuple items.
+        Assert.Null(node["item1"]);
+        Assert.Null(node["Item1"]);
+    }
+
+    [Fact]
+    public void ScheduledTaskDto_optional_fields_omitted_when_null()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-25T10:00:00+00:00");
+        var node = ServeJson.ToNode(new ScheduledTaskDto(
+            "abc123", null, "at", "ping", "one-shot", "UTC", ts, "idle", null, null))!;
+
+        Assert.Null(node["name"]);
+        Assert.Null(node["activeTaskId"]);
+        Assert.Null(node["lastOutcome"]);
+
+        // Required fields always present.
+        Assert.Equal("abc123", node["id"]!.GetValue<string>());
+        Assert.Equal("idle", node["state"]!.GetValue<string>());
+    }
+
+    // ── ScheduleListResult ──────────────────────────────────────────────────
+
+    [Fact]
+    public void ScheduleListResult_round_trips_with_dtos()
+    {
+        var ts = DateTimeOffset.Parse("2026-07-25T10:00:00+00:00");
+        var dto = new ScheduledTaskDto("id1", null, "interval", "p", "interval (every 5m)", "UTC", ts, "idle", null, null);
+        var original = new ScheduleListResult([dto]);
+        var result = RoundTrip(original);
+        var item = Assert.Single(result.Schedules);
+        Assert.Equal("id1", item.Id);
+    }
+
+    [Fact]
+    public void ScheduleListResult_wire_key_is_schedules()
+    {
+        var original = new ScheduleListResult([]);
+        var node = ServeJson.ToNode(original)!;
+        Assert.NotNull(node["schedules"]);
+    }
+
+    // ── ScheduleCreateParams ────────────────────────────────────────────────
+
+    [Fact]
+    public void ScheduleCreateParams_round_trips()
+    {
+        var original = new ScheduleCreateParams("daily", "run report", null, null, "0 6 * * *", "America/Chicago");
+        var result = RoundTrip(original);
+        Assert.Equal("daily", result.Name);
+        Assert.Equal("run report", result.Prompt);
+        Assert.Null(result.Every);
+        Assert.Equal("0 6 * * *", result.Cron);
+        Assert.Equal("America/Chicago", result.TimeZone);
+    }
+
+    [Fact]
+    public void ScheduleCreateParams_wire_keys_are_camelCase()
+    {
+        var node = ServeJson.ToNode(new ScheduleCreateParams(null, "ping", "5m", null, null, null))!;
+        Assert.NotNull(node["prompt"]);
+        Assert.NotNull(node["every"]);
+        Assert.Null(node["cron"]);
+    }
+
+    // ── ScheduleDeleteParams / ScheduleDeleteResult ─────────────────────────
+
+    [Fact]
+    public void ScheduleDeleteParams_round_trips()
+    {
+        var original = new ScheduleDeleteParams("abc123");
+        var result = RoundTrip(original);
+        Assert.Equal("abc123", result.Id);
+        var node = ServeJson.ToNode(original)!;
+        Assert.Equal("abc123", node["id"]!.GetValue<string>());
+    }
+
+    [Fact]
+    public void ScheduleDeleteResult_round_trips()
+    {
+        var original = new ScheduleDeleteResult(true, "abc123");
+        var result = RoundTrip(original);
+        Assert.True(result.Ok);
+        Assert.Equal("abc123", result.Id);
+    }
 }

@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Scheduling;
 using Coda.Agent.Tasks;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
@@ -67,6 +68,9 @@ public sealed class AgentRunner : IDisposable
 
     /// <summary>The live task registry once the session exists (null before the first turn runs).</summary>
     public TaskManager? Tasks => this.session?.Tasks;
+
+    /// <summary>The live schedule control surface, or null before the first session is created.</summary>
+    public IScheduleControl? ScheduleControl => this.session?.ScheduleControl;
 
     /// <summary>The session's cooperative pause gate (null before the first turn runs).</summary>
     public AgentExecutionGate? ExecutionGate => this.session?.ExecutionGate;
