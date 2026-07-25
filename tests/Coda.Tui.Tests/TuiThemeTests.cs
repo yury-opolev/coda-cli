@@ -241,4 +241,29 @@ public sealed class TuiThemeTests
         Assert.Equal(new TgColor(TuiTheme.WarmEmber.Background.Fallback), scheme.Normal.Background);
         Assert.Equal(new TgColor(TuiTheme.WarmEmber.TranscriptAssistant.Fallback), scheme.Normal.Foreground);
     }
+
+    [Fact]
+    public void PendingUser_role_resolves_to_dim_user_foreground_over_user_background()
+    {
+        using IApplication app = Application.Create();
+        using var view = new VirtualizedTranscriptView(app, theme: TuiTheme.WarmEmber);
+
+        var attr = view.AttributeFor(TranscriptRole.PendingUser, trueColor: true);
+
+        // Foreground is the theme's PendingUser dim color, not the normal bright user color.
+        Assert.Equal(TuiTheme.WarmEmber.PendingUser.TrueColor, attr.Foreground);
+        Assert.NotEqual(TuiTheme.WarmEmber.TranscriptUser.TrueColor, attr.Foreground);
+        // Background matches the user block background (shared fill-width treatment).
+        Assert.Equal(TuiTheme.WarmEmber.TranscriptUserBackground.TrueColor, attr.Background);
+    }
+
+    [Fact]
+    public void PendingUser_warm_ember_default_is_dim_warm_tone()
+    {
+        var theme = TuiTheme.WarmEmber;
+
+        // The PendingUser color is the same dim warm tone as TranscriptUserTime (muted amber).
+        Assert.Equal(new TgColor(150, 128, 104), theme.PendingUser.TrueColor);
+        Assert.Equal(TgName.Gray, theme.PendingUser.Fallback);
+    }
 }

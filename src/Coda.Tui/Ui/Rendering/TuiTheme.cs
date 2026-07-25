@@ -74,9 +74,12 @@ internal sealed class TuiTheme
     public TuiThemeColor CalloutWarning { get; init; } = new(new TgColor(235, 165, 45), TgName.Yellow);
     public TuiThemeColor CalloutCaution { get; init; } = new(new TgColor(220, 90, 70), TgName.BrightRed);
 
+    /// <summary>Dim user foreground for a queued/not-yet-delivered pending user message. A muted version of
+    /// the theme's user color so the whole pending block reads as unconfirmed until delivered.</summary>
+    public TuiThemeColor PendingUser { get; init; } = new(new TgColor(150, 128, 104), TgName.Gray);
+
     /// <summary>Foreground color applied to honest link spans (display text identifies the destination).</summary>
     public TuiThemeColor Link { get; init; } = new(new TgColor(110, 165, 215), TgName.BrightBlue);
-
     /// <summary>Foreground color applied to deceptive link spans (display text hides the destination),
     /// including the trailing ⚠ warning glyph. Chosen to visually warn without being aggressive.</summary>
     public TuiThemeColor LinkDeceptive { get; init; } = new(new TgColor(215, 125, 55), TgName.Yellow);

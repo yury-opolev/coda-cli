@@ -54,6 +54,10 @@ public enum TranscriptRole
     CalloutImportant,
     CalloutWarning,
     CalloutCaution,
+
+    /// <summary>A queued user message that has not yet been delivered: rendered with a dim user foreground
+    /// and a <c>[pending]</c> prefix on the first line so it reads as muted until sent.</summary>
+    PendingUser,
 }
 
 /// <summary>A single rendered transcript line: display text plus the role that colors it.</summary>
@@ -1446,17 +1450,17 @@ public static class TranscriptBlockFormatter
 
     private static void AppendPendingUser(List<TranscriptRenderLine> lines, PendingUserTranscriptBlock pending, int width)
     {
-        var annotationPending = true;
+        var firstLine = true;
         foreach (var sourceLine in SplitLines(pending.Text))
         {
             foreach (var wrapped in WrapLine(sourceLine, width))
             {
-                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.User)
+                var text = firstLine ? "[pending] " + wrapped : wrapped;
+                firstLine = false;
+                lines.Add(new TranscriptRenderLine(text, TranscriptRole.PendingUser)
                 {
                     FillWidth = true,
-                    RightText = annotationPending ? "pending" : null,
                 });
-                annotationPending = false;
             }
         }
     }

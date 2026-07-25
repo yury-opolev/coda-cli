@@ -595,6 +595,65 @@ public sealed class TranscriptBlockFormatterTests
         Assert.Equal(ToolDisplayMode.Summary, fallback.Mode);
     }
 
+    [Fact]
+    public void Pending_user_block_prefixes_first_wrapped_line_with_pending_marker()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "queued message", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        var line = Assert.Single(lines);
+        Assert.StartsWith("[pending] ", line.Text, StringComparison.Ordinal);
+        Assert.Contains("queued message", line.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Pending_user_block_all_lines_use_pending_user_role_and_fill_width()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "queued message", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.All(lines, line => Assert.Equal(TranscriptRole.PendingUser, line.Role));
+        Assert.All(lines, line => Assert.True(line.FillWidth));
+    }
+
+    [Fact]
+    public void Pending_user_block_has_no_right_annotation()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "queued", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.All(lines, line => Assert.Null(line.RightText));
+    }
+
+    [Fact]
+    public void Pending_user_multiline_message_has_marker_only_on_first_line()
+    {
+        var block = new PendingUserTranscriptBlock(Guid.NewGuid(), "first line\nsecond line\nthird line", "entry", DateTimeOffset.UtcNow);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        Assert.True(lines.Count >= 3, "multi-line message must produce at least three lines");
+        Assert.StartsWith("[pending] ", lines[0].Text, StringComparison.Ordinal);
+        Assert.All(lines.Skip(1), line => Assert.False(line.Text.StartsWith("[pending]", StringComparison.Ordinal)));
+    }
+
+    [Fact]
+    public void Delivered_user_block_renders_with_user_role_unchanged()
+    {
+        var block = new UserTranscriptBlock(Guid.NewGuid(), "sent message");
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        var line = Assert.Single(lines);
+        Assert.Equal(TranscriptRole.User, line.Role);
+        Assert.Equal("sent message", line.Text);
+        Assert.True(line.FillWidth);
+        Assert.DoesNotContain("[pending]", line.Text, StringComparison.Ordinal);
+    }
+
     private static void AssertContentInOrder(
         IReadOnlyList<TranscriptRenderLine> lines, IReadOnlyList<string> needles)
     {

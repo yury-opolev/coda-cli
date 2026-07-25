@@ -968,6 +968,7 @@ internal sealed class VirtualizedTranscriptView : View
         var foreground = role switch
         {
             TranscriptRole.User => this.theme.TranscriptUser,
+            TranscriptRole.PendingUser => this.theme.PendingUser,
             TranscriptRole.Heading => this.theme.Heading,
             TranscriptRole.Code => this.theme.Code,
             TranscriptRole.Tool => this.theme.TranscriptTool,
@@ -991,9 +992,11 @@ internal sealed class VirtualizedTranscriptView : View
             _ => this.theme.TranscriptAssistant,
         };
 
-        // User message rows sit on a subtly different full-width background block; every other role keeps the
-        // global shell background so non-user rows are unchanged.
-        var background = role == TranscriptRole.User ? this.theme.TranscriptUserBackground : this.theme.Background;
+        // User and pending-user message rows sit on a subtly different full-width background block; every
+        // other role keeps the global shell background so non-user rows are unchanged.
+        var background = role is TranscriptRole.User or TranscriptRole.PendingUser
+            ? this.theme.TranscriptUserBackground
+            : this.theme.Background;
         return new TgAttribute(
             TuiTheme.Resolve(foreground, useTrueColor),
             TuiTheme.Resolve(background, useTrueColor));
