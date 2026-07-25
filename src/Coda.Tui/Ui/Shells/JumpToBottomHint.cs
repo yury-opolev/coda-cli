@@ -11,10 +11,9 @@ internal readonly record struct JumpHintHitTarget(int Left, int Width)
         point.Y == 0 && point.X >= this.Left && point.X < this.Left + this.Width;
 }
 
-/// <summary>A centered, clickable one-row prompt for returning to the newest transcript content.</summary>
 internal sealed class JumpToBottomHint : View
 {
-    private readonly TgAttribute attribute;
+    private TgAttribute attribute;
     private int unseenBlocks;
     private JumpHintHitTarget? renderedHitTarget;
 
@@ -27,12 +26,17 @@ internal sealed class JumpToBottomHint : View
     }
 
     public event Action? Jump;
-
     internal JumpHintHitTarget? RenderedHitTargetForTest => this.renderedHitTarget;
 
     public static string HintText(int unseenBlocks) => unseenBlocks <= 0
         ? "Jump to bottom (Ctrl+End) v"
         : $"{unseenBlocks} new message{(unseenBlocks == 1 ? string.Empty : "s")} (Ctrl+End) v";
+
+    internal void ApplyTheme(TuiTheme theme, IDriver? driver)
+    {
+        this.attribute = theme.JumpHintAttribute(driver);
+        this.SetNeedsDraw();
+    }
 
     public void Update(bool autoFollow, int unseenBlockCount)
     {

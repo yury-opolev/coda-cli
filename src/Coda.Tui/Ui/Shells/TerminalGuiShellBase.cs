@@ -56,6 +56,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly TaskBrowserOverlay? taskOverlay;
     private readonly McpBrowserController? mcpController;
     private readonly McpBrowserOverlay? mcpOverlay;
+    private readonly bool followsRegistryTheme;
     private bool disposed;
 
     /// <summary>
@@ -94,7 +95,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.clipboardWriter = clipboardWriter ??
             (text => this.app.Clipboard?.TrySetClipboardData(text) == true);
         this.clipboardReader = clipboardReader ?? this.ReadApplicationClipboard;
-        this.Theme = theme ?? TuiTheme.WarmEmber;
+        this.Theme = theme ?? CodaThemes.Current.Tui;
+        this.followsRegistryTheme = theme is null;
+        if (this.followsRegistryTheme)
+        {
+            CodaThemes.Changed += this.OnThemeChanged;
+        }
 
         // The chord clock and the timeout seams drive the deterministic Esc/Ctrl+C chords: the same
         // add/remove-timeout delegates the operational row uses (defaulting to the application's own timer)
@@ -108,7 +114,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Operational = new OperationalStatusView(app, this.Theme, addTimeout, removeTimeout);
         this.Status = new Label { CanFocus = false };
         this.PromptOverlay = new PromptOverlay(publisher, this.Theme);
-        this.PromptOverlay.ApplyTheme(app.Driver);
+        this.PromptOverlay.ApplyTheme(this.Theme, app.Driver);
         this.Completion = new CommandCompletionView(this.Theme);
 
         // Build the browser controller + hidden overlay before BuildLayout so the concrete shell can add the
@@ -178,8 +184,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The one-line stable-metadata label pinned to the shell's final row.</summary>
     internal Label Status { get; }
 
-    /// <summary>The Warm Ember theme shared by every view this shell constructs.</summary>
-    protected TuiTheme Theme { get; }
+    /// <summary>The theme shared by every view this shell constructs.</summary>
+    protected TuiTheme Theme { get; private set; }
 
     /// <summary>The clock used for the deterministic interrupt/exit chord windows.</summary>
     protected TimeProvider TimeSource { get; }
@@ -382,6 +388,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// </summary>
     protected abstract void OnComposerLayoutInvalidated();
 
+    protected virtual void RebuildThemeSchemes()
+    {
+        this.TranscriptView.ApplyTheme(this.Theme);
+        this.Chrome.ApplyTheme(this.Theme);
+        this.Operational.ApplyTheme(this.Theme);
+        this.Completion.ApplyTheme(this.Theme);
+        this.PromptOverlay.ApplyTheme(this.Theme, this.HostApp.Driver);
+        this.TaskOverlay?.ApplyTheme(this.Theme);
+        this.McpOverlay?.ApplyTheme(this.Theme);
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (disposing && !this.disposed)
@@ -403,6 +420,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.Composer.CompletionChanged -= this.OnCompletionChanged;
             this.Composer.LayoutInvalidated -= this.OnComposerLayoutInvalidatedHandler;
             this.Initialized -= this.OnShellInitialized;
+            if (this.followsRegistryTheme)
+            {
+                CodaThemes.Changed -= this.OnThemeChanged;
+            }
 
             // Hide() cancels the pump, unsubscribes Changed, releases any pause lease (resuming the main
             // agent), and closes the controller — so a mode switch or shutdown never leaves the agent paused.
@@ -1038,6 +1059,31 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.UpdateComposerAvailability(snapshot);
         this.UpdatePrompt(snapshot);
         this.ApplyTranscriptChanges(previous, snapshot);
+    }
+
+    private void OnThemeChanged()
+    {
+        void ApplyThemeChange()
+        {
+            this.Theme = CodaThemes.Current.Tui;
+            this.RebuildThemeSchemes();
+            this.SetNeedsDraw();
+        }
+
+        if (this.app.MainThreadId is null || this.IsOnUiThread())
+        {
+            ApplyThemeChange();
+            return;
+        }
+
+        try
+        {
+            this.app.Invoke(ApplyThemeChange);
+        }
+        catch (Terminal.Gui.App.NotInitializedException)
+        {
+            ApplyThemeChange();
+        }
     }
 
     private bool IsOnUiThread() =>

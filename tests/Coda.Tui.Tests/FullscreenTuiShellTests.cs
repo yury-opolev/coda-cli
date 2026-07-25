@@ -1166,10 +1166,10 @@ public sealed class FullscreenTuiShellTests
         app.LayoutAndDraw();
 
         var expected = force16
-            ? new TgColor(TuiTheme.WarmEmber.Background.Fallback)
-            : TuiTheme.WarmEmber.Background.TrueColor;
+            ? new TgColor(CodaThemes.Default.Tui.Background.Fallback)
+            : CodaThemes.Default.Tui.Background.TrueColor;
 
-        // The shell paints the Warm Ember surface, and header/status/transcript/completion carry no
+        // The shell paints the default surface, and header/status/transcript/completion carry no
         // explicit scheme of their own, so each inherits the same normal background from the top level.
         Assert.Equal(expected, shell.GetScheme().Normal.Background);
         Assert.Equal(expected, shell.Header.GetScheme().Normal.Background);
@@ -1228,7 +1228,7 @@ public sealed class FullscreenTuiShellTests
         await shell.ApplyAsync(UiSessionSnapshot.Empty with { Transcript = [reply] }, CancellationToken.None);
         app.LayoutAndDraw();
 
-        var expected = TuiTheme.WarmEmber.Background.TrueColor;
+        var expected = CodaThemes.Default.Tui.Background.TrueColor;
         Assert.False(shell.Transcript.HasScheme);
         Assert.Equal(expected, shell.Transcript.GetScheme().Normal.Background);
         Assert.Equal(shell.GetScheme().Normal.Background, shell.Transcript.GetScheme().Normal.Background);
@@ -2680,3 +2680,4 @@ public sealed class VirtualizedTranscriptViewTests
         }
     }
 }
+

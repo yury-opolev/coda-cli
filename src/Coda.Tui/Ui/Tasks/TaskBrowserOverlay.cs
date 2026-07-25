@@ -32,7 +32,7 @@ internal sealed class TaskBrowserOverlay : View
 
     private readonly IApplication app;
     private readonly TaskBrowserController controller;
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
     private readonly Action? onChanged;
 
     private readonly Label header;
@@ -44,11 +44,11 @@ internal sealed class TaskBrowserOverlay : View
     private bool disposed;
     private List<string> visibleOutput = [];
 
-    public TaskBrowserOverlay(IApplication app, TaskBrowserController controller, TuiTheme theme, Action? onChanged = null)
+    public TaskBrowserOverlay(IApplication app, TaskBrowserController controller, TuiTheme? theme = null, Action? onChanged = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
 
         this.Visible = false;
@@ -63,6 +63,20 @@ internal sealed class TaskBrowserOverlay : View
         this.Add(this.header);
         this.Add(this.body);
         this.Add(this.footer);
+    }
+
+    internal void ApplyTheme(TuiTheme theme)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        if (this.active)
+        {
+            this.Render();
+        }
+        else
+        {
+            this.SetNeedsDraw();
+        }
     }
 
     /// <summary>True while a background-shell attachment holds the composer; the shell folds this into composer availability.</summary>
@@ -531,3 +545,5 @@ internal sealed class TaskBrowserOverlay : View
         base.Dispose(disposing);
     }
 }
+
+

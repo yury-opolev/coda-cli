@@ -26,7 +26,7 @@ internal sealed class VirtualizedTranscriptView : View
     private const int DefaultWidth = 80;
 
     private readonly IApplication app;
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
     private readonly TranscriptLayoutIndex index;
     private readonly TranscriptViewportState viewport = new();
     private readonly HashSet<Guid> expanded = new();
@@ -55,12 +55,21 @@ internal sealed class VirtualizedTranscriptView : View
         TuiTheme? theme = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.index = new TranscriptLayoutIndex(
             formatter ?? TranscriptBlockFormatter.Format,
             enableIncrementalAssistant: formatter is null);
         this.CanFocus = true;
         this.MousePositionTracking = true;
+    }
+
+    internal void ApplyTheme(TuiTheme theme)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.roleAttributeCache.Clear();
+        this.annotationAttributeCache.Clear();
+        this.attributeCacheInitialized = false;
+        this.SetNeedsDraw();
     }
 
     /// <summary>Whether the viewport is pinned to the newest output.</summary>

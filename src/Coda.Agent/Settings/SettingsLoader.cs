@@ -91,6 +91,7 @@ public static class SettingsLoader
             && githubEnterpriseDomain is null
             && goalMerged is null
             && telemetry is null
+            && userSettings.Theme is null
             && userSettings.ToolDisplayMode is null
             && effortByModel.Count == 0)
         {
@@ -116,6 +117,7 @@ public static class SettingsLoader
             GitHubEnterpriseDomain = githubEnterpriseDomain,
             Goal = goalMerged,
             Telemetry = telemetry,
+            Theme = userSettings.Theme,
             ToolDisplayMode = userSettings.ToolDisplayMode,
             EffortByModel = effortByModel,
         };
@@ -148,6 +150,7 @@ public static class SettingsLoader
                 GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
                 Telemetry = ParseTelemetry(doc?.Telemetry),
+                Theme = NullIfBlank(doc?.Theme),
                 ToolDisplayMode = MigrateDisplayMode(doc?.ToolDisplayMode),
                 EffortByModel = ParseEffortByModel(doc?.EffortByModel),
             };
@@ -361,6 +364,8 @@ public static class SettingsLoader
         public string? GithubEnterpriseDomain { get; set; }
         public GoalSection? Goal { get; set; }
         public TelemetrySection? Telemetry { get; set; }
+        [JsonPropertyName("theme")]
+        public string? Theme { get; set; }
         [JsonPropertyName("toolDisplayMode")]
         public string? ToolDisplayMode { get; set; }
         [JsonPropertyName("effortByModel")]
@@ -457,3 +462,6 @@ public static class SettingsLoader
         public string? Matcher { get; set; }
     }
 }
+
+
+

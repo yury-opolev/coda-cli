@@ -648,10 +648,10 @@ public sealed class InlineTuiShellTests
         app.LayoutAndDraw();
 
         var expected = force16
-            ? new TgColor(TuiTheme.WarmEmber.Background.Fallback)
-            : TuiTheme.WarmEmber.Background.TrueColor;
+            ? new TgColor(CodaThemes.Default.Tui.Background.Fallback)
+            : CodaThemes.Default.Tui.Background.TrueColor;
 
-        // Inline reuses the retained shell, so it inherits the same Warm Ember surface background as
+        // Inline reuses the retained shell, so it inherits the same default surface background as
         // full-screen across header/status/transcript/completion.
         Assert.Equal(expected, shell.GetScheme().Normal.Background);
         Assert.Equal(expected, shell.Header.GetScheme().Normal.Background);
@@ -962,3 +962,4 @@ public sealed class PromptOverlayTests
         Assert.False(overlay.Visible);
     }
 }
+

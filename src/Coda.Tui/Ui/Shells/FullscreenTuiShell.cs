@@ -113,7 +113,7 @@ internal class FullscreenTuiShell(
         // after Application.Init) and before the first draw. Header, status, transcript, and completion
         // carry no explicit scheme, so they inherit this uniform background; the composer and prompt
         // overlay set their own schemes below and keep them.
-        this.SetScheme(TuiTheme.WarmEmber.SurfaceScheme(this.HostApp.Driver));
+        this.SetScheme(this.Theme.SurfaceScheme(this.HostApp.Driver));
 
         this.header = new Label { CanFocus = false };
         this.header.X = 0;
@@ -245,6 +245,14 @@ internal class FullscreenTuiShell(
     /// overlaying the transcript. The chrome, composer, navigation and operational rows, and status stay
     /// pinned to the bottom, so the menu never displaces them.
     /// </summary>
+    protected override void RebuildThemeSchemes()
+    {
+        base.RebuildThemeSchemes();
+        this.SetScheme(this.Theme.SurfaceScheme(this.HostApp.Driver));
+        this.Composer.SetScheme(this.Chrome.CreateInputScheme(this.HostApp.Driver));
+        this.jumpHint?.ApplyTheme(this.Theme, this.HostApp.Driver);
+    }
+
     protected override void PlaceCompletion(int height, bool visible)
     {
         this.Completion.Y = Pos.AnchorEnd(this.composerHeight + height + NavigationChromeHeight + 4);

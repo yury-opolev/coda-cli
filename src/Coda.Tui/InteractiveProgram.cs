@@ -250,6 +250,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // switch never rebuilds them; only the actor's frame/observer sink and the command environment swap.
         using var mailbox = new UiEventMailbox(capacity: 512, hostToken);
         var actorPrompts = new ActorUiPromptService(mailbox);
+        ApplyStartupTheme(startupSettings, mailbox);
         if (!toolDisplayResolution.IsValid)
         {
             Publish(mailbox, new DiagnosticEvent(
@@ -564,6 +565,24 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         }
     }
 
+    internal static void ApplyStartupTheme(
+        Coda.Agent.Settings.CodaSettings settings,
+        IUiEventPublisher events)
+    {
+        ArgumentNullException.ThrowIfNull(settings);
+        ArgumentNullException.ThrowIfNull(events);
+
+        var resolution = ThemeResolver.Resolve(settings.Theme);
+        CodaThemes.Set(resolution.Theme);
+        if (!resolution.IsValid)
+        {
+            events.Publish(new DiagnosticEvent(
+                "settings",
+                ThemeResolver.InvalidValueWarning(settings.Theme),
+                UiNotificationLevel.Warning));
+        }
+    }
+
     /// <summary>
     /// Drive the host to a clean exit, then — once and only after the terminal is restored and the UI
     /// has drained — render the session card to the restored real console. Mode switches and fallbacks
@@ -823,3 +842,5 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
     private int OffscreenHeight() => Math.Max(this.capabilities.Height, 24);
 }
+
+

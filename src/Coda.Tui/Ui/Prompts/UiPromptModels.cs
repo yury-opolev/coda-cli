@@ -56,6 +56,14 @@ public sealed record UiPromptRequest(
     /// <summary>A free-form text (or secret) entry.</summary>
     public static UiPromptRequest Text(string title, string? defaultValue = null, bool required = false, bool secret = false) =>
         new(Guid.NewGuid(), secret ? UiPromptKind.Secret : UiPromptKind.Text, title, null, [], defaultValue, required);
+
+    /// <summary>
+    /// Optional callback invoked on the UI thread whenever the highlighted row changes in a selection
+    /// prompt (including the initial selection when the prompt opens). Has no effect on Text/Secret
+    /// prompts or any caller that passes <see langword="null"/>. The serve path and all existing pickers
+    /// other than the theme picker always leave this null, preserving their existing behavior.
+    /// </summary>
+    public Action<string>? OnHighlight { get; init; }
 }
 
 /// <summary>

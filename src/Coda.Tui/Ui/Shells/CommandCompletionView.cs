@@ -20,7 +20,7 @@ internal sealed class CommandCompletionView : View
     /// <summary>Maximum number of option rows shown at once; the list scrolls beyond this.</summary>
     internal const int MaxVisibleOptions = 8;
 
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
 
     private IReadOnlyList<ISlashCommand> suggestions = [];
     private int selectedIndex = -1;
@@ -28,9 +28,15 @@ internal sealed class CommandCompletionView : View
 
     public CommandCompletionView(TuiTheme? theme = null)
     {
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.CanFocus = false;
         this.Visible = false;
+    }
+
+    internal void ApplyTheme(TuiTheme theme)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.SetNeedsDraw();
     }
 
     /// <summary>The suggestions currently displayed (empty when hidden).</summary>
@@ -48,10 +54,6 @@ internal sealed class CommandCompletionView : View
     /// <summary>Rows the menu wants to occupy (bounded by <see cref="MaxVisibleOptions"/>); 0 when hidden.</summary>
     internal int DesiredHeight => Math.Min(this.suggestions.Count, MaxVisibleOptions);
 
-    /// <summary>
-    /// Replaces the displayed suggestions and selected index. The selection is clamped into range and the
-    /// scroll window is adjusted so the selection stays visible.
-    /// </summary>
     internal void SetSuggestions(IReadOnlyList<ISlashCommand> suggestions, int selectedIndex)
     {
         this.suggestions = suggestions ?? [];
@@ -62,10 +64,6 @@ internal sealed class CommandCompletionView : View
         this.SetNeedsDraw();
     }
 
-    /// <summary>
-    /// The plain-text rows for the current scrolled window, each truncated to <paramref name="width"/>
-    /// display cells. Exposed so the shell (and tests) can render/inspect the menu without a live draw.
-    /// </summary>
     internal IReadOnlyList<string> RenderVisibleRows(int width)
     {
         if (this.suggestions.Count == 0)
@@ -89,11 +87,6 @@ internal sealed class CommandCompletionView : View
         return rows;
     }
 
-    /// <summary>
-    /// The foreground/background attribute for a completion row. Selected rows invert to the theme's warm
-    /// highlight; normal rows use the theme's completion foreground over its dark background. Resolved for
-    /// the driver's color depth unless <paramref name="trueColor"/> is forced.
-    /// </summary>
     internal TgAttribute AttributeFor(bool selected, bool? trueColor = null)
     {
         var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.App?.Driver);
@@ -106,7 +99,6 @@ internal sealed class CommandCompletionView : View
                 TuiTheme.Resolve(this.theme.Background, useTrueColor));
     }
 
-    /// <inheritdoc />
     protected override bool OnDrawingContent(DrawContext? context)
     {
         if (context is not null)
@@ -166,11 +158,6 @@ internal sealed class CommandCompletionView : View
         return $"{marker}/{command.Name}{summary}";
     }
 
-    /// <summary>
-    /// Truncates <paramref name="text"/> to at most <paramref name="width"/> display cells without
-    /// splitting a grapheme cluster, collapsing embedded control whitespace to spaces first, so a row can
-    /// never overflow the view. Cell-safe slicing is delegated to <see cref="TerminalCellText"/>.
-    /// </summary>
     private static string Fit(string text, int width)
     {
         if (width <= 0)

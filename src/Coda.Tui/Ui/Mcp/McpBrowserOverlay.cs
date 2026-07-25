@@ -14,7 +14,7 @@ internal sealed class McpBrowserOverlay : View
 {
     private readonly IApplication app;
     private readonly McpBrowserController controller;
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
     private readonly Action? onChanged;
     private readonly Label header;
     private readonly Label body;
@@ -37,7 +37,7 @@ internal sealed class McpBrowserOverlay : View
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
 
         this.Visible = false;
@@ -93,6 +93,20 @@ internal sealed class McpBrowserOverlay : View
                 this.Render();
             }
         };
+    }
+
+    internal void ApplyTheme(TuiTheme theme)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        if (this.active)
+        {
+            this.Render();
+        }
+        else
+        {
+            this.SetNeedsDraw();
+        }
     }
 
     internal string HeaderText => this.header.Text ?? string.Empty;
@@ -649,3 +663,5 @@ internal sealed class McpBrowserOverlay : View
         base.Dispose(disposing);
     }
 }
+
+

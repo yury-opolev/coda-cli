@@ -24,6 +24,7 @@ public static class SlashCommandCatalog
         new LogCommand(),
         new GoalCommand(),
         new OutputStyleCommand(),
+        new ThemeCommand(),
         new PermissionsCommand(),
         new YoloCommand(),
         new HeadersCommand(),
@@ -51,3 +52,5 @@ public static class SlashCommandCatalog
         new ExitCommand(),
     ];
 }
+
+

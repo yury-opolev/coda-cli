@@ -4,26 +4,13 @@ using TgAttribute = Terminal.Gui.Drawing.Attribute;
 
 namespace Coda.Tui.Ui.Shells;
 
-/// <summary>
-/// The always-visible one-row operational status pinned directly above the composer. It renders the
-/// current <see cref="OperationalStatus"/> — a semantic prefix (spinner frame, dot, bang, or ring) plus
-/// the status text — in a Warm Ember tone chosen for the status's <see cref="OperationalTone"/>. Only an
-/// animated status runs a timer, and that timer ticks and redraws <em>only this view</em>, never the
-/// whole shell; a static status stops any running timer immediately. The view owns the timer lifecycle
-/// and tears it down on disposal.
-/// </summary>
-/// <remarks>
-/// The timer is injected as <c>addTimeout</c>/<c>removeTimeout</c> seams (defaulting to the application's
-/// own timer) so tests can drive the spinner deterministically without a running loop. Colors come
-/// entirely from <see cref="TuiTheme"/> so the view carries no independent palette.
-/// </remarks>
 internal sealed class OperationalStatusView : View
 {
     private static readonly string[] Spinner = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
     private static readonly TimeSpan Interval = TimeSpan.FromMilliseconds(180);
 
     private readonly IApplication app;
-    private readonly TuiTheme theme;
+    private TuiTheme theme;
     private readonly Func<TimeSpan, Func<bool>, object> addTimeout;
     private readonly Func<object, bool> removeTimeout;
     private object? timer;
@@ -36,7 +23,7 @@ internal sealed class OperationalStatusView : View
         Func<object, bool>? removeTimeout = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
-        this.theme = theme ?? TuiTheme.WarmEmber;
+        this.theme = theme ?? CodaThemes.Current.Tui;
         this.addTimeout = addTimeout ?? ((time, callback) => app.AddTimeout(time, callback)!);
         this.removeTimeout = removeTimeout ?? app.RemoveTimeout;
         this.Status = new OperationalStatus("Ready", OperationalTone.Ready, false);
@@ -44,22 +31,17 @@ internal sealed class OperationalStatusView : View
         this.Height = 1;
     }
 
-    /// <summary>The status currently displayed.</summary>
+    internal void ApplyTheme(TuiTheme theme)
+    {
+        this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.SetNeedsDraw();
+    }
+
     internal OperationalStatus Status { get; private set; }
-
-    /// <summary>The current spinner frame index; advances only while an animated status ticks.</summary>
     internal int SpinnerFrame { get; private set; }
-
-    /// <summary>Whether an animation timer is currently running for this view.</summary>
     internal bool TimerActive => this.timer is not null;
-
-    /// <summary>Number of animation-driven redraw requests; exposed for tests only.</summary>
     internal int AnimationDrawRequests { get; private set; }
 
-    /// <summary>
-    /// Replaces the displayed status. An animated status starts (or keeps) the per-view timer; a static
-    /// status stops any running timer at once. Re-applying the same status is a no-op.
-    /// </summary>
     internal void SetStatus(OperationalStatus status)
     {
         ArgumentNullException.ThrowIfNull(status);
@@ -79,7 +61,6 @@ internal sealed class OperationalStatusView : View
         this.SetNeedsDraw();
     }
 
-    /// <summary>The plain text drawn for the current status: a semantic prefix plus the status text.</summary>
     internal string RenderText()
     {
         var prefix = this.Status.Animated
@@ -94,7 +75,6 @@ internal sealed class OperationalStatusView : View
         return $"{prefix} {this.Status.Text}";
     }
 
-    /// <inheritdoc />
     protected override bool OnDrawingContent(DrawContext? context)
     {
         if (context is not null)
@@ -108,7 +88,6 @@ internal sealed class OperationalStatusView : View
         return true;
     }
 
-    /// <inheritdoc />
     protected override void Dispose(bool disposing)
     {
         if (disposing && !this.disposed)
