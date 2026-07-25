@@ -146,12 +146,12 @@ public sealed class SettingsDefaultsTests : IDisposable
     [Fact]
     public void Project_tool_display_mode_cannot_override_user_value()
     {
-        this.WriteUser("""{ "toolDisplayMode": "verbose" }""");
-        this.WriteProject("""{ "toolDisplayMode": "tiny" }""");
+        this.WriteUser("""{ "toolDisplayMode": "full" }""");
+        this.WriteProject("""{ "toolDisplayMode": "hidden" }""");
 
         var settings = SettingsLoader.Load(this.projectDir, this.userHome);
 
-        Assert.Equal("verbose", settings.ToolDisplayMode);
+        Assert.Equal("full", settings.ToolDisplayMode);
     }
 
     [Fact]

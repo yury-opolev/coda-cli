@@ -24,9 +24,9 @@ namespace Coda.Tui.Tests;
 public sealed class CliTuiMcpSpecComplianceTests
 {
     [Theory]
-    [InlineData("verbose", ToolDisplayMode.Verbose)]
+    [InlineData("full", ToolDisplayMode.Full)]
     [InlineData("compact", ToolDisplayMode.Compact)]
-    [InlineData("tiny", ToolDisplayMode.Tiny)]
+    [InlineData("hidden", ToolDisplayMode.Hidden)]
     public void Explicit_tool_modes_remain_unchanged(string raw, ToolDisplayMode expected)
     {
         var resolution = ToolDisplayModeResolver.Resolve(raw);

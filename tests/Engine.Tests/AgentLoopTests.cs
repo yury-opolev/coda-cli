@@ -130,6 +130,21 @@ public sealed class AgentLoopTests
         public void OnError(string message) { }
     }
 
+    /// <summary>Captures OnThinking / OnThinkingComplete calls for assertion.</summary>
+    private sealed class ThinkingCapturingSink : IAgentSink
+    {
+        public List<string> ThinkingDeltas { get; } = [];
+        public int ThinkingCompleteCount { get; private set; }
+
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputJson) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+        public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
+        public void OnThinkingComplete() => this.ThinkingCompleteCount++;
+    }
+
     /// <summary>Records error and limit-reached signals for assertion.</summary>
     private sealed class RecordingSink : IAgentSink
     {
@@ -517,5 +532,60 @@ public sealed class AgentLoopTests
     {
         public Task<bool> RequestAsync(ITool tool, string inputPreview, CancellationToken cancellationToken = default)
             => Task.FromResult(false);
+    }
+
+    // ─── Fix 1: AgentLoop finalizes open thinking burst ──────────────────────────
+
+    [Fact]
+    public async Task Open_thinking_burst_at_turn_end_triggers_OnThinkingComplete()
+    {
+        // Stream emits ThinkingDelta but NO ThinkingDone before Done — simulates a provider that
+        // ends without closing the reasoning burst. AgentLoop must finalize it via OnThinkingComplete.
+        var turn = new[]
+        {
+            AssistantStreamEvent.ThinkingDelta("let me think"),
+            AssistantStreamEvent.Delta("answer"),
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+
+        var sink = new ThinkingCapturingSink();
+        var loop = new AgentLoop(
+            new ScriptedClient(turn),
+            new ToolRegistry([]),
+            new AllowAllPermissionPrompt(),
+            Options());
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+        await loop.RunAsync(history, sink, CancellationToken.None);
+
+        Assert.Equal(["let me think"], sink.ThinkingDeltas);
+        Assert.Equal(1, sink.ThinkingCompleteCount); // finalized even without ThinkingDone in stream
+    }
+
+    [Fact]
+    public async Task Already_closed_thinking_burst_does_not_double_complete()
+    {
+        // Stream emits ThinkingDelta + ThinkingDone (normal path) — AgentLoop must NOT add
+        // a second OnThinkingComplete call after the streaming loop.
+        var thinking = new ThinkingBlock("reasoning", "sig123");
+        var turn = new[]
+        {
+            AssistantStreamEvent.ThinkingDelta("reasoning"),
+            AssistantStreamEvent.ThinkingDone(thinking),
+            AssistantStreamEvent.Delta("answer"),
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+
+        var sink = new ThinkingCapturingSink();
+        var loop = new AgentLoop(
+            new ScriptedClient(turn),
+            new ToolRegistry([]),
+            new AllowAllPermissionPrompt(),
+            Options());
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+        await loop.RunAsync(history, sink, CancellationToken.None);
+
+        Assert.Equal(1, sink.ThinkingCompleteCount); // exactly once — from the stream's ThinkingDone
     }
 }

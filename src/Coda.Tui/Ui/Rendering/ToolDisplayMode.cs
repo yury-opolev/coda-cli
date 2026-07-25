@@ -3,10 +3,10 @@ namespace Coda.Tui.Ui.Rendering;
 /// <summary>Controls how tool activity is presented by human-facing renderers.</summary>
 public enum ToolDisplayMode
 {
-    Verbose,
+    Full,
     Compact,
-    Tiny,
     Summary,
+    Hidden,
 }
 
 /// <summary>The resolved display mode plus the raw setting information needed for diagnostics.</summary>
@@ -48,9 +48,9 @@ public static class ToolDisplayModeResolver
 
         var mode = rawValue.Trim().ToLowerInvariant() switch
         {
-            "verbose" => ToolDisplayMode.Verbose,
+            "full" => ToolDisplayMode.Full,
             "compact" => ToolDisplayMode.Compact,
-            "tiny" => ToolDisplayMode.Tiny,
+            "hidden" => ToolDisplayMode.Hidden,
             "summary" => ToolDisplayMode.Summary,
             _ => (ToolDisplayMode?)null,
         };

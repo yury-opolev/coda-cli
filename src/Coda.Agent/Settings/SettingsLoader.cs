@@ -148,7 +148,7 @@ public static class SettingsLoader
                 GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
                 Telemetry = ParseTelemetry(doc?.Telemetry),
-                ToolDisplayMode = doc?.ToolDisplayMode,
+                ToolDisplayMode = MigrateDisplayMode(doc?.ToolDisplayMode),
                 EffortByModel = ParseEffortByModel(doc?.EffortByModel),
             };
         }
@@ -254,6 +254,14 @@ public static class SettingsLoader
 
     private static string? NullIfBlank(string? value) =>
         string.IsNullOrWhiteSpace(value) ? null : value.Trim();
+
+    /// <summary>Migrates legacy display-mode values to their renamed equivalents on load.</summary>
+    private static string? MigrateDisplayMode(string? value) => value?.Trim().ToLowerInvariant() switch
+    {
+        "verbose" => "full",
+        "tiny" => "hidden",
+        _ => value,
+    };
 
     private static readonly IReadOnlyDictionary<string, string> emptyModelByProvider =
         new Dictionary<string, string>(StringComparer.Ordinal);

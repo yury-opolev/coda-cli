@@ -31,6 +31,10 @@ public sealed class WireAgentSink : IAgentSink
     private readonly StringBuilder pendingText = new();
     private long lastFlushTicks;
 
+    // Thinking-burst tracking: wall-clock start of the current burst (TickCount64 at first OnThinking).
+    // null when no burst is active.
+    private long? thinkingBurstStartTicks;
+
     public WireAgentSink(IJsonRpcConnection connection)
         : this(connection, static () => Environment.TickCount64)
     {
@@ -54,6 +58,31 @@ public sealed class WireAgentSink : IAgentSink
     public void OnAssistantTextComplete()
     {
         _ = this.SendAsync(ServeMethods.EventAssistantTextComplete, new JsonObject());
+    }
+
+    /// <summary>
+    /// Forwards a reasoning-text delta. The first delta in a burst records the burst start time so
+    /// <see cref="OnThinkingComplete"/> can report accurate elapsed milliseconds.
+    /// </summary>
+    public void OnThinking(string delta)
+    {
+        this.thinkingBurstStartTicks ??= this.clock();
+
+        var node = ServeJson.ToNode(new ThinkingEvent(delta));
+        _ = this.SendAsync(ServeMethods.EventThinking, node);
+    }
+
+    /// <summary>
+    /// Closes the current reasoning burst and reports elapsed time. The burst start was recorded
+    /// by the first <see cref="OnThinking"/> call; it is reset here so the next burst starts fresh.
+    /// </summary>
+    public void OnThinkingComplete()
+    {
+        var now = this.clock();
+        var elapsedMs = this.thinkingBurstStartTicks is { } start ? now - start : 0L;
+        this.thinkingBurstStartTicks = null;
+        var node = ServeJson.ToNode(new ThinkingCompleteEvent(elapsedMs, ThinkingTokens: null));
+        _ = this.SendAsync(ServeMethods.EventThinkingComplete, node);
     }
 
     public void OnToolCall(string toolName, string inputJson)

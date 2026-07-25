@@ -353,7 +353,9 @@ public sealed partial class AgentLoop : IAgentLoop
 
                 var text = new StringBuilder();
                 var toolUses = new List<ToolUseBlock>();
+                var thinkingBlocks = new List<ThinkingBlock>();
                 string? stopReason = null;
+                var thinkingBurstOpen = false;
 
                 this.LogTurnStart(iteration, this.options.Model, history.Count, toolDefinitions.Count);
 
@@ -388,6 +390,21 @@ public sealed partial class AgentLoop : IAgentLoop
                                     }
 
                                     break;
+
+                                case AssistantEventKind.ThinkingDelta:
+                                    thinkingBurstOpen = true;
+                                    sink.OnThinking(streamEvent.Text!);
+                                    break;
+
+                                case AssistantEventKind.ThinkingComplete:
+                                    thinkingBurstOpen = false;
+                                    sink.OnThinkingComplete();
+                                    if (streamEvent.Thinking is { } completedBlock)
+                                    {
+                                        thinkingBlocks.Add(completedBlock);
+                                    }
+
+                                    break;
                             }
                         }
 
@@ -404,6 +421,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         // Discard the partial turn and summarize the history in place, then retry.
                         text.Clear();
                         toolUses.Clear();
+                        thinkingBlocks.Clear();
                         stopReason = null;
                         await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
                         request = request with { Messages = history };
@@ -427,11 +445,31 @@ public sealed partial class AgentLoop : IAgentLoop
                     }
                 }
 
+                // Finalize any open thinking burst that the provider stream did not explicitly close.
+                // Mirrors the unconditional OnAssistantTextComplete below: both are called at the
+                // iteration boundary regardless of whether the stream emitted the closing event.
+                if (thinkingBurstOpen)
+                {
+                    sink.OnThinkingComplete();
+                    thinkingBurstOpen = false;
+                }
+
                 sink.OnAssistantTextComplete();
 
                 this.LogTurnEnd(iteration, stopReason ?? "(none)", toolUses.Count, text.Length);
 
                 var assistantContent = new List<ContentBlock>();
+                // Thinking blocks precede text and tool_use in the assistant turn so the provider
+                // receives them in the same order they were emitted. Only blocks with a signature
+                // are included; unsigned blocks are not replayable and are silently skipped.
+                foreach (var block in thinkingBlocks)
+                {
+                    if (block.Signature is not null)
+                    {
+                        assistantContent.Add(block);
+                    }
+                }
+
                 if (text.Length > 0)
                 {
                     assistantContent.Add(new TextBlock(text.ToString()));

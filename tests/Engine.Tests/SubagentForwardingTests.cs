@@ -329,4 +329,58 @@ public sealed class SubagentForwardingTests
             Assert.Single(identities, candidate => candidate == identity);
         }
     }
+
+    // ─── Fix 2: CollectingSink forwards OnThinking / OnThinkingComplete ──────────
+
+    private sealed class ThinkingCapturingSink : IAgentSink
+    {
+        public List<string> ThinkingDeltas { get; } = [];
+        public int ThinkingCompleteCount { get; private set; }
+
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputJson) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+        public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
+        public void OnThinkingComplete() => this.ThinkingCompleteCount++;
+    }
+
+    [Fact]
+    public async Task CollectingSink_forwards_OnThinking_and_OnThinkingComplete_to_parent()
+    {
+        // A scripted client that emits ThinkingDelta + ThinkingDone in its turn. The SubagentHost
+        // wraps the parent in a CollectingSink; that CollectingSink must forward thinking events.
+        var thinkingTurn = new[]
+        {
+            AssistantStreamEvent.ThinkingDelta("let me reason"),
+            AssistantStreamEvent.ThinkingDone(new ThinkingBlock("let me reason", "sig123")),
+            AssistantStreamEvent.Delta("done"),
+            AssistantStreamEvent.Finished("end_turn"),
+        };
+
+        var client = new ScriptedClient(thinkingTurn);
+        var parent = new ThinkingCapturingSink();
+        var mgr = new TaskManager(sessionId: "collecting-thinking", logRoot: null);
+        var host = new SubagentHost(
+            client,
+            new ToolRegistry([]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            mgr,
+            includeAnthropicSystemPrefix: false);
+
+        await host.RunSubagentAsync(
+            "general-purpose",
+            "think",
+            parent,
+            new SteeringInbox(),
+            "task-ct",
+            depth: 1,
+            parentActivity: null,
+            cancellationToken: CancellationToken.None);
+
+        Assert.Equal(["let me reason"], parent.ThinkingDeltas);
+        Assert.Equal(1, parent.ThinkingCompleteCount);
+    }
 }

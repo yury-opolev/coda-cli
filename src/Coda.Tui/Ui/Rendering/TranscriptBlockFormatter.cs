@@ -77,13 +77,14 @@ public static class TranscriptBlockFormatter
 
     /// <summary>Projects <paramref name="block"/> onto wrapped, attributed lines for the given cell width.</summary>
     public static IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block, int width) =>
-        Format(block, width, ToolDisplayMode.Verbose);
+        Format(block, width, ToolDisplayMode.Full);
 
     /// <summary>Projects <paramref name="block"/> using the requested tool display mode.</summary>
     public static IReadOnlyList<TranscriptRenderLine> Format(
         TranscriptBlock block,
         int width,
-        ToolDisplayMode toolDisplayMode)
+        ToolDisplayMode toolDisplayMode,
+        TimeProvider? timeProvider = null)
     {
         ArgumentNullException.ThrowIfNull(block);
 
@@ -105,7 +106,7 @@ public static class TranscriptBlockFormatter
                 break;
 
             case ToolTranscriptBlock tool:
-                if (toolDisplayMode != ToolDisplayMode.Tiny)
+                if (toolDisplayMode != ToolDisplayMode.Hidden)
                 {
                     AppendTool(lines, tool, safeWidth, toolDisplayMode);
                 }
@@ -142,6 +143,14 @@ public static class TranscriptBlockFormatter
             case SessionBoundaryTranscriptBlock boundary:
                 AppendWrapped(lines, $"── session {boundary.SessionId} ──", safeWidth, TranscriptRole.Notification);
                 break;
+
+            case ThinkingTranscriptBlock thinking:
+                if (toolDisplayMode != ToolDisplayMode.Hidden)
+                {
+                    AppendThinking(lines, thinking, safeWidth, toolDisplayMode, timeProvider);
+                }
+
+                break;
         }
 
         return lines;
@@ -151,7 +160,7 @@ public static class TranscriptBlockFormatter
     public static string FormatPlainText(
         TranscriptBlock block,
         int width,
-        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Verbose) =>
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Full) =>
         string.Join('\n', Format(block, width, toolDisplayMode).Select(line => line.Text));
 
     /// <summary>
@@ -388,7 +397,7 @@ public static class TranscriptBlockFormatter
 
         AppendPreformatted(lines, header.ToString(), width, role);
 
-        if (toolDisplayMode == ToolDisplayMode.Verbose && tool.Result is { Length: > 0 } result)
+        if (toolDisplayMode == ToolDisplayMode.Full && tool.Result is { Length: > 0 } result)
         {
             foreach (var line in SplitLines(result))
             {
@@ -408,7 +417,7 @@ public static class TranscriptBlockFormatter
     {
         switch (toolDisplayMode)
         {
-            case ToolDisplayMode.Tiny:
+            case ToolDisplayMode.Hidden:
                 return;
             case ToolDisplayMode.Summary:
                 AppendToolActivitySummary(lines, activity, width);
@@ -417,9 +426,105 @@ public static class TranscriptBlockFormatter
                 AppendToolActivityCompact(lines, activity, width);
                 return;
             default:
-                AppendToolActivityVerbose(lines, activity, width);
+                AppendToolActivityFull(lines, activity, width);
                 return;
         }
+    }
+
+    /// <summary>
+    /// Projects a <see cref="ThinkingTranscriptBlock"/> per the requested display mode.
+    /// <list type="bullet">
+    /// <item><term>Full</term><description>Status line + full reasoning text (streamed tail while active).</description></item>
+    /// <item><term>Compact</term><description>Status line + last ~5 lines of reasoning (streamed tail).</description></item>
+    /// <item><term>Summary</term><description>Status one-liner only.</description></item>
+    /// </list>
+    /// Hidden is already guarded by the caller. Elapsed time is computed live from <see
+    /// cref="ThinkingTranscriptBlock.StartedAt"/> when the block is active and frozen from
+    /// <see cref="ThinkingTranscriptBlock.ElapsedMs"/> when complete.
+    /// </summary>
+    private static void AppendThinking(
+        List<TranscriptRenderLine> lines,
+        ThinkingTranscriptBlock thinking,
+        int width,
+        ToolDisplayMode displayMode,
+        TimeProvider? timeProvider = null)
+    {
+        var status = FormatThinkingStatus(thinking, timeProvider);
+        AppendWrapped(lines, status, width, TranscriptRole.Notification);
+
+        if (displayMode == ToolDisplayMode.Summary)
+        {
+            return;
+        }
+
+        if (string.IsNullOrEmpty(thinking.Text))
+        {
+            return;
+        }
+
+        if (displayMode == ToolDisplayMode.Full)
+        {
+            // Full: stream the entire reasoning; completed turns show all text.
+            AppendMarkdown(lines, thinking.Text, width);
+            return;
+        }
+
+        // Compact: show the last ~5 lines (streaming tail) without re-parsing the full markdown.
+        // We split the raw text, take the tail, and append as preformatted lines.
+        const int CompactTailLines = 5;
+        var allLines = SplitLines(thinking.Text).ToList();
+        // Remove trailing empty lines to avoid wasted blank rows at the tail.
+        while (allLines.Count > 0 && string.IsNullOrEmpty(allLines[^1]))
+        {
+            allLines.RemoveAt(allLines.Count - 1);
+        }
+
+        var tailStart = Math.Max(0, allLines.Count - CompactTailLines);
+        for (var i = tailStart; i < allLines.Count; i++)
+        {
+            foreach (var wrapped in WrapPreformatted(allLines[i], width))
+            {
+                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.Notification));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Returns the one-line thinking status: "💭 Thinking… Xs · N tok" while active, or
+    /// "💭 Thought for Xs" when complete. Elapsed is computed live when the burst is active,
+    /// using the injected <paramref name="timeProvider"/> (defaults to <see cref="TimeProvider.System"/>).
+    /// </summary>
+    private static string FormatThinkingStatus(ThinkingTranscriptBlock thinking, TimeProvider? timeProvider = null)
+    {
+        long elapsedMs;
+        if (thinking.ElapsedMs is { } frozen)
+        {
+            elapsedMs = frozen;
+        }
+        else
+        {
+            // Live: compute from StartedAt via the injectable clock so tests are deterministic.
+            // The render loop drives periodic refresh so the elapsed ticks are decoupled from delta arrival.
+            var now = (timeProvider ?? TimeProvider.System).GetUtcNow();
+            elapsedMs = (long)Math.Max(0, (now - thinking.StartedAt.ToUniversalTime()).TotalMilliseconds);
+        }
+
+        var seconds = elapsedMs / 1000;
+        var sb = new StringBuilder();
+        if (thinking.Complete)
+        {
+            sb.Append("\U0001f4ad Thought for ").Append(seconds).Append('s');
+        }
+        else
+        {
+            sb.Append("\U0001f4ad Thinking\u2026 ").Append(seconds).Append('s');
+            if (thinking.ThinkingTokens is { } tokens)
+            {
+                sb.Append(" \u00b7 ").Append(tokens.ToString(CultureInfo.InvariantCulture)).Append(" tok");
+            }
+        }
+
+        return sb.ToString();
     }
 
     private static void AppendToolActivitySummary(
@@ -490,7 +595,7 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendToolActivityVerbose(
+    private static void AppendToolActivityFull(
         List<TranscriptRenderLine> lines,
         ToolActivityTranscriptBlock activity,
         int width)

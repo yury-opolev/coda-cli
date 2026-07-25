@@ -323,4 +323,48 @@ public class SubagentManagerTests
 
         throw new Xunit.Sdk.XunitException("Condition not met in time.");
     }
+
+    // ─── Fix 2: TaskOutputSink forwards OnThinking / OnThinkingComplete ──────────
+
+    /// <summary>Host that emits one OnThinking + OnThinkingComplete event before returning.</summary>
+    private sealed class ThinkingEmittingHost : ISubagentHost
+    {
+        public Task<string> RunSubagentAsync(
+            string subagentType, string prompt, IAgentSink sink, SteeringInbox steering,
+            string taskId, int depth, CancellationToken cancellationToken = default)
+        {
+            sink.OnThinking("let me reason");
+            sink.OnThinkingComplete();
+            return Task.FromResult("done");
+        }
+    }
+
+    private sealed class ThinkingRecordingSink : IAgentSink
+    {
+        public List<string> ThinkingDeltas { get; } = [];
+        public int ThinkingCompleteCount { get; private set; }
+
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputPreview) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+        public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
+        public void OnThinkingComplete() => this.ThinkingCompleteCount++;
+    }
+
+    [Fact]
+    public async Task TaskOutputSink_ForwardsThinkingEventsToParent()
+    {
+        // TaskOutputSink must forward OnThinking/OnThinkingComplete to the parent sink so that
+        // subagent reasoning reaches the UI even when routed through a background task wrapper.
+        var mgr = NewManager();
+        var parent = new ThinkingRecordingSink();
+
+        await mgr.RunSubagentForegroundAsync(
+            new ThinkingEmittingHost(), "general-purpose", "go", "desc", parent, parentTaskId: null);
+
+        Assert.Equal(["let me reason"], parent.ThinkingDeltas);
+        Assert.Equal(1, parent.ThinkingCompleteCount);
+    }
 }

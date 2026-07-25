@@ -22,6 +22,8 @@ public static class OpenAiResponsesSseReader
         var toolCalls = new SortedDictionary<int, ToolCallAccumulator>();
         var hasToolCall = false;
         var hasFinished = false;
+        // Accumulate reasoning summary text for ThinkingBlock history replay.
+        var reasoningText = new StringBuilder();
 
         while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
@@ -63,6 +65,18 @@ public static class OpenAiResponsesSseReader
 
                     break;
 
+                case "response.reasoning_summary_text.delta":
+                    // Normalized thinking-text delta: emit to the sink and accumulate for history replay.
+                    if (root.TryGetProperty("delta", out var reasoningDelta)
+                        && reasoningDelta.ValueKind == JsonValueKind.String
+                        && reasoningDelta.GetString() is { Length: > 0 } reasoningChunk)
+                    {
+                        reasoningText.Append(reasoningChunk);
+                        yield return AssistantStreamEvent.ThinkingDelta(reasoningChunk);
+                    }
+
+                    break;
+
                 case "response.output_item.added":
                 case "response.output_item.done":
                     if (root.TryGetProperty("item", out var item)
@@ -94,6 +108,14 @@ public static class OpenAiResponsesSseReader
                     foreach (var toolCall in FlushToolCalls(toolCalls))
                     {
                         yield return AssistantStreamEvent.Tool(toolCall);
+                    }
+
+                    // Emit the complete thinking block if any reasoning was accumulated.
+                    // OpenAI stores encrypted reasoning content server-side; the summary text is
+                    // the rendered version. Signature is null (no client-side replay token required).
+                    if (reasoningText.Length > 0)
+                    {
+                        yield return AssistantStreamEvent.ThinkingDone(new ThinkingBlock(reasoningText.ToString(), null));
                     }
 
                     var response = root.TryGetProperty("response", out var responseElement)

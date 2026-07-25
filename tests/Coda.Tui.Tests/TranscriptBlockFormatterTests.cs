@@ -138,12 +138,12 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
-    public void Tiny_tool_block_is_hidden_without_mutating_the_block()
+    public void Hidden_tool_block_is_hidden_without_mutating_the_block()
     {
         var block = new ToolTranscriptBlock(
             Guid.NewGuid(), "grep", "{\"pattern\":\"x\"}", 12, "result", IsError: false, Complete: true);
 
-        var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Tiny);
+        var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Hidden);
 
         Assert.Empty(lines);
         Assert.Equal("{\"pattern\":\"x\"}", block.InputJson);
@@ -562,9 +562,9 @@ public sealed class TranscriptBlockFormatterTests
             Call("run_command", """{"command":"echo \u001b[31mhello"}""", ToolCallStatus.Running, result: "line one\nline two"),
             Call("write_file", """{"path":"x"}""", ToolCallStatus.Failed, error: "\u001b[2Jdenied"));
 
-        var verbose = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Verbose);
+        var verbose = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Full);
         var compact = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Compact);
-        var tiny = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Tiny);
+        var tiny = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Hidden);
         var legacy = new ToolTranscriptBlock(
             Guid.NewGuid(), "grep", "{}", 1, "legacy result", IsError: false, Complete: true);
 
@@ -576,12 +576,12 @@ public sealed class TranscriptBlockFormatterTests
         Assert.DoesNotContain(compact, line => line.Text.Contains("line one", StringComparison.Ordinal));
         Assert.Empty(tiny);
         Assert.Contains(
-            TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Verbose),
+            TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Full),
             line => line.Text == "legacy result");
         Assert.Equal(
             "grep {} [success]",
             Assert.Single(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Compact)).Text);
-        Assert.Empty(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Tiny));
+        Assert.Empty(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Hidden));
     }
 
     [Fact]

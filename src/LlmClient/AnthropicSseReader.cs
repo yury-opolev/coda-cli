@@ -25,6 +25,8 @@ public static class AnthropicSseReader
     {
         // Accumulator for the in-flight tool_use block, keyed by content index.
         var toolUses = new Dictionary<int, (string Id, string Name, StringBuilder Input)>();
+        // Accumulator for the in-flight thinking block, keyed by content index.
+        var thinkingBlocks = new Dictionary<int, (StringBuilder Text, StringBuilder Signature)>();
         string? stopReason = null;
         var inputTokens = 0;
         var outputTokens = 0;
@@ -86,12 +88,20 @@ public static class AnthropicSseReader
                     {
                         var index = GetIndex(root);
                         if (root.TryGetProperty("content_block", out var block)
-                            && block.TryGetProperty("type", out var bt)
-                            && bt.GetString() == "tool_use")
+                            && block.TryGetProperty("type", out var bt))
                         {
-                            var id = block.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? string.Empty : string.Empty;
-                            var name = block.TryGetProperty("name", out var nm) ? nm.GetString() ?? string.Empty : string.Empty;
-                            toolUses[index] = (id, name, new StringBuilder());
+                            var blockType = bt.GetString();
+                            if (blockType == "tool_use")
+                            {
+                                var id = block.TryGetProperty("id", out var idEl) ? idEl.GetString() ?? string.Empty : string.Empty;
+                                var name = block.TryGetProperty("name", out var nm) ? nm.GetString() ?? string.Empty : string.Empty;
+                                toolUses[index] = (id, name, new StringBuilder());
+                            }
+                            else if (blockType == "thinking")
+                            {
+                                // Register an accumulator for the thinking block at this index.
+                                thinkingBlocks[index] = (new StringBuilder(), new StringBuilder());
+                            }
                         }
 
                         break;
@@ -121,6 +131,27 @@ public static class AnthropicSseReader
                                     }
 
                                     break;
+
+                                case "thinking_delta":
+                                    // Emit a normalized thinking-text delta and accumulate in the block.
+                                    var thinkingText = delta.TryGetProperty("thinking", out var tt) ? tt.GetString() : null;
+                                    if (!string.IsNullOrEmpty(thinkingText) && thinkingBlocks.TryGetValue(index, out var thacc))
+                                    {
+                                        thacc.Text.Append(thinkingText);
+                                        yield return AssistantStreamEvent.ThinkingDelta(thinkingText!);
+                                    }
+
+                                    break;
+
+                                case "signature_delta":
+                                    // Accumulate the Anthropic signed-thinking signature (not streamed to the UI).
+                                    var sig = delta.TryGetProperty("signature", out var sv) ? sv.GetString() : null;
+                                    if (sig is not null && thinkingBlocks.TryGetValue(index, out var sigacc))
+                                    {
+                                        sigacc.Signature.Append(sig);
+                                    }
+
+                                    break;
                             }
                         }
 
@@ -134,6 +165,15 @@ public static class AnthropicSseReader
                         {
                             var input = finished.Input.Length > 0 ? finished.Input.ToString() : "{}";
                             yield return AssistantStreamEvent.Tool(new ToolUseBlock(finished.Id, finished.Name, input));
+                        }
+                        else if (thinkingBlocks.Remove(index, out var completedThinking))
+                        {
+                            // Emit the complete thinking block with its signature for history replay.
+                            var thinkingText = completedThinking.Text.ToString();
+                            var signature = completedThinking.Signature.Length > 0
+                                ? completedThinking.Signature.ToString()
+                                : null;
+                            yield return AssistantStreamEvent.ThinkingDone(new ThinkingBlock(thinkingText, signature));
                         }
 
                         break;

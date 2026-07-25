@@ -34,3 +34,13 @@ public sealed record ToolResultBlock(string ToolUseId, string Content, bool IsEr
 /// <see cref="Base64Data"/> is the base-64-encoded image bytes.
 /// </summary>
 public sealed record ImageBlock(string MediaType, string Base64Data) : ContentBlock;
+
+/// <summary>
+/// Accumulated model reasoning emitted during extended-thinking / reasoning-summary modes.
+/// <see cref="Text"/> is the full reasoning text.
+/// <see cref="Signature"/> is the opaque provider token required for round-trip replay (Anthropic
+/// signed-thinking token, OpenAI encrypted reasoning content), or <see langword="null"/> when the
+/// provider requires no replay token. A block without a signature is still displayed but is excluded
+/// from subsequent assistant history to avoid sending an invalid request.
+/// </summary>
+public sealed record ThinkingBlock(string Text, string? Signature) : ContentBlock;

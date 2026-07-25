@@ -446,6 +446,13 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         var content = new JsonArray();
         foreach (var block in message.Content)
         {
+            // ThinkingBlock without a signature cannot be round-tripped (Anthropic rejects them).
+            // Skip them silently so a turn with unsigned thinking blocks doesn't produce a 400 error.
+            if (block is ThinkingBlock { Signature: null })
+            {
+                continue;
+            }
+
             content.Add(SerializeBlock(block));
         }
 
@@ -477,6 +484,18 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
                 ["data"] = image.Base64Data,
             },
         },
+        // Thinking blocks must be returned verbatim in multi-step turns so Anthropic can
+        // verify the signature. Blocks without a signature (e.g. when the provider stream
+        // never delivered one) are silently dropped from history to avoid an invalid request.
+        ThinkingBlock thinking when thinking.Signature is not null => new JsonObject
+        {
+            ["type"] = "thinking",
+            ["thinking"] = thinking.Text,
+            ["signature"] = thinking.Signature,
+        },
+        ThinkingBlock => throw new InvalidOperationException(
+            "ThinkingBlock without a signature cannot be serialized for Anthropic history replay. " +
+            "Callers must exclude signature-less blocks before building the request."),
         _ => throw new InvalidOperationException($"Unknown content block: {block.GetType().Name}"),
     };
 
