@@ -65,6 +65,15 @@ internal sealed class TuiTheme
     public TuiThemeColor ContextAutocompactBuffer { get; init; } = new(new TgColor(168, 154, 134), TgName.Gray);
     public TuiThemeColor ContextFreeSpace { get; init; } = new(new TgColor(112, 102, 92), TgName.DarkGray);
 
+    // Five GitHub-style callout roles (Note/Tip/Important/Warning/Caution). Each pairs with a matching
+    // TranscriptRole so title rows resolve to the callout hue. Values here are the Warm Ember defaults;
+    // Default and CoolDark built-ins override all five to their own palette (enforced by the parity test).
+    public TuiThemeColor CalloutNote { get; init; } = new(new TgColor(150, 190, 230), TgName.BrightBlue);
+    public TuiThemeColor CalloutTip { get; init; } = new(new TgColor(120, 190, 100), TgName.BrightGreen);
+    public TuiThemeColor CalloutImportant { get; init; } = new(new TgColor(200, 140, 215), TgName.BrightMagenta);
+    public TuiThemeColor CalloutWarning { get; init; } = new(new TgColor(235, 165, 45), TgName.Yellow);
+    public TuiThemeColor CalloutCaution { get; init; } = new(new TgColor(220, 90, 70), TgName.BrightRed);
+
     public TuiThemeColor ComposerText { get; init; } = new(new TgColor(242, 214, 179), TgName.White);
     public TuiThemeColor ComposerPrompt { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
 

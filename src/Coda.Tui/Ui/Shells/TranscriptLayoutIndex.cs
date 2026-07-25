@@ -19,6 +19,16 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
 
     /// <summary>Whether this is the synthetic, inert blank row after a visible semantic block.</summary>
     public bool IsSeparator { get; init; }
+
+    /// <summary>
+    /// When greater than zero, the first <see cref="PrefixCells"/> display cells of <see cref="Text"/> are
+    /// painted in <see cref="PrefixRole"/> rather than <see cref="Role"/>. Selection highlight still wins
+    /// within its range; outside selection, prefix cells use <see cref="PrefixRole"/> and the rest use <see cref="Role"/>.
+    /// </summary>
+    public int PrefixCells { get; init; }
+
+    /// <summary>The role (and thus color) applied to the first <see cref="PrefixCells"/> cells of the row.</summary>
+    public TranscriptRole PrefixRole { get; init; }
 }
 
 /// <summary>
@@ -282,6 +292,8 @@ internal sealed class TranscriptLayoutIndex
                     FillWidth = line.FillWidth,
                     RightText = line.RightText,
                     RightTextTrailingCells = line.RightTextTrailingCells,
+                    PrefixCells = line.PrefixCells,
+                    PrefixRole = line.PrefixRole,
                 });
             }
 

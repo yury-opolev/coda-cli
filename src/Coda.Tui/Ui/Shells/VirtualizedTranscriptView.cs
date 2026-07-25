@@ -349,12 +349,13 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>
     /// Paints one row at <paramref name="screenRow"/>. A <see cref="TranscriptRow.FillWidth"/> row first paints
     /// its role background across the whole visible width (the user-message block), then draws its text over it;
-    /// other rows keep the global background. Rows with no selection intersection draw their text once in their
-    /// role color; where the selection covers part (or all) of the row, the text is drawn in three cell-sliced
-    /// segments — role-colored prefix, Warm Ember selection-highlighted middle, role-colored suffix — so the
-    /// highlight is segmented exactly over the selected cells and survives redraw/scroll. Finally, a
-    /// <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim attribute
-    /// near the row's trailing edge; the row text was wrapped to reserve its cells, so it never overlaps.
+    /// other rows keep the global background. When <see cref="TranscriptRow.PrefixCells"/> is set, the first
+    /// PrefixCells cells are drawn in <see cref="TranscriptRow.PrefixRole"/> (callout bar color) and the rest
+    /// in the normal role color. Rows with no selection intersection draw their text once in their role color;
+    /// where the selection covers part (or all) of the row, the text is drawn in cell-sliced segments — the
+    /// selection highlight always wins within its range, and outside it the prefix/role coloring applies.
+    /// Finally, a <see cref="TranscriptRow.RightText"/> annotation (e.g. the sent-time HH:mm) is drawn in a dim
+    /// attribute near the row's trailing edge; the row text was wrapped to reserve its cells, so it never overlaps.
     /// </summary>
     private void DrawRow(TranscriptRow row, int screenRow)
     {
@@ -375,9 +376,27 @@ internal sealed class VirtualizedTranscriptView : View
         var range = row.IsSeparator ? null : this.selection.RangeForRow(row.GlobalRow, rowWidth);
         if (range is null)
         {
-            this.SetAttribute(rowAttribute);
-            this.Move(0, screenRow);
-            this.AddStr(row.Text);
+            if (row.PrefixCells <= 0)
+            {
+                this.SetAttribute(rowAttribute);
+                this.Move(0, screenRow);
+                this.AddStr(row.Text);
+            }
+            else
+            {
+                // Prefix cells draw in PrefixRole; remainder draws in Role.
+                var prefixAttribute = this.AttributeFor(row.PrefixRole);
+                var (_, prefixEnd) = TerminalCellText.SnapRangeToGraphemes(row.Text, 0, row.PrefixCells);
+                var prefixText = TerminalCellText.SliceByCells(row.Text, 0, prefixEnd);
+                var bodyText = TerminalCellText.SliceByCells(row.Text, prefixEnd, rowWidth);
+                this.SetAttribute(prefixAttribute);
+                this.Move(0, screenRow);
+                this.AddStr(prefixText);
+                var col = TerminalCellText.Width(prefixText);
+                this.SetAttribute(rowAttribute);
+                this.Move(col, screenRow);
+                this.AddStr(bodyText);
+            }
         }
         else
         {
@@ -394,26 +413,85 @@ internal sealed class VirtualizedTranscriptView : View
                 row.Text,
                 range.Value.StartCell,
                 range.Value.EndCellExclusive);
-            var prefix = TerminalCellText.SliceByCells(row.Text, 0, selectStart);
-            var selected = TerminalCellText.SliceByCells(row.Text, selectStart, selectEnd);
-            var suffix = TerminalCellText.SliceByCells(row.Text, selectEnd, rowWidth);
 
-            this.SetAttribute(rowAttribute);
-            this.Move(0, screenRow);
-            this.AddStr(prefix);
-            var column = TerminalCellText.Width(prefix);
-            if (selected.Length > 0)
+            if (row.PrefixCells <= 0)
             {
-                this.SetAttribute(selectedAttribute);
-                this.Move(column, screenRow);
-                this.AddStr(selected);
-                column += TerminalCellText.Width(selected);
-                this.SelectionDrawCount++;
-            }
+                // Original 3-segment path: role-colored prefix, selected middle, role-colored suffix.
+                var prefix = TerminalCellText.SliceByCells(row.Text, 0, selectStart);
+                var selected = TerminalCellText.SliceByCells(row.Text, selectStart, selectEnd);
+                var suffix = TerminalCellText.SliceByCells(row.Text, selectEnd, rowWidth);
 
-            this.SetAttribute(rowAttribute);
-            this.Move(column, screenRow);
-            this.AddStr(suffix);
+                this.SetAttribute(rowAttribute);
+                this.Move(0, screenRow);
+                this.AddStr(prefix);
+                var column = TerminalCellText.Width(prefix);
+                if (selected.Length > 0)
+                {
+                    this.SetAttribute(selectedAttribute);
+                    this.Move(column, screenRow);
+                    this.AddStr(selected);
+                    column += TerminalCellText.Width(selected);
+                    this.SelectionDrawCount++;
+                }
+
+                this.SetAttribute(rowAttribute);
+                this.Move(column, screenRow);
+                this.AddStr(suffix);
+            }
+            else
+            {
+                // Up-to-5-segment path: selection wins in [selectStart, selectEnd); outside selection,
+                // prefix cells [0, prefixEnd) use PrefixRole and the rest use Role.
+                var prefixAttribute = this.AttributeFor(row.PrefixRole);
+                var (_, prefixEnd) = TerminalCellText.SnapRangeToGraphemes(row.Text, 0, row.PrefixCells);
+
+                // Sort the 5 boundary points (duplicates collapse naturally in the segStart >= segEnd guard).
+                var bps = new[] { 0, prefixEnd, selectStart, selectEnd, rowWidth };
+                Array.Sort(bps);
+
+                var column = 0;
+                var selectionDrawn = false;
+                for (var i = 0; i + 1 < bps.Length; i++)
+                {
+                    var segStart = bps[i];
+                    var segEnd = bps[i + 1];
+                    if (segStart >= segEnd)
+                    {
+                        continue;
+                    }
+
+                    var segText = TerminalCellText.SliceByCells(row.Text, segStart, segEnd);
+                    if (segText.Length == 0)
+                    {
+                        continue;
+                    }
+
+                    TgAttribute segAttr;
+                    if (segStart >= selectStart && segEnd <= selectEnd)
+                    {
+                        segAttr = selectedAttribute;
+                        selectionDrawn = true;
+                    }
+                    else if (segStart < prefixEnd)
+                    {
+                        segAttr = prefixAttribute;
+                    }
+                    else
+                    {
+                        segAttr = rowAttribute;
+                    }
+
+                    this.SetAttribute(segAttr);
+                    this.Move(column, screenRow);
+                    this.AddStr(segText);
+                    column += TerminalCellText.Width(segText);
+                }
+
+                if (selectionDrawn)
+                {
+                    this.SelectionDrawCount++;
+                }
+            }
         }
 
         if (row.RightText is { Length: > 0 } annotation && viewWidth > 0)
@@ -827,6 +905,11 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.ContextMessages => this.theme.ContextMessages,
             TranscriptRole.ContextAutocompactBuffer => this.theme.ContextAutocompactBuffer,
             TranscriptRole.ContextFreeSpace => this.theme.ContextFreeSpace,
+            TranscriptRole.CalloutNote => this.theme.CalloutNote,
+            TranscriptRole.CalloutTip => this.theme.CalloutTip,
+            TranscriptRole.CalloutImportant => this.theme.CalloutImportant,
+            TranscriptRole.CalloutWarning => this.theme.CalloutWarning,
+            TranscriptRole.CalloutCaution => this.theme.CalloutCaution,
             _ => this.theme.TranscriptAssistant,
         };
 

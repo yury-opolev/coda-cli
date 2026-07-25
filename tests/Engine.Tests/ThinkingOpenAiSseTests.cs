@@ -109,13 +109,13 @@ public sealed class ThinkingOpenAiSseTests
 
         var events = await ReadAll(sse);
 
-        var thinkingDelta = Assert.Single(events.Where(e => e.Kind == AssistantEventKind.ThinkingDelta));
+        var thinkingDelta = Assert.Single(events, e => e.Kind == AssistantEventKind.ThinkingDelta);
         Assert.Equal("my plan", thinkingDelta.Text);
 
-        var textDelta = Assert.Single(events.Where(e => e.Kind == AssistantEventKind.TextDelta));
+        var textDelta = Assert.Single(events, e => e.Kind == AssistantEventKind.TextDelta);
         Assert.Equal("my answer", textDelta.Text);
 
-        Assert.Single(events.Where(e => e.Kind == AssistantEventKind.ThinkingComplete));
-        Assert.Single(events.Where(e => e.Kind == AssistantEventKind.Done));
+        Assert.Single(events, e => e.Kind == AssistantEventKind.ThinkingComplete);
+        Assert.Single(events, e => e.Kind == AssistantEventKind.Done);
     }
 }

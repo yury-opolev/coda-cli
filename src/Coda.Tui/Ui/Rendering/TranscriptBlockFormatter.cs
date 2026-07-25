@@ -32,6 +32,14 @@ public enum TranscriptRole
     ContextMessages,
     ContextAutocompactBuffer,
     ContextFreeSpace,
+
+    // Five GitHub-style admonition callout roles, one per type. Title rows use the callout role so they
+    // render in the type's hue; body text rows stay Assistant for readable neutral color.
+    CalloutNote,
+    CalloutTip,
+    CalloutImportant,
+    CalloutWarning,
+    CalloutCaution,
 }
 
 /// <summary>A single rendered transcript line: display text plus the role that colors it.</summary>
@@ -57,6 +65,17 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
 
     /// <summary>Cells intentionally left blank after <see cref="RightText"/>.</summary>
     public int RightTextTrailingCells { get; init; }
+
+    /// <summary>
+    /// When greater than zero, the first <c>PrefixCells</c> display cells of <see cref="Text"/> are painted
+    /// in <see cref="PrefixRole"/> rather than <see cref="Role"/>. The bar text (e.g. <c>│ </c>) stays in
+    /// <see cref="Text"/> so copy/selection still includes it; only its COLOR comes from the prefix role.
+    /// Selection highlight still wins over the prefix color within its range.
+    /// </summary>
+    public int PrefixCells { get; init; }
+
+    /// <summary>The role (and thus color) applied to the first <see cref="PrefixCells"/> cells of the row.</summary>
+    public TranscriptRole PrefixRole { get; init; }
 
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
@@ -279,16 +298,24 @@ public static class TranscriptBlockFormatter
                 break;
 
             case QuoteBlock quote:
-                var innerFirst = true;
-                foreach (var child in quote)
+                var callout = DetectCallout(quote);
+                if (callout is { } type)
                 {
-                    if (!innerFirst)
+                    AppendCallout(lines, quote, type, width, indent);
+                }
+                else
+                {
+                    var innerFirst = true;
+                    foreach (var child in quote)
                     {
-                        lines.Add(new TranscriptRenderLine(indent, TranscriptRole.Assistant));
-                    }
+                        if (!innerFirst)
+                        {
+                            lines.Add(new TranscriptRenderLine(indent, TranscriptRole.Assistant));
+                        }
 
-                    innerFirst = false;
-                    AppendBlock(lines, child, width, indent);
+                        innerFirst = false;
+                        AppendBlock(lines, child, width, indent);
+                    }
                 }
 
                 break;
@@ -300,6 +327,177 @@ public static class TranscriptBlockFormatter
             case LeafBlock leaf when leaf.Inline is not null:
                 AppendWrapped(lines, RenderInline(leaf.Inline), width, TranscriptRole.Assistant, indent);
                 break;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // Callout detection and rendering (GitHub-style > [!TYPE] blockquote syntax)
+    // ---------------------------------------------------------------------------
+
+    private enum CalloutType { Note, Tip, Important, Warning, Caution }
+
+    /// <summary>
+    /// Returns the unicode or ASCII glyph for a callout <see cref="TranscriptRole"/>.
+    /// Unicode is used in production; the ASCII form is the fallback for environments that cannot
+    /// display the unicode symbol (exposed <c>internal</c> so tests can verify both forms).
+    /// </summary>
+    internal static string CalloutGlyph(TranscriptRole role, bool ascii = false) => role switch
+    {
+        TranscriptRole.CalloutNote => ascii ? "i" : "ℹ",
+        TranscriptRole.CalloutTip => ascii ? "*" : "✦",
+        TranscriptRole.CalloutImportant => ascii ? "!!" : "‼",
+        TranscriptRole.CalloutWarning => ascii ? "!" : "⚠",
+        TranscriptRole.CalloutCaution => ascii ? "x" : "⊗",
+        _ => ascii ? "?" : "ℹ",
+    };
+
+    /// <summary>
+    /// Checks whether <paramref name="quote"/>'s first block is a paragraph whose leading inline text
+    /// is exactly <c>[!TYPE]</c> (case-insensitive, optional surrounding whitespace). Returns the
+    /// recognized <see cref="CalloutType"/>, or <c>null</c> when the blockquote is a plain quote.
+    /// GitHub semantics: the marker must be alone on the first line; trailing text or an unknown type
+    /// make this a plain blockquote (no false positives).
+    /// </summary>
+    private static CalloutType? DetectCallout(QuoteBlock quote)
+    {
+        if (quote.Count == 0 || quote[0] is not ParagraphBlock firstParagraph)
+        {
+            return null;
+        }
+
+        var container = firstParagraph.Inline;
+        if (container is null)
+        {
+            return null;
+        }
+
+        // Collect consecutive LiteralInline nodes from the start of the paragraph until the first
+        // non-literal (a soft/hard line break, emphasis, image, …). This gives the first "logical line"
+        // of the blockquote even when Markdig splits the marker into multiple adjacent literal nodes.
+        var firstLineText = new System.Text.StringBuilder();
+        foreach (var inline in container)
+        {
+            if (inline is LiteralInline literal)
+            {
+                firstLineText.Append(literal.Content.ToString());
+            }
+            else
+            {
+                // Non-literal encountered — stop; we now have the first logical line text.
+                break;
+            }
+        }
+
+        return ParseCalloutType(firstLineText.ToString());
+    }
+
+    /// <summary>
+    /// Parses a trimmed first-line string as a callout marker (<c>[!TYPE]</c>). Returns the
+    /// <see cref="CalloutType"/> when the string is exactly <c>[!TYPE]</c> with no extra content;
+    /// returns <c>null</c> for unknown types, trailing text, or malformed markers.
+    /// </summary>
+    private static CalloutType? ParseCalloutType(string markerText)
+    {
+        var trimmed = markerText.Trim();
+        if (trimmed.Length < 4 || trimmed[0] != '[' || trimmed[1] != '!' || trimmed[^1] != ']')
+        {
+            return null;
+        }
+
+        // Inner text must match exactly (no interior whitespace); ToUpperInvariant gives case-insensitivity.
+        var type = trimmed[2..^1];
+        return type.ToUpperInvariant() switch
+        {
+            "NOTE" => CalloutType.Note,
+            "TIP" => CalloutType.Tip,
+            "IMPORTANT" => CalloutType.Important,
+            "WARNING" => CalloutType.Warning,
+            "CAUTION" => CalloutType.Caution,
+            _ => null,
+        };
+    }
+
+    /// <summary>
+    /// Returns the <see cref="TranscriptRole"/> and display label for a callout type.
+    /// </summary>
+    private static (TranscriptRole Role, string Label) CalloutRoleAndLabel(CalloutType type) => type switch
+    {
+        CalloutType.Note => (TranscriptRole.CalloutNote, "NOTE"),
+        CalloutType.Tip => (TranscriptRole.CalloutTip, "TIP"),
+        CalloutType.Important => (TranscriptRole.CalloutImportant, "IMPORTANT"),
+        CalloutType.Warning => (TranscriptRole.CalloutWarning, "WARNING"),
+        CalloutType.Caution => (TranscriptRole.CalloutCaution, "CAUTION"),
+        _ => (TranscriptRole.CalloutNote, "NOTE"),
+    };
+
+    /// <summary>
+    /// Extracts the body text from a callout's first paragraph: everything after the <c>[!TYPE]</c>
+    /// marker on the first inline line. Returns an empty string when the marker is the only content.
+    /// </summary>
+    private static string ExtractBodyFromFirstParagraph(ParagraphBlock paragraph)
+    {
+        var fullText = RenderInline(paragraph.Inline);
+        var closingBracket = fullText.IndexOf(']');
+        if (closingBracket < 0 || closingBracket + 1 >= fullText.Length)
+        {
+            return string.Empty;
+        }
+
+        return fullText[(closingBracket + 1)..].TrimStart();
+    }
+
+    /// <summary>
+    /// Renders a detected callout: a glyph+label title row in the callout's role, followed by body rows
+    /// each prefixed with <c>│ </c>. The bar glyph stays in the row text (so copy still includes it);
+    /// its color comes from <c>PrefixRole</c> set to the callout role while the body text uses the normal
+    /// <c>Role</c> (Assistant, Code, …).
+    /// </summary>
+    private static void AppendCallout(
+        List<TranscriptRenderLine> lines,
+        QuoteBlock quote,
+        CalloutType type,
+        int width,
+        string indent)
+    {
+        var (role, label) = CalloutRoleAndLabel(type);
+        var glyph = CalloutGlyph(role);
+
+        // Title row: "<glyph> LABEL" in the callout role.
+        AppendWrapped(lines, $"{glyph} {label}", width, role, indent);
+
+        // Body bar prefix: each body row is indented with "│ " so the bar is visible as the
+        // left boundary of the callout body, mirroring the list-indent discipline.
+        var barPrefix = indent + "│ ";
+        // The bar glyph and trailing space together occupy this many display cells; these cells
+        // are drawn in the callout role color via PrefixRole/PrefixCells on each body row.
+        var prefixCells = TerminalCellText.Width(barPrefix);
+        var firstParagraph = (ParagraphBlock)quote[0];
+        var bodyText = ExtractBodyFromFirstParagraph(firstParagraph);
+
+        var bodyStart = lines.Count;
+        if (!string.IsNullOrEmpty(bodyText))
+        {
+            AppendWrapped(lines, bodyText, width, TranscriptRole.Assistant, barPrefix);
+        }
+
+        // Subsequent child blocks of the blockquote (second paragraph onward, code blocks, etc.).
+        var hadBody = !string.IsNullOrEmpty(bodyText);
+        for (var i = 1; i < quote.Count; i++)
+        {
+            if (hadBody)
+            {
+                lines.Add(new TranscriptRenderLine(barPrefix, TranscriptRole.Assistant));
+            }
+
+            hadBody = true;
+            AppendBlock(lines, quote[i], width, barPrefix);
+        }
+
+        // Apply prefix coloring to all body rows: the first PrefixCells cells (the "│ " bar) draw in
+        // the callout role color; the remainder draws in the row's own Role (Assistant, Code, …).
+        for (var j = bodyStart; j < lines.Count; j++)
+        {
+            lines[j] = lines[j] with { PrefixCells = prefixCells, PrefixRole = role };
         }
     }
 

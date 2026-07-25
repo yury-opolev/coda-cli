@@ -152,14 +152,14 @@ public sealed class ThinkingAnthropicSseTests
 
         var events = await ReadAll(sse);
 
-        var thinkingDelta = Assert.Single(events.Where(e => e.Kind == AssistantEventKind.ThinkingDelta));
+        var thinkingDelta = Assert.Single(events, e => e.Kind == AssistantEventKind.ThinkingDelta);
         Assert.Equal("reasoning", thinkingDelta.Text);
 
-        var thinkingComplete = Assert.Single(events.Where(e => e.Kind == AssistantEventKind.ThinkingComplete));
+        var thinkingComplete = Assert.Single(events, e => e.Kind == AssistantEventKind.ThinkingComplete);
         Assert.Equal("reasoning", thinkingComplete.Thinking!.Text);
         Assert.Equal("SIG", thinkingComplete.Thinking.Signature);
 
-        var textDelta = Assert.Single(events.Where(e => e.Kind == AssistantEventKind.TextDelta));
+        var textDelta = Assert.Single(events, e => e.Kind == AssistantEventKind.TextDelta);
         Assert.Equal("answer", textDelta.Text);
     }
 
