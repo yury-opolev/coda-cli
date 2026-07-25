@@ -46,12 +46,12 @@ public sealed record UiPromptRequest(
         new(Guid.NewGuid(), UiPromptKind.Confirm, title, null, [new("yes", "Yes"), new("no", "No")], defaultValue ? "yes" : "no", true);
 
     /// <summary>A single-choice selection over <paramref name="options"/>, optionally pre-selecting <paramref name="defaultValue"/>.</summary>
-    public static UiPromptRequest Select(string title, IEnumerable<UiPromptOption> options, string? defaultValue = null) =>
-        new(Guid.NewGuid(), UiPromptKind.SelectOne, title, null, [.. options], defaultValue, true);
+    public static UiPromptRequest Select(string title, IEnumerable<UiPromptOption> options, string? defaultValue = null, bool allowFreeText = false) =>
+        new(Guid.NewGuid(), UiPromptKind.SelectOne, title, null, [.. options], defaultValue, true) { AllowFreeText = allowFreeText };
 
     /// <summary>A multi-choice selection over <paramref name="options"/>.</summary>
-    public static UiPromptRequest SelectMany(string title, IEnumerable<UiPromptOption> options) =>
-        new(Guid.NewGuid(), UiPromptKind.SelectMany, title, null, [.. options], null, false);
+    public static UiPromptRequest SelectMany(string title, IEnumerable<UiPromptOption> options, bool allowFreeText = false) =>
+        new(Guid.NewGuid(), UiPromptKind.SelectMany, title, null, [.. options], null, false) { AllowFreeText = allowFreeText };
 
     /// <summary>A free-form text (or secret) entry.</summary>
     public static UiPromptRequest Text(string title, string? defaultValue = null, bool required = false, bool secret = false) =>
@@ -64,6 +64,14 @@ public sealed record UiPromptRequest(
     /// other than the theme picker always leave this null, preserving their existing behavior.
     /// </summary>
     public Action<string>? OnHighlight { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/> on a <see cref="UiPromptKind.SelectOne"/> or
+    /// <see cref="UiPromptKind.SelectMany"/> prompt, the overlay appends a trailing
+    /// <c>✎ Type your own answer…</c> row that lets the user submit an arbitrary string instead of
+    /// picking from the fixed options. Always <see langword="false"/> for closed-set internal pickers.
+    /// </summary>
+    public bool AllowFreeText { get; init; }
 }
 
 /// <summary>

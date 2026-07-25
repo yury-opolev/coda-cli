@@ -79,6 +79,6 @@ public sealed class AskUserQuestionTool : ITool
         }
 
         var answer = await context.UserQuestion.AskAsync(question, options, multiSelect, cancellationToken).ConfigureAwait(false);
-        return new ToolResult($"User selected: {answer}");
+        return new ToolResult($"User answered: {answer}");
     }
 }

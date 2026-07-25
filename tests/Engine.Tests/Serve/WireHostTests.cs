@@ -268,6 +268,43 @@ public sealed class WireHostTests
         Assert.Equal("A", answer);
     }
 
+    [Fact]
+    public async Task WireUserQuestionPrompt_sends_allow_free_text_true()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        JsonNode? receivedNode = null;
+        serverConn.OnRequest(ServeMethods.RequestQuestion, node =>
+        {
+            receivedNode = node;
+            return ServeJson.ToNode(new QuestionResponse("A"));
+        });
+
+        var prompt = new WireUserQuestionPrompt(clientConn);
+        await prompt.AskAsync("Pick one", ["A", "B"], false).WaitAsync(WaitTimeout);
+
+        Assert.NotNull(receivedNode);
+        Assert.True(receivedNode!["allowFreeText"]!.GetValue<bool>());
+    }
+
+    [Fact]
+    public async Task WireUserQuestionPrompt_returns_answer_verbatim()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        serverConn.OnRequest(ServeMethods.RequestQuestion, _ =>
+            ServeJson.ToNode(new QuestionResponse("totally free-form text")));
+
+        var prompt = new WireUserQuestionPrompt(clientConn);
+        var answer = await prompt.AskAsync("Pick one", ["A", "B"], false).WaitAsync(WaitTimeout);
+
+        Assert.Equal("totally free-form text", answer);
+    }
+
     // ---------------------------------------------------------------------------
     // WirePlanApprover tests
     // ---------------------------------------------------------------------------

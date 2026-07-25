@@ -29,8 +29,8 @@ public sealed class TuiUserQuestionPrompt(IUiPromptService prompts, IUiEventPubl
             .ToImmutableArray();
 
         var request = multiSelect
-            ? UiPromptRequest.SelectMany(question, promptOptions)
-            : UiPromptRequest.Select(question, promptOptions);
+            ? UiPromptRequest.SelectMany(question, promptOptions, allowFreeText: true)
+            : UiPromptRequest.Select(question, promptOptions, allowFreeText: true);
 
         var response = await prompts.RequestAsync(request, cancellationToken).ConfigureAwait(false);
 
@@ -38,6 +38,10 @@ public sealed class TuiUserQuestionPrompt(IUiPromptService prompts, IUiEventPubl
         if (response.Cancelled)
         {
             answer = string.Empty;
+        }
+        else if (response.Text is { Length: > 0 } freeText)
+        {
+            answer = freeText;
         }
         else
         {

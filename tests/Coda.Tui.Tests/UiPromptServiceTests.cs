@@ -346,6 +346,61 @@ public sealed class UiPromptServiceTests
         Assert.Equal(UiPromptKind.SelectOne, prompts.Requests[0].Kind);
     }
 
+    [Fact]
+    public async Task User_question_adapter_sets_allow_free_text_on_request()
+    {
+        var options = new[] { "Option A", "Option B" };
+        var events = new RecordingEventPublisher();
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["0"], null));
+        var adapter = new TuiUserQuestionPrompt(prompts, events);
+
+        await adapter.AskAsync("What do you want?", options, multiSelect: false);
+
+        Assert.True(prompts.Requests[0].AllowFreeText);
+    }
+
+    [Fact]
+    public async Task User_question_adapter_sets_allow_free_text_on_multi_select_request()
+    {
+        var options = new[] { "A", "B", "C" };
+        var events = new RecordingEventPublisher();
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["0"], null));
+        var adapter = new TuiUserQuestionPrompt(prompts, events);
+
+        await adapter.AskAsync("Pick all", options, multiSelect: true);
+
+        Assert.True(prompts.Requests[0].AllowFreeText);
+    }
+
+    [Fact]
+    public async Task User_question_adapter_free_text_response_returns_typed_string()
+    {
+        var options = new[] { "Option A", "Option B" };
+        var events = new RecordingEventPublisher();
+        // Simulate the user typing a free-text answer (Text set, SelectedIds empty).
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, [], "My custom answer"));
+        var adapter = new TuiUserQuestionPrompt(prompts, events);
+
+        var answer = await adapter.AskAsync("What do you want?", options, multiSelect: false);
+
+        Assert.Equal("My custom answer", answer);
+        Assert.Equal("My custom answer", Assert.IsType<UserQuestionResolvedEvent>(events.Events[1]).Answer);
+    }
+
+    [Fact]
+    public async Task User_question_adapter_option_response_returns_labels_when_no_free_text()
+    {
+        var options = new[] { "Red", "Green", "Blue" };
+        var events = new RecordingEventPublisher();
+        // Simulate picking an option (SelectedIds set, Text null).
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["1"], null));
+        var adapter = new TuiUserQuestionPrompt(prompts, events);
+
+        var answer = await adapter.AskAsync("Pick a color", options, multiSelect: false);
+
+        Assert.Equal("Green", answer);
+    }
+
     private sealed class RecordingEventPublisher : IUiEventPublisher
     {
         public List<UiEvent> Events { get; } = [];
