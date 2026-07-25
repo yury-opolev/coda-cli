@@ -350,7 +350,7 @@ public class SubagentManagerTests
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
         public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
-        public void OnThinkingComplete() => this.ThinkingCompleteCount++;
+        public void OnThinkingComplete(int? thinkingTokens = null) => this.ThinkingCompleteCount++;
     }
 
     [Fact]

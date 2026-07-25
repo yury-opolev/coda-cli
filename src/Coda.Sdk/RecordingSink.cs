@@ -211,7 +211,7 @@ internal sealed class RecordingSink : IAgentSink
 
     public void OnThinking(string delta) => this.inner?.OnThinking(delta);
 
-    public void OnThinkingComplete() => this.inner?.OnThinkingComplete();
+    public void OnThinkingComplete(int? thinkingTokens = null) => this.inner?.OnThinkingComplete();
 
     public void OnLimitReached(string kind, string message) => this.inner?.OnLimitReached(kind, message);
 

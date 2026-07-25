@@ -7,6 +7,7 @@ namespace Engine.Tests;
 /// Unit tests for OpenAI Responses SSE reasoning-summary parsing:
 /// response.reasoning_summary_text.delta emits normalized ThinkingDelta events, and
 /// response.completed emits a ThinkingComplete event with the accumulated reasoning text.
+/// Also covers Finding 2 (ThinkingTokens) and Finding 3 (encrypted reasoning round-trip).
 /// </summary>
 public sealed class ThinkingOpenAiSseTests
 {
@@ -117,5 +118,83 @@ public sealed class ThinkingOpenAiSseTests
 
         Assert.Single(events, e => e.Kind == AssistantEventKind.ThinkingComplete);
         Assert.Single(events, e => e.Kind == AssistantEventKind.Done);
+    }
+
+    // -- Finding 2: ThinkingTokens from output_tokens at response.completed ---
+
+    [Fact]
+    public async Task Reasoning_output_tokens_are_carried_as_ThinkingTokens_in_ThinkingComplete()
+    {
+        // When the Responses API emits reasoning summary deltas and then completes with
+        // output_tokens in the usage, the ThinkingComplete event must carry that count so
+        // callers can display "N tok" in the thinking block header.
+        const string sse = """
+            data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"my reasoning"}
+
+            data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":99}}}
+
+            """;
+
+        var events = await ReadAll(sse);
+
+        var complete = events.Single(e => e.Kind == AssistantEventKind.ThinkingComplete);
+        Assert.NotNull(complete.Thinking);
+        Assert.Equal("my reasoning", complete.Thinking!.Text);
+        Assert.Equal(99, complete.ThinkingTokens);
+    }
+
+    // -- Finding 3: OpenAI encrypted reasoning content round-trip ---
+
+    [Fact]
+    public async Task Reasoning_item_with_encrypted_content_carries_signature_in_ThinkingComplete()
+    {
+        // When the Responses API returns a reasoning output_item with an encrypted_content field
+        // (used for stateless/store=false requests), the SSE reader must capture it and convey
+        // it as ThinkingBlock.Signature so the caller can replay the reasoning across turns.
+        const string sse = """
+            data: {"type":"response.reasoning_summary_text.delta","item_id":"rs_1","output_index":0,"summary_index":0,"delta":"my reasoning"}
+
+            data: {"type":"response.output_item.done","output_index":0,"item":{"type":"reasoning","id":"rs_1","encrypted_content":"SYNTHETIC_ENCRYPTED_BLOB"}}
+
+            data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":5,"output_tokens":3}}}
+
+            """;
+
+        var events = await ReadAll(sse);
+
+        var complete = events.Single(e => e.Kind == AssistantEventKind.ThinkingComplete);
+        Assert.NotNull(complete.Thinking);
+        Assert.Equal("my reasoning", complete.Thinking!.Text);
+        Assert.NotNull(complete.Thinking.Signature);
+        // Signature must contain the encrypted content so it can be replayed
+        Assert.Contains("SYNTHETIC_ENCRYPTED_BLOB", complete.Thinking.Signature);
+    }
+
+    [Fact]
+    public async Task ThinkingBlock_with_signature_is_serialized_as_reasoning_input_item()
+    {
+        // When an assistant turn contains a ThinkingBlock with a non-null Signature
+        // (captured from an earlier reasoning output_item), OpenAiResponsesRequest.Build
+        // must include a reasoning input item so the model retains its reasoning state.
+        const string signatureJson = """{"id":"rs_1","encrypted_content":"SYNTHETIC_ENCRYPTED_BLOB"}""";
+        var request = new ChatRequest
+        {
+            Model = "o3",
+            Messages =
+            [
+                new ChatMessage(ChatRole.Assistant,
+                [
+                    new ThinkingBlock("my reasoning", signatureJson),
+                    new ToolUseBlock("call_1", "bash", "{}"),
+                ]),
+            ],
+        };
+
+        var body = OpenAiResponsesRequest.Build(request);
+        var inputJson = body["input"]!.ToJsonString();
+
+        Assert.Contains("\"type\":\"reasoning\"", inputJson);
+        Assert.Contains("\"id\":\"rs_1\"", inputJson);
+        Assert.Contains("SYNTHETIC_ENCRYPTED_BLOB", inputJson);
     }
 }

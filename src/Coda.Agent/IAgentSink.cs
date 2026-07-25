@@ -57,9 +57,11 @@ public interface IAgentSink
 
     /// <summary>
     /// The current reasoning burst is complete (its block is now fully accumulated and ready for
-    /// history replay). Default: no-op.
+    /// history replay). <paramref name="thinkingTokens"/> is the provider-reported token count for
+    /// the burst, or <see langword="null"/> when the provider does not report per-burst counts.
+    /// Default: no-op.
     /// </summary>
-    void OnThinkingComplete() { }
+    void OnThinkingComplete(int? thinkingTokens = null) { }
 
     /// <summary>
     /// A recoverable per-turn limit was hit and the turn ended early — this is NOT a crash.

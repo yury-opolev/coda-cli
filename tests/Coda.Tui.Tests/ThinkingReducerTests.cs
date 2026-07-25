@@ -182,13 +182,29 @@ public sealed class ThinkingReducerTests
         Assert.Equal(1000L, block.ElapsedMs);
     }
 
+    // -- Finding 2: ThinkingTokens carried on block ---
+
     [Fact]
-    public void TurnInterrupted_with_no_thinking_block_is_safe()
+    public void ThinkingCompleteEvent_with_ThinkingTokens_sets_tokens_on_block()
     {
         var state = UiSessionSnapshot.Empty;
-        state = UiReducer.Reduce(state, new TurnInterruptedEvent());
+        state = UiReducer.Reduce(state, new ThinkingDeltaEvent("reasoning", T0));
+        state = UiReducer.Reduce(state, new ThinkingCompleteEvent(500L, ThinkingTokens: 123));
 
-        // Must not throw; no thinking block in transcript.
-        Assert.Empty(state.Transcript.OfType<ThinkingTranscriptBlock>());
+        var block = Assert.IsType<ThinkingTranscriptBlock>(Assert.Single(state.Transcript));
+        Assert.True(block.Complete);
+        Assert.Equal(500L, block.ElapsedMs);
+        Assert.Equal(123, block.ThinkingTokens);
+    }
+
+    [Fact]
+    public void ThinkingCompleteEvent_without_ThinkingTokens_leaves_tokens_null_on_block()
+    {
+        var state = UiSessionSnapshot.Empty;
+        state = UiReducer.Reduce(state, new ThinkingDeltaEvent("reasoning", T0));
+        state = UiReducer.Reduce(state, new ThinkingCompleteEvent(500L));
+
+        var block = Assert.IsType<ThinkingTranscriptBlock>(Assert.Single(state.Transcript));
+        Assert.Null(block.ThinkingTokens);
     }
 }

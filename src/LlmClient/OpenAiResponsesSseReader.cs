@@ -24,6 +24,10 @@ public static class OpenAiResponsesSseReader
         var hasFinished = false;
         // Accumulate reasoning summary text for ThinkingBlock history replay.
         var reasoningText = new StringBuilder();
+        // Capture the reasoning item's id and encrypted_content for stateless replay (store=false).
+        // Both are null when the Responses API does not return an encrypted_content field.
+        string? reasoningItemId = null;
+        string? reasoningEncryptedContent = null;
 
         while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
@@ -80,13 +84,30 @@ public static class OpenAiResponsesSseReader
                 case "response.output_item.added":
                 case "response.output_item.done":
                     if (root.TryGetProperty("item", out var item)
-                        && item.ValueKind == JsonValueKind.Object
-                        && IsFunctionCall(item))
+                        && item.ValueKind == JsonValueKind.Object)
                     {
-                        var index = ReadOutputIndex(root);
-                        var accumulator = GetToolCall(toolCalls, index);
-                        ReadToolCall(item, accumulator);
-                        hasToolCall = true;
+                        if (IsFunctionCall(item))
+                        {
+                            var index = ReadOutputIndex(root);
+                            var accumulator = GetToolCall(toolCalls, index);
+                            ReadToolCall(item, accumulator);
+                            hasToolCall = true;
+                        }
+                        else if (IsReasoningItem(item))
+                        {
+                            // Capture the reasoning item id and encrypted_content (if present) for
+                            // stateless replay. The encrypted_content field is only present when the
+                            // request uses store=false; omitting it is safe (no client-side replay).
+                            if (item.TryGetProperty("id", out var itemId) && itemId.ValueKind == JsonValueKind.String)
+                            {
+                                reasoningItemId = itemId.GetString();
+                            }
+
+                            if (item.TryGetProperty("encrypted_content", out var enc) && enc.ValueKind == JsonValueKind.String)
+                            {
+                                reasoningEncryptedContent = enc.GetString();
+                            }
+                        }
                     }
 
                     break;
@@ -110,21 +131,39 @@ public static class OpenAiResponsesSseReader
                         yield return AssistantStreamEvent.Tool(toolCall);
                     }
 
-                    // Emit the complete thinking block if any reasoning was accumulated.
-                    // OpenAI stores encrypted reasoning content server-side; the summary text is
-                    // the rendered version. Signature is null (no client-side replay token required).
-                    if (reasoningText.Length > 0)
-                    {
-                        yield return AssistantStreamEvent.ThinkingDone(new ThinkingBlock(reasoningText.ToString(), null));
-                    }
-
                     var response = root.TryGetProperty("response", out var responseElement)
                         ? responseElement
                         : default;
+                    var turnUsage = ReadUsage(response);
+
+                    // Emit the complete thinking block if any reasoning was accumulated.
+                    // Signature carries the reasoning item id + encrypted_content (JSON) when the
+                    // provider returned an encrypted_content field; null otherwise (server-side only).
+                    // ThinkingTokens is set to output_tokens so the block header can display "N tok".
+                    if (reasoningText.Length > 0)
+                    {
+                        string? signature = null;
+                        if (reasoningEncryptedContent is not null)
+                        {
+                            // Store as a small JSON object so AppendAssistantInput can reconstruct
+                            // the full reasoning input item (needs both id and encrypted_content).
+                            signature = System.Text.Json.JsonSerializer.Serialize(new
+                            {
+                                id = reasoningItemId ?? string.Empty,
+                                encrypted_content = reasoningEncryptedContent,
+                            });
+                        }
+
+                        var thinkingTokens = turnUsage?.OutputTokens is { } ot && ot > 0 ? ot : (int?)null;
+                        yield return AssistantStreamEvent.ThinkingDone(
+                            new ThinkingBlock(reasoningText.ToString(), signature),
+                            thinkingTokens: thinkingTokens);
+                    }
+
                     var stopReason = type == "response.incomplete"
                         ? MapIncompleteReason(response)
                         : hasToolCall ? "tool_use" : "end_turn";
-                    yield return AssistantStreamEvent.Finished(stopReason, ReadUsage(response));
+                    yield return AssistantStreamEvent.Finished(stopReason, turnUsage);
                     hasFinished = true;
                     break;
 
@@ -144,6 +183,11 @@ public static class OpenAiResponsesSseReader
         item.TryGetProperty("type", out var itemType)
         && itemType.ValueKind == JsonValueKind.String
         && itemType.GetString() == "function_call";
+
+    private static bool IsReasoningItem(JsonElement item) =>
+        item.TryGetProperty("type", out var itemType)
+        && itemType.ValueKind == JsonValueKind.String
+        && itemType.GetString() == "reasoning";
 
     private static int ReadOutputIndex(JsonElement root) =>
         root.TryGetProperty("output_index", out var index)

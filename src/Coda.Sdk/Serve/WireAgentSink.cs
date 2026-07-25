@@ -75,13 +75,14 @@ public sealed class WireAgentSink : IAgentSink
     /// <summary>
     /// Closes the current reasoning burst and reports elapsed time. The burst start was recorded
     /// by the first <see cref="OnThinking"/> call; it is reset here so the next burst starts fresh.
+    /// Forwards <paramref name="thinkingTokens"/> to the wire event unchanged.
     /// </summary>
-    public void OnThinkingComplete()
+    public void OnThinkingComplete(int? thinkingTokens = null)
     {
         var now = this.clock();
         var elapsedMs = this.thinkingBurstStartTicks is { } start ? now - start : 0L;
         this.thinkingBurstStartTicks = null;
-        var node = ServeJson.ToNode(new ThinkingCompleteEvent(elapsedMs, ThinkingTokens: null));
+        var node = ServeJson.ToNode(new ThinkingCompleteEvent(elapsedMs, ThinkingTokens: thinkingTokens));
         _ = this.SendAsync(ServeMethods.EventThinkingComplete, node);
     }
 

@@ -354,6 +354,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 var text = new StringBuilder();
                 var toolUses = new List<ToolUseBlock>();
                 var thinkingBlocks = new List<ThinkingBlock>();
+                var redactedThinkingBlocks = new List<RedactedThinkingBlock>();
                 string? stopReason = null;
                 var thinkingBurstOpen = false;
 
@@ -397,11 +398,19 @@ public sealed partial class AgentLoop : IAgentLoop
                                     break;
 
                                 case AssistantEventKind.ThinkingComplete:
-                                    thinkingBurstOpen = false;
-                                    sink.OnThinkingComplete();
-                                    if (streamEvent.Thinking is { } completedBlock)
+                                    if (streamEvent.RedactedThinking is { } redactedBlock)
                                     {
-                                        thinkingBlocks.Add(completedBlock);
+                                        // Opaque redacted block: no user-visible burst, just preserve for replay.
+                                        redactedThinkingBlocks.Add(redactedBlock);
+                                    }
+                                    else
+                                    {
+                                        thinkingBurstOpen = false;
+                                        sink.OnThinkingComplete(streamEvent.ThinkingTokens);
+                                        if (streamEvent.Thinking is { } completedBlock)
+                                        {
+                                            thinkingBlocks.Add(completedBlock);
+                                        }
                                     }
 
                                     break;
@@ -422,6 +431,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         text.Clear();
                         toolUses.Clear();
                         thinkingBlocks.Clear();
+                        redactedThinkingBlocks.Clear();
                         stopReason = null;
                         await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
                         request = request with { Messages = history };
@@ -459,6 +469,13 @@ public sealed partial class AgentLoop : IAgentLoop
                 this.LogTurnEnd(iteration, stopReason ?? "(none)", toolUses.Count, text.Length);
 
                 var assistantContent = new List<ContentBlock>();
+                // Redacted thinking blocks (opaque, no user-visible text) precede signed thinking
+                // blocks in the assistant turn so Anthropic receives them before the tool_use items.
+                foreach (var block in redactedThinkingBlocks)
+                {
+                    assistantContent.Add(block);
+                }
+
                 // Thinking blocks precede text and tool_use in the assistant turn so the provider
                 // receives them in the same order they were emitted. Only blocks with a signature
                 // are included; unsigned blocks are not replayable and are silently skipped.

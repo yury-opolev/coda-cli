@@ -134,4 +134,25 @@ public sealed class ThinkingServeTests
         Assert.False(received!.AsObject().ContainsKey("thinkingTokens"),
             "thinkingTokens should be omitted when null");
     }
+
+    // -- Finding 2: ThinkingTokens flows through WireAgentSink ---
+
+    [Fact]
+    public async Task OnThinkingComplete_with_thinkingTokens_carries_value_in_wire_event()
+    {
+        using var pair = new DuplexStreamPair();
+        await using var clientConn = new JsonRpcConnection(pair.ClientReads, pair.ClientWrites);
+        await using var serverConn = new JsonRpcConnection(pair.ServerReads, pair.ServerWrites);
+
+        var tcs = new TaskCompletionSource<JsonNode?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        serverConn.OnNotification(ServeMethods.EventThinkingComplete, node => tcs.TrySetResult(node));
+
+        IAgentSink sink = new WireAgentSink(clientConn);
+        sink.OnThinking("reasoning");
+        sink.OnThinkingComplete(thinkingTokens: 999);
+
+        var received = await tcs.Task.WaitAsync(WaitTimeout);
+        Assert.NotNull(received);
+        Assert.Equal(999, received!["thinkingTokens"]!.GetValue<int>());
+    }
 }

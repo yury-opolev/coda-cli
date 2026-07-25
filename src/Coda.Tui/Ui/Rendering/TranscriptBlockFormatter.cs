@@ -442,8 +442,10 @@ public static class TranscriptBlockFormatter
         }
 
         // Collect consecutive LiteralInline nodes from the start of the paragraph until the first
-        // non-literal (a soft/hard line break, emphasis, image, …). This gives the first "logical line"
-        // of the blockquote even when Markdig splits the marker into multiple adjacent literal nodes.
+        // non-literal. Per GitHub semantics, the marker must be ALONE on the first line: if anything
+        // other than a LineBreakInline (soft/hard break) immediately follows the leading literals, the
+        // marker has inline-formatted content on the same line (emphasis, code, link, …) and is NOT a
+        // callout. A LineBreakInline means the marker ends cleanly at a line boundary.
         var firstLineText = new System.Text.StringBuilder();
         foreach (var inline in container)
         {
@@ -451,10 +453,16 @@ public static class TranscriptBlockFormatter
             {
                 firstLineText.Append(literal.Content.ToString());
             }
+            else if (inline is LineBreakInline)
+            {
+                // Clean line break — the marker occupies the first line alone.
+                break;
+            }
             else
             {
-                // Non-literal encountered — stop; we now have the first logical line text.
-                break;
+                // Inline-formatted content (emphasis, code span, link, image, …) on the same line
+                // as the marker → not a valid callout per GitHub spec.
+                return null;
             }
         }
 
@@ -501,22 +509,6 @@ public static class TranscriptBlockFormatter
     };
 
     /// <summary>
-    /// Extracts the body text from a callout's first paragraph: everything after the <c>[!TYPE]</c>
-    /// marker on the first inline line. Returns an empty string when the marker is the only content.
-    /// </summary>
-    private static string ExtractBodyFromFirstParagraph(ParagraphBlock paragraph)
-    {
-        var fullText = RenderInline(paragraph.Inline);
-        var closingBracket = fullText.IndexOf(']');
-        if (closingBracket < 0 || closingBracket + 1 >= fullText.Length)
-        {
-            return string.Empty;
-        }
-
-        return fullText[(closingBracket + 1)..].TrimStart();
-    }
-
-    /// <summary>
     /// Renders a detected callout: a glyph+label title row in the callout's role, followed by body rows
     /// each prefixed with <c>│ </c>. The bar glyph stays in the row text (so copy still includes it);
     /// its color comes from <c>PrefixRole</c> set to the callout role while the body text uses the normal
@@ -542,16 +534,12 @@ public static class TranscriptBlockFormatter
         // are drawn in the callout role color via PrefixRole/PrefixCells on each body row.
         var prefixCells = TerminalCellText.Width(barPrefix);
         var firstParagraph = (ParagraphBlock)quote[0];
-        var bodyText = ExtractBodyFromFirstParagraph(firstParagraph);
 
         var bodyStart = lines.Count;
-        if (!string.IsNullOrEmpty(bodyText))
-        {
-            AppendWrapped(lines, bodyText, width, TranscriptRole.Assistant, barPrefix);
-        }
+        AppendCalloutFirstParagraphBody(lines, firstParagraph, width, barPrefix);
 
         // Subsequent child blocks of the blockquote (second paragraph onward, code blocks, etc.).
-        var hadBody = !string.IsNullOrEmpty(bodyText);
+        var hadBody = lines.Count > bodyStart;
         for (var i = 1; i < quote.Count; i++)
         {
             if (hadBody)
@@ -565,10 +553,59 @@ public static class TranscriptBlockFormatter
 
         // Apply prefix coloring to all body rows: the first PrefixCells cells (the "│ " bar) draw in
         // the callout role color; the remainder draws in the row's own Role (Assistant, Code, …).
+        // The `with` expression preserves all other properties including Links.
         for (var j = bodyStart; j < lines.Count; j++)
         {
             lines[j] = lines[j] with { PrefixCells = prefixCells, PrefixRole = role };
         }
+    }
+
+    /// <summary>
+    /// Renders the body portion of a callout's first paragraph (everything after the <c>[!TYPE]</c>
+    /// marker line) through the link-aware path so that URLs in the body produce
+    /// <see cref="LinkSpan"/>s exactly like subsequent paragraphs do.
+    /// </summary>
+    /// <remarks>
+    /// Markdig folds the marker line and the body line into a single <see cref="ParagraphBlock"/>
+    /// separated by a <see cref="LineBreakInline"/>. This method skips every inline up to and including
+    /// that break, then renders the remaining siblings with <see cref="AppendWrappedText"/>.
+    /// Does nothing when the paragraph contains only the marker (no body content).
+    /// </remarks>
+    private static void AppendCalloutFirstParagraphBody(
+        List<TranscriptRenderLine> lines,
+        ParagraphBlock firstParagraph,
+        int width,
+        string barPrefix)
+    {
+        // Walk the inline tree to find the LineBreakInline that ends the [!TYPE] marker.
+        Inline? bodyStart = null;
+        if (firstParagraph.Inline is not null)
+        {
+            foreach (var node in firstParagraph.Inline)
+            {
+                if (node is LineBreakInline)
+                {
+                    bodyStart = node.NextSibling;
+                    break;
+                }
+            }
+        }
+
+        if (bodyStart is null)
+        {
+            return; // marker-only paragraph — no body to render
+        }
+
+        // Render body inlines using the same per-node helper that RenderInlineWithLinks uses,
+        // but walking NextSibling rather than iterating a ContainerInline.
+        var linkRecords = new List<InlineLinkRecord>();
+        var builder = new StringBuilder();
+        for (var node = bodyStart; node is not null; node = node.NextSibling)
+        {
+            RenderInlineNodeWithLinks(node, builder, linkRecords);
+        }
+
+        AppendWrappedText(lines, builder.ToString(), linkRecords, width, TranscriptRole.Assistant, barPrefix);
     }
 
     private static void AppendList(List<TranscriptRenderLine> lines, ListBlock list, int width, string indent)
@@ -1007,6 +1044,23 @@ public static class TranscriptBlockFormatter
     {
         var linkRecords = new List<InlineLinkRecord>();
         var text = RenderInlineWithLinks(container, linkRecords);
+        AppendWrappedText(lines, text, linkRecords, width, role, indent);
+    }
+
+    /// <summary>
+    /// Wraps <paramref name="text"/> (with associated <paramref name="linkRecords"/>) into one or more
+    /// <see cref="TranscriptRenderLine"/> entries, applying <paramref name="indent"/> and shifting link
+    /// column spans by the indent's display-cell width. Shared between
+    /// <see cref="AppendWrappedInline"/> and <see cref="AppendCalloutFirstParagraphBody"/>.
+    /// </summary>
+    private static void AppendWrappedText(
+        List<TranscriptRenderLine> lines,
+        string text,
+        List<InlineLinkRecord> linkRecords,
+        int width,
+        TranscriptRole role,
+        string indent)
+    {
         var contentWidth = EffectiveWidth(width, indent);
 
         // WrapLineWithLinks produces LinkSpan columns relative to the wrapped text (column 0 = start of
@@ -1092,51 +1146,62 @@ public static class TranscriptBlockFormatter
     {
         foreach (var inline in container)
         {
-            switch (inline)
-            {
-                case LiteralInline literal:
-                    builder.Append(literal.Content.ToString());
-                    break;
+            RenderInlineNodeWithLinks(inline, builder, links);
+        }
+    }
 
-                case CodeInline code:
-                    builder.Append(code.Content);
-                    break;
+    /// <summary>
+    /// Renders a single <see cref="Inline"/> node into <paramref name="builder"/>, recording any
+    /// hyperlink span into <paramref name="links"/>. Shared by
+    /// <see cref="RenderInlineWithLinks(ContainerInline,StringBuilder,List{InlineLinkRecord})"/> (which
+    /// iterates a container) and the callout body walker (which iterates <c>NextSibling</c> links).
+    /// </summary>
+    private static void RenderInlineNodeWithLinks(Inline inline, StringBuilder builder, List<InlineLinkRecord> links)
+    {
+        switch (inline)
+        {
+            case LiteralInline literal:
+                builder.Append(literal.Content.ToString());
+                break;
 
-                case LineBreakInline lineBreak:
-                    builder.Append(lineBreak.IsHard ? '\n' : ' ');
-                    break;
+            case CodeInline code:
+                builder.Append(code.Content);
+                break;
 
-                case LinkInline link:
-                    var linkStart = builder.Length;
-                    // Render the display text (recurse into children; for images this is the alt text).
-                    RenderInlineWithLinks(link, builder, links);
-                    var linkUrl = link.Url ?? string.Empty;
-                    // If no children produced text and we have a URL, use the URL as fallback display text
-                    // (handles links without explicit text in non-image links).
-                    if (builder.Length == linkStart && linkUrl.Length > 0 && !link.IsImage)
+            case LineBreakInline lineBreak:
+                builder.Append(lineBreak.IsHard ? '\n' : ' ');
+                break;
+
+            case LinkInline link:
+                var linkStart = builder.Length;
+                // Render the display text (recurse into children; for images this is the alt text).
+                RenderInlineWithLinks(link, builder, links);
+                var linkUrl = link.Url ?? string.Empty;
+                // If no children produced text and we have a URL, use the URL as fallback display text
+                // (handles links without explicit text in non-image links).
+                if (builder.Length == linkStart && linkUrl.Length > 0 && !link.IsImage)
+                {
+                    builder.Append(linkUrl);
+                }
+
+                // Record link spans only for actual hyperlinks (not images) with non-empty URLs.
+                if (!link.IsImage && linkUrl.Length > 0)
+                {
+                    var displayText = builder.ToString()[linkStart..];
+                    var textMatchesUrl = ComputeTextMatchesUrl(displayText, linkUrl);
+                    if (!textMatchesUrl)
                     {
-                        builder.Append(linkUrl);
+                        builder.Append(DeceptiveMarker);
                     }
 
-                    // Record link spans only for actual hyperlinks (not images) with non-empty URLs.
-                    if (!link.IsImage && linkUrl.Length > 0)
-                    {
-                        var displayText = builder.ToString()[linkStart..];
-                        var textMatchesUrl = ComputeTextMatchesUrl(displayText, linkUrl);
-                        if (!textMatchesUrl)
-                        {
-                            builder.Append(DeceptiveMarker);
-                        }
+                    links.Add(new InlineLinkRecord(linkStart, builder.Length, linkUrl, textMatchesUrl));
+                }
 
-                        links.Add(new InlineLinkRecord(linkStart, builder.Length, linkUrl, textMatchesUrl));
-                    }
+                break;
 
-                    break;
-
-                case ContainerInline nested:
-                    RenderInlineWithLinks(nested, builder, links);
-                    break;
-            }
+            case ContainerInline nested:
+                RenderInlineWithLinks(nested, builder, links);
+                break;
         }
     }
 

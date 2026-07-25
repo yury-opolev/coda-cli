@@ -32,7 +32,7 @@ public static class UiReducer
         AssistantTextCompletedEvent => CompleteAssistant(state),
 
         ThinkingDeltaEvent e => AppendOrExtendThinking(state, e.Delta, e.BurstStartedAt),
-        ThinkingCompleteEvent e => CompleteThinking(state, e.ElapsedMs),
+        ThinkingCompleteEvent e => CompleteThinking(state, e.ElapsedMs, e.ThinkingTokens),
 
         ToolQueuedEvent e => ReduceActivity(
             state,
@@ -376,7 +376,7 @@ public static class UiReducer
         };
     }
 
-    private static UiSessionSnapshot CompleteThinking(UiSessionSnapshot state, long elapsedMs)
+    private static UiSessionSnapshot CompleteThinking(UiSessionSnapshot state, long elapsedMs, int? thinkingTokens)
     {
         var index = LastIndex(state.Transcript, b => b is ThinkingTranscriptBlock { Complete: false });
         if (index < 0)
@@ -389,7 +389,7 @@ public static class UiReducer
         {
             Transcript = state.Transcript.SetItem(
                 index,
-                existing with { Complete = true, ElapsedMs = elapsedMs }),
+                existing with { Complete = true, ElapsedMs = elapsedMs, ThinkingTokens = thinkingTokens }),
         };
     }
 

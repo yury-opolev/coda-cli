@@ -39,8 +39,24 @@ public sealed record AssistantStreamEvent
     /// The completed reasoning block; set on <see cref="AssistantEventKind.ThinkingComplete"/> events.
     /// The block carries the accumulated reasoning text and the provider signature required for history
     /// replay (Anthropic) or encrypted content (OpenAI). <see langword="null"/> on all other event kinds.
+    /// Mutually exclusive with <see cref="RedactedThinking"/>.
     /// </summary>
     public ThinkingBlock? Thinking { get; init; }
+
+    /// <summary>
+    /// A completed opaque redacted-thinking block; set on <see cref="AssistantEventKind.ThinkingComplete"/>
+    /// events when the provider emits a <c>redacted_thinking</c> block (Anthropic). Mutually exclusive with
+    /// <see cref="Thinking"/>. <see langword="null"/> on all other event kinds.
+    /// </summary>
+    public RedactedThinkingBlock? RedactedThinking { get; init; }
+
+    /// <summary>
+    /// The provider-reported token count for the completed reasoning burst, when available.
+    /// Set on <see cref="AssistantEventKind.ThinkingComplete"/> events. <see langword="null"/> when the
+    /// provider does not report per-burst token counts (e.g. Anthropic without <c>usage.output_tokens</c>
+    /// in the stream, or OpenAI reasoning-summary mode without an encrypted reasoning item).
+    /// </summary>
+    public int? ThinkingTokens { get; init; }
 
     public static AssistantStreamEvent Delta(string text) => new() { Kind = AssistantEventKind.TextDelta, Text = text };
 
@@ -54,6 +70,10 @@ public sealed record AssistantStreamEvent
         new() { Kind = AssistantEventKind.ThinkingDelta, Text = text };
 
     /// <summary>Closes the current reasoning burst and carries the fully-accumulated block.</summary>
-    public static AssistantStreamEvent ThinkingDone(ThinkingBlock thinking) =>
-        new() { Kind = AssistantEventKind.ThinkingComplete, Thinking = thinking };
+    public static AssistantStreamEvent ThinkingDone(ThinkingBlock thinking, int? thinkingTokens = null) =>
+        new() { Kind = AssistantEventKind.ThinkingComplete, Thinking = thinking, ThinkingTokens = thinkingTokens };
+
+    /// <summary>Closes a redacted-thinking block; carries the opaque encrypted data for history replay.</summary>
+    public static AssistantStreamEvent RedactedThinkingDone(RedactedThinkingBlock block) =>
+        new() { Kind = AssistantEventKind.ThinkingComplete, RedactedThinking = block };
 }

@@ -121,4 +121,34 @@ public sealed class TuiAgentSinkThinkingTests
         Assert.IsType<ThinkingCompleteEvent>(events[3]);
         Assert.IsType<AgentErrorEvent>(events[4]);
     }
+
+    // -- Finding 2: ThinkingTokens flows through TuiAgentSink ---
+
+    [Fact]
+    public void OnThinkingComplete_with_token_count_carries_tokens_in_ThinkingCompleteEvent()
+    {
+        var events = new List<UiEvent>();
+        var tp = new ManualTimeProvider();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events), tp);
+
+        sink.OnThinking("reasoning");
+        sink.OnThinkingComplete(thinkingTokens: 777);
+
+        var complete = Assert.IsType<ThinkingCompleteEvent>(events[^1]);
+        Assert.Equal(777, complete.ThinkingTokens);
+    }
+
+    [Fact]
+    public void OnThinkingComplete_without_tokens_carries_null_in_ThinkingCompleteEvent()
+    {
+        var events = new List<UiEvent>();
+        var tp = new ManualTimeProvider();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events), tp);
+
+        sink.OnThinking("reasoning");
+        sink.OnThinkingComplete();
+
+        var complete = Assert.IsType<ThinkingCompleteEvent>(events[^1]);
+        Assert.Null(complete.ThinkingTokens);
+    }
 }

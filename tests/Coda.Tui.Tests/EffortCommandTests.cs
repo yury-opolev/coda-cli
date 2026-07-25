@@ -1,3 +1,4 @@
+using Coda.Sdk;
 using Coda.Tui.Commands;
 
 namespace Coda.Tui.Tests;
@@ -50,5 +51,56 @@ public sealed class EffortCommandTests
 
         Assert.Null(context.Session.Effort);
         Assert.Contains("Invalid", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Effort_resolves_Copilot_reasoning_model_levels_without_prior_model_command()
+    {
+        // Parity with serve: /effort should lazily fetch model list when cache is empty,
+        // so a Copilot reasoning model is correctly recognized even before /model is opened.
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+
+        // Switch to github-copilot with a reasoning model; NO ModelListCache entry yet.
+        context.Session.ActiveProviderId = "github-copilot";
+        context.Session.Model = "o4-mini";
+        Assert.Empty(context.Session.ModelListCache);
+
+        // Inject a fake model-list resolver (mirrors serve's ListModelsAsync path).
+        var fakeList = new ModelListResult(
+            "github-copilot",
+            ModelSource.Live,
+            [new ModelListEntry("o4-mini", ReasoningLevels: ["low", "medium", "high"])]);
+
+        var command = new EffortCommand(
+            EffortCommand.TryPersistEffortForModel,
+            (_, _) => Task.FromResult<ModelListResult?>(fakeList));
+
+        await command.ExecuteAsync(context, ["high"], CancellationToken.None);
+
+        // Effort was accepted and applied.
+        Assert.Equal("high", context.Session.Effort);
+        Assert.Contains("high", console.Output, StringComparison.OrdinalIgnoreCase);
+
+        // Cache was populated so subsequent calls skip the network.
+        Assert.True(context.Session.ModelListCache.ContainsKey("github-copilot"));
+    }
+
+    [Fact]
+    public async Task Effort_treats_Copilot_model_as_unsupported_when_lazy_fetch_returns_null()
+    {
+        // If the lazy fetch fails (returns null), the model is treated as non-reasoning.
+        var (_, context, console, _) = TestAppBuilder.BuildApp();
+        context.Session.ActiveProviderId = "github-copilot";
+        context.Session.Model = "gpt-4o";
+
+        var command = new EffortCommand(
+            EffortCommand.TryPersistEffortForModel,
+            (_, _) => Task.FromResult<ModelListResult?>(null));
+
+        await command.ExecuteAsync(context, ["high"], CancellationToken.None);
+
+        // gpt-4o with no metadata → unsupported → rejected
+        Assert.Null(context.Session.Effort);
+        Assert.Contains("not supported", console.Output, StringComparison.OrdinalIgnoreCase);
     }
 }

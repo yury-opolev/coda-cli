@@ -448,6 +448,7 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         {
             // ThinkingBlock without a signature cannot be round-tripped (Anthropic rejects them).
             // Skip them silently so a turn with unsigned thinking blocks doesn't produce a 400 error.
+            // RedactedThinkingBlock is always included verbatim (it is self-contained and required).
             if (block is ThinkingBlock { Signature: null })
             {
                 continue;
@@ -492,6 +493,11 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
             ["type"] = "thinking",
             ["thinking"] = thinking.Text,
             ["signature"] = thinking.Signature,
+        },
+        RedactedThinkingBlock redacted => new JsonObject
+        {
+            ["type"] = "redacted_thinking",
+            ["data"] = redacted.Data,
         },
         ThinkingBlock => throw new InvalidOperationException(
             "ThinkingBlock without a signature cannot be serialized for Anthropic history replay. " +

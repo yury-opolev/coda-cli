@@ -50,15 +50,15 @@ public sealed class TuiAgentSink : IAgentSink
     /// <summary>
     /// Publishes a <see cref="ThinkingCompleteEvent"/> with the burst's wall-clock elapsed time computed
     /// from the injected <see cref="TimeProvider"/>, then resets the burst start so the next burst is
-    /// tracked independently.
+    /// tracked independently. Forwards <paramref name="thinkingTokens"/> to the event unchanged.
     /// </summary>
-    public void OnThinkingComplete()
+    public void OnThinkingComplete(int? thinkingTokens = null)
     {
         var elapsedMs = this.currentBurstStartTick is { } startTick
             ? (long)this.timeProvider.GetElapsedTime(startTick).TotalMilliseconds
             : 0L;
         this.currentBurstStartTick = null;
-        this.publisher.Publish(new ThinkingCompleteEvent(elapsedMs));
+        this.publisher.Publish(new ThinkingCompleteEvent(elapsedMs, thinkingTokens));
     }
 
     public void OnToolCall(string toolName, string inputJson) =>

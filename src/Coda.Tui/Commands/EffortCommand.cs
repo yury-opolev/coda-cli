@@ -1,4 +1,5 @@
 using Coda.Agent.Settings;
+using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Prompts;
@@ -17,17 +18,31 @@ namespace Coda.Tui.Commands;
 public sealed class EffortCommand : ISlashCommand
 {
     private readonly Func<string, string, string?, string> persistEffort;
+    private readonly Func<CommandContext, CancellationToken, Task<ModelListResult?>> modelListResolver;
 
     /// <summary>Creates an <see cref="EffortCommand"/> that persists choices to disk.</summary>
     public EffortCommand()
-        : this(TryPersistEffortForModel)
+        : this(TryPersistEffortForModel, DefaultModelListResolver)
     {
     }
 
     /// <summary>Creates an <see cref="EffortCommand"/> with an injectable persistence function (test seam).</summary>
     internal EffortCommand(Func<string, string, string?, string> persistEffort)
+        : this(persistEffort, DefaultModelListResolver)
+    {
+    }
+
+    /// <summary>
+    /// Creates an <see cref="EffortCommand"/> with injectable persistence and model-listing functions.
+    /// The <paramref name="modelListResolver"/> is called lazily when the model-list cache is empty for
+    /// the active provider, mirroring how the serve host fetches model metadata on demand.
+    /// </summary>
+    internal EffortCommand(
+        Func<string, string, string?, string> persistEffort,
+        Func<CommandContext, CancellationToken, Task<ModelListResult?>> modelListResolver)
     {
         this.persistEffort = persistEffort ?? throw new ArgumentNullException(nameof(persistEffort));
+        this.modelListResolver = modelListResolver ?? throw new ArgumentNullException(nameof(modelListResolver));
     }
 
     public string Name => "effort";
@@ -52,7 +67,7 @@ public sealed class EffortCommand : ISlashCommand
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        var capability = ResolveCapability(context);
+        var capability = await this.ResolveCapabilityAsync(context, cancellationToken).ConfigureAwait(false);
 
         if (args.Count == 0 || args[0] is "current" or "status")
         {
@@ -224,12 +239,22 @@ public sealed class EffortCommand : ISlashCommand
     }
 
     /// <summary>
-    /// Resolves the <see cref="ReasoningCapability"/> for the current session
-    /// (provider + model), using cached model-list metadata for Copilot models.
+    /// Resolves the <see cref="ReasoningCapability"/> for the current session synchronously,
+    /// reading only from the in-session model-list cache (populated by <c>/model</c>).
+    /// Used by <see cref="SessionMetadataEvents"/> and other non-async callers that only
+    /// need the best-available cached info. For the interactive /effort command, prefer
+    /// <see cref="ResolveCapabilityAsync"/> which lazily fetches when the cache is empty.
     /// </summary>
     internal static ReasoningCapability ResolveCapability(CommandContext context)
     {
-        var reasoningLevels = GetModelReasoningLevels(context);
+        IReadOnlyList<string>? reasoningLevels = null;
+        if (context.Session.ModelListCache.TryGetValue(context.ActiveProvider.Id, out var list))
+        {
+            reasoningLevels = list.Models
+                .FirstOrDefault(m => string.Equals(m.Id, context.Session.Model, StringComparison.OrdinalIgnoreCase))
+                ?.ReasoningLevels;
+        }
+
         return ReasoningCapabilityResolver.Resolve(
             context.ActiveProvider.Id,
             context.Session.Model,
@@ -237,19 +262,70 @@ public sealed class EffortCommand : ISlashCommand
     }
 
     /// <summary>
-    /// Looks up the reasoning levels for the current model from the cached model-list
-    /// metadata (populated by <c>/model</c>). Returns null when no metadata is available.
+    /// Resolves the <see cref="ReasoningCapability"/> for the current session
+    /// (provider + model). Lazily populates the model-list cache when empty, mirroring
+    /// the serve host's <c>session/setEffort</c> handler which calls <c>ListModelsAsync</c>
+    /// on demand so Copilot model capabilities are always current.
     /// </summary>
-    private static IReadOnlyList<string>? GetModelReasoningLevels(CommandContext context)
+    internal async Task<ReasoningCapability> ResolveCapabilityAsync(CommandContext context, CancellationToken cancellationToken)
     {
-        if (!context.Session.ModelListCache.TryGetValue(context.ActiveProvider.Id, out var list))
+        var reasoningLevels = await this.GetModelReasoningLevelsAsync(context, cancellationToken).ConfigureAwait(false);
+        return ReasoningCapabilityResolver.Resolve(
+            context.ActiveProvider.Id,
+            context.Session.Model,
+            reasoningLevels);
+    }
+
+    /// <summary>
+    /// Looks up the reasoning levels for the current model. First checks the per-session
+    /// model-list cache (populated by <c>/model</c>). When the cache is empty for the
+    /// active provider, calls <see cref="modelListResolver"/> to fetch the list lazily —
+    /// matching the serve host's behavior — and caches the result for the remainder of the session.
+    /// Returns null when no metadata is available (provider returned nothing or fetch failed).
+    /// </summary>
+    private async Task<IReadOnlyList<string>?> GetModelReasoningLevelsAsync(CommandContext context, CancellationToken cancellationToken)
+    {
+        var providerId = context.ActiveProvider.Id;
+
+        if (!context.Session.ModelListCache.TryGetValue(providerId, out var list))
         {
-            return null;
+            try
+            {
+                list = await this.modelListResolver(context, cancellationToken).ConfigureAwait(false);
+                if (list is not null)
+                {
+                    context.Session.ModelListCache[providerId] = list;
+                }
+            }
+            catch
+            {
+                // Best-effort: if listing fails (network unavailable, no credentials), fall
+                // through with null so the command doesn't block. Anthropic models resolve
+                // via static rules in ReasoningCapabilityResolver and are unaffected.
+            }
         }
 
-        return list.Models
+        return list?.Models
             .FirstOrDefault(m => string.Equals(m.Id, context.Session.Model, StringComparison.OrdinalIgnoreCase))
             ?.ReasoningLevels;
+    }
+
+    /// <summary>
+    /// Default model-list resolver: creates a <see cref="CodaSession"/> scoped to the
+    /// current provider/model and calls <see cref="CodaSession.ListModelsAsync"/>.
+    /// Mirrors the ModelCommand and serve host paths exactly for TUI/serve parity.
+    /// </summary>
+    private static async Task<ModelListResult?> DefaultModelListResolver(
+        CommandContext context, CancellationToken cancellationToken)
+    {
+        var options = new SessionOptions
+        {
+            ProviderId = context.ActiveProvider.Id,
+            Model = context.Session.Model,
+            WorkingDirectory = context.Session.WorkingDirectory,
+        };
+        using var session = new CodaSession(context.Credentials, options);
+        return await session.ListModelsAsync(refresh: false, cancellationToken).ConfigureAwait(false);
     }
 
     private static string Describe(string level) => level switch

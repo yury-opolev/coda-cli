@@ -97,6 +97,49 @@ public sealed class CalloutTests
     }
 
     [Fact]
+    public void Marker_with_inline_emphasis_on_same_line_is_not_a_callout()
+    {
+        // "[!NOTE] *em*" — the *em* is an EmphasisInline, not a LineBreak → plain quote.
+        var lines = Format("> [!NOTE] *em*");
+
+        Assert.True(lines.Count >= 1);
+        Assert.Equal(TranscriptRole.Assistant, lines[0].Role);
+        Assert.DoesNotContain(lines, l => l.Role == TranscriptRole.CalloutNote);
+    }
+
+    [Fact]
+    public void Marker_with_inline_code_on_same_line_is_not_a_callout()
+    {
+        // "[!WARNING] `code`" — the `code` is a CodeInline → plain quote.
+        var lines = Format("> [!WARNING] `code`");
+
+        Assert.True(lines.Count >= 1);
+        Assert.Equal(TranscriptRole.Assistant, lines[0].Role);
+        Assert.DoesNotContain(lines, l => l.Role == TranscriptRole.CalloutWarning);
+    }
+
+    [Fact]
+    public void Marker_with_inline_link_on_same_line_is_not_a_callout()
+    {
+        // "[!TIP] [x](y)" — the [x](y) is a LinkInline → plain quote.
+        var lines = Format("> [!TIP] [x](y)");
+
+        Assert.True(lines.Count >= 1);
+        Assert.Equal(TranscriptRole.Assistant, lines[0].Role);
+        Assert.DoesNotContain(lines, l => l.Role == TranscriptRole.CalloutTip);
+    }
+
+    [Fact]
+    public void Genuine_callout_with_newline_body_is_still_detected()
+    {
+        // Regression: "[!NOTE]\n> body" — the marker is alone on the first line → callout.
+        var lines = Format("> [!NOTE]\n> body");
+
+        Assert.True(lines.Count >= 1);
+        Assert.Equal(TranscriptRole.CalloutNote, lines[0].Role);
+    }
+
+    [Fact]
     public void Marker_not_on_first_line_is_not_a_callout()
     {
         // The [!NOTE] marker appears on the second paragraph — the first line is "text".
@@ -387,5 +430,67 @@ public sealed class CalloutTests
 
         // The bar draws in a distinct foreground color from the body text.
         Assert.NotEqual(barAttr.Foreground, textAttr.Foreground);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Links in callout first paragraph body
+    // ---------------------------------------------------------------------------
+
+    [Fact]
+    public void Callout_first_paragraph_bare_URL_produces_LinkSpan_with_bar_shifted_columns()
+    {
+        // Markdig parses [!NOTE] + body into ONE paragraph; the whole body must go through the
+        // link-aware path so that https://… URLs inside it become clickable LinkSpans.
+        var lines = Format("> [!NOTE]\n> See https://example.com for details.", width: 80);
+
+        Assert.True(lines.Count >= 2, "must have title + at least one body row");
+        Assert.Equal(TranscriptRole.CalloutNote, lines[0].Role);
+
+        var bodyRow = lines[1];
+        Assert.NotNull(bodyRow.Links);
+        var link = Assert.Single(bodyRow.Links!);
+        Assert.Equal("https://example.com", link.Url);
+        Assert.True(link.TextMatchesUrl);
+        // The bar prefix "│ " is 2 display cells wide; "See " is 4 cells — URL starts at col 6.
+        var barWidth = TerminalCellText.Width("│ ");
+        var prefixWidth = TerminalCellText.Width("See ");
+        Assert.Equal(barWidth + prefixWidth, link.StartColumn);
+        Assert.Equal(barWidth + prefixWidth + TerminalCellText.Width("https://example.com"), link.EndColumn);
+    }
+
+    [Fact]
+    public void Callout_first_paragraph_deceptive_link_has_TextMatchesUrl_false_and_warning_marker()
+    {
+        // A deceptive markdown link inside a callout body must set TextMatchesUrl=false
+        // and inject the ⚠ marker exactly like it does in normal paragraphs.
+        var lines = Format("> [!WARNING]\n> [Click here](https://example.com)", width: 80);
+
+        Assert.True(lines.Count >= 2);
+        Assert.Equal(TranscriptRole.CalloutWarning, lines[0].Role);
+
+        var bodyRow = lines[1];
+        Assert.NotNull(bodyRow.Links);
+        var link = Assert.Single(bodyRow.Links!);
+        Assert.Equal("https://example.com", link.Url);
+        Assert.False(link.TextMatchesUrl, "deceptive link: display text differs from URL");
+        Assert.Contains("⚠", bodyRow.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Callout_first_paragraph_honest_link_is_clickable_with_bar_shifted_start()
+    {
+        // An honest explicit link in the first paragraph is clickable and its columns
+        // are shifted right by the bar prefix (so StartColumn ≥ bar width).
+        var lines = Format("> [!TIP]\n> Visit https://tip.example.com now", width: 80);
+
+        Assert.True(lines.Count >= 2);
+        var bodyRow = lines[1];
+        Assert.NotNull(bodyRow.Links);
+        var link = Assert.Single(bodyRow.Links!);
+        Assert.Equal("https://tip.example.com", link.Url);
+        Assert.True(link.TextMatchesUrl);
+        // The bar "│ " is at least 2 cells; the link must appear after it.
+        Assert.True(link.StartColumn >= TerminalCellText.Width("│ "),
+            $"link StartColumn {link.StartColumn} must be ≥ bar width 2 (bar-shifted)");
     }
 }
