@@ -420,7 +420,8 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
                     id,
                     (string?)item["name"],
                     ReadContextLimit(item),
-                    ReadSupportedEndpoints(item)));
+                    ReadSupportedEndpoints(item),
+                    ReadReasoningLevels(item)));
             }
         }
 
@@ -457,6 +458,27 @@ public sealed partial class CopilotChatClient : ILlmClient, IDisposable
                 .Where(endpoint => !string.IsNullOrWhiteSpace(endpoint))
                 .Select(endpoint => endpoint!),
         ];
+    }
+
+    /// <summary>
+    /// Read the reasoning effort levels from the model's Copilot capabilities:
+    /// <c>capabilities.supports.reasoning_effort</c>. Returns null when the field is
+    /// absent or the model does not advertise reasoning support.
+    /// </summary>
+    private static IReadOnlyList<string>? ReadReasoningLevels(JsonNode item)
+    {
+        if (item["capabilities"]?["supports"]?["reasoning_effort"] is not JsonArray levels)
+        {
+            return null;
+        }
+
+        var result = levels
+            .Select(level => (string?)level)
+            .Where(level => !string.IsNullOrWhiteSpace(level))
+            .Select(level => level!.ToLowerInvariant())
+            .ToList();
+
+        return result.Count > 0 ? result : null;
     }
 
     [LoggerMessage(Level = LogLevel.Information, Message = "Copilot request: model {model}")]

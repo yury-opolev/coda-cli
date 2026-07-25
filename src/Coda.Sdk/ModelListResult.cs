@@ -14,7 +14,11 @@ public enum ModelSource
 }
 
 /// <summary>One model in a resolved list, with catalog metadata when known.</summary>
-public sealed record ModelListEntry(string Id, string? DisplayName = null, int? ContextLimit = null);
+public sealed record ModelListEntry(
+    string Id,
+    string? DisplayName = null,
+    int? ContextLimit = null,
+    IReadOnlyList<string>? ReasoningLevels = null);
 
 /// <summary>A resolved model list for a provider, plus where it came from.</summary>
 public sealed record ModelListResult(

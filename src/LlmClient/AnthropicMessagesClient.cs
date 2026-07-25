@@ -120,7 +120,8 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
 
                 // The effort parameter is gated behind a beta header; only add it when an
                 // effort level will actually be sent for this model.
-                if (EffortSupport.ResolveAppliedEffort(request.Model, request.Effort) is not null)
+                if (ReasoningCapabilityResolver.ResolveAppliedLevel(
+                    ReasoningCapabilityResolver.ResolveAnthropic(request.Model), request.Effort) is not null)
                 {
                     httpRequest.Headers.TryAddWithoutValidation("anthropic-beta", EffortSupport.EffortBetaHeader);
                 }
@@ -266,8 +267,9 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         }
 
         // Reasoning effort (output_config.effort), gated by model support. Honors
-        // the max→high clamp on non-Opus models via ResolveAppliedEffort.
-        var effort = EffortSupport.ResolveAppliedEffort(request.Model, request.Effort);
+        // the max→high clamp on non-Opus models via the resolver.
+        var effort = ReasoningCapabilityResolver.ResolveAppliedLevel(
+            ReasoningCapabilityResolver.ResolveAnthropic(request.Model), request.Effort);
         if (effort is not null)
         {
             body["output_config"] = new JsonObject { ["effort"] = effort };

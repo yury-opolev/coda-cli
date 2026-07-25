@@ -77,6 +77,9 @@ public static class SettingsLoader
         // Telemetry: project block overrides user block wholesale (it is a single value object).
         var telemetry = projectSettings.Telemetry ?? userSettings.Telemetry;
 
+        // effortByModel: project entries overlay user entries by key.
+        var effortByModel = MergeEffortByModel(userSettings.EffortByModel, projectSettings.EffortByModel);
+
         if (userSettings.Allow.Count == 0 && userSettings.Deny.Count == 0
             && userSettings.Hooks.Count == 0
             && userSettings.LspServers.Count == 0
@@ -88,7 +91,8 @@ public static class SettingsLoader
             && githubEnterpriseDomain is null
             && goalMerged is null
             && telemetry is null
-            && userSettings.ToolDisplayMode is null)
+            && userSettings.ToolDisplayMode is null
+            && effortByModel.Count == 0)
         {
             return CodaSettings.Empty;
         }
@@ -113,6 +117,7 @@ public static class SettingsLoader
             Goal = goalMerged,
             Telemetry = telemetry,
             ToolDisplayMode = userSettings.ToolDisplayMode,
+            EffortByModel = effortByModel,
         };
     }
 
@@ -144,6 +149,7 @@ public static class SettingsLoader
                 Goal = ParseGoalSettings(doc?.Goal),
                 Telemetry = ParseTelemetry(doc?.Telemetry),
                 ToolDisplayMode = doc?.ToolDisplayMode,
+                EffortByModel = ParseEffortByModel(doc?.EffortByModel),
             };
         }
         catch (Exception ex) when (ex is JsonException or IOException)
@@ -252,6 +258,9 @@ public static class SettingsLoader
     private static readonly IReadOnlyDictionary<string, string> emptyModelByProvider =
         new Dictionary<string, string>(StringComparer.Ordinal);
 
+    private static readonly IReadOnlyDictionary<string, string> emptyEffortByModel =
+        new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Parse the <c>defaultModelByProvider</c> object, dropping blank keys/values.</summary>
     private static IReadOnlyDictionary<string, string> ParseModelByProvider(Dictionary<string, string>? raw)
     {
@@ -292,6 +301,49 @@ public static class SettingsLoader
         return merged;
     }
 
+    /// <summary>
+    /// Parse the <c>effortByModel</c> object, dropping blank keys/values. Keys are
+    /// case-insensitive <c>"{provider}/{model}"</c> strings.
+    /// </summary>
+    private static IReadOnlyDictionary<string, string> ParseEffortByModel(Dictionary<string, string>? raw)
+    {
+        if (raw is not { Count: > 0 })
+        {
+            return emptyEffortByModel;
+        }
+
+        var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, effort) in raw)
+        {
+            var trimmedKey = key?.Trim();
+            var trimmedEffort = effort?.Trim();
+            if (!string.IsNullOrEmpty(trimmedKey) && !string.IsNullOrEmpty(trimmedEffort))
+            {
+                map[trimmedKey] = trimmedEffort;
+            }
+        }
+
+        return map;
+    }
+
+    /// <summary>Merge effortByModel entries: project entries overlay user entries by key.</summary>
+    private static IReadOnlyDictionary<string, string> MergeEffortByModel(
+        IReadOnlyDictionary<string, string> user, IReadOnlyDictionary<string, string> project)
+    {
+        if (user.Count == 0 && project.Count == 0)
+        {
+            return emptyEffortByModel;
+        }
+
+        var merged = new Dictionary<string, string>(user, StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, effort) in project)
+        {
+            merged[key] = effort;
+        }
+
+        return merged;
+    }
+
     private sealed class SettingsDocument
     {
         public PermissionsSection? Permissions { get; set; }
@@ -303,6 +355,8 @@ public static class SettingsLoader
         public TelemetrySection? Telemetry { get; set; }
         [JsonPropertyName("toolDisplayMode")]
         public string? ToolDisplayMode { get; set; }
+        [JsonPropertyName("effortByModel")]
+        public Dictionary<string, string>? EffortByModel { get; set; }
     }
 
     private sealed class GoalSection

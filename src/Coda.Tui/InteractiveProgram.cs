@@ -242,6 +242,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             startupSettings,
             connectedProviderId);
         session.Model = string.IsNullOrWhiteSpace(resolvedStartupModel) ? startupProvider.DefaultModel : resolvedStartupModel;
+        ApplyStartupEffort(session, startupProvider.Id, startupSettings);
 
         var registry = new SlashCommandRegistry(SlashCommandCatalog.CreateAll());
 
@@ -535,6 +536,33 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             StartupSystemPromptOverride = options.SystemPromptOverride,
             SystemPromptOverride = options.SystemPromptOverride,
         };
+
+    /// <summary>
+    /// Seeds <paramref name="session"/>.<see cref="SessionState.EffortByModel"/> from
+    /// <paramref name="settings"/>, then resolves and applies the initial
+    /// <see cref="SessionState.Effort"/> for the current
+    /// <c>{providerId}/{session.Model}</c> key through
+    /// <see cref="ReasoningCapabilityResolver"/> so stale or unsupported stored levels
+    /// are clamped or dropped — never sent verbatim to the Copilot Responses endpoint.
+    /// Call this AFTER <see cref="SessionState.Model"/> is set to the resolved startup model.
+    /// </summary>
+    internal static void ApplyStartupEffort(
+        SessionState session,
+        string providerId,
+        Coda.Agent.Settings.CodaSettings settings)
+    {
+        foreach (var (key, level) in settings.EffortByModel)
+        {
+            session.EffortByModel[key] = level;
+        }
+
+        var effortKey = $"{providerId}/{session.Model}";
+        if (session.EffortByModel.TryGetValue(effortKey, out var storedEffort))
+        {
+            var capability = ReasoningCapabilityResolver.Resolve(providerId, session.Model);
+            session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, storedEffort);
+        }
+    }
 
     /// <summary>
     /// Drive the host to a clean exit, then — once and only after the terminal is restored and the UI

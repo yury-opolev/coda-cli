@@ -47,6 +47,7 @@ public static class ModelListBuilder
         return new ModelListEntry(
             live.Id,
             live.DisplayName ?? meta?.DisplayName,
-            live.ContextLimit ?? meta?.ContextLimit);
+            live.ContextLimit ?? meta?.ContextLimit,
+            live.ReasoningLevels);
     }
 }

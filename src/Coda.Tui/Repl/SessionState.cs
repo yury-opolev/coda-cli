@@ -55,6 +55,14 @@ public sealed class SessionState
     /// </summary>
     public string? Effort { get; set; }
 
+    /// <summary>
+    /// In-memory cache of persisted effort levels, keyed by <c>"{provider}/{model}"</c>.
+    /// Populated from <c>settings.json</c> at startup and updated by <c>/effort</c>.
+    /// A lookup miss means "auto" (model default). The in-memory value is the
+    /// authoritative source within a session; disk persistence keeps it durable.
+    /// </summary>
+    public Dictionary<string, string?> EffortByModel { get; } = new(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>The running conversation (grows across turns; cleared by /clear).</summary>
     public List<ChatMessage> History { get; } = [];
 

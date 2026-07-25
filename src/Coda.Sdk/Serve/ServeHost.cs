@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json.Nodes;
 using Coda.Agent;
 using Coda.Agent.Goals;
+using Coda.Agent.Settings;
 using Coda.JsonRpc;
 using Coda.Sdk.Serve.Messages;
 using LlmClient;
@@ -632,6 +633,83 @@ public sealed class ServeHost : IAsyncDisposable
                 Goal: sess.Options.Goal,
                 MaxDuration: resultDuration,
                 MaxContinuations: sess.Options.GoalMaxContinuations));
+        });
+
+        // model/reasoningCapability → resolve the reasoning capability for the current (provider, model).
+        conn.OnRequestAsync(ServeMethods.ReasoningCapability, async (_, ct) =>
+        {
+            this.EnsureAuthenticated();
+            var result = await sess.ListModelsAsync(refresh: false, ct).ConfigureAwait(false);
+            var entry = result.Models.FirstOrDefault(m =>
+                string.Equals(m.Id, sess.Options.Model, StringComparison.OrdinalIgnoreCase));
+            var capability = ReasoningCapabilityResolver.Resolve(
+                sess.Options.ProviderId,
+                sess.Options.Model,
+                entry?.ReasoningLevels);
+            return ServeJson.ToNode(new ReasoningCapabilityResult(
+                capability.Supported,
+                capability.Supported ? [.. capability.Levels] : [],
+                capability.SupportsAuto));
+        });
+
+        // session/setEffort → validate + persist the reasoning effort for the current (provider, model).
+        conn.OnRequestAsync(ServeMethods.SetEffort, async (p, ct) =>
+        {
+            this.EnsureAuthenticated();
+            var sp = ServeJson.FromNode<SetEffortParams>(p);
+            var effort = string.IsNullOrWhiteSpace(sp?.Effort) ? null : sp!.Effort.Trim().ToLowerInvariant();
+
+            // "auto" or null both mean "clear the explicit level".
+            if (effort is "auto")
+            {
+                effort = null;
+            }
+
+            string? applied = effort;
+            string note = string.Empty;
+
+            if (effort is not null)
+            {
+                // Resolve capability and validate.
+                var result = await sess.ListModelsAsync(refresh: false, ct).ConfigureAwait(false);
+                var entry = result.Models.FirstOrDefault(m =>
+                    string.Equals(m.Id, sess.Options.Model, StringComparison.OrdinalIgnoreCase));
+                var capability = ReasoningCapabilityResolver.Resolve(
+                    sess.Options.ProviderId,
+                    sess.Options.Model,
+                    entry?.ReasoningLevels);
+
+                if (!capability.Supported)
+                {
+                    return ServeJson.ToNode(new SetEffortResult(
+                        Ok: false,
+                        Applied: null,
+                        Note: $"Reasoning effort is not supported for model '{sess.Options.Model}'."));
+                }
+
+                applied = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, effort);
+                if (applied is null)
+                {
+                    var valid = string.Join(", ", capability.Levels);
+                    return ServeJson.ToNode(new SetEffortResult(
+                        Ok: false,
+                        Applied: null,
+                        Note: $"Invalid effort level '{effort}'. Valid: {valid}, auto"));
+                }
+
+                if (!string.Equals(applied, effort, StringComparison.Ordinal))
+                {
+                    note = $"'{effort}' clamped to '{applied}'";
+                }
+            }
+
+            // Persist: null = remove key (auto).
+            SettingsWriter.SetUserEffortForModel(sess.Options.ProviderId, sess.Options.Model, effort);
+
+            // Update the live session options.
+            sess.Options = sess.Options with { Effort = applied };
+
+            return ServeJson.ToNode(new SetEffortResult(Ok: true, Applied: applied, Note: note));
         });
 
         // shutdown → signal the run loop to exit.
