@@ -254,4 +254,82 @@ public sealed class TerminalGuiModeRunnerTests
         Assert.Equal(TuiShellExitKind.Exit, result.Kind);
         Assert.Null(result.Error);
     }
+
+    [Fact]
+    public async Task Diffing_init_failure_falls_back_to_stock_application_and_completes_normally()
+    {
+        // Simulates the most fragile reflection step failing after an app instance is constructed:
+        // the injected diffingInit throws instead of calling app.Init, so the runner must dispose the
+        // diffing app best-effort and fall back to Application.Create() so the user is never left
+        // without a UI.
+        var runner = new TerminalGuiModeRunner(
+            shellFactory: (_, _, _) => throw new InvalidOperationException("stock shell ran"),
+            spectreRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            plainRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            driverName: DriverRegistry.Names.ANSI,
+            diffingApplicationFactory: () => Application.Create(),
+            diffingInit: (_, _) => throw new InvalidOperationException("diffing Init deliberately failed"));
+
+        var result = await runner.RunAsync(TuiRunMode.Fullscreen, ComposerState.Empty, CancellationToken.None);
+
+        // Recovery: the stock shell factory was reached, proving the stock app was created and Init'd.
+        Assert.Equal(TuiShellExitKind.Failed, result.Kind);
+        var error = Assert.IsType<InvalidOperationException>(result.Error);
+        Assert.Equal("stock shell ran", error.Message);
+    }
+
+    [Fact]
+    public async Task Diffing_factory_is_invoked_when_driver_is_ansi()
+    {
+        // Regression guard: any change that flips ShouldUseDiffingOutput for the ANSI driver
+        // (the core of the optimisation) will break this assertion.
+        var diffingFactoryCalled = false;
+        var runner = new TerminalGuiModeRunner(
+            shellFactory: (_, _, _) => throw new InvalidOperationException("stop"),
+            spectreRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            plainRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            driverName: DriverRegistry.Names.ANSI,
+            diffingApplicationFactory: () => { diffingFactoryCalled = true; return null; });
+
+        await runner.RunAsync(TuiRunMode.Fullscreen, ComposerState.Empty, CancellationToken.None);
+
+        Assert.True(diffingFactoryCalled);
+    }
+
+    [Fact]
+    public async Task Diffing_factory_is_not_invoked_when_driver_is_not_ansi()
+    {
+        // Regression guard: the diffing output must only activate for the ANSI driver.
+        var diffingFactoryCalled = false;
+        var runner = new TerminalGuiModeRunner(
+            shellFactory: (_, _, _) => throw new InvalidOperationException("stop"),
+            spectreRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            plainRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            driverName: DriverRegistry.Names.WINDOWS,
+            diffingApplicationFactory: () => { diffingFactoryCalled = true; return null; });
+
+        await runner.RunAsync(TuiRunMode.Fullscreen, ComposerState.Empty, CancellationToken.None);
+
+        Assert.False(diffingFactoryCalled);
+    }
+
+    [Fact]
+    public async Task When_diffing_factory_returns_null_the_runner_falls_back_to_the_stock_application()
+    {
+        // diffingApplicationFactory is injected to simulate TryCreate() failing; no explicit
+        // applicationFactory is passed so useDiffingOutput = true and the diffing path is attempted.
+        // The shellFactory throw confirms that a valid stock application was created and Init'd.
+        var runner = new TerminalGuiModeRunner(
+            shellFactory: (_, _, _) => throw new InvalidOperationException("fallback ran"),
+            spectreRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            plainRunner: (_, _) => Task.FromResult(TuiShellExit.Exited),
+            driverName: DriverRegistry.Names.ANSI,
+            diffingApplicationFactory: () => null);
+
+        var result = await runner.RunAsync(TuiRunMode.Fullscreen, ComposerState.Empty, CancellationToken.None);
+
+        Assert.Equal(TuiShellExitKind.Failed, result.Kind);
+        var error = Assert.IsType<InvalidOperationException>(result.Error);
+        Assert.Equal("fallback ran", error.Message);
+    }
 }
