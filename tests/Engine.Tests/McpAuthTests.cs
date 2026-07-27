@@ -76,6 +76,71 @@ public sealed class McpMetadataParsingTests
         Assert.Equal("https://auth.example.com/register", meta.RegistrationEndpoint);
         Assert.True(meta.IssuerParameterSupported);
     }
+
+    /// <summary>
+    /// A hostile <c>authorization_endpoint</c> scheme (e.g. <c>ms-msdt:</c>) must cause
+    /// <see cref="AuthorizationServerMetadata.Parse"/> to return <see langword="null"/> so
+    /// the URL never reaches <c>BuildAuthorizeUrl</c> and the browser opener.
+    /// ShellExecute on Windows invokes ANY registered protocol handler for the scheme.
+    /// </summary>
+    [Fact]
+    public void Authorization_server_metadata_rejects_non_https_authorization_endpoint()
+    {
+        Assert.Null(AuthorizationServerMetadata.Parse(Json("""
+            {"issuer":"https://auth.example.com",
+             "authorization_endpoint":"ms-msdt://example.com/evil",
+             "token_endpoint":"https://auth.example.com/token"}
+            """)));
+    }
+
+    /// <summary>
+    /// A hostile <c>token_endpoint</c> scheme must also be rejected at parse time.
+    /// </summary>
+    [Fact]
+    public void Authorization_server_metadata_rejects_non_https_token_endpoint()
+    {
+        Assert.Null(AuthorizationServerMetadata.Parse(Json("""
+            {"issuer":"https://auth.example.com",
+             "authorization_endpoint":"https://auth.example.com/authorize",
+             "token_endpoint":"ftp://auth.example.com/token"}
+            """)));
+    }
+
+    /// <summary>
+    /// <c>http://127.0.0.1</c> endpoints are accepted for local OAuth redirect/dev servers.
+    /// </summary>
+    [Fact]
+    public void Authorization_server_metadata_accepts_http_loopback_endpoints()
+    {
+        var meta = AuthorizationServerMetadata.Parse(Json("""
+            {"issuer":"https://auth.example.com",
+             "authorization_endpoint":"http://127.0.0.1:8080/authorize",
+             "token_endpoint":"http://127.0.0.1:8080/token"}
+            """));
+
+        Assert.NotNull(meta);
+        Assert.Equal("http://127.0.0.1:8080/authorize", meta!.AuthorizationEndpoint);
+        Assert.Equal("http://127.0.0.1:8080/token", meta.TokenEndpoint);
+    }
+
+    /// <summary>
+    /// When <c>registration_endpoint</c> has a hostile scheme it is treated as absent
+    /// (null) rather than failing the whole document, because a configured
+    /// <c>auth.clientId</c> can still be used without dynamic client registration.
+    /// </summary>
+    [Fact]
+    public void Authorization_server_metadata_nulls_out_hostile_registration_endpoint()
+    {
+        var meta = AuthorizationServerMetadata.Parse(Json("""
+            {"issuer":"https://auth.example.com",
+             "authorization_endpoint":"https://auth.example.com/authorize",
+             "token_endpoint":"https://auth.example.com/token",
+             "registration_endpoint":"file:///C:/evil.exe"}
+            """));
+
+        Assert.NotNull(meta);
+        Assert.Null(meta!.RegistrationEndpoint);
+    }
 }
 
 public sealed class McpScopeSelectionTests
