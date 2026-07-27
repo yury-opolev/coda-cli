@@ -23,8 +23,14 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
     private readonly Func<ComposerState, CancellationToken, Task<TuiShellExit>> spectreRunner;
     private readonly Func<ComposerState, CancellationToken, Task<TuiShellExit>> plainRunner;
     private readonly Func<IApplication> applicationFactory;
+    private readonly Func<IApplication?> diffingApplicationFactory;
+    private readonly Action<IApplication, string?> diffingInit;
     private readonly string? driverName;
     private readonly bool mouseDisabled;
+
+    // True only when no explicit applicationFactory was injected; reflects that the diffing output
+    // path is a production-only enhancement and should not interfere with test-provided factories.
+    private readonly bool useDiffingOutput;
 
     public TerminalGuiModeRunner(
         Func<TuiRunMode, IApplication, ComposerState, TerminalGuiShellBase> shellFactory,
@@ -32,12 +38,21 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         Func<ComposerState, CancellationToken, Task<TuiShellExit>> plainRunner,
         Func<IApplication>? applicationFactory = null,
         string? driverName = null,
-        bool mouseDisabled = false)
+        bool mouseDisabled = false,
+        Func<IApplication?>? diffingApplicationFactory = null,
+        Action<IApplication, string?>? diffingInit = null)
     {
         this.shellFactory = shellFactory ?? throw new ArgumentNullException(nameof(shellFactory));
         this.spectreRunner = spectreRunner ?? throw new ArgumentNullException(nameof(spectreRunner));
         this.plainRunner = plainRunner ?? throw new ArgumentNullException(nameof(plainRunner));
+
+        // Track whether a factory was explicitly provided: if so, the diffing output path is
+        // disabled so the injected factory is used verbatim (tests rely on this invariant).
+        this.useDiffingOutput = applicationFactory is null;
         this.applicationFactory = applicationFactory ?? (static () => Application.Create());
+        this.diffingApplicationFactory = diffingApplicationFactory ?? DiffingApplicationFactory.TryCreate;
+        // Thin seam around app.Init for testability; the default delegates to Init directly.
+        this.diffingInit = diffingInit ?? (static (app, driver) => { app.Init(driver); });
         this.driverName = driverName;
         this.mouseDisabled = mouseDisabled;
     }
@@ -123,19 +138,61 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
 
         try
         {
-            app = this.applicationFactory();
-            TerminalGuiShellComposition.ConfigureApplication(app, mode);
-            var mouseService = app.Mouse;
-            if (mouseService is not null)
+            // Resolve the driver name once; the diffing path passes it to Init but Init ignores it
+            // when the component factory is set (fact: _componentFactory != null overrides _driverName).
+            var resolved = ResolveDriverName(this.driverName, TerminalInputCompatibility.SelectDriverName);
+
+            bool initDone = false;
+
+            // When no factory was explicitly injected and the resolved driver is ANSI (or defaults
+            // to it on this platform), attempt the diffing output path, which reduces terminal
+            // bandwidth significantly by transmitting only changed cells per frame.
+            if (this.useDiffingOutput && TerminalInputCompatibility.ShouldUseDiffingOutput(resolved))
             {
-                mouseService.IsMouseDisabled = this.mouseDisabled;
+                var diffingApp = this.diffingApplicationFactory();
+                if (diffingApp is not null)
+                {
+                    try
+                    {
+                        TerminalGuiShellComposition.ConfigureApplication(diffingApp, mode);
+                        var diffingMouse = diffingApp.Mouse;
+                        if (diffingMouse is not null)
+                        {
+                            diffingMouse.IsMouseDisabled = this.mouseDisabled;
+                        }
+
+                        this.diffingInit(diffingApp, resolved);
+                        app = diffingApp;
+                        initDone = true;
+                    }
+                    catch
+                    {
+                        // Diffing Init failed (e.g. a future Terminal.Gui update changed the
+                        // internal factory contract); dispose best-effort to unsubscribe from the
+                        // static events that ApplicationImpl registers in its constructor, then fall
+                        // back to the stock driver so the user is never left without a UI.
+                        try { diffingApp.Dispose(); } catch { }
+                    }
+                }
             }
 
-            app.Init(ResolveDriverName(this.driverName, TerminalInputCompatibility.SelectDriverName));
+            // Stock path: taken when diffing is disabled, not applicable, or its Init failed.
+            if (!initDone)
+            {
+                app = this.applicationFactory();
+                TerminalGuiShellComposition.ConfigureApplication(app, mode);
+                var mouseService = app.Mouse;
+                if (mouseService is not null)
+                {
+                    mouseService.IsMouseDisabled = this.mouseDisabled;
+                }
+
+                app.Init(resolved);
+            }
 
             // Register the process-exit stop after Init (so there is a live application to stop) and
             // dispose it before the application itself, below.
-            var initialized = app;
+            var initialized = app!;
             processExit = new TerminalProcessExitRegistration(() =>
             {
                 try
@@ -148,8 +205,8 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
                 }
             });
 
-            shell = this.shellFactory(mode, app, composer);
-            await app.RunAsync(shell, cancellationToken).ConfigureAwait(false);
+            shell = this.shellFactory(mode, initialized, composer);
+            await initialized.RunAsync(shell, cancellationToken).ConfigureAwait(false);
 
             // Cancellation cleanly stops the loop with no RequestedExit; treat that as a normal exit.
             outcome = shell.RequestedExit ?? TuiShellExit.Exited;

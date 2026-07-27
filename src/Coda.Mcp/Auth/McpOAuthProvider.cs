@@ -255,6 +255,12 @@ public sealed class McpOAuthProvider : IMcpAuthProvider
             ? "Opening browser to authorize MCP server…"
             : $"Opening browser to authorize MCP server {this.DisplayResource}…");
         await this.openBrowser(authorizeUrl, cancellationToken).ConfigureAwait(false);
+        // Log the URL AFTER the launch so that if the opener rejects a hostile scheme
+        // (LlmAuthException), the URL is never surfaced as copy-pasteable text.
+        // For suppressed/headless environments the opener returns immediately (after
+        // scheme validation), so the URL is still available for the operator to copy
+        // before the redirect listener begins waiting.
+        this.log?.Invoke($"Authorization URL: {authorizeUrl}");
 
         var redirect = await listener.WaitForCallbackAsync(cancellationToken).ConfigureAwait(false);
         ValidateRedirect(redirect, state, asMeta);

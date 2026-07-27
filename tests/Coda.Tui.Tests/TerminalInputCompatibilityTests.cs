@@ -20,6 +20,21 @@ public sealed class TerminalInputCompatibilityTests
     }
 
     [Fact]
+    public void CODA_TUI_DRIVER_ansi_pins_ansi_driver_explicitly()
+    {
+        // CODA_TUI_DRIVER=ansi selects the diffing output (ansi resolves to the diffing layer).
+        var env = new Dictionary<string, string?>
+        {
+            ["WT_SESSION"] = "abc-123",
+            ["CODA_TUI_DRIVER"] = "ansi",
+        };
+
+        var driver = TerminalInputCompatibility.SelectDriverName(env.GetValueOrDefault, isWindows: true);
+
+        Assert.Equal(DriverRegistry.Names.ANSI, driver);
+    }
+
+    [Fact]
     public void Windows_terminal_without_session_keeps_default_driver()
     {
         var env = new Dictionary<string, string?>();
@@ -69,6 +84,73 @@ public sealed class TerminalInputCompatibilityTests
         var driver = TerminalInputCompatibility.SelectDriverName(env.GetValueOrDefault, isWindows: true);
 
         Assert.Null(driver);
+    }
+
+    [Theory]
+    [InlineData("ansi")]
+    [InlineData("ANSI")]
+    [InlineData("Ansi")]
+    public void ShouldUseDiffingOutput_is_true_for_ansi_names(string name)
+    {
+        Assert.True(TerminalInputCompatibility.ShouldUseDiffingOutput(name, getEnv: _ => null));
+    }
+
+    [Theory]
+    [InlineData("windows")]
+    [InlineData("dotnet")]
+    public void ShouldUseDiffingOutput_is_false_for_non_ansi_names(string? name)
+    {
+        Assert.False(TerminalInputCompatibility.ShouldUseDiffingOutput(name));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void ShouldUseDiffingOutput_is_true_when_driver_is_null_or_blank_and_default_is_ansi(string? name)
+    {
+        // A null/blank name means "let Terminal.Gui pick the platform default". When the
+        // platform default resolves to the ANSI driver, the diffing output should activate.
+        Assert.True(TerminalInputCompatibility.ShouldUseDiffingOutput(
+            name,
+            getEnv: _ => null,
+            getDefaultDriverName: () => DriverRegistry.Names.ANSI));
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("  ")]
+    public void ShouldUseDiffingOutput_is_false_when_driver_is_null_or_blank_and_default_is_dotnet(string? name)
+    {
+        Assert.False(TerminalInputCompatibility.ShouldUseDiffingOutput(
+            name,
+            getDefaultDriverName: () => DriverRegistry.Names.DOTNET));
+    }
+
+    [Theory]
+    [InlineData("0")]
+    [InlineData("false")]
+    [InlineData("off")]
+    [InlineData("FALSE")]
+    [InlineData("  off  ")]
+    public void CODA_TUI_DIFF_opt_out_values_disable_diffing_output(string optOutValue)
+    {
+        Assert.False(TerminalInputCompatibility.ShouldUseDiffingOutput(
+            DriverRegistry.Names.ANSI,
+            getEnv: key => key == "CODA_TUI_DIFF" ? optOutValue : null));
+    }
+
+    [Theory]
+    [InlineData("1")]
+    [InlineData("true")]
+    [InlineData(null)]
+    [InlineData("")]
+    public void CODA_TUI_DIFF_non_opt_out_values_keep_diffing_enabled(string? optOutValue)
+    {
+        Assert.True(TerminalInputCompatibility.ShouldUseDiffingOutput(
+            DriverRegistry.Names.ANSI,
+            getEnv: key => key == "CODA_TUI_DIFF" ? optOutValue : null));
     }
 
     [Fact]

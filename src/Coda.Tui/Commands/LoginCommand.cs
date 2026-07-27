@@ -17,6 +17,14 @@ namespace Coda.Tui.Commands;
 /// </summary>
 public sealed class LoginCommand : ISlashCommand
 {
+    /// <summary>
+    /// Seam for tests: if non-null, replaces <see cref="SystemBrowser.OpenAsync"/> in the
+    /// OAuth loopback flow. Tests inject a no-op (or a cancelling delegate) to avoid real
+    /// browser launches without relying on the process-wide env-var suppression alone.
+    /// Production code leaves this null and the real browser is used.
+    /// </summary>
+    internal Func<Uri, CancellationToken, Task>? OpenBrowserOverride { get; init; }
+
     public string Name => "login";
 
     public IReadOnlyList<string> Aliases => [];
@@ -55,7 +63,7 @@ public sealed class LoginCommand : ISlashCommand
             }
         }
 
-        await ConnectAsync(context, provider, cancellationToken).ConfigureAwait(false);
+        await ConnectAsync(context, provider, cancellationToken, OpenBrowserOverride).ConfigureAwait(false);
         return CommandResult.Continue;
     }
 
@@ -67,7 +75,7 @@ public sealed class LoginCommand : ISlashCommand
     /// is now derived from the connected credential rather than a persisted settings
     /// pointer, so no <c>defaultProvider</c> is written here.
     /// </summary>
-    internal static async Task ConnectAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
+    internal static async Task ConnectAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken, Func<Uri, CancellationToken, Task>? openBrowser = null)
     {
         // API-key auth has no interactive step — handle it up front. It also stores no
         // credential of its own, so connecting to it must still purge any OTHER provider's
@@ -85,7 +93,7 @@ public sealed class LoginCommand : ISlashCommand
         {
             var credential = provider.LoginKind switch
             {
-                LoginKind.OAuthLoopback => await LoginLoopbackAsync(context, provider, cancellationToken).ConfigureAwait(false),
+                LoginKind.OAuthLoopback => await LoginLoopbackAsync(context, provider, openBrowser, cancellationToken).ConfigureAwait(false),
                 LoginKind.DeviceCode => await LoginDeviceAsync(context, provider, cancellationToken).ConfigureAwait(false),
                 _ => null,
             };
@@ -131,7 +139,7 @@ public sealed class LoginCommand : ISlashCommand
         return await SetupWizard.ChooseProviderAsync(context, cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task<Credential> LoginLoopbackAsync(CommandContext context, ProviderDescriptor provider, CancellationToken cancellationToken)
+    private static async Task<Credential> LoginLoopbackAsync(CommandContext context, ProviderDescriptor provider, Func<Uri, CancellationToken, Task>? openBrowser, CancellationToken cancellationToken)
     {
         context.Console.MarkupLine($"Opening your browser to sign in to {Theme.AccentMarkup(provider.DisplayName)}…");
         return await context.Credentials.LoginAsync(provider.Id, new LoginOptions
@@ -140,7 +148,7 @@ public sealed class LoginCommand : ISlashCommand
             {
                 context.Console.MarkupLine(Theme.DimMarkup("If your browser didn't open, visit:"));
                 context.Console.WriteLine(url.ToString());
-                await SystemBrowser.OpenAsync(url, ct).ConfigureAwait(false);
+                await (openBrowser ?? SystemBrowser.OpenAsync)(url, ct).ConfigureAwait(false);
             },
         }, cancellationToken).ConfigureAwait(false);
     }
