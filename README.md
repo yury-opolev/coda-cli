@@ -594,10 +594,15 @@ AuthHeaders headers = await manager.GetAuthHeadersAsync(GitHubCopilotProvider.Id
 
 `/login copilot` (and first-run setup) asks whether you're on **public github.com** or
 a **GitHub Enterprise Cloud** data-residency tenant (a `*.ghe.com` subdomain, e.g.
-`octocorp.ghe.com`). Enterprise sign-in runs the device flow against your host and uses
-the raw device-flow token directly at `copilot-api.<domain>` (no dotcom token exchange),
-so the credential is durable — **you sign in once and are not re-prompted** on later
-sessions. Public github.com keeps the standard token exchange.
+`octocorp.ghe.com`). Enterprise sign-in runs the device flow against your host, then
+exchanges the durable device-flow token for a short-lived Copilot token at
+`api.<domain>` — the same exchange public github.com uses — so Enterprise accounts get
+full model entitlement rather than the legacy subset the raw token grants. The short-lived
+token auto-refreshes from the stored durable token, the same way it does on github.com.
+If the exchange endpoint turns out to be absent on a given host (or unreachable — DNS
+failure, timeout, 5xx), sign-in and refresh fall back to using the raw device-flow token
+directly as the bearer instead of failing outright; this is retried at most once per
+process and re-checked automatically on the next restart.
 
 Your choice is persisted to `~/.coda/settings.json` as `githubEnterpriseDomain`:
 
