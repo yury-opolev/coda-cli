@@ -32,6 +32,11 @@ internal sealed class PresentedFrame
     private string?[,]? urlCache;
     private bool urlCacheValid;
 
+    // Per-row flag set during Adopt: true when any cell in that row had a non-null URL in the
+    // baseline. Lets SuppressUnchangedCells skip the lock-bearing GetCellUrl for rows where
+    // neither the baseline nor the current frame can contain a URL.
+    private bool[]? baselineRowHasUrl;
+
     private int cols;
     private int rows;
 
@@ -39,8 +44,10 @@ internal sealed class PresentedFrame
     /// Clears dirty flags on cells unchanged from the previous frame and recomputes dirty lines.
     /// </summary>
     /// <returns>
-    /// <see langword="false"/> when there is no compatible retained frame and the buffer must be written in
-    /// full; in that case, no flags are modified.
+    /// <see langword="false"/> when there is no compatible retained frame and suppression is
+    /// disabled; no flags are modified. Terminal.Gui's write loop still skips rows whose
+    /// <c>DirtyLines</c> entry is false, so a disabled-suppression frame is not guaranteed to
+    /// be a full write.
     /// </returns>
     public bool SuppressUnchangedCells(IOutputBuffer buffer)
     {
@@ -64,17 +71,40 @@ internal sealed class PresentedFrame
         Array.Clear(keepDirtyScratch!);  // the wide-glyph pass only ever sets true, so it must start clear
         urlCacheValid = false;
 
+        // Read DirtyLines once before the loops; it drives both the URL-skip optimisation and
+        // the dirty-line recomputation pass at the end.
+        var dirtyLines = buffer.DirtyLines;
+
         // Equality covers everything that determines a cell's appearance: grapheme, attribute and URL.
         // GetCellUrl takes (col, row) — the inverse of Contents[row, col].
         for (var row = 0; row < rows; row++)
         {
+            // Only call GetCellUrl (which acquires the buffer's lock and does dictionary lookups)
+            // for rows that might carry a URL: rows written this frame (DirtyLines[row] == true)
+            // or rows whose retained baseline already held a URL. For all other rows, the URL is
+            // null on both sides and the comparison is trivially equal without the lookup.
+            var rowNeedsUrlCheck = dirtyLines is null
+                || (row < dirtyLines.Length && dirtyLines[row])
+                || (baselineRowHasUrl is not null && row < baselineRowHasUrl.Length && baselineRowHasUrl[row]);
+
             for (var col = 0; col < cols; col++)
             {
                 var cell = contents[row, col];
                 var presented = cells[row, col];
-                var url = NormalizeUrl(buffer.GetCellUrl(col, row));
+                string? url;
+                if (rowNeedsUrlCheck)
+                {
+                    url = NormalizeUrl(buffer.GetCellUrl(col, row));
+                }
+                else
+                {
+                    url = null;
+                }
                 urlCache![row, col] = url;  // reused by Adopt so each cell's URL is fetched once per frame
-                equalScratch![row, col] = StringComparer.Ordinal.Equals(cell.Grapheme, presented.Grapheme)
+                // A cell whose baseline is Unknown (Known == false) was never confirmed as
+                // presented; it must not be suppressed regardless of apparent content equality.
+                equalScratch![row, col] = presented.Known
+                    && StringComparer.Ordinal.Equals(cell.Grapheme, presented.Grapheme)
                     && Nullable.Equals(cell.Attribute, presented.Attribute)
                     && StringComparer.Ordinal.Equals(url, presented.Url);  // both sides already normalised
             }
@@ -111,7 +141,6 @@ internal sealed class PresentedFrame
             }
         }
 
-        var dirtyLines = buffer.DirtyLines;
         if (dirtyLines is null)
         {
             return true;
@@ -162,11 +191,10 @@ internal sealed class PresentedFrame
         var newRows = buffer.Rows;
         var newCols = buffer.Cols;
 
-        // A cell still dirty after the write was never transmitted, because Terminal.Gui clears the flag
-        // on each cell it emits. Such cells keep their previous baseline so the next frame repaints them
-        // rather than silently accepting content the terminal never received. This is only possible when
-        // a compatible previous frame exists to fall back to.
-        var hasPrevFrame = cells is not null && rows == newRows && cols == newCols;
+        if (cells is null || rows != newRows || cols != newCols)
+        {
+            cells = new FrameCell[newRows, newCols];
+        }
 
         // The preceding suppression pass, when it ran, already resolved every cell's URL.
         var useUrlCache = urlCacheValid
@@ -175,10 +203,17 @@ internal sealed class PresentedFrame
             && urlCache.GetLength(1) >= newCols;
         urlCacheValid = false;
 
-        if (!hasPrevFrame)
+        // Reset per-row URL tracking; it will be rebuilt from the cells adopted below.
+        if (baselineRowHasUrl is null || baselineRowHasUrl.Length < newRows)
         {
-            cells = new FrameCell[newRows, newCols];
+            baselineRowHasUrl = new bool[newRows];
         }
+        else
+        {
+            Array.Clear(baselineRowHasUrl, 0, newRows);
+        }
+
+        var dirtyLines = buffer.DirtyLines;
 
         for (var row = 0; row < newRows; row++)
         {
@@ -186,13 +221,40 @@ internal sealed class PresentedFrame
             {
                 var cell = contents[row, col];
 
-                if (cell.IsDirty && hasPrevFrame)
+                if (cell.IsDirty)
                 {
-                    continue;
+                    if (cells![row, col].Known)
+                    {
+                        // A confirmed previous value exists. Retain it so the next frame can
+                        // detect whether the content changed relative to what the terminal shows.
+                        if (cells[row, col].Url is not null)
+                        {
+                            baselineRowHasUrl![row] = true;
+                        }
+
+                        continue;
+                    }
+
+                    // No confirmed previous value. Adopt only if the row is known to have been
+                    // emitted: when DirtyLines tracking says the row was not dirty, the write
+                    // loop skipped it entirely (e.g. a FillRect-only draw), and the cell never
+                    // reached the terminal — leave it Unknown so future frames keep it dirty.
+                    var rowWasEmitted = dirtyLines is null
+                        || (row < dirtyLines.Length && dirtyLines[row]);
+                    if (!rowWasEmitted)
+                    {
+                        continue;  // cell is Unknown; default(FrameCell) already in place
+                    }
+
+                    // Row was in the dirty set; fall through to adopt with Known = true.
                 }
 
                 var url = useUrlCache ? urlCache![row, col] : NormalizeUrl(buffer.GetCellUrl(col, row));
-                cells![row, col] = new FrameCell(cell.Grapheme, cell.Attribute, url, IsWide(cell.Grapheme));
+                cells![row, col] = new FrameCell(cell.Grapheme, cell.Attribute, url, IsWide(cell.Grapheme), Known: true);
+                if (url is not null)
+                {
+                    baselineRowHasUrl![row] = true;
+                }
             }
         }
 
@@ -201,7 +263,12 @@ internal sealed class PresentedFrame
         rows = newRows;
     }
 
-    /// <summary>Drops the retained frame so the next frame is written in full.</summary>
+    /// <summary>
+    /// Drops the retained frame so the next <see cref="SuppressUnchangedCells"/> call returns
+    /// <see langword="false"/>, disabling cell-level suppression for that frame. Terminal.Gui's
+    /// write loop still skips rows whose <c>DirtyLines</c> entry is false, so an invalidated
+    /// frame does not guarantee a complete write to the terminal.
+    /// </summary>
     public void Invalidate()
     {
         cells = null;
@@ -256,5 +323,6 @@ internal sealed class PresentedFrame
         string? Grapheme,
         Terminal.Gui.Drawing.Attribute? Attribute,
         string? Url,
-        bool IsWide);
+        bool IsWide,
+        bool Known);
 }

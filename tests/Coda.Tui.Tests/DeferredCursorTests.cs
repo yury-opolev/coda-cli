@@ -5,14 +5,6 @@ namespace Coda.Tui.Tests;
 public sealed class DeferredCursorTests
 {
     [Fact]
-    public void No_pending_initially()
-    {
-        var cursor = new DeferredCursor();
-
-        Assert.False(cursor.HasPending);
-    }
-
-    [Fact]
     public void TryTake_returns_false_and_zeroed_outputs_when_no_pending()
     {
         var cursor = new DeferredCursor();
@@ -30,14 +22,11 @@ public sealed class DeferredCursorTests
         var cursor = new DeferredCursor();
         cursor.Request(5, 10);
 
-        Assert.True(cursor.HasPending);
-
         var first = cursor.TryTake(out var col, out var row);
         Assert.True(first);
         Assert.Equal(5, col);
         Assert.Equal(10, row);
 
-        Assert.False(cursor.HasPending);
         Assert.False(cursor.TryTake(out _, out _));
     }
 
@@ -53,17 +42,16 @@ public sealed class DeferredCursorTests
         Assert.Equal(3, col);
         Assert.Equal(3, row);
 
-        Assert.False(cursor.HasPending);
+        Assert.False(cursor.TryTake(out _, out _));
     }
 
     [Fact]
-    public void Clear_discards_pending_position_and_HasPending_becomes_false()
+    public void Clear_discards_pending_position()
     {
         var cursor = new DeferredCursor();
         cursor.Request(7, 8);
         cursor.Clear();
 
-        Assert.False(cursor.HasPending);
         Assert.False(cursor.TryTake(out _, out _));
     }
 
@@ -87,7 +75,6 @@ public sealed class DeferredCursorTests
 
         cursor.Request(9, 12);
 
-        Assert.True(cursor.HasPending);
         Assert.True(cursor.TryTake(out var col, out var row));
         Assert.Equal(9, col);
         Assert.Equal(12, row);

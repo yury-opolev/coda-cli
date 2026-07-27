@@ -51,9 +51,4 @@ internal sealed class DeferredCursor
 
     /// <summary>Discards any pending position without emitting it.</summary>
     public void Clear() => hasPending = false;
-
-    /// <summary>
-    /// <see langword="true"/> when a position has been requested but not yet taken or cleared.
-    /// </summary>
-    public bool HasPending => hasPending;
 }

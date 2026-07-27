@@ -329,6 +329,88 @@ public sealed class PresentedFrameTests
         Assert.True(IsDirty(buffer, 1, 0));  // col 1 must remain dirty — it was never presented
     }
 
+    // ── Dirty cells with no previous frame must not be baselined ──────────────
+    // These three tests cover the hasPrevFrame == false paths where Invalidate() or a
+    // dimension change clears the retained baseline. Before the fix, Adopt would write
+    // the current (never-transmitted) cell content as the new baseline, so an identical
+    // next-frame draw would be wrongly suppressed and the cell would stay blank forever.
+
+    [Fact]
+    public void After_invalidate_dirty_cell_is_not_adopted_as_baseline()
+    {
+        var buffer = CreateBuffer(4, 1);
+        buffer.AddStr("x");
+        var frame = new PresentedFrame();
+        frame.Adopt(buffer);
+        frame.Invalidate();  // drop the retained frame; the next Adopt has no previous baseline
+
+        // Draw new content, then clear DirtyLines to model the path where a row is skipped
+        // by Terminal.Gui's write loop (e.g. because only FillRect touched it, not AddStr).
+        buffer.Move(0, 0);
+        buffer.AddStr("y");
+        buffer.DirtyLines[0] = false;  // row was not actually transmitted
+
+        frame.Adopt(buffer);  // col 0 is still dirty; must not be baselined as "y"
+
+        // Identical next frame: if "y" was wrongly adopted the suppression would clear the
+        // dirty flag and the cell would silently remain blank for the rest of the session.
+        buffer.Move(0, 0);
+        buffer.AddStr("y");
+
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+        Assert.True(IsDirty(buffer, 0, 0));  // must remain dirty — never transmitted
+    }
+
+    [Fact]
+    public void Dirty_cell_with_false_dirtylines_not_adopted_as_baseline_after_invalidate()
+    {
+        // Models the FillRect path: IsDirty is set on a cell directly (e.g. View.ClearViewport
+        // calls Driver.FillRect) without ever calling AddGrapheme, so DirtyLines stays false
+        // and the row is skipped by the write loop.
+        var buffer = CreateBuffer(4, 1);
+        buffer.AddStr("ab");
+        var frame = new PresentedFrame();
+        frame.Adopt(buffer);
+        frame.Invalidate();
+
+        // Reset dirty-line tracking and mark col 0 dirty without touching DirtyLines,
+        // simulating a FillRect-only frame where the write loop skips the row entirely.
+        buffer.DirtyLines[0] = false;
+        buffer.Contents![0, 0].IsDirty = true;
+        // DirtyLines[0] remains false; the row will be skipped by the write loop.
+
+        frame.Adopt(buffer);  // col 0 is dirty in a non-emitted row; must not be baselined
+
+        buffer.Move(0, 0);
+        buffer.AddStr("a");  // next frame draws the same grapheme
+
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+        Assert.True(IsDirty(buffer, 0, 0));  // must remain dirty — the prior write was skipped
+    }
+
+    [Fact]
+    public void After_dimension_change_dirty_cell_is_not_adopted_as_baseline()
+    {
+        var buffer = CreateBuffer(2, 1);
+        buffer.AddStr("x");
+        var frame = new PresentedFrame();
+        frame.Adopt(buffer);
+
+        // Resize: cols change so there is no previous baseline for the new frame.
+        buffer.SetSize(3, 1);
+        buffer.Move(0, 0);
+        buffer.AddStr("y");
+        buffer.DirtyLines[0] = false;  // simulate the row not being transmitted
+
+        frame.Adopt(buffer);  // hasPrevFrame == false due to dimension change
+
+        buffer.Move(0, 0);
+        buffer.AddStr("y");
+
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+        Assert.True(IsDirty(buffer, 0, 0));  // must remain dirty — never transmitted
+    }
+
     private static bool IsDirty(OutputBufferImpl buffer, int col, int row)
         => (buffer.Contents ?? throw new InvalidOperationException("Buffer contents were not initialized."))[row, col].IsDirty;
     private static OutputBufferImpl CreateBuffer(int cols, int rows)

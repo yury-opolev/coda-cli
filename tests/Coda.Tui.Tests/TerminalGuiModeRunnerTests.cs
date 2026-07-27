@@ -5,6 +5,12 @@ using Point = System.Drawing.Point;
 
 namespace Coda.Tui.Tests;
 
+/// <summary>
+/// Tests for <see cref="TerminalGuiModeRunner"/>. Placed in the "TerminalGuiInit" collection
+/// because several tests call <c>app.Init</c> through the production runner and must not race
+/// with <see cref="DiffingApplicationFactoryTests"/>, which does the same.
+/// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class TerminalGuiModeRunnerTests
 {
     [Fact]

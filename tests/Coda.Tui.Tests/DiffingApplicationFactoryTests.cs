@@ -6,12 +6,16 @@ namespace Coda.Tui.Tests;
 /// Integration tests for <see cref="DiffingApplicationFactory"/>.
 /// </summary>
 /// <remarks>
-/// The collection definition serializes these tests so that Init calls do not race with one another
-/// inside this class. Existing Terminal.Gui Init tests in the project have no collection attribute
-/// (verified: FullscreenTuiShellTests, InlineTuiShellTests, RetainedShellFixture all call
-/// app.Init without [Collection]); they rely on xUnit's default per-class sequential execution and
-/// have worked in CI without explicit collection isolation. The new integration test is placed in
-/// the "TerminalGuiInit" collection so future Init tests can join it for guaranteed serialization.
+/// The collection definition serializes these tests with <see cref="TerminalGuiInitCollection"/>
+/// so that <c>app.Init</c> calls do not race with one another. Note that xUnit's unit of
+/// serialization is the <em>collection</em>, not the class: each class without a
+/// <c>[Collection]</c> attribute forms its own collection and runs in parallel with every
+/// other collection (including this one). The classes verified in the comment below —
+/// FullscreenTuiShellTests, InlineTuiShellTests, RetainedShellFixture — call
+/// <c>app.Init</c> without a collection attribute and therefore run in parallel with this
+/// class. That race is pre-existing and accepted because it has not caused CI flakiness.
+/// <see cref="TerminalGuiModeRunnerTests"/> is placed in this collection because it also
+/// calls Init through the production runner and is modified alongside this file.
 /// </remarks>
 [Collection("TerminalGuiInit")]
 public sealed class DiffingApplicationFactoryTests

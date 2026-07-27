@@ -41,10 +41,11 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
 
         var hasGraphics = HasGraphics(buffer);
 
-        // Images are positioned independently of the cell grid and are not diffable; present the
-        // frame in full whenever any are in play. One additional invalidation after images
-        // disappear ensures that cells the graphics subsystem force-cleared without transmitting
-        // are retransmitted on the next frame rather than silently accepted as the new baseline.
+        // Images are positioned independently of the cell grid and are not diffable; disable
+        // suppression whenever any are in play. One additional invalidation after images
+        // disappear prevents cells the graphics subsystem may have force-cleared from being
+        // silently adopted as the new baseline: they remain dirty and are re-emitted the next
+        // time Terminal.Gui writes their row.
         if (hasGraphics || graphicsPresentedLastFrame)
         {
             frame.Invalidate();
@@ -63,6 +64,13 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
         {
             base.Write(buffer);
             trusted = coalescer.EndFrame();
+        }
+        catch
+        {
+            // If the underlying write partially succeeded the URL cache and dirty-flag state
+            // may be inconsistent; drop the baseline so the next frame starts from scratch.
+            frame.Invalidate();
+            throw;
         }
         finally
         {
@@ -99,6 +107,14 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
     {
         if (output is null || output.Length == 0)
         {
+            return;
+        }
+
+        // Coalescer calls are only meaningful during a frame write; outside that scope the
+        // deferred state is stale and the flush/note calls would be asymmetric no-ops.
+        if (!coalescing)
+        {
+            base.Write(output);
             return;
         }
 

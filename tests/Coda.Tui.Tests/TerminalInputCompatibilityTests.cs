@@ -92,7 +92,7 @@ public sealed class TerminalInputCompatibilityTests
     [InlineData("Ansi")]
     public void ShouldUseDiffingOutput_is_true_for_ansi_names(string name)
     {
-        Assert.True(TerminalInputCompatibility.ShouldUseDiffingOutput(name));
+        Assert.True(TerminalInputCompatibility.ShouldUseDiffingOutput(name, getEnv: _ => null));
     }
 
     [Theory]
@@ -113,6 +113,7 @@ public sealed class TerminalInputCompatibilityTests
         // platform default resolves to the ANSI driver, the diffing output should activate.
         Assert.True(TerminalInputCompatibility.ShouldUseDiffingOutput(
             name,
+            getEnv: _ => null,
             getDefaultDriverName: () => DriverRegistry.Names.ANSI));
     }
 
