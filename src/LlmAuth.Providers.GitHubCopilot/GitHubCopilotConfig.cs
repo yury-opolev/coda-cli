@@ -42,9 +42,10 @@ public sealed record GitHubCopilotConfig
     /// <summary>
     /// When <see langword="true"/> (the default), the raw GitHub OAuth token is
     /// exchanged for a short-lived Copilot token via <see cref="CopilotTokenUrl"/>.
-    /// Set to <see langword="false"/> for GitHub Enterprise data-residency tenants,
-    /// where the raw device-flow OAuth token is the bearer directly and no exchange
-    /// endpoint is available.
+    /// The exchanged Copilot token carries full model entitlement (all plan-permitted
+    /// models), whereas the raw device-flow token yields only a legacy subset.
+    /// Set to <see langword="false"/> only to explicitly opt out of the exchange on
+    /// deployments where the exchange endpoint is confirmed absent.
     /// </summary>
     public bool UseExchange { get; init; } = true;
 
@@ -66,8 +67,8 @@ public sealed record GitHubCopilotConfig
     /// <summary>
     /// Build a configuration for a GitHub Enterprise data-residency tenant.
     /// Device-code and token endpoints are on the GHE host; the inference endpoint
-    /// is <c>https://copilot-api.{domain}</c>; the dotcom token exchange is skipped
-    /// (<see cref="UseExchange"/> is <see langword="false"/>).
+    /// is <c>https://copilot-api.{domain}</c>; the Copilot token exchange endpoint is
+    /// <c>https://api.{domain}/copilot_internal/v2/token</c>.
     /// ClientId and editor headers are inherited from <see cref="Default"/>.
     /// </summary>
     /// <param name="domain">
@@ -90,13 +91,42 @@ public sealed record GitHubCopilotConfig
             d = d["copilot-api.".Length..];
         }
 
+        EnsureBareHost(d, nameof(domain));
+
+        // Enterprise hosts expose the same copilot_internal/v2/token exchange endpoint
+        // as github.com, but under api.<gheHost>.  Using the exchanged Copilot token
+        // (rather than the raw device-flow OAuth token) grants full model entitlement;
+        // the raw token yields only a legacy subset of models.
         return Default with
         {
             DeviceCodeUrl = $"https://{d}/login/device/code",
             TokenUrl = $"https://{d}/login/oauth/access_token",
+            CopilotTokenUrl = $"https://api.{d}/copilot_internal/v2/token",
             ApiBaseUrl = $"https://copilot-api.{d}",
-            UseExchange = false,
+            UseExchange = true,
         };
+    }
+
+    /// <summary>Characters that indicate <c>domain</c> is not a bare hostname (a path, query,
+    /// fragment, or userinfo component).</summary>
+    private static readonly char[] disallowedHostChars = ['/', '\\', '@', '?', '#'];
+
+    /// <summary>
+    /// Reject anything but a bare hostname[:port] — no path, query, fragment, embedded
+    /// credentials, or whitespace. This value is later interpolated into <c>api.&lt;domain&gt;</c>
+    /// and used as the destination of the durable OAuth-token exchange, so a stray path or
+    /// userinfo could silently redirect that token to an unintended host. A clear exception at
+    /// config time is preferable to risking that, so this throws rather than sanitizing.
+    /// </summary>
+    private static void EnsureBareHost(string host, string paramName)
+    {
+        if (host.Length == 0 || host.Any(char.IsWhiteSpace) || host.IndexOfAny(disallowedHostChars) >= 0)
+        {
+            throw new ArgumentException(
+                "GitHub Enterprise domain must be a bare hostname, e.g. 'octocorp.ghe.com' " +
+                "(no path, query, fragment, or embedded credentials).",
+                paramName);
+        }
     }
 
     /// <summary>

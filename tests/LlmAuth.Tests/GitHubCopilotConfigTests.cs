@@ -29,11 +29,36 @@ public sealed class GitHubCopilotConfigTests
     [InlineData("http://microsoft.ghe.com")]
     [InlineData("microsoft.ghe.com/")]
     [InlineData("https://microsoft.ghe.com/")]
-    public void ForEnterprise_UseExchange_IsFalse(string domain)
+    public void ForEnterprise_UseExchange_IsTrue(string domain)
+    {
+        // Enterprise hosts do have a copilot_internal/v2/token exchange endpoint;
+        // the raw OAuth token yields fewer models than the exchanged Copilot token.
+        var config = GitHubCopilotConfig.ForEnterprise(domain);
+
+        Assert.True(config.UseExchange);
+    }
+
+    [Theory]
+    [InlineData("microsoft.ghe.com", "https://api.microsoft.ghe.com/copilot_internal/v2/token")]
+    [InlineData("https://microsoft.ghe.com", "https://api.microsoft.ghe.com/copilot_internal/v2/token")]
+    [InlineData("microsoft.ghe.com/", "https://api.microsoft.ghe.com/copilot_internal/v2/token")]
+    public void ForEnterprise_SetsCopilotTokenUrl_ToEnterpriseExchangeEndpoint(string domain, string expected)
     {
         var config = GitHubCopilotConfig.ForEnterprise(domain);
 
-        Assert.False(config.UseExchange);
+        Assert.Equal(expected, config.CopilotTokenUrl);
+    }
+
+    [Theory]
+    [InlineData("copilot-api.microsoft.ghe.com")]
+    [InlineData("https://copilot-api.microsoft.ghe.com")]
+    public void ForEnterprise_CopilotHostPastedByMistake_CopilotTokenUrlIsCorrect(string domain)
+    {
+        // When the caller pastes the Copilot host instead of the GHE host, the prefix
+        // is stripped and all URLs — including CopilotTokenUrl — reference the GHE host.
+        var config = GitHubCopilotConfig.ForEnterprise(domain);
+
+        Assert.Equal("https://api.microsoft.ghe.com/copilot_internal/v2/token", config.CopilotTokenUrl);
     }
 
     [Fact]
@@ -55,6 +80,21 @@ public sealed class GitHubCopilotConfigTests
     {
         Assert.Throws<ArgumentException>(() => GitHubCopilotConfig.ForEnterprise(string.Empty));
         Assert.Throws<ArgumentException>(() => GitHubCopilotConfig.ForEnterprise("   "));
+    }
+
+    [Theory]
+    [InlineData("acme.com/evil-path")]
+    [InlineData("acme.com evil")]
+    [InlineData("user@acme.com")]
+    [InlineData("acme.com?x=1")]
+    [InlineData("acme.com#frag")]
+    [InlineData("acme.com\\evil")]
+    public void ForEnterprise_DomainWithPathQueryFragmentOrUserInfo_Throws(string domain)
+    {
+        // The domain is interpolated into api.<domain> and used as the destination for the
+        // durable OAuth token exchange; a stray path/query/fragment/userinfo must not silently
+        // redirect that token to an unintended host.
+        Assert.Throws<ArgumentException>(() => GitHubCopilotConfig.ForEnterprise(domain));
     }
 
     [Theory]
@@ -118,11 +158,50 @@ public sealed class GitHubCopilotConfigTests
             Assert.Equal("https://contoso.ghe.com/login/device/code", config.DeviceCodeUrl);
             Assert.Equal("https://contoso.ghe.com/login/oauth/access_token", config.TokenUrl);
             Assert.Equal("https://copilot-api.contoso.ghe.com", config.ApiBaseUrl);
+            Assert.Equal("https://api.contoso.ghe.com/copilot_internal/v2/token", config.CopilotTokenUrl);
+            Assert.True(config.UseExchange);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_COPILOT_ENTERPRISE_DOMAIN", null);
+        }
+    }
+
+    [Fact]
+    public void FromEnvironment_EnterpriseDomain_UseExchangeCanBeOverriddenToFalse()
+    {
+        // GH_COPILOT_USE_EXCHANGE=false must win over the ForEnterprise default (true).
+        ClearCopilotEnv();
+        Environment.SetEnvironmentVariable("GH_COPILOT_ENTERPRISE_DOMAIN", "contoso.ghe.com");
+        Environment.SetEnvironmentVariable("GH_COPILOT_USE_EXCHANGE", "false");
+        try
+        {
+            var config = GitHubCopilotConfig.FromEnvironment();
             Assert.False(config.UseExchange);
         }
         finally
         {
             Environment.SetEnvironmentVariable("GH_COPILOT_ENTERPRISE_DOMAIN", null);
+            Environment.SetEnvironmentVariable("GH_COPILOT_USE_EXCHANGE", null);
+        }
+    }
+
+    [Fact]
+    public void FromEnvironment_EnterpriseDomain_CopilotTokenUrlCanBeOverridden()
+    {
+        // GH_COPILOT_COPILOT_TOKEN_URL must win over the ForEnterprise-derived value.
+        ClearCopilotEnv();
+        Environment.SetEnvironmentVariable("GH_COPILOT_ENTERPRISE_DOMAIN", "contoso.ghe.com");
+        Environment.SetEnvironmentVariable("GH_COPILOT_COPILOT_TOKEN_URL", "https://custom-token.contoso.internal/copilot/v2/token");
+        try
+        {
+            var config = GitHubCopilotConfig.FromEnvironment();
+            Assert.Equal("https://custom-token.contoso.internal/copilot/v2/token", config.CopilotTokenUrl);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("GH_COPILOT_ENTERPRISE_DOMAIN", null);
+            Environment.SetEnvironmentVariable("GH_COPILOT_COPILOT_TOKEN_URL", null);
         }
     }
 
@@ -180,7 +259,8 @@ public sealed class GitHubCopilotConfigTests
             Assert.Equal("https://acme.ghe.com/login/device/code", config.DeviceCodeUrl);
             // ApiBaseUrl overridden individually
             Assert.Equal("https://custom-api.acme.internal", config.ApiBaseUrl);
-            Assert.False(config.UseExchange);
+            // UseExchange inherits the ForEnterprise default (true)
+            Assert.True(config.UseExchange);
         }
         finally
         {
@@ -207,7 +287,8 @@ public sealed class GitHubCopilotConfigTests
             return (HttpStatusCode.OK, """{"access_token":"ghe_RAW_OAUTH_TOKEN","token_type":"bearer","scope":"read:user"}""");
         });
 
-        var config = GitHubCopilotConfig.ForEnterprise("microsoft.ghe.com");
+        // UseExchange=false: explicit opt-out for hosts that accept the raw token directly.
+        var config = GitHubCopilotConfig.ForEnterprise("microsoft.ghe.com") with { UseExchange = false };
         using var provider = new GitHubCopilotProvider(config, new HttpClient(handler));
 
         var credential = await provider.LoginWithDeviceCodeAsync(
@@ -224,8 +305,32 @@ public sealed class GitHubCopilotConfigTests
     }
 
     [Fact]
-    public void NeedsRefresh_NoExpiresAt_ReturnsFalse()
+    public void NeedsRefresh_NoExpiresAt_NonRawToken_ReturnsFalse()
     {
+        // An already-exchanged-looking token (not a raw GitHub OAuth prefix) with no
+        // ExpiresAt is the durable/long-lived case and must not trigger a refresh. This is
+        // deliberately NOT a "ghe_"-prefixed token: that scenario is the raw-token self-heal
+        // covered by NeedsRefresh_EnterpriseConfig_RawGheToken_SelfHeals_ReturnsTrue below.
+        var config = GitHubCopilotConfig.ForEnterprise("microsoft.ghe.com");
+        using var provider = new GitHubCopilotProvider(config, new HttpClient(new StubHandler(_ => (HttpStatusCode.OK, "{}"))));
+        var credential = new Credential
+        {
+            ProviderId = GitHubCopilotProvider.Id,
+            Kind = CredentialKind.OAuth,
+            AccessToken = "tid=already-exchanged-enterprise-token",
+            RefreshToken = "ghu_underlying",
+            ExpiresAt = null,
+        };
+
+        Assert.False(provider.NeedsRefresh(credential));
+    }
+
+    [Fact]
+    public void NeedsRefresh_EnterpriseConfig_RawGheToken_SelfHeals_ReturnsTrue()
+    {
+        // This is exactly the scenario the self-heal exists for: a credential stored before
+        // the Enterprise exchange fix, still carrying the raw "ghe_" device-flow token, under
+        // a config that now expects the exchanged Copilot token (UseExchange=true).
         var config = GitHubCopilotConfig.ForEnterprise("microsoft.ghe.com");
         using var provider = new GitHubCopilotProvider(config, new HttpClient(new StubHandler(_ => (HttpStatusCode.OK, "{}"))));
         var credential = new Credential
@@ -237,7 +342,7 @@ public sealed class GitHubCopilotConfigTests
             ExpiresAt = null,
         };
 
-        Assert.False(provider.NeedsRefresh(credential));
+        Assert.True(provider.NeedsRefresh(credential));
     }
 
     [Fact]
