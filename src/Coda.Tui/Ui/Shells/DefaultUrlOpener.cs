@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using LlmAuth;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -73,11 +74,21 @@ internal sealed class DefaultUrlOpener : IUrlOpener
 
     private bool LaunchProcess(ProcessStartInfo psi, out string? error)
     {
+        // The ProcessStarterOverride takes unconditional precedence: tests that inject a fake
+        // starter can observe launch signals even while the env-var suppression is active.
         if (this.ProcessStarterOverride is { } starter)
         {
             var ok = starter(psi);
             error = ok ? null : "Launch failed";
             return ok;
+        }
+
+        // When the suppression variable is set (always the case in test assemblies via the
+        // module initialiser), return a silent success so no OS window is opened.
+        if (!string.IsNullOrEmpty(Environment.GetEnvironmentVariable(SystemBrowser.SuppressEnvironmentVariable)))
+        {
+            error = null;
+            return true;
         }
 
         try
