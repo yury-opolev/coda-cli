@@ -1,8 +1,8 @@
 # TUI Feature Suite — Implementation Overview
 
 **Date:** 2026-07-25
-**Status:** In progress
-**Branch:** `features/tui-feature-suite`
+**Status:** Completed — merged to `main` via [PR #50](https://github.com/yury-opolev/coda-cli/pull/50); released in v0.1.91
+**Branch:** `features/tui-feature-suite` (merged)
 
 This suite makes the Coda TUI more responsive, expressive, and pleasant to use. It collects nine designed
 features, each with its own approved design spec under `docs/superpowers/specs/`. Every feature honors the

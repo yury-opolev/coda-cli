@@ -968,4 +968,5 @@ dotnet run --project samples/LlmAuth.Sample -- copilot-logout
 - **Authorization:** the Claude.ai subscription sign-in is subject to Anthropic's
   Terms of Service. Using your own `ANTHROPIC_API_KEY` (via `ApiKeyProvider`) is the
   most straightforward option and is unaffected.
-- GitHub Copilot and OpenAI providers are planned as additional `ICredentialProvider`s.
+- OpenAI is planned as an additional `ICredentialProvider`. GitHub Copilot is
+  already implemented (device flow, with automatic token refresh).
