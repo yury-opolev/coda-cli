@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Hooks;
 using Coda.Mcp.Auth;
 using Coda.Sdk;
 using Coda.Tui.Clipboard;
@@ -220,6 +221,12 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var toolDisplayMode = toolDisplayResolution.Mode;
         CopilotEnvironment.ApplyEnterpriseDomain(startupSettings.GitHubEnterpriseDomain);
 
+        // Compute the static display-buffering flag from the hook set (§8.1). This is read once here at
+        // the composition root so the reducer/actor receive a plain bool — they never touch the hook system.
+        var bufferAssistantText = startupSettings.Hooks.Count > 0
+            && new UserHookRunner(startupSettings.Hooks).AnyHookMutatesDisplay;
+        var initialSnapshot = UiSessionSnapshot.Empty with { BufferAssistantText = bufferAssistantText };
+
         using var claude = new ClaudeAiProvider();
         var copilotConfig = GitHubCopilotConfig.FromEnvironment();
         using var copilot = new GitHubCopilotProvider(copilotConfig);
@@ -349,7 +356,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 ? new Coda.Tui.Ui.Schedule.ScheduleBrowserProvider(() => sc, actorPrompts)
                 : null;
 
-        using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
+        using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, initialSnapshot, hostToken);
         var mcpBrowserProvider = InteractiveProgram.CreateMcpBrowserProvider(
             mcpManagement, actorPrompts, controller);
 
@@ -361,7 +368,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // The single actor keeps one switchable frame/observer sink for the whole session.
         var frameSink = new SwitchableUiFrameSink();
         var observer = new SwitchableUiEventObserver();
-        var actor = new UiActor(mailbox, frameSink, UiSessionSnapshot.Empty, observer, actorPrompts);
+        var actor = new UiActor(mailbox, frameSink, initialSnapshot, observer, actorPrompts);
         var actorTask = RunActorAsync(actor, error, hostToken);
 
         // Semantic commands (e.g. /status) and metadata republishes read the live actor snapshot, so

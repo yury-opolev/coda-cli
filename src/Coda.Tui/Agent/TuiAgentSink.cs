@@ -102,4 +102,7 @@ public sealed class TuiAgentSink : IAgentSink
 
     public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
         this.publisher.Publish(new PromptRewrittenEvent(hookCommand, originalPrompt, modifiedPrompt));
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
+        this.publisher.Publish(new ResponseRewrittenEvent(hookCommand, originalResponse, displayContent, modifiedResponse));
 }

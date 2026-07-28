@@ -191,7 +191,7 @@ public static class SettingsLoader
                 continue;
             }
 
-            target.Add(new UserHook(eventName, entry.Command, entry.Matcher, entry.TimeoutSeconds, entry.FailOpen, entry.UnattendedDecision, entry.AllowSystemPromptReplace));
+            target.Add(new UserHook(eventName, entry.Command, entry.Matcher, entry.TimeoutSeconds, entry.FailOpen, entry.UnattendedDecision, entry.AllowSystemPromptReplace, entry.Mutates?.AsReadOnly()));
         }
     }
 
@@ -472,5 +472,13 @@ public static class SettingsLoader
 
         [JsonPropertyName("allowSystemPromptReplace")]
         public bool AllowSystemPromptReplace { get; set; }
+
+        /// <summary>
+        /// List of output fields this hook may return that mutate data. Used statically at
+        /// session start (e.g. <c>"displayContent"</c>, <c>"modifiedResponse"</c> for
+        /// <c>AgentResponse</c> hooks). Unknown entries are preserved and ignored at runtime.
+        /// </summary>
+        [JsonPropertyName("mutates")]
+        public List<string>? Mutates { get; set; }
     }
 }

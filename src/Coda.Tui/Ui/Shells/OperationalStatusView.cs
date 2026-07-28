@@ -72,7 +72,19 @@ internal sealed class OperationalStatusView : View
                 OperationalTone.Error => "!",
                 _ => "◌",
             };
-        return $"{prefix} {this.Status.Text}";
+
+        var text = this.Status.Text;
+        if (this.Status.StartedAt is { } startedAt)
+        {
+            // Compute elapsed seconds live on each draw tick so the time updates at the existing
+            // 180 ms spinner interval without adding a separate timer. This is the same pattern
+            // the transcript uses for ThinkingTranscriptBlock.StartedAt: store the origin in state,
+            // compute the delta at render time.
+            var elapsedSec = (long)Math.Max(0, (DateTimeOffset.UtcNow - startedAt).TotalSeconds);
+            text = $"{text} · {elapsedSec}s";
+        }
+
+        return $"{prefix} {text}";
     }
 
     protected override bool OnDrawingContent(DrawContext? context)

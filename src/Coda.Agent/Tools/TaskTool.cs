@@ -83,5 +83,6 @@ public sealed class TaskTool : ITool
         public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) { }
         public void OnToolActivityCompleted(ToolActivitySummary summary) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

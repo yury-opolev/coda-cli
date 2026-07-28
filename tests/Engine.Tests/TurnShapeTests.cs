@@ -424,5 +424,6 @@ public sealed class TurnShapeTests
         public void OnToolCall(string toolName, string inputJson) { }
         public void OnToolResult(string toolName, ToolResult result) => captured.Add((toolName, result));
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

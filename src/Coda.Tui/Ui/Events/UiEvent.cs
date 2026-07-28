@@ -194,8 +194,12 @@ public sealed record ContextChangedEvent(ContextStatus Context) : UiEvent;
 /// <summary>The UI mode changed.</summary>
 public sealed record ModeChangedEvent(string Mode) : UiEvent;
 
-/// <summary>A turn started for a prompt.</summary>
-public sealed record TurnStartedEvent(string Prompt) : UiEvent;
+/// <summary>
+/// A turn started for a prompt. <see cref="StartedAt"/> is captured at event creation from a testable
+/// <see cref="TimeProvider"/> seam (UTC), so the reducer can set
+/// <see cref="UiSessionSnapshot.BufferingStartedAt"/> to a stable value in tests.
+/// </summary>
+public sealed record TurnStartedEvent(string Prompt, DateTimeOffset? StartedAt = null) : UiEvent;
 
 /// <summary>A turn completed (successfully or not).</summary>
 public sealed record TurnCompletedEvent(bool Success) : UiEvent;
@@ -220,6 +224,17 @@ public sealed record PromptRewrittenEvent(
     string HookCommand,
     string OriginalPrompt,
     string ModifiedPrompt) : UiEvent;
+
+/// <summary>
+/// An <c>AgentResponse</c> hook rewrote the assistant's response. The original response
+/// is available for comparison; the display and history may differ when both
+/// <see cref="DisplayContent"/> and <see cref="ModifiedResponse"/> are set.
+/// </summary>
+public sealed record ResponseRewrittenEvent(
+    string HookCommand,
+    string OriginalResponse,
+    string DisplayContent,
+    string? ModifiedResponse) : UiEvent;
 
 /// <summary>
 /// An internal ordering barrier published through the mailbox by <see cref="UiActor.FlushAsync"/>. The

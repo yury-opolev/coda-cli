@@ -44,4 +44,6 @@ public sealed class PlainTextSink : IAgentSink
     }
 
     public void OnError(string message) => this.error.WriteLine(message);
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
 }

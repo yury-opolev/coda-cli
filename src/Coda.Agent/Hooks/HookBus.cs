@@ -77,6 +77,14 @@ public sealed partial class HookBus
         this.HasSessionStart = hooks.Any(h => string.Equals(h.Event, "SessionStart", StringComparison.OrdinalIgnoreCase));
         this.HasSessionEnd = hooks.Any(h => string.Equals(h.Event, "SessionEnd", StringComparison.OrdinalIgnoreCase));
         this.HasNotification = hooks.Any(h => string.Equals(h.Event, "Notification", StringComparison.OrdinalIgnoreCase));
+        this.HasStop = hooks.Any(h => string.Equals(h.Event, "Stop", StringComparison.OrdinalIgnoreCase));
+        this.HasAgentResponse = hooks.Any(h => string.Equals(h.Event, "AgentResponse", StringComparison.OrdinalIgnoreCase));
+        this.AnyHookMutatesDisplay = hooks.Any(h =>
+            string.Equals(h.Event, "AgentResponse", StringComparison.OrdinalIgnoreCase)
+            && h.Mutates is not null
+            && h.Mutates.Any(m =>
+                string.Equals(m, "displayContent", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(m, "modifiedResponse", StringComparison.OrdinalIgnoreCase)));
     }
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
@@ -93,6 +101,19 @@ public sealed partial class HookBus
 
     /// <summary>True when at least one <c>Notification</c> hook is configured.</summary>
     public bool HasNotification { get; }
+
+    /// <summary>True when at least one <c>Stop</c> hook is configured.</summary>
+    public bool HasStop { get; }
+
+    /// <summary>True when at least one <c>AgentResponse</c> hook is configured.</summary>
+    public bool HasAgentResponse { get; }
+
+    /// <summary>
+    /// True when any configured <c>AgentResponse</c> hook declares <c>"displayContent"</c> or
+    /// <c>"modifiedResponse"</c> in its <c>mutates</c> list. Consulted once at session start by
+    /// the TUI to decide whether to buffer assistant text before display.
+    /// </summary>
+    public bool AnyHookMutatesDisplay { get; }
 
     // -------------------------------------------------------------------------
     // Public run-methods (mirror the old UserHookRunner public surface)
@@ -194,6 +215,113 @@ public sealed partial class HookBus
         {
             // Same as PostToolUse.
         }
+    }
+
+    /// <summary>
+    /// Runs all <c>Stop</c> hooks with full blocking power. A hook returning
+    /// <c>decision:"block"</c> (or exit code 2) forces continuation and injects its
+    /// <paramref name="reason"/> as the next instruction in history, exactly as
+    /// <see cref="AgentHooks.RunStopHooksAsync"/> does for in-process hooks.
+    /// Both paths share one <c>stopContinuations</c> counter so they cannot each
+    /// spend the full <c>MaxStopContinuations</c> budget independently.
+    /// Policy: 10 s timeout, fail-open — a broken stop hook must not trap the agent.
+    /// </summary>
+    /// <param name="stopReason">The stop reason emitted by the model, if any.</param>
+    /// <param name="iterations">Number of agent iterations completed so far.</param>
+    /// <param name="continuationCount">Continuations already consumed (shared counter).</param>
+    /// <param name="stopHookActive">
+    /// <see langword="true"/> when this call is itself a continuation driven by a prior hook block;
+    /// <see langword="false"/> on the first natural stop.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth.</param>
+    /// <param name="taskId">Task identifier, or <see langword="null"/> for the main agent.</param>
+    public async Task<StopHookOutcome> RunStopWithOutcomeAsync(
+        string? stopReason,
+        int iterations,
+        int continuationCount,
+        bool stopHookActive,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null)
+    {
+        var matching = this.GetMatchingHooks("Stop", toolName: null);
+        if (matching.Count == 0)
+        {
+            return StopHookOutcome.Stop;
+        }
+
+        var payload = this.BuildStopWithOutcomePayload(stopReason, iterations, continuationCount, stopHookActive, depth, taskId);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "Stop", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken stop hook must not trap the agent in a loop.
+            return StopHookOutcome.Stop;
+        }
+
+        var merged = MergeOutputs(outputs);
+
+        // A block decision forces continuation — inject the reason as the next instruction.
+        if (string.Equals(merged.Decision, "block", StringComparison.OrdinalIgnoreCase)
+            && !string.IsNullOrWhiteSpace(merged.Reason))
+        {
+            return new StopHookOutcome(ShouldContinue: true, InjectedMessage: merged.Reason);
+        }
+
+        return StopHookOutcome.Stop;
+    }
+
+    /// <summary>
+    /// Runs all <c>AgentResponse</c> hooks after the assistant's final text is settled.
+    /// Policy: 10 s timeout, fail-open — a broken hook leaves the response unchanged.
+    /// </summary>
+    /// <param name="response">The final assistant text.</param>
+    /// <param name="stopReason">The stop reason emitted by the model, if any.</param>
+    /// <param name="usage">Token usage breakdown for this response.</param>
+    /// <param name="durationMs">Wall-clock duration of the agent turn in milliseconds.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth.</param>
+    /// <param name="taskId">Task identifier, or <see langword="null"/> for the main agent.</param>
+    public async Task<AgentResponseResult> RunAgentResponseAsync(
+        string response,
+        string? stopReason,
+        TokenUsage usage,
+        long durationMs,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null)
+    {
+        var matching = this.GetMatchingHooks("AgentResponse", toolName: null);
+        if (matching.Count == 0)
+        {
+            return AgentResponseResult.NoChange;
+        }
+
+        var payload = this.BuildAgentResponsePayload(response, stopReason, usage, durationMs, depth, taskId);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "AgentResponse", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken hook leaves the response unchanged.
+            return AgentResponseResult.NoChange;
+        }
+
+        return this.MergeAgentResponseOutputs(matching, outputs);
     }
 
     /// <summary>
@@ -599,7 +727,65 @@ public sealed partial class HookBus
     }
 
     /// <summary>
-    /// Merges <c>UserPromptSubmit</c> hook outputs following §6 of the proposal: last-writer-wins
+    /// Merges <c>AgentResponse</c> hook outputs following last-writer-wins for both
+    /// <c>displayContent</c> and <c>modifiedResponse</c>.
+    /// </summary>
+    private AgentResponseResult MergeAgentResponseOutputs(
+        IReadOnlyList<UserHook> matching,
+        IReadOnlyList<HookOutput> outputs)
+    {
+        if (outputs.Count == 0)
+        {
+            return AgentResponseResult.NoChange;
+        }
+
+        string? displayContent = null;
+        string? modifiedResponse = null;
+        string? lastHookCommand = null;
+
+        for (var i = 0; i < outputs.Count; i++)
+        {
+            var specific = outputs[i].HookSpecificOutput;
+            if (specific is null)
+            {
+                continue;
+            }
+
+            var hookCommand = i < matching.Count ? matching[i].Command : null;
+
+            if (TryGetStringAllowEmpty(specific, "displayContent", out var dc))
+            {
+                if (matching[i].Mutates?.Any(m => string.Equals(m, "displayContent", StringComparison.OrdinalIgnoreCase)) != true)
+                {
+                    this.LogUndeclaredMutation(hookCommand ?? string.Empty, "displayContent");
+                }
+
+                displayContent = dc;
+                lastHookCommand = hookCommand;
+            }
+
+            if (TryGetStringAllowEmpty(specific, "modifiedResponse", out var mr))
+            {
+                if (matching[i].Mutates?.Any(m => string.Equals(m, "modifiedResponse", StringComparison.OrdinalIgnoreCase)) != true)
+                {
+                    this.LogUndeclaredMutation(hookCommand ?? string.Empty, "modifiedResponse");
+                }
+
+                modifiedResponse = mr;
+                lastHookCommand = hookCommand;
+            }
+        }
+
+        if (displayContent is null && modifiedResponse is null)
+        {
+            return AgentResponseResult.NoChange;
+        }
+
+        return new AgentResponseResult(displayContent, modifiedResponse, lastHookCommand);
+    }
+
+    /// <summary>
+    /// Merges <c>UserPromptSubmit</c> hook outputs following last-writer-wins
     /// for single-valued fields (logged), union for <c>deniedTools</c>, intersection for
     /// <c>allowedTools</c> (null = no opinion, not an empty list), concatenation for
     /// <c>additionalContext</c> / <c>appendSystemPrompt</c>.
@@ -891,6 +1077,26 @@ public sealed partial class HookBus
         return false;
     }
 
+    /// <summary>
+    /// Like <see cref="TryGetString"/> but permits an empty string: succeeds whenever the property
+    /// exists and its value is a JSON string (including <c>""</c>). Used for
+    /// <c>displayContent</c> and <c>modifiedResponse</c> in <see cref="MergeAgentResponseOutputs"/>,
+    /// where an empty string means "suppress this response entirely".
+    /// </summary>
+    private static bool TryGetStringAllowEmpty(JsonObject obj, string key, out string? value)
+    {
+        if (obj.TryGetPropertyValue(key, out var node)
+            && node is JsonValue jv
+            && jv.TryGetValue<string>(out var s))
+        {
+            value = s;
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
     private static IEnumerable<string> ReadStringArray(JsonArray array)
     {
         foreach (var item in array)
@@ -946,6 +1152,66 @@ public sealed partial class HookBus
         {
             writer.WriteStartObject();
             this.WriteEnvelope(writer, "Stop", depth, taskId);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildStopWithOutcomePayload(
+        string? stopReason,
+        int iterations,
+        int continuationCount,
+        bool stopHookActive,
+        int depth,
+        string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "Stop", depth, taskId);
+            if (stopReason is not null)
+            {
+                writer.WriteString("stopReason", stopReason);
+            }
+
+            writer.WriteNumber("iterations", iterations);
+            writer.WriteNumber("continuationCount", continuationCount);
+            writer.WriteBoolean("stopHookActive", stopHookActive);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildAgentResponsePayload(
+        string response,
+        string? stopReason,
+        TokenUsage usage,
+        long durationMs,
+        int depth,
+        string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "AgentResponse", depth, taskId);
+            writer.WriteString("response", response);
+            if (stopReason is not null)
+            {
+                writer.WriteString("stopReason", stopReason);
+            }
+
+            writer.WriteStartObject("usage");
+            writer.WriteNumber("inputTokens", usage.InputTokens);
+            writer.WriteNumber("outputTokens", usage.OutputTokens);
+            writer.WriteNumber("cacheReadTokens", usage.CacheReadTokens);
+            writer.WriteNumber("cacheWrite5mTokens", usage.CacheWrite5mTokens);
+            writer.WriteNumber("cacheWrite1hTokens", usage.CacheWrite1hTokens);
+            writer.WriteEndObject();
+            writer.WriteNumber("durationMs", durationMs);
             writer.WriteEndObject();
         }
 
@@ -1239,4 +1505,9 @@ public sealed partial class HookBus
         Level = LogLevel.Information,
         Message = "UserPromptSubmit hook returned ask with no interactive answerer; resolved unattended as {resolution} (§8.2)")]
     private partial void LogAskResolvedUnattended(bool resolution);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "AgentResponse hook '{command}' returned '{field}' but did not declare it in 'mutates'; buffering may be off and the raw response may already have streamed — add \"{field}\" to the hook's mutates list to enable buffered redaction")]
+    private partial void LogUndeclaredMutation(string command, string field);
 }

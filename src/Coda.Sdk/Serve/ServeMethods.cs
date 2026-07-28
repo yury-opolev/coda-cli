@@ -38,6 +38,7 @@ public static class ServeMethods
     public const string EventThinking = "event/thinking";
     public const string EventThinkingComplete = "event/thinkingComplete";
     public const string EventPromptRewritten = "event/promptRewritten";
+    public const string EventResponseRewritten = "event/responseRewritten";
 
     // Server-initiated requests (Coda → orchestrator)
     public const string RequestPermission = "request/permission";

@@ -59,6 +59,7 @@ public sealed class ToolSearchIntegrationTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A non-deferred read-only stub ("read_file").</summary>

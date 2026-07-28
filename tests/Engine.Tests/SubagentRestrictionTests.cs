@@ -64,6 +64,7 @@ public sealed class SubagentRestrictionTests
         public void OnToolResult(string toolName, ToolResult result) { }
 
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private static AgentOptions Options(string model = "test-model") =>

@@ -63,6 +63,7 @@ public sealed class SubagentTypeTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A read-only tool whose execution can be observed.</summary>

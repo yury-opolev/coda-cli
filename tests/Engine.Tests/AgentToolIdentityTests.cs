@@ -71,6 +71,7 @@ public sealed class AgentToolIdentityTests
                     : $"{kind}:{identity.CallId}");
             }
         }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class LegacySink : IAgentSink
@@ -88,6 +89,7 @@ public sealed class AgentToolIdentityTests
         public void OnToolResult(string toolName, ToolResult result) => this.ToolResults++;
 
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class ScriptedClient(params IReadOnlyList<AssistantStreamEvent>[] turns) : ILlmClient

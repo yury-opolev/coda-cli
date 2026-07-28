@@ -190,7 +190,7 @@ public sealed class AgentRunner : IDisposable
             // status reflect the in-flight turn immediately. The send time is captured here (local) from the
             // injected TimeProvider so the transcript's send-time indicator is stable across redraws/resume.
             context.Events.Publish(new UserPromptSubmittedEvent(prompt, this.timeProvider.GetLocalNow()));
-            context.Events.Publish(new TurnStartedEvent(prompt));
+            context.Events.Publish(new TurnStartedEvent(prompt, this.timeProvider.GetUtcNow()));
 
             await this.EnsureSessionAsync(context, turnCts.Token).ConfigureAwait(false);
 

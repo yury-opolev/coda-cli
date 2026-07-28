@@ -321,6 +321,7 @@ public sealed class CliTuiMcpEngineIntegrationTests
 
         public void OnToolActivityCompleted(ToolActivitySummary summary) =>
             this.Completions.Add(summary);
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed record RecordedNotification(string Method, JsonNode? Params);

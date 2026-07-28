@@ -924,6 +924,7 @@ public sealed class SessionLifecycleHookTests : IDisposable
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class AllowAllPermissionPrompt : IPermissionPrompt

@@ -220,6 +220,19 @@ internal sealed class RecordingSink : IAgentSink
     public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
         this.inner?.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
 
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse)
+    {
+        if (modifiedResponse is not null)
+        {
+            lock (this.gate)
+            {
+                this.finalText = modifiedResponse;
+            }
+        }
+
+        this.inner?.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
+    }
+
     public void OnUsage(TokenUsage usage)
     {
         lock (this.gate)

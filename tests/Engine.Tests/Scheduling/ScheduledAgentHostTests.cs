@@ -206,6 +206,7 @@ public sealed class ScheduledAgentHostTests : IDisposable
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class CompletionSink : IAgentSink
@@ -219,6 +220,7 @@ public sealed class ScheduledAgentHostTests : IDisposable
         public void OnError(string message) { }
 
         public void OnToolActivityCompleted(ToolActivitySummary summary) => this.Completions.Add(summary);
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     // ---- Builders --------------------------------------------------------------------------

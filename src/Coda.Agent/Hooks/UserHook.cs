@@ -30,6 +30,14 @@ namespace Coda.Agent.Hooks;
 /// enabled tends to produce a model that ignores its tools; this deliberate opt-in ensures the
 /// hook author understands the hazard.
 /// </param>
+/// <param name="Mutates">
+/// The list of output fields this hook may return that mutate data seen by the user or stored in
+/// history. Accepted values for an <c>AgentResponse</c> hook: <c>"displayContent"</c> (changes
+/// what the user sees; history keeps the original) and <c>"modifiedResponse"</c> (changes both
+/// display and history). Unknown entries are preserved and silently ignored at runtime. Used
+/// statically at session start by the TUI to decide whether to buffer assistant text.
+/// <see langword="null"/> or empty when the hook does not declare any mutations.
+/// </param>
 public sealed record UserHook(
     string Event,
     string Command,
@@ -37,4 +45,5 @@ public sealed record UserHook(
     int? TimeoutSeconds = null,
     bool? FailOpen = null,
     string? UnattendedDecision = null,
-    bool AllowSystemPromptReplace = false);
+    bool AllowSystemPromptReplace = false,
+    IReadOnlyList<string>? Mutates = null);

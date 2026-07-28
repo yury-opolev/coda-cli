@@ -48,6 +48,7 @@ public sealed class GoalLoopTests
         public void OnToolCall(string toolName, string inputJson) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A judge whose responses are scripted from a queue; defaults to "DONE" when empty.</summary>

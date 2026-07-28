@@ -227,6 +227,9 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Debug, Message = "Stop user hooks failed (best-effort); completing the turn")]
     private partial void LogStopHooksFailed(Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "AgentResponse hooks failed (fail-open); response passes through unchanged")]
+    private partial void LogAgentResponseHooksFailed(Exception ex);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "draining post-sampling hook tasks faulted (best-effort); turn already complete")]
     private partial void LogPostSamplingDrainFailed(Exception ex);
 
@@ -377,6 +380,8 @@ public sealed partial class AgentLoop : IAgentLoop
                 var redactedThinkingBlocks = new List<RedactedThinkingBlock>();
                 string? stopReason = null;
                 var thinkingBurstOpen = false;
+                TokenUsage? capturedUsage = null;
+                var iterationStartTick = Stopwatch.GetTimestamp();
 
                 this.LogTurnStart(iteration, resolution.Model, history.Count, toolDefinitions.Count);
 
@@ -408,6 +413,7 @@ public sealed partial class AgentLoop : IAgentLoop
                                     if (streamEvent.Usage is { } turnUsage)
                                     {
                                         sink.OnUsage(turnUsage);
+                                        capturedUsage = turnUsage;
                                     }
 
                                     break;
@@ -453,6 +459,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         thinkingBlocks.Clear();
                         redactedThinkingBlocks.Clear();
                         stopReason = null;
+                        capturedUsage = null;
                         await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
                         request = request with { Messages = history };
                     }
@@ -619,6 +626,34 @@ public sealed partial class AgentLoop : IAgentLoop
                         }
                     }
 
+                    // Shell Stop hooks with full blocking power — share the same stopContinuations
+                    // counter as the in-process IStopHook path so neither can each spend the full budget.
+                    if (this.userHooks is { HasStop: true }
+                        && stopContinuations < this.options.MaxStopContinuations)
+                    {
+                        StopHookOutcome shellOutcome;
+                        try
+                        {
+                            shellOutcome = await this.userHooks.RunStopWithOutcomeAsync(
+                                stopReason, iteration, stopContinuations, stopHookActive,
+                                cancellationToken, this.currentDepth, this.currentTaskId).ConfigureAwait(false);
+                        }
+                        catch (Exception ex)
+                        {
+                            // Fail-open: a broken stop hook must not trap the agent in a loop.
+                            this.LogStopHooksFailed(ex);
+                            shellOutcome = StopHookOutcome.Stop;
+                        }
+
+                        if (shellOutcome.ShouldContinue)
+                        {
+                            history.Add(new ChatMessage(ChatRole.User, [new TextBlock(shellOutcome.InjectedMessage)]));
+                            stopHookActive = true;
+                            stopContinuations++;
+                            continue;
+                        }
+                    }
+
                     // Seal only at a natural completion. A failed seal means an operator raced the
                     // boundary; loop once more to deliver it before asking the model again.
                     if (this.steering is not null && !this.steering.TrySealEmpty())
@@ -626,17 +661,45 @@ public sealed partial class AgentLoop : IAgentLoop
                         continue;
                     }
 
-                    // Fire user Stop hooks (observation only — ignore exit code and errors).
-                    if (this.userHooks is not null)
+                    // AgentResponse hooks: run after stop hooks agreed to stop, before display and
+                    // persistence. The final assistant text is now settled. Fail-open: a broken or
+                    // timed-out hook leaves the response completely unchanged.
+                    if (this.userHooks is { HasAgentResponse: true } && text.Length > 0)
                     {
+                        var responseText = text.ToString();
+                        var durationMs = (long)(Stopwatch.GetElapsedTime(iterationStartTick).TotalMilliseconds);
+                        AgentResponseResult agentResponseResult;
                         try
                         {
-                            await this.userHooks.RunStopAsync(cancellationToken, this.currentDepth, this.currentTaskId).ConfigureAwait(false);
+                            agentResponseResult = await this.userHooks.RunAgentResponseAsync(
+                                responseText, stopReason, capturedUsage ?? TokenUsage.Zero, durationMs,
+                                cancellationToken, this.currentDepth, this.currentTaskId).ConfigureAwait(false);
                         }
                         catch (Exception ex)
                         {
-                            // User hook errors must not interrupt normal turn completion.
-                            this.LogStopHooksFailed(ex);
+                            // Fail-open: an exception from RunAgentResponseAsync leaves the response unchanged.
+                            this.LogAgentResponseHooksFailed(ex);
+                            agentResponseResult = AgentResponseResult.NoChange;
+                        }
+
+                        if (agentResponseResult.HasChange)
+                        {
+                            // When only displayContent is set, the user also sees modifiedResponse would
+                            // be redundant — fall back to displayContent. When only modifiedResponse is set,
+                            // the user sees that too (display and history both get modifiedResponse).
+                            var displayContent = agentResponseResult.DisplayContent
+                                ?? agentResponseResult.ModifiedResponse!;
+
+                            if (agentResponseResult.ModifiedResponse is not null)
+                            {
+                                ReplaceLastAssistantText(history, agentResponseResult.ModifiedResponse);
+                            }
+
+                            sink.OnResponseRewritten(
+                                agentResponseResult.ByHookCommand!,
+                                responseText,
+                                displayContent,
+                                agentResponseResult.ModifiedResponse);
                         }
                     }
 
@@ -690,6 +753,45 @@ public sealed partial class AgentLoop : IAgentLoop
         SystemPrompt = this.options.SystemPrompt,
         WorkingDirectory = this.options.WorkingDirectory,
     };
+
+    /// <summary>
+    /// Replaces the <see cref="TextBlock"/> of the last assistant message in <paramref name="history"/>
+    /// with <paramref name="newText"/>. Called by the <c>AgentResponse</c> hook path when
+    /// <c>modifiedResponse</c> is set to keep history consistent with what was displayed.
+    /// </summary>
+    private static void ReplaceLastAssistantText(List<ChatMessage> history, string newText)
+    {
+        if (history.Count == 0)
+        {
+            return;
+        }
+
+        var last = history[history.Count - 1];
+        if (last.Role != ChatRole.Assistant)
+        {
+            return;
+        }
+
+        var replaced = false;
+        var newContent = new List<ContentBlock>(last.Content.Count);
+        foreach (var block in last.Content)
+        {
+            if (!replaced && block is TextBlock)
+            {
+                newContent.Add(new TextBlock(newText));
+                replaced = true;
+            }
+            else
+            {
+                newContent.Add(block);
+            }
+        }
+
+        if (replaced)
+        {
+            history[history.Count - 1] = new ChatMessage(ChatRole.Assistant, newContent);
+        }
+    }
 
     private async Task<List<ContentBlock>> RunToolsAsync(
         IReadOnlyList<ToolUseBlock> toolUses,

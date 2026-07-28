@@ -125,4 +125,6 @@ public sealed class JsonStreamSink : IAgentSink
         this.writer.WriteLine(obj.ToJsonString());
         this.writer.Flush();
     }
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
 }

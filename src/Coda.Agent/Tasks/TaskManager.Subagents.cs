@@ -385,6 +385,12 @@ public sealed partial class TaskManager
         // Token usage: forwarded for accounting, but kept out of the ring/log as it is
         // per-iteration accounting noise rather than readable transcript content.
         public void OnUsage(TokenUsage usage) => _parent.OnUsage(usage);
+
+        public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+            _parent.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
+
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
+            _parent.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
     }
 
     /// <summary>An IAgentSink that discards everything — used as the parent for background subagents.</summary>
@@ -407,5 +413,6 @@ public sealed partial class TaskManager
         public void OnLimitReached(string kind, string message) { }
         public void OnStopReason(string? stopReason) { }
         public void OnUsage(TokenUsage usage) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

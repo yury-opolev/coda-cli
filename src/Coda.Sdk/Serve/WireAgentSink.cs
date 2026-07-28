@@ -177,6 +177,12 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventPromptRewritten, node);
     }
 
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse)
+    {
+        var node = ServeJson.ToNode(new ResponseRewrittenEvent(hookCommand, originalResponse, displayContent, modifiedResponse));
+        _ = this.SendAsync(ServeMethods.EventResponseRewritten, node);
+    }
+
     private void CoalesceText(string delta)
     {
         if (string.IsNullOrEmpty(delta))

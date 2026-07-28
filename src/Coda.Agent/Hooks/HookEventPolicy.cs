@@ -24,6 +24,8 @@ public static class HookEventPolicy
             ["SessionStart"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
             ["SessionEnd"]    = new HookEventDefaults(TimeoutSeconds:  2, FailOpen: true),
             ["Notification"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+                // Response-side events: fail-open — a broken hook must not discard the response.
+                ["AgentResponse"] = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
         };
 
     private static readonly HookEventDefaults UnknownDefault = new(TimeoutSeconds: 10, FailOpen: true);

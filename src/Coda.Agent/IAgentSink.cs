@@ -88,4 +88,17 @@ public interface IAgentSink
     /// <param name="originalPrompt">The original prompt text as typed by the user.</param>
     /// <param name="modifiedPrompt">The model-facing prompt text after rewriting.</param>
     void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) { }
+
+    /// <summary>
+    /// An <c>AgentResponse</c> hook rewrote the assistant's response. Called after the final
+    /// text is settled and the hook has run, before display and persistence.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the last hook that produced a mutation.</param>
+    /// <param name="originalResponse">The original assistant text as produced by the model.</param>
+    /// <param name="displayContent">The text the user will see (may differ from history).</param>
+    /// <param name="modifiedResponse">
+    /// The text stored in history (and therefore what the model believes it said), or
+    /// <see langword="null"/> when only <paramref name="displayContent"/> was set.
+    /// </param>
+    void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse);
 }

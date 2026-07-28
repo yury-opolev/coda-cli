@@ -89,6 +89,19 @@ public sealed class UserHookRunner
     /// <summary>True when at least one <c>Notification</c> hook is configured.</summary>
     public bool HasNotification => this.bus.HasNotification;
 
+    /// <summary>True when at least one <c>Stop</c> hook is configured.</summary>
+    public bool HasStop => this.bus.HasStop;
+
+    /// <summary>True when at least one <c>AgentResponse</c> hook is configured.</summary>
+    public bool HasAgentResponse => this.bus.HasAgentResponse;
+
+    /// <summary>
+    /// True when any configured <c>AgentResponse</c> hook declares <c>"displayContent"</c> or
+    /// <c>"modifiedResponse"</c> in its <c>mutates</c> list. Consulted once at session start by
+    /// the TUI to decide whether to buffer assistant text before display.
+    /// </summary>
+    public bool AnyHookMutatesDisplay => this.bus.AnyHookMutatesDisplay;
+
     /// <summary>
     /// Runs all matching <c>PreToolUse</c> hooks in order and returns the merged result.
     /// A hook that exits non-zero (or fails / times out) now <strong>blocks</strong> because
@@ -134,6 +147,36 @@ public sealed class UserHookRunner
     /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
     public Task RunStopAsync(CancellationToken ct, int depth = 0, string? taskId = null) =>
         this.bus.RunStopAsync(ct, depth, taskId);
+
+    /// <summary>
+    /// Runs all <c>Stop</c> hooks with full blocking power, returning a
+    /// <see cref="StopHookOutcome"/> that the agent loop can act on. A hook returning
+    /// <c>decision:"block"</c> forces continuation and injects its reason into history.
+    /// Policy: 10 s timeout, fail-open.
+    /// </summary>
+    public Task<StopHookOutcome> RunStopWithOutcomeAsync(
+        string? stopReason,
+        int iterations,
+        int continuationCount,
+        bool stopHookActive,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null) =>
+        this.bus.RunStopWithOutcomeAsync(stopReason, iterations, continuationCount, stopHookActive, ct, depth, taskId);
+
+    /// <summary>
+    /// Runs all <c>AgentResponse</c> hooks after the assistant's final text is settled, before
+    /// it is displayed or persisted. Policy: 10 s timeout, fail-open.
+    /// </summary>
+    public Task<AgentResponseResult> RunAgentResponseAsync(
+        string response,
+        string? stopReason,
+        LlmClient.TokenUsage usage,
+        long durationMs,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null) =>
+        this.bus.RunAgentResponseAsync(response, stopReason, usage, durationMs, ct, depth, taskId);
 
     /// <summary>
     /// Runs all matching <c>UserPromptSubmit</c> hooks in order and returns the merged result.

@@ -112,6 +112,8 @@ public sealed class SubagentForwardingTests
             this.UsageCalls++;
             this.TotalUsage = this.TotalUsage.Add(usage);
         }
+
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class NullSink : IAgentSink
@@ -128,6 +130,7 @@ public sealed class SubagentForwardingTests
         public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) { }
         public void OnToolActivityCompleted(ToolActivitySummary summary) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>Deliberately implements only the original host contract.</summary>
@@ -344,6 +347,7 @@ public sealed class SubagentForwardingTests
         public void OnError(string message) { }
         public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
         public void OnThinkingComplete(int? thinkingTokens = null) => this.ThinkingCompleteCount++;
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     [Fact]

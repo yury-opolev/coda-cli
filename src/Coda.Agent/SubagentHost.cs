@@ -264,5 +264,11 @@ public sealed class SubagentHost : ISubagentHost
         public void OnStopReason(string? stopReason) => this.parent.OnStopReason(stopReason);
 
         public void OnUsage(TokenUsage usage) => this.parent.OnUsage(usage);
+
+        public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+            this.parent.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
+
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
+            this.parent.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
     }
 }
