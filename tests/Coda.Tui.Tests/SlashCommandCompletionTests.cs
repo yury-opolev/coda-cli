@@ -54,8 +54,61 @@ public sealed class SlashCommandCompletionTests
 
         completion.MoveSelection(-1);
 
-        Assert.Equal("/status ", completion.Complete());
+        Assert.Equal(new SlashCompletionAccept("/status ", 0), completion.Complete());
         Assert.False(completion.IsVisible);
+    }
+
+    [Theory]
+    [InlineData("explain this /mo", 16, "mo", 13)]  // after a space, mid-sentence
+    [InlineData("explain this /", 14, "", 13)]      // bare slash mid-sentence lists everything
+    [InlineData("one\n/mo", 7, "mo", 4)]            // a newline counts as whitespace
+    [InlineData("/mo", 3, "mo", 0)]                 // still works at the head of the draft
+    public void Update_offers_the_menu_for_a_slash_token_after_whitespace(
+        string input, int cursor, string expectedQuery, int expectedStart)
+    {
+        var completion = CreateCompletion();
+
+        completion.Update(input, cursor);
+
+        Assert.True(completion.IsVisible);
+        Assert.Equal(expectedStart, completion.QueryStart);
+        // The query drives the filtering, so assert it through the surviving suggestions.
+        Assert.All(
+            completion.Suggestions,
+            command => Assert.Contains(expectedQuery, command.Name, StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Theory]
+    [InlineData("src/mo", 6)]        // a slash inside a word is a path separator, not a trigger
+    [InlineData("https://ex", 10)]   // ... including in a URL
+    [InlineData("/model opus", 11)]  // the caret has left the command token
+    [InlineData("/model ", 7)]       // the caret sits on whitespace
+    public void Update_ignores_a_slash_that_is_not_a_command_token(string input, int cursor)
+    {
+        var completion = CreateCompletion();
+
+        completion.Update(input, cursor);
+
+        Assert.False(completion.IsVisible);
+    }
+
+    [Fact]
+    public void Complete_reports_the_slash_position_so_a_mid_draft_token_can_be_spliced()
+    {
+        var completion = CreateCompletion();
+        completion.Update("explain this /mo then", "explain this /mo".Length);
+
+        // Already followed by a space, so the command is spliced in without adding another.
+        Assert.Equal(new SlashCompletionAccept("/model", 13), completion.Complete());
+    }
+
+    [Fact]
+    public void Complete_keeps_the_separating_space_when_the_token_ends_the_draft()
+    {
+        var completion = CreateCompletion();
+        completion.Update("explain this /mo", "explain this /mo".Length);
+
+        Assert.Equal(new SlashCompletionAccept("/model ", 13), completion.Complete());
     }
 
     [Fact]

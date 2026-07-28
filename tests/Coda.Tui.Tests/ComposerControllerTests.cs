@@ -166,6 +166,45 @@ public sealed class ComposerControllerTests
     }
 
     [Fact]
+    public void Completing_a_mid_draft_command_splices_it_in_place_and_does_not_submit()
+    {
+        var controller = CreateController(new TestCommand("model", "Model"));
+        controller.ReplaceDraft("explain this /mo then stop", "explain this /mo".Length);
+
+        // Enter accepts the suggestion, but the command is part of a sentence rather than an
+        // invocation, so the draft is kept for the user to finish.
+        var result = controller.Apply(UiAction.CompleteAndSubmit);
+
+        Assert.Null(result.SubmittedText);
+        Assert.Equal("explain this /model then stop", controller.State.Draft);
+        Assert.Equal("explain this /model".Length, controller.State.CursorIndex);
+    }
+
+    [Fact]
+    public void Completing_a_leading_command_submits_it()
+    {
+        var controller = CreateController(new TestCommand("model", "Model"));
+        controller.ReplaceDraft("/mo", 3);
+
+        var result = controller.Apply(UiAction.CompleteAndSubmit);
+
+        Assert.Equal("/model", result.SubmittedText?.Trim());
+        Assert.Equal(string.Empty, controller.State.Draft);
+    }
+
+    [Fact]
+    public void Tab_completing_a_mid_draft_command_preserves_the_text_around_it()
+    {
+        var controller = CreateController(new TestCommand("model", "Model"));
+        controller.ReplaceDraft("use /mo here", "use /mo".Length);
+
+        controller.Apply(UiAction.CompleteSuggestion);
+
+        // The draft already separates the token from "here", so no second space is added.
+        Assert.Equal("use /model here", controller.State.Draft);
+    }
+
+    [Fact]
     public void SelectedSuggestionIndex_tracks_selection_and_is_negative_when_hidden()
     {
         var controller = CreateController(

@@ -5,9 +5,10 @@ namespace Coda.Tui.Tests;
 
 /// <summary>
 /// Coverage for accepting-and-submitting a slash-command completion with a single Enter press. When the
-/// completion menu is visible Enter behaves like Tab-then-Enter: it accepts the selected suggestion and
-/// immediately submits, hiding the menu and recording history once — without emitting a duplicate submission.
-/// A normal Enter (no completion) and multiline Ctrl+J are unchanged.
+/// completion menu is visible for a command at the head of the draft, Enter behaves like Tab-then-Enter: it
+/// accepts the selected suggestion and immediately submits, hiding the menu and recording history once —
+/// without emitting a duplicate submission. A command accepted mid-draft is only spliced in, since it is
+/// part of a sentence still being written. A normal Enter (no completion) and multiline Ctrl+J are unchanged.
 /// </summary>
 public sealed class CommandCompletionSubmitTests
 {
@@ -130,6 +131,27 @@ public sealed class CommandCompletionSubmitTests
         view.NewKeyDownEvent(Key.Enter);
 
         Assert.Equal(1, count);
+    }
+
+    [Fact]
+    public void Enter_with_a_mid_draft_completion_accepts_it_without_submitting()
+    {
+        var controller = CreateController(new TestCommand("model", "Pick a model"));
+        using var view = new ComposerView(controller);
+        var submissions = new List<string>();
+        view.Submitted += (_, text) => submissions.Add(text);
+
+        view.SetDraft("use /mo", "use /mo".Length);
+        Assert.NotEmpty(view.Suggestions);
+
+        view.NewKeyDownEvent(Key.Enter);
+
+        Assert.Empty(submissions);
+        Assert.Equal("use /model ", view.GetDraft());
+
+        // A second Enter sends the whole line as one prompt.
+        view.NewKeyDownEvent(Key.Enter);
+        Assert.Equal(["use /model "], submissions);
     }
 
     [Fact]

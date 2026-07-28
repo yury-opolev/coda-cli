@@ -115,10 +115,11 @@ internal sealed class ComposerController
             case UiAction.Submit:
                 return this.Submit();
             case UiAction.CompleteAndSubmit:
-                // Accept the selected suggestion into the draft, then submit it in one step — the caller sees a
-                // single submission result and never a duplicate.
-                this.CompleteSuggestion();
-                return this.Submit();
+                // Enter accepts the highlighted suggestion first. A command accepted at the head of
+                // the draft is an invocation, so it submits in the same press; one accepted mid-draft
+                // is part of a sentence still being written, so the draft is kept for the user to
+                // finish. With no menu open this is an ordinary submission.
+                return this.CompleteSuggestion() is > 0 ? Redraw() : this.Submit();
             case UiAction.InsertNewline:
                 this.InsertText("\n");
                 return Redraw();
@@ -209,23 +210,32 @@ internal sealed class ComposerController
         return new ComposerActionResult(draft, true);
     }
 
-    private void CompleteSuggestion()
+    /// <summary>
+    /// Splices the selected suggestion over the slash token under the caret.
+    /// </summary>
+    /// <returns>
+    /// The draft index the command was spliced at, or <see langword="null"/> when no suggestion was
+    /// accepted. An index of 0 means the command leads the draft and will be dispatched as a command.
+    /// </returns>
+    private int? CompleteSuggestion()
     {
-        if (this.completion.Complete() is not { } completed)
+        if (this.completion.Complete() is not { } accepted)
         {
-            return;
+            return null;
         }
 
         var draft = this.State.Draft;
         var cursor = Math.Clamp(this.State.CursorIndex, 0, draft.Length);
-        var newDraft = completed + draft[cursor..];
+        var start = Math.Clamp(accepted.Start, 0, cursor);
+        var newDraft = draft[..start] + accepted.Text + draft[cursor..];
         this.State = this.State with
         {
             Draft = newDraft,
-            CursorIndex = completed.Length,
+            CursorIndex = start + accepted.Text.Length,
             PreferredDisplayColumn = null,
         };
         this.RefreshCompletion();
+        return start;
     }
 
     private void HistoryPrevious()
