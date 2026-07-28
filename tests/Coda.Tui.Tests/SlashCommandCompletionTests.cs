@@ -72,6 +72,20 @@ public sealed class SlashCommandCompletionTests
         Assert.True(completion.IsVisible);
     }
 
+    [Fact]
+    public void Update_bare_slash_lists_every_command()
+    {
+        // The popup bounds how many rows are on screen and scrolls through the rest, so the
+        // suggestion list itself must never be truncated.
+        var registry = new SlashCommandRegistry(
+            Enumerable.Range(0, 40).Select(i => (ISlashCommand)new TestCommand($"cmd{i:D2}", $"Command {i}")).ToArray());
+        var completion = new SlashCommandCompletion(registry);
+
+        completion.Update("/", 1);
+
+        Assert.Equal(40, completion.Suggestions.Count);
+    }
+
     private static SlashCommandCompletion CreateCompletion() =>
         new(new SlashCommandRegistry(
         [
