@@ -74,6 +74,27 @@ public sealed class SubagentHost : ISubagentHost
             parentActivity: null,
             cancellationToken: cancellationToken);
 
+    public Task<string> RunSubagentAsync(
+        string subagentType,
+        string prompt,
+        IAgentSink sink,
+        SteeringInbox steering,
+        string taskId,
+        int depth,
+        ToolActivityContext? parentActivity,
+        CancellationToken cancellationToken = default) =>
+        this.RunSubagentAsync(
+            subagentType,
+            prompt,
+            sink,
+            steering,
+            taskId,
+            depth,
+            parentActivity,
+            parentToolRestriction: null,
+            cancellationToken: cancellationToken);
+
+    /// <inheritdoc/>
     public async Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,
@@ -82,6 +103,7 @@ public sealed class SubagentHost : ISubagentHost
         string taskId,
         int depth,
         ToolActivityContext? parentActivity,
+        TurnShape? parentToolRestriction,
         CancellationToken cancellationToken = default)
     {
         var definition = BuiltInAgents.Resolve(subagentType);
@@ -136,7 +158,7 @@ public sealed class SubagentHost : ISubagentHost
         var collecting = new CollectingSink(sink);
         var history = new List<ChatMessage> { ChatMessage.UserText(prompt) };
 
-        await loop.RunAsync(history, collecting, cancellationToken).ConfigureAwait(false);
+        await loop.RunAsync(history, collecting, cancellationToken, shape: parentToolRestriction).ConfigureAwait(false);
 
         var text = collecting.CollectedText;
         return text.Length == 0 ? "(subagent produced no text output)" : text;

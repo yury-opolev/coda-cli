@@ -568,7 +568,7 @@ public sealed class CodaSessionScheduleRuntimeTests : IDisposable
     {
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default) =>
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null) =>
             body(history, sink, cancellationToken);
     }
 
@@ -578,7 +578,7 @@ public sealed class CodaSessionScheduleRuntimeTests : IDisposable
 
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             sink.OnAssistantText(CannedText);
             sink.OnAssistantTextComplete();
@@ -783,3 +783,4 @@ public sealed class CodaSessionScheduleRuntimeTests : IDisposable
         try { Directory.Delete(this.root, recursive: true); } catch { /* best-effort */ }
     }
 }
+

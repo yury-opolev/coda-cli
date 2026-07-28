@@ -4,16 +4,19 @@ namespace Coda.Agent.Hooks;
 /// Per-event timeout and fail-open defaults for user hooks.
 /// </summary>
 /// <remarks>
-/// <c>FailOpen = false</c> for <c>PreToolUse</c> is deliberate: a policy gate that silently
-/// permits on error is no gate at all. For the observation-only events (<c>PostToolUse</c>,
-/// <c>Stop</c>) fail-open preserves the existing behaviour where exceptions and timeouts are
-/// swallowed rather than interrupting the turn.
+/// <c>FailOpen = false</c> for <c>UserPromptSubmit</c> and <c>PreToolUse</c> is deliberate:
+/// a policy gate that silently permits on error is no gate at all. For the observation-only
+/// events (<c>PostToolUse</c>, <c>Stop</c>) fail-open preserves the existing behaviour where
+/// exceptions and timeouts are swallowed rather than interrupting the turn.
 /// </remarks>
 public static class HookEventPolicy
 {
     private static readonly Dictionary<string, HookEventDefaults> Policies =
         new(StringComparer.OrdinalIgnoreCase)
         {
+            // Fail-closed: a policy gate that silently permits on error is no gate at all.
+            // 30 s budget because a classifier hook is a plausible UserPromptSubmit implementation.
+            ["UserPromptSubmit"] = new HookEventDefaults(TimeoutSeconds: 30, FailOpen: false),
             ["PreToolUse"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: false),
             ["PostToolUse"] = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
             ["Stop"]        = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),

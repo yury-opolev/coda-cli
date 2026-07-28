@@ -60,6 +60,7 @@ public sealed class TaskTool : ITool
                 parentSink,
                 context.CurrentTaskId,
                 parentActivity: context.ToolActivity,
+                parentRestriction: context.ParentToolRestriction,
                 cancellationToken: cancellationToken)
             .ConfigureAwait(false);
 

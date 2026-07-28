@@ -191,7 +191,7 @@ public static class SettingsLoader
                 continue;
             }
 
-            target.Add(new UserHook(eventName, entry.Command, entry.Matcher, entry.TimeoutSeconds, entry.FailOpen, entry.UnattendedDecision));
+            target.Add(new UserHook(eventName, entry.Command, entry.Matcher, entry.TimeoutSeconds, entry.FailOpen, entry.UnattendedDecision, entry.AllowSystemPromptReplace));
         }
     }
 
@@ -469,5 +469,8 @@ public static class SettingsLoader
 
         [JsonPropertyName("unattendedDecision")]
         public string? UnattendedDecision { get; set; }
+
+        [JsonPropertyName("allowSystemPromptReplace")]
+        public bool AllowSystemPromptReplace { get; set; }
     }
 }

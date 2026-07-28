@@ -4,7 +4,7 @@ namespace Coda.Agent.Hooks;
 
 /// <summary>
 /// Executes user-configured shell hooks at agent lifecycle events
-/// (PreToolUse, PostToolUse, Stop).
+/// (UserPromptSubmit, PreToolUse, PostToolUse, Stop).
 /// </summary>
 /// <remarks>
 /// <para>
@@ -62,6 +62,9 @@ public sealed class UserHookRunner
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
     public bool HasPreToolUse => this.bus.HasPreToolUse;
 
+    /// <summary>True when at least one <c>UserPromptSubmit</c> hook is configured.</summary>
+    public bool HasUserPromptSubmit => this.bus.HasUserPromptSubmit;
+
     /// <summary>
     /// Runs all matching <c>PreToolUse</c> hooks in order and returns the merged result.
     /// A hook that exits non-zero (or fails / times out) now <strong>blocks</strong> because
@@ -107,6 +110,30 @@ public sealed class UserHookRunner
     /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
     public Task RunStopAsync(CancellationToken ct, int depth = 0, string? taskId = null) =>
         this.bus.RunStopAsync(ct, depth, taskId);
+
+    /// <summary>
+    /// Runs all matching <c>UserPromptSubmit</c> hooks in order and returns the merged result.
+    /// A broken or timed-out hook <strong>blocks</strong> (fail-closed) because this is a policy
+    /// gate: silently permitting on error would defeat the purpose.
+    /// </summary>
+    /// <param name="prompt">Concatenated text of all text blocks in the user message.</param>
+    /// <param name="attachments">Non-text content-block kinds (e.g. <c>"image"</c>), or empty.</param>
+    /// <param name="historyLength">Number of messages in history before this turn is appended.</param>
+    /// <param name="model">The model identifier for this turn.</param>
+    /// <param name="permissionMode">The permission mode string for this turn (e.g. <c>"default"</c>).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The running task id, or <see langword="null"/> for the main agent.</param>
+    public Task<UserPromptSubmitResult> RunUserPromptSubmitAsync(
+        string prompt,
+        IReadOnlyList<string> attachments,
+        int historyLength,
+        string model,
+        string permissionMode,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null) =>
+        this.bus.RunUserPromptSubmitAsync(prompt, attachments, historyLength, model, permissionMode, ct, depth, taskId);
 
     // -------------------------------------------------------------------------
     // Legacy 2-tuple exec adapter

@@ -154,4 +154,22 @@ public sealed class TuiAgentSinkTests
     {
         public void Publish(UiEvent uiEvent) => events.Add(uiEvent);
     }
+
+    // =========================================================================
+    // OnPromptRewritten — publishes PromptRewrittenEvent
+    // =========================================================================
+
+    [Fact]
+    public void OnPromptRewritten_publishes_PromptRewrittenEvent_with_all_fields()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+
+        sink.OnPromptRewritten("my-hook", "original text", "rewritten text");
+
+        var evt = Assert.IsType<PromptRewrittenEvent>(Assert.Single(events));
+        Assert.Equal("my-hook", evt.HookCommand);
+        Assert.Equal("original text", evt.OriginalPrompt);
+        Assert.Equal("rewritten text", evt.ModifiedPrompt);
+    }
 }

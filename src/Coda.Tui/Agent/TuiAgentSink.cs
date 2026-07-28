@@ -99,4 +99,7 @@ public sealed class TuiAgentSink : IAgentSink
         this.publisher.Publish(new SteeringDeliveredEvent(ids));
 
     public void OnError(string message) => this.publisher.Publish(new AgentErrorEvent(message));
+
+    public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+        this.publisher.Publish(new PromptRewrittenEvent(hookCommand, originalPrompt, modifiedPrompt));
 }

@@ -225,7 +225,7 @@ public sealed class HeadlessOptionsResumeTests : IDisposable
     {
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             sink.OnAssistantText("done");
             sink.OnAssistantTextComplete();
@@ -234,3 +234,4 @@ public sealed class HeadlessOptionsResumeTests : IDisposable
         }
     }
 }
+

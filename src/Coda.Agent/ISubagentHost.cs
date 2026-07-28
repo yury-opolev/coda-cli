@@ -32,4 +32,23 @@ public interface ISubagentHost
         ToolActivityContext? parentActivity,
         CancellationToken cancellationToken = default) =>
         RunSubagentAsync(subagentType, prompt, sink, steering, taskId, depth, cancellationToken);
+
+    /// <summary>
+    /// Runs a nested subagent with the parent turn's tool restriction applied monotonically to the
+    /// child: the child can only be <em>at least as restricted</em> as the parent. A non-null
+    /// <paramref name="parentToolRestriction"/> carries only the tool filter (AllowedTools or
+    /// DeniedTools); system prompt, model, and effort are per-parent-turn overrides that must NOT
+    /// bleed into a child that has its own system prompt and context.
+    /// </summary>
+    Task<string> RunSubagentAsync(
+        string subagentType,
+        string prompt,
+        IAgentSink sink,
+        SteeringInbox steering,
+        string taskId,
+        int depth,
+        ToolActivityContext? parentActivity,
+        TurnShape? parentToolRestriction,
+        CancellationToken cancellationToken = default) =>
+        RunSubagentAsync(subagentType, prompt, sink, steering, taskId, depth, parentActivity, cancellationToken);
 }

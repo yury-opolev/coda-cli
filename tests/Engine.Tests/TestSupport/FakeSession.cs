@@ -77,7 +77,7 @@ internal sealed class ConfigurableLoop : IAgentLoop
 
     public List<ChatMessage>? DrivenHistory { get; private set; }
 
-    public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+    public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
     {
         this.RunCalls++;
         this.DrivenHistory = history;
@@ -158,3 +158,4 @@ internal static class FakeSession
             agentLoopFactory: new StubLoopFactory(loop));
     }
 }
+

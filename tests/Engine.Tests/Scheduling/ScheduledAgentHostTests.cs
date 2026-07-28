@@ -126,7 +126,7 @@ public sealed class ScheduledAgentHostTests : IDisposable
     {
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default) =>
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null) =>
             body(sink, activity.EnsureActivity().ForCall("scheduled-call"));
     }
 
@@ -137,7 +137,7 @@ public sealed class ScheduledAgentHostTests : IDisposable
 
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             this.SeenHistory = history;
             return body(history, sink, cancellationToken);
@@ -826,8 +826,52 @@ public sealed class ScheduledAgentHostTests : IDisposable
         Assert.DoesNotContain("schedule_list", obs.ToolNames);
     }
 
+    // =========================================================================
+    // Test 7 — UserPromptSubmit hook gate runs for scheduled firings
+    // =========================================================================
+
+    [Fact]
+    public async Task RunScheduledAsync_blocking_hook_fails_the_firing_before_loop_runs()
+    {
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        using var http = new HttpClient();
+
+        var loopCallCount = 0;
+        var loop = new ProgrammableLoop((_, _, _) =>
+        {
+            loopCallCount++;
+            return Task.CompletedTask;
+        });
+        var loopFactory = new RecordingLoopFactory(loop);
+
+        var blockingRunner = new UserHookRunner(
+            [new UserHook("UserPromptSubmit", "block-cmd")],
+            execOverride: static (_, _, _) => Task.FromResult((0, """{"decision":"block","reason":"scheduled blocked"}""")));
+
+        var host = new ScheduledAgentHost(
+            () => this.Options(),
+            new FakeClientFactory(new InertClient()),
+            loopFactory,
+            SignedInClaude(),
+            new ClientFingerprint(),
+            http,
+            NullLoggerFactory.Instance,
+            builder,
+            userHookRunnerForTesting: blockingRunner);
+
+        var ex = await Assert.ThrowsAnyAsync<InvalidOperationException>(() =>
+            host.RunScheduledAsync("prompt", new NullSink(), new SteeringInbox(), "task-1", 1, CancellationToken.None));
+
+        // The block reason must be present in the exception message so it can be recorded in the task log.
+        Assert.Contains("scheduled blocked", ex.Message, StringComparison.OrdinalIgnoreCase);
+        // The loop must never have run — blocked before reaching it.
+        Assert.Equal(0, loopCallCount);
+    }
+
     public void Dispose()
     {
         try { Directory.Delete(this.root, recursive: true); } catch { /* ignore */ }
     }
 }
+

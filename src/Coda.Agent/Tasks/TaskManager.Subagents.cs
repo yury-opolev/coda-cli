@@ -25,6 +25,7 @@ public sealed partial class TaskManager
             parentSink,
             parentTaskId,
             parentActivity: null,
+            parentRestriction: null,
             cancellationToken: cancellationToken);
 
     /// <summary>
@@ -38,6 +39,7 @@ public sealed partial class TaskManager
         IAgentSink parentSink,
         string? parentTaskId,
         ToolActivityContext? parentActivity,
+        TurnShape? parentRestriction = null,
         CancellationToken cancellationToken = default)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Foreground);
@@ -49,7 +51,7 @@ public sealed partial class TaskManager
         try
         {
             var result = await host
-                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity, linked.Token)
+                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity, parentRestriction, linked.Token)
                 .ConfigureAwait(false);
             Complete(task.Id, result);
             return result;
@@ -86,7 +88,8 @@ public sealed partial class TaskManager
         string subagentType,
         string prompt,
         string description,
-        string? parentTaskId)
+        string? parentTaskId,
+        TurnShape? parentRestriction = null)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Background);
         var steering = new SteeringInbox();
@@ -98,7 +101,7 @@ public sealed partial class TaskManager
             try
             {
                 var result = await host
-                    .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, task.Token)
+                    .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity: null, parentRestriction, task.Token)
                     .ConfigureAwait(false);
                 Complete(task.Id, result);
             }

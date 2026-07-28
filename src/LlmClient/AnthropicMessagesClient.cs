@@ -275,6 +275,11 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
             }
 
             body["tools"] = tools;
+
+            if (request.ToolChoice is not null)
+            {
+                body["tool_choice"] = new JsonObject { ["type"] = request.ToolChoice };
+            }
         }
 
         // Reasoning effort (output_config.effort), gated by model support. Honors

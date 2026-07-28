@@ -72,10 +72,14 @@ public sealed partial class HookBus
         this.spillDirFactory = spillDirFactory;
         this.logger = logger ?? NullLogger.Instance;
         this.HasPreToolUse = hooks.Any(h => string.Equals(h.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase));
+        this.HasUserPromptSubmit = hooks.Any(h => string.Equals(h.Event, "UserPromptSubmit", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
     public bool HasPreToolUse { get; }
+
+    /// <summary>True when at least one <c>UserPromptSubmit</c> hook is configured.</summary>
+    public bool HasUserPromptSubmit { get; }
 
     // -------------------------------------------------------------------------
     // Public run-methods (mirror the old UserHookRunner public surface)
@@ -150,7 +154,7 @@ public sealed partial class HookBus
     }
 
     /// <summary>
-    /// Runs all <c>Stop</c> hooks. Exit codes and errors are ignored (fail-open default).
+    /// Runs all matching <c>Stop</c> hooks. Exit codes and errors are ignored (fail-open default).
     /// The merged output is not acted on in Phase 0.
     /// </summary>
     /// <param name="ct">Cancellation token.</param>
@@ -177,6 +181,51 @@ public sealed partial class HookBus
         {
             // Same as PostToolUse.
         }
+    }
+
+    /// <summary>
+    /// Runs all matching <c>UserPromptSubmit</c> hooks in configuration order and returns the
+    /// merged result. A broken or timed-out hook <strong>blocks</strong> (fail-closed, FailOpen
+    /// defaults to <see langword="false"/> for this event) because a policy gate that silently
+    /// permits on error is no gate at all.
+    /// </summary>
+    /// <param name="prompt">Concatenated text of all text blocks in the user message.</param>
+    /// <param name="attachments">Non-text content-block kinds present (e.g. <c>"image"</c>), or empty.</param>
+    /// <param name="historyLength">Number of messages in history before this turn is appended.</param>
+    /// <param name="model">The model identifier for this turn.</param>
+    /// <param name="permissionMode">The permission mode string for this turn (e.g. <c>"default"</c>).</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The running task id, or <see langword="null"/> for the main agent.</param>
+    public async Task<UserPromptSubmitResult> RunUserPromptSubmitAsync(
+        string prompt,
+        IReadOnlyList<string> attachments,
+        int historyLength,
+        string model,
+        string permissionMode,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null)
+    {
+        var matching = this.GetMatchingHooks("UserPromptSubmit", toolName: null);
+        if (matching.Count == 0)
+        {
+            return UserPromptSubmitResult.Allow;
+        }
+
+        var payload = this.BuildUserPromptSubmitPayload(prompt, attachments, historyLength, model, permissionMode, depth, taskId);
+        var pairs = new List<(UserHook Hook, HookOutput Output)>(matching.Count);
+        foreach (var hook in matching)
+        {
+            var output = await this.RunSingleHookAsync(hook, "UserPromptSubmit", payload, ct).ConfigureAwait(false);
+            pairs.Add((hook, output));
+            if (!output.Continue)
+            {
+                break;
+            }
+        }
+
+        return this.MergeUserPromptSubmitOutputs(pairs);
     }
 
     // -------------------------------------------------------------------------
@@ -413,6 +462,310 @@ public sealed partial class HookBus
         return UserHookResult.Allow;
     }
 
+    /// <summary>
+    /// Merges <c>UserPromptSubmit</c> hook outputs following §6 of the proposal: last-writer-wins
+    /// for single-valued fields (logged), union for <c>deniedTools</c>, intersection for
+    /// <c>allowedTools</c> (null = no opinion, not an empty list), concatenation for
+    /// <c>additionalContext</c> / <c>appendSystemPrompt</c>.
+    /// </summary>
+    /// <remarks>
+    /// The <paramref name="pairs"/> parameter carries the hook alongside its output so that
+    /// <c>AllowSystemPromptReplace</c> and <c>UnattendedDecision</c> can be read per hook.
+    /// </remarks>
+    private UserPromptSubmitResult MergeUserPromptSubmitOutputs(
+        IReadOnlyList<(UserHook Hook, HookOutput Output)> pairs)
+    {
+        if (pairs.Count == 0)
+        {
+            return UserPromptSubmitResult.Allow;
+        }
+
+        string? decision = null;
+        var reasons = new List<string>();
+        var additionalContexts = new List<string>();
+        var appendSystemPrompts = new List<string>();
+        var continueRun = true;
+        string? stopReason = null;
+
+        // Single-valued last-writer-wins fields for UserPromptSubmit.
+        string? modifiedPrompt = null;
+        string? modifiedPromptHookCommand = null;
+        string? systemPrompt = null;
+        string? toolChoice = null;
+        string? modelOverride = null;
+        string? effortOverride = null;
+
+        // Tool list accumulators.
+        List<string>? deniedTools = null;       // union — null until first hook contributes
+        List<string>? allowedTools = null;       // intersection — null means "no restriction yet"
+        var allowedHasValue = false;             // true once at least one hook expressed an allowedTools list
+
+        foreach (var (hook, output) in pairs)
+        {
+            // Decision: strictest wins (allow < ask < deny < block).
+            decision = StrictestDecision(decision, output.Decision);
+
+            // Reasons: collected from blocking / denying hooks only.
+            if (IsBlockingDecision(output.Decision) && !string.IsNullOrEmpty(output.Reason))
+            {
+                reasons.Add(output.Reason);
+            }
+
+            // Continue: false wins.
+            if (!output.Continue)
+            {
+                continueRun = false;
+            }
+
+            // StopReason: last writer wins.
+            if (output.StopReason is not null)
+            {
+                stopReason = output.StopReason;
+            }
+
+            // --- event-specific fields from hookSpecificOutput ---
+            var specific = output.HookSpecificOutput;
+            if (specific is null)
+            {
+                continue;
+            }
+
+            // additionalContext — concatenate in order.
+            if (TryGetString(specific, "additionalContext", out var addCtx))
+            {
+                additionalContexts.Add(addCtx!);
+            }
+
+            // appendSystemPrompt — concatenate in order.
+            if (TryGetString(specific, "appendSystemPrompt", out var appendSp))
+            {
+                appendSystemPrompts.Add(appendSp!);
+            }
+
+            // modifiedPrompt — last writer wins, logged.
+            if (TryGetString(specific, "modifiedPrompt", out var mp))
+            {
+                if (modifiedPrompt is not null)
+                {
+                    this.LogFieldOverride("modifiedPrompt", modifiedPrompt, mp!);
+                }
+
+                modifiedPrompt = mp;
+                modifiedPromptHookCommand = hook.Command;
+            }
+
+            // systemPrompt — last writer wins, only when AllowSystemPromptReplace.
+            if (TryGetString(specific, "systemPrompt", out var sp))
+            {
+                if (!hook.AllowSystemPromptReplace)
+                {
+                    this.LogSystemPromptIgnored(hook.Command);
+                }
+                else
+                {
+                    if (systemPrompt is not null)
+                    {
+                        this.LogFieldOverride("systemPrompt", systemPrompt, sp!);
+                    }
+
+                    systemPrompt = sp;
+                }
+            }
+
+            // toolChoice — last writer wins, logged.
+            if (TryGetString(specific, "toolChoice", out var tc))
+            {
+                if (toolChoice is not null)
+                {
+                    this.LogFieldOverride("toolChoice", toolChoice, tc!);
+                }
+
+                toolChoice = tc;
+            }
+
+            // model — last writer wins, logged.
+            if (TryGetString(specific, "model", out var m))
+            {
+                if (modelOverride is not null)
+                {
+                    this.LogFieldOverride("model", modelOverride, m!);
+                }
+
+                modelOverride = m;
+            }
+
+            // effort — last writer wins, logged.
+            if (TryGetString(specific, "effort", out var eff))
+            {
+                if (effortOverride is not null)
+                {
+                    this.LogFieldOverride("effort", effortOverride, eff!);
+                }
+
+                effortOverride = eff;
+            }
+
+            // allowedTools — intersection (null from one hook = "no opinion").
+            if (specific.TryGetPropertyValue("allowedTools", out var allowedNode)
+                && allowedNode is JsonArray allowedArray)
+            {
+                var hookAllowed = ReadStringArray(allowedArray);
+                if (!allowedHasValue)
+                {
+                    // First hook with an opinion: start with its list.
+                    allowedTools = [.. hookAllowed];
+                    allowedHasValue = true;
+                }
+                else
+                {
+                    // Subsequent hooks: intersect — a permissive hook cannot widen a restrictive one.
+                    var hookSet = new HashSet<string>(hookAllowed, StringComparer.OrdinalIgnoreCase);
+                    allowedTools = [.. (allowedTools ?? []).Where(t => hookSet.Contains(t))];
+                }
+            }
+
+            // deniedTools — union.
+            if (specific.TryGetPropertyValue("deniedTools", out var deniedNode)
+                && deniedNode is JsonArray deniedArray)
+            {
+                var hookDenied = ReadStringArray(deniedArray);
+                if (deniedTools is null)
+                {
+                    deniedTools = [.. hookDenied];
+                }
+                else
+                {
+                    foreach (var tool in hookDenied)
+                    {
+                        if (!deniedTools.Any(t => string.Equals(t, tool, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            deniedTools.Add(tool);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Resolve ask → unattended decision (§8.2).
+        // ask requires an answerer; at this seam there is no interactive answerer wired.
+        // Resolve via the hook's UnattendedDecision (per-hook, strictest wins across all
+        // hooks that contributed ask). An interactive path is deliberately deferred — this
+        // is the §8.2 rule.
+        if (string.Equals(decision, "ask", StringComparison.OrdinalIgnoreCase))
+        {
+            var resolved = ResolveUnattendedAsk(pairs);
+            this.LogAskResolvedUnattended(resolved);
+            decision = resolved ? "allow" : "block";
+            if (!resolved)
+            {
+                reasons.Add("ask resolved as deny (unattended — no interactive answerer)");
+            }
+        }
+
+        if (!continueRun || IsBlockingDecision(decision))
+        {
+            var blockReason = reasons.Count > 0
+                ? string.Join("\n\n", reasons)
+                : stopReason ?? "blocked by hook";
+            return new UserPromptSubmitResult { Block = true, Reason = blockReason };
+        }
+
+        // Build the TurnShape from merged fields.
+        var shape = BuildTurnShape(systemPrompt, appendSystemPrompts, allowedTools, allowedHasValue, deniedTools, toolChoice, modelOverride, effortOverride);
+
+        return new UserPromptSubmitResult
+        {
+            Block = false,
+            ModifiedPrompt = modifiedPrompt,
+            ModifiedByHookCommand = modifiedPromptHookCommand,
+            AdditionalContext = additionalContexts.Count > 0 ? string.Join("\n\n", additionalContexts) : null,
+            Shape = shape?.IsEmpty == false ? shape : null,
+        };
+    }
+
+    private static TurnShape? BuildTurnShape(
+        string? systemPrompt,
+        List<string> appendSystemPrompts,
+        List<string>? allowedTools,
+        bool allowedHasValue,
+        List<string>? deniedTools,
+        string? toolChoice,
+        string? model,
+        string? effort)
+    {
+        var appendSp = appendSystemPrompts.Count > 0 ? string.Join("\n\n", appendSystemPrompts) : null;
+
+        if (systemPrompt is null
+            && appendSp is null
+            && !allowedHasValue
+            && deniedTools is null
+            && toolChoice is null
+            && model is null
+            && effort is null)
+        {
+            return null;
+        }
+
+        return new TurnShape
+        {
+            SystemPrompt = systemPrompt,
+            AppendSystemPrompt = appendSp,
+            AllowedTools = allowedHasValue ? allowedTools?.AsReadOnly() : null,
+            DeniedTools = deniedTools?.AsReadOnly(),
+            ToolChoice = toolChoice,
+            Model = model,
+            Effort = effort,
+        };
+    }
+
+    /// <summary>
+    /// Resolves an <c>ask</c> decision via each contributing hook's <c>UnattendedDecision</c>.
+    /// Returns <see langword="true"/> (allow) only when every hook that contributed <c>ask</c>
+    /// has <c>UnattendedDecision == "allow"</c>. Any hook with <c>deny</c> or the default (null)
+    /// resolves to <see langword="false"/> (deny/block), because deny is the safer default.
+    /// </summary>
+    private static bool ResolveUnattendedAsk(IReadOnlyList<(UserHook Hook, HookOutput Output)> pairs)
+    {
+        foreach (var (hook, output) in pairs)
+        {
+            if (string.Equals(output.Decision, "ask", StringComparison.OrdinalIgnoreCase))
+            {
+                if (!string.Equals(hook.UnattendedDecision, "allow", StringComparison.OrdinalIgnoreCase))
+                {
+                    return false; // deny (or null default = deny)
+                }
+            }
+        }
+
+        return true; // all ask-returning hooks opted into allow
+    }
+
+    private static bool TryGetString(JsonObject obj, string key, out string? value)
+    {
+        if (obj.TryGetPropertyValue(key, out var node)
+            && node is JsonValue jv
+            && jv.TryGetValue<string>(out var s)
+            && !string.IsNullOrWhiteSpace(s))
+        {
+            value = s;
+            return true;
+        }
+
+        value = null;
+        return false;
+    }
+
+    private static IEnumerable<string> ReadStringArray(JsonArray array)
+    {
+        foreach (var item in array)
+        {
+            if (item is JsonValue jv && jv.TryGetValue<string>(out var s) && !string.IsNullOrWhiteSpace(s))
+            {
+                yield return s.Trim();
+            }
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Payload builders
     // -------------------------------------------------------------------------
@@ -457,6 +810,37 @@ public sealed partial class HookBus
         {
             writer.WriteStartObject();
             this.WriteEnvelope(writer, "Stop", depth, taskId);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildUserPromptSubmitPayload(
+        string prompt,
+        IReadOnlyList<string> attachments,
+        int historyLength,
+        string model,
+        string permissionMode,
+        int depth,
+        string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "UserPromptSubmit", depth, taskId);
+            writer.WriteString("prompt", prompt);
+            writer.WriteStartArray("attachments");
+            foreach (var kind in attachments)
+            {
+                writer.WriteStringValue(kind);
+            }
+
+            writer.WriteEndArray();
+            writer.WriteNumber("historyLength", historyLength);
+            writer.WriteString("model", model);
+            writer.WriteString("permissionMode", permissionMode);
             writer.WriteEndObject();
         }
 
@@ -580,4 +964,14 @@ public sealed partial class HookBus
         Level = LogLevel.Debug,
         Message = "hook single-valued field '{field}' overridden; previous: '{previous}', new: '{newValue}'")]
     private partial void LogFieldOverride(string field, string previous, string newValue);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "UserPromptSubmit hook '{command}' returned systemPrompt but allowSystemPromptReplace is false — ignoring; set allowSystemPromptReplace:true on the hook definition to enable full replacement")]
+    private partial void LogSystemPromptIgnored(string command);
+
+    [LoggerMessage(
+        Level = LogLevel.Information,
+        Message = "UserPromptSubmit hook returned ask with no interactive answerer; resolved unattended as {resolution} (§8.2)")]
+    private partial void LogAskResolvedUnattended(bool resolution);
 }

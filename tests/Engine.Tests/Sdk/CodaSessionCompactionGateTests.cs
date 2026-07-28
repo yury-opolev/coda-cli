@@ -84,7 +84,7 @@ public sealed class CodaSessionCompactionGateTests : IDisposable
 
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             this.ObservedExecutingDuringRun = gate.IsExecuting;
             sink.OnAssistantText("ok");
@@ -157,3 +157,4 @@ public sealed class CodaSessionCompactionGateTests : IDisposable
         try { Directory.Delete(this.root, recursive: true); } catch { /* ignore */ }
     }
 }
+

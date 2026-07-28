@@ -236,10 +236,21 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Debug, Message = "LSP edit-seam notify failed (best-effort); tool result and turn unaffected")]
     private partial void LogLspNotifyFailed(Exception ex);
 
-    public async Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+    public async Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
     {
         ArgumentNullException.ThrowIfNull(history);
         ArgumentNullException.ThrowIfNull(sink);
+
+        // Resolve per-turn overrides once at the start of the run. All iterations use the
+        // same resolution: model, effort, system prompt, and tool filter are stable for the
+        // lifetime of the call. (Tool-search output is still recomputed per iteration; the
+        // shape filter is applied to it via resolution.FilterDefinitions.)
+        var resolution = TurnShapeResolver.Resolve(
+            this.options.SystemPrompt,
+            this.options.Model,
+            this.options.Effort,
+            this.tools,
+            shape);
 
         var pendingHookTasks = new List<Task>();
         var stopContinuations = 0;
@@ -336,20 +347,28 @@ public sealed partial class AgentLoop : IAgentLoop
 
                 // Per-request wire tool definitions: when tool search is active, the
                 // discovered set may grow during the turn, so we recompute each call.
-                // When inactive (or no coordinator), use the registry definitions unchanged.
-                var toolDefinitions = this.toolSearch is not null && this.toolSearch.IsActive
-                    ? this.toolSearch.BuildWireDefinitions(this.tools)
-                    : this.tools.Definitions;
+                // When inactive (or no coordinator), use the resolver's pre-computed definitions.
+                // Apply shape filtering after whichever branch produced the definitions.
+                IReadOnlyList<ToolDefinition> toolDefinitions;
+                if (this.toolSearch is not null && this.toolSearch.IsActive)
+                {
+                    toolDefinitions = resolution.FilterDefinitions(this.toolSearch.BuildWireDefinitions(this.tools));
+                }
+                else
+                {
+                    toolDefinitions = resolution.ToolDefinitions;
+                }
 
                 var request = new ChatRequest
                 {
-                    Model = this.options.Model,
+                    Model = resolution.Model,
                     MaxTokens = this.options.MaxTokens,
-                    System = this.options.SystemPrompt,
+                    System = resolution.SystemPrompt,
                     Messages = history,
                     Tools = toolDefinitions,
-                    Effort = this.options.Effort,
+                    Effort = resolution.Effort,
                     ToolsVolatile = this.toolSearch is not null && this.toolSearch.IsActive,
+                    ToolChoice = resolution.ToolChoice,
                 };
 
                 var text = new StringBuilder();
@@ -359,7 +378,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 string? stopReason = null;
                 var thinkingBurstOpen = false;
 
-                this.LogTurnStart(iteration, this.options.Model, history.Count, toolDefinitions.Count);
+                this.LogTurnStart(iteration, resolution.Model, history.Count, toolDefinitions.Count);
 
                 // Reactive overflow compaction: if the provider rejects the request because the
                 // context is too long, summarize the history once and retry the turn — rather than
@@ -634,7 +653,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 // direct result of a prior stop-hook continuation. Reset so stop hooks
                 // treat the next natural stop correctly.
                 stopHookActive = false;
-                var resultBlocks = await this.RunToolsAsync(toolUses, activity, sink, cancellationToken).ConfigureAwait(false);
+                var resultBlocks = await this.RunToolsAsync(toolUses, activity, sink, resolution, cancellationToken).ConfigureAwait(false);
                 history.Add(new ChatMessage(ChatRole.User, resultBlocks));
 
                 // Persist again once tool results are in history, so a kill in the gap before
@@ -676,6 +695,7 @@ public sealed partial class AgentLoop : IAgentLoop
         IReadOnlyList<ToolUseBlock> toolUses,
         ToolActivityContext activity,
         IAgentSink sink,
+        TurnShapeResolution resolution,
         CancellationToken cancellationToken)
     {
         var results = new List<ContentBlock>();
@@ -697,6 +717,7 @@ public sealed partial class AgentLoop : IAgentLoop
             AllTools = this.tools.All,
             OnToolsDiscovered = names => this.toolSearch?.AddDiscovered(names),
             Logger = this.logger,
+            ParentToolRestriction = resolution.ToToolRestrictionShape(),
         };
 
         for (var i = 0; i < toolUses.Count; i++)
@@ -737,6 +758,19 @@ public sealed partial class AgentLoop : IAgentLoop
                 var unknown = new ToolResult($"Unknown tool '{toolUse.Name}'.", IsError: true);
                 sink.OnToolResult(identity, toolUse.Name, unknown, ToolCallStatus.Failed);
                 results.Add(CreateToolResultBlock(identity, unknown, ToolCallStatus.Failed));
+                continue;
+            }
+
+            // Enforce turn-shape tool restriction. Advertising a filtered set but executing
+            // from the unfiltered registry would make the restriction cosmetic — per proposal
+            // §8, tool filtering is a policy mechanism and must be enforced at invocation too.
+            if (!resolution.IsToolAllowed(toolUse.Name))
+            {
+                var denied = new ToolResult(
+                    $"Tool '{toolUse.Name}' is not available this turn.",
+                    IsError: true);
+                sink.OnToolResult(identity, toolUse.Name, denied, ToolCallStatus.Failed);
+                results.Add(CreateToolResultBlock(identity, denied, ToolCallStatus.Failed));
                 continue;
             }
 

@@ -64,6 +64,16 @@ public sealed record ToolContext(string WorkingDirectory)
 
     /// <summary>Callback invoked with matched tool names after a tool_search execution; null when not wired.</summary>
     public Action<IReadOnlyList<string>>? OnToolsDiscovered { get; init; }
+
+    /// <summary>
+    /// The tool restriction that was active for the parent turn, or <see langword="null"/> when
+    /// no restriction is in effect. Passed to child subagents so they can inherit at least the
+    /// same restriction, guaranteeing monotonic (never-less-restricted) security across nesting
+    /// levels. Only the restriction portion of the parent's <see cref="TurnShape"/> is threaded
+    /// through — system prompt, model, and effort overrides belong to the parent turn's context
+    /// and must not leak into a child's independent agent context.
+    /// </summary>
+    public TurnShape? ParentToolRestriction { get; init; }
 }
 
 /// <summary>The outcome of running a tool, fed back to the model.</summary>

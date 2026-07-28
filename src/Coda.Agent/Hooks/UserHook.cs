@@ -23,10 +23,18 @@ namespace Coda.Agent.Hooks;
 /// Accepted values: <c>"allow"</c> or <c>"deny"</c> (case-insensitive); anything else is treated as <c>"deny"</c>.
 /// Stored and forwarded in Phase 0 but not yet consumed, because no Phase 0 event can return <c>ask</c>.
 /// </param>
+/// <param name="AllowSystemPromptReplace">
+/// Opt-in flag that permits a <c>UserPromptSubmit</c> hook to return <c>systemPrompt</c> (full
+/// replacement). Default <see langword="false"/>: without this flag a <c>systemPrompt</c> field
+/// in the hook output is ignored and a warning is logged. Full replacement while tools remain
+/// enabled tends to produce a model that ignores its tools; this deliberate opt-in ensures the
+/// hook author understands the hazard.
+/// </param>
 public sealed record UserHook(
     string Event,
     string Command,
     string? Matcher = null,
     int? TimeoutSeconds = null,
     bool? FailOpen = null,
-    string? UnattendedDecision = null);
+    string? UnattendedDecision = null,
+    bool AllowSystemPromptReplace = false);

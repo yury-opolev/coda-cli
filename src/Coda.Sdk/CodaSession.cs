@@ -3,6 +3,7 @@ using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
+using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
@@ -58,6 +59,12 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly ILogger logger;
     private readonly TurnPipelineBuilder turnPipelineBuilder;
     private readonly SteeringInbox steeringInbox = new();
+    /// <summary>
+    /// Test seam: when non-null, overrides the <see cref="UserHookRunner"/> produced by
+    /// <see cref="Turns.TurnPipelineBuilder"/> so unit tests can inject controlled hook behaviour
+    /// without spawning real processes or writing settings to disk. Null in production.
+    /// </summary>
+    private readonly UserHookRunner? userHookRunnerOverride;
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
 
@@ -86,7 +93,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         ILlmClientFactory? llmClientFactory = null,
         IAgentLoopFactory? agentLoopFactory = null,
         Func<SessionOptions>? currentOptionsProvider = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        UserHookRunner? userHookRunnerOverride = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
@@ -98,6 +106,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // construction snapshot), so a mid-session model/effort/tool/permission change is picked up.
         this.currentOptionsProvider = currentOptionsProvider ?? (() => this.Options);
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.userHookRunnerOverride = userHookRunnerOverride;
         this.history = history ?? [];
         this.SessionId = sessionId ?? SessionIds.NewId();
         // The manager groups persistent task logs under the session id captured HERE. If the id
@@ -435,6 +444,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 Gate = this.ExecutionGate,
                 ToolActivity = rootToolActivity,
             };
+            // Test seam: override the settings-derived hook runner when injected. Null in production.
+            if (this.userHookRunnerOverride is not null)
+            {
+                loopSpec = loopSpec with { UserHooks = this.userHookRunnerOverride };
+            }
             loop = this.agentLoopFactory.Create(loopSpec);
         }
         catch
@@ -489,9 +503,59 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 }
 
                 snapshot = this.history.Count;
-                this.history.Add(new ChatMessage(ChatRole.User, userContent));
 
-                await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
+                // USER PROMPT SUBMIT HOOK GATE: fires before the message is appended to history
+                // (§10 Phase 1 of the agent-hooks proposal). A fail-closed hook that blocks must
+                // prevent both the append and the loop, returning a clean non-exceptional RunResult.
+                TurnShape? turnShape = null;
+                var effectiveContent = userContent;
+
+                if (loopSpec.UserHooks is { } submitHooks && submitHooks.HasUserPromptSubmit)
+                {
+                    var originalPrompt = ExtractPromptText(userContent);
+                    var submitResult = await submitHooks.RunUserPromptSubmitAsync(
+                        originalPrompt,
+                        ExtractAttachmentKinds(userContent),
+                        this.history.Count,
+                        options.Model,
+                        PermissionModeToString(options.PermissionMode),
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (submitResult.Block)
+                    {
+                        return new RunResult(false, string.Empty, [], null, submitResult.Reason ?? "blocked by hook")
+                        {
+                            RootTurnId = rootToolActivity.RootTurnId,
+                            ToolActivity = CompleteToolActivity(interrupted: false),
+                        };
+                    }
+
+                    if (submitResult.ModifiedPrompt is not null)
+                    {
+                        recording.OnPromptRewritten(
+                            submitResult.ModifiedByHookCommand ?? string.Empty,
+                            originalPrompt,
+                            submitResult.ModifiedPrompt);
+                        effectiveContent = ReplacePromptText(userContent, submitResult.ModifiedPrompt);
+                    }
+
+                    turnShape = submitResult.Shape;
+
+                    this.history.Add(new ChatMessage(ChatRole.User, effectiveContent));
+
+                    // additionalContext: a separate synthetic user message appended after the
+                    // main user message (not merged into it — mirrors the LSP diagnostics seam).
+                    if (submitResult.AdditionalContext is not null)
+                    {
+                        this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(submitResult.AdditionalContext)]));
+                    }
+                }
+                else
+                {
+                    this.history.Add(new ChatMessage(ChatRole.User, userContent));
+                }
+
+                await loop.RunAsync(this.history, recording, cancellationToken, turnShape).ConfigureAwait(false);
             }
 
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
@@ -856,6 +920,95 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.history.RemoveRange(snapshot, this.history.Count - snapshot);
         }
     }
+
+    // -------------------------------------------------------------------------
+    // UserPromptSubmit helpers
+    // -------------------------------------------------------------------------
+
+    private static string ExtractPromptText(IReadOnlyList<ContentBlock> content)
+    {
+        var parts = new List<string>();
+        foreach (var block in content)
+        {
+            if (block is TextBlock tb)
+            {
+                parts.Add(tb.Text);
+            }
+        }
+
+        return string.Concat(parts);
+    }
+
+    private static IReadOnlyList<string> ExtractAttachmentKinds(IReadOnlyList<ContentBlock> content)
+    {
+        var kinds = new List<string>();
+        foreach (var block in content)
+        {
+            if (block is ImageBlock)
+            {
+                kinds.Add("image");
+            }
+            else if (block is not TextBlock)
+            {
+                // Forward-compatible: surface other non-text block types by lowercased type name
+                // without the "Block" suffix (e.g. "thinkingBlock" → "thinking").
+                var typeName = block.GetType().Name;
+                var suffix = "Block";
+                var kind = typeName.EndsWith(suffix, StringComparison.Ordinal)
+                    ? typeName[..^suffix.Length].ToLowerInvariant()
+                    : typeName.ToLowerInvariant();
+                kinds.Add(kind);
+            }
+        }
+
+        return kinds.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Replaces all <see cref="TextBlock"/> instances in <paramref name="content"/> with a
+    /// single <see cref="TextBlock"/> containing <paramref name="modifiedPrompt"/>. Non-text
+    /// blocks are preserved in their original positions. The replacement is inserted at the
+    /// location of the first text block; if there are no text blocks, it is prepended.
+    /// </summary>
+    private static IReadOnlyList<ContentBlock> ReplacePromptText(
+        IReadOnlyList<ContentBlock> content,
+        string modifiedPrompt)
+    {
+        var result = new List<ContentBlock>(content.Count);
+        var replaced = false;
+        foreach (var block in content)
+        {
+            if (block is TextBlock)
+            {
+                if (!replaced)
+                {
+                    result.Add(new TextBlock(modifiedPrompt));
+                    replaced = true;
+                }
+                // Skip subsequent TextBlocks — all are subsumed by the single modified prompt.
+            }
+            else
+            {
+                result.Add(block);
+            }
+        }
+
+        if (!replaced)
+        {
+            result.Insert(0, new TextBlock(modifiedPrompt));
+        }
+
+        return result.AsReadOnly();
+    }
+
+    internal static string PermissionModeToString(PermissionMode mode) => mode switch
+    {
+        PermissionMode.Default           => "default",
+        PermissionMode.AcceptEdits       => "acceptEdits",
+        PermissionMode.Plan              => "plan",
+        PermissionMode.BypassPermissions => "bypassPermissions",
+        _                                => mode.ToString().ToLowerInvariant(),
+    };
 
     /// <summary>
     /// Asynchronously tears the session down: shuts down LSP servers (bounded by

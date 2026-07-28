@@ -23,5 +23,10 @@ public interface IAgentLoop
     /// <param name="history">The conversation history; the loop reads and appends to it in place.</param>
     /// <param name="sink">Receives streamed assistant text, tool calls, and results.</param>
     /// <param name="cancellationToken">Cancels the run.</param>
-    Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default);
+    /// <param name="shape">
+    /// Optional per-turn override: adjusts the system prompt, model, effort, tool set, and
+    /// tool_choice for this run without mutating session state. Null and an all-null shape are
+    /// equivalent to no override.
+    /// </param>
+    Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null);
 }

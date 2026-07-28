@@ -78,4 +78,14 @@ public interface IAgentSink
 
     /// <summary>Queued steering entries were delivered into the provider history. Optional.</summary>
     void OnSteeringDelivered(IReadOnlyList<string> ids) { }
+
+    /// <summary>
+    /// The model-facing prompt was rewritten by a <c>UserPromptSubmit</c> hook before being
+    /// sent to the model. The original text (what the user typed) remains in history; this
+    /// event conveys that the model will see a different prompt than what was entered. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that performed the rewrite.</param>
+    /// <param name="originalPrompt">The original prompt text as typed by the user.</param>
+    /// <param name="modifiedPrompt">The model-facing prompt text after rewriting.</param>
+    void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) { }
 }

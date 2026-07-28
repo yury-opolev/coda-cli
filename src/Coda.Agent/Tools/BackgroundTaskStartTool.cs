@@ -46,7 +46,7 @@ public sealed class BackgroundTaskStartTool : ITool
         }
 
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
-        var id = context.Tasks.StartSubagentBackground(context.Subagents, subagentType, prompt, subagentType, context.CurrentTaskId);
+        var id = context.Tasks.StartSubagentBackground(context.Subagents, subagentType, prompt, subagentType, context.CurrentTaskId, context.ParentToolRestriction);
 
         return Task.FromResult(new ToolResult(
             $"Started background task {id}. Use task_output to read its progress."));

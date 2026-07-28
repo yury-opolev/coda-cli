@@ -213,6 +213,15 @@ public sealed record UiPromptResponseSubmittedEvent(Guid RequestId, UiPromptResp
 public sealed record ActiveOperationChangedEvent(ActiveOperation? Operation) : UiEvent;
 
 /// <summary>
+/// A <c>UserPromptSubmit</c> hook rewrote the user's prompt before the model saw it.
+/// The original text is available for display so the user can see what changed.
+/// </summary>
+public sealed record PromptRewrittenEvent(
+    string HookCommand,
+    string OriginalPrompt,
+    string ModifiedPrompt) : UiEvent;
+
+/// <summary>
 /// An internal ordering barrier published through the mailbox by <see cref="UiActor.FlushAsync"/>. The
 /// actor completes <see cref="Completion"/> only after every event queued before it has passed the
 /// observer, reducer, and frame sink in FIFO order. <see cref="UiReducer"/> ignores it (the default

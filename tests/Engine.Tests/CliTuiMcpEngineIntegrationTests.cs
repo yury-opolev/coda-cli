@@ -275,7 +275,7 @@ public sealed class CliTuiMcpEngineIntegrationTests
         public Task RunAsync(
             List<ChatMessage> history,
             IAgentSink sink,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             var identity = root.EnsureActivity().ForCall("call-1");
             identities.Add(identity);
@@ -529,3 +529,4 @@ public sealed class CliTuiMcpEngineIntegrationTests
         Assert.Equal(nameof(ToolCallStatus.Succeeded), result.ToolStatus);
     }
 }
+

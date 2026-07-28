@@ -217,6 +217,9 @@ internal sealed class RecordingSink : IAgentSink
 
     public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.inner?.OnSteeringDelivered(ids);
 
+    public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+        this.inner?.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
+
     public void OnUsage(TokenUsage usage)
     {
         lock (this.gate)

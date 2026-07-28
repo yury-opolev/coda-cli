@@ -38,4 +38,16 @@ public sealed record ChatRequest
     /// so a breakpoint on a volatile set pays a write cost every call and never yields a read.
     /// </summary>
     public bool ToolsVolatile { get; init; }
+
+    /// <summary>
+    /// Sets <c>tool_choice</c> on the wire when non-null and the request includes tools. Accepted
+    /// values: <c>auto</c>, <c>any</c>, <c>none</c>. Emitted by
+    /// <see cref="AnthropicMessagesClient"/> only; not used by <c>CopilotChatClient</c>.
+    /// <para>
+    /// Changing this value mid-session invalidates the <c>tools</c> and <c>system</c> prompt
+    /// cache entries — the provider treats <c>tool_choice</c> as part of the cache key. Set it
+    /// deliberately rather than per-turn on a whim to avoid unnecessary cache churn.
+    /// </para>
+    /// </summary>
+    public string? ToolChoice { get; init; }
 }
