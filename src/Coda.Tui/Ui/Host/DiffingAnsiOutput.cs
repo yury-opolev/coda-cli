@@ -49,10 +49,15 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
         if (hasGraphics || graphicsPresentedLastFrame)
         {
             frame.Invalidate();
+            PresentedFrame.SyncDirtyLines(buffer);
         }
-        else
+        else if (!frame.SuppressUnchangedCells(buffer))
         {
-            frame.SuppressUnchangedCells(buffer);
+            // Suppression declined this frame, so it did not recompute the line flags either.
+            // They still have to be re-derived: Terminal.Gui never lowers a DirtyLines entry and
+            // never raises one for a FillRect-only row, so a row left clean while holding dirty
+            // cells would be skipped by the write loop and keep stale content on screen.
+            PresentedFrame.SyncDirtyLines(buffer);
         }
 
         graphicsPresentedLastFrame = hasGraphics;

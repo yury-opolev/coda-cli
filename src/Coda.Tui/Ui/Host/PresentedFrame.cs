@@ -45,9 +45,9 @@ internal sealed class PresentedFrame
     /// </summary>
     /// <returns>
     /// <see langword="false"/> when there is no compatible retained frame and suppression is
-    /// disabled; no flags are modified. Terminal.Gui's write loop still skips rows whose
-    /// <c>DirtyLines</c> entry is false, so a disabled-suppression frame is not guaranteed to
-    /// be a full write.
+    /// disabled; no flags are modified, and <see cref="SyncDirtyLines"/> is not called either.
+    /// Terminal.Gui's write loop still skips rows whose <c>DirtyLines</c> entry is false, so a
+    /// disabled-suppression frame is not guaranteed to be a full write.
     /// </returns>
     public bool SuppressUnchangedCells(IOutputBuffer buffer)
     {
@@ -141,18 +141,45 @@ internal sealed class PresentedFrame
             }
         }
 
-        if (dirtyLines is null)
+        SyncDirtyLines(buffer);
+        return true;
+    }
+
+    /// <summary>
+    /// Re-derives every <c>DirtyLines</c> entry from the per-cell dirty flags of that row.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Terminal.Gui raises <c>DirtyLines[row]</c> only from <c>AddGrapheme</c> — an actual text
+    /// write — and never lowers it again. <c>FillRect</c>, the path behind
+    /// <c>View.ClearViewport</c>, marks the individual cells dirty but leaves the line flag
+    /// alone. Lowering a line flag is therefore a one-way door in stock Terminal.Gui: a row that
+    /// is subsequently only blanked, never written with text, would be skipped by
+    /// <c>OutputBase.Write</c> for the rest of the session, leaving whatever was last drawn
+    /// there — the body of a dialog that has since closed, for instance — permanently on screen.
+    /// </para>
+    /// <para>
+    /// Recomputing in both directions on every frame removes that hazard: the flag becomes a
+    /// plain summary of the row rather than accumulated history, so lowering it is always
+    /// reversible and no dirty cell can hide inside a row the write loop skips.
+    /// </para>
+    /// </remarks>
+    public static void SyncDirtyLines(IOutputBuffer buffer)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        var contents = buffer.Contents;
+        var dirtyLines = buffer.DirtyLines;
+        if (contents is null || dirtyLines is null)
         {
-            return true;
+            return;
         }
 
-        for (var row = 0; row < rows && row < dirtyLines.Length; row++)
-        {
-            if (!dirtyLines[row])
-            {
-                continue;
-            }
+        var rows = Math.Min(Math.Min(buffer.Rows, contents.GetLength(0)), dirtyLines.Length);
+        var cols = Math.Min(buffer.Cols, contents.GetLength(1));
 
+        for (var row = 0; row < rows; row++)
+        {
             var hasDirtyCell = false;
             for (var col = 0; col < cols; col++)
             {
@@ -163,13 +190,8 @@ internal sealed class PresentedFrame
                 }
             }
 
-            if (!hasDirtyCell)
-            {
-                dirtyLines[row] = false;
-            }
+            dirtyLines[row] = hasDirtyCell;
         }
-
-        return true;
     }
 
     /// <summary>Records the buffer grid as the newly presented frame baseline.</summary>
