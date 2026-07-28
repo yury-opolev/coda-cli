@@ -36,6 +36,7 @@ internal static class ToolActivityPreview
             "notebook_edit" => "Editing " + Field(objectRoot, "notebook_path", safeToolName),
             "grep" or "glob" => "Searching for " + Field(objectRoot, "pattern", safeToolName),
             "web_search" or "tool_search" => "Searching for " + Field(objectRoot, "query", safeToolName),
+            "skill" => "Loading skill " + Field(objectRoot, "name", safeToolName),
             _ => string.IsNullOrEmpty(argumentPreview)
                 ? safeToolName
                 : $"{safeToolName} {argumentPreview}",

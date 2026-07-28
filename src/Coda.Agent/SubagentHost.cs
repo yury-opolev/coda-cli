@@ -53,6 +53,9 @@ public sealed class SubagentHost : ISubagentHost
     /// </summary>
     internal IPermissionPrompt Permissions => this.permissions;
 
+    /// <summary>Exposes the subagent tool registry for test inspection.</summary>
+    internal ToolRegistry SubagentTools => this.subagentTools;
+
     public Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,

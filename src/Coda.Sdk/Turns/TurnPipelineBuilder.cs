@@ -1,6 +1,7 @@
 using Coda.Agent;
 using Coda.Agent.Tasks;
 using Coda.Agent.Classifier;
+using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
@@ -146,8 +147,13 @@ public sealed class TurnPipelineBuilder
             ToolSearch: this.toolSearchCoordinator,
             Goal: goalSupervisor,
             // The loop runs on the session history, which the compaction delegate compacts in
-            // place, so the list argument is intentionally ignored.
-            CompactAsync: goalSupervisor is null ? null : (_, ct) => this.compactHistoryAsync(client, options.Model, ct),
+            // place. When a skill-reattach provider is configured, the reattach content is
+            // injected into history immediately after compaction so the model does not lose
+            // previously loaded skill bodies. The history list argument IS the live session
+            // history shared with CodaSession, so mutations are visible after the await.
+            CompactAsync: goalSupervisor is null
+                ? null
+                : BuildCompactDelegate(client, options),
             Logger: this.loggerFactory.CreateLogger("Coda.Tool"),
             // Evaluated per turn so a runtime that starts after the builder was constructed is
             // picked up on the next turn; returns null until then.
@@ -155,7 +161,57 @@ public sealed class TurnPipelineBuilder
     }
 
     /// <summary>
-    /// Assembles the <see cref="AgentLoopSpec"/> for one ISOLATED scheduled firing. The scheduled
+    /// Builds the in-loop compaction delegate. After running the session's in-place history
+    /// compaction, optionally injects skill-reattach content so a compacted goal run does not
+    /// silently lose skills the model already loaded.
+    /// </summary>
+    /// <remarks>
+    /// Two guards prevent reattach from eroding the headroom compaction just freed:
+    /// <list type="bullet">
+    ///   <item>Skip injection when adding the reattach content would bring the post-compaction
+    ///     token estimate back up to or beyond the compaction threshold.</item>
+    ///   <item>Skip injection when the reattach content is already the trailing message
+    ///     (exactly-once guarantee — prevents double-injection when this delegate fires
+    ///     consecutively without intervening turns).</item>
+    /// </list>
+    /// </remarks>
+    private Func<List<ChatMessage>, CancellationToken, Task> BuildCompactDelegate(
+        ILlmClient client,
+        SessionOptions options)
+    {
+        var skillReattach = options.SkillReattachContentProvider;
+        return async (history, ct) =>
+        {
+                await this.compactHistoryAsync(client, options.Model, ct).ConfigureAwait(false);
+                if (skillReattach is not null)
+                {
+                    var content = skillReattach(options.AutoCompactTokenThreshold);
+                    if (!string.IsNullOrEmpty(content))
+                    {
+                        // Skip if adding reattach would bring history back up to the threshold,
+                        // which would trigger compaction again on the next iteration.
+                        var postCompactTokens = TokenEstimator.Estimate(history);
+                        var reattachTokenEstimate = content.Length / 4;
+                        var wouldExceedThreshold = options.AutoCompactTokenThreshold > 0
+                            && postCompactTokens + reattachTokenEstimate >= options.AutoCompactTokenThreshold;
+
+                        // Skip if reattach is already the trailing message (exactly-once guard).
+                        var alreadyLastMessage = history.Count > 0
+                            && history[^1].Role == ChatRole.User
+                            && history[^1].Content is [TextBlock tbLast]
+                            && tbLast.Text == content;
+
+                        if (!wouldExceedThreshold && !alreadyLastMessage)
+                        {
+                            history.Add(new ChatMessage(ChatRole.User, [new TextBlock(content)]));
+                        }
+                    }
+                }
+        };
+    }
+
+    /// <summary>
+    /// Assembles the <see cref="AgentLoopSpec"/> for one ISOLATED scheduled firing.
     /// root runs an independent conversation that never touches the session's main history, yet
     /// reuses the CURRENT session's provider/model/effort/output style (via <paramref name="options"/>),
     /// the same live <see cref="BuildPermissions"/> path (including the shared
@@ -205,7 +261,7 @@ public sealed class TurnPipelineBuilder
         // A normal child host so the scheduled root (depth 1) can create depth-2 children; depth-3
         // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
         // stripped so a depth-2 child cannot reintroduce them.
-        var subagentTools = StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools]);
+        var subagentTools = StripSkillTool(StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools]).All);
         var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks);
 
         var tools = this.BuildScheduledTools(options);
@@ -264,6 +320,18 @@ public sealed class TurnPipelineBuilder
     /// <summary>Returns a registry with every <c>schedule_*</c> tool removed.</summary>
     private static ToolRegistry StripScheduleTools(IEnumerable<ITool> tools) =>
         new(tools.Where(t => !t.Name.StartsWith("schedule_", StringComparison.Ordinal)));
+
+    /// <summary>Returns a registry with the <c>skill</c> tool removed.</summary>
+    /// <remarks>
+    /// Subagents must not receive the <c>skill</c> tool because it shares mutable
+    /// <c>SkillSessionState</c> with the root session. A subagent invocation would permanently
+    /// mark a skill loaded in the root's state without adding the body to the root's history;
+    /// the reattach provider is only wired for the root, so re-attachment after compaction would
+    /// then inject bodies the root never actually loaded — the model would believe it has
+    /// instructions it does not have. Skills are a session-level capability of the main agent.
+    /// </remarks>
+    private static ToolRegistry StripSkillTool(IEnumerable<ITool> tools) =>
+        new(tools.Where(t => t.Name != "skill"));
 
     /// <summary>Builds the agent options: effective root system prompt + base bounds.</summary>
     private AgentOptions BuildAgentOptions(SessionOptions options)
@@ -360,7 +428,7 @@ public sealed class TurnPipelineBuilder
         UserHookRunner? userHooks,
         TaskManager tasks)
     {
-        var subagentTools = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]);
+        var subagentTools = StripSkillTool([.. BuiltInTools.All(), .. options.ExtraTools]);
         return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks);
     }
 

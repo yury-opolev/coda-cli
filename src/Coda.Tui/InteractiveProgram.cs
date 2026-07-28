@@ -280,8 +280,21 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             new Coda.Mcp.ListMcpResourcesTool(mcp), new Coda.Mcp.ReadMcpResourceTool(mcp),
             new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp),
         ];
+
+        // Load skills once at session start and build the skill tool (model-invocable skills only).
+        // The session state is shared between the skill tool and the reattach callback so compaction
+        // re-injects exactly the bodies the model loaded in this session.
+        var skillState = new Coda.Tui.Skills.SkillSessionState();
+        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
+            Coda.Tui.Skills.SkillLoader.Load(cwd), skillState);
+
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
-            mcp.Clients.Count > 0 ? [.. mcp.Tools, .. mcpHelperTools] : [];
+        {
+            var mcpTools = mcp.Clients.Count > 0
+                ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, .. mcpHelperTools]
+                : [];
+            return skillTool is not null ? [.. mcpTools, skillTool] : mcpTools;
+        };
         context.ExtraToolsProvider = agentToolsProvider;
         context.Mcp = mcp;
         context.CredentialStore = store;
@@ -313,7 +326,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             }
         }, hostToken);
 
-        using var agentRunner = new AgentRunner(agentToolsProvider);
+        using var agentRunner = new AgentRunner(
+            agentToolsProvider,
+            skillReattachProvider: skillTool is not null
+                ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+                : null);
         using var app = new TuiApp(context, agentToolsProvider, agentRunner: agentRunner);
 
         // The command context and the browser both read the live session through agentRunner (a provider,

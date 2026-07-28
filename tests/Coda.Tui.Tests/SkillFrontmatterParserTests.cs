@@ -151,10 +151,11 @@ public sealed class SkillFrontmatterParserTests
     [InlineData("YES")]
     public void Boolean_spellings_stored_as_raw_string_in_unknown_fields(string boolValue)
     {
-        var fm = Parse($"user-invocable: {boolValue}");
+        // Use a key that is not known to the parser, so the raw string is preserved in UnknownFields.
+        var fm = Parse($"some-flag: {boolValue}");
 
-        Assert.True(fm.UnknownFields.ContainsKey("user-invocable"));
-        Assert.Equal(boolValue, fm.UnknownFields["user-invocable"]);
+        Assert.True(fm.UnknownFields.ContainsKey("some-flag"));
+        Assert.Equal(boolValue, fm.UnknownFields["some-flag"]);
     }
 
     [Fact]

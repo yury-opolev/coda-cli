@@ -16,10 +16,13 @@ public static class SkillFrontmatterParser
     private const string KeyWhenToUse = "when-to-use";
     private const string KeyArgumentHint = "argument-hint";
     private const string KeyArguments = "arguments";
+    private const string KeyDisableModelInvocation = "disable-model-invocation";
+    private const string KeyUserInvocable = "user-invocable";
 
     private static readonly HashSet<string> KnownKeys = new(StringComparer.Ordinal)
     {
         KeyName, KeyDescription, KeyWhenToUse, KeyArgumentHint, KeyArguments,
+        KeyDisableModelInvocation, KeyUserInvocable,
     };
 
     // Keys that carry list values — [bracket] syntax is parsed as a flow list only for these.
@@ -85,7 +88,7 @@ public static class SkillFrontmatterParser
         var bodyLines = lines[(end + 1)..];
         var body = string.Join("\n", bodyLines).Trim();
 
-        var (name, description, whenToUse, argumentHint, arguments, unknown) =
+        var (name, description, whenToUse, argumentHint, arguments, disableModelInvocation, userInvocable, unknown) =
             ParseBlock(frontmatterLines);
 
         return new SkillFrontmatter
@@ -96,6 +99,8 @@ public static class SkillFrontmatterParser
             WhenToUse = whenToUse,
             ArgumentHint = argumentHint,
             Arguments = arguments,
+            DisableModelInvocation = disableModelInvocation,
+            UserInvocable = userInvocable,
             UnknownFields = unknown,
             Body = body,
         };
@@ -109,6 +114,8 @@ public static class SkillFrontmatterParser
         string? WhenToUse,
         string? ArgumentHint,
         IReadOnlyList<string> Arguments,
+        bool DisableModelInvocation,
+        bool UserInvocable,
         IReadOnlyDictionary<string, string> UnknownFields)
         ParseBlock(string[] lines)
     {
@@ -241,6 +248,16 @@ public static class SkillFrontmatterParser
         var argumentHint = GetScalar(KeyArgumentHint);
         var arguments = GetList(KeyArguments);
 
+        // Boolean fields: "true" → true; anything else (including absent) → the default.
+        static bool ParseBool(string? raw, bool defaultValue) =>
+            raw is null ? defaultValue
+            : string.Equals(raw, "true", StringComparison.OrdinalIgnoreCase) ? true
+            : string.Equals(raw, "false", StringComparison.OrdinalIgnoreCase) ? false
+            : defaultValue;
+
+        var disableModelInvocation = ParseBool(GetScalar(KeyDisableModelInvocation), defaultValue: false);
+        var userInvocable = ParseBool(GetScalar(KeyUserInvocable), defaultValue: true);
+
         // ── Collect unknown fields ────────────────────────────────────────
         var unknown = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var (k, v) in scalars)
@@ -259,7 +276,7 @@ public static class SkillFrontmatterParser
             }
         }
 
-        return (name, description, whenToUse, argumentHint, arguments, unknown);
+        return (name, description, whenToUse, argumentHint, arguments, disableModelInvocation, userInvocable, unknown);
     }
 
     // ── Key normalization ─────────────────────────────────────────────────

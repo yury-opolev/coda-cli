@@ -36,10 +36,10 @@ public sealed class SkillCommand : ISlashCommand
     {
         var skills = SkillLoader.Load(context.Session.WorkingDirectory);
 
-        // No arguments → behave like /skills (list).
+        // No arguments → behave like /skills (list), showing only user-invocable skills.
         if (args.Count == 0)
         {
-            return ListSkillsAsync(context, skills);
+            return ListSkillsAsync(context, skills.Where(s => s.UserInvocable).ToList());
         }
 
         var requestedName = args[0];
@@ -52,11 +52,19 @@ public sealed class SkillCommand : ISlashCommand
 
         if (skill is null)
         {
-            var available = skills.Count > 0
-                ? string.Join(", ", skills.Select(s => s.Name))
+            var userVisible = skills.Where(s => s.UserInvocable).ToList();
+            var available = userVisible.Count > 0
+                ? string.Join(", ", userVisible.Select(s => s.Name))
                 : "(none)";
             context.Console.MarkupLine(Theme.WarnMarkup(
                 $"Skill '{requestedName}' not found. Available: {available}"));
+            return Task.FromResult(CommandResult.Continue);
+        }
+
+        if (!skill.UserInvocable)
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup(
+                $"Skill '{skill.Name}' is model-invocable only and cannot be run with /skill."));
             return Task.FromResult(CommandResult.Continue);
         }
 

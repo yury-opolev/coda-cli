@@ -135,13 +135,24 @@ public static class HeadlessRunner
             if (options.Fork) { Console.Error.WriteLine($"[fork] from {resolvedTarget.Id} -> {seedSessionId} ({resolvedTarget.Messages.Count} messages)"); }
         }
 
+        // Load skills and build the skill tool for headless runs as well.
+        var skillState = new Coda.Tui.Skills.SkillSessionState();
+        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
+            Coda.Tui.Skills.SkillLoader.Load(workingDirectory), skillState);
+        var allExtraTools = skillTool is not null
+            ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, skillTool]
+            : mcp.Tools;
+
         var sessionOptions = new SessionOptions
         {
             ProviderId = providerId,
             Model = model,
             WorkingDirectory = workingDirectory,
             PermissionMode = options.PermissionMode,
-            ExtraTools = mcp.Tools,
+            ExtraTools = allExtraTools,
+            SkillReattachContentProvider = skillTool is not null
+                ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+                : null,
             Effort = options.Effort,
             InteractivePrompt = null, // headless: Ask → deny
             EnableBypassClassifier = options.EnableClassifier,

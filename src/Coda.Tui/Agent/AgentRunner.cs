@@ -23,6 +23,7 @@ namespace Coda.Tui.Agent;
 public sealed class AgentRunner : IDisposable
 {
     private readonly Func<IReadOnlyList<ITool>>? extraToolsProvider;
+    private readonly Func<int, string>? skillReattachProvider;
     private readonly Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory;
     private readonly TimeProvider timeProvider;
     private readonly object turnGate = new();
@@ -45,12 +46,26 @@ public sealed class AgentRunner : IDisposable
     {
     }
 
+    /// <summary>
+    /// Creates an <see cref="AgentRunner"/> with an optional skill reattach content provider.
+    /// The provider is invoked each turn to supply <see cref="SessionOptions.SkillReattachContentProvider"/>.
+    /// The integer argument is the resolved <c>AutoCompactTokenThreshold</c> for the turn.
+    /// </summary>
+    public AgentRunner(
+        Func<IReadOnlyList<ITool>>? extraToolsProvider,
+        Func<int, string>? skillReattachProvider)
+        : this(extraToolsProvider, DefaultSessionFactory, null, skillReattachProvider)
+    {
+    }
+
     internal AgentRunner(
         Func<IReadOnlyList<ITool>>? extraToolsProvider,
         Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        Func<int, string>? skillReattachProvider = null)
     {
         this.extraToolsProvider = extraToolsProvider;
+        this.skillReattachProvider = skillReattachProvider;
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -469,6 +484,8 @@ public sealed class AgentRunner : IDisposable
         PermissionModeState = context.Session.PermissionModes,
         // Re-read each turn so /mcp start|stop changes take effect from the next turn.
         ExtraTools = this.extraToolsProvider?.Invoke() ?? [],
+        // Stable callback captured once at construction; null when no skill state is wired.
+        SkillReattachContentProvider = this.skillReattachProvider,
         InteractivePrompt = new TuiPermissionPrompt(context.Prompts, context.Events),
         UserQuestionPrompt = context.Prompts.IsInteractive
             ? new TuiUserQuestionPrompt(context.Prompts, context.Events)

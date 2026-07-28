@@ -463,6 +463,29 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                     && TokenEstimator.Estimate(this.history) > options.AutoCompactTokenThreshold)
                 {
                     await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
+
+                    // After pre-turn compaction, re-inject any skill bodies that were previously
+                    // loaded so the model does not silently lose its skills after compaction.
+                    var reattachContent = options.SkillReattachContentProvider?.Invoke(options.AutoCompactTokenThreshold);
+                    if (!string.IsNullOrEmpty(reattachContent))
+                    {
+                        // Skip if adding reattach would bring history back up to the threshold,
+                        // which would trigger compaction again on the next iteration.
+                        var postCompactTokens = TokenEstimator.Estimate(this.history);
+                        var reattachTokenEstimate = reattachContent.Length / 4;
+                        var wouldExceedThreshold = postCompactTokens + reattachTokenEstimate >= options.AutoCompactTokenThreshold;
+
+                        // Skip if reattach is already the trailing message (exactly-once guard).
+                        var alreadyLastMessage = this.history.Count > 0
+                            && this.history[^1].Role == ChatRole.User
+                            && this.history[^1].Content is [TextBlock tbLast]
+                            && tbLast.Text == reattachContent;
+
+                        if (!wouldExceedThreshold && !alreadyLastMessage)
+                        {
+                            this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(reattachContent)]));
+                        }
+                    }
                 }
 
                 snapshot = this.history.Count;

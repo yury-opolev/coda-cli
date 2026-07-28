@@ -12,6 +12,9 @@ public static partial class SkillLoader
     [LoggerMessage(Level = LogLevel.Debug, Message = "skipping malformed/unreadable skill file (best-effort); it is omitted from the loaded set: file={file}")]
     private static partial void LogSkillSkipped(ILogger logger, string file, Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "skill '{skillName}' has both 'disable-model-invocation: true' and 'user-invocable: false'; it would be unreachable — treating as user-invocable so it can still be run via /skill")]
+    private static partial void LogBothExclusionsSet(ILogger logger, string skillName);
+
     /// <summary>
     /// Loads skills from the Claude CLI (~/.claude/skills, read-only), user-level
     /// (~/.coda/skills), plugin skill directories, and project-level (.coda/skills in
@@ -113,6 +116,18 @@ public static partial class SkillLoader
 
             if (skill is not null)
             {
+                // A skill with both exclusions set to their exclusionary values is unreachable.
+                // Log a warning and restore user-invocability so /skill <name> still works.
+                if (skill.DisableModelInvocation && !skill.UserInvocable)
+                {
+                    if (logger is not null)
+                    {
+                        LogBothExclusionsSet(logger, skill.Name);
+                    }
+
+                    skill = skill with { UserInvocable = true };
+                }
+
                 yield return skill;
             }
         }
@@ -150,6 +165,8 @@ public static partial class SkillLoader
             SourcePath = sourcePath,
             Origin = origin,
             UnknownFields = fm.UnknownFields,
+            DisableModelInvocation = fm.DisableModelInvocation,
+            UserInvocable = fm.UserInvocable,
         };
     }
 }

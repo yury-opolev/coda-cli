@@ -25,6 +25,20 @@ public sealed class SkillFrontmatter
     public IReadOnlyList<string> Arguments { get; init; } = [];
 
     /// <summary>
+    /// When <see langword="true"/>, this skill is excluded from the model-facing <c>skill</c> tool
+    /// (its enum and description catalogue) but remains runnable by the user via <c>/skill</c>.
+    /// Default <see langword="false"/>.
+    /// </summary>
+    public bool DisableModelInvocation { get; init; }
+
+    /// <summary>
+    /// When <see langword="false"/>, this skill is model-only: absent from <c>/skills</c> listing
+    /// and rejected by <c>/skill &lt;name&gt;</c>, but present in the model-facing <c>skill</c> tool.
+    /// Default <see langword="true"/>.
+    /// </summary>
+    public bool UserInvocable { get; init; } = true;
+
+    /// <summary>
     /// Raw string values for any frontmatter key not modelled by this class. List values are
     /// serialized as newline-joined items. Preserves forward-compatibility: a skill authored for
     /// a future Coda version or another harness still loads cleanly.

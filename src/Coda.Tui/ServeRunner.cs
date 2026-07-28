@@ -440,7 +440,21 @@ public static class ServeRunner
                     msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null,
                     secretStore: mcpCredentialStore, includeProjectMcp: includeProjectMcp).ConfigureAwait(false);
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
-                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools, settings.EffortByModel);
+
+                // Load skills once per serve session; build the skill tool if any are model-invocable.
+                var skillState = new Coda.Tui.Skills.SkillSessionState();
+                var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
+                    Coda.Tui.Skills.SkillLoader.Load(options.WorkingDirectory!), skillState);
+
+                var allExtraTools = skillTool is not null
+                    ? (IReadOnlyList<ITool>)[.. mcpTools, skillTool]
+                    : mcpTools;
+
+                Func<int, string>? skillReattach = skillTool is not null
+                    ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+                    : null;
+
+                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, allExtraTools, settings.EffortByModel, skillReattach);
 
                 var streams = await transport.AcceptAsync(cts.Token).ConfigureAwait(false);
                 await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey);
@@ -472,7 +486,8 @@ public static class ServeRunner
         ServeOptions options,
         TelemetrySettings? baseTelemetry = null,
         IReadOnlyList<ITool>? extraTools = null,
-        IReadOnlyDictionary<string, string>? effortByModel = null) =>
+        IReadOnlyDictionary<string, string>? effortByModel = null,
+        Func<int, string>? skillReattachProvider = null) =>
         new()
         {
             ProviderId = options.ProviderId!,
@@ -489,6 +504,7 @@ public static class ServeRunner
             GoalMaxContinuations = options.GoalMaxContinuations,
             // MCP (and any future host-supplied) tools. Empty unless serve connected MCP servers.
             ExtraTools = extraTools ?? [],
+            SkillReattachContentProvider = skillReattachProvider,
             // Serve owns the schedule runtime (parity with interactive) so persisted, project-scoped
             // schedules resume and fire as isolated agent runs. Headless one-shot (`coda run`) keeps
             // the default (false). ServeHost drives CodaSession.InitializeAsync to start it.

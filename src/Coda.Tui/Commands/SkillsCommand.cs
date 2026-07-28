@@ -54,7 +54,8 @@ public sealed class SkillsCommand : ISlashCommand
 
     private Task<CommandResult> ListAsync(CommandContext context)
     {
-        var skills = SkillLoader.Load(context.Session.WorkingDirectory);
+        var allSkills = SkillLoader.Load(context.Session.WorkingDirectory);
+        var skills = allSkills.Where(s => s.UserInvocable).ToList();
 
         if (skills.Count == 0)
         {

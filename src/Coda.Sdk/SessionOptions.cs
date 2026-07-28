@@ -26,6 +26,17 @@ public sealed record SessionOptions
     /// <summary>Extra tools beyond the built-ins (e.g. MCP tools).</summary>
     public IReadOnlyList<ITool> ExtraTools { get; init; } = [];
 
+    /// <summary>
+    /// Optional callback invoked after in-loop or pre-turn compaction to obtain skill body content
+    /// that should be re-injected into history. The integer argument is the resolved
+    /// <see cref="AutoCompactTokenThreshold"/> for this turn; the lambda computes the character
+    /// budget via <c>SkillSessionState.DeriveReattachBudget</c> and calls
+    /// <c>SkillSessionState.GetReattachContent</c>. Returns the content to inject, or null/empty
+    /// when nothing needs re-injecting. Wires the <see cref="Coda.Tui.Skills.SkillSessionState"/>
+    /// into the compaction path without creating a dependency on <c>Coda.Tui</c> in this assembly.
+    /// </summary>
+    public Func<int, string>? SkillReattachContentProvider { get; init; }
+
     /// <summary>Interactive prompt used when the mode decides to Ask. Null = headless (Ask denies).</summary>
     public IPermissionPrompt? InteractivePrompt { get; init; }
 
