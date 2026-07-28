@@ -51,7 +51,7 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearch;
     private readonly GoalSupervisor? goal;
-    private readonly Func<List<ChatMessage>, CancellationToken, Task>? compactAsync;
+    private readonly Func<List<ChatMessage>, IAgentSink, CancellationToken, Task<bool>>? compactAsync;
     private readonly SteeringInbox? steering;
     private readonly AgentExecutionGate? gate;
     private readonly ILogger logger;
@@ -117,7 +117,7 @@ public sealed partial class AgentLoop : IAgentLoop
         LspDiagnosticRegistry? lspDiagnostics = null,
         ToolSearchCoordinator? toolSearch = null,
         GoalSupervisor? goal = null,
-        Func<List<ChatMessage>, CancellationToken, Task>? compactAsync = null,
+        Func<List<ChatMessage>, IAgentSink, CancellationToken, Task<bool>>? compactAsync = null,
         SteeringInbox? steering = null,
         ILogger? logger = null,
         TimeSpan? toolProgressInterval = null,
@@ -282,6 +282,12 @@ public sealed partial class AgentLoop : IAgentLoop
         var stopHookActive = false;
         string? lastInjectedReminder = null;
         var activity = this.initialToolActivity;
+        // Tracks the token count at which a PreCompact hook last blocked compaction. When set,
+        // in-loop and overflow-path compaction are suppressed until history has grown by at least
+        // one full threshold past that point — honouring the documented contract in
+        // PreCompactResult ("the caller must not retry immediately") and preventing the livelock
+        // where a blocking hook is re-spawned on every goal-run iteration.
+        int? blockedCompactionAt = null;
 
         try
         {
@@ -306,21 +312,32 @@ public sealed partial class AgentLoop : IAgentLoop
                 if (this.goal is not null
                     && this.compactAsync is not null
                     && this.options.AutoCompact
-                    && this.options.AutoCompactTokenThreshold > 0
-                    && TokenEstimator.Estimate(history) > this.options.AutoCompactTokenThreshold)
+                    && this.options.AutoCompactTokenThreshold > 0)
                 {
-                    try
+                    var currentTokens = TokenEstimator.Estimate(history);
+                    var growthBuffer = this.options.AutoCompactTokenThreshold;
+                    var suppressedByBlock = blockedCompactionAt is not null
+                        && currentTokens <= blockedCompactionAt.Value + growthBuffer;
+
+                    if (!suppressedByBlock && currentTokens > this.options.AutoCompactTokenThreshold)
                     {
-                        await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
-                    }
-                    catch (OperationCanceledException)
-                    {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        // Compaction is best-effort; never aborts the run.
-                        this.LogCompactionFailed(iteration, ex);
+                        try
+                        {
+                            var didCompact = await this.compactAsync(history, sink, cancellationToken).ConfigureAwait(false);
+                            if (!didCompact)
+                            {
+                                blockedCompactionAt = currentTokens;
+                            }
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            // Compaction is best-effort; never aborts the run.
+                            this.LogCompactionFailed(iteration, ex);
+                        }
                     }
                 }
 
@@ -472,6 +489,19 @@ public sealed partial class AgentLoop : IAgentLoop
                         && ex is not OperationCanceledException
                         && IsContextOverflowError(ex))
                     {
+                        var currentTokens = TokenEstimator.Estimate(history);
+                        var growthBuffer = this.options.AutoCompactTokenThreshold;
+                        var suppressedByBlock = blockedCompactionAt is not null
+                            && currentTokens <= blockedCompactionAt.Value + growthBuffer;
+
+                        // If a previous PreCompact block is still suppressing this path, treat
+                        // the overflow as unrecoverable for this iteration (rethrow so the turn
+                        // surfaces an error rather than spawning the hook subprocess again).
+                        if (suppressedByBlock)
+                        {
+                            throw;
+                        }
+
                         overflowRetried = true;
                         this.LogContextOverflowCompaction(iteration, ex);
 
@@ -482,7 +512,12 @@ public sealed partial class AgentLoop : IAgentLoop
                         redactedThinkingBlocks.Clear();
                         stopReason = null;
                         capturedUsage = null;
-                        await this.compactAsync(history, cancellationToken).ConfigureAwait(false);
+                        var didCompact = await this.compactAsync(history, sink, cancellationToken).ConfigureAwait(false);
+                        if (!didCompact)
+                        {
+                            blockedCompactionAt = currentTokens;
+                        }
+
                         request = request with { Messages = history };
                     }
                     catch (Exception ex) when (transportRetries < MaxTransportRetries

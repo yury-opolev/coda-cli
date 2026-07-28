@@ -146,4 +146,43 @@ public interface IAgentSink
         string? modeApplied,
         IReadOnlyList<string> addedAllow,
         IReadOnlyList<string> addedDeny) { }
+
+    // -------------------------------------------------------------------------
+    // Phase 5: subagent and compaction hook notifications
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// A <c>SubagentStart</c> hook blocked a subagent from running. The <c>task</c> tool will
+    /// return <paramref name="reason"/> as an error result. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that blocked.</param>
+    /// <param name="taskId">The subagent's task identifier.</param>
+    /// <param name="reason">The block reason that the <c>task</c> tool will surface.</param>
+    void OnSubagentBlocked(string hookCommand, string taskId, string reason) { }
+
+    /// <summary>
+    /// A <c>SubagentStop</c> hook replaced the result a subagent returned to its parent. The parent
+    /// agent cannot distinguish a modified result from the original. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that replaced the result.</param>
+    /// <param name="taskId">The subagent's task identifier.</param>
+    /// <param name="originalResult">The result the subagent actually produced.</param>
+    /// <param name="modifiedResult">The result the parent agent will see.</param>
+    void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) { }
+
+    /// <summary>
+    /// A <c>PreCompact</c> hook cancelled a compaction attempt. The caller will not retry
+    /// immediately; the next trigger (auto threshold or <c>/compact</c>) offers a fresh chance. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that cancelled compaction.</param>
+    /// <param name="trigger"><c>"auto"</c> or <c>"manual"</c>.</param>
+    void OnCompactionCancelled(string hookCommand, string trigger) { }
+
+    /// <summary>
+    /// A <c>PostCompact</c> hook injected additional context into history after compaction.
+    /// This fires before skill re-attachment; together they represent the total post-compaction
+    /// context injection (PostCompact context first, then skill bodies). Optional.
+    /// </summary>
+    /// <param name="additionalContext">The text injected as a synthetic user message.</param>
+    void OnPostCompactContextInjected(string additionalContext) { }
 }

@@ -43,6 +43,10 @@ public static class ServeMethods
     public const string EventToolResultModified = "event/toolResultModified";
     public const string EventPermissionDecided = "event/permissionDecided";
     public const string EventPermissionsUpdated = "event/permissionsUpdated";
+    public const string EventSubagentBlocked = "event/subagentBlocked";
+    public const string EventSubagentResultModified = "event/subagentResultModified";
+    public const string EventCompactionCancelled = "event/compactionCancelled";
+    public const string EventPostCompactContextInjected = "event/postCompactContextInjected";
 
     // Server-initiated requests (Coda → orchestrator)
     public const string RequestPermission = "request/permission";

@@ -65,7 +65,7 @@ public sealed record AgentLoopSpec(
     LspDiagnosticRegistry? LspDiagnostics,
     ToolSearchCoordinator? ToolSearch,
     GoalSupervisor? Goal,
-    Func<List<ChatMessage>, CancellationToken, Task>? CompactAsync,
+    Func<List<ChatMessage>, IAgentSink, CancellationToken, Task<bool>>? CompactAsync,
     ILogger Logger,
     SteeringInbox? Steering = null,
     Func<CancellationToken, Task>? PersistTurnAsync = null,

@@ -40,7 +40,7 @@ public sealed class CompactionTests
         };
         var service = new CompactionService(new FakeForkedAgent("SUMMARY: built a parser and tests."));
 
-        var compacted = await service.CompactAsync(history, CancellationToken.None);
+        var (compacted, _) = await service.CompactAsync(history, cancellationToken: CancellationToken.None);
 
         Assert.Equal(2, compacted.Count);
         Assert.Equal(ChatRole.User, compacted[0].Role);
@@ -52,7 +52,7 @@ public sealed class CompactionTests
     public async Task Compact_on_empty_history_returns_it_unchanged()
     {
         var service = new CompactionService(new FakeForkedAgent("unused"));
-        var compacted = await service.CompactAsync([], CancellationToken.None);
+        var (compacted, _) = await service.CompactAsync([], cancellationToken: CancellationToken.None);
         Assert.Empty(compacted);
     }
 

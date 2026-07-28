@@ -88,6 +88,40 @@ public sealed class JsonStreamSink : IAgentSink
         this.Emit(obj);
     }
 
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "subagent_blocked",
+            ["hookCommand"] = hookCommand,
+            ["taskId"] = taskId,
+            ["reason"] = reason,
+        });
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "subagent_result_modified",
+            ["hookCommand"] = hookCommand,
+            ["taskId"] = taskId,
+            ["originalResult"] = originalResult,
+            ["modifiedResult"] = modifiedResult,
+        });
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "compaction_cancelled",
+            ["hookCommand"] = hookCommand,
+            ["trigger"] = trigger,
+        });
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "post_compact_context_injected",
+            ["additionalContext"] = additionalContext,
+        });
+
     /// <summary>Write the terminal result event (called once after the run).</summary>
     public void EmitResult(RunResult result)
     {

@@ -72,6 +72,13 @@ public sealed partial class TaskManager
             Stop(task.Id);
             return "(subagent stopped)";
         }
+        catch (SubagentStartBlockedException)
+        {
+            // A SubagentStart hook (fail-closed) blocked this subagent. Fail the task and
+            // rethrow so TaskTool can surface the reason as an error ToolResult.
+            Fail(task.Id, "blocked by SubagentStart hook");
+            throw;
+        }
         catch (Exception ex)
         {
             Fail(task.Id, ex.Message);
@@ -400,6 +407,18 @@ public sealed partial class TaskManager
 
         public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
             _parent.OnPermissionDecided(hookCommand, toolName, decision);
+
+        public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+            _parent.OnSubagentBlocked(hookCommand, taskId, reason);
+
+        public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+            _parent.OnSubagentResultModified(hookCommand, taskId, originalResult, modifiedResult);
+
+        public void OnCompactionCancelled(string hookCommand, string trigger) =>
+            _parent.OnCompactionCancelled(hookCommand, trigger);
+
+        public void OnPostCompactContextInjected(string additionalContext) =>
+            _parent.OnPostCompactContextInjected(additionalContext);
     }
 
     /// <summary>An IAgentSink that discards everything — used as the parent for background subagents.</summary>

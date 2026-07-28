@@ -77,4 +77,16 @@ public sealed class PlainTextSink : IAgentSink
     }
 
     public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
+
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.error.WriteLine($"  ✗ subagent {taskId} blocked by hook {hookCommand}: {reason}");
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.error.WriteLine($"  ↺ subagent {taskId} result rewritten by hook {hookCommand}");
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.error.WriteLine($"  ✗ compaction ({trigger}) cancelled by hook {hookCommand}");
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.error.WriteLine($"  ↻ PostCompact: injected {additionalContext.Length} chars of additional context");
 }

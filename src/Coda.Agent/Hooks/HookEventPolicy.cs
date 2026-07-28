@@ -29,6 +29,13 @@ public static class HookEventPolicy
             ["Notification"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
                 // Response-side events: fail-open — a broken hook must not discard the response.
                 ["AgentResponse"] = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+                // Subagent lifecycle: SubagentStart is fail-closed (a broken hook must not let an
+                // unshaped subagent run); SubagentStop is fail-open (must not lose the completed work).
+                ["SubagentStart"] = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: false),
+                ["SubagentStop"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+                // Compaction hooks: fail-open — a broken hook must not block or lose a compaction.
+                ["PreCompact"]    = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+                ["PostCompact"]   = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
         };
 
     private static readonly HookEventDefaults UnknownDefault = new(TimeoutSeconds: 10, FailOpen: true);

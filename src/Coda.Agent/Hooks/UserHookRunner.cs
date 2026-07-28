@@ -108,6 +108,18 @@ public sealed class UserHookRunner
     /// </summary>
     public bool AnyHookMutatesDisplay => this.bus.AnyHookMutatesDisplay;
 
+    /// <summary>True when at least one <c>SubagentStart</c> hook is configured.</summary>
+    public bool HasSubagentStart => this.bus.HasSubagentStart;
+
+    /// <summary>True when at least one <c>SubagentStop</c> hook is configured.</summary>
+    public bool HasSubagentStop => this.bus.HasSubagentStop;
+
+    /// <summary>True when at least one <c>PreCompact</c> hook is configured.</summary>
+    public bool HasPreCompact => this.bus.HasPreCompact;
+
+    /// <summary>True when at least one <c>PostCompact</c> hook is configured.</summary>
+    public bool HasPostCompact => this.bus.HasPostCompact;
+
     /// <summary>
     /// Runs all matching <c>PreToolUse</c> hooks in order and returns the merged result.
     /// A hook that exits non-zero (or fails / times out) now <strong>blocks</strong> because
@@ -270,6 +282,60 @@ public sealed class UserHookRunner
         string? taskId,
         CancellationToken ct) =>
         this.bus.RunNotificationAsync(kind, message, taskId, ct);
+
+    /// <summary>
+    /// Runs all <c>SubagentStart</c> hooks before the nested agent makes its first model call.
+    /// Policy: 10 s, fail-closed — a broken hook must not let an unshaped subagent run.
+    /// </summary>
+    public Task<SubagentStartResult> RunSubagentStartAsync(
+        string? parentTaskId,
+        string taskId,
+        int depth,
+        string prompt,
+        IReadOnlyList<string> toolset,
+        TurnShape? parentToolRestriction,
+        CancellationToken ct) =>
+        this.bus.RunSubagentStartAsync(parentTaskId, taskId, depth, prompt, toolset, parentToolRestriction, ct);
+
+    /// <summary>
+    /// Runs all <c>SubagentStop</c> hooks after the nested agent finishes, before its result returns to the parent.
+    /// Policy: 10 s, fail-open — a broken hook must not lose the completed subagent work.
+    /// </summary>
+    public Task<SubagentStopResult> RunSubagentStopAsync(
+        string taskId,
+        int depth,
+        string result,
+        LlmClient.TokenUsage usage,
+        CancellationToken ct) =>
+        this.bus.RunSubagentStopAsync(taskId, depth, result, usage, ct);
+
+    /// <summary>
+    /// Runs all <c>PreCompact</c> hooks before history compaction.
+    /// Policy: 10 s, fail-open — a broken hook lets compaction proceed.
+    /// </summary>
+    public Task<PreCompactResult> RunPreCompactAsync(
+        string trigger,
+        int tokensBefore,
+        int messageCount,
+        string? instructions,
+        int depth,
+        string? taskId,
+        CancellationToken ct) =>
+        this.bus.RunPreCompactAsync(trigger, tokensBefore, messageCount, instructions, depth, taskId, ct);
+
+    /// <summary>
+    /// Runs all <c>PostCompact</c> hooks after history compaction, before the next model call.
+    /// Policy: 10 s, fail-open — a broken hook leaves the compacted history unchanged.
+    /// </summary>
+    public Task<PostCompactResult> RunPostCompactAsync(
+        int tokensBefore,
+        int tokensAfter,
+        int messageCount,
+        string summary,
+        int depth,
+        string? taskId,
+        CancellationToken ct) =>
+        this.bus.RunPostCompactAsync(tokensBefore, tokensAfter, messageCount, summary, depth, taskId, ct);
 
     // -------------------------------------------------------------------------
     // Legacy 2-tuple exec adapter

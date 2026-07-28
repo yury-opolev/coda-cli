@@ -58,10 +58,10 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             lspDiagnostics,
             toolSearch,
             NullLoggerFactory.Instance,
-            (_, _, _) =>
+            (_, _, _, _, _) =>
             {
                 Interlocked.Increment(ref this.compactCalls);
-                return Task.CompletedTask;
+                return Task.FromResult(true);
             },
             scheduleRuntimeProvider ?? (() => null));
     }
@@ -75,6 +75,16 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         }
 
         public IReadOnlyList<ScheduleRuntimeSnapshot> GetSnapshot() => [];
+    }
+
+    private sealed class NullSink : IAgentSink
+    {
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputJson) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private SessionOptions Options(
@@ -196,7 +206,7 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(this.Options(goal: "ship it"), this.Client(), CodaSettings.Empty);
 
-        await spec.CompactAsync!([], CancellationToken.None);
+        await spec.CompactAsync!([], new NullSink(), CancellationToken.None);
 
         Assert.Equal(1, this.compactCalls);
     }
@@ -443,22 +453,22 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     {
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             null!, new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), null!, new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), null!, null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            null!, (_, _, _) => Task.CompletedTask, () => null));
+            null!, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
             NullLoggerFactory.Instance, null!, () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, null!));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), null!));
     }
 
     [Fact]

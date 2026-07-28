@@ -82,6 +82,12 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private string? sessionAppendSystemPrompt;
     private UserHookRunner? sessionHookRunner;
 
+    // Compaction hook runner (Phase 5). Set to loopSpec.UserHooks before each RunAsync turn so
+    // CompactHistoryAsync (called both pre-turn and by TurnPipelineBuilder's in-loop delegate)
+    // can fire Pre/PostCompact hooks. Shared single field; no race because RunAsync is not
+    // re-entrant (one user turn at a time).
+    private UserHookRunner? compactionHooks;
+
     // Reused across the incremental "record on the go" saves so the store's createdUtc cache
     // survives between turns (a fresh store per call would re-read the file every save).
     private SessionTranscriptStore? transcriptStore;
@@ -216,7 +222,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lspDiagnostics,
             this.toolSearchCoordinator,
             this.loggerFactory,
-            this.CompactHistoryAsync,
+            // Wrap the 5-param method into the expected delegate signature.
+            (client, model, trigger, sink, ct) => this.CompactHistoryAsync(client, model, trigger, sink, ct),
             // Evaluated per turn, so once InitializeAsync starts the runtime the main schedule_list
             // sees the live view; it returns null before initialization and when scheduling is off.
             () => this.scheduleRuntime);
@@ -588,32 +595,43 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             // cancel — if the turn ends before offering a boundary the gate still reports "reached".
             using (this.ExecutionGate.BeginExecution())
             {
+                // Set the compaction hook runner from the turn's loopSpec (which already applies
+                // the test-seam override). CompactHistoryAsync reads this field so both the pre-turn
+                // path (here) and the in-loop delegate (TurnPipelineBuilder) share the same runner.
+                this.compactionHooks = loopSpec.UserHooks;
+
                 if (options.AutoCompactTokenThreshold > 0
                     && this.history.Count > 0
                     && TokenEstimator.Estimate(this.history) > options.AutoCompactTokenThreshold)
                 {
-                    await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
+                    var didCompact = await this.CompactHistoryAsync(client, options.Model, "auto", recording, cancellationToken).ConfigureAwait(false);
 
                     // After pre-turn compaction, re-inject any skill bodies that were previously
                     // loaded so the model does not silently lose its skills after compaction.
-                    var reattachContent = options.SkillReattachContentProvider?.Invoke(options.AutoCompactTokenThreshold);
-                    if (!string.IsNullOrEmpty(reattachContent))
+                    // PostCompact additionalContext was already injected inside CompactHistoryAsync.
+                    // Order: PostCompact context first (inside CompactHistoryAsync), then skill
+                    // re-attach here — skill bodies are closest to the model's next turn.
+                    if (didCompact)
                     {
-                        // Skip if adding reattach would bring history back up to the threshold,
-                        // which would trigger compaction again on the next iteration.
-                        var postCompactTokens = TokenEstimator.Estimate(this.history);
-                        var reattachTokenEstimate = reattachContent.Length / 4;
-                        var wouldExceedThreshold = postCompactTokens + reattachTokenEstimate >= options.AutoCompactTokenThreshold;
-
-                        // Skip if reattach is already the trailing message (exactly-once guard).
-                        var alreadyLastMessage = this.history.Count > 0
-                            && this.history[^1].Role == ChatRole.User
-                            && this.history[^1].Content is [TextBlock tbLast]
-                            && tbLast.Text == reattachContent;
-
-                        if (!wouldExceedThreshold && !alreadyLastMessage)
+                        var reattachContent = options.SkillReattachContentProvider?.Invoke(options.AutoCompactTokenThreshold);
+                        if (!string.IsNullOrEmpty(reattachContent))
                         {
-                            this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(reattachContent)]));
+                            // Skip if adding reattach would bring history back up to the threshold,
+                            // which would trigger compaction again on the next iteration.
+                            var postCompactTokens = TokenEstimator.Estimate(this.history);
+                            var reattachTokenEstimate = reattachContent.Length / 4;
+                            var wouldExceedThreshold = postCompactTokens + reattachTokenEstimate >= options.AutoCompactTokenThreshold;
+
+                            // Skip if reattach is already the trailing message (exactly-once guard).
+                            var alreadyLastMessage = this.history.Count > 0
+                                && this.history[^1].Role == ChatRole.User
+                                && this.history[^1].Content is [TextBlock tbLast]
+                                && tbLast.Text == reattachContent;
+
+                            if (!wouldExceedThreshold && !alreadyLastMessage)
+                            {
+                                this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(reattachContent)]));
+                            }
                         }
                     }
                 }
@@ -762,7 +780,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             return;
         }
 
-        await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
+        // For the manual /compact path, use the session hook runner (same as the per-turn runner
+        // for hooks that apply to the full session). The compactionHooks field may not be set yet
+        // if /compact is called before the first RunAsync turn.
+        this.compactionHooks = this.userHookRunnerOverride ?? this.sessionHookRunner;
+        await this.CompactHistoryAsync(client, options.Model, "manual", null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The nominal context window used for the /context breakdown and percentage.</summary>
@@ -967,20 +989,172 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         return (int)(toolChars / 4);
     }
 
-    private async Task CompactHistoryAsync(ILlmClient client, string model, CancellationToken cancellationToken)
+    private async Task<bool> CompactHistoryAsync(
+        ILlmClient client,
+        string model,
+        string trigger,
+        IAgentSink? sink,
+        CancellationToken cancellationToken)
     {
         if (this.history.Count == 0)
+        {
+            return false;
+        }
+
+        var hooks = this.compactionHooks;
+        var tokensBefore = TokenEstimator.Estimate(this.history);
+        var messageCount = this.history.Count;
+
+        // PreCompact hook: fail-open, but a "block" decision cancels this compaction attempt.
+        // The caller must not immediately retry — the next trigger (auto threshold or /compact)
+        // offers a fresh chance.
+        if (hooks is { HasPreCompact: true })
+        {
+            PreCompactResult preResult;
+            try
+            {
+                preResult = await hooks.RunPreCompactAsync(
+                    trigger,
+                    tokensBefore,
+                    messageCount,
+                    instructions: null,
+                    depth: 0,
+                    taskId: null,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Fail-open: a broken hook lets compaction proceed.
+                preResult = PreCompactResult.Allow;
+            }
+
+            if (preResult.Block)
+            {
+                sink?.OnCompactionCancelled(preResult.ByHookCommand ?? string.Empty, trigger);
+                return false; // compaction cancelled by hook
+            }
+
+            // Run compaction with possible instructions override.
+            var service = new CompactionService(new ForkedAgentRunner(client, model));
+            var (compacted, summary) = await service.CompactAsync(
+                this.history,
+                preResult.Instructions,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!ReferenceEquals(compacted, this.history))
+            {
+                this.history.Clear();
+                this.history.AddRange(compacted);
+
+                // PostCompact hook: injects additional context before skill re-attachment.
+                // Order: PostCompact context first, then skill re-attach — so skill bodies
+                // are closest to the model's next turn (deterministic, documented ordering).
+                if (hooks is { HasPostCompact: true } && summary is not null)
+                {
+                    await this.ApplyPostCompactHookAsync(
+                        tokensBefore,
+                        messageCount,
+                        summary,
+                        hooks,
+                        sink,
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            return !ReferenceEquals(compacted, this.history) || compacted.Count < messageCount;
+        }
+        else
+        {
+            // No PreCompact hooks: run compaction directly.
+            var service = new CompactionService(new ForkedAgentRunner(client, model));
+            var (compacted, summary) = await service.CompactAsync(
+                this.history,
+                instructionsOverride: null,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!ReferenceEquals(compacted, this.history))
+            {
+                this.history.Clear();
+                this.history.AddRange(compacted);
+
+                if (hooks is { HasPostCompact: true } && summary is not null)
+                {
+                    await this.ApplyPostCompactHookAsync(
+                        tokensBefore,
+                        messageCount,
+                        summary,
+                        hooks,
+                        sink,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Fires the <c>PostCompact</c> hook and injects <c>additionalContext</c> into history when
+    /// present. The injection is budget-guarded: if adding the context would bring the token count
+    /// back up to or beyond the compaction threshold, the injection is skipped so compaction is not
+    /// immediately undone. Exactly-once: the check is inside <see cref="CompactHistoryAsync"/>.
+    /// </summary>
+    private async Task ApplyPostCompactHookAsync(
+        int tokensBefore,
+        int messageCount,
+        string summary,
+        UserHookRunner hooks,
+        IAgentSink? sink,
+        CancellationToken cancellationToken)
+    {
+        var tokensAfter = TokenEstimator.Estimate(this.history);
+        PostCompactResult postResult;
+        try
+        {
+            postResult = await hooks.RunPostCompactAsync(
+                tokensBefore,
+                tokensAfter,
+                messageCount,
+                summary,
+                depth: 0,
+                taskId: null,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken PostCompact hook leaves history unchanged.
+            return;
+        }
+
+        if (string.IsNullOrEmpty(postResult.AdditionalContext))
         {
             return;
         }
 
-        var service = new CompactionService(new ForkedAgentRunner(client, model));
-        var compacted = await service.CompactAsync(this.history, cancellationToken).ConfigureAwait(false);
-        if (!ReferenceEquals(compacted, this.history))
+        // Budget guard: re-injecting more than compaction freed defeats the compaction.
+        var options = this.ResolveEffectiveOptions();
+        var threshold = options.AutoCompactTokenThreshold;
+        if (threshold > 0)
         {
-            this.history.Clear();
-            this.history.AddRange(compacted);
+            var contextTokens = postResult.AdditionalContext.Length / 4;
+            if (tokensAfter + contextTokens >= threshold)
+            {
+                return;
+            }
         }
+
+        this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(postResult.AdditionalContext)]));
+        sink?.OnPostCompactContextInjected(postResult.AdditionalContext);
     }
 
     private async Task PersistTranscriptAsync(CancellationToken cancellationToken)

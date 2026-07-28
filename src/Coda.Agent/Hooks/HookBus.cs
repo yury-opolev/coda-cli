@@ -87,6 +87,10 @@ public sealed partial class HookBus
             && h.Mutates.Any(m =>
                 string.Equals(m, "displayContent", StringComparison.OrdinalIgnoreCase)
                 || string.Equals(m, "modifiedResponse", StringComparison.OrdinalIgnoreCase)));
+        this.HasSubagentStart = hooks.Any(h => string.Equals(h.Event, "SubagentStart", StringComparison.OrdinalIgnoreCase));
+        this.HasSubagentStop = hooks.Any(h => string.Equals(h.Event, "SubagentStop", StringComparison.OrdinalIgnoreCase));
+        this.HasPreCompact = hooks.Any(h => string.Equals(h.Event, "PreCompact", StringComparison.OrdinalIgnoreCase));
+        this.HasPostCompact = hooks.Any(h => string.Equals(h.Event, "PostCompact", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
@@ -122,6 +126,18 @@ public sealed partial class HookBus
     /// the TUI to decide whether to buffer assistant text before display.
     /// </summary>
     public bool AnyHookMutatesDisplay { get; }
+
+    /// <summary>True when at least one <c>SubagentStart</c> hook is configured.</summary>
+    public bool HasSubagentStart { get; }
+
+    /// <summary>True when at least one <c>SubagentStop</c> hook is configured.</summary>
+    public bool HasSubagentStop { get; }
+
+    /// <summary>True when at least one <c>PreCompact</c> hook is configured.</summary>
+    public bool HasPreCompact { get; }
+
+    /// <summary>True when at least one <c>PostCompact</c> hook is configured.</summary>
+    public bool HasPostCompact { get; }
 
     // -------------------------------------------------------------------------
     // Public run-methods (mirror the old UserHookRunner public surface)
@@ -583,6 +599,188 @@ public sealed partial class HookBus
         {
             // Observation-only; swallow.
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5 run-methods: SubagentStart, SubagentStop, PreCompact, PostCompact
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Runs all <c>SubagentStart</c> hooks before the nested agent makes its first model call.
+    /// Policy: 10 s timeout, fail-closed — a broken hook must not let an unshaped subagent run.
+    /// </summary>
+    /// <param name="parentTaskId">The parent task identifier, or <see langword="null"/> for a main-agent spawn.</param>
+    /// <param name="taskId">The new subagent's task identifier.</param>
+    /// <param name="depth">Subagent nesting depth (1 or 2).</param>
+    /// <param name="prompt">The subagent's task text.</param>
+    /// <param name="toolset">Tool names the child will be offered.</param>
+    /// <param name="parentToolRestriction">
+    /// The parent's inherited tool restriction (monotonic: a hook can only tighten it, never widen it).
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<SubagentStartResult> RunSubagentStartAsync(
+        string? parentTaskId,
+        string taskId,
+        int depth,
+        string prompt,
+        IReadOnlyList<string> toolset,
+        TurnShape? parentToolRestriction,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("SubagentStart", toolName: null);
+        if (matching.Count == 0)
+        {
+            return SubagentStartResult.Allow;
+        }
+
+        var payload = this.BuildSubagentStartPayload(parentTaskId, taskId, depth, prompt, toolset);
+        var pairs = new List<(UserHook Hook, HookOutput Output)>(matching.Count);
+
+        // SubagentStart uses the same pair-list pattern as UserPromptSubmit so Continue:false
+        // short-circuits and per-hook commands are available for logging.
+        foreach (var hook in matching)
+        {
+            var output = await this.RunSingleHookAsync(hook, "SubagentStart", payload, ct).ConfigureAwait(false);
+            pairs.Add((hook, output));
+            if (!output.Continue)
+            {
+                break;
+            }
+        }
+
+        return this.MergeSubagentStartOutputs(pairs, parentToolRestriction);
+    }
+
+    /// <summary>
+    /// Runs all <c>SubagentStop</c> hooks after the nested agent finishes, before its result
+    /// returns to the parent.
+    /// Policy: 10 s timeout, fail-open — a broken hook must not lose the completed subagent work.
+    /// </summary>
+    /// <param name="taskId">The subagent's task identifier.</param>
+    /// <param name="depth">Subagent nesting depth.</param>
+    /// <param name="result">The subagent's report text.</param>
+    /// <param name="usage">The subagent's accumulated token usage.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<SubagentStopResult> RunSubagentStopAsync(
+        string taskId,
+        int depth,
+        string result,
+        TokenUsage usage,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("SubagentStop", toolName: null);
+        if (matching.Count == 0)
+        {
+            return SubagentStopResult.NoChange;
+        }
+
+        var payload = this.BuildSubagentStopPayload(taskId, depth, result, usage);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "SubagentStop", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken stop hook must not lose the subagent's completed work.
+            return SubagentStopResult.NoChange;
+        }
+
+        return this.MergeSubagentStopOutputs(matching, outputs);
+    }
+
+    /// <summary>
+    /// Runs all <c>PreCompact</c> hooks before history compaction.
+    /// Policy: 10 s timeout, fail-open — a broken hook must not block or corrupt the compaction.
+    /// </summary>
+    /// <param name="trigger"><c>"auto"</c> when triggered by the token threshold; <c>"manual"</c> for the <c>/compact</c> command.</param>
+    /// <param name="tokensBefore">Estimated token count before compaction.</param>
+    /// <param name="messageCount">Number of messages in history.</param>
+    /// <param name="instructions">The current summarisation instructions, or <see langword="null"/> for the default.</param>
+    /// <param name="depth">Agent nesting depth (always 0 for the main session).</param>
+    /// <param name="taskId">Task identifier, or <see langword="null"/> for the main agent.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<PreCompactResult> RunPreCompactAsync(
+        string trigger,
+        int tokensBefore,
+        int messageCount,
+        string? instructions,
+        int depth,
+        string? taskId,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("PreCompact", toolName: null);
+        if (matching.Count == 0)
+        {
+            return PreCompactResult.Allow;
+        }
+
+        var payload = this.BuildPreCompactPayload(trigger, tokensBefore, messageCount, instructions, depth, taskId);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "PreCompact", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken hook lets compaction proceed.
+            return PreCompactResult.Allow;
+        }
+
+        return ParsePreCompactOutputs(matching, outputs);
+    }
+
+    /// <summary>
+    /// Runs all <c>PostCompact</c> hooks after history compaction, before the next model call.
+    /// Policy: 10 s timeout, fail-open — a broken hook leaves the compacted history unchanged.
+    /// </summary>
+    /// <param name="tokensBefore">Estimated token count before compaction.</param>
+    /// <param name="tokensAfter">Estimated token count after compaction.</param>
+    /// <param name="messageCount">Number of messages in the compacted history.</param>
+    /// <param name="summary">The summary text produced by the compaction.</param>
+    /// <param name="depth">Agent nesting depth (always 0 for the main session).</param>
+    /// <param name="taskId">Task identifier, or <see langword="null"/> for the main agent.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<PostCompactResult> RunPostCompactAsync(
+        int tokensBefore,
+        int tokensAfter,
+        int messageCount,
+        string summary,
+        int depth,
+        string? taskId,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("PostCompact", toolName: null);
+        if (matching.Count == 0)
+        {
+            return PostCompactResult.NoChange;
+        }
+
+        var payload = this.BuildPostCompactPayload(tokensBefore, tokensAfter, messageCount, summary, depth, taskId);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "PostCompact", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken hook leaves the compacted history unchanged.
+            return PostCompactResult.NoChange;
+        }
+
+        return ParsePostCompactOutputs(outputs);
     }
 
     // -------------------------------------------------------------------------
@@ -1406,6 +1604,345 @@ public sealed partial class HookBus
     }
 
     // -------------------------------------------------------------------------
+    // Phase 5 merge methods: SubagentStart, SubagentStop, PreCompact, PostCompact
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Merges <c>SubagentStart</c> hook outputs. Decision strictest-wins; <c>modifiedPrompt</c>
+    /// last-writer-wins; <c>additionalContext</c> and <c>appendSystemPrompt</c> concatenated;
+    /// <c>allowedTools</c> intersected and <c>deniedTools</c> unioned — then composed monotonically
+    /// with <paramref name="parentToolRestriction"/> so a hook can never widen the inherited restriction.
+    /// </summary>
+    private SubagentStartResult MergeSubagentStartOutputs(
+        IReadOnlyList<(UserHook Hook, HookOutput Output)> pairs,
+        TurnShape? parentToolRestriction)
+    {
+        if (pairs.Count == 0)
+        {
+            return SubagentStartResult.Allow;
+        }
+
+        string? decision = null;
+        var reasons = new List<string>();
+        var continueRun = true;
+        string? stopReason = null;
+        string? modifiedPrompt = null;
+        string? modifiedPromptHookCommand = null;
+        var additionalContexts = new List<string>();
+        var appendSystemPrompts = new List<string>();
+        List<string>? allowedTools = null;
+        var allowedHasValue = false;
+        List<string>? deniedTools = null;
+        string? byHookCommand = null;
+
+        for (var i = 0; i < pairs.Count; i++)
+        {
+            var (hook, output) = pairs[i];
+
+            decision = StrictestDecision(decision, output.Decision);
+            if (IsBlockingDecision(output.Decision) && !string.IsNullOrEmpty(output.Reason))
+            {
+                reasons.Add(output.Reason);
+            }
+
+            if (!output.Continue)
+            {
+                continueRun = false;
+                if (output.StopReason is not null)
+                {
+                    stopReason = output.StopReason;
+                }
+            }
+
+            var specific = output.HookSpecificOutput;
+            if (specific is null)
+            {
+                continue;
+            }
+
+            if (TryGetString(specific, "modifiedPrompt", out var mp))
+            {
+                if (modifiedPrompt is not null)
+                {
+                    this.LogFieldOverride("modifiedPrompt", modifiedPrompt, mp!);
+                }
+
+                modifiedPrompt = mp;
+                modifiedPromptHookCommand = hook.Command;
+                byHookCommand = hook.Command;
+            }
+
+            if (TryGetString(specific, "additionalContext", out var ac))
+            {
+                additionalContexts.Add(ac!);
+            }
+
+            if (TryGetString(specific, "appendSystemPrompt", out var asp))
+            {
+                appendSystemPrompts.Add(asp!);
+            }
+
+            // allowedTools — intersect across hooks (null = no opinion from this hook).
+            if (specific.TryGetPropertyValue("allowedTools", out var allowedNode)
+                && allowedNode is JsonArray allowedArray)
+            {
+                var hookAllowed = ReadStringArray(allowedArray).ToList();
+                if (!allowedHasValue)
+                {
+                    allowedTools = hookAllowed;
+                    allowedHasValue = true;
+                }
+                else
+                {
+                    var hookSet = new HashSet<string>(hookAllowed, StringComparer.OrdinalIgnoreCase);
+                    allowedTools = [.. (allowedTools ?? []).Where(t => hookSet.Contains(t))];
+                }
+            }
+
+            // deniedTools — union across hooks.
+            if (specific.TryGetPropertyValue("deniedTools", out var deniedNode)
+                && deniedNode is JsonArray deniedArray)
+            {
+                var hookDenied = ReadStringArray(deniedArray);
+                if (deniedTools is null)
+                {
+                    deniedTools = [.. hookDenied];
+                }
+                else
+                {
+                    foreach (var t in hookDenied)
+                    {
+                        if (!deniedTools.Any(e => string.Equals(e, t, StringComparison.OrdinalIgnoreCase)))
+                        {
+                            deniedTools.Add(t);
+                        }
+                    }
+                }
+            }
+        }
+
+        if (!continueRun || IsBlockingDecision(decision))
+        {
+            var blockReason = reasons.Count > 0
+                ? string.Join("\n\n", reasons)
+                : stopReason ?? "blocked by SubagentStart hook";
+            return new SubagentStartResult { Block = true, Reason = blockReason };
+        }
+
+        // Compose tool restriction monotonically with the parent's: a hook can only tighten.
+        // AppendSystemPrompt is carried in SubagentStartResult and applied directly in
+        // SubagentHost — it must NOT also be placed in the shape, or TurnShapeResolver would
+        // apply it a second time.
+        var shape = ComposeSubagentToolShape(
+            parentToolRestriction,
+            allowedTools,
+            allowedHasValue,
+            deniedTools);
+
+        return new SubagentStartResult
+        {
+            Block = false,
+            ModifiedPrompt = modifiedPrompt,
+            AdditionalContext = additionalContexts.Count > 0 ? string.Join("\n\n", additionalContexts) : null,
+            AppendSystemPrompt = appendSystemPrompts.Count > 0 ? string.Join("\n\n", appendSystemPrompts) : null,
+            Shape = shape,
+            ByHookCommand = byHookCommand ?? modifiedPromptHookCommand,
+        };
+    }
+
+    /// <summary>
+    /// Composes hook tool lists with the inherited parent restriction, producing the effective
+    /// <see cref="TurnShape"/> for the child subagent.
+    /// <para>
+    /// Monotonicity is preserved: <c>allowedTools</c> is intersected with the parent's allowed set
+    /// (a hook cannot widen what the parent has restricted), and <c>deniedTools</c> is unioned with
+    /// the parent's denied set (a hook cannot un-deny what the parent has denied).
+    /// </para>
+    /// </summary>
+    private static TurnShape? ComposeSubagentToolShape(
+        TurnShape? parent,
+        List<string>? hookAllowed,
+        bool hookAllowedHasValue,
+        List<string>? hookDenied)
+    {
+        // Start from the parent's restriction.
+        List<string>? effectiveAllowed = parent?.AllowedTools?.ToList();
+        var effectiveAllowedHasValue = parent?.AllowedTools is not null;
+        List<string>? effectiveDenied = parent?.DeniedTools?.ToList();
+
+        // Intersect allowed: a hook cannot widen a parent restriction.
+        if (hookAllowedHasValue)
+        {
+            if (!effectiveAllowedHasValue)
+            {
+                // Parent had no AllowedTools filter; hook starts one.
+                effectiveAllowed = hookAllowed;
+                effectiveAllowedHasValue = true;
+            }
+            else
+            {
+                // Both parent and hook specify allowed lists: intersect.
+                var hookSet = new HashSet<string>(hookAllowed ?? [], StringComparer.OrdinalIgnoreCase);
+                effectiveAllowed = [.. (effectiveAllowed ?? []).Where(t => hookSet.Contains(t))];
+            }
+        }
+
+        // Union denied: a hook can only add denials, never remove them.
+        if (hookDenied is not null)
+        {
+            if (effectiveDenied is null)
+            {
+                effectiveDenied = [.. hookDenied];
+            }
+            else
+            {
+                foreach (var t in hookDenied)
+                {
+                    if (!effectiveDenied.Any(e => string.Equals(e, t, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        effectiveDenied.Add(t);
+                    }
+                }
+            }
+        }
+
+        if (!effectiveAllowedHasValue && effectiveDenied is null)
+        {
+            return null;
+        }
+
+        return new TurnShape
+        {
+            AllowedTools = effectiveAllowedHasValue ? effectiveAllowed?.AsReadOnly() : null,
+            DeniedTools = effectiveDenied?.AsReadOnly(),
+        };
+    }
+
+    /// <summary>
+    /// Merges <c>SubagentStop</c> hook outputs. A <c>block</c> decision forces continuation;
+    /// <c>modifiedResult</c> is last-writer-wins.
+    /// </summary>
+    private SubagentStopResult MergeSubagentStopOutputs(
+        IReadOnlyList<UserHook> matching,
+        IReadOnlyList<HookOutput> outputs)
+    {
+        if (outputs.Count == 0)
+        {
+            return SubagentStopResult.NoChange;
+        }
+
+        var merged = MergeOutputs(outputs);
+
+        string? modifiedResult = null;
+        string? byHookCommand = null;
+        for (var i = 0; i < outputs.Count; i++)
+        {
+            var specific = outputs[i].HookSpecificOutput;
+            if (specific is null || !TryGetStringAllowEmpty(specific, "modifiedResult", out var mr))
+            {
+                continue;
+            }
+
+            if (modifiedResult is not null)
+            {
+                this.LogFieldOverride("modifiedResult", modifiedResult, mr!);
+            }
+
+            modifiedResult = mr;
+            byHookCommand = i < matching.Count ? matching[i].Command : null;
+        }
+
+        // A block decision forces the subagent to continue; reason is injected as next instruction.
+        if (IsBlockingDecision(merged.Decision) && !string.IsNullOrWhiteSpace(merged.Reason))
+        {
+            return new SubagentStopResult
+            {
+                Block = true,
+                Reason = merged.Reason,
+                ModifiedResult = modifiedResult,
+                ByHookCommand = byHookCommand ?? (matching.Count > 0 ? matching[0].Command : null),
+            };
+        }
+
+        return modifiedResult is null
+            ? SubagentStopResult.NoChange
+            : new SubagentStopResult { ModifiedResult = modifiedResult, ByHookCommand = byHookCommand };
+    }
+
+    /// <summary>
+    /// Parses <c>PreCompact</c> hook outputs. A <c>block</c> decision cancels the compaction;
+    /// <c>instructions</c> is last-writer-wins.
+    /// </summary>
+    private static PreCompactResult ParsePreCompactOutputs(
+        IReadOnlyList<UserHook> matching,
+        IReadOnlyList<HookOutput> outputs)
+    {
+        if (outputs.Count == 0)
+        {
+            return PreCompactResult.Allow;
+        }
+
+        var merged = MergeOutputs(outputs);
+
+        if (IsBlockingDecision(merged.Decision))
+        {
+            // Find the first hook that issued the blocking decision so we can surface its command.
+            string? byHookCommand = null;
+            for (var i = 0; i < outputs.Count && i < matching.Count; i++)
+            {
+                if (IsBlockingDecision(outputs[i].Decision))
+                {
+                    byHookCommand = matching[i].Command;
+                    break;
+                }
+            }
+
+            return new PreCompactResult { Block = true, ByHookCommand = byHookCommand };
+        }
+
+        // instructions — last-writer-wins across all hooks.
+        string? instructions = null;
+        foreach (var output in outputs)
+        {
+            if (output.HookSpecificOutput is { } specific
+                && TryGetString(specific, "instructions", out var inst))
+            {
+                instructions = inst;
+            }
+        }
+
+        return instructions is null ? PreCompactResult.Allow : new PreCompactResult { Instructions = instructions };
+    }
+
+    /// <summary>
+    /// Parses <c>PostCompact</c> hook outputs. <c>additionalContext</c> is concatenated in hook order.
+    /// </summary>
+    private static PostCompactResult ParsePostCompactOutputs(IReadOnlyList<HookOutput> outputs)
+    {
+        if (outputs.Count == 0)
+        {
+            return PostCompactResult.NoChange;
+        }
+
+        var additionalContexts = new List<string>();
+        foreach (var output in outputs)
+        {
+            if (output.HookSpecificOutput is { } specific
+                && specific.TryGetPropertyValue("additionalContext", out var node)
+                && node is JsonValue jv
+                && jv.TryGetValue<string>(out var ctx)
+                && !string.IsNullOrWhiteSpace(ctx))
+            {
+                additionalContexts.Add(ctx);
+            }
+        }
+
+        return additionalContexts.Count > 0
+            ? new PostCompactResult { AdditionalContext = string.Join("\n\n", additionalContexts) }
+            : PostCompactResult.NoChange;
+    }
+
+    // -------------------------------------------------------------------------
     // Payload builders
     // -------------------------------------------------------------------------
 
@@ -1715,6 +2252,128 @@ public sealed partial class HookBus
             AppendSystemPrompt = appendSystemPrompts.Count > 0 ? string.Join("\n\n", appendSystemPrompts) : null,
             InitialUserMessage = initialUserMessage,
         };
+    }
+
+    // -------------------------------------------------------------------------
+    // Phase 5 payload builders
+    // -------------------------------------------------------------------------
+
+    private string BuildSubagentStartPayload(
+        string? parentTaskId,
+        string taskId,
+        int depth,
+        string prompt,
+        IReadOnlyList<string> toolset)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "SubagentStart", depth, taskId);
+            if (parentTaskId is not null)
+            {
+                writer.WriteString("parentTaskId", parentTaskId);
+            }
+            else
+            {
+                writer.WriteNull("parentTaskId");
+            }
+
+            writer.WriteString("taskId", taskId);
+            writer.WriteNumber("depth", depth);
+            writer.WriteString("prompt", prompt);
+            writer.WriteStartArray("toolset");
+            foreach (var tool in toolset)
+            {
+                writer.WriteStringValue(tool);
+            }
+
+            writer.WriteEndArray();
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildSubagentStopPayload(
+        string taskId,
+        int depth,
+        string result,
+        TokenUsage usage)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "SubagentStop", depth, taskId);
+            writer.WriteString("taskId", taskId);
+            writer.WriteNumber("depth", depth);
+            writer.WriteString("result", result);
+            writer.WriteStartObject("usage");
+            writer.WriteNumber("inputTokens", usage.InputTokens);
+            writer.WriteNumber("outputTokens", usage.OutputTokens);
+            writer.WriteNumber("cacheReadTokens", usage.CacheReadTokens);
+            writer.WriteNumber("cacheWrite5mTokens", usage.CacheWrite5mTokens);
+            writer.WriteNumber("cacheWrite1hTokens", usage.CacheWrite1hTokens);
+            writer.WriteEndObject();
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildPreCompactPayload(
+        string trigger,
+        int tokensBefore,
+        int messageCount,
+        string? instructions,
+        int depth,
+        string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "PreCompact", depth, taskId);
+            writer.WriteString("trigger", trigger);
+            writer.WriteNumber("tokensBefore", tokensBefore);
+            writer.WriteNumber("messageCount", messageCount);
+            if (instructions is not null)
+            {
+                writer.WriteString("instructions", instructions);
+            }
+            else
+            {
+                writer.WriteNull("instructions");
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildPostCompactPayload(
+        int tokensBefore,
+        int tokensAfter,
+        int messageCount,
+        string summary,
+        int depth,
+        string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "PostCompact", depth, taskId);
+            writer.WriteNumber("tokensBefore", tokensBefore);
+            writer.WriteNumber("tokensAfter", tokensAfter);
+            writer.WriteNumber("messageCount", messageCount);
+            writer.WriteString("summary", summary);
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
     }
 
     private void WriteEnvelope(Utf8JsonWriter writer, string eventName, int depth, string? taskId)

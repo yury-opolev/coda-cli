@@ -41,7 +41,7 @@ public sealed class TurnPipelineBuilder
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
     private readonly ILoggerFactory loggerFactory;
-    private readonly Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync;
+    private readonly Func<ILlmClient, string, string, IAgentSink?, CancellationToken, Task<bool>> compactHistoryAsync;
     private readonly Func<IScheduleRuntimeView?> scheduleRuntimeProvider;
 
     /// <summary>
@@ -58,6 +58,8 @@ public sealed class TurnPipelineBuilder
     /// <param name="compactHistoryAsync">
     /// Compaction delegate bound to the session's in-place history compaction
     /// (<c>CodaSession.CompactHistoryAsync</c>); invoked by the goal-run compact callback.
+    /// Returns <see langword="true"/> when compaction actually ran, <see langword="false"/> when
+    /// it was blocked by a <c>PreCompact</c> hook or skipped because history was empty.
     /// </param>
     /// <param name="scheduleRuntimeProvider">
     /// Stable accessor for the session's schedule runtime-state view. Evaluated on every
@@ -72,7 +74,7 @@ public sealed class TurnPipelineBuilder
         LspDiagnosticRegistry? lspDiagnostics,
         ToolSearchCoordinator? toolSearchCoordinator,
         ILoggerFactory loggerFactory,
-        Func<ILlmClient, string, CancellationToken, Task> compactHistoryAsync,
+        Func<ILlmClient, string, string, IAgentSink?, CancellationToken, Task<bool>> compactHistoryAsync,
         Func<IScheduleRuntimeView?> scheduleRuntimeProvider)
     {
         this.todos = todos ?? throw new ArgumentNullException(nameof(todos));
@@ -178,15 +180,18 @@ public sealed class TurnPipelineBuilder
     ///     consecutively without intervening turns).</item>
     /// </list>
     /// </remarks>
-    private Func<List<ChatMessage>, CancellationToken, Task> BuildCompactDelegate(
+    private Func<List<ChatMessage>, IAgentSink, CancellationToken, Task<bool>> BuildCompactDelegate(
         ILlmClient client,
         SessionOptions options)
     {
         var skillReattach = options.SkillReattachContentProvider;
-        return async (history, ct) =>
+        return async (history, sink, ct) =>
         {
-                await this.compactHistoryAsync(client, options.Model, ct).ConfigureAwait(false);
-                if (skillReattach is not null)
+                var didCompact = await this.compactHistoryAsync(client, options.Model, "auto", sink, ct).ConfigureAwait(false);
+                // PostCompact additionalContext is injected inside compactHistoryAsync (before we
+                // return here), so skill re-attach goes after it — skill bodies are closest to the
+                // model's next turn.
+                if (didCompact && skillReattach is not null)
                 {
                     var content = skillReattach(options.AutoCompactTokenThreshold);
                     if (!string.IsNullOrEmpty(content))
@@ -210,6 +215,8 @@ public sealed class TurnPipelineBuilder
                         }
                     }
                 }
+
+                return didCompact;
         };
     }
 

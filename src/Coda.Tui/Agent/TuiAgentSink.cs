@@ -121,4 +121,16 @@ public sealed class TuiAgentSink : IAgentSink
         IReadOnlyList<string> addedAllow,
         IReadOnlyList<string> addedDeny) =>
         this.publisher.Publish(new PermissionsUpdatedEvent(hookCommand, modeApplied, addedAllow, addedDeny));
+
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.publisher.Publish(new SubagentBlockedEvent(hookCommand, taskId, reason));
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.publisher.Publish(new SubagentResultModifiedEvent(hookCommand, taskId, originalResult, modifiedResult));
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.publisher.Publish(new CompactionCancelledUiEvent(hookCommand, trigger));
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.publisher.Publish(new PostCompactContextInjectedEvent(additionalContext));
 }

@@ -35,7 +35,7 @@ public sealed class SkillSubagentRegistryTests : IDisposable
         lspDiagnostics: null,
         toolSearchCoordinator: null,
         NullLoggerFactory.Instance,
-        (_, _, _) => Task.CompletedTask,
+        (_, _, _, _, _) => Task.FromResult(true),
         () => null);
 
     private static ILlmClient StubClient() => new StubLlmClient();
@@ -226,7 +226,6 @@ public sealed class SkillSessionStateFindingsTests
 public sealed class SkillReattachPipelineTests : IDisposable
 {
     private readonly string root = Directory.CreateTempSubdirectory("coda_skill_pipe_").FullName;
-    private int compactCalls;
 
     private TurnPipelineBuilder NewBuilder() => new(
         new TodoStore(),
@@ -236,13 +235,7 @@ public sealed class SkillReattachPipelineTests : IDisposable
         lspDiagnostics: null,
         toolSearchCoordinator: null,
         NullLoggerFactory.Instance,
-        (_, _, _) =>
-        {
-            // No-op compaction: history is NOT modified, simulating post-compact state
-            // that's already at or near the threshold.
-            Interlocked.Increment(ref this.compactCalls);
-            return Task.CompletedTask;
-        },
+        (_, _, _, _, _) => Task.FromResult(true),
         () => null);
 
     private static ILlmClient StubClient() => new StubLlmClient();
@@ -290,7 +283,7 @@ public sealed class SkillReattachPipelineTests : IDisposable
         };
         var historyCountBefore = history.Count;
 
-        await spec.CompactAsync!(history, CancellationToken.None);
+        await spec.CompactAsync!(history, new NullSink(), CancellationToken.None);
 
         // Reattach must NOT have been injected because history was already near the threshold.
         Assert.Equal(historyCountBefore, history.Count);
@@ -319,12 +312,12 @@ public sealed class SkillReattachPipelineTests : IDisposable
         var history = new List<ChatMessage>();
 
         // First compaction: reattach content is injected.
-        await spec.CompactAsync!(history, CancellationToken.None);
+        await spec.CompactAsync!(history, new NullSink(), CancellationToken.None);
         Assert.Single(history);
 
         // Second compaction without an intervening turn: trailing-message guard must prevent
         // a second copy of the reattach content from being added.
-        await spec.CompactAsync!(history, CancellationToken.None);
+        await spec.CompactAsync!(history, new NullSink(), CancellationToken.None);
 
         var reattachMessages = history
             .Where(m =>
@@ -353,4 +346,15 @@ public sealed class SkillReattachPipelineTests : IDisposable
             yield return AssistantStreamEvent.Finished("end_turn");
         }
     }
+
+    private sealed class NullSink : IAgentSink
+    {
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputJson) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
+    }
 }
+

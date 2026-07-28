@@ -242,6 +242,18 @@ internal sealed class RecordingSink : IAgentSink
     public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
         this.inner?.OnPermissionDecided(hookCommand, toolName, decision);
 
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.inner?.OnSubagentBlocked(hookCommand, taskId, reason);
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.inner?.OnSubagentResultModified(hookCommand, taskId, originalResult, modifiedResult);
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.inner?.OnCompactionCancelled(hookCommand, trigger);
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.inner?.OnPostCompactContextInjected(additionalContext);
+
     public void OnPermissionsUpdated(
         string hookCommand,
         string? modeApplied,

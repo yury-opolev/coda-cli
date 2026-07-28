@@ -252,7 +252,7 @@ public sealed class ScheduledAgentHostTests : IDisposable
             lspDiagnostics,
             toolSearch,
             NullLoggerFactory.Instance,
-            (_, _, _) => Task.CompletedTask,
+            (_, _, _, _, _) => Task.FromResult(true),
             () => null);
     }
 

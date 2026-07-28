@@ -211,6 +211,30 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventPermissionsUpdated, node);
     }
 
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason)
+    {
+        var node = ServeJson.ToNode(new Messages.SubagentBlockedEvent(hookCommand, taskId, reason));
+        _ = this.SendAsync(ServeMethods.EventSubagentBlocked, node);
+    }
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult)
+    {
+        var node = ServeJson.ToNode(new Messages.SubagentResultModifiedEvent(hookCommand, taskId, originalResult, modifiedResult));
+        _ = this.SendAsync(ServeMethods.EventSubagentResultModified, node);
+    }
+
+    public void OnCompactionCancelled(string hookCommand, string trigger)
+    {
+        var node = ServeJson.ToNode(new Messages.CompactionCancelledEvent(hookCommand, trigger));
+        _ = this.SendAsync(ServeMethods.EventCompactionCancelled, node);
+    }
+
+    public void OnPostCompactContextInjected(string additionalContext)
+    {
+        var node = ServeJson.ToNode(new Messages.PostCompactContextInjectedEvent(additionalContext));
+        _ = this.SendAsync(ServeMethods.EventPostCompactContextInjected, node);
+    }
+
     private void CoalesceText(string delta)
     {
         if (string.IsNullOrEmpty(delta))

@@ -276,6 +276,39 @@ public sealed record PermissionsUpdatedEvent(
     IReadOnlyList<string> AddedDeny) : UiEvent;
 
 /// <summary>
+/// A <c>SubagentStart</c> hook blocked a subagent from running. The <c>task</c> tool will
+/// surface <see cref="Reason"/> as an error result.
+/// </summary>
+public sealed record SubagentBlockedEvent(
+    string HookCommand,
+    string TaskId,
+    string Reason) : UiEvent;
+
+/// <summary>
+/// A <c>SubagentStop</c> hook replaced the result a subagent returned to its parent.
+/// The parent agent cannot distinguish a modified result from the original.
+/// </summary>
+public sealed record SubagentResultModifiedEvent(
+    string HookCommand,
+    string TaskId,
+    string OriginalResult,
+    string ModifiedResult) : UiEvent;
+
+/// <summary>
+/// A <c>PreCompact</c> hook cancelled a compaction attempt. The next trigger
+/// (auto threshold or <c>/compact</c>) will offer a fresh chance.
+/// </summary>
+public sealed record CompactionCancelledUiEvent(
+    string HookCommand,
+    string Trigger) : UiEvent;
+
+/// <summary>
+/// A <c>PostCompact</c> hook injected additional context into history after compaction.
+/// Fires before skill re-attachment; together they represent the total post-compaction injection.
+/// </summary>
+public sealed record PostCompactContextInjectedEvent(string AdditionalContext) : UiEvent;
+
+/// <summary>
 /// An internal ordering barrier published through the mailbox by <see cref="UiActor.FlushAsync"/>. The
 /// actor completes <see cref="Completion"/> only after every event queued before it has passed the
 /// observer, reducer, and frame sink in FIFO order. <see cref="UiReducer"/> ignores it (the default
