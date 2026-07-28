@@ -47,13 +47,13 @@ public static partial class SkillLoader
         var byName = new Dictionary<string, SkillDefinition>(StringComparer.OrdinalIgnoreCase);
 
         // 0. Claude CLI skills (lowest precedence, read-only).
-        foreach (var skill in LoadFromDirectory(claudeSkillsPath, logger))
+        foreach (var skill in LoadFromDirectory(claudeSkillsPath, SkillOrigin.Claude, logger))
         {
             byName[skill.Name] = skill;
         }
 
         // 1. User skills (override Claude CLI skills).
-        foreach (var skill in LoadFromDirectory(userSkillsPath, logger))
+        foreach (var skill in LoadFromDirectory(userSkillsPath, SkillOrigin.User, logger))
         {
             byName[skill.Name] = skill;
         }
@@ -62,14 +62,14 @@ public static partial class SkillLoader
         var pluginSkillDirs = PluginLoader.SkillDirsFor(workingDirectory, userBase);
         foreach (var pluginSkillsDir in pluginSkillDirs)
         {
-            foreach (var skill in LoadFromDirectory(pluginSkillsDir, logger))
+            foreach (var skill in LoadFromDirectory(pluginSkillsDir, SkillOrigin.Plugin, logger))
             {
                 byName[skill.Name] = skill;
             }
         }
 
         // 3. Project skills (highest precedence).
-        foreach (var skill in LoadFromDirectory(projectSkillsPath, logger))
+        foreach (var skill in LoadFromDirectory(projectSkillsPath, SkillOrigin.Project, logger))
         {
             byName[skill.Name] = skill;
         }
@@ -77,7 +77,10 @@ public static partial class SkillLoader
         return [.. byName.Values.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)];
     }
 
-    private static IEnumerable<SkillDefinition> LoadFromDirectory(string skillsRoot, ILogger? logger)
+    private static IEnumerable<SkillDefinition> LoadFromDirectory(
+        string skillsRoot,
+        SkillOrigin origin,
+        ILogger? logger)
     {
         if (!Directory.Exists(skillsRoot))
         {
@@ -87,16 +90,17 @@ public static partial class SkillLoader
         foreach (var subDir in Directory.EnumerateDirectories(skillsRoot))
         {
             var skillFile = Path.Combine(subDir, SkillFileName);
-            if (!File.Exists(skillFile))
-            {
-                continue;
-            }
-
             SkillDefinition? skill = null;
             try
             {
+                skillFile = Path.GetFullPath(skillFile);
+                if (!File.Exists(skillFile))
+                {
+                    continue;
+                }
+
                 var content = File.ReadAllText(skillFile);
-                skill = ParseSkillFile(content, Path.GetFileName(subDir));
+                skill = ParseSkillFile(content, Path.GetFileName(subDir), skillFile, origin);
             }
             catch (Exception ex)
             {
@@ -115,78 +119,37 @@ public static partial class SkillLoader
     }
 
     /// <summary>
-    /// Parses a SKILL.md file. Optional YAML-ish frontmatter is delimited by lines of <c>---</c>
-    /// at the top and may contain <c>name:</c> and <c>description:</c> keys. If no frontmatter,
-    /// the directory name is used as the skill name.
+    /// Parses a SKILL.md file using the YAML-subset frontmatter parser. If no frontmatter is
+    /// present, the directory name is used as the skill name and the whole file becomes the body.
     /// </summary>
-    internal static SkillDefinition ParseSkillFile(string content, string directoryName)
+    internal static SkillDefinition ParseSkillFile(
+        string content,
+        string directoryName,
+        string? sourcePath = null,
+        SkillOrigin origin = SkillOrigin.Project)
     {
-        var lines = content.ReplaceLineEndings("\n").Split('\n');
+        var fm = SkillFrontmatterParser.Parse(content);
 
-        // Check for frontmatter: first non-empty line must be "---"
-        var firstNonEmpty = Array.FindIndex(lines, l => l.Trim().Length > 0);
-        if (firstNonEmpty >= 0 && lines[firstNonEmpty].Trim() == "---")
+        if (!fm.HasFrontmatter)
         {
-            // Find closing "---"
-            var closingIndex = -1;
-            for (var i = firstNonEmpty + 1; i < lines.Length; i++)
+            return new SkillDefinition(directoryName, string.Empty, content.Trim())
             {
-                if (lines[i].Trim() == "---")
-                {
-                    closingIndex = i;
-                    break;
-                }
-            }
-
-            if (closingIndex > firstNonEmpty)
-            {
-                var name = string.Empty;
-                var description = string.Empty;
-
-                for (var i = firstNonEmpty + 1; i < closingIndex; i++)
-                {
-                    var line = lines[i];
-                    if (TryParseYamlValue(line, "name", out var nameVal))
-                    {
-                        name = nameVal;
-                    }
-                    else if (TryParseYamlValue(line, "description", out var descVal))
-                    {
-                        description = descVal;
-                    }
-                }
-
-                // Body is everything after the closing ---
-                var bodyLines = lines[(closingIndex + 1)..];
-                var body = string.Join("\n", bodyLines).Trim();
-
-                return new SkillDefinition(
-                    string.IsNullOrWhiteSpace(name) ? directoryName : name,
-                    description,
-                    body);
-            }
+                SourcePath = sourcePath,
+                Origin = origin,
+            };
         }
 
-        // No valid frontmatter — name = directory name, description = "", body = whole file.
-        return new SkillDefinition(directoryName, string.Empty, content.Trim());
-    }
-
-    private static bool TryParseYamlValue(string line, string key, out string value)
-    {
-        value = string.Empty;
-        var prefix = key + ":";
-        if (!line.TrimStart().StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        return new SkillDefinition(
+            string.IsNullOrWhiteSpace(fm.Name) ? directoryName : fm.Name,
+            fm.Description ?? string.Empty,
+            fm.Body)
         {
-            return false;
-        }
-
-        var colonIndex = line.IndexOf(':', StringComparison.Ordinal);
-        if (colonIndex < 0 || colonIndex >= line.Length - 1)
-        {
-            return false;
-        }
-
-        value = line[(colonIndex + 1)..].Trim().Trim('"').Trim('\'');
-        return true;
+            WhenToUse = fm.WhenToUse,
+            ArgumentHint = fm.ArgumentHint,
+            Arguments = fm.Arguments,
+            SourcePath = sourcePath,
+            Origin = origin,
+            UnknownFields = fm.UnknownFields,
+        };
     }
 }

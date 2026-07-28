@@ -5,7 +5,7 @@ using Spectre.Console;
 
 namespace Coda.Tui.Commands;
 
-/// <summary>Runs a named skill by injecting its body as an agent prompt.</summary>
+/// <summary>Runs a named skill by injecting its body as an agent prompt, with argument substitution.</summary>
 public sealed class SkillCommand : ISlashCommand
 {
     public string Name => "skill";
@@ -15,19 +15,21 @@ public sealed class SkillCommand : ISlashCommand
     public string Summary => "Run a skill by name (or list skills if no name given)";
 
     public CommandHelp Help => new(
-        Usage: "/skill [<name>]",
+        Usage: "/skill [<name> [args...]]",
         Description: "Runs the named skill by injecting its SKILL.md body as an agent prompt. " +
+            "Arguments after the name are substituted into $1, $2, $name, and $ARGUMENTS placeholders. " +
             "Skills are discovered from .coda/skills/<name>/ (project) and ~/.coda/skills/<name>/ (user). " +
             "With no argument, lists available skills (same as /skills).",
         Options:
         [
             ("<name>", "Name of the skill to run. Case-insensitive. Omit to list all available skills."),
+            ("[args...]", "Arguments substituted into $1, $2, $name, and $ARGUMENTS placeholders in the body."),
         ],
         Examples:
         [
             "/skill",
             "/skill code-review",
-            "/skill brainstorming",
+            "/skill translate French \"Hello world\"",
         ]);
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
@@ -41,6 +43,10 @@ public sealed class SkillCommand : ISlashCommand
         }
 
         var requestedName = args[0];
+        IReadOnlyList<string> invokeArgs = args.Count > 1
+            ? [.. args.Skip(1)]
+            : [];
+
         var skill = skills.FirstOrDefault(s =>
             string.Equals(s.Name, requestedName, StringComparison.OrdinalIgnoreCase));
 
@@ -54,7 +60,10 @@ public sealed class SkillCommand : ISlashCommand
             return Task.FromResult(CommandResult.Continue);
         }
 
-        return Task.FromResult(CommandResult.RunPrompt(skill.Body));
+        var body = (invokeArgs.Count > 0 || skill.Arguments.Count > 0)
+            ? SkillArgumentBinder.Bind(skill.Body, skill.Arguments, invokeArgs)
+            : skill.Body;
+        return Task.FromResult(CommandResult.RunPrompt(body));
     }
 
     private static Task<CommandResult> ListSkillsAsync(CommandContext context, IReadOnlyList<SkillDefinition> skills)
@@ -73,7 +82,10 @@ public sealed class SkillCommand : ISlashCommand
             var description = string.IsNullOrWhiteSpace(skill.Description)
                 ? string.Empty
                 : skill.Description;
-            grid.AddRow(Theme.AccentMarkup(skill.Name), Theme.DimMarkup(description));
+            var hintSuffix = skill.ArgumentHint is not null
+                ? "  " + Theme.DimMarkup(skill.ArgumentHint)
+                : string.Empty;
+            grid.AddRow(Theme.AccentMarkup(skill.Name), Theme.DimMarkup(description) + hintSuffix);
         }
 
         context.Console.Write(grid);
