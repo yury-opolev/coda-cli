@@ -4,7 +4,8 @@ namespace Coda.Agent.Hooks;
 /// Per-event timeout and fail-open defaults for user hooks.
 /// </summary>
 /// <remarks>
-/// <c>FailOpen = false</c> for <c>UserPromptSubmit</c> and <c>PreToolUse</c> is deliberate:
+/// <c>FailOpen = false</c> for <c>UserPromptSubmit</c>, <c>PreToolUse</c>, and
+/// <c>PermissionRequest</c> is deliberate:
 /// a policy gate that silently permits on error is no gate at all. For the observation-only
 /// events (<c>PostToolUse</c>, <c>Stop</c>) fail-open preserves the existing behaviour where
 /// exceptions and timeouts are swallowed rather than interrupting the turn.
@@ -18,6 +19,8 @@ public static class HookEventPolicy
             // 30 s budget because a classifier hook is a plausible UserPromptSubmit implementation.
             ["UserPromptSubmit"] = new HookEventDefaults(TimeoutSeconds: 30, FailOpen: false),
             ["PreToolUse"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: false),
+            // Fail-closed: a broken permission gate must never grant access.
+            ["PermissionRequest"] = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: false),
             ["PostToolUse"]   = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
             ["Stop"]          = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
             // Session lifecycle events: fail-open so a broken hook never blocks the user.

@@ -101,4 +101,49 @@ public interface IAgentSink
     /// <see langword="null"/> when only <paramref name="displayContent"/> was set.
     /// </param>
     void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse);
+
+    /// <summary>
+    /// A <c>PreToolUse</c> or <c>PermissionRequest</c> hook replaced the arguments a tool call runs
+    /// with. The replacement is total (not a merge) and is what the tool executed with. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that performed the replacement.</param>
+    /// <param name="toolName">The tool whose arguments were replaced.</param>
+    /// <param name="originalInput">The JSON arguments the model produced.</param>
+    /// <param name="modifiedInput">The JSON arguments the tool actually ran with.</param>
+    void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) { }
+
+    /// <summary>
+    /// A <c>PostToolUse</c> hook replaced the result text reported back to the model. The tool has
+    /// already run; only what the model sees changed. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that performed the replacement.</param>
+    /// <param name="toolName">The tool whose result was replaced.</param>
+    /// <param name="originalResult">The result text the tool actually produced.</param>
+    /// <param name="modifiedResult">The result text the model will see.</param>
+    void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) { }
+
+    /// <summary>
+    /// A <c>PermissionRequest</c> hook decided a pending approval without the interactive prompt.
+    /// Emitted only for <c>allow</c> and <c>deny</c> — a <c>prompt</c> decision changes nothing and
+    /// is not surfaced. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that decided.</param>
+    /// <param name="toolName">The tool the decision applies to.</param>
+    /// <param name="decision">Either <c>"allow"</c> or <c>"deny"</c>.</param>
+    void OnPermissionDecided(string hookCommand, string toolName, string decision) { }
+
+    /// <summary>
+    /// A <c>PermissionRequest</c> hook's <c>updatedPermissions</c> was applied to the live session:
+    /// a mode was changed and/or rules were added. Emitted only when something was actually mutated
+    /// (not on no-ops). Surfaced for auditability per §8 of the spec. Optional.
+    /// </summary>
+    /// <param name="hookCommand">The shell command of the hook that produced the update.</param>
+    /// <param name="modeApplied">The new permission mode that was applied, or <see langword="null"/> when the mode was not changed.</param>
+    /// <param name="addedAllow">Allow rules that were added to the live store. Empty when no allow rules were added.</param>
+    /// <param name="addedDeny">Deny rules that were added to the live store. Empty when no deny rules were added.</param>
+    void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny) { }
 }

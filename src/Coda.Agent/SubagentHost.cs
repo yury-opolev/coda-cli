@@ -270,5 +270,14 @@ public sealed class SubagentHost : ISubagentHost
 
         public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
             this.parent.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
+
+        public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+            this.parent.OnToolInputModified(hookCommand, toolName, originalInput, modifiedInput);
+
+        public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+            this.parent.OnToolResultModified(hookCommand, toolName, originalResult, modifiedResult);
+
+        public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+            this.parent.OnPermissionDecided(hookCommand, toolName, decision);
     }
 }

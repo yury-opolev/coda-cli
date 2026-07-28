@@ -45,5 +45,36 @@ public sealed class PlainTextSink : IAgentSink
 
     public void OnError(string message) => this.error.WriteLine(message);
 
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+        this.error.WriteLine($"  ↺ {toolName} input rewritten by hook {hookCommand}");
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+        this.error.WriteLine($"  ↺ {toolName} result rewritten by hook {hookCommand}");
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+        this.error.WriteLine($"  {(decision == "allow" ? "✓" : "✗")} {toolName}: {decision} (by hook {hookCommand})");
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny)
+    {
+        if (modeApplied is not null)
+        {
+            this.error.WriteLine($"  ↻ permission mode → {modeApplied} (by hook {hookCommand})");
+        }
+
+        foreach (var rule in addedAllow)
+        {
+            this.error.WriteLine($"  + allow:{rule} (by hook {hookCommand})");
+        }
+
+        foreach (var rule in addedDeny)
+        {
+            this.error.WriteLine($"  + deny:{rule} (by hook {hookCommand})");
+        }
+    }
+
     public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
 }

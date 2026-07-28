@@ -77,6 +77,12 @@ public sealed class UserHookRunner
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
     public bool HasPreToolUse => this.bus.HasPreToolUse;
 
+    /// <summary>True when at least one <c>PostToolUse</c> hook is configured.</summary>
+    public bool HasPostToolUse => this.bus.HasPostToolUse;
+
+    /// <summary>True when at least one <c>PermissionRequest</c> hook is configured.</summary>
+    public bool HasPermissionRequest => this.bus.HasPermissionRequest;
+
     /// <summary>True when at least one <c>UserPromptSubmit</c> hook is configured.</summary>
     public bool HasUserPromptSubmit => this.bus.HasUserPromptSubmit;
 
@@ -121,8 +127,10 @@ public sealed class UserHookRunner
         this.bus.RunPreToolUseAsync(toolName, inputJson, ct, depth, taskId);
 
     /// <summary>
-    /// Runs all matching <c>PostToolUse</c> hooks. Exit codes and errors are ignored
-    /// (fail-open default — observation-only hooks must not interrupt tool execution).
+    /// Runs all matching <c>PostToolUse</c> hooks and returns the merged result. Exit codes and
+    /// errors never fail the tool call (fail-open default). A hook may replace the reported result
+    /// via <c>hookSpecificOutput.modifiedResult</c> or <c>decision:"block"</c>; the tool has
+    /// already run either way.
     /// </summary>
     /// <param name="toolName">The name of the tool that was called.</param>
     /// <param name="inputJson">The tool's input as a JSON string.</param>
@@ -130,14 +138,38 @@ public sealed class UserHookRunner
     /// <param name="ct">Cancellation token.</param>
     /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
     /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
-    public Task RunPostToolUseAsync(
+    /// <param name="errorText">The failure text when the tool call failed, or <see langword="null"/>.</param>
+    public Task<PostToolUseResult> RunPostToolUseAsync(
         string toolName,
         string inputJson,
         string toolResultText,
         CancellationToken ct,
         int depth = 0,
+        string? taskId = null,
+        string? errorText = null) =>
+        this.bus.RunPostToolUseAsync(toolName, inputJson, toolResultText, ct, depth, taskId, errorText);
+
+    /// <summary>
+    /// Runs all matching <c>PermissionRequest</c> hooks, fired only when a tool actually needs
+    /// interactive approval and only after <c>PreToolUse</c> passed. Policy: 10 s timeout,
+    /// fail-closed — a broken hook denies.
+    /// </summary>
+    /// <param name="toolName">The name of the tool requesting approval.</param>
+    /// <param name="inputJson">The tool's input as a JSON string.</param>
+    /// <param name="permissionMode">The live permission mode (e.g. <c>"default"</c>).</param>
+    /// <param name="matchedRule">The matching rule in <c>allow:rule</c>/<c>deny:rule</c> form, or null.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
+    public Task<PermissionRequestResult> RunPermissionRequestAsync(
+        string toolName,
+        string inputJson,
+        string permissionMode,
+        string? matchedRule,
+        CancellationToken ct,
+        int depth = 0,
         string? taskId = null) =>
-        this.bus.RunPostToolUseAsync(toolName, inputJson, toolResultText, ct, depth, taskId);
+        this.bus.RunPermissionRequestAsync(toolName, inputJson, permissionMode, matchedRule, ct, depth, taskId);
 
     /// <summary>
     /// Runs all <c>Stop</c> hooks. Exit codes and errors are ignored (fail-open default).

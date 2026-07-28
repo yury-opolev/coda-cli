@@ -39,6 +39,10 @@ public static class ServeMethods
     public const string EventThinkingComplete = "event/thinkingComplete";
     public const string EventPromptRewritten = "event/promptRewritten";
     public const string EventResponseRewritten = "event/responseRewritten";
+    public const string EventToolInputModified = "event/toolInputModified";
+    public const string EventToolResultModified = "event/toolResultModified";
+    public const string EventPermissionDecided = "event/permissionDecided";
+    public const string EventPermissionsUpdated = "event/permissionsUpdated";
 
     // Server-initiated requests (Coda → orchestrator)
     public const string RequestPermission = "request/permission";

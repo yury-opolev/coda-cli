@@ -7,7 +7,9 @@ using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
+using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
+using Coda.Agent.Settings;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
 using LlmClient;
@@ -35,6 +37,12 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly IScheduleRuntimeView? scheduleRuntime;
     private readonly IUserQuestionPrompt? userQuestion;
     private readonly UserHookRunner? userHooks;
+
+    /// <summary>
+    /// The live permission rules used to compute <c>matchedRule</c> for the
+    /// <c>PermissionRequest</c> hook payload and mutated by <c>updatedPermissions</c>.
+    /// </summary>
+    private readonly PermissionRuleStore? permissionRules;
     private readonly IPlanApprover? planApprover;
     private readonly TaskManager? tasks;
     private readonly string? currentTaskId;
@@ -117,7 +125,8 @@ public sealed partial class AgentLoop : IAgentLoop
         TimeSpan? toolMaxDuration = null,
         TimeSpan? transportRetryDelay = null,
         AgentExecutionGate? gate = null,
-        ToolActivityContext? toolActivity = null)
+        ToolActivityContext? toolActivity = null,
+        PermissionRuleStore? permissionRules = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -130,6 +139,7 @@ public sealed partial class AgentLoop : IAgentLoop
         this.scheduleRuntime = scheduleRuntime;
         this.userQuestion = userQuestion;
         this.userHooks = userHooks;
+        this.permissionRules = permissionRules;
         this.planApprover = planApprover;
         this.tasks = tasks;
         this.currentTaskId = currentTaskId;
@@ -235,6 +245,18 @@ public sealed partial class AgentLoop : IAgentLoop
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "PostToolUse user hooks failed (best-effort); continuing: tool={toolName}")]
     private partial void LogPostToolUseHooksFailed(string toolName, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest user hooks failed; denying (fail-closed): tool={toolName}")]
+    private partial void LogPermissionRequestHooksFailed(string toolName, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest hook returned an unknown permission mode '{mode}' — ignoring")]
+    private partial void LogUnknownPermissionMode(string mode);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest hook '{hookCommand}' requested bypassPermissions — refusing hook-driven bypass escalation")]
+    private partial void LogHookBypassEscalationRefused(string hookCommand);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "failed to apply updatedPermissions for scope '{scope}'; the turn continues")]
+    private partial void LogPermissionUpdateFailed(string scope, Exception ex);
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "LSP edit-seam notify failed (best-effort); tool result and turn unaffected")]
     private partial void LogLspNotifyFailed(Exception ex);
@@ -851,12 +873,13 @@ public sealed partial class AgentLoop : IAgentLoop
                 break;
             }
 
-            sink.OnToolCall(identity, toolUse.Name, toolUse.InputJson);
-            this.LogToolCall(toolUse.Name, SummarizeToolInput(toolUse.InputJson));
+            var effectiveInput = toolUse.InputJson;
 
             var tool = this.tools.Resolve(toolUse.Name);
             if (tool is null)
             {
+                sink.OnToolCall(identity, toolUse.Name, effectiveInput);
+                this.LogToolCall(toolUse.Name, SummarizeToolInput(effectiveInput));
                 var unknown = new ToolResult($"Unknown tool '{toolUse.Name}'.", IsError: true);
                 sink.OnToolResult(identity, toolUse.Name, unknown, ToolCallStatus.Failed);
                 results.Add(CreateToolResultBlock(identity, unknown, ToolCallStatus.Failed));
@@ -868,6 +891,8 @@ public sealed partial class AgentLoop : IAgentLoop
             // §8, tool filtering is a policy mechanism and must be enforced at invocation too.
             if (!resolution.IsToolAllowed(toolUse.Name))
             {
+                sink.OnToolCall(identity, toolUse.Name, effectiveInput);
+                this.LogToolCall(toolUse.Name, SummarizeToolInput(effectiveInput));
                 var denied = new ToolResult(
                     $"Tool '{toolUse.Name}' is not available this turn.",
                     IsError: true);
@@ -877,15 +902,20 @@ public sealed partial class AgentLoop : IAgentLoop
             }
 
             // Check user PreToolUse hooks BEFORE the permission prompt so a hook can
-            // block a call even when permissions would otherwise allow it.
+            // block a call even when permissions would otherwise allow it. The hook may also
+            // replace the arguments outright (hookSpecificOutput.modifiedInput), so it runs
+            // before OnToolCall — tool activity must report what the tool actually ran with.
+            string? inputModifiedBy = null;
             if (this.userHooks is not null && this.userHooks.HasPreToolUse)
             {
                 var hookResult = await this.userHooks
-                    .RunPreToolUseAsync(toolUse.Name, toolUse.InputJson, cancellationToken, this.currentDepth, this.currentTaskId)
+                    .RunPreToolUseAsync(toolUse.Name, effectiveInput, cancellationToken, this.currentDepth, this.currentTaskId)
                     .ConfigureAwait(false);
 
                 if (hookResult.Block)
                 {
+                    sink.OnToolCall(identity, toolUse.Name, effectiveInput);
+                    this.LogToolCall(toolUse.Name, SummarizeToolInput(effectiveInput));
                     var blocked = new ToolResult(
                         $"Blocked by hook: {hookResult.Message}",
                         IsError: true);
@@ -893,6 +923,20 @@ public sealed partial class AgentLoop : IAgentLoop
                     results.Add(CreateToolResultBlock(identity, blocked, ToolCallStatus.Failed));
                     continue;
                 }
+
+                if (hookResult.ModifiedInput is { } replacement)
+                {
+                    inputModifiedBy = hookResult.ByHookCommand ?? string.Empty;
+                    effectiveInput = replacement;
+                }
+            }
+
+            sink.OnToolCall(identity, toolUse.Name, effectiveInput);
+            this.LogToolCall(toolUse.Name, SummarizeToolInput(effectiveInput));
+
+            if (inputModifiedBy is not null)
+            {
+                sink.OnToolInputModified(inputModifiedBy, toolUse.Name, toolUse.InputJson, effectiveInput);
             }
 
             if (!tool.IsReadOnly)
@@ -910,31 +954,76 @@ public sealed partial class AgentLoop : IAgentLoop
                         CancellationToken.None);
                 }
 
-                bool allowed;
-                try
+                // PermissionRequest hooks see the call after PreToolUse passed and only when the
+                // tool would actually prompt. They may grant, refuse, or defer to the prompt.
+                var grantedByHook = false;
+                if (this.userHooks is not null && this.userHooks.HasPermissionRequest)
                 {
-                    allowed = await this.permissions
-                        .RequestAsync(tool, toolUse.InputJson, cancellationToken)
+                    var decision = await this
+                        .DecidePermissionByHookAsync(toolUse.Name, effectiveInput, cancellationToken)
                         .ConfigureAwait(false);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    var promptError = new ToolResult($"Permission prompt error: {ex.Message}", IsError: true);
-                    sink.OnToolResult(identity, toolUse.Name, promptError, ToolCallStatus.Failed);
-                    results.Add(CreateToolResultBlock(identity, promptError, ToolCallStatus.Failed));
-                    continue;
+
+                    this.ApplyUpdatedPermissions(decision.UpdatedPermissions, decision.ByHookCommand ?? string.Empty, sink);
+
+                    if (decision.ModifiedInput is { } permissionReplacement
+                        && !string.Equals(permissionReplacement, effectiveInput, StringComparison.Ordinal))
+                    {
+                        sink.OnToolInputModified(
+                            decision.ByHookCommand ?? string.Empty,
+                            toolUse.Name,
+                            effectiveInput,
+                            permissionReplacement);
+                        effectiveInput = permissionReplacement;
+                    }
+
+                    if (decision.IsDeny)
+                    {
+                        sink.OnPermissionDecided(decision.ByHookCommand ?? string.Empty, toolUse.Name, PermissionDecisions.Deny);
+                        var refused = new ToolResult(
+                            decision.Reason is { Length: > 0 } reason
+                                ? $"Permission denied by hook: {reason}"
+                                : "Permission denied by a PermissionRequest hook.",
+                            IsError: true);
+                        sink.OnToolResult(identity, toolUse.Name, refused, ToolCallStatus.Failed);
+                        results.Add(CreateToolResultBlock(identity, refused, ToolCallStatus.Failed));
+                        continue;
+                    }
+
+                    if (decision.IsAllow)
+                    {
+                        sink.OnPermissionDecided(decision.ByHookCommand ?? string.Empty, toolUse.Name, PermissionDecisions.Allow);
+                        grantedByHook = true;
+                    }
                 }
 
-                if (!allowed)
+                if (!grantedByHook)
                 {
-                    var denied = new ToolResult("Permission denied by the user.", IsError: true);
-                    sink.OnToolResult(identity, toolUse.Name, denied, ToolCallStatus.Failed);
-                    results.Add(CreateToolResultBlock(identity, denied, ToolCallStatus.Failed));
-                    continue;
+                    bool allowed;
+                    try
+                    {
+                        allowed = await this.permissions
+                            .RequestAsync(tool, effectiveInput, cancellationToken)
+                            .ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException)
+                    {
+                        throw;
+                    }
+                    catch (Exception ex)
+                    {
+                        var promptError = new ToolResult($"Permission prompt error: {ex.Message}", IsError: true);
+                        sink.OnToolResult(identity, toolUse.Name, promptError, ToolCallStatus.Failed);
+                        results.Add(CreateToolResultBlock(identity, promptError, ToolCallStatus.Failed));
+                        continue;
+                    }
+
+                    if (!allowed)
+                    {
+                        var userDenied = new ToolResult("Permission denied by the user.", IsError: true);
+                        sink.OnToolResult(identity, toolUse.Name, userDenied, ToolCallStatus.Failed);
+                        results.Add(CreateToolResultBlock(identity, userDenied, ToolCallStatus.Failed));
+                        continue;
+                    }
                 }
             }
 
@@ -965,7 +1054,7 @@ public sealed partial class AgentLoop : IAgentLoop
 
             try
             {
-                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(toolUse.InputJson) ? "{}" : toolUse.InputJson);
+                using var doc = JsonDocument.Parse(string.IsNullOrWhiteSpace(effectiveInput) ? "{}" : effectiveInput);
 
                 // Recompute the sandbox flag per individual tool execution (not once per batch) so a
                 // mid-batch mode change (Default→Bypass or back) applies to the very next tool. Read
@@ -1008,14 +1097,34 @@ public sealed partial class AgentLoop : IAgentLoop
                 }
             }
 
-            // Fire PostToolUse hooks (observation only — ignore exit code and errors).
+            // Fire PostToolUse hooks. The tool has already run — a hook can only change what the
+            // model is told (modifiedResult, or decision:block whose reason replaces the result).
+            // Fires on the failure path too, with the failure text in the payload's `error` field.
             if (this.userHooks is not null)
             {
                 try
                 {
-                    await this.userHooks
-                        .RunPostToolUseAsync(toolUse.Name, toolUse.InputJson, result.Content, cancellationToken, this.currentDepth, this.currentTaskId)
+                    var post = await this.userHooks
+                        .RunPostToolUseAsync(
+                            toolUse.Name,
+                            effectiveInput,
+                            result.Content,
+                            cancellationToken,
+                            this.currentDepth,
+                            this.currentTaskId,
+                            errorText: result.IsError ? result.Content : null)
                         .ConfigureAwait(false);
+
+                    if (post.Block && post.Reason is { Length: > 0 } blockReason)
+                    {
+                        sink.OnToolResultModified(post.ByHookCommand ?? string.Empty, toolUse.Name, result.Content, blockReason);
+                        result = new ToolResult(blockReason, IsError: true);
+                    }
+                    else if (post.ModifiedResult is { } replacementResult)
+                    {
+                        sink.OnToolResultModified(post.ByHookCommand ?? string.Empty, toolUse.Name, result.Content, replacementResult);
+                        result = result with { Content = replacementResult };
+                    }
                 }
                 catch (Exception ex)
                 {
@@ -1034,11 +1143,158 @@ public sealed partial class AgentLoop : IAgentLoop
             // Failures are swallowed — LSP must never break a tool result.
             if (!result.IsError && this.lsp is not null && IsMutatingFileTool(toolUse.Name))
             {
-                await this.NotifyLspFileEditedAsync(toolUse.InputJson, cancellationToken).ConfigureAwait(false);
+                await this.NotifyLspFileEditedAsync(effectiveInput, cancellationToken).ConfigureAwait(false);
             }
         }
 
         return results;
+    }
+
+    /// <summary>
+    /// Runs the <c>PermissionRequest</c> hooks for a pending approval. Fail-closed: any unexpected
+    /// failure denies rather than granting access.
+    /// </summary>
+    /// <param name="toolName">The tool requesting approval.</param>
+    /// <param name="inputJson">The arguments the tool would run with (post-<c>PreToolUse</c>).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    private async Task<PermissionRequestResult> DecidePermissionByHookAsync(
+        string toolName,
+        string inputJson,
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var mode = this.options.PermissionModeState?.Mode ?? this.options.PermissionMode;
+            var matchedRule = this.permissionRules?.FindMatchedRule(toolName, inputJson);
+
+            return await this.userHooks!
+                .RunPermissionRequestAsync(
+                    toolName,
+                    inputJson,
+                    PermissionModeNames.ToWireString(mode),
+                    matchedRule,
+                    cancellationToken,
+                    this.currentDepth,
+                    this.currentTaskId)
+                .ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            this.LogPermissionRequestHooksFailed(toolName, ex);
+            return new PermissionRequestResult
+            {
+                Decision = PermissionDecisions.Deny,
+                Reason = $"permission hook failed: {ex.Message}",
+            };
+        }
+    }
+
+    /// <summary>
+    /// Applies a <c>PermissionRequest</c> hook's <c>updatedPermissions</c>. Live session state is
+    /// always updated; <c>project</c> and <c>user</c> scopes additionally persist to the matching
+    /// settings file. A failed write is logged and never fails the turn. Emits
+    /// <see cref="IAgentSink.OnPermissionsUpdated"/> for every non-no-op mutation. Refuses
+    /// hook-driven escalation to <c>bypassPermissions</c> — a hook cannot grant itself bypass.
+    /// </summary>
+    /// <param name="update">The parsed update, or <see langword="null"/> when the hook sent none.</param>
+    /// <param name="hookCommand">The hook command string, for logging and sink attribution.</param>
+    /// <param name="sink">The agent sink to receive <see cref="IAgentSink.OnPermissionsUpdated"/>.</param>
+    private void ApplyUpdatedPermissions(PermissionUpdate? update, string hookCommand, IAgentSink sink)
+    {
+        if (update is null || update.IsEmpty)
+        {
+            return;
+        }
+
+        var appliedAllow = new List<string>();
+        var appliedDeny = new List<string>();
+        string? appliedMode = null;
+
+        try
+        {
+            if (update.AddAllow.Count > 0)
+            {
+                this.permissionRules?.AddAllow(update.AddAllow.Select(PermissionRule.Parse));
+                appliedAllow.AddRange(update.AddAllow);
+            }
+
+            if (update.AddDeny.Count > 0)
+            {
+                this.permissionRules?.AddDeny(update.AddDeny.Select(PermissionRule.Parse));
+                appliedDeny.AddRange(update.AddDeny);
+            }
+
+            if (update.SetMode is { Length: > 0 } requestedMode)
+            {
+                if (!PermissionModeNames.TryParse(requestedMode, out var parsedMode))
+                {
+                    this.LogUnknownPermissionMode(requestedMode);
+                }
+                // I1: refuse hook-driven bypass escalation — a subprocess hook must not be able
+                // to disable all future approval prompts without the user's consent.
+                else if (parsedMode == PermissionMode.BypassPermissions)
+                {
+                    this.LogHookBypassEscalationRefused(hookCommand);
+                }
+                else if (this.options.PermissionModeState is { } state)
+                {
+                    state.Mode = parsedMode;
+                    appliedMode = requestedMode;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            this.LogPermissionUpdateFailed(update.Scope, ex);
+            return;
+        }
+
+        // Emit the sink event for auditability (§8 spec).
+        if (appliedAllow.Count > 0 || appliedDeny.Count > 0 || appliedMode is not null)
+        {
+            sink.OnPermissionsUpdated(hookCommand, appliedMode, appliedAllow, appliedDeny);
+        }
+
+        var settingsFile = this.ResolveSettingsFileForScope(update.Scope);
+        if (settingsFile is null)
+        {
+            return; // session scope (or an unknown scope) — live state only.
+        }
+
+        SettingsWriter.AddPermissionRules(
+            update.AddAllow,
+            update.AddDeny,
+            settingsFile,
+            this.logger);
+    }
+
+    /// <summary>
+    /// Maps an <c>updatedPermissions.scope</c> to the settings file it persists to, or
+    /// <see langword="null"/> for the session scope (which never touches disk).
+    /// </summary>
+    /// <param name="scope">The requested scope: <c>session</c>, <c>project</c> or <c>user</c>.</param>
+    private string? ResolveSettingsFileForScope(string scope)
+    {
+        if (string.Equals(scope, PermissionUpdate.ProjectScope, StringComparison.OrdinalIgnoreCase))
+        {
+            var workingDirectory = string.IsNullOrWhiteSpace(this.options.WorkingDirectory)
+                ? Directory.GetCurrentDirectory()
+                : this.options.WorkingDirectory;
+            return Path.Combine(workingDirectory, ".coda", "settings.json");
+        }
+
+        if (string.Equals(scope, PermissionUpdate.UserScope, StringComparison.OrdinalIgnoreCase))
+        {
+            var homeDir = Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
+                ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+            return Path.Combine(homeDir, ".coda", "settings.json");
+        }
+
+        return null;
     }
 
     private static ToolResultBlock CreateToolResultBlock(

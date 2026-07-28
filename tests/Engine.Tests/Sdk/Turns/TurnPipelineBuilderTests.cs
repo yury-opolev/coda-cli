@@ -106,7 +106,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: true),
             this.Client(),
             CodaSettings.Empty);
-        Assert.IsType<LiveBypassClassifierPermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<LiveBypassClassifierPermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
@@ -117,7 +118,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: false),
             this.Client(),
             CodaSettings.Empty);
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
@@ -125,7 +127,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     {
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     // ---- Permissions: rules on/off (allow-only, deny-only, both, none) ----
@@ -149,11 +152,30 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     }
 
     [Fact]
-    public void No_rules_leave_the_base_prompt_unwrapped()
+    public void No_rules_always_wraps_with_rules_prompt()
     {
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
-        Assert.IsNotType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+    }
+
+    [Fact]
+    public void No_initial_rules_store_is_live_and_takes_effect_when_rules_added_mid_session()
+    {
+        // Regression: when no rules are pre-configured, the store must still be the live source of
+        // truth so a PermissionRequest hook can add a deny rule that takes effect on the next call.
+        var builder = this.NewBuilder();
+        var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
+
+        // Store starts empty.
+        Assert.NotNull(spec.PermissionRules);
+        Assert.Null(spec.PermissionRules!.FindMatchedRule("danger", "{}"));
+
+        // Hook adds a deny rule mid-session.
+        spec.PermissionRules.AddDeny([PermissionRule.Parse("danger")]);
+
+        // The deny is now reflected by the live RulesPermissionPrompt.
+        Assert.Equal("deny:danger", spec.PermissionRules.FindMatchedRule("danger", "{}"));
     }
 
     // ---- Goal on/off ----

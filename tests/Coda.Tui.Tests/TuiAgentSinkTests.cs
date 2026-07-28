@@ -172,4 +172,21 @@ public sealed class TuiAgentSinkTests
         Assert.Equal("original text", evt.OriginalPrompt);
         Assert.Equal("rewritten text", evt.ModifiedPrompt);
     }
+
+    [Fact]
+    public void OnPermissionsUpdated_publishes_PermissionsUpdatedEvent()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+        var addedAllow = new[] { "danger" };
+        var addedDeny = new[] { "safe(rm:*)" };
+
+        sink.OnPermissionsUpdated("rules-hook", "acceptEdits", addedAllow, addedDeny);
+
+        var evt = Assert.IsType<PermissionsUpdatedEvent>(Assert.Single(events));
+        Assert.Equal("rules-hook", evt.HookCommand);
+        Assert.Equal("acceptEdits", evt.ModeApplied);
+        Assert.Contains("danger", evt.AddedAllow);
+        Assert.Contains("safe(rm:*)", evt.AddedDeny);
+    }
 }

@@ -18,6 +18,13 @@ namespace Coda.Agent.Permissions;
 public sealed record PermissionRule(string ToolName, string? ArgPattern)
 {
     /// <summary>
+    /// Returns the canonical string form of this rule — the inverse of <see cref="Parse"/>.
+    /// Always round-trips cleanly: <c>Parse(r.ToRuleString())</c> equals <c>r</c>.
+    /// </summary>
+    public string ToRuleString() =>
+        this.ArgPattern is null ? this.ToolName : $"{this.ToolName}({this.ArgPattern})";
+
+    /// <summary>
     /// Parses a rule string into a <see cref="PermissionRule"/>.
     /// </summary>
     /// <param name="rule">

@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Coda.Agent.Permissions;
 using Microsoft.Extensions.Logging;
 
 namespace Coda.Agent.Settings;
@@ -183,6 +184,111 @@ public static class SettingsWriter
         var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
         File.WriteAllText(tmp, json);
         File.Move(tmp, file, overwrite: true);
+    }
+
+    /// <summary>
+    /// Merge permission rules into the <c>permissions</c> section of the settings file at
+    /// <paramref name="settingsFilePath"/>. Existing rules are preserved and duplicates are
+    /// dropped. Atomic (temp file + move), preserving all other keys.
+    /// </summary>
+    /// <remarks>
+    /// This is what a <c>PermissionRequest</c> hook's <c>updatedPermissions</c> writes for
+    /// <c>scope:"project"</c> and <c>scope:"user"</c>. Failures are logged and swallowed — a
+    /// settings file that cannot be written must never fail the turn. Mode changes (<c>setMode</c>)
+    /// are session-scoped only and are never persisted to disk.
+    /// </remarks>
+    /// <param name="addAllow">Rules to append to <c>permissions.allow</c>.</param>
+    /// <param name="addDeny">Rules to append to <c>permissions.deny</c>.</param>
+    /// <param name="settingsFilePath">The full path of the <c>settings.json</c> file to update.</param>
+    /// <param name="logger">Optional logger for write failures and skipped malformed rules.</param>
+    public static void AddPermissionRules(
+        IReadOnlyList<string> addAllow,
+        IReadOnlyList<string> addDeny,
+        string settingsFilePath,
+        ILogger? logger = null)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(settingsFilePath);
+
+        try
+        {
+            JsonObject root;
+            try
+            {
+                root = (File.Exists(settingsFilePath)
+                    ? JsonNode.Parse(File.ReadAllText(settingsFilePath)) as JsonObject
+                    : null) ?? new JsonObject();
+            }
+            catch (JsonException)
+            {
+                root = new JsonObject(); // corrupt file → start fresh rather than throw
+            }
+
+            var permissions = root["permissions"] as JsonObject ?? new JsonObject();
+            MergeRules(permissions, "allow", addAllow, logger);
+            MergeRules(permissions, "deny", addDeny, logger);
+
+            root["permissions"] = permissions;
+
+            var dir = Path.GetDirectoryName(Path.GetFullPath(settingsFilePath));
+            if (!string.IsNullOrEmpty(dir))
+            {
+                Directory.CreateDirectory(dir);
+            }
+
+            var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+            var tmp = Path.Combine(dir ?? ".", $".settings.{Guid.NewGuid():N}.tmp");
+            File.WriteAllText(tmp, json);
+            File.Move(tmp, settingsFilePath, overwrite: true);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
+        {
+            logger?.LogWarning(ex, "Failed to persist permission rules to {SettingsFile}", settingsFilePath);
+        }
+    }
+
+    /// <summary>Append rules to a string array under <paramref name="key"/>, skipping duplicates and malformed entries.</summary>
+    private static void MergeRules(JsonObject permissions, string key, IReadOnlyList<string> additions, ILogger? logger)
+    {
+        if (additions is not { Count: > 0 })
+        {
+            return;
+        }
+
+        var array = permissions[key] as JsonArray ?? new JsonArray();
+        var existing = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var node in array)
+        {
+            if (node is JsonValue value && value.TryGetValue<string>(out var text))
+            {
+                existing.Add(text);
+            }
+        }
+
+        foreach (var rule in additions)
+        {
+            if (string.IsNullOrWhiteSpace(rule) || !existing.Add(rule))
+            {
+                continue;
+            }
+
+            // M1: reject rules that do not round-trip cleanly — a malformed rule litters the file.
+            // Parse uses the trimmed form to get the canonical representation, then compare with
+            // the original (untrimmed) to catch extra whitespace and other non-canonical forms.
+            var parsed = PermissionRule.Parse(rule.Trim());
+            var normalized = parsed.ToRuleString();
+            if (!string.Equals(normalized, rule, StringComparison.Ordinal))
+            {
+                logger?.LogWarning(
+                    "Skipping malformed permission rule '{Rule}'; it does not round-trip through the parser (normalized: '{Normalized}')",
+                    rule,
+                    normalized);
+                continue;
+            }
+
+            array.Add(rule);
+        }
+
+        permissions[key] = array;
     }
 
     private static void ApplyKey(JsonObject root, string key, string? value)

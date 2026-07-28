@@ -105,4 +105,20 @@ public sealed class TuiAgentSink : IAgentSink
 
     public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
         this.publisher.Publish(new ResponseRewrittenEvent(hookCommand, originalResponse, displayContent, modifiedResponse));
+
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+        this.publisher.Publish(new ToolInputModifiedEvent(hookCommand, toolName, originalInput, modifiedInput));
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+        this.publisher.Publish(new ToolResultModifiedEvent(hookCommand, toolName, originalResult, modifiedResult));
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+        this.publisher.Publish(new PermissionDecidedEvent(hookCommand, toolName, decision));
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny) =>
+        this.publisher.Publish(new PermissionsUpdatedEvent(hookCommand, modeApplied, addedAllow, addedDeny));
 }

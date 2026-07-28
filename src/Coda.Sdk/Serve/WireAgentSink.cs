@@ -183,6 +183,34 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventResponseRewritten, node);
     }
 
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput)
+    {
+        var node = ServeJson.ToNode(new ToolInputModifiedEvent(hookCommand, toolName, originalInput, modifiedInput));
+        _ = this.SendAsync(ServeMethods.EventToolInputModified, node);
+    }
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult)
+    {
+        var node = ServeJson.ToNode(new ToolResultModifiedEvent(hookCommand, toolName, originalResult, modifiedResult));
+        _ = this.SendAsync(ServeMethods.EventToolResultModified, node);
+    }
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision)
+    {
+        var node = ServeJson.ToNode(new PermissionDecidedEvent(hookCommand, toolName, decision));
+        _ = this.SendAsync(ServeMethods.EventPermissionDecided, node);
+    }
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny)
+    {
+        var node = ServeJson.ToNode(new PermissionsUpdatedEvent(hookCommand, modeApplied, addedAllow, addedDeny));
+        _ = this.SendAsync(ServeMethods.EventPermissionsUpdated, node);
+    }
+
     private void CoalesceText(string delta)
     {
         if (string.IsNullOrEmpty(delta))

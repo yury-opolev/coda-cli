@@ -391,6 +391,15 @@ public sealed partial class TaskManager
 
         public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
             _parent.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
+
+        public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+            _parent.OnToolInputModified(hookCommand, toolName, originalInput, modifiedInput);
+
+        public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+            _parent.OnToolResultModified(hookCommand, toolName, originalResult, modifiedResult);
+
+        public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+            _parent.OnPermissionDecided(hookCommand, toolName, decision);
     }
 
     /// <summary>An IAgentSink that discards everything — used as the parent for background subagents.</summary>

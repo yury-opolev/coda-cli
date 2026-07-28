@@ -104,7 +104,7 @@ public sealed class TurnPipelineBuilder
 
         var agentOptions = this.BuildAgentOptions(options);
 
-        var permissions = BuildPermissions(options, client, settings);
+        var (permissions, permissionRules) = BuildPermissions(options, client, settings);
 
         // The goal step may mutate agentOptions (AutoCompact + threshold) when a goal is active.
         var (goalSupervisor, goalAgentOptions) = BuildGoalSupervisor(options, client, settings, agentOptions);
@@ -157,7 +157,10 @@ public sealed class TurnPipelineBuilder
             Logger: this.loggerFactory.CreateLogger("Coda.Tool"),
             // Evaluated per turn so a runtime that starts after the builder was constructed is
             // picked up on the next turn; returns null until then.
-            ScheduleRuntime: this.scheduleRuntimeProvider());
+            ScheduleRuntime: this.scheduleRuntimeProvider())
+        {
+            PermissionRules = permissionRules,
+        };
     }
 
     /// <summary>
@@ -251,7 +254,7 @@ public sealed class TurnPipelineBuilder
 
         var agentOptions = this.BuildAgentOptions(options);
 
-        var permissions = BuildPermissions(options, client, settings);
+        var (permissions, permissionRules) = BuildPermissions(options, client, settings);
 
         var hookContext = new HookContext(
             SessionId: this.tasks.SessionId,
@@ -296,7 +299,10 @@ public sealed class TurnPipelineBuilder
             Gate: null,
             ScheduleRuntime: null,
             CurrentTaskId: taskId,
-            CurrentDepth: depth);
+            CurrentDepth: depth)
+        {
+            PermissionRules = permissionRules,
+        };
     }
 
     /// <summary>
@@ -357,7 +363,10 @@ public sealed class TurnPipelineBuilder
     /// Builds the permission policy: the mode/classifier base, then a rules wrapper when the
     /// settings carry any allow/deny rules.
     /// </summary>
-    private static IPermissionPrompt BuildPermissions(SessionOptions options, ILlmClient client, CodaSettings settings)
+    private static (IPermissionPrompt Permissions, PermissionRuleStore Rules) BuildPermissions(
+        SessionOptions options,
+        ILlmClient client,
+        CodaSettings settings)
     {
         // Read the mode live from the shared session state when supplied, so a mid-run mode change
         // is applied to the next decision; otherwise wrap a fixed state from the snapshot.
@@ -378,15 +387,16 @@ public sealed class TurnPipelineBuilder
             permissions = new ModePermissionPrompt(state, options.InteractivePrompt);
         }
 
-        // Wrap the base permissions with the allow/deny rule lists when any rules exist.
-        if (settings.Allow.Count > 0 || settings.Deny.Count > 0)
-        {
-            var allowRules = settings.Allow.Select(PermissionRule.Parse).ToList();
-            var denyRules = settings.Deny.Select(PermissionRule.Parse).ToList();
-            permissions = new RulesPermissionPrompt(allowRules, denyRules, permissions);
-        }
+        // Always wrap the base permissions with the live rule store. The store starts empty
+        // when no rules are pre-configured; rules added mid-session by a PermissionRequest hook
+        // take effect immediately because RulesPermissionPrompt reads the same store instance.
+        var ruleStore = new PermissionRuleStore(
+            settings.Allow.Select(PermissionRule.Parse),
+            settings.Deny.Select(PermissionRule.Parse));
 
-        return permissions;
+        permissions = new RulesPermissionPrompt(ruleStore, permissions);
+
+        return (permissions, ruleStore);
     }
 
     /// <summary>

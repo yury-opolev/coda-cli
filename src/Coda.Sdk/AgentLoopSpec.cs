@@ -3,6 +3,7 @@ using Coda.Agent.Tasks;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
+using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
@@ -79,4 +80,11 @@ public sealed record AgentLoopSpec(
     /// a single activity id from it when it executes the first tool batch.
     /// </summary>
     public ToolActivityContext? ToolActivity { get; init; }
+
+    /// <summary>
+    /// The live permission rule store shared with the permission prompt. The loop reads it to
+    /// compute the <c>matchedRule</c> field of the <c>PermissionRequest</c> hook payload and
+    /// mutates it when a hook returns session-scoped <c>updatedPermissions</c>.
+    /// </summary>
+    public PermissionRuleStore? PermissionRules { get; init; }
 }

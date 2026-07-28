@@ -73,6 +73,8 @@ public sealed partial class HookBus
         this.spillDirFactory = spillDirFactory;
         this.logger = logger ?? NullLogger.Instance;
         this.HasPreToolUse = hooks.Any(h => string.Equals(h.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase));
+        this.HasPostToolUse = hooks.Any(h => string.Equals(h.Event, "PostToolUse", StringComparison.OrdinalIgnoreCase));
+        this.HasPermissionRequest = hooks.Any(h => string.Equals(h.Event, "PermissionRequest", StringComparison.OrdinalIgnoreCase));
         this.HasUserPromptSubmit = hooks.Any(h => string.Equals(h.Event, "UserPromptSubmit", StringComparison.OrdinalIgnoreCase));
         this.HasSessionStart = hooks.Any(h => string.Equals(h.Event, "SessionStart", StringComparison.OrdinalIgnoreCase));
         this.HasSessionEnd = hooks.Any(h => string.Equals(h.Event, "SessionEnd", StringComparison.OrdinalIgnoreCase));
@@ -89,6 +91,12 @@ public sealed partial class HookBus
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
     public bool HasPreToolUse { get; }
+
+    /// <summary>True when at least one <c>PostToolUse</c> hook is configured.</summary>
+    public bool HasPostToolUse { get; }
+
+    /// <summary>True when at least one <c>PermissionRequest</c> hook is configured.</summary>
+    public bool HasPermissionRequest { get; }
 
     /// <summary>True when at least one <c>UserPromptSubmit</c> hook is configured.</summary>
     public bool HasUserPromptSubmit { get; }
@@ -124,6 +132,12 @@ public sealed partial class HookBus
     /// merged result. A hook exiting with code 1 (or any other non-zero code) blocks the
     /// tool call because <c>PreToolUse</c> defaults to fail-closed.
     /// </summary>
+    /// <remarks>
+    /// A hook may also return <c>hookSpecificOutput.modifiedInput</c>: a JSON object that
+    /// <strong>fully replaces</strong> the tool arguments (it is never merged into them).
+    /// A non-object value is ignored with a warning; across multiple hooks the last writer wins
+    /// and the override is logged.
+    /// </remarks>
     /// <param name="toolName">The name of the tool about to be called.</param>
     /// <param name="inputJson">The tool's input as a JSON string.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -144,37 +158,59 @@ public sealed partial class HookBus
 
         var payload = this.BuildPrePayload(toolName, inputJson, depth, taskId);
         var outputs = await this.RunHooksAsync(matching, "PreToolUse", payload, ct).ConfigureAwait(false);
-        return ToUserHookResult(MergeOutputs(outputs));
+
+        var merged = ToUserHookResult(MergeOutputs(outputs));
+        if (merged.Block)
+        {
+            return merged;
+        }
+
+        var (modifiedInput, byHookCommand) = this.ExtractLastJsonObject(matching, outputs, "modifiedInput");
+        return modifiedInput is null
+            ? merged
+            : merged with { ModifiedInput = modifiedInput, ByHookCommand = byHookCommand };
     }
 
     /// <summary>
-    /// Runs all matching <c>PostToolUse</c> hooks. Exit codes and errors are ignored
-    /// (fail-open default). The merged output is not acted on in Phase 0.
+    /// Runs all matching <c>PostToolUse</c> hooks and returns the merged result. Exit codes and
+    /// errors never fail the tool call (fail-open default) — the tool has already run and its
+    /// side effects cannot be undone.
     /// </summary>
+    /// <remarks>
+    /// A hook may return <c>hookSpecificOutput.modifiedResult</c> to replace the result text the
+    /// model sees, or <c>decision:"block"</c> with a <c>reason</c> that replaces the result
+    /// entirely. Neither un-runs the tool. Both are last-writer-wins across hooks.
+    /// </remarks>
     /// <param name="toolName">The name of the tool that was called.</param>
     /// <param name="inputJson">The tool's input as a JSON string.</param>
     /// <param name="toolResultText">The tool result text.</param>
     /// <param name="ct">Cancellation token.</param>
     /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
     /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
-    public async Task RunPostToolUseAsync(
+    /// <param name="errorText">
+    /// The failure text when the tool call failed (threw, or exceeded its time ceiling), written to
+    /// the payload's <c>error</c> field; <see langword="null"/> for a successful call.
+    /// </param>
+    public async Task<PostToolUseResult> RunPostToolUseAsync(
         string toolName,
         string inputJson,
         string toolResultText,
         CancellationToken ct,
         int depth = 0,
-        string? taskId = null)
+        string? taskId = null,
+        string? errorText = null)
     {
         var matching = this.GetMatchingHooks("PostToolUse", toolName);
         if (matching.Count == 0)
         {
-            return;
+            return PostToolUseResult.NoChange;
         }
 
-        var payload = this.BuildPostPayload(toolName, inputJson, toolResultText, depth, taskId);
+        var payload = this.BuildPostPayload(toolName, inputJson, toolResultText, errorText, depth, taskId);
+        List<HookOutput> outputs;
         try
         {
-            await this.RunHooksAsync(matching, "PostToolUse", payload, ct).ConfigureAwait(false);
+            outputs = await this.RunHooksAsync(matching, "PostToolUse", payload, ct).ConfigureAwait(false);
         }
         catch (OperationCanceledException)
         {
@@ -184,7 +220,64 @@ public sealed partial class HookBus
         {
             // Individual hook errors are already swallowed in RunSingleHookAsync;
             // this outer catch guards against unexpected failures in the loop itself.
+            return PostToolUseResult.NoChange;
         }
+
+        return this.MergePostToolUseOutputs(matching, outputs);
+    }
+
+    /// <summary>
+    /// Runs all matching <c>PermissionRequest</c> hooks. The event fires after <c>PreToolUse</c>
+    /// passed and only for a tool that would otherwise render an interactive approval prompt.
+    /// Policy: 10 s timeout, fail-closed — a broken hook denies rather than grants.
+    /// </summary>
+    /// <param name="toolName">The name of the tool requesting approval.</param>
+    /// <param name="inputJson">The tool's input as a JSON string.</param>
+    /// <param name="permissionMode">The live permission mode (e.g. <c>"default"</c>).</param>
+    /// <param name="matchedRule">
+    /// The matching permission rule in <c>allow:rule</c> / <c>deny:rule</c> form, or
+    /// <see langword="null"/> when no configured rule matches this call.
+    /// </param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
+    public async Task<PermissionRequestResult> RunPermissionRequestAsync(
+        string toolName,
+        string inputJson,
+        string permissionMode,
+        string? matchedRule,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null)
+    {
+        var matching = this.GetMatchingHooks("PermissionRequest", toolName);
+        if (matching.Count == 0)
+        {
+            return PermissionRequestResult.Prompt;
+        }
+
+        var payload = this.BuildPermissionRequestPayload(toolName, inputJson, permissionMode, matchedRule, depth, taskId);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "PermissionRequest", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            // Fail-closed: an unexpected loop-level failure denies.
+            return new PermissionRequestResult
+            {
+                Decision = PermissionDecisions.Deny,
+                Reason = $"permission hook failed: {ex.Message}",
+                ByHookCommand = matching[0].Command,
+            };
+        }
+
+        return this.MergePermissionRequestOutputs(matching, outputs);
     }
 
     /// <summary>
@@ -727,6 +820,210 @@ public sealed partial class HookBus
     }
 
     /// <summary>
+    /// Merges <c>PostToolUse</c> hook outputs: a <c>block</c> decision wins outright (its reason
+    /// replaces the result), otherwise <c>modifiedResult</c> is applied last-writer-wins.
+    /// </summary>
+    private PostToolUseResult MergePostToolUseOutputs(
+        IReadOnlyList<UserHook> matching,
+        IReadOnlyList<HookOutput> outputs)
+    {
+        if (outputs.Count == 0)
+        {
+            return PostToolUseResult.NoChange;
+        }
+
+        var merged = MergeOutputs(outputs);
+
+        string? modifiedResult = null;
+        string? byHookCommand = null;
+        for (var i = 0; i < outputs.Count; i++)
+        {
+            var specific = outputs[i].HookSpecificOutput;
+            if (specific is null || !TryGetStringAllowEmpty(specific, "modifiedResult", out var mr))
+            {
+                continue;
+            }
+
+            if (modifiedResult is not null)
+            {
+                this.LogFieldOverride("modifiedResult", modifiedResult, mr!);
+            }
+
+            modifiedResult = mr;
+            byHookCommand = i < matching.Count ? matching[i].Command : null;
+        }
+
+        if (IsBlockingDecision(merged.Decision))
+        {
+            var reason = merged.Reason ?? "blocked by hook";
+            return new PostToolUseResult(Block: true, reason, modifiedResult, byHookCommand ?? matching[0].Command);
+        }
+
+        return modifiedResult is null
+            ? PostToolUseResult.NoChange
+            : new PostToolUseResult(Block: false, null, modifiedResult, byHookCommand);
+    }
+
+    /// <summary>
+    /// Merges <c>PermissionRequest</c> hook outputs. The decision is resolved strictest-first
+    /// (<c>deny</c> beats <c>prompt</c> beats <c>allow</c>) so a permissive hook can never
+    /// override a restrictive one; <c>modifiedInput</c> and <c>updatedPermissions</c> are
+    /// last-writer-wins.
+    /// </summary>
+    private PermissionRequestResult MergePermissionRequestOutputs(
+        IReadOnlyList<UserHook> matching,
+        IReadOnlyList<HookOutput> outputs)
+    {
+        if (outputs.Count == 0)
+        {
+            return PermissionRequestResult.Prompt;
+        }
+
+        string? decision = null;
+        var reasons = new List<string>();
+        string? decisionHookCommand = null;
+        PermissionUpdate? update = null;
+
+        for (var i = 0; i < outputs.Count; i++)
+        {
+            var output = outputs[i];
+            var hookCommand = i < matching.Count ? matching[i].Command : null;
+
+            // Continue:false is a hard stop — treat it as a denial rather than a silent allow.
+            var candidate = output.Continue
+                ? NormalizePermissionDecision(output.Decision)
+                : PermissionDecisions.Deny;
+
+            if (candidate is not null
+                && (decision is null || PermissionDecisionRank(candidate) > PermissionDecisionRank(decision)))
+            {
+                decision = candidate;
+                decisionHookCommand = hookCommand;
+            }
+
+            if (!string.IsNullOrEmpty(output.Reason)
+                && (string.Equals(candidate, PermissionDecisions.Deny, StringComparison.OrdinalIgnoreCase)
+                    || !output.Continue))
+            {
+                reasons.Add(output.Reason);
+            }
+
+            if (output.HookSpecificOutput is { } specific
+                && ParsePermissionUpdate(specific) is { } parsed)
+            {
+                update = parsed;
+            }
+        }
+
+        var (modifiedInput, modifiedByCommand) = this.ExtractLastJsonObject(matching, outputs, "modifiedInput");
+
+        return new PermissionRequestResult
+        {
+            Decision = decision ?? PermissionDecisions.Prompt,
+            Reason = reasons.Count > 0 ? string.Join("\n\n", reasons) : null,
+            ModifiedInput = modifiedInput,
+            UpdatedPermissions = update,
+            ByHookCommand = decisionHookCommand ?? modifiedByCommand,
+        };
+    }
+
+    /// <summary>
+    /// Maps a raw hook decision onto the <c>PermissionRequest</c> vocabulary. <c>block</c> and
+    /// <c>ask</c> are folded onto <c>deny</c> and <c>prompt</c> respectively; an unrecognised or
+    /// absent value expresses no opinion (<see langword="null"/>).
+    /// </summary>
+    private static string? NormalizePermissionDecision(string? decision) => decision?.ToLowerInvariant() switch
+    {
+        "allow"  => PermissionDecisions.Allow,
+        "prompt" => PermissionDecisions.Prompt,
+        "ask"    => PermissionDecisions.Prompt,
+        "deny"   => PermissionDecisions.Deny,
+        "block"  => PermissionDecisions.Deny,
+        _        => null,
+    };
+
+    private static int PermissionDecisionRank(string decision) => decision switch
+    {
+        PermissionDecisions.Allow  => 0,
+        PermissionDecisions.Prompt => 1,
+        PermissionDecisions.Deny   => 2,
+        _                          => 0,
+    };
+
+    /// <summary>Parses <c>hookSpecificOutput.updatedPermissions</c>, or returns null when absent/empty.</summary>
+    private static PermissionUpdate? ParsePermissionUpdate(JsonObject specific)
+    {
+        if (!specific.TryGetPropertyValue("updatedPermissions", out var node) || node is not JsonObject updated)
+        {
+            return null;
+        }
+
+        List<string> addAllow = [];
+        List<string> addDeny = [];
+        if (updated.TryGetPropertyValue("addRules", out var rulesNode) && rulesNode is JsonObject rules)
+        {
+            if (rules.TryGetPropertyValue("allow", out var allowNode) && allowNode is JsonArray allowArray)
+            {
+                addAllow = [.. ReadStringArray(allowArray)];
+            }
+
+            if (rules.TryGetPropertyValue("deny", out var denyNode) && denyNode is JsonArray denyArray)
+            {
+                addDeny = [.. ReadStringArray(denyArray)];
+            }
+        }
+
+        TryGetString(updated, "setMode", out var setMode);
+        var scope = TryGetString(updated, "scope", out var scopeValue)
+            ? scopeValue!.Trim()
+            : PermissionUpdate.SessionScope;
+
+        var result = new PermissionUpdate(addAllow, addDeny, setMode, scope);
+        return result.IsEmpty ? null : result;
+    }
+
+    /// <summary>
+    /// Extracts the last <c>hookSpecificOutput.<paramref name="key"/></c> value that is a JSON
+    /// object, returning its compact JSON text plus the command of the hook that produced it.
+    /// A value of any other kind is ignored with a warning; an override is logged.
+    /// </summary>
+    private (string? Json, string? ByHookCommand) ExtractLastJsonObject(
+        IReadOnlyList<UserHook> matching,
+        IReadOnlyList<HookOutput> outputs,
+        string key)
+    {
+        string? json = null;
+        string? byHookCommand = null;
+
+        for (var i = 0; i < outputs.Count; i++)
+        {
+            var specific = outputs[i].HookSpecificOutput;
+            if (specific is null || !specific.TryGetPropertyValue(key, out var node) || node is null)
+            {
+                continue;
+            }
+
+            var hookCommand = i < matching.Count ? matching[i].Command : string.Empty;
+            if (node is not JsonObject obj)
+            {
+                this.LogNonObjectHookField(key, hookCommand, node.GetValueKind().ToString());
+                continue;
+            }
+
+            var candidate = obj.ToJsonString();
+            if (json is not null)
+            {
+                this.LogFieldOverride(key, json, candidate);
+            }
+
+            json = candidate;
+            byHookCommand = hookCommand;
+        }
+
+        return (json, byHookCommand);
+    }
+
+    /// <summary>
     /// Merges <c>AgentResponse</c> hook outputs following last-writer-wins for both
     /// <c>displayContent</c> and <c>modifiedResponse</c>.
     /// </summary>
@@ -1128,7 +1425,7 @@ public sealed partial class HookBus
         return Encoding.UTF8.GetString(ms.ToArray());
     }
 
-    private string BuildPostPayload(string toolName, string inputJson, string resultText, int depth, string? taskId)
+    private string BuildPostPayload(string toolName, string inputJson, string resultText, string? errorText, int depth, string? taskId)
     {
         using var ms = new System.IO.MemoryStream();
         using (var writer = new Utf8JsonWriter(ms))
@@ -1139,6 +1436,48 @@ public sealed partial class HookBus
             writer.WritePropertyName("input");
             WriteJsonOrString(writer, inputJson);
             writer.WriteString("result", resultText);
+
+            // Gemini's shape: one event for success and failure, with an optional error field
+            // carrying the failure text alongside the result.
+            if (errorText is not null)
+            {
+                writer.WriteString("error", errorText);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildPermissionRequestPayload(
+        string toolName,
+        string inputJson,
+        string permissionMode,
+        string? matchedRule,
+        int depth,
+        string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "PermissionRequest", depth, taskId);
+            writer.WriteString("tool", toolName);
+            writer.WritePropertyName("input");
+            WriteJsonOrString(writer, inputJson);
+            writer.WriteString("permissionMode", permissionMode);
+
+            // Always written (null when nothing matched) so a hook can rely on the key existing.
+            if (matchedRule is null)
+            {
+                writer.WriteNull("matchedRule");
+            }
+            else
+            {
+                writer.WriteString("matchedRule", matchedRule);
+            }
+
             writer.WriteEndObject();
         }
 
@@ -1505,6 +1844,11 @@ public sealed partial class HookBus
         Level = LogLevel.Information,
         Message = "UserPromptSubmit hook returned ask with no interactive answerer; resolved unattended as {resolution} (§8.2)")]
     private partial void LogAskResolvedUnattended(bool resolution);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "hook '{command}' returned '{field}' of kind {valueKind}; only a JSON object is accepted — ignoring")]
+    private partial void LogNonObjectHookField(string field, string command, string valueKind);
 
     [LoggerMessage(
         Level = LogLevel.Warning,

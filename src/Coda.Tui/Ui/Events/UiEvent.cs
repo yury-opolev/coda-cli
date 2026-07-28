@@ -237,6 +237,45 @@ public sealed record ResponseRewrittenEvent(
     string? ModifiedResponse) : UiEvent;
 
 /// <summary>
+/// A <c>PreToolUse</c> or <c>PermissionRequest</c> hook replaced the arguments a tool ran with.
+/// The replacement is total — <see cref="ModifiedInput"/> is exactly what the tool executed.
+/// </summary>
+public sealed record ToolInputModifiedEvent(
+    string HookCommand,
+    string ToolName,
+    string OriginalInput,
+    string ModifiedInput) : UiEvent;
+
+/// <summary>
+/// A <c>PostToolUse</c> hook replaced the result text reported to the model. The tool already
+/// ran; only what the model sees changed.
+/// </summary>
+public sealed record ToolResultModifiedEvent(
+    string HookCommand,
+    string ToolName,
+    string OriginalResult,
+    string ModifiedResult) : UiEvent;
+
+/// <summary>
+/// A <c>PermissionRequest</c> hook decided a pending approval without the interactive prompt.
+/// <see cref="Decision"/> is either <c>"allow"</c> or <c>"deny"</c>.
+/// </summary>
+public sealed record PermissionDecidedEvent(
+    string HookCommand,
+    string ToolName,
+    string Decision) : UiEvent;
+
+/// <summary>
+/// A <c>PermissionRequest</c> hook's <c>updatedPermissions</c> was applied to the live session.
+/// Emitted for auditability whenever a mode change or rule additions take effect.
+/// </summary>
+public sealed record PermissionsUpdatedEvent(
+    string HookCommand,
+    string? ModeApplied,
+    IReadOnlyList<string> AddedAllow,
+    IReadOnlyList<string> AddedDeny) : UiEvent;
+
+/// <summary>
 /// An internal ordering barrier published through the mailbox by <see cref="UiActor.FlushAsync"/>. The
 /// actor completes <see cref="Completion"/> only after every event queued before it has passed the
 /// observer, reducer, and frame sink in FIFO order. <see cref="UiReducer"/> ignores it (the default
