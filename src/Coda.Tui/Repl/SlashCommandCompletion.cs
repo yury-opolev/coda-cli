@@ -2,7 +2,6 @@ namespace Coda.Tui.Repl;
 
 internal sealed class SlashCommandCompletion
 {
-    private const int MaxSuggestions = 10;
     private readonly SlashCommandRegistry commands;
     private IReadOnlyList<ISlashCommand> suggestions = [];
     private bool isDismissed;
@@ -30,12 +29,14 @@ internal sealed class SlashCommandCompletion
         }
 
         var previousName = this.IsVisible ? this.suggestions[this.SelectedIndex].Name : null;
+
+        // Every match is offered; the popup bounds what is on screen at once and scrolls through
+        // the rest, so truncating here would silently hide commands the query legitimately matched.
         this.suggestions = this.commands.ListSorted()
             .Select(command => new { Command = command, Rank = GetRank(command, query) })
             .Where(match => match.Rank >= 0)
             .OrderBy(match => match.Rank)
             .ThenBy(match => match.Command.Name, StringComparer.OrdinalIgnoreCase)
-            .Take(MaxSuggestions)
             .Select(match => match.Command)
             .ToArray();
 

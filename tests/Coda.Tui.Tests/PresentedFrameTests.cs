@@ -93,6 +93,58 @@ public sealed class PresentedFrameTests
     }
 
     [Fact]
+    public void Row_blanked_after_being_suppressed_is_marked_dirty_again()
+    {
+        // Reproduces the closed-dialog artifact: Terminal.Gui raises DirtyLines only from a text
+        // write and never lowers it, while FillRect (View.ClearViewport) dirties cells without
+        // touching the line flag. A row that was fully suppressed while a dialog sat on it, then
+        // only blanked when the dialog closed, must not stay clean — the write loop would skip it
+        // and the dialog's content would remain on screen for the rest of the session.
+        var buffer = CreateBuffer(4, 1);
+        buffer.AddStr("abcd");  // dialog content, transmitted
+        var frame = new PresentedFrame();
+        frame.Adopt(buffer);
+
+        // The dialog redraws itself identically (e.g. the user moved the selection): every cell is
+        // suppressed, which lowers the line flag.
+        buffer.Move(0, 0);
+        buffer.AddStr("abcd");
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+        Assert.False(buffer.DirtyLines[0]);
+        frame.Adopt(buffer);
+
+        // The dialog closes and the row underneath is blank, so it is only cleared — never written
+        // with text — and Terminal.Gui leaves the line flag down.
+        buffer.FillRect(new System.Drawing.Rectangle(0, 0, 4, 1), ' ');
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+
+        Assert.True(IsDirty(buffer, 0, 0));
+        Assert.True(buffer.DirtyLines[0], "A row holding dirty cells must be transmitted.");
+    }
+
+    [Fact]
+    public void Dirty_lines_summarize_cell_flags_without_suppression()
+    {
+        var buffer = CreateBuffer(3, 2);
+        buffer.AddStr("aa");
+        buffer.Move(0, 1);
+        buffer.AddStr("bb");
+
+        // Model the state Terminal.Gui can leave behind: a FillRect-only row whose cells are dirty
+        // while its line flag is down.
+        buffer.DirtyLines[0] = true;
+        buffer.DirtyLines[1] = false;
+        buffer.Contents![0, 0].IsDirty = false;
+        buffer.Contents[0, 1].IsDirty = false;
+        buffer.Contents[0, 2].IsDirty = false;
+
+        PresentedFrame.SyncDirtyLines(buffer);
+
+        Assert.False(buffer.DirtyLines[0]);
+        Assert.True(buffer.DirtyLines[1]);
+    }
+
+    [Fact]
     public void First_frame_requires_full_write()
     {
         var buffer = CreateBuffer(2, 1);
