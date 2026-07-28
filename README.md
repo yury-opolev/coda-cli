@@ -177,7 +177,12 @@ switches between full-screen and inline · `Ctrl+B` sends the selected (or lates
 shell** to the background — and, inside the `/tasks` browser, releases an output attachment — without ever
 opening the browser · `Ctrl+End` jumps to the newest transcript output (the scrollbar shows position).
 Typing a `/` shows a slash-command completion menu directly
-above the composer (Up/Down select, Tab completes, a single Esc dismisses).
+above the composer (Up/Down select, Tab completes, a single Esc dismisses). The menu opens for a `/`
+at the start of the prompt **or after whitespace**, so a command can be picked mid-sentence — a `/`
+inside a word, such as a path or URL, never opens it. Accepting a suggestion always just splices the
+command name into the prompt. Only a command at the **start** of the prompt is executed as a command;
+one accepted mid-sentence stays literal text and is sent to the model together with the prose around
+it, so `Enter` there accepts the suggestion and leaves the prompt for you to finish.
 
 **Mouse:** in the **transcript**, **left-drag** selects text and `Ctrl+C` copies it. In the **composer**,
 **left-drag** selects text; when a selection exists, `Ctrl+C`, a **left-click**, or a **right-click**

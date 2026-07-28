@@ -101,13 +101,16 @@ internal sealed class InteractiveLineEditor
                 return true;
 
             case ConsoleKey.Tab when this.completion.IsVisible:
-                if (this.completion.Complete() is { } completed)
+                if (this.completion.Complete() is { } accepted)
                 {
                     var suffix = this.input.ToString(this.cursorIndex, this.input.Length - this.cursorIndex);
+                    var start = Math.Clamp(accepted.Start, 0, this.cursorIndex);
+                    var prefix = this.input.ToString(0, start);
                     this.input.Clear();
-                    this.input.Append(completed);
+                    this.input.Append(prefix);
+                    this.input.Append(accepted.Text);
                     this.input.Append(suffix);
-                    this.cursorIndex = completed.Length;
+                    this.cursorIndex = start + accepted.Text.Length;
                 }
 
                 return true;
