@@ -611,7 +611,7 @@ public sealed partial class AgentLoop : IAgentLoop
                     {
                         try
                         {
-                            await this.userHooks.RunStopAsync(cancellationToken).ConfigureAwait(false);
+                            await this.userHooks.RunStopAsync(cancellationToken, this.currentDepth, this.currentTaskId).ConfigureAwait(false);
                         }
                         catch (Exception ex)
                         {
@@ -744,7 +744,7 @@ public sealed partial class AgentLoop : IAgentLoop
             if (this.userHooks is not null && this.userHooks.HasPreToolUse)
             {
                 var hookResult = await this.userHooks
-                    .RunPreToolUseAsync(toolUse.Name, toolUse.InputJson, cancellationToken)
+                    .RunPreToolUseAsync(toolUse.Name, toolUse.InputJson, cancellationToken, this.currentDepth, this.currentTaskId)
                     .ConfigureAwait(false);
 
                 if (hookResult.Block)
@@ -865,7 +865,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 try
                 {
                     await this.userHooks
-                        .RunPostToolUseAsync(toolUse.Name, toolUse.InputJson, result.Content, cancellationToken)
+                        .RunPostToolUseAsync(toolUse.Name, toolUse.InputJson, result.Content, cancellationToken, this.currentDepth, this.currentTaskId)
                         .ConfigureAwait(false);
                 }
                 catch (Exception ex)

@@ -1,6 +1,4 @@
-using System.Diagnostics;
-using System.Text;
-using System.Text.Json;
+using Microsoft.Extensions.Logging;
 
 namespace Coda.Agent.Hooks;
 
@@ -9,296 +7,132 @@ namespace Coda.Agent.Hooks;
 /// (PreToolUse, PostToolUse, Stop).
 /// </summary>
 /// <remarks>
-/// Process execution is injected via <paramref name="execOverride"/> for testability.
-/// When null, the real OS shell is used (cmd.exe on Windows, /bin/sh elsewhere).
-/// A broken hook command (exec exception) is treated as Allow and never propagates.
+/// <para>
+/// This class is a thin facade over <see cref="HookBus"/>. All ordering, merging,
+/// exit-code interpretation, output parsing, and fail-open/fail-closed policy live
+/// inside the bus, which is the independently unit-testable orchestrator.
+/// </para>
+/// <para>
+/// Process execution is injectable via <paramref name="execOverride"/> for tests.
+/// The override returns <c>(exitCode, stdout)</c>; stderr is treated as empty when
+/// using the legacy 2-tuple override.  For tests that need to supply stderr, create
+/// <see cref="HookBus"/> directly with a full <see cref="IHookExecutor"/> implementation.
+/// </para>
+/// <para>
+/// Important behaviour change from the previous implementation: a broken or timed-out
+/// <c>PreToolUse</c> hook now <strong>blocks</strong> (fail-closed), because a policy
+/// gate that silently permits on error is no gate at all. <c>PostToolUse</c> and
+/// <c>Stop</c> remain fail-open.
+/// </para>
 /// </remarks>
 public sealed class UserHookRunner
 {
-    private static readonly TimeSpan HookTimeout = TimeSpan.FromSeconds(10);
+    private readonly HookBus bus;
 
-    private readonly IReadOnlyList<UserHook> hooks;
-    private readonly Func<string, string, CancellationToken, Task<(int exitCode, string stdout)>>? execOverride;
-
+    /// <summary>
+    /// Initialises the runner.
+    /// </summary>
+    /// <param name="hooks">All user-configured hooks for this session.</param>
+    /// <param name="execOverride">
+    /// Optional test seam: a delegate that simulates shell execution, returning
+    /// <c>(exitCode, stdout)</c>. Stderr is treated as empty when this is used.
+    /// Pass <see langword="null"/> to use the real OS shell.
+    /// </param>
+    /// <param name="context">
+    /// Optional session-level envelope values written into every hook payload.
+    /// When <see langword="null"/> the envelope fields are omitted from the payload
+    /// (backward-compatible with callers that do not supply a context).
+    /// </param>
+    /// <param name="logger">Logger forwarded to the underlying <see cref="HookBus"/>.</param>
     public UserHookRunner(
         IReadOnlyList<UserHook> hooks,
-        Func<string, string, CancellationToken, Task<(int exitCode, string stdout)>>? execOverride = null)
+        Func<string, string, CancellationToken, Task<(int exitCode, string stdout)>>? execOverride = null,
+        HookContext? context = null,
+        ILogger? logger = null)
     {
-        this.hooks = hooks ?? throw new ArgumentNullException(nameof(hooks));
-        this.execOverride = execOverride;
-        this.hasPreToolUse = hooks.Any(h => string.Equals(h.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase));
+        ArgumentNullException.ThrowIfNull(hooks);
+
+        IHookExecutor executor = execOverride is not null
+            ? new LegacyExecAdapter(execOverride)
+            : new ShellHookExecutor();
+
+        this.bus = new HookBus(hooks, executor, context, logger: logger);
     }
 
-    private readonly bool hasPreToolUse;
-
-    /// <summary>True when at least one PreToolUse hook is configured.</summary>
-    public bool HasPreToolUse => this.hasPreToolUse;
+    /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
+    public bool HasPreToolUse => this.bus.HasPreToolUse;
 
     /// <summary>
-    /// Runs all matching PreToolUse hooks in order.
-    /// Returns <see cref="UserHookResult"/> with Block=true on the first non-zero exit.
-    /// Exec exceptions are swallowed and treated as Allow.
+    /// Runs all matching <c>PreToolUse</c> hooks in order and returns the merged result.
+    /// A hook that exits non-zero (or fails / times out) now <strong>blocks</strong> because
+    /// <c>PreToolUse</c> defaults to fail-closed.
     /// </summary>
-    public async Task<UserHookResult> RunPreToolUseAsync(string toolName, string inputJson, CancellationToken ct)
-    {
-        var payload = BuildPayload(toolName, inputJson);
-        foreach (var hook in this.hooks)
-        {
-            if (!string.Equals(hook.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            if (!MatchesTool(hook, toolName))
-            {
-                continue;
-            }
-
-            try
-            {
-                var (exitCode, stdout) = await this.ExecAsync(hook.Command, payload, ct).ConfigureAwait(false);
-                if (exitCode != 0)
-                {
-                    var message = string.IsNullOrWhiteSpace(stdout)
-                        ? "blocked by PreToolUse hook"
-                        : stdout;
-                    return new UserHookResult(Block: true, Message: message);
-                }
-            }
-            catch
-            {
-                // A broken hook command must not crash the turn — treat exec failure as Allow.
-            }
-        }
-
-        return UserHookResult.Allow;
-    }
+    /// <param name="toolName">The name of the tool about to be called.</param>
+    /// <param name="inputJson">The tool's input as a JSON string.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
+    public Task<UserHookResult> RunPreToolUseAsync(
+        string toolName,
+        string inputJson,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null) =>
+        this.bus.RunPreToolUseAsync(toolName, inputJson, ct, depth, taskId);
 
     /// <summary>
-    /// Runs all matching PostToolUse hooks. Exit code and errors are ignored.
+    /// Runs all matching <c>PostToolUse</c> hooks. Exit codes and errors are ignored
+    /// (fail-open default — observation-only hooks must not interrupt tool execution).
     /// </summary>
-    public async Task RunPostToolUseAsync(string toolName, string inputJson, string toolResultText, CancellationToken ct)
-    {
-        var payload = BuildPostPayload(toolName, inputJson, toolResultText);
-        foreach (var hook in this.hooks)
-        {
-            if (!string.Equals(hook.Event, "PostToolUse", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            if (!MatchesTool(hook, toolName))
-            {
-                continue;
-            }
-
-            try
-            {
-                await this.ExecAsync(hook.Command, payload, ct).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Ignore all errors for observation-only hooks.
-            }
-        }
-    }
+    /// <param name="toolName">The name of the tool that was called.</param>
+    /// <param name="inputJson">The tool's input as a JSON string.</param>
+    /// <param name="toolResultText">The tool result text.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
+    public Task RunPostToolUseAsync(
+        string toolName,
+        string inputJson,
+        string toolResultText,
+        CancellationToken ct,
+        int depth = 0,
+        string? taskId = null) =>
+        this.bus.RunPostToolUseAsync(toolName, inputJson, toolResultText, ct, depth, taskId);
 
     /// <summary>
-    /// Runs all Stop hooks. Exit code and errors are ignored.
+    /// Runs all <c>Stop</c> hooks. Exit codes and errors are ignored (fail-open default).
     /// </summary>
-    public async Task RunStopAsync(CancellationToken ct)
+    /// <param name="ct">Cancellation token.</param>
+    /// <param name="depth">Agent nesting depth for this invocation: 0 = main agent, 1–2 = subagent.</param>
+    /// <param name="taskId">The task identifier for this invocation, or <see langword="null"/> for the main agent.</param>
+    public Task RunStopAsync(CancellationToken ct, int depth = 0, string? taskId = null) =>
+        this.bus.RunStopAsync(ct, depth, taskId);
+
+    // -------------------------------------------------------------------------
+    // Legacy 2-tuple exec adapter
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Adapts the legacy <c>(exitCode, stdout)</c> test-override delegate to the
+    /// <see cref="IHookExecutor"/> interface, supplying an empty string for stderr.
+    /// </summary>
+    private sealed class LegacyExecAdapter : IHookExecutor
     {
-        var payload = "{}";
-        foreach (var hook in this.hooks)
-        {
-            if (!string.Equals(hook.Event, "Stop", StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
+        private readonly Func<string, string, CancellationToken, Task<(int exitCode, string stdout)>> func;
 
-            try
-            {
-                await this.ExecAsync(hook.Command, payload, ct).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Ignore all errors for observation-only hooks.
-            }
-        }
-    }
-
-    private Task<(int exitCode, string stdout)> ExecAsync(string command, string stdinPayload, CancellationToken ct)
-    {
-        if (this.execOverride is not null)
+        public LegacyExecAdapter(
+            Func<string, string, CancellationToken, Task<(int exitCode, string stdout)>> func)
         {
-            return this.execOverride(command, stdinPayload, ct);
+            this.func = func;
         }
 
-        return ExecShellAsync(command, stdinPayload, ct);
-    }
-
-    private static async Task<(int exitCode, string stdout)> ExecShellAsync(
-        string command,
-        string stdinPayload,
-        CancellationToken ct)
-    {
-        var (shell, args) = OperatingSystem.IsWindows()
-            ? ("cmd.exe", new[] { "/c", command })
-            : ("/bin/sh", new[] { "-c", command });
-
-        var startInfo = new ProcessStartInfo
+        public async Task<(int ExitCode, string Stdout, string Stderr)> ExecAsync(
+            string command,
+            string payload,
+            CancellationToken ct)
         {
-            FileName = shell,
-            RedirectStandardInput = true,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true,
-        };
-
-        foreach (var arg in args)
-        {
-            startInfo.ArgumentList.Add(arg);
+            var (exitCode, stdout) = await this.func(command, payload, ct).ConfigureAwait(false);
+            return (exitCode, stdout, string.Empty);
         }
-
-        using var process = new Process { StartInfo = startInfo };
-        process.Start();
-
-        // Write payload to stdin then close so the process can read EOF.
-        await process.StandardInput.WriteAsync(stdinPayload).ConfigureAwait(false);
-        process.StandardInput.Close();
-
-        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
-        timeoutCts.CancelAfter(HookTimeout);
-
-        // Drain both pipes concurrently to avoid deadlock.
-        // Pass the linked timeout token so the read tasks are cancelled on timeout too.
-        var stdoutTask = ReadBoundedAsync(process.StandardOutput, maxChars: 4096, timeoutCts.Token);
-        var stderrTask = ReadBoundedAsync(process.StandardError, maxChars: 4096, timeoutCts.Token);
-
-        try
-        {
-            await process.WaitForExitAsync(timeoutCts.Token).ConfigureAwait(false);
-        }
-        catch (OperationCanceledException)
-        {
-            try { process.Kill(entireProcessTree: true); } catch { /* ignore */ }
-
-            // Drain read tasks so the streams are settled before the Process is disposed.
-            try
-            {
-                await Task.WhenAll(stdoutTask, stderrTask).ConfigureAwait(false);
-            }
-            catch
-            {
-                // Drained / cancelled — expected on timeout path.
-            }
-
-            if (ct.IsCancellationRequested)
-            {
-                throw;
-            }
-
-            // Timeout — treat as Allow (broken hook).
-            return (0, string.Empty);
-        }
-
-        var stdout = await stdoutTask.ConfigureAwait(false);
-        await stderrTask.ConfigureAwait(false); // drain stderr to avoid deadlock
-
-        return (process.ExitCode, stdout);
-    }
-
-    private static async Task<string> ReadBoundedAsync(
-        System.IO.TextReader reader,
-        int maxChars,
-        CancellationToken ct)
-    {
-        var buffer = new char[maxChars];
-        var sb = new StringBuilder();
-        int read;
-        while (sb.Length < maxChars && (read = await reader.ReadAsync(buffer.AsMemory(), ct).ConfigureAwait(false)) > 0)
-        {
-            sb.Append(buffer, 0, read);
-        }
-
-        return sb.ToString();
-    }
-
-    private static bool MatchesTool(UserHook hook, string toolName) =>
-        hook.Matcher is null ||
-        string.Equals(hook.Matcher, toolName, StringComparison.OrdinalIgnoreCase);
-
-    private static string BuildPayload(string toolName, string inputJson)
-    {
-        var normalizedInput = string.IsNullOrWhiteSpace(inputJson) ? "{}" : inputJson;
-        try
-        {
-            using var doc = JsonDocument.Parse(normalizedInput);
-            using var ms = new System.IO.MemoryStream();
-            using (var writer = new System.Text.Json.Utf8JsonWriter(ms))
-            {
-                writer.WriteStartObject();
-                writer.WriteString("tool", toolName);
-                writer.WritePropertyName("input");
-                doc.RootElement.WriteTo(writer);
-                writer.WriteEndObject();
-            }
-
-            return System.Text.Encoding.UTF8.GetString(ms.ToArray());
-        }
-        catch (JsonException)
-        {
-            // Malformed tool input — send the input as a JSON string so the payload stays valid.
-            using var ms = new System.IO.MemoryStream();
-            using (var writer = new System.Text.Json.Utf8JsonWriter(ms))
-            {
-                writer.WriteStartObject();
-                writer.WriteString("tool", toolName);
-                writer.WriteString("input", inputJson);
-                writer.WriteEndObject();
-            }
-
-            return System.Text.Encoding.UTF8.GetString(ms.ToArray());
-        }
-    }
-
-    private static string BuildPostPayload(string toolName, string inputJson, string resultText)
-    {
-        var normalizedInput = string.IsNullOrWhiteSpace(inputJson) ? "{}" : inputJson;
-        JsonElement inputElement;
-        bool inputParsed;
-        try
-        {
-            using var doc = JsonDocument.Parse(normalizedInput);
-            inputElement = doc.RootElement.Clone();
-            inputParsed = true;
-        }
-        catch (JsonException)
-        {
-            inputElement = default;
-            inputParsed = false;
-        }
-
-        using var ms = new System.IO.MemoryStream();
-        using (var writer = new System.Text.Json.Utf8JsonWriter(ms))
-        {
-            writer.WriteStartObject();
-            writer.WriteString("tool", toolName);
-            writer.WritePropertyName("input");
-            if (inputParsed)
-            {
-                inputElement.WriteTo(writer);
-            }
-            else
-            {
-                writer.WriteStringValue(inputJson);
-            }
-
-            writer.WriteString("result", resultText);
-            writer.WriteEndObject();
-        }
-
-        return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
 }

@@ -83,14 +83,15 @@ public sealed class UserHookRunnerTests
     [Fact]
     public async Task PreToolUse_exec_exception_returns_allow_without_throwing()
     {
-        // A broken hook command must not crash the turn — treat exec failure as Allow
+        // DELIBERATELY CHANGED from Phase 0: exec failures on PreToolUse now BLOCK (fail-closed).
+        // A policy gate that silently permits on error is no gate at all (see §8 of the proposal).
         var runner = new UserHookRunner(
             [new UserHook("PreToolUse", "bad-command", Matcher: null)],
             execOverride: (_, _, _) => throw new InvalidOperationException("process start failed"));
 
         var result = await runner.RunPreToolUseAsync("any_tool", "{}", CancellationToken.None);
 
-        Assert.False(result.Block);
+        Assert.True(result.Block);
     }
 
     [Fact]
@@ -609,8 +610,8 @@ public sealed class AgentLoopUserHookIntegrationTests
     // caller's token fires (vs. the internal timeout token). Testing that path
     // end-to-end requires actually spawning a process, which is not feasible
     // cross-platform in a unit-test suite. Instead we verify the observable
-    // contract via the execOverride: a cancelled execOverride is swallowed (treated
-    // as Allow, same as any exec failure), so the runner always returns a result.
+    // contract via the execOverride: a simulated hook timeout now BLOCKS for
+    // PreToolUse (fail-closed — Phase 0 deliberate change from the old "treat as Allow").
     [Fact]
     public async Task PreToolUse_cancelled_exec_override_is_swallowed_and_returns_allow()
     {
@@ -621,7 +622,7 @@ public sealed class AgentLoopUserHookIntegrationTests
             execOverride: async (_, _, token) =>
             {
                 // Simulate a long-running hook; throwing OperationCanceledException
-                // from the override goes through the "treat exec failure as Allow" path.
+                // now goes through the "hook timeout → fail-closed → block" path for PreToolUse.
                 await Task.Delay(1, CancellationToken.None);
                 throw new OperationCanceledException("simulated timeout");
 #pragma warning disable CS0162 // unreachable
@@ -629,9 +630,9 @@ public sealed class AgentLoopUserHookIntegrationTests
 #pragma warning restore CS0162
             });
 
-        // Must not throw — exec failures are swallowed as Allow.
+        // DELIBERATELY CHANGED from Phase 0: PreToolUse is fail-closed; timeout → block.
         var result = await runner.RunPreToolUseAsync("any_tool", "{}", CancellationToken.None);
-        Assert.False(result.Block);
+        Assert.True(result.Block);
     }
 
     // -------------------------------------------------------------------------

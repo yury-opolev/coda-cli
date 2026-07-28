@@ -161,7 +161,7 @@ public static class SettingsLoader
         }
     }
 
-    private static List<UserHook> ParseHooks(HooksSection? section)
+    private static List<UserHook> ParseHooks(Dictionary<string, List<HookEntry>>? section)
     {
         if (section is null)
         {
@@ -169,9 +169,11 @@ public static class SettingsLoader
         }
 
         var hooks = new List<UserHook>();
-        AddHooksForEvent(hooks, "PreToolUse", section.PreToolUse);
-        AddHooksForEvent(hooks, "PostToolUse", section.PostToolUse);
-        AddHooksForEvent(hooks, "Stop", section.Stop);
+        foreach (var (eventName, entries) in section)
+        {
+            AddHooksForEvent(hooks, eventName, entries);
+        }
+
         return hooks;
     }
 
@@ -189,7 +191,7 @@ public static class SettingsLoader
                 continue;
             }
 
-            target.Add(new UserHook(eventName, entry.Command, entry.Matcher));
+            target.Add(new UserHook(eventName, entry.Command, entry.Matcher, entry.TimeoutSeconds, entry.FailOpen, entry.UnattendedDecision));
         }
     }
 
@@ -358,7 +360,12 @@ public static class SettingsLoader
     private sealed class SettingsDocument
     {
         public PermissionsSection? Permissions { get; set; }
-        public HooksSection? Hooks { get; set; }
+
+        /// <summary>
+        /// Extensible map of event name → hook list. Unknown event keys are retained
+        /// without error so future events need no parser change.
+        /// </summary>
+        public Dictionary<string, List<HookEntry>>? Hooks { get; set; }
         public string? DefaultProvider { get; set; }
         public Dictionary<string, string>? ModelByProvider { get; set; }
         public string? GithubEnterpriseDomain { get; set; }
@@ -449,19 +456,18 @@ public static class SettingsLoader
         public List<string>? Deny { get; set; }
     }
 
-    private sealed class HooksSection
-    {
-        public List<HookEntry>? PreToolUse { get; set; }
-        public List<HookEntry>? PostToolUse { get; set; }
-        public List<HookEntry>? Stop { get; set; }
-    }
-
     private sealed class HookEntry
     {
         public string? Command { get; set; }
         public string? Matcher { get; set; }
+
+        [JsonPropertyName("timeoutSeconds")]
+        public int? TimeoutSeconds { get; set; }
+
+        [JsonPropertyName("failOpen")]
+        public bool? FailOpen { get; set; }
+
+        [JsonPropertyName("unattendedDecision")]
+        public string? UnattendedDecision { get; set; }
     }
 }
-
-
-

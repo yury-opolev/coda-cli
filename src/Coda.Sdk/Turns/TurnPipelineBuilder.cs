@@ -114,7 +114,15 @@ public sealed class TurnPipelineBuilder
         // acceptable because the notes file is advisory and idempotent.
         var hooks = BuildHooks(client, options);
 
-        var userHooks = settings.Hooks.Count > 0 ? new UserHookRunner(settings.Hooks) : null;
+        // HookContext supplies the common envelope written into every hook payload.
+        // SessionId comes from the TaskManager (the stable per-session identifier).
+        // Depth and task id are per-invocation and supplied by AgentLoop at each hook call site.
+        var hookContext = new HookContext(
+            SessionId: this.tasks.SessionId,
+            Cwd: agentOptions.WorkingDirectory);
+        var userHooks = settings.Hooks.Count > 0
+            ? new UserHookRunner(settings.Hooks, context: hookContext)
+            : null;
 
         var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks);
 
@@ -189,7 +197,10 @@ public sealed class TurnPipelineBuilder
 
         var permissions = BuildPermissions(options, client, settings);
 
-        var userHooks = settings.Hooks.Count > 0 ? new UserHookRunner(settings.Hooks) : null;
+        var hookContext = new HookContext(
+            SessionId: this.tasks.SessionId,
+            Cwd: agentOptions.WorkingDirectory);
+        var userHooks = settings.Hooks.Count > 0 ? new UserHookRunner(settings.Hooks, context: hookContext) : null;
 
         // A normal child host so the scheduled root (depth 1) can create depth-2 children; depth-3
         // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
