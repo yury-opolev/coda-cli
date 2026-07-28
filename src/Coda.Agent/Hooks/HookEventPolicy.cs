@@ -18,8 +18,12 @@ public static class HookEventPolicy
             // 30 s budget because a classifier hook is a plausible UserPromptSubmit implementation.
             ["UserPromptSubmit"] = new HookEventDefaults(TimeoutSeconds: 30, FailOpen: false),
             ["PreToolUse"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: false),
-            ["PostToolUse"] = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
-            ["Stop"]        = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+            ["PostToolUse"]   = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+            ["Stop"]          = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+            // Session lifecycle events: fail-open so a broken hook never blocks the user.
+            ["SessionStart"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
+            ["SessionEnd"]    = new HookEventDefaults(TimeoutSeconds:  2, FailOpen: true),
+            ["Notification"]  = new HookEventDefaults(TimeoutSeconds: 10, FailOpen: true),
         };
 
     private static readonly HookEventDefaults UnknownDefault = new(TimeoutSeconds: 10, FailOpen: true);

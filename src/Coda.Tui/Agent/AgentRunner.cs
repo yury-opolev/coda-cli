@@ -160,6 +160,25 @@ public sealed class AgentRunner : IDisposable
     /// <summary>A fresh copy of the current session runtime snapshot, or null before the first turn.</summary>
     public SessionRuntimeSnapshot? GetRuntimeSnapshot() => this.session?.GetRuntimeSnapshot();
 
+    /// <summary>
+    /// Sets the reason reported in the <c>SessionEnd</c> hook payload. Call before <see cref="Dispose"/>
+    /// to override the default <c>"exit"</c> — e.g. <c>"interrupt"</c> for a keyboard-chord exit,
+    /// <c>"error"</c> for an unrecoverable failure, or <c>"shutdown"</c> for a process-exit signal.
+    /// No-op when called before the session is created.
+    /// </summary>
+    public void SetSessionEndReason(string reason) => this.session?.SetSessionEndReason(reason);
+
+    /// <summary>
+    /// Fires the <c>SessionEnd</c> hook immediately, bounded by its 2 s deadline, without waiting for
+    /// the full session disposal. This is the process-exit path: it lets the hook run within the
+    /// <c>AppDomain.ProcessExit</c> budget even when the main-thread <c>using</c> block may not unwind
+    /// in time. Safe to call concurrently with <see cref="Dispose"/>: the underlying idempotency guard
+    /// ensures the hook fires at most once regardless of call order.
+    /// No-op when called before the session is created.
+    /// </summary>
+    public Task TriggerSessionEndAsync() =>
+        this.session?.TriggerSessionEndAsync() ?? Task.CompletedTask;
+
     public async Task RunAsync(CommandContext context, string prompt, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);

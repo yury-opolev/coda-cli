@@ -796,6 +796,18 @@ public sealed partial class AgentLoop : IAgentLoop
             if (!tool.IsReadOnly)
             {
                 sink.OnToolStatus(identity, toolUse.Name, ToolCallStatus.AwaitingApproval);
+
+                // Fire Notification("approval") fire-and-forget so approval-pending hooks
+                // never delay the permission prompt.
+                if (this.userHooks?.HasNotification == true)
+                {
+                    _ = this.userHooks.RunNotificationAsync(
+                        "approval",
+                        $"Approval pending for tool: {toolUse.Name}",
+                        this.currentTaskId,
+                        CancellationToken.None);
+                }
+
                 bool allowed;
                 try
                 {

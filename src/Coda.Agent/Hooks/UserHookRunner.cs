@@ -59,11 +59,35 @@ public sealed class UserHookRunner
         this.bus = new HookBus(hooks, executor, context, logger: logger);
     }
 
+    /// <summary>
+    /// Internal constructor for tests: accepts a full <see cref="IHookExecutor"/> so tests can
+    /// inject a capturing executor that returns stderr without spawning real processes.
+    /// </summary>
+    internal UserHookRunner(
+        IReadOnlyList<UserHook> hooks,
+        IHookExecutor executor,
+        HookContext? context = null,
+        ILogger? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(hooks);
+        ArgumentNullException.ThrowIfNull(executor);
+        this.bus = new HookBus(hooks, executor, context, logger: logger);
+    }
+
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
     public bool HasPreToolUse => this.bus.HasPreToolUse;
 
     /// <summary>True when at least one <c>UserPromptSubmit</c> hook is configured.</summary>
     public bool HasUserPromptSubmit => this.bus.HasUserPromptSubmit;
+
+    /// <summary>True when at least one <c>SessionStart</c> hook is configured.</summary>
+    public bool HasSessionStart => this.bus.HasSessionStart;
+
+    /// <summary>True when at least one <c>SessionEnd</c> hook is configured.</summary>
+    public bool HasSessionEnd => this.bus.HasSessionEnd;
+
+    /// <summary>True when at least one <c>Notification</c> hook is configured.</summary>
+    public bool HasNotification => this.bus.HasNotification;
 
     /// <summary>
     /// Runs all matching <c>PreToolUse</c> hooks in order and returns the merged result.
@@ -134,6 +158,43 @@ public sealed class UserHookRunner
         int depth = 0,
         string? taskId = null) =>
         this.bus.RunUserPromptSubmitAsync(prompt, attachments, historyLength, model, permissionMode, ct, depth, taskId);
+
+    /// <summary>
+    /// Runs all <c>SessionStart</c> hooks and returns the merged session-scoped outputs.
+    /// Fail-open: a broken or timed-out hook returns <see cref="SessionStartResult.Empty"/>.
+    /// </summary>
+    public Task<SessionStartResult> RunSessionStartAsync(
+        string source,
+        string model,
+        string permissionMode,
+        string? transcriptPath,
+        string? resumedFrom,
+        CancellationToken ct) =>
+        this.bus.RunSessionStartAsync(source, model, permissionMode, transcriptPath, resumedFrom, ct);
+
+    /// <summary>
+    /// Runs all <c>SessionEnd</c> hooks (observation-only). The caller must apply a hard 2 s
+    /// deadline via <paramref name="ct"/> before awaiting.
+    /// </summary>
+    public Task RunSessionEndAsync(
+        string reason,
+        long durationMs,
+        int turnCount,
+        LlmClient.TokenUsage usage,
+        string? transcriptPath,
+        CancellationToken ct) =>
+        this.bus.RunSessionEndAsync(reason, durationMs, turnCount, usage, transcriptPath, ct);
+
+    /// <summary>
+    /// Runs all <c>Notification</c> hooks (observation-only). Callers should fire-and-forget
+    /// so notification latency never blocks the agent.
+    /// </summary>
+    public Task RunNotificationAsync(
+        string kind,
+        string message,
+        string? taskId,
+        CancellationToken ct) =>
+        this.bus.RunNotificationAsync(kind, message, taskId, ct);
 
     // -------------------------------------------------------------------------
     // Legacy 2-tuple exec adapter

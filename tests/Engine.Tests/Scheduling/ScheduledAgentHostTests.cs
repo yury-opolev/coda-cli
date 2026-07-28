@@ -869,6 +869,128 @@ public sealed class ScheduledAgentHostTests : IDisposable
         Assert.Equal(0, loopCallCount);
     }
 
+    // ── Finding 2: source="scheduled" hooks ─────────────────────────────────
+
+    [Fact]
+    public async Task RunScheduledAsync_FiresSessionStart_WithScheduledSource()
+    {
+        // SessionStart must fire with source="scheduled" for every scheduled run,
+        // so hooks filtering on that value actually trigger.
+        var capturedSources = new List<string>();
+        var executor = new DelegateExecutor((_, payload, _) =>
+        {
+            var doc = JsonDocument.Parse(payload);
+            var ev = doc.RootElement.GetProperty("event").GetString();
+            if (ev == "SessionStart")
+            {
+                capturedSources.Add(doc.RootElement.GetProperty("source").GetString() ?? "");
+            }
+
+            return Task.FromResult((0, "{}", string.Empty));
+        });
+
+        var hookRunner = new UserHookRunner(
+            [new UserHook("SessionStart", "cmd")],
+            executor,
+            context: null);
+
+        using var http = new HttpClient(new BlockingHandler());
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        var loopFactory = new RecordingLoopFactory(new IdleLoop());
+
+        var host = new ScheduledAgentHost(
+            () => this.Options(),
+            new FakeClientFactory(new InertClient()),
+            loopFactory,
+            SignedInClaude(),
+            new ClientFingerprint(),
+            http,
+            NullLoggerFactory.Instance,
+            builder,
+            userHookRunnerForTesting: hookRunner);
+
+        await host.RunScheduledAsync("go", new NullSink(), new SteeringInbox(), "task-1", 1, CancellationToken.None);
+
+        Assert.Single(capturedSources);
+        Assert.Equal("scheduled", capturedSources[0]);
+    }
+
+    [Fact]
+    public async Task RunScheduledAsync_FiresSessionEnd_AfterRun()
+    {
+        // SessionEnd must fire after every scheduled run (whether successful or not),
+        // with reason="exit" for a clean completion.
+        var sessionEndReasons = new List<string>();
+        var executor = new DelegateExecutor((_, payload, _) =>
+        {
+            var doc = JsonDocument.Parse(payload);
+            if (doc.RootElement.GetProperty("event").GetString() == "SessionEnd")
+            {
+                sessionEndReasons.Add(doc.RootElement.GetProperty("reason").GetString() ?? "");
+            }
+
+            return Task.FromResult((0, "{}", string.Empty));
+        });
+
+        var hookRunner = new UserHookRunner(
+            [new UserHook("SessionEnd", "cmd")],
+            executor,
+            context: null);
+
+        using var http = new HttpClient(new BlockingHandler());
+        var tasks = this.NewTaskManager();
+        var builder = this.NewBuilder(tasks);
+        var loopFactory = new RecordingLoopFactory(new IdleLoop());
+
+        var host = new ScheduledAgentHost(
+            () => this.Options(),
+            new FakeClientFactory(new InertClient()),
+            loopFactory,
+            SignedInClaude(),
+            new ClientFingerprint(),
+            http,
+            NullLoggerFactory.Instance,
+            builder,
+            userHookRunnerForTesting: hookRunner);
+
+        await host.RunScheduledAsync("go", new NullSink(), new SteeringInbox(), "task-1", 1, CancellationToken.None);
+
+        Assert.Single(sessionEndReasons);
+        Assert.Equal("exit", sessionEndReasons[0]);
+    }
+
+    // ── helpers for new tests ────────────────────────────────────────────────
+
+    private sealed class DelegateExecutor(
+        Func<string, string, CancellationToken, Task<(int, string, string)>> fn) : IHookExecutor
+    {
+        public Task<(int ExitCode, string Stdout, string Stderr)> ExecAsync(
+            string command, string payload, CancellationToken ct) => fn(command, payload, ct);
+    }
+
+    /// <summary>An idle loop that produces one minimal assistant turn and returns.</summary>
+    private sealed class IdleLoop : IAgentLoop
+    {
+        public GoalStatus? LastGoalStatus => null;
+
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
+        {
+            sink.OnAssistantText("done");
+            sink.OnAssistantTextComplete();
+            sink.OnUsage(new TokenUsage(0, 1));
+            sink.OnStopReason("end_turn");
+            return Task.CompletedTask;
+        }
+    }
+
+    private sealed class BlockingHandler : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(
+            HttpRequestMessage request, CancellationToken cancellationToken) =>
+            throw new InvalidOperationException("No HTTP calls expected.");
+    }
+
     public void Dispose()
     {
         try { Directory.Delete(this.root, recursive: true); } catch { /* ignore */ }

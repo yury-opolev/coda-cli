@@ -563,7 +563,22 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             ShellFactory,
             RunSpectreSessionAsync,
             RunPlainSessionAsync,
-            mouseDisabled: options.MouseDisabled);
+            mouseDisabled: options.MouseDisabled,
+            onProcessExit: () =>
+            {
+                // Process-exit path (SIGTERM / Ctrl-Break / container-stop): fire SessionEnd
+                // with reason "shutdown" before RequestStop tears down the TUI.  Bounded at
+                // 2 s so it never holds up the OS-imposed exit deadline.
+                agentRunner.SetSessionEndReason("shutdown");
+                try
+                {
+                    agentRunner.TriggerSessionEndAsync().Wait(TimeSpan.FromSeconds(2));
+                }
+                catch
+                {
+                    // Fail-open: never propagate from a process-exit callback.
+                }
+            });
         var host = new TuiHost(modeRunner, error, mailbox);
 
         return await this.RunHostToCleanExitAsync(
@@ -581,7 +596,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 await actorTask.ConfigureAwait(false);
             },
             hostToken,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            onExhausted: () => agentRunner.SetSessionEndReason("error")).ConfigureAwait(false);
     }
 
     internal static SessionState CreateSessionState(string providerId, TuiLaunchOptions options) =>
@@ -654,7 +670,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         Func<CancellationToken, Task> flushUi,
         Func<Task> finalize,
         CancellationToken hostToken,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? onExhausted = null)
     {
         ArgumentNullException.ThrowIfNull(host);
         ArgumentNullException.ThrowIfNull(context);
@@ -686,6 +703,12 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             if (outcome == TuiHostOutcome.Exited)
             {
                 this.RenderExitSummary(context, exitConsole, startedAt);
+            }
+            else if (outcome == TuiHostOutcome.Exhausted)
+            {
+                // All fallback shells failed: the session ended unrecoverably.  Set the reason
+                // BEFORE the using-block disposes the session so SessionEnd carries "error".
+                onExhausted?.Invoke();
             }
         }
         finally

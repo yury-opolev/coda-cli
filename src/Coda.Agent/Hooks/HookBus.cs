@@ -2,6 +2,7 @@ using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using LlmClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
 
@@ -73,6 +74,9 @@ public sealed partial class HookBus
         this.logger = logger ?? NullLogger.Instance;
         this.HasPreToolUse = hooks.Any(h => string.Equals(h.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase));
         this.HasUserPromptSubmit = hooks.Any(h => string.Equals(h.Event, "UserPromptSubmit", StringComparison.OrdinalIgnoreCase));
+        this.HasSessionStart = hooks.Any(h => string.Equals(h.Event, "SessionStart", StringComparison.OrdinalIgnoreCase));
+        this.HasSessionEnd = hooks.Any(h => string.Equals(h.Event, "SessionEnd", StringComparison.OrdinalIgnoreCase));
+        this.HasNotification = hooks.Any(h => string.Equals(h.Event, "Notification", StringComparison.OrdinalIgnoreCase));
     }
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
@@ -80,6 +84,15 @@ public sealed partial class HookBus
 
     /// <summary>True when at least one <c>UserPromptSubmit</c> hook is configured.</summary>
     public bool HasUserPromptSubmit { get; }
+
+    /// <summary>True when at least one <c>SessionStart</c> hook is configured.</summary>
+    public bool HasSessionStart { get; }
+
+    /// <summary>True when at least one <c>SessionEnd</c> hook is configured.</summary>
+    public bool HasSessionEnd { get; }
+
+    /// <summary>True when at least one <c>Notification</c> hook is configured.</summary>
+    public bool HasNotification { get; }
 
     // -------------------------------------------------------------------------
     // Public run-methods (mirror the old UserHookRunner public surface)
@@ -226,6 +239,129 @@ public sealed partial class HookBus
         }
 
         return this.MergeUserPromptSubmitOutputs(pairs);
+    }
+
+    // -------------------------------------------------------------------------
+    // Session lifecycle run-methods (Phase 2)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Runs all <c>SessionStart</c> hooks in configuration order and returns the merged
+    /// session-scoped outputs. Fail-open: a broken or timed-out hook returns
+    /// <see cref="SessionStartResult.Empty"/> rather than blocking the session.
+    /// </summary>
+    /// <param name="source">Session source: <c>"new"</c>, <c>"resume"</c>, or <c>"scheduled"</c>.</param>
+    /// <param name="model">The model identifier for this session.</param>
+    /// <param name="permissionMode">The permission mode string (e.g. <c>"default"</c>).</param>
+    /// <param name="transcriptPath">Absolute path to the transcript file, or <see langword="null"/>.</param>
+    /// <param name="resumedFrom">Session id being resumed, or <see langword="null"/> for a new session.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task<SessionStartResult> RunSessionStartAsync(
+        string source,
+        string model,
+        string permissionMode,
+        string? transcriptPath,
+        string? resumedFrom,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("SessionStart", toolName: null);
+        if (matching.Count == 0)
+        {
+            return SessionStartResult.Empty;
+        }
+
+        var payload = this.BuildSessionStartPayload(source, model, permissionMode, transcriptPath, resumedFrom);
+        List<HookOutput> outputs;
+        try
+        {
+            outputs = await this.RunHooksAsync(matching, "SessionStart", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Unexpected loop-level failure: fail-open, return empty result.
+            return SessionStartResult.Empty;
+        }
+
+        return ParseSessionStartOutputs(outputs);
+    }
+
+    /// <summary>
+    /// Runs all <c>SessionEnd</c> hooks (observation-only; outputs are discarded).
+    /// The caller is responsible for imposing a hard timeout via
+    /// <paramref name="ct"/> before awaiting this task.
+    /// </summary>
+    /// <param name="reason">Why the session ended: <c>"exit"</c>, <c>"interrupt"</c>, <c>"error"</c>, or <c>"shutdown"</c>.</param>
+    /// <param name="durationMs">Wall-clock session duration in milliseconds.</param>
+    /// <param name="turnCount">Number of turns completed this session.</param>
+    /// <param name="usage">Accumulated token usage for the session.</param>
+    /// <param name="transcriptPath">Absolute path to the transcript file, or <see langword="null"/>.</param>
+    /// <param name="ct">Cancellation token (should carry the hard 2 s deadline).</param>
+    public async Task RunSessionEndAsync(
+        string reason,
+        long durationMs,
+        int turnCount,
+        TokenUsage usage,
+        string? transcriptPath,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("SessionEnd", toolName: null);
+        if (matching.Count == 0)
+        {
+            return;
+        }
+
+        var payload = this.BuildSessionEndPayload(reason, durationMs, turnCount, usage, transcriptPath);
+        try
+        {
+            await this.RunHooksAsync(matching, "SessionEnd", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Observation-only; swallow unexpected loop-level failures.
+        }
+    }
+
+    /// <summary>
+    /// Runs all <c>Notification</c> hooks (observation-only; outputs are discarded).
+    /// Callers should fire-and-forget so notification latency never blocks the agent.
+    /// </summary>
+    /// <param name="kind">Notification kind: <c>"idle"</c>, <c>"approval"</c>, or <c>"task-complete"</c>.</param>
+    /// <param name="message">Human-readable description of the event.</param>
+    /// <param name="taskId">The background task id, or <see langword="null"/> for non-task notifications.</param>
+    /// <param name="ct">Cancellation token.</param>
+    public async Task RunNotificationAsync(
+        string kind,
+        string message,
+        string? taskId,
+        CancellationToken ct)
+    {
+        var matching = this.GetMatchingHooks("Notification", toolName: null);
+        if (matching.Count == 0)
+        {
+            return;
+        }
+
+        var payload = this.BuildNotificationPayload(kind, message, taskId);
+        try
+        {
+            await this.RunHooksAsync(matching, "Notification", payload, ct).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Observation-only; swallow.
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -845,6 +981,135 @@ public sealed partial class HookBus
         }
 
         return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildSessionStartPayload(
+        string source,
+        string model,
+        string permissionMode,
+        string? transcriptPath,
+        string? resumedFrom)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "SessionStart", depth: 0, taskId: null);
+            writer.WriteString("source", source);
+            writer.WriteString("model", model);
+            writer.WriteString("permissionMode", permissionMode);
+            if (transcriptPath is not null)
+            {
+                writer.WriteString("transcriptPath", transcriptPath);
+            }
+
+            if (resumedFrom is not null)
+            {
+                writer.WriteString("resumedFrom", resumedFrom);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildSessionEndPayload(
+        string reason,
+        long durationMs,
+        int turnCount,
+        TokenUsage usage,
+        string? transcriptPath)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "SessionEnd", depth: 0, taskId: null);
+            writer.WriteString("reason", reason);
+            writer.WriteNumber("durationMs", durationMs);
+            writer.WriteNumber("turnCount", turnCount);
+            writer.WriteStartObject("usage");
+            writer.WriteNumber("inputTokens", usage.InputTokens);
+            writer.WriteNumber("outputTokens", usage.OutputTokens);
+            writer.WriteNumber("cacheReadTokens", usage.CacheReadTokens);
+            writer.WriteNumber("cacheWriteTokens", usage.CacheWriteTokens);
+            writer.WriteEndObject();
+            if (transcriptPath is not null)
+            {
+                writer.WriteString("transcriptPath", transcriptPath);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private string BuildNotificationPayload(string kind, string message, string? taskId)
+    {
+        using var ms = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(ms))
+        {
+            writer.WriteStartObject();
+            this.WriteEnvelope(writer, "Notification", depth: 0, taskId: null);
+            writer.WriteString("kind", kind);
+            writer.WriteString("message", message);
+            if (taskId is not null)
+            {
+                writer.WriteString("taskId", taskId);
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(ms.ToArray());
+    }
+
+    private static SessionStartResult ParseSessionStartOutputs(IReadOnlyList<HookOutput> outputs)
+    {
+        string? additionalContext = null;
+        var appendSystemPrompts = new List<string>();
+        string? initialUserMessage = null;
+
+        foreach (var output in outputs)
+        {
+            var specific = output.HookSpecificOutput;
+            if (specific is null)
+            {
+                continue;
+            }
+
+            // additionalContext — concatenate in order.
+            if (TryGetString(specific, "additionalContext", out var ac))
+            {
+                additionalContext = additionalContext is null ? ac : additionalContext + "\n\n" + ac;
+            }
+
+            // appendSystemPrompt — concatenate in order.
+            if (TryGetString(specific, "appendSystemPrompt", out var asp))
+            {
+                appendSystemPrompts.Add(asp!);
+            }
+
+            // initialUserMessage — last-writer-wins (§4 spec).
+            if (TryGetString(specific, "initialUserMessage", out var ium))
+            {
+                initialUserMessage = ium;
+            }
+        }
+
+        if (additionalContext is null && appendSystemPrompts.Count == 0 && initialUserMessage is null)
+        {
+            return SessionStartResult.Empty;
+        }
+
+        return new SessionStartResult
+        {
+            AdditionalContext = additionalContext,
+            AppendSystemPrompt = appendSystemPrompts.Count > 0 ? string.Join("\n\n", appendSystemPrompts) : null,
+            InitialUserMessage = initialUserMessage,
+        };
     }
 
     private void WriteEnvelope(Utf8JsonWriter writer, string eventName, int depth, string? taskId)

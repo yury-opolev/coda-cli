@@ -106,6 +106,7 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         }
 
         ILlmClient? client = null;
+        UserHookRunner? hooksToRun = null;
         try
         {
             // Snapshot the live options AT ENTRY so a mid-firing mutation cannot tear the run.
@@ -140,7 +141,7 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
             // block exactly as it does at the session seam. On block the exception propagates to
             // TaskManager.StartScheduledBackground, which calls Fail(task.Id, ex.Message) so the
             // reason is recorded in the task log and visible in /tasks — not silent.
-            var hooksToRun = this.userHookRunnerForTesting ?? spec.UserHooks;
+            hooksToRun = this.userHookRunnerForTesting ?? spec.UserHooks;
             if (hooksToRun is { } submitHooks && submitHooks.HasUserPromptSubmit)
             {
                 var submitResult = await submitHooks.RunUserPromptSubmitAsync(
@@ -156,6 +157,27 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
                 if (submitResult.Block)
                 {
                     throw new InvalidOperationException(submitResult.Reason ?? "blocked by hook");
+                }
+            }
+
+            // Fire SessionStart with source="scheduled" so hooks filtering on that source
+            // actually trigger for unattended runs.
+            if (hooksToRun?.HasSessionStart == true)
+            {
+                using var sessionStartCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                try
+                {
+                    await hooksToRun.RunSessionStartAsync(
+                        "scheduled",
+                        options.Model,
+                        CodaSession.PermissionModeToString(options.PermissionMode),
+                        transcriptPath: null,
+                        resumedFrom: null,
+                        sessionStartCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // SessionStart is fail-open: a broken hook must not abort the scheduled run.
                 }
             }
 
@@ -176,6 +198,27 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         }
         finally
         {
+            // Fire SessionEnd after the run (success, failure, or cancellation) so hooks
+            // monitoring scheduled firings always receive a paired end event.
+            if (hooksToRun?.HasSessionEnd == true)
+            {
+                try
+                {
+                    using var sessionEndCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await hooksToRun.RunSessionEndAsync(
+                        "exit",
+                        durationMs: 0,
+                        turnCount: 0,
+                        usage: LlmClient.TokenUsage.Zero,
+                        transcriptPath: null,
+                        sessionEndCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // SessionEnd is fail-open: never propagate during cleanup.
+                }
+            }
+
             // Dispose the per-execution client on success, failure, OR cancellation.
             if (client is IDisposable disposable)
             {

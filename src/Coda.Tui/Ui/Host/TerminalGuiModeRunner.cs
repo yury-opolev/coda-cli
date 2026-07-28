@@ -27,6 +27,7 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
     private readonly Action<IApplication, string?> diffingInit;
     private readonly string? driverName;
     private readonly bool mouseDisabled;
+    private readonly Action? onProcessExit;
 
     // True only when no explicit applicationFactory was injected; reflects that the diffing output
     // path is a production-only enhancement and should not interfere with test-provided factories.
@@ -40,7 +41,8 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         string? driverName = null,
         bool mouseDisabled = false,
         Func<IApplication?>? diffingApplicationFactory = null,
-        Action<IApplication, string?>? diffingInit = null)
+        Action<IApplication, string?>? diffingInit = null,
+        Action? onProcessExit = null)
     {
         this.shellFactory = shellFactory ?? throw new ArgumentNullException(nameof(shellFactory));
         this.spectreRunner = spectreRunner ?? throw new ArgumentNullException(nameof(spectreRunner));
@@ -55,6 +57,7 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
         this.diffingInit = diffingInit ?? (static (app, driver) => { app.Init(driver); });
         this.driverName = driverName;
         this.mouseDisabled = mouseDisabled;
+        this.onProcessExit = onProcessExit;
     }
 
     /// <inheritdoc />
@@ -195,6 +198,17 @@ internal sealed class TerminalGuiModeRunner : ITuiModeRunner
             var initialized = app!;
             processExit = new TerminalProcessExitRegistration(() =>
             {
+                try
+                {
+                    // Notify the caller (e.g. InteractiveProgram) so it can set the shutdown
+                    // reason and drive a bounded SessionEnd before the process terminates.
+                    this.onProcessExit?.Invoke();
+                }
+                catch
+                {
+                    // Best-effort; never propagate from a process-exit callback.
+                }
+
                 try
                 {
                     initialized.RequestStop();

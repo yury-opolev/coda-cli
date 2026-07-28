@@ -114,4 +114,14 @@ public sealed record SessionOptions
     /// here, inside the client — not by any turn-level watchdog.
     /// </summary>
     public LlmHttpTimeoutConfig? LlmHttpTimeoutOverride { get; init; }
+
+    /// <summary>
+    /// Optional session source label for the <c>SessionStart</c> hook payload. When set, this
+    /// value is emitted as the <c>source</c> field instead of the default "new". Callers that
+    /// create sessions for a specific lifecycle context (e.g. a scheduled run) pass
+    /// <c>"scheduled"</c> here so hooks can distinguish those sessions from interactive ones.
+    /// Null emits "new" (the default). "resume" is set automatically when
+    /// <see cref="CodaSession.Resume"/> is called, regardless of this property.
+    /// </summary>
+    public string? SessionSource { get; init; }
 }
