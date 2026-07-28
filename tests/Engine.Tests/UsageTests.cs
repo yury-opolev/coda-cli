@@ -141,9 +141,9 @@ public sealed class UsageTests : IDisposable
     }
 
     [Fact]
-    public async Task AnthropicSseReader_folds_cache_tokens_into_input()
+    public async Task AnthropicSseReader_keeps_cache_tokens_in_separate_fields()
     {
-        // cache_creation_input_tokens and cache_read_input_tokens are billed as input
+        // The three input counters in message_start are DISJOINT — they must not be summed.
         const string sse = """
             event: message_start
             data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3}}}
@@ -160,8 +160,10 @@ public sealed class UsageTests : IDisposable
 
         var done = events.Single(e => e.Kind == AssistantEventKind.Done);
         Assert.NotNull(done.Usage);
-        // 10 + 5 + 3 = 18 input tokens
-        Assert.Equal(18, done.Usage!.InputTokens);
+        Assert.Equal(10, done.Usage!.InputTokens);
+        Assert.Equal(3, done.Usage.CacheReadTokens);
+        Assert.Equal(5, done.Usage.CacheWrite5mTokens);
+        Assert.Equal(18, done.Usage.TotalInputTokens); // 10 + 3 + 5 = 18
         Assert.Equal(20, done.Usage.OutputTokens);
     }
 

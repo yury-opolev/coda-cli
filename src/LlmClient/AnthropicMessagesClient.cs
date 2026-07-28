@@ -212,7 +212,7 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
                 request.Model,
                 TelemetryText.Truncate(SecretRedactor.Redact(accumulator.Content)),
                 accumulator.StopReason ?? "(none)",
-                accumulator.Usage?.InputTokens ?? 0,
+                accumulator.Usage?.TotalInputTokens ?? 0,
                 accumulator.Usage?.OutputTokens ?? 0,
                 stopwatch.ElapsedMilliseconds);
         }

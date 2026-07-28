@@ -33,8 +33,17 @@ public sealed class CostCommand : ISlashCommand
         var catalog = ModelCatalog.Default.Get(context.Session.ActiveProviderId, model);
         var estimatedUsd = Pricing.EstimateUsd(model, usage, catalog);
 
-        var summary = $"Input: {usage.InputTokens:N0} tokens · Output: {usage.OutputTokens:N0} tokens · Total: {usage.Total:N0} tokens · Est. cost: ${estimatedUsd:F4}";
+        var summary = $"Input: {usage.TotalInputTokens:N0} tokens · Output: {usage.OutputTokens:N0} tokens · Total: {usage.Total:N0} tokens · Est. cost: ${estimatedUsd:F4}";
         context.Console.MarkupLine(Theme.DimMarkup(summary));
+
+        if (usage.HasCacheActivity)
+        {
+            var hitRate = usage.TotalInputTokens > 0
+                ? (decimal)usage.CacheReadTokens / usage.TotalInputTokens * 100m
+                : 0m;
+            var cacheDetail = $"Cache read: {usage.CacheReadTokens:N0} tokens · Cache write: {usage.CacheWriteTokens:N0} tokens · Hit rate: {hitRate:N1}%";
+            context.Console.MarkupLine(Theme.DimMarkup(cacheDetail));
+        }
 
         context.Events.Publish(new CostEstimateChangedEvent(estimatedUsd));
 

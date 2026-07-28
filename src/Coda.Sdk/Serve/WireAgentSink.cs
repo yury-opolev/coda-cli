@@ -167,7 +167,7 @@ public sealed class WireAgentSink : IAgentSink
 
     public void OnUsage(TokenUsage usage)
     {
-        var node = ServeJson.ToNode(new UsageEvent(usage.InputTokens, usage.OutputTokens));
+        var node = ServeJson.ToNode(new UsageEvent(usage.TotalInputTokens, usage.OutputTokens));
         _ = this.SendAsync(ServeMethods.EventUsage, node);
     }
 

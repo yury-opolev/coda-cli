@@ -810,7 +810,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 TsUtc = DateTime.UtcNow,
                 Provider = options.ProviderId,
                 Model = options.Model,
-                InputTokens = recording.Usage.InputTokens,
+                InputTokens = recording.Usage.TotalInputTokens,
                 OutputTokens = recording.Usage.OutputTokens,
                 StopReason = recording.StopReason,
                 ToolCalls = recording.ToolCalls,

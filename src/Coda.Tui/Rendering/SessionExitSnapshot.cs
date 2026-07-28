@@ -88,7 +88,7 @@ public sealed record SessionExitSnapshot
             Model = session.Model,
             Effort = session.Effort,
             MessageCount = session.History.Count,
-            InputTokens = usage.InputTokens,
+            InputTokens = usage.TotalInputTokens,
             OutputTokens = usage.OutputTokens,
             EstimatedUsd = estimatedUsd,
             Context = contextSnapshot,

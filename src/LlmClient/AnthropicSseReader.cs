@@ -34,6 +34,9 @@ public static class AnthropicSseReader
         string? stopReason = null;
         var inputTokens = 0;
         var outputTokens = 0;
+        var cacheReadTokens = 0;
+        var cacheWrite5mTokens = 0;
+        var cacheWrite1hTokens = 0;
 
         while (await reader.ReadLineAsync(cancellationToken).ConfigureAwait(false) is { } line)
         {
@@ -66,24 +69,40 @@ public static class AnthropicSseReader
                     if (root.TryGetProperty("message", out var msg)
                         && msg.TryGetProperty("usage", out var startUsage))
                     {
-                        // Anthropic sends input_tokens exactly once in message_start as a
-                        // cumulative total for the entire request (including cache tokens).
-                        // Use assignment (=), not +=, so this is last-wins and never double-counted.
-                        var rawInput = startUsage.TryGetProperty("input_tokens", out var it) && it.ValueKind == JsonValueKind.Number
+                        // The three input counters in message_start are DISJOINT:
+                        //   input_tokens              — uncached tokens only (the remainder after the last cache breakpoint)
+                        //   cache_read_input_tokens   — tokens served from an existing cache entry
+                        //   cache_creation_input_tokens — tokens written to a new cache entry
+                        // total_input_tokens = input_tokens + cache_read_input_tokens + cache_creation_input_tokens
+                        // Use assignment (=), not +=; message_start arrives exactly once per request.
+                        inputTokens = startUsage.TryGetProperty("input_tokens", out var it) && it.ValueKind == JsonValueKind.Number
                             ? it.GetInt32()
                             : 0;
 
-                        // cache_creation_input_tokens and cache_read_input_tokens are billed as
-                        // input tokens and are part of the same single message_start usage event.
-                        var cacheCreate = startUsage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.ValueKind == JsonValueKind.Number
-                            ? cct.GetInt32()
-                            : 0;
-
-                        var cacheRead = startUsage.TryGetProperty("cache_read_input_tokens", out var crt) && crt.ValueKind == JsonValueKind.Number
+                        cacheReadTokens = startUsage.TryGetProperty("cache_read_input_tokens", out var crt) && crt.ValueKind == JsonValueKind.Number
                             ? crt.GetInt32()
                             : 0;
 
-                        inputTokens = rawInput + cacheCreate + cacheRead;
+                        var totalCacheCreate = startUsage.TryGetProperty("cache_creation_input_tokens", out var cct) && cct.ValueKind == JsonValueKind.Number
+                            ? cct.GetInt32()
+                            : 0;
+
+                        // When the cache_creation sub-object is present it splits writes by TTL.
+                        // Otherwise, fall back to attributing all writes to the 5m bucket (the default TTL).
+                        if (startUsage.TryGetProperty("cache_creation", out var cc) && cc.ValueKind == JsonValueKind.Object)
+                        {
+                            cacheWrite5mTokens = cc.TryGetProperty("ephemeral_5m_input_tokens", out var c5m) && c5m.ValueKind == JsonValueKind.Number
+                                ? c5m.GetInt32()
+                                : 0;
+                            cacheWrite1hTokens = cc.TryGetProperty("ephemeral_1h_input_tokens", out var c1h) && c1h.ValueKind == JsonValueKind.Number
+                                ? c1h.GetInt32()
+                                : 0;
+                        }
+                        else
+                        {
+                            cacheWrite5mTokens = totalCacheCreate;
+                            cacheWrite1hTokens = 0;
+                        }
                     }
 
                     break;
@@ -238,8 +257,8 @@ public static class AnthropicSseReader
                         }
                     }
 
-                    var usage = (inputTokens > 0 || outputTokens > 0)
-                        ? new TokenUsage(inputTokens, outputTokens)
+                    var usage = (inputTokens > 0 || outputTokens > 0 || cacheReadTokens > 0 || cacheWrite5mTokens > 0 || cacheWrite1hTokens > 0)
+                        ? new TokenUsage(inputTokens, outputTokens, cacheReadTokens, cacheWrite5mTokens, cacheWrite1hTokens)
                         : null;
                     yield return AssistantStreamEvent.Finished(stopReason, usage);
                     break;
