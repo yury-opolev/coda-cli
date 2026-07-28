@@ -229,8 +229,8 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
 
         if (!string.IsNullOrEmpty(request.System))
         {
-            // System as a text block with cache_control (matches the real client and
-            // enables prompt caching of the long, stable system prompt).
+            // System as a text block with cache_control (slot 2 — always placed so the long,
+            // stable system prompt is cached on every call regardless of message count).
             body["system"] = new JsonArray
             {
                 new JsonObject
@@ -242,10 +242,14 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
             };
         }
 
+        // Plan slots 1, 3, 4 (slot 2 — system — is handled unconditionally above).
+        var plan = PromptCachePlanner.Plan(request);
+
         var messages = new JsonArray();
-        foreach (var message in request.Messages)
+        for (var i = 0; i < request.Messages.Count; i++)
         {
-            messages.Add(SerializeMessage(message));
+            var hasBreakpoint = i == plan.AnchorMessageIndex || i == plan.RollingMessageIndex;
+            messages.Add(SerializeMessage(request.Messages[i], hasBreakpoint));
         }
 
         body["messages"] = messages;
@@ -253,14 +257,21 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         if (request.Tools.Count > 0)
         {
             var tools = new JsonArray();
-            foreach (var tool in request.Tools)
+            for (var i = 0; i < request.Tools.Count; i++)
             {
-                tools.Add(new JsonObject
+                var tool = request.Tools[i];
+                var toolNode = new JsonObject
                 {
                     ["name"] = tool.Name,
                     ["description"] = tool.Description,
                     ["input_schema"] = ParseOrEmpty(tool.InputSchemaJson),
-                });
+                };
+                if (plan.ToolsBreakpoint && i == request.Tools.Count - 1)
+                {
+                    toolNode["cache_control"] = new JsonObject { ["type"] = "ephemeral" };
+                }
+
+                tools.Add(toolNode);
             }
 
             body["tools"] = tools;
@@ -441,7 +452,7 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         return models;
     }
 
-    private static JsonObject SerializeMessage(ChatMessage message)
+    private static JsonObject SerializeMessage(ChatMessage message, bool addBreakpointToLastBlock = false)
     {
         var content = new JsonArray();
         foreach (var block in message.Content)
@@ -455,6 +466,13 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
             }
 
             content.Add(SerializeBlock(block));
+        }
+
+        // Attach cache_control to the last block when the planner designates this message
+        // as an anchor or rolling-write breakpoint.
+        if (addBreakpointToLastBlock && content.Count > 0 && content[^1] is JsonObject lastBlock)
+        {
+            lastBlock["cache_control"] = new JsonObject { ["type"] = "ephemeral" };
         }
 
         return new JsonObject

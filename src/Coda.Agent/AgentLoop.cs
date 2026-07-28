@@ -349,6 +349,7 @@ public sealed partial class AgentLoop : IAgentLoop
                     Messages = history,
                     Tools = toolDefinitions,
                     Effort = this.options.Effort,
+                    ToolsVolatile = this.toolSearch is not null && this.toolSearch.IsActive,
                 };
 
                 var text = new StringBuilder();

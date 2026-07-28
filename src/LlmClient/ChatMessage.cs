@@ -30,4 +30,12 @@ public sealed record ChatRequest
     /// header. Ignored by providers/models that don't support effort.
     /// </summary>
     public string? Effort { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/> the tool set may change during this request (e.g. tool search
+    /// is active and the discovered set may grow mid-turn). <see cref="PromptCachePlanner"/>
+    /// skips slot 1 when this flag is set — any tool-set change invalidates the entire cache,
+    /// so a breakpoint on a volatile set pays a write cost every call and never yields a read.
+    /// </summary>
+    public bool ToolsVolatile { get; init; }
 }
