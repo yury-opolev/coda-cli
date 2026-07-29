@@ -184,8 +184,13 @@ Fires before each tool call.  A block here prevents the tool from executing.
 
 ### `PermissionRequest`
 
-Fires after `PreToolUse` passed, only when the tool would otherwise trigger the interactive
-approve/deny prompt.  Lets a hook grant or deny programmatically without interrupting the user.
+Fires after `PreToolUse` passed, only when **no deny rule matches** and the tool would otherwise
+trigger the interactive approve/deny prompt.  Lets a hook grant or deny programmatically without
+interrupting the user.
+
+> **Note:** a call blocked by a configured deny rule never reaches this hook — the deny rule is a
+> floor the hook cannot lift.  This matches the documented "only when it would otherwise prompt"
+> semantics: a denied call would never reach the prompt.
 
 **Default policy:** fail-closed, 10 s timeout.  `matcher` applies.
 
@@ -201,12 +206,35 @@ approve/deny prompt.  Lets a hook grant or deny programmatically without interru
 }
 ```
 
+`matchedRule` is populated when an existing allow rule matched the call (e.g. `"allow:bash(safe:*)"`),
+or `null` when no rule matched.  A deny rule match prevents the hook from firing entirely.
+
 **Output fields:**
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `decision` | `"allow"\|"deny"\|"allowOnce"\|"denySession"\|"prompt"` | Strictest decision across hooks wins.  `prompt` (default) defers to the user. |
 | `reason` | `string` | Shown when denied. |
+| `hookSpecificOutput.updatedPermissions` | `object` | Optional — persist rule changes for this or future sessions (see below). |
+
+**`updatedPermissions` output:**
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `addRules.allow` | `string[]` | Allow rules to add (e.g. `["bash(safe:*)"]`). Must include an argument pattern — bare tool names are rejected (see security notes below). |
+| `addRules.deny` | `string[]` | Deny rules to add. |
+| `setMode` | `string` | Set the permission mode for this session (e.g. `"acceptEdits"`). Cannot be `"bypassPermissions"`. |
+| `scope` | `"session"\|"project"\|"user"` | Where to persist. `session` applies only to the current run. `project` writes `<project>/.coda/settings.json`. `user` writes `~/.coda/settings.json`. |
+
+**Security restrictions on `updatedPermissions`:**
+
+- **No bypass escalation** — `setMode: "bypassPermissions"` is always refused; a hook cannot
+  disable all permission prompts.
+- **No scope escalation** — a project-scoped hook requesting `scope: "user"` is silently clamped
+  to `scope: "project"`.  Project hooks may only persist to project scope.
+- **No over-broad allow rules** — a bare tool name with no argument pattern (e.g. `"bash"`) is
+  rejected for disk persistence.  Such a rule would match every call to that tool, blanket-disabling
+  future prompts.  Specify an argument pattern (e.g. `"bash(safe:*)"`) to persist to disk.
 
 ---
 

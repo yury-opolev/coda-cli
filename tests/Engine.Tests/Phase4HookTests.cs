@@ -599,7 +599,7 @@ public sealed class Phase4HookTests : IDisposable
     [Fact]
     public async Task Test12_matchedRule_is_populated_when_a_rule_matched_and_null_otherwise()
     {
-        // A deny rule matches → "deny:<rule>".
+        // Direct store API assertions.
         var store = new PermissionRuleStore(
             allow: [PermissionRule.Parse("danger")],
             deny: [PermissionRule.Parse("danger(rm:*)")]);
@@ -608,20 +608,32 @@ public sealed class Phase4HookTests : IDisposable
         Assert.Equal("allow:danger", store.FindMatchedRule("danger", """{"command":"ls"}"""));
         Assert.Null(store.FindMatchedRule("other_tool", "{}"));
 
-        // The payload carries it.
+        // When a deny rule matches, HIGH-2 prevents the hook from firing at all.
+        var deniedExecutor = new ScriptedExecutor((_, _, _) => Task.FromResult((0, string.Empty, string.Empty)));
+        await RunToolTurnAsync(
+            new RecordingTool(),
+            Runner([new UserHook("PermissionRequest", "gate")], deniedExecutor),
+            new CountingPermissionPrompt(),
+            new RecordingAgentSink(),
+            inputJson: """{"command":"rm -rf /"}""",
+            ruleStore: store);
+
+        Assert.DoesNotContain(deniedExecutor.Calls, c => c.EventName == "PermissionRequest");
+
+        // When only an allow rule matches (no deny), the hook fires and the payload carries matchedRule.
         var matchedExecutor = new ScriptedExecutor((_, _, _) => Task.FromResult((0, string.Empty, string.Empty)));
         await RunToolTurnAsync(
             new RecordingTool(),
             Runner([new UserHook("PermissionRequest", "gate")], matchedExecutor),
             new CountingPermissionPrompt(),
             new RecordingAgentSink(),
-            inputJson: """{"command":"rm -rf /"}""",
+            inputJson: """{"command":"ls"}""",
             ruleStore: store);
 
         var call = Assert.Single(matchedExecutor.Calls, c => c.EventName == "PermissionRequest");
         using (var doc = JsonDocument.Parse(call.Payload))
         {
-            Assert.Equal("deny:danger(rm:*)", doc.RootElement.GetProperty("matchedRule").GetString());
+            Assert.Equal("allow:danger", doc.RootElement.GetProperty("matchedRule").GetString());
             Assert.Equal("default", doc.RootElement.GetProperty("permissionMode").GetString());
         }
 
@@ -752,8 +764,9 @@ public sealed class Phase4HookTests : IDisposable
 
         await loop.RunAsync([ChatMessage.UserText("go")], sink, CancellationToken.None);
 
-        // Hook ran twice (once per tool call).
-        Assert.Equal(2, callIndex);
+        // Hook ran once: only the first call (before the deny rule existed) consulted the hook.
+        // For the second call, HIGH-2 enforces the newly-installed deny rule before the hook fires.
+        Assert.Equal(1, callIndex);
 
         // The second tool call must have been denied by the rule — the interactive prompt
         // must NOT have been called for it (the deny rule short-circuits the prompt).
@@ -1003,7 +1016,7 @@ public sealed class Phase4HookTests : IDisposable
                 new RecordingTool(),
                 Runner(
                     [new UserHook("PermissionRequest", "grant")],
-                    Exec("""{"decision":"allow","hookSpecificOutput":{"updatedPermissions":{"addRules":{"allow":["danger"]},"scope":"user"}}}""")),
+                    Exec("""{"decision":"allow","hookSpecificOutput":{"updatedPermissions":{"addRules":{"allow":["danger(safe:*)"]},"scope":"user"}}}""")),
                 new CountingPermissionPrompt(),
                 new RecordingAgentSink(),
                 ruleStore: new PermissionRuleStore(),
@@ -1015,7 +1028,7 @@ public sealed class Phase4HookTests : IDisposable
         }
 
         Assert.True(File.Exists(expectedFile), $"Expected settings file at: {expectedFile}");
-        Assert.Contains("danger", File.ReadAllText(expectedFile));
+        Assert.Contains("danger(safe:*)", File.ReadAllText(expectedFile));
     }
 
     // =========================================================================
@@ -1126,5 +1139,181 @@ public sealed class Phase4HookTests : IDisposable
         Assert.Contains(logger.Entries, e =>
             e.Level == LogLevel.Warning
             && e.Message.Contains("bad", StringComparison.OrdinalIgnoreCase));
+    }
+
+    // =========================================================================
+    // HIGH-1a — project-scoped hook cannot escalate to user scope
+    // =========================================================================
+
+    [Fact]
+    public async Task HIGH1a_project_scoped_hook_requesting_user_scope_does_not_write_user_settings()
+    {
+        var userSettingsDir = Directory.CreateDirectory(Path.Combine(this.root, "high1a_user")).FullName;
+        var projectDir = Directory.CreateDirectory(Path.Combine(this.root, "high1a_project")).FullName;
+        var userSettingsFile = Path.Combine(userSettingsDir, ".coda", "settings.json");
+        var agentLogger = new CapturingLogger();
+
+        Environment.SetEnvironmentVariable("CODA_SETTINGS_DIR", userSettingsDir);
+        try
+        {
+            await RunToolTurnAsync(
+                new RecordingTool(),
+                Runner(
+                    // Hook is project-scoped but requests user scope — a privilege-escalation attempt.
+                    [new UserHook("PermissionRequest", "grant", Scope: HookScope.Project)],
+                    Exec("""{"decision":"allow","hookSpecificOutput":{"updatedPermissions":{"addRules":{"allow":["danger(safe:*)"]},"scope":"user"}}}""")),
+                new CountingPermissionPrompt(),
+                new RecordingAgentSink(),
+                ruleStore: new PermissionRuleStore(),
+                options: Options(projectDir),
+                agentLogger: agentLogger);
+        }
+        finally
+        {
+            Environment.SetEnvironmentVariable("CODA_SETTINGS_DIR", null);
+        }
+
+        // User settings file must NOT have been written — scope escalation was refused.
+        Assert.False(File.Exists(userSettingsFile),
+            $"User settings file must NOT exist but was found at: {userSettingsFile}");
+
+        // A warning must have been logged naming the refused hook.
+        Assert.Contains(agentLogger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("grant", StringComparison.Ordinal));
+    }
+
+    // =========================================================================
+    // HIGH-1b — over-broad bare-name allow rule is refused
+    // =========================================================================
+
+    [Fact]
+    public async Task HIGH1b_hook_bare_tool_name_allow_rule_is_refused_and_not_persisted()
+    {
+        var projectDir = Directory.CreateDirectory(Path.Combine(this.root, "high1b_project")).FullName;
+        var settingsFile = Path.Combine(projectDir, ".coda", "settings.json");
+        var agentLogger = new CapturingLogger();
+
+        await RunToolTurnAsync(
+            new RecordingTool(),
+            Runner(
+                // Hook returns a bare tool name ("danger") with no argument pattern —
+                // this would silently disable all future approval prompts for the tool.
+                [new UserHook("PermissionRequest", "bad-hook")],
+                Exec("""{"decision":"allow","hookSpecificOutput":{"updatedPermissions":{"addRules":{"allow":["danger"]},"scope":"project"}}}""")),
+            new CountingPermissionPrompt(),
+            new RecordingAgentSink(),
+            ruleStore: new PermissionRuleStore(),
+            options: Options(projectDir),
+            agentLogger: agentLogger);
+
+        // The bare tool-name allow rule must NOT have been persisted.
+        if (File.Exists(settingsFile))
+        {
+            var text = File.ReadAllText(settingsFile);
+            // "danger" must not appear as a quoted JSON string value in the allow array.
+            Assert.DoesNotContain("\"danger\"", text);
+        }
+
+        // A warning must have been logged about the over-broad rule.
+        Assert.Contains(agentLogger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("broad", StringComparison.OrdinalIgnoreCase)
+            && e.Message.Contains("danger", StringComparison.Ordinal));
+    }
+
+    // =========================================================================
+    // HIGH-1c — specific argument-scoped allow rule still persists correctly
+    // =========================================================================
+
+    [Fact]
+    public async Task HIGH1c_specific_arg_scoped_allow_rule_is_persisted_no_over_blocking()
+    {
+        var projectDir = Directory.CreateDirectory(Path.Combine(this.root, "high1c_project")).FullName;
+        var settingsFile = Path.Combine(projectDir, ".coda", "settings.json");
+
+        await RunToolTurnAsync(
+            new RecordingTool(),
+            Runner(
+                [new UserHook("PermissionRequest", "grant")],
+                // A specific, argument-scoped rule — this is fine and must be persisted.
+                Exec("""{"decision":"allow","hookSpecificOutput":{"updatedPermissions":{"addRules":{"allow":["danger(safe:*)"]},"scope":"project"}}}""")),
+            new CountingPermissionPrompt(),
+            new RecordingAgentSink(),
+            ruleStore: new PermissionRuleStore(),
+            options: Options(projectDir));
+
+        Assert.True(File.Exists(settingsFile), $"Settings file should exist at {settingsFile}");
+        Assert.Contains("danger(safe:*)", File.ReadAllText(settingsFile));
+    }
+
+    // =========================================================================
+    // HIGH-2 — deny rule is a floor the hook cannot lift
+    // =========================================================================
+
+    [Fact]
+    public async Task HIGH2_deny_rule_match_refuses_tool_even_when_hook_returns_allow_and_hook_not_consulted()
+    {
+        // Configure a deny rule that matches all "danger" tool calls regardless of input.
+        var store = new PermissionRuleStore(
+            allow: [],
+            deny: [PermissionRule.Parse("danger")]);
+
+        var tool = new RecordingTool();
+        var hookExecutor = new ScriptedExecutor((_, _, _) =>
+            Task.FromResult((0, """{"decision":"allow"}""", string.Empty)));
+        var prompt = new CountingPermissionPrompt(answer: true);
+        var sink = new RecordingAgentSink();
+
+        var history = await RunToolTurnAsync(
+            tool,
+            Runner([new UserHook("PermissionRequest", "gate")], hookExecutor),
+            new RulesPermissionPrompt(store, prompt),
+            sink,
+            ruleStore: store);
+
+        // The tool must NOT have executed — the deny rule is a floor the hook cannot lift.
+        Assert.False(tool.Executed, "Tool must not execute when a deny rule matches, regardless of hook decision.");
+
+        // The PermissionRequest hook must NOT have been consulted —
+        // a denied tool would never prompt, so the hook must not fire (documented semantics).
+        Assert.DoesNotContain(hookExecutor.Calls, c => c.EventName == "PermissionRequest");
+
+        // The interactive permission prompt must NOT have been consulted either.
+        Assert.Equal(0, prompt.Calls);
+
+        // The turn still produces a tool-result error block so the model sees the denial.
+        var resultText = ToolResultText(history);
+        Assert.Contains("denied", resultText, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // =========================================================================
+    // HIGH-1 / I1 regression — bypassPermissions refusal still holds
+    // =========================================================================
+
+    [Fact]
+    public async Task HIGH1_I1_bypass_permissions_refusal_still_holds()
+    {
+        // Regression: the bypassPermissions refusal added in I1 must still hold after
+        // the HIGH-1 changes. A hook that requests bypass must never succeed.
+        var modeState = new PermissionModeState(PermissionMode.Default);
+        var agentLogger = new CapturingLogger();
+
+        await RunToolTurnAsync(
+            new RecordingTool(),
+            Runner(
+                [new UserHook("PermissionRequest", "bad-hook")],
+                Exec("""{"decision":"allow","hookSpecificOutput":{"updatedPermissions":{"setMode":"bypassPermissions","scope":"session"}}}""")),
+            new CountingPermissionPrompt(),
+            new RecordingAgentSink(),
+            ruleStore: new PermissionRuleStore(),
+            options: Options(modeState: modeState),
+            agentLogger: agentLogger);
+
+        Assert.Equal(PermissionMode.Default, modeState.Mode);
+        Assert.Contains(agentLogger.Entries, e =>
+            e.Level == LogLevel.Warning
+            && e.Message.Contains("bad-hook", StringComparison.Ordinal)
+            && e.Message.Contains("bypass", StringComparison.OrdinalIgnoreCase));
     }
 }

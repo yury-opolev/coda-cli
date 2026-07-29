@@ -2,6 +2,7 @@ using Coda.Agent.Hooks;
 using Coda.Agent.OutputStyles;
 using Coda.Agent.Subagents;
 using Coda.Mcp;
+using Coda.Tui.Skills;
 using Coda.Tui.Ui.Rendering;
 using Microsoft.Extensions.Logging;
 
@@ -43,6 +44,14 @@ public sealed class PluginComposition
     /// session-scoped theme resolution path.
     /// </summary>
     internal IReadOnlyList<CodaTheme> Themes { get; init; } = [];
+
+    /// <summary>
+    /// Slash commands contributed by enabled, approved plugins. Each entry is a
+    /// <see cref="SkillDefinition"/> parsed from a <c>.md</c> file in the plugin's commands
+    /// directory. Registered into the <see cref="Coda.Tui.Repl.SlashCommandRegistry"/> by the
+    /// caller (e.g. <see cref="Coda.Tui.InteractiveProgram"/>) alongside skill-derived commands.
+    /// </summary>
+    public IReadOnlyList<SkillDefinition> Commands { get; init; } = [];
 }
 
 /// <summary>
@@ -81,6 +90,7 @@ public static class PluginComponentComposer
 
         var agents = new List<SubagentDefinition>();
         var hooks = new List<UserHook>();
+        var commands = new List<SkillDefinition>();
 
         foreach (var plugin in plugins)
         {
@@ -157,6 +167,26 @@ public static class PluginComponentComposer
                 logger?.LogInformation(
                     "Plugin '{Plugin}': hooks not loaded — class not approved.", plugin.Name);
             }
+
+            // Commands (slash commands backed by Markdown prompt bodies)
+            if (trustFilter is null || trustFilter.IsClassAllowed(PluginComponentClass.SlashCommand))
+            {
+                try
+                {
+                    commands.AddRange(PluginCommandLoader.Load(plugin, logger));
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogError(
+                        "Plugin '{Plugin}': unexpected error loading commands: {Message}",
+                        plugin.Name, ex.Message);
+                }
+            }
+            else
+            {
+                logger?.LogInformation(
+                    "Plugin '{Plugin}': commands not loaded — class not approved.", plugin.Name);
+            }
         }
 
         // MCP servers — filter per-plugin by class approval before the merge pass.
@@ -181,12 +211,25 @@ public static class PluginComponentComposer
             mcpServers = new Dictionary<string, (McpServerConfig, string)>(StringComparer.Ordinal);
         }
 
+        // Output styles and themes: apply workspace-trust filtering so project plugins in an
+        // untrusted workspace cannot inject content into the session even for non-executable
+        // components. LoadOutputStyles/LoadThemes are called outside the per-plugin loop (they
+        // need the full collection), so we pre-filter here to a trust-safe list.
+        var eligibleForStyles = trustStore is null
+            ? (IReadOnlyList<PluginInfo>)plugins
+            : plugins.Where(p =>
+            {
+                if (!p.IsEnabled) return false;
+                var f = BuildTrustFilter(p, workingDirectory, trustStore, logger);
+                return !f.BlocksAll;
+            }).ToList();
+
         // Output styles: registered into the static registry (TUI/CLI path) and returned in
         // the composition for session-scoped serve resolution (I1 fix).
         var outputStyles = new List<OutputStyle>();
         try
         {
-            outputStyles.AddRange(LoadOutputStyles(plugins, logger));
+            outputStyles.AddRange(LoadOutputStyles(eligibleForStyles, logger));
         }
         catch (Exception ex)
         {
@@ -197,7 +240,7 @@ public static class PluginComponentComposer
         var themes = new List<CodaTheme>();
         try
         {
-            themes.AddRange(LoadThemes(plugins, logger));
+            themes.AddRange(LoadThemes(eligibleForStyles, logger));
         }
         catch (Exception ex)
         {
@@ -211,6 +254,7 @@ public static class PluginComponentComposer
             McpServers = mcpServers,
             OutputStyles = outputStyles,
             Themes = themes,
+            Commands = commands,
         };
     }
 

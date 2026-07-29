@@ -73,4 +73,38 @@ public static class SlashCommandCatalog
         var skillCommands = SkillCommandRegistrar.BuildSkillCommands(skills, builtIns, logger);
         return [.. builtIns, .. skillCommands];
     }
+
+    /// <summary>
+    /// Creates the full command set: all built-ins, skill-derived commands, and plugin commands.
+    /// Plugin commands that collide with a built-in or skill-derived command name are skipped
+    /// with a logged warning. The collision namespace is the union of all built-in names and all
+    /// skill-derived command names, so neither source can silently shadow anything registered
+    /// before it.
+    /// </summary>
+    /// <param name="skills">Discovered, precedence-resolved skills for the current session.</param>
+    /// <param name="pluginCommands">
+    /// Commands contributed by trusted, enabled plugins via <see cref="Coda.Tui.Plugins.PluginComponentComposer.Compose"/>.
+    /// </param>
+    /// <param name="logger">Optional logger for name-collision warnings.</param>
+    public static IReadOnlyList<ISlashCommand> CreateWithSkillsAndPluginCommands(
+        IReadOnlyList<SkillDefinition> skills,
+        IReadOnlyList<SkillDefinition> pluginCommands,
+        ILogger? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(skills);
+        ArgumentNullException.ThrowIfNull(pluginCommands);
+
+        var builtIns = CreateAll();
+        var skillCommands = SkillCommandRegistrar.BuildSkillCommands(skills, builtIns, logger);
+
+        // Plugin commands must not shadow any built-in or skill-derived command.
+        // Pass the full set so far as the collision namespace.
+        var allSoFar = new List<ISlashCommand>(builtIns.Count + skillCommands.Count);
+        allSoFar.AddRange(builtIns);
+        allSoFar.AddRange(skillCommands);
+
+        var pluginSlashCommands = SkillCommandRegistrar.BuildSkillCommands(pluginCommands, allSoFar, logger);
+
+        return [.. allSoFar, .. pluginSlashCommands];
+    }
 }

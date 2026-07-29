@@ -13,7 +13,8 @@ using Coda.Tui.Ui.State;
 using Coda.Tui.Ui.Prompts;
 
 namespace Coda.Tui.Tests;
-
+
+[Collection("TerminalGuiInit")]
 public sealed class CliTuiMcpTuiIntegrationTests
 {
     [Theory]

@@ -32,7 +32,14 @@ public sealed record PermissionRequestResult
     /// <summary>The shell command of the hook that produced the decision or mutation.</summary>
     public string? ByHookCommand { get; init; }
 
-    /// <summary>The neutral result: no opinion, fall through to the interactive prompt.</summary>
+        /// <summary>
+        /// The scope of the hook(s) that produced this result. Used by the agent loop to prevent
+        /// a project-scoped hook from persisting rules to the user-scope settings file.
+        /// Defaults to <see cref="HookScope.User"/> for the neutral/no-hook case.
+        /// </summary>
+        public HookScope ByHookScope { get; init; } = HookScope.User;
+
+        /// <summary>The neutral result: no opinion, fall through to the interactive prompt.</summary>
     public static PermissionRequestResult Prompt { get; } = new();
 
     /// <summary><see langword="true"/> when the hook granted access without prompting.</summary>

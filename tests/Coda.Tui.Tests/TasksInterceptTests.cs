@@ -18,6 +18,7 @@ namespace Coda.Tui.Tests;
 /// driver emits nothing to the console during Begin/LayoutAndDraw/Run/End, so the suite is deterministic
 /// and never corrupts the developer's terminal.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class TasksInterceptTests
 {
     /// <summary>A hosted full-screen shell wired to a live provider, begun on a real ANSI application.</summary>

@@ -8,6 +8,7 @@ namespace Coda.Tui.Tests;
 /// ANSI-driver render/interaction coverage for <see cref="PluginBrowserOverlay"/>. Plugins are read
 /// from a temp working directory so the tests are hermetic.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class PluginBrowserOverlayTests : IDisposable
 {
     private readonly IApplication _app;

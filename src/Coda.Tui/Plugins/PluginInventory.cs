@@ -17,9 +17,13 @@ public sealed record PluginInventory
     /// <summary>Number of subagent definition files found in the plugin's agents directory.</summary>
     public int SubagentCount { get; init; }
 
+    /// <summary>Number of command files (<c>.md</c>) found in the plugin's commands directory.</summary>
+    public int CommandCount { get; init; }
+
     /// <summary><see langword="true"/> when the plugin provides no components at all.</summary>
     public bool IsEmpty =>
-        this.SkillCount == 0 && this.HookCount == 0 && this.McpServerCount == 0 && this.SubagentCount == 0;
+        this.SkillCount == 0 && this.HookCount == 0 && this.McpServerCount == 0 &&
+        this.SubagentCount == 0 && this.CommandCount == 0;
 
     /// <summary>
     /// The set of <see cref="PluginComponentClass"/> values present in this inventory
@@ -34,6 +38,7 @@ public sealed record PluginInventory
             if (this.HookCount > 0) set.Add(PluginComponentClass.Hook);
             if (this.McpServerCount > 0) set.Add(PluginComponentClass.McpServer);
             if (this.SubagentCount > 0) set.Add(PluginComponentClass.Subagent);
+            if (this.CommandCount > 0) set.Add(PluginComponentClass.SlashCommand);
             return set;
         }
     }
@@ -46,6 +51,7 @@ public sealed record PluginInventory
     {
         var parts = new List<string>();
         if (this.SkillCount > 0) parts.Add($"{this.SkillCount} skill{(this.SkillCount == 1 ? string.Empty : "s")}");
+        if (this.CommandCount > 0) parts.Add($"{this.CommandCount} command{(this.CommandCount == 1 ? string.Empty : "s")}");
         if (this.HookCount > 0) parts.Add($"{this.HookCount} hook{(this.HookCount == 1 ? string.Empty : "s")}");
         if (this.McpServerCount > 0) parts.Add($"{this.McpServerCount} MCP server{(this.McpServerCount == 1 ? string.Empty : "s")}");
         if (this.SubagentCount > 0) parts.Add($"{this.SubagentCount} subagent{(this.SubagentCount == 1 ? string.Empty : "s")}");
@@ -69,6 +75,7 @@ public sealed record PluginInventory
             HookCount = manifest.Hooks.Count,
             McpServerCount = manifest.McpServers.Count,
             SubagentCount = CountSubagents(manifest, pluginDirectory),
+            CommandCount = CountCommands(manifest, pluginDirectory),
         };
     }
 
@@ -124,6 +131,21 @@ public sealed record PluginInventory
 
             return Directory.EnumerateFiles(agentsDir, "*.md", SearchOption.TopDirectoryOnly).Count()
                    + Directory.EnumerateFiles(agentsDir, "*.json", SearchOption.TopDirectoryOnly).Count();
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return 0;
+        }
+    }
+
+    private static int CountCommands(PluginManifest manifest, string pluginDirectory)
+    {
+        var commandsRelative = manifest.Commands ?? "commands";
+        try
+        {
+            var commandsDir = Path.GetFullPath(Path.Combine(pluginDirectory, commandsRelative));
+            if (!Directory.Exists(commandsDir)) return 0;
+            return Directory.EnumerateFiles(commandsDir, "*.md", SearchOption.TopDirectoryOnly).Count();
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
         {

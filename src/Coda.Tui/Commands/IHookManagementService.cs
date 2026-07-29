@@ -25,6 +25,21 @@ public interface IHookManagementService
     IReadOnlyList<UserHook> Hooks { get; }
 
     /// <summary>
+    /// The trust guard that project-scoped hook execution is checked against, or
+    /// <see langword="null"/> when the session was started without trust enforcement.
+    /// Exposed so commands such as <c>/compact</c> can forward it to a throwaway
+    /// <see cref="Coda.Sdk.CodaSession"/> to keep project hooks trust-gated.
+    /// </summary>
+    HookTrustGuard? TrustGuard { get; }
+
+    /// <summary>
+    /// The session-scoped run log that records each hook execution.
+    /// Forwarded to throwaway <see cref="Coda.Sdk.CodaSession"/> instances (e.g. for
+    /// <c>/compact</c>) so hook runs appear in <c>/hooks info</c>.
+    /// </summary>
+    HookRunLog RunLog { get; }
+
+    /// <summary>
     /// Returns the most recent run entry for the hook at <paramref name="hookIndex"/>, or
     /// <see langword="null"/> if the hook has not run in this session.
     /// </summary>

@@ -316,6 +316,7 @@ public sealed partial class HookBus
                 Decision = PermissionDecisions.Deny,
                 Reason = $"permission hook failed: {ex.Message}",
                 ByHookCommand = GetHookIdentifier(matching[0]),
+                ByHookScope = matching.Any(h => h.Scope == HookScope.Project) ? HookScope.Project : HookScope.User,
             };
         }
 
@@ -1317,6 +1318,13 @@ public sealed partial class HookBus
 
         var (modifiedInput, modifiedByCommand) = this.ExtractLastJsonObject(matching, outputs, "modifiedInput");
 
+        // The effective hook scope is the most-restrictive (lowest-privilege) scope across all
+        // matching hooks. If any hook is project-scoped, the result scope is project so that
+        // ApplyUpdatedPermissions can refuse user-scope escalation requests.
+        var hookScope = matching.Any(h => h.Scope == HookScope.Project)
+            ? HookScope.Project
+            : HookScope.User;
+
         return new PermissionRequestResult
         {
             Decision = decision ?? PermissionDecisions.Prompt,
@@ -1324,6 +1332,7 @@ public sealed partial class HookBus
             ModifiedInput = modifiedInput,
             UpdatedPermissions = update,
             ByHookCommand = decisionHookCommand ?? modifiedByCommand,
+            ByHookScope = hookScope,
         };
     }
 

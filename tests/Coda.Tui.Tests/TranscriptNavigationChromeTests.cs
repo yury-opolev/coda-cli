@@ -7,7 +7,8 @@ using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Tests;
-
+
+[Collection("TerminalGuiInit")]
 public sealed class TranscriptNavigationChromeTests
 {
     [Fact]

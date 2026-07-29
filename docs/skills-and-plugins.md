@@ -174,6 +174,26 @@ are **exclusive** — a declared path *replaces* the default directory for that 
 | `mcpServers` | list | MCP server configurations. | — |
 | `lspServers` | list | LSP server configurations. | — |
 
+#### Plugin commands
+
+Each `.md` file in the commands directory is parsed identically to a user skill file (same
+YAML-subset frontmatter, same argument-substitution semantics). The file stem is the fallback
+command name when no `name` field is present in the frontmatter.
+
+**Trust requirement.** Commands expand into a prompt the model acts on, so they are executable
+content. A plugin must have the `SlashCommand` component class approved (or have no approval
+record at all, which grants all-approved for backward compatibility) for its commands to register.
+A project-scoped plugin in an untrusted workspace contributes no commands.
+
+**Collision rule.** A plugin command whose name matches any built-in or skill-derived command is
+silently skipped with a diagnostic warning visible in the TUI. The built-in name always wins.
+Plugin commands from different plugins that share the same name are resolved first-wins (earlier
+in the enabled-plugin list wins). No namespace prefix is added — the author is responsible for
+choosing a name that does not conflict.
+
+**`/plugin validate`** counts the `*.md` files in the declared commands directory and reports
+the total in the component inventory.
+
 ### User configuration
 
 `userConfig` declares install-time prompts. Each entry is an object:

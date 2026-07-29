@@ -55,6 +55,12 @@ public sealed class HookManagementService : IHookManagementService
     public IReadOnlyList<UserHook> Hooks => this.hooks;
 
     /// <inheritdoc/>
+    public HookTrustGuard? TrustGuard => this.trustGuard;
+
+    /// <inheritdoc/>
+    public HookRunLog RunLog => this.runLog;
+
+    /// <inheritdoc/>
     public HookRunEntry? GetLastRun(int hookIndex) =>
         this.runLog.Get(hookIndex);
 

@@ -282,6 +282,15 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Warning, Message = "failed to apply updatedPermissions for scope '{scope}'; the turn continues")]
     private partial void LogPermissionUpdateFailed(string scope, Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest hook '{hookCommand}' is project-scoped but requested user-scope persistence — refusing scope escalation; clamped to project scope")]
+    private partial void LogHookScopeEscalationRefused(string hookCommand);
+
+    [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest hook '{hookCommand}' supplied an over-broad allow rule '{rule}' — a bare tool name with no argument restriction would disable all approval prompts for that tool; rule was not applied")]
+    private partial void LogHookOverbreadAllowRuleRefused(string hookCommand, string rule);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "PermissionRequest hook skipped for tool '{toolName}': deny rule '{rule}' matches — the hook is not consulted when a configured rule already blocks the call")]
+    private partial void LogDenyRuleEnforcedBeforeHook(string toolName, string rule);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "LSP edit-seam notify failed (best-effort); tool result and turn unaffected")]
     private partial void LogLspNotifyFailed(Exception ex);
 
@@ -1045,6 +1054,35 @@ public sealed partial class AgentLoop : IAgentLoop
 
             if (!tool.IsReadOnly)
             {
+                // HIGH-2: deny rules are a floor the hook cannot lift. Evaluate matching deny
+                // rules before consulting any PermissionRequest hook — a call that would be
+                // blocked by a rule would never reach the interactive prompt either, so the
+                // documented "only when it would otherwise prompt" semantics mean the hook must
+                // not see it at all.
+                if (this.permissionRules is { } denyCheckRules)
+                {
+                    PermissionRule? matchedDeny = null;
+                    foreach (var denyRule in denyCheckRules.Deny)
+                    {
+                        if (denyRule.Matches(tool.Name, effectiveInput))
+                        {
+                            matchedDeny = denyRule;
+                            break;
+                        }
+                    }
+
+                    if (matchedDeny is not null)
+                    {
+                        this.LogDenyRuleEnforcedBeforeHook(tool.Name, matchedDeny.ToRuleString());
+                        var deniedByRule = new ToolResult(
+                            $"Permission denied by rule: {matchedDeny.ToRuleString()}",
+                            IsError: true);
+                        sink.OnToolResult(identity, toolUse.Name, deniedByRule, ToolCallStatus.Failed);
+                        results.Add(CreateToolResultBlock(identity, deniedByRule, ToolCallStatus.Failed));
+                        continue; // outer for loop: skip hook, prompt, and execution for this tool
+                    }
+                }
+
                 sink.OnToolStatus(identity, toolUse.Name, ToolCallStatus.AwaitingApproval);
 
                 // Fire Notification("approval") fire-and-forget so approval-pending hooks
@@ -1067,7 +1105,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         .DecidePermissionByHookAsync(toolUse.Name, effectiveInput, cancellationToken)
                         .ConfigureAwait(false);
 
-                    this.ApplyUpdatedPermissions(decision.UpdatedPermissions, decision.ByHookCommand ?? string.Empty, sink);
+                    this.ApplyUpdatedPermissions(decision.UpdatedPermissions, decision.ByHookCommand ?? string.Empty, sink, decision.ByHookScope);
 
                     if (decision.ModifiedInput is { } permissionReplacement
                         && !string.Equals(permissionReplacement, effectiveInput, StringComparison.Ordinal))
@@ -1331,7 +1369,12 @@ public sealed partial class AgentLoop : IAgentLoop
     /// <param name="update">The parsed update, or <see langword="null"/> when the hook sent none.</param>
     /// <param name="hookCommand">The hook command string, for logging and sink attribution.</param>
     /// <param name="sink">The agent sink to receive <see cref="IAgentSink.OnPermissionsUpdated"/>.</param>
-    private void ApplyUpdatedPermissions(PermissionUpdate? update, string hookCommand, IAgentSink sink)
+    /// <param name="hookScope">
+    /// The scope of the hook(s) that produced the decision. A <see cref="HookScope.Project"/>
+    /// hook must not be able to persist rules to the user settings file; the request is clamped
+    /// to project scope and a warning is logged.
+    /// </param>
+    private void ApplyUpdatedPermissions(PermissionUpdate? update, string hookCommand, IAgentSink sink, HookScope hookScope = HookScope.User)
     {
         if (update is null || update.IsEmpty)
         {
@@ -1387,14 +1430,44 @@ public sealed partial class AgentLoop : IAgentLoop
             sink.OnPermissionsUpdated(hookCommand, appliedMode, appliedAllow, appliedDeny);
         }
 
-        var settingsFile = this.ResolveSettingsFileForScope(update.Scope);
+        // HIGH-1a: prevent project-scoped hooks from writing to the user settings file.
+        // A project hook (from repo code the user cloned) may only persist to project scope.
+        // Clamp the requested scope down to project and log the refusal.
+        var effectiveScope = update.Scope;
+        if (hookScope == HookScope.Project
+            && string.Equals(effectiveScope, PermissionUpdate.UserScope, StringComparison.OrdinalIgnoreCase))
+        {
+            this.LogHookScopeEscalationRefused(hookCommand);
+            effectiveScope = PermissionUpdate.ProjectScope;
+        }
+
+        var settingsFile = this.ResolveSettingsFileForScope(effectiveScope);
         if (settingsFile is null)
         {
             return; // session scope (or an unknown scope) — live state only.
         }
 
+        // HIGH-1b: filter out over-broad allow rules before persisting to disk. A bare tool name
+        // (no argument pattern) matches every call regardless of arguments, silently blanket-
+        // disabling prompts for that tool across all future sessions. Bare names may still apply
+        // to the current session's in-memory state above; only disk persistence is blocked here.
+        // Deny rules are restrictive and do not need this check.
+        var allowForDisk = new List<string>(appliedAllow.Count);
+        foreach (var rule in appliedAllow)
+        {
+            var parsed = PermissionRule.Parse(rule);
+            if (parsed.ArgPattern is null || parsed.ArgPattern.Length == 0)
+            {
+                this.LogHookOverbreadAllowRuleRefused(hookCommand, rule);
+            }
+            else
+            {
+                allowForDisk.Add(rule);
+            }
+        }
+
         SettingsWriter.AddPermissionRules(
-            update.AddAllow,
+            allowForDisk,
             update.AddDeny,
             settingsFile,
             this.logger);

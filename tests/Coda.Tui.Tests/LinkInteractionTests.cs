@@ -110,7 +110,8 @@ file static class LinkShellFactory
 // ---------------------------------------------------------------------------
 // 1. TryGetLinkAt — hit / miss
 // ---------------------------------------------------------------------------
-
+
+[Collection("TerminalGuiInit")]
 public sealed class TryGetLinkAtTests
 {
     [Fact]
@@ -225,7 +226,8 @@ public sealed class TryGetLinkAtTests
 // ---------------------------------------------------------------------------
 // 2. Left-click — event-level tests on VirtualizedTranscriptView
 // ---------------------------------------------------------------------------
-
+
+[Collection("TerminalGuiInit")]
 public sealed class TranscriptLinkMouseTests
 {
     private static void ClickAt(VirtualizedTranscriptView view, int x, int y)
@@ -319,7 +321,8 @@ public sealed class TranscriptLinkMouseTests
 // ---------------------------------------------------------------------------
 // 3. Shell-level: honest left-click opens immediately via IUrlOpener
 // ---------------------------------------------------------------------------
-
+
+[Collection("TerminalGuiInit")]
 public sealed class LinkActivationShellTests
 {
     private static void ClickAt(VirtualizedTranscriptView view, int x, int y)
@@ -438,7 +441,8 @@ public sealed class LinkActivationShellTests
 // ---------------------------------------------------------------------------
 // 4. Shell-level: right-click context menu
 // ---------------------------------------------------------------------------
-
+
+[Collection("TerminalGuiInit")]
 public sealed class LinkContextMenuShellTests
 {
     private static void RightClickAt(VirtualizedTranscriptView view, int x, int y)
@@ -737,7 +741,8 @@ public sealed class UrlOpenerTests
 // ---------------------------------------------------------------------------
 // 6. Copy link writes URL + status text
 // ---------------------------------------------------------------------------
-
+
+[Collection("TerminalGuiInit")]
 public sealed class CopyLinkShellTests
 {
     private static void RightClickAt(VirtualizedTranscriptView view, int x, int y)
@@ -809,7 +814,8 @@ file sealed class ThrowingPromptService : IUiPromptService
     public Task<UiPromptResponse> RequestAsync(UiPromptRequest request, CancellationToken cancellationToken = default) =>
         throw new InvalidOperationException("Simulated unexpected failure from prompt service");
 }
-
+
+[Collection("TerminalGuiInit")]
 public sealed class LinkSecurityTests
 {
     private static void ClickAt(VirtualizedTranscriptView view, int x, int y)

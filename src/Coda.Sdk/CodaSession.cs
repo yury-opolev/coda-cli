@@ -69,6 +69,21 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly List<UserHook> configuredHooks;
     private readonly HookRunLog hookRunLog;
     private readonly HookTrustGuard? trustGuard;
+    /// <summary>
+    /// Test seam: executor override forwarded to <see cref="sessionHookRunner"/> at construction.
+    /// Null in production (real <see cref="ShellHookExecutor"/> is used).
+    /// </summary>
+    private readonly Func<string, string, CancellationToken, Task<(int, string)>>? sessionExecOverride;
+    /// <summary>
+    /// Test seam: prompt handler override forwarded to <see cref="sessionHookRunner"/> at construction.
+    /// Null in production (real handler is wired in <see cref="RebuildSessionRunnerWithHandlers"/>).
+    /// </summary>
+    private readonly IHookHandler? sessionPromptHandlerOverride;
+    /// <summary>
+    /// Set to <see langword="true"/> once <see cref="RebuildSessionRunnerWithHandlers"/> has been
+    /// called so the upgrade runs at most once per session lifetime.
+    /// </summary>
+    private bool sessionRunnerHandlersUpgraded;
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
 
@@ -132,8 +147,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         UserHookRunner? userHookRunnerOverride = null,
         HookTrustGuard? trustGuard = null,
         HookRunLog? runLog = null,
-        List<UserHook>? hookList = null,
-        Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null)
+        IReadOnlyList<UserHook>? hookList = null,
+        Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null,
+        Func<string, string, CancellationToken, Task<(int, string)>>? sessionExecOverride = null,
+        Coda.Agent.Hooks.IHookHandler? sessionPromptHandlerOverride = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
@@ -150,6 +167,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.SessionId = sessionId ?? SessionIds.NewId();
         this.trustGuard = trustGuard;
         this.hookRunLog = runLog ?? new HookRunLog();
+        this.sessionExecOverride = sessionExecOverride;
+        this.sessionPromptHandlerOverride = sessionPromptHandlerOverride;
         if (options.SessionSource is { } src)
         {
             this.sessionSource = src;
@@ -179,8 +198,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // settings always win on exact-key clashes.
         var settings = SettingsLoader.Load(options.WorkingDirectory);
         // Use caller-provided hook list when available (supports /hooks enable/disable and
-        // the shared run log). Fall back to a fresh copy of the settings hooks otherwise.
-        this.configuredHooks = hookList ?? new List<UserHook>(settings.Hooks);
+        // the shared run log). Preserve the mutable-list contract: when the caller already
+        // gave us a List<UserHook>, reuse it so HookManagementService.SetEnabled mutations
+        // are visible inside this session. Otherwise copy. Falls back to settings hooks.
+        this.configuredHooks = (hookList as List<UserHook>)
+            ?? (hookList is not null ? new List<UserHook>(hookList) : new List<UserHook>(settings.Hooks));
 
         var userCodaPluginsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -260,33 +282,39 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             "Session {sessionId} started: provider {provider}, model {model}",
             this.SessionId, options.ProviderId, options.Model);
 
-        // Session-level hook runner for SessionStart / SessionEnd / Notification.
-        // Created once at construction from the settings snapshot. In tests,
-        // userHookRunnerOverride serves as both the per-turn and session-level runner.
+        // Session-level hook runner for SessionStart / SessionEnd / Notification / Pre/PostCompact.
+        // Built for any configured hook so that compaction hooks (not session-lifecycle events)
+        // are also wired here — the old `hasSessionLevelHooks` guard was the IMPORTANT-1 bug.
+        // In tests, userHookRunnerOverride serves as both the per-turn and session-level runner;
+        // sessionExecOverride / sessionPromptHandlerOverride are minimal seams that inject only
+        // the executor or prompt handler without replacing the whole runner.
         if (userHookRunnerOverride is not null)
         {
             this.sessionHookRunner = userHookRunnerOverride;
+            this.sessionRunnerHandlersUpgraded = true; // override already has whatever it needs
         }
         else if (this.configuredHooks.Count > 0)
         {
-            // Use the full configuredHooks list so run-log indices are consistent with
-            // HookManagementService (which also indexes into configuredHooks). The bus's
-            // GetMatchingHooks filters to the relevant event names on each call.
-            var hasSessionLevelHooks = this.configuredHooks.Any(h => IsSessionLevelHookEvent(h.Event));
-            if (hasSessionLevelHooks)
-            {
-                var sessionHttpHandler = new Coda.Agent.Hooks.HttpHookHandler(
-                    httpClient: null,
-                    settings.HttpHookAllowlist,
-                    logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
-                this.sessionHookRunner = new UserHookRunner(
-                    this.configuredHooks,
-                    context: new HookContext(this.SessionId, options.WorkingDirectory),
-                    logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
-                    httpHandler: sessionHttpHandler,
-                    trustGuard: this.trustGuard,
-                    runLog: this.hookRunLog);
-            }
+            // Build the session runner immediately with the available handlers.
+            // Prompt/agent handlers need an LLM client and are added later via
+            // RebuildSessionRunnerWithHandlers (called from RunAsync and CompactAsync).
+            // sessionPromptHandlerOverride lets tests inject a fake handler right now
+            // without needing the upgrade path.
+            var sessionHttpHandler = new Coda.Agent.Hooks.HttpHookHandler(
+                httpClient: null,
+                settings.HttpHookAllowlist,
+                logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
+            this.sessionHookRunner = new UserHookRunner(
+                this.configuredHooks,
+                execOverride: this.sessionExecOverride,
+                context: new HookContext(this.SessionId, options.WorkingDirectory),
+                logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
+                httpHandler: sessionHttpHandler,
+                promptHandler: this.sessionPromptHandlerOverride,
+                trustGuard: this.trustGuard,
+                runLog: this.hookRunLog);
+            // Mark upgraded only when the test seam already provided the prompt handler.
+            this.sessionRunnerHandlersUpgraded = this.sessionPromptHandlerOverride is not null;
         }
 
         // Wire task-complete notifications for background tasks.
@@ -527,6 +555,30 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // A previous natural turn seals its inbox. Reopen before publishing the next loop spec,
         // without dropping a steer that raced a serve host's transition into this turn.
         this.steeringInbox.OpenForTurn();
+
+        // Upgrade the session runner with prompt/agent handlers before SessionStart fires.
+        // Best-effort: if the client cannot be created the runner stays as-is (prompt hooks will
+        // log "handler not configured" and fail-open, which is acceptable).
+        if (this.sessionHookRunner is not null && !this.sessionRunnerHandlersUpgraded && this.userHookRunnerOverride is null)
+        {
+            try
+            {
+                var earlyOpts = this.ResolveEffectiveOptions();
+                var earlyClient = this.llmClientFactory.Create(
+                    earlyOpts.ProviderId, this.credentials, this.fingerprint, this.http,
+                    this.loggerFactory, earlyOpts.LlmHttpTimeoutOverride, this.StreamProgressSink);
+                if (earlyClient is not null)
+                {
+                    var earlySettings = Coda.Agent.Settings.SettingsLoader.Load(earlyOpts.WorkingDirectory);
+                    this.RebuildSessionRunnerWithHandlers(earlyClient, earlySettings, earlyOpts);
+                    this.sessionRunnerHandlersUpgraded = true;
+                }
+            }
+            catch
+            {
+                // Best-effort: proceed with the partially-wired runner.
+            }
+        }
 
         // Idempotent SessionStart hook: fires once regardless of whether InitializeAsync was called
         // explicitly (composition sites) or skipped (headless callers). Does NOT start the schedule
@@ -863,6 +915,15 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         if (client is null)
         {
             return;
+        }
+
+        // Upgrade session runner with prompt/agent handlers now that we have a client.
+        // This is the manual /compact path; RunAsync may not have been called yet.
+        if (this.sessionHookRunner is not null && !this.sessionRunnerHandlersUpgraded && this.userHookRunnerOverride is null)
+        {
+            var compactSettings = Coda.Agent.Settings.SettingsLoader.Load(options.WorkingDirectory);
+            this.RebuildSessionRunnerWithHandlers(client, compactSettings, options);
+            this.sessionRunnerHandlersUpgraded = true;
         }
 
         // For the manual /compact path, use the session hook runner (same as the per-turn runner
@@ -1399,6 +1460,37 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     // -------------------------------------------------------------------------
     // Session lifecycle helpers (Phase 2)
     // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Rebuilds <see cref="sessionHookRunner"/> adding a <c>promptHandler</c> now that an
+    /// <see cref="ILlmClient"/> is available. The executor override and all other construction
+    /// parameters are preserved from the original build so test seams stay effective.
+    /// Called at most once per session lifetime (guarded by <see cref="sessionRunnerHandlersUpgraded"/>).
+    /// Not called when <see cref="userHookRunnerOverride"/> is set (it already has whatever
+    /// handlers the test/production caller wants).
+    /// </summary>
+    private void RebuildSessionRunnerWithHandlers(
+        ILlmClient client,
+        Coda.Agent.Settings.CodaSettings settings,
+        SessionOptions options)
+    {
+        var httpHandler = new Coda.Agent.Hooks.HttpHookHandler(
+            httpClient: null,
+            settings.HttpHookAllowlist,
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
+        var promptHandler = new Coda.Agent.Hooks.PromptHookHandler(
+            new Coda.Agent.Watchers.ForkedAgentRunner(client, options.Model),
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Prompt"));
+        this.sessionHookRunner = new UserHookRunner(
+            this.configuredHooks,
+            execOverride: this.sessionExecOverride,
+            context: new HookContext(this.SessionId, options.WorkingDirectory),
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
+            httpHandler: httpHandler,
+            promptHandler: promptHandler,
+            trustGuard: this.trustGuard,
+            runLog: this.hookRunLog);
+    }
 
     private static bool IsSessionLevelHookEvent(string eventName) =>
         string.Equals(eventName, "SessionStart", StringComparison.OrdinalIgnoreCase)

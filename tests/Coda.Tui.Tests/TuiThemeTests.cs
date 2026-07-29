@@ -12,6 +12,7 @@ namespace Coda.Tui.Tests;
 /// drivers and the named value otherwise, and confirm the retained transcript view resolves each
 /// <see cref="TranscriptRole"/> through the theme (including the forced-16-color driver path).
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class TuiThemeTests
 {
     [Fact]

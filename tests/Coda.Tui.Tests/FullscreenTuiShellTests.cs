@@ -15,6 +15,7 @@ namespace Coda.Tui.Tests;
 /// released 2.4.17 ANSI driver (isolated screen buffer), which emits nothing to the console during
 /// Begin/LayoutAndDraw/End, so the developer's terminal is never corrupted.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class FullscreenTuiShellTests
 {
     private static ImmutableArray<TranscriptBlock> Lines(int count) =>
@@ -1794,6 +1795,7 @@ public sealed class TranscriptViewportStateTests
 }
 
 /// <summary>Behavioral tests for <see cref="VirtualizedTranscriptView"/> that avoid a real terminal.</summary>
+[Collection("TerminalGuiInit")]
 public sealed class VirtualizedTranscriptViewTests
 {
     private static ImmutableArray<TranscriptBlock> Blocks(int count) =>

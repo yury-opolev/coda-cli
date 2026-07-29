@@ -3,7 +3,8 @@ using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.Shells;
 
 namespace Coda.Tui.Tests;
-
+
+[Collection("TerminalGuiInit")]
 public sealed class JumpToBottomHintTests
 {
     [Theory]

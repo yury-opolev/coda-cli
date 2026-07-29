@@ -14,4 +14,7 @@ public enum PluginComponentClass
 
     /// <summary>Custom subagent type definitions.</summary>
     Subagent,
+
+    /// <summary>Custom slash commands backed by Markdown prompt bodies.</summary>
+    SlashCommand,
 }

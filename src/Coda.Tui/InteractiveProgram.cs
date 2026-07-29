@@ -225,12 +225,6 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var toolDisplayMode = toolDisplayResolution.Mode;
         CopilotEnvironment.ApplyEnterpriseDomain(startupSettings.GitHubEnterpriseDomain);
 
-        // Compute the static display-buffering flag from the hook set (§8.1). This is read once here at
-        // the composition root so the reducer/actor receive a plain bool — they never touch the hook system.
-        var bufferAssistantText = startupSettings.Hooks.Count > 0
-            && new UserHookRunner(startupSettings.Hooks).AnyHookMutatesDisplay;
-        var initialSnapshot = UiSessionSnapshot.Empty with { BufferAssistantText = bufferAssistantText };
-
         using var claude = new ClaudeAiProvider();
         var copilotConfig = GitHubCopilotConfig.FromEnvironment();
         using var copilot = new GitHubCopilotProvider(copilotConfig);
@@ -349,10 +343,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             loadedSkills, skillState, cwd, originGate: skillOriginGate);
 
         // Phase 5: register user-invocable skills as first-class /<name> slash commands.
+        // Plugin commands (loaded in pluginComposition.Commands) are registered alongside them
+        // so every enabled, approved plugin command becomes reachable as /<name> in the session.
         // Thread a real logger so collision and name-validation warnings appear as TUI
         // diagnostic notifications, visible to the skill author.
         var skillCollisionLogger = new MailboxWarningLogger(mailbox);
-        registry.ReplaceAll(SlashCommandCatalog.CreateWithSkills(loadedSkills, skillCollisionLogger));
+        registry.ReplaceAll(SlashCommandCatalog.CreateWithSkillsAndPluginCommands(
+            loadedSkills, pluginComposition.Commands, skillCollisionLogger));
 
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
         {
@@ -403,6 +400,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             userSettingsDir: null,
             trustGuard: hookTrustGuard);
         context.HookManagement = hookManagement;
+
+        // Compute the static display-buffering flag from the MERGED hook set (§8.1, LOW-3 fix).
+        // Must be computed AFTER plugin hooks are merged into hookList so a plugin-contributed
+        // AgentResponse hook with mutates:["modifiedResponse"] is included. This is read once here
+        // at the composition root; the reducer/actor receive a plain bool.
+        var bufferAssistantText = hookList.Count > 0
+            && new UserHookRunner(hookList).AnyHookMutatesDisplay;
+        var initialSnapshot = UiSessionSnapshot.Empty with { BufferAssistantText = bufferAssistantText };
 
         // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
         // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only

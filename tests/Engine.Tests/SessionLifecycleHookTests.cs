@@ -951,3 +951,126 @@ public sealed class SessionLifecycleHookTests : IDisposable
         }
     }
 }
+
+// =========================================================================
+// BUG-FIX: MINOR-2 — prompt/agent-type session lifecycle hooks silently no-op
+// =========================================================================
+
+/// <summary>
+/// Regression tests for MINOR-2: the session-level <see cref="UserHookRunner"/> was
+/// constructed without <c>promptHandler</c> or <c>agentHandler</c>, so a
+/// <c>SessionStart</c> hook declared as <c>type: prompt</c> hit the null-handler branch
+/// in <see cref="HookBus"/> and silently no-oped.
+/// </summary>
+public sealed partial class SessionLifecycleHookTests_PromptHandlerWiring : IDisposable
+{
+    private readonly string root = Directory.CreateTempSubdirectory("coda_hooks_ph_").FullName;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(this.root, recursive: true); } catch { }
+    }
+
+    private SessionOptions Options() => new()
+    {
+        ProviderId = LlmAuth.Providers.ClaudeAi.ClaudeAiProvider.Id,
+        Model = "claude-sonnet-4-6",
+        WorkingDirectory = this.root,
+        PermissionMode = PermissionMode.BypassPermissions,
+    };
+
+    /// <summary>
+    /// A fake <see cref="IHookHandler"/> that returns a pre-configured <see cref="HookOutput"/>
+    /// without calling a real model.
+    /// </summary>
+    private sealed class FakePromptHandler(HookOutput output) : IHookHandler
+    {
+        public bool WasCalled { get; private set; }
+
+        public Task<HookOutput> HandleAsync(UserHook hook, string payload, CancellationToken ct)
+        {
+            this.WasCalled = true;
+            return Task.FromResult(output);
+        }
+    }
+
+    /// <summary>
+    /// A <c>prompt</c>-type <c>SessionStart</c> hook must fire and its
+    /// <c>additionalContext</c> must be injected into the session history.
+    ///
+    /// <para>Before the fix: <c>sessionHookRunner</c> was built without <c>promptHandler</c>.
+    /// The bus hit the null-handler branch and returned <c>HookOutput.NoOp</c>,
+    /// so no synthetic additionalContext message appeared.</para>
+    ///
+    /// <para>After the fix: <c>sessionPromptHandlerOverride</c> (test seam) is wired into the
+    /// runner at construction; the handler fires and <c>additionalContext</c> is injected
+    /// before the first user turn.</para>
+    /// </summary>
+    [Fact]
+    public async Task PromptType_SessionStart_hook_fires_and_injects_additionalContext()
+    {
+        var fakeHandler = new FakePromptHandler(new HookOutput
+        {
+            HookSpecificOutput = new System.Text.Json.Nodes.JsonObject
+            {
+                ["additionalContext"] = "injected-by-prompt-hook",
+            },
+        });
+
+        var hookList = new List<UserHook>
+        {
+            new UserHook("SessionStart", Command: null, HandlerType: "prompt", HookPrompt: "always allow"),
+        };
+
+        var loopFactory = new CapturingLoopFactory2();
+        using var http = new HttpClient(new SseTestHandler(TextTurn));
+
+        // NOT using userHookRunnerOverride: exercises the real sessionHookRunner construction.
+        // sessionPromptHandlerOverride is the minimal seam — only the handler is injected, not the whole runner.
+        using var session = new CodaSession(
+            SignedInClaude(),
+            this.Options(),
+            httpClient: http,
+            agentLoopFactory: loopFactory,
+            hookList: hookList,
+            sessionPromptHandlerOverride: fakeHandler);
+
+        await session.RunAsync("first turn");
+
+        Assert.True(fakeHandler.WasCalled, "prompt handler was never called — sessionHookRunner is missing promptHandler");
+
+        var historyList = session.History.ToList();
+        var ctxIdx = historyList.FindIndex(m =>
+            m.Role == ChatRole.User
+            && m.Content is [TextBlock tb]
+            && tb.Text == "injected-by-prompt-hook");
+        Assert.True(ctxIdx >= 0, "additionalContext was not injected into session history");
+
+        var firstTurnIdx = historyList.FindIndex(m =>
+            m.Role == ChatRole.User
+            && m.Content is [TextBlock tb]
+            && tb.Text == "first turn");
+        Assert.True(ctxIdx < firstTurnIdx, "additionalContext must precede the first user turn");
+    }
+
+    // Minimal capturing loop factory scoped to this test class.
+    private sealed class CapturingLoopFactory2 : IAgentLoopFactory
+    {
+        public IAgentLoop Create(AgentLoopSpec spec) => new CapturingLoop2();
+
+        private sealed class CapturingLoop2 : IAgentLoop
+        {
+            public GoalStatus? LastGoalStatus => null;
+
+            public Task RunAsync(
+                List<ChatMessage> history,
+                IAgentSink sink,
+                CancellationToken cancellationToken = default,
+                TurnShape? shape = null)
+            {
+                history.Add(new ChatMessage(ChatRole.Assistant, [new TextBlock("ok")]));
+                return Task.CompletedTask;
+            }
+        }
+    }
+}

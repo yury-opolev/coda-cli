@@ -13,6 +13,7 @@ namespace Coda.Tui.Tests;
 /// deceptive-link marker, wrapping across lines, TranscriptRow mirroring, theme roles, and
 /// draw-path attribute tests.  Interaction (Part B) is explicitly out of scope here.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class LinkSpanTests
 {
     // ---------------------------------------------------------------------------

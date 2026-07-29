@@ -11,6 +11,7 @@ namespace Coda.Tui.Tests;
 /// staged and its token inserted into the draft (preferred over text); an absent image falls through to
 /// the existing text-paste path unchanged; a rejected image pins a warning without a text fallthrough.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class ImagePasteShellTests
 {
     private sealed class FakeImageReader(ClipboardImage? image) : IClipboardImageReader
