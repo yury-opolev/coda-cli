@@ -55,6 +55,47 @@ public sealed record SkillDefinition(string Name, string Description, string Bod
     public bool UserInvocable { get; init; } = true;
 
     /// <summary>
+    /// Tools pre-approved for the invoking turn (skipping the permission prompt). Does not widen
+    /// any hook-imposed restriction — denial lists always beat allowlists.
+    /// Empty means no pre-approval declared.
+    /// </summary>
+    public IReadOnlyList<string> AllowedTools { get; init; } = [];
+
+    /// <summary>
+    /// Tools removed from the pool for the invoking turn. Unioned with hook-imposed denial lists.
+    /// Empty means no additional tools are denied.
+    /// </summary>
+    public IReadOnlyList<string> DisallowedTools { get; init; } = [];
+
+    /// <summary>
+    /// Model override for the invoking turn. <see langword="null"/> means use the session default
+    /// (<c>"inherit"</c> in frontmatter is normalised to null by the parser).
+    /// </summary>
+    public string? Model { get; init; }
+
+    /// <summary>
+    /// Reasoning effort override for the invoking turn. <see langword="null"/> means use the
+    /// session default (<c>"inherit"</c> in frontmatter is normalised to null by the parser).
+    /// </summary>
+    public string? Effort { get; init; }
+
+    /// <summary>How the skill body is executed — inline (default) or in a forked subagent.</summary>
+    public SkillContextMode ContextMode { get; init; } = SkillContextMode.Inline;
+
+    /// <summary>
+    /// The subagent type to use when <see cref="ContextMode"/> is <see cref="SkillContextMode.Fork"/>.
+    /// <see langword="null"/> means the general-purpose subagent.
+    /// </summary>
+    public string? AgentType { get; init; }
+
+    /// <summary>
+    /// Glob patterns that restrict which workspaces this skill is advertised to the model in.
+    /// User invocation via <c>/skill</c> is never filtered.
+    /// Empty means the skill is always advertised.
+    /// </summary>
+    public IReadOnlyList<string> Paths { get; init; } = [];
+
+    /// <summary>
     /// Raw string values for frontmatter keys not modelled by this record. Preserved so a skill
     /// authored for a future Coda version or another harness still loads cleanly.
     /// </summary>

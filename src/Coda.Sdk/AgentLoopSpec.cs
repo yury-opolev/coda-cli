@@ -87,4 +87,12 @@ public sealed record AgentLoopSpec(
     /// mutates it when a hook returns session-scoped <c>updatedPermissions</c>.
     /// </summary>
     public PermissionRuleStore? PermissionRules { get; init; }
+
+    /// <summary>
+    /// Factory that returns the current set of additional filesystem roots the file tools may
+    /// access beyond the working directory. Invoked per tool-batch so grants made mid-session
+    /// take effect on the next batch. Null means no additional roots (the default).
+    /// Populated from skill directory-consent grants via <c>SkillSessionState.GetGrantedDirectories</c>.
+    /// </summary>
+    public Func<IReadOnlySet<string>?>? GrantedDirectoriesSource { get; init; }
 }

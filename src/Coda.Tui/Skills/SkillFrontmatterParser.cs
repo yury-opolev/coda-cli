@@ -18,11 +18,19 @@ public static class SkillFrontmatterParser
     private const string KeyArguments = "arguments";
     private const string KeyDisableModelInvocation = "disable-model-invocation";
     private const string KeyUserInvocable = "user-invocable";
+    private const string KeyAllowedTools = "allowed-tools";
+    private const string KeyDisallowedTools = "disallowed-tools";
+    private const string KeyModel = "model";
+    private const string KeyEffort = "effort";
+    private const string KeyContext = "context";
+    private const string KeyAgent = "agent";
+    private const string KeyPaths = "paths";
 
     private static readonly HashSet<string> KnownKeys = new(StringComparer.Ordinal)
     {
         KeyName, KeyDescription, KeyWhenToUse, KeyArgumentHint, KeyArguments,
         KeyDisableModelInvocation, KeyUserInvocable,
+        KeyAllowedTools, KeyDisallowedTools, KeyModel, KeyEffort, KeyContext, KeyAgent, KeyPaths,
     };
 
     // Keys that carry list values — [bracket] syntax is parsed as a flow list only for these.
@@ -30,7 +38,7 @@ public static class SkillFrontmatterParser
     // remain faithful and adding a new scalar key in future is safe by default.
     private static readonly HashSet<string> KnownListKeys = new(StringComparer.Ordinal)
     {
-        KeyArguments,
+        KeyArguments, KeyAllowedTools, KeyDisallowedTools, KeyPaths,
     };
 
     /// <summary>
@@ -88,7 +96,8 @@ public static class SkillFrontmatterParser
         var bodyLines = lines[(end + 1)..];
         var body = string.Join("\n", bodyLines).Trim();
 
-        var (name, description, whenToUse, argumentHint, arguments, disableModelInvocation, userInvocable, unknown) =
+        var (name, description, whenToUse, argumentHint, arguments, disableModelInvocation, userInvocable,
+            allowedTools, disallowedTools, model, effort, contextMode, agent, paths, unknown) =
             ParseBlock(frontmatterLines);
 
         return new SkillFrontmatter
@@ -101,6 +110,13 @@ public static class SkillFrontmatterParser
             Arguments = arguments,
             DisableModelInvocation = disableModelInvocation,
             UserInvocable = userInvocable,
+            AllowedTools = allowedTools,
+            DisallowedTools = disallowedTools,
+            Model = model,
+            Effort = effort,
+            ContextMode = contextMode,
+            Agent = agent,
+            Paths = paths,
             UnknownFields = unknown,
             Body = body,
         };
@@ -116,6 +132,13 @@ public static class SkillFrontmatterParser
         IReadOnlyList<string> Arguments,
         bool DisableModelInvocation,
         bool UserInvocable,
+        IReadOnlyList<string> AllowedTools,
+        IReadOnlyList<string> DisallowedTools,
+        string? Model,
+        string? Effort,
+        SkillContextMode ContextMode,
+        string? Agent,
+        IReadOnlyList<string> Paths,
         IReadOnlyDictionary<string, string> UnknownFields)
         ParseBlock(string[] lines)
     {
@@ -258,6 +281,24 @@ public static class SkillFrontmatterParser
         var disableModelInvocation = ParseBool(GetScalar(KeyDisableModelInvocation), defaultValue: false);
         var userInvocable = ParseBool(GetScalar(KeyUserInvocable), defaultValue: true);
 
+        // Phase 2 fields
+        var allowedTools = GetList(KeyAllowedTools);
+        var disallowedTools = GetList(KeyDisallowedTools);
+
+        var rawModel = GetScalar(KeyModel);
+        var model = string.Equals(rawModel, "inherit", StringComparison.OrdinalIgnoreCase) ? null : rawModel;
+
+        var rawEffort = GetScalar(KeyEffort);
+        var effort = string.Equals(rawEffort, "inherit", StringComparison.OrdinalIgnoreCase) ? null : rawEffort;
+
+        var contextRaw = GetScalar(KeyContext);
+        var contextMode = string.Equals(contextRaw, "fork", StringComparison.OrdinalIgnoreCase)
+            ? SkillContextMode.Fork
+            : SkillContextMode.Inline;
+
+        var agent = GetScalar(KeyAgent);
+        var paths = GetList(KeyPaths);
+
         // ── Collect unknown fields ────────────────────────────────────────
         var unknown = new Dictionary<string, string>(StringComparer.Ordinal);
         foreach (var (k, v) in scalars)
@@ -276,7 +317,8 @@ public static class SkillFrontmatterParser
             }
         }
 
-        return (name, description, whenToUse, argumentHint, arguments, disableModelInvocation, userInvocable, unknown);
+        return (name, description, whenToUse, argumentHint, arguments, disableModelInvocation, userInvocable,
+            allowedTools, disallowedTools, model, effort, contextMode, agent, paths, unknown);
     }
 
     // ── Key normalization ─────────────────────────────────────────────────

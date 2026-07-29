@@ -676,7 +676,7 @@ public sealed class SkillLoaderOriginAndPathTests : IDisposable
         Directory.CreateDirectory(skillDir);
         File.WriteAllText(
             Path.Combine(skillDir, "SKILL.md"),
-            "---\nname: ext-skill\ndescription: d\nmodel: claude-opus\n---\nBody.\n");
+            "---\nname: ext-skill\ndescription: d\nversion: 2.1\n---\nBody.\n");
 
         var skills = SkillLoader.Load(
             this.tempDir,
@@ -684,8 +684,8 @@ public sealed class SkillLoaderOriginAndPathTests : IDisposable
             claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
 
         var skill = Assert.Single(skills);
-        Assert.True(skill.UnknownFields.ContainsKey("model"));
-        Assert.Equal("claude-opus", skill.UnknownFields["model"]);
+        Assert.True(skill.UnknownFields.ContainsKey("version"));
+        Assert.Equal("2.1", skill.UnknownFields["version"]);
     }
 }
 
@@ -774,7 +774,7 @@ public sealed class SkillsCommandSubcommandTests : IDisposable
     {
         var skillFile = Path.Combine(this.tempDir, "unknown-keys.md");
         File.WriteAllText(skillFile,
-            "---\nname: uk\ndescription: d\nallowed-tools: [read_file]\nmodel: opus\n---\nBody.\n");
+            "---\nname: uk\ndescription: d\nversion: 1.0\ncategory: tools\n---\nBody.\n");
 
         var (console, context) = BuildContext(this.tempDir);
         var command = new SkillsCommand();
@@ -784,7 +784,7 @@ public sealed class SkillsCommandSubcommandTests : IDisposable
         // At least one of the unknown keys should appear in the output
         var output = console.Output;
         Assert.True(
-            output.Contains("allowed-tools") || output.Contains("model"),
+            output.Contains("version") || output.Contains("category"),
             $"Expected unknown key names in output; got: {output}");
     }
 

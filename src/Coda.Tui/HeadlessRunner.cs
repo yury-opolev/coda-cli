@@ -139,7 +139,7 @@ public static class HeadlessRunner
         // Load skills and build the skill tool for headless runs as well.
         var skillState = new Coda.Tui.Skills.SkillSessionState();
         var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
-            Coda.Tui.Skills.SkillLoader.Load(workingDirectory), skillState);
+            Coda.Tui.Skills.SkillLoader.Load(workingDirectory), skillState, workingDirectory);
         var allExtraTools = skillTool is not null
             ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, skillTool]
             : mcp.Tools;
@@ -153,6 +153,9 @@ public static class HeadlessRunner
             ExtraTools = allExtraTools,
             SkillReattachContentProvider = skillTool is not null
                 ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+                : null,
+            GrantedDirectoriesSource = skillTool is not null
+                ? () => skillState.GetGrantedDirectories()
                 : null,
             Effort = options.Effort,
             InteractivePrompt = null, // headless: Ask → deny

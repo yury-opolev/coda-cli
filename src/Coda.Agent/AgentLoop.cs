@@ -97,6 +97,8 @@ public sealed partial class AgentLoop : IAgentLoop
     private const string GoalContinueOption = "Provide guidance and continue";
     private const string GoalStopOption = "Stop — goal not met";
 
+    private readonly Func<IReadOnlySet<string>?>? grantedDirectoriesSource;
+
     public AgentLoop(
         ILlmClient client,
         ToolRegistry tools,
@@ -126,7 +128,8 @@ public sealed partial class AgentLoop : IAgentLoop
         TimeSpan? transportRetryDelay = null,
         AgentExecutionGate? gate = null,
         ToolActivityContext? toolActivity = null,
-        PermissionRuleStore? permissionRules = null)
+        PermissionRuleStore? permissionRules = null,
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -163,6 +166,7 @@ public sealed partial class AgentLoop : IAgentLoop
         this.transportRetryDelay = transportRetryDelay;
         this.persistTurn = persistTurnAsync;
         this.initialToolActivity = toolActivity ?? ToolActivityContext.CreateRoot();
+        this.grantedDirectoriesSource = grantedDirectoriesSource;
     }
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "turn start: iteration={iteration}, model={model}, historyMessages={messageCount}, tools={toolCount}")]
@@ -237,6 +241,9 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Debug, Message = "Stop user hooks failed (best-effort); completing the turn")]
     private partial void LogStopHooksFailed(Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "Skill shape delta applied: model={Model}, effort={Effort}")]
+    private partial void LogSkillShapeDeltaApplied(string model, string? effort);
+
     [LoggerMessage(Level = LogLevel.Debug, Message = "AgentResponse hooks failed (fail-open); response passes through unchanged")]
     private partial void LogAgentResponseHooksFailed(Exception ex);
 
@@ -261,6 +268,9 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Debug, Message = "LSP edit-seam notify failed (best-effort); tool result and turn unaffected")]
     private partial void LogLspNotifyFailed(Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "ShapeDelta from non-skill tool '{toolName}' was ignored; only ISkillShapeDeltaSource tools may modify turn shape")]
+    private partial void LogShapeDeltaIgnored(string toolName);
+
     public async Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
     {
         ArgumentNullException.ThrowIfNull(history);
@@ -268,8 +278,10 @@ public sealed partial class AgentLoop : IAgentLoop
 
         // Resolve per-turn overrides once at the start of the run. All iterations use the
         // same resolution: model, effort, system prompt, and tool filter are stable for the
-        // lifetime of the call. (Tool-search output is still recomputed per iteration; the
+        // lifetime of the call unless a skill tool applies a shape delta mid-turn.
+        // (Tool-search output is still recomputed per iteration; the
         // shape filter is applied to it via resolution.FilterDefinitions.)
+        var effectiveShape = shape;
         var resolution = TurnShapeResolver.Resolve(
             this.options.SystemPrompt,
             this.options.Model,
@@ -773,8 +785,22 @@ public sealed partial class AgentLoop : IAgentLoop
                 // direct result of a prior stop-hook continuation. Reset so stop hooks
                 // treat the next natural stop correctly.
                 stopHookActive = false;
-                var resultBlocks = await this.RunToolsAsync(toolUses, activity, sink, resolution, cancellationToken).ConfigureAwait(false);
+                var (resultBlocks, shapeDelta) = await this.RunToolsAsync(toolUses, activity, sink, resolution, cancellationToken).ConfigureAwait(false);
                 history.Add(new ChatMessage(ChatRole.User, resultBlocks));
+
+                // When a skill tool returned a shape delta, layer it onto the effective shape and
+                // re-resolve so subsequent iterations see the updated model/effort/tool restrictions.
+                if (shapeDelta is not null)
+                {
+                    effectiveShape = TurnShape.Layer(effectiveShape, shapeDelta);
+                    resolution = TurnShapeResolver.Resolve(
+                        this.options.SystemPrompt,
+                        this.options.Model,
+                        this.options.Effort,
+                        this.tools,
+                        effectiveShape);
+                    this.LogSkillShapeDeltaApplied(resolution.Model, resolution.Effort);
+                }
 
                 // Persist again once tool results are in history, so a kill in the gap before
                 // the next sampling still captures the outputs, not just the requests.
@@ -850,7 +876,7 @@ public sealed partial class AgentLoop : IAgentLoop
         }
     }
 
-    private async Task<List<ContentBlock>> RunToolsAsync(
+    private async Task<(List<ContentBlock> Blocks, TurnShape? ShapeDelta)> RunToolsAsync(
         IReadOnlyList<ToolUseBlock> toolUses,
         ToolActivityContext activity,
         IAgentSink sink,
@@ -858,6 +884,7 @@ public sealed partial class AgentLoop : IAgentLoop
         CancellationToken cancellationToken)
     {
         var results = new List<ContentBlock>();
+        TurnShape? accumulatedDelta = null;
         var identities = toolUses.Select(toolUse => activity.ForCall(toolUse.Id)).ToArray();
         var context = new ToolContext(this.options.WorkingDirectory)
         {
@@ -877,6 +904,7 @@ public sealed partial class AgentLoop : IAgentLoop
             OnToolsDiscovered = names => this.toolSearch?.AddDiscovered(names),
             Logger = this.logger,
             ParentToolRestriction = resolution.ToToolRestrictionShape(),
+            GrantedDirectories = this.grantedDirectoriesSource?.Invoke(),
         };
 
         for (var i = 0; i < toolUses.Count; i++)
@@ -1033,31 +1061,40 @@ public sealed partial class AgentLoop : IAgentLoop
 
                 if (!grantedByHook)
                 {
-                    bool allowed;
-                    try
+                    // Pre-approved tools (explicitly in AllowedTools when set by a skill or hook)
+                    // skip the user permission prompt — the shape is the approval surface.
+                    if (resolution.IsPreApprovedTool(toolUse.Name))
                     {
-                        allowed = await this.permissions
-                            .RequestAsync(tool, effectiveInput, cancellationToken)
-                            .ConfigureAwait(false);
+                        grantedByHook = true;
                     }
-                    catch (OperationCanceledException)
+                    else
                     {
-                        throw;
-                    }
-                    catch (Exception ex)
-                    {
-                        var promptError = new ToolResult($"Permission prompt error: {ex.Message}", IsError: true);
-                        sink.OnToolResult(identity, toolUse.Name, promptError, ToolCallStatus.Failed);
-                        results.Add(CreateToolResultBlock(identity, promptError, ToolCallStatus.Failed));
-                        continue;
-                    }
+                        bool allowed;
+                        try
+                        {
+                            allowed = await this.permissions
+                                .RequestAsync(tool, effectiveInput, cancellationToken)
+                                .ConfigureAwait(false);
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            throw;
+                        }
+                        catch (Exception ex)
+                        {
+                            var promptError = new ToolResult($"Permission prompt error: {ex.Message}", IsError: true);
+                            sink.OnToolResult(identity, toolUse.Name, promptError, ToolCallStatus.Failed);
+                            results.Add(CreateToolResultBlock(identity, promptError, ToolCallStatus.Failed));
+                            continue;
+                        }
 
-                    if (!allowed)
-                    {
-                        var userDenied = new ToolResult("Permission denied by the user.", IsError: true);
-                        sink.OnToolResult(identity, toolUse.Name, userDenied, ToolCallStatus.Failed);
-                        results.Add(CreateToolResultBlock(identity, userDenied, ToolCallStatus.Failed));
-                        continue;
+                        if (!allowed)
+                        {
+                            var userDenied = new ToolResult("Permission denied by the user.", IsError: true);
+                            sink.OnToolResult(identity, toolUse.Name, userDenied, ToolCallStatus.Failed);
+                            results.Add(CreateToolResultBlock(identity, userDenied, ToolCallStatus.Failed));
+                            continue;
+                        }
                     }
                 }
             }
@@ -1173,6 +1210,21 @@ public sealed partial class AgentLoop : IAgentLoop
             this.LogToolResult(toolUse.Name, result.IsError, result.Content.Length);
             results.Add(CreateToolResultBlock(identity, result, terminalStatus));
 
+            // Accumulate shape delta only from tools that implement ISkillShapeDeltaSource.
+            // Accepting deltas from arbitrary tools would let any in-process tool pre-approve
+            // itself or others by injecting a PreApprovedTools list — I3 gate.
+            if (result.ShapeDelta is { } delta)
+            {
+                if (tool is ISkillShapeDeltaSource)
+                {
+                    accumulatedDelta = TurnShape.Layer(accumulatedDelta, delta);
+                }
+                else
+                {
+                    this.LogShapeDeltaIgnored(toolUse.Name);
+                }
+            }
+
             // EDIT SEAM: when a mutating file tool succeeds, notify the LSP server
             // about the new file content (change + save) so it can publish diagnostics.
             // Failures are swallowed — LSP must never break a tool result.
@@ -1182,7 +1234,7 @@ public sealed partial class AgentLoop : IAgentLoop
             }
         }
 
-        return results;
+        return (results, accumulatedDelta);
     }
 
     /// <summary>

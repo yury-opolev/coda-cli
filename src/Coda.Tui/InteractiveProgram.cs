@@ -294,7 +294,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // re-injects exactly the bodies the model loaded in this session.
         var skillState = new Coda.Tui.Skills.SkillSessionState();
         var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
-            Coda.Tui.Skills.SkillLoader.Load(cwd), skillState);
+            Coda.Tui.Skills.SkillLoader.Load(cwd), skillState, cwd);
 
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
         {
@@ -368,6 +368,9 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         Func<int, string>? skillReattach = skillTool is not null
             ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
             : null;
+        Func<IReadOnlySet<string>?>? grantedDirs = skillTool is not null
+            ? () => skillState.GetGrantedDirectories()
+            : null;
         using var agentRunner = new AgentRunner(
             agentToolsProvider,
             sessionFactory: (ctx, opts, currentOpts) =>
@@ -381,7 +384,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                     runLog: capturedRunLog,
                     trustGuard: capturedTrustGuard),
             timeProvider: null,
-            skillReattachProvider: skillReattach);
+            skillReattachProvider: skillReattach,
+            grantedDirectoriesSource: grantedDirs);
         using var app = new TuiApp(context, agentToolsProvider, agentRunner: agentRunner);
 
         // The command context and the browser both read the live session through agentRunner (a provider,

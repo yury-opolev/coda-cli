@@ -124,4 +124,12 @@ public sealed record SessionOptions
     /// <see cref="CodaSession.Resume"/> is called, regardless of this property.
     /// </summary>
     public string? SessionSource { get; init; }
+
+    /// <summary>
+    /// Factory that returns the current set of additional filesystem roots the file tools may
+    /// access beyond <see cref="WorkingDirectory"/>. Invoked per tool-batch so grants made
+    /// mid-session take effect on the next batch. Null means no additional roots.
+    /// Populated from <c>SkillSessionState.GetGrantedDirectories</c> at composition time.
+    /// </summary>
+    public Func<IReadOnlySet<string>?>? GrantedDirectoriesSource { get; init; }
 }

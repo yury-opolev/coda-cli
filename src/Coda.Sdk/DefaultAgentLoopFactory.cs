@@ -40,6 +40,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             currentTaskId: spec.CurrentTaskId,
             currentDepth: spec.CurrentDepth,
             toolActivity: spec.ToolActivity,
-            permissionRules: spec.PermissionRules);
+            permissionRules: spec.PermissionRules,
+            grantedDirectoriesSource: spec.GrantedDirectoriesSource);
     }
 }

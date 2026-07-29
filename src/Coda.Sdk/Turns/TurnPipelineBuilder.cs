@@ -196,6 +196,7 @@ public sealed class TurnPipelineBuilder
             ScheduleRuntime: this.scheduleRuntimeProvider())
         {
             PermissionRules = permissionRules,
+            GrantedDirectoriesSource = options.GrantedDirectoriesSource,
         };
     }
 
@@ -352,6 +353,7 @@ public sealed class TurnPipelineBuilder
             CurrentDepth: depth)
         {
             PermissionRules = permissionRules,
+            GrantedDirectoriesSource = options.GrantedDirectoriesSource,
         };
     }
 

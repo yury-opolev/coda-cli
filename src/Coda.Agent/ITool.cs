@@ -74,10 +74,30 @@ public sealed record ToolContext(string WorkingDirectory)
     /// and must not leak into a child's independent agent context.
     /// </summary>
     public TurnShape? ParentToolRestriction { get; init; }
+
+    /// <summary>
+    /// Additional filesystem roots that file tools may access, beyond <see cref="WorkingDirectory"/>.
+    /// Populated from skill directory-consent grants: when the user approves loading a skill from
+    /// an external directory (e.g. <c>~/.coda/skills/foo</c>), that canonical directory is added
+    /// here so the skill's bundled resource files can be read during the session.
+    /// <see langword="null"/> means no additional roots are permitted (the default).
+    /// </summary>
+    public IReadOnlySet<string>? GrantedDirectories { get; init; }
 }
 
 /// <summary>The outcome of running a tool, fed back to the model.</summary>
-public sealed record ToolResult(string Content, bool IsError = false);
+/// <param name="Content">The text or serialised output returned to the model.</param>
+/// <param name="IsError">When <see langword="true"/>, the model receives this as an error result.</param>
+public sealed record ToolResult(string Content, bool IsError = false)
+{
+    /// <summary>
+    /// Optional <see cref="TurnShape"/> delta that this tool wants applied to the current turn
+    /// after its execution. The caller (typically <see cref="AgentLoop"/>) accumulates and
+    /// layers deltas from all tools in a batch via <see cref="TurnShape.Layer"/>.
+    /// <see langword="null"/> means no change to the current turn's shape.
+    /// </summary>
+    public TurnShape? ShapeDelta { get; init; }
+}
 
 /// <summary>An executable tool the model can call.</summary>
 public interface ITool

@@ -18,6 +18,9 @@ public sealed class SkillSessionState
     private readonly Dictionary<string, (string RenderedBody, int InvocationOrder)> _loaded
         = new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly Dictionary<string, string> _consentedSkills
+        = new(StringComparer.OrdinalIgnoreCase);
+
     private int _nextOrder;
 
     /// <summary>
@@ -51,6 +54,28 @@ public sealed class SkillSessionState
         this._loaded[skillName] = (renderedBody, this._nextOrder++);
         return (true, renderedBody);
     }
+
+    /// <summary>
+    /// Returns <see langword="true"/> if directory access for <paramref name="skillName"/>
+    /// was already consented to in this session (no re-prompt needed).
+    /// </summary>
+    public bool HasDirectoryConsent(string skillName) =>
+        this._consentedSkills.ContainsKey(skillName);
+
+    /// <summary>
+    /// Records that the user has granted directory access for <paramref name="skillName"/>
+    /// for the remainder of this session. The <paramref name="canonicalDir"/> is persisted so
+    /// filesystem tools can check whether a path falls within the consented root.
+    /// </summary>
+    public void GrantDirectoryConsent(string skillName, string canonicalDir) =>
+        this._consentedSkills[skillName] = canonicalDir;
+
+    /// <summary>
+    /// Returns the set of canonical directory paths that have been consented to this session.
+    /// Filesystem tools use this to allow access to skill directories outside the working directory.
+    /// </summary>
+    public IReadOnlySet<string> GetGrantedDirectories() =>
+        new HashSet<string>(this._consentedSkills.Values, StringComparer.OrdinalIgnoreCase);
 
     /// <summary>
     /// Derives the character budget for <see cref="GetReattachContent"/> from the session's

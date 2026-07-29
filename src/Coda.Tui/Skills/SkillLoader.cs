@@ -167,6 +167,13 @@ public static partial class SkillLoader
             UnknownFields = fm.UnknownFields,
             DisableModelInvocation = fm.DisableModelInvocation,
             UserInvocable = fm.UserInvocable,
+            AllowedTools = fm.AllowedTools,
+            DisallowedTools = fm.DisallowedTools,
+            Model = fm.Model,
+            Effort = fm.Effort,
+            ContextMode = fm.ContextMode,
+            AgentType = fm.Agent,
+            Paths = fm.Paths,
         };
     }
 }

@@ -37,6 +37,14 @@ internal sealed record TurnShapeResolution
     private HashSet<string>? AllowedNames { get; init; }
 
     /// <summary>
+    /// Case-insensitive set of tool names that are pre-approved for the current turn — they
+    /// skip the user permission prompt. Distinct from <see cref="AllowedNames"/>: pre-approval
+    /// does not affect which tools are advertised or executable; it only gates the prompt.
+    /// Derived from <see cref="TurnShape.PreApprovedTools"/>. Null when no pre-approval is set.
+    /// </summary>
+    private HashSet<string>? PreApprovedNames { get; init; }
+
+    /// <summary>
     /// When the restriction was driven by <see cref="TurnShape.DeniedTools"/> alone (no
     /// AllowedTools filter was set), records the original denied list so that
     /// <see cref="ToToolRestrictionShape"/> can propagate a <c>DeniedTools</c>-only shape to
@@ -95,6 +103,16 @@ internal sealed record TurnShapeResolution
 
 
     /// <summary>
+    /// Returns <see langword="true"/> when the named tool is explicitly listed in
+    /// <see cref="TurnShape.PreApprovedTools"/>, making it pre-approved for execution without a
+    /// user permission prompt. Returns <see langword="false"/> when no pre-approval is active or
+    /// the tool is absent. Note that pre-approval does not override <see cref="IsToolAllowed"/>:
+    /// a tool that is both pre-approved and denied still cannot run.
+    /// </summary>
+    public bool IsPreApprovedTool(string name) =>
+        this.PreApprovedNames is not null && this.PreApprovedNames.Contains(name);
+
+    /// <summary>
     /// Returns <see langword="true"/> when the named tool is permitted to execute this turn.
     /// When no filter is active (null shape or no tool lists set) every tool is allowed.
     /// Matching is case-insensitive.
@@ -130,6 +148,7 @@ internal sealed record TurnShapeResolution
             Effort = effort,
             ToolDefinitions = toolDefinitions,
             AllowedNames = null,
+            PreApprovedNames = null,
             ToolChoice = null,
         };
 
@@ -140,7 +159,8 @@ internal sealed record TurnShapeResolution
         IReadOnlyList<ToolDefinition> toolDefinitions,
         HashSet<string>? allowedNames,
         string? toolChoice,
-        IReadOnlyList<string>? deniedOnlyInput = null) =>
+        IReadOnlyList<string>? deniedOnlyInput = null,
+        HashSet<string>? preApprovedNames = null) =>
         new()
         {
             SystemPrompt = systemPrompt,
@@ -148,6 +168,7 @@ internal sealed record TurnShapeResolution
             Effort = effort,
             ToolDefinitions = toolDefinitions,
             AllowedNames = allowedNames,
+            PreApprovedNames = preApprovedNames,
             ToolChoice = toolChoice,
             DeniedOnlyInput = deniedOnlyInput,
         };
@@ -213,6 +234,13 @@ internal static class TurnShapeResolver
         // - AllowedTools empty → no tools at all (empty ≠ null)
         // - DeniedTools        → always remove, denial wins when in both
         // Matching is case-insensitive; unrecognized names are silently ignored.
+        // PreApprovedTools is separate: it only gates the permission prompt, never the tool set.
+
+        // Build the pre-approved set independently of the allow/deny filter.
+        HashSet<string>? preApprovedNames = shape.PreApprovedTools is { Count: > 0 }
+            ? new HashSet<string>(shape.PreApprovedTools, StringComparer.OrdinalIgnoreCase)
+            : null;
+
         if (shape.AllowedTools is not null || shape.DeniedTools is { Count: > 0 })
         {
             var allNames = tools.All.Select(t => t.Name);
@@ -245,9 +273,9 @@ internal static class TurnShapeResolver
             // AllowedNames intersection is forwarded directly in that case.
             var deniedOnlyInput = shape.AllowedTools is null ? shape.DeniedTools : null;
 
-            return TurnShapeResolution.Create(systemPrompt, model, effort, filteredDefs, allowedNames, toolChoice, deniedOnlyInput);
+            return TurnShapeResolution.Create(systemPrompt, model, effort, filteredDefs, allowedNames, toolChoice, deniedOnlyInput, preApprovedNames);
         }
 
-        return TurnShapeResolution.Create(systemPrompt, model, effort, tools.Definitions, allowedNames: null, toolChoice);
+        return TurnShapeResolution.Create(systemPrompt, model, effort, tools.Definitions, allowedNames: null, toolChoice, preApprovedNames: preApprovedNames);
     }
 }

@@ -45,7 +45,7 @@ public sealed class GrepTool : ITool
         {
             baseDir = context.WorkingDirectory;
         }
-        else if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, pathArg, out baseDir!, out var pathError, context.AllowOutsideWorkingDirectory))
+        else if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, pathArg, out baseDir!, out var pathError, context.AllowOutsideWorkingDirectory, context.GrantedDirectories))
         {
             return new ToolResult(pathError!, IsError: true);
         }

@@ -101,11 +101,11 @@ public sealed class SkillFrontmatterParserTests
     [Fact]
     public void Block_list_unknown_field_retained()
     {
-        var fm = Parse("allowed-tools:\n  - read_file\n  - grep");
+        var fm = Parse("tags:\n  - read_file\n  - grep");
 
-        Assert.True(fm.UnknownFields.ContainsKey("allowed-tools"),
-            "allowed-tools should appear in UnknownFields");
-        var stored = fm.UnknownFields["allowed-tools"];
+        Assert.True(fm.UnknownFields.ContainsKey("tags"),
+            "tags should appear in UnknownFields");
+        var stored = fm.UnknownFields["tags"];
         Assert.Contains("read_file", stored);
         Assert.Contains("grep", stored);
     }
@@ -227,33 +227,33 @@ public sealed class SkillFrontmatterParserTests
     [Fact]
     public void Unknown_scalar_key_is_retained_in_unknown_fields()
     {
-        var fm = Parse("name: foo\nmodel: claude-opus-4\ndescription: bar");
+        var fm = Parse("name: foo\nversion: 1.2.3\ndescription: bar");
 
-        Assert.True(fm.UnknownFields.ContainsKey("model"),
-            "model is an unknown field and should appear in UnknownFields");
-        Assert.Equal("claude-opus-4", fm.UnknownFields["model"]);
+        Assert.True(fm.UnknownFields.ContainsKey("version"),
+            "version is an unknown field and should appear in UnknownFields");
+        Assert.Equal("1.2.3", fm.UnknownFields["version"]);
     }
 
     [Fact]
     public void Unknown_key_with_bracketed_value_is_retained_verbatim_with_brackets()
     {
-        // model: [gpt-4] must NOT be parsed as a flow list — brackets preserved literally.
-        var fm = Parse("name: s\nmodel: [gpt-4]");
+        // version: [1.0] must NOT be parsed as a flow list — brackets preserved literally.
+        var fm = Parse("name: s\nversion: [1.0]");
 
-        Assert.True(fm.UnknownFields.ContainsKey("model"),
-            "model should appear in UnknownFields");
-        Assert.Equal("[gpt-4]", fm.UnknownFields["model"]);
+        Assert.True(fm.UnknownFields.ContainsKey("version"),
+            "version should appear in UnknownFields");
+        Assert.Equal("[1.0]", fm.UnknownFields["version"]);
     }
 
     [Fact]
     public void Multiple_unknown_keys_all_retained()
     {
-        var fm = Parse("name: s\nmodel: x\neffort: high\ncontext: fork");
+        var fm = Parse("name: s\nversion: 1\ncategory: tools\ntags: misc");
 
         Assert.Equal(3, fm.UnknownFields.Count);
-        Assert.Equal("x", fm.UnknownFields["model"]);
-        Assert.Equal("high", fm.UnknownFields["effort"]);
-        Assert.Equal("fork", fm.UnknownFields["context"]);
+        Assert.Equal("1", fm.UnknownFields["version"]);
+        Assert.Equal("tools", fm.UnknownFields["category"]);
+        Assert.Equal("misc", fm.UnknownFields["tags"]);
     }
 
     [Fact]

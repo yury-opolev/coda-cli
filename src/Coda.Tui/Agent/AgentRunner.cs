@@ -24,6 +24,7 @@ public sealed class AgentRunner : IDisposable
 {
     private readonly Func<IReadOnlyList<ITool>>? extraToolsProvider;
     private readonly Func<int, string>? skillReattachProvider;
+    private readonly Func<IReadOnlySet<string>?>? grantedDirectoriesSource;
     private readonly Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory;
     private readonly TimeProvider timeProvider;
     private readonly object turnGate = new();
@@ -47,14 +48,14 @@ public sealed class AgentRunner : IDisposable
     }
 
     /// <summary>
-    /// Creates an <see cref="AgentRunner"/> with an optional skill reattach content provider.
-    /// The provider is invoked each turn to supply <see cref="SessionOptions.SkillReattachContentProvider"/>.
-    /// The integer argument is the resolved <c>AutoCompactTokenThreshold</c> for the turn.
+    /// Creates an <see cref="AgentRunner"/> with an optional skill reattach content provider and
+    /// an optional granted-directories source for skill directory-consent enforcement.
     /// </summary>
     public AgentRunner(
         Func<IReadOnlyList<ITool>>? extraToolsProvider,
-        Func<int, string>? skillReattachProvider)
-        : this(extraToolsProvider, DefaultSessionFactory, null, skillReattachProvider)
+        Func<int, string>? skillReattachProvider,
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null)
+        : this(extraToolsProvider, DefaultSessionFactory, null, skillReattachProvider, grantedDirectoriesSource)
     {
     }
 
@@ -62,10 +63,12 @@ public sealed class AgentRunner : IDisposable
         Func<IReadOnlyList<ITool>>? extraToolsProvider,
         Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory,
         TimeProvider? timeProvider = null,
-        Func<int, string>? skillReattachProvider = null)
+        Func<int, string>? skillReattachProvider = null,
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null)
     {
         this.extraToolsProvider = extraToolsProvider;
         this.skillReattachProvider = skillReattachProvider;
+        this.grantedDirectoriesSource = grantedDirectoriesSource;
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -505,6 +508,8 @@ public sealed class AgentRunner : IDisposable
         ExtraTools = this.extraToolsProvider?.Invoke() ?? [],
         // Stable callback captured once at construction; null when no skill state is wired.
         SkillReattachContentProvider = this.skillReattachProvider,
+        // Stable factory captured at construction; null when no skill state is wired.
+        GrantedDirectoriesSource = this.grantedDirectoriesSource,
         InteractivePrompt = new TuiPermissionPrompt(context.Prompts, context.Events),
         UserQuestionPrompt = context.Prompts.IsInteractive
             ? new TuiUserQuestionPrompt(context.Prompts, context.Events)
