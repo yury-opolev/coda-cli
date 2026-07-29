@@ -305,8 +305,9 @@ public sealed class PluginCommand : ISlashCommand
         (bool ok, string message) result;
         if (IsGitUrl(source))
         {
-            result = await PluginInstaller.InstallFromGitAsync(userPluginsDir, source, ct)
+            var (installOk, installMsg, _) = await PluginInstaller.InstallFromGitAsync(userPluginsDir, source, null, ct)
                 .ConfigureAwait(false);
+            result = (installOk, installMsg);
         }
         else
         {

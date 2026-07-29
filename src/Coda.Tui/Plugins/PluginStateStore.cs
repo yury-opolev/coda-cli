@@ -195,10 +195,11 @@ public sealed class PluginStateStore
                     var source = infoObj["source"]?.GetValue<string>() ?? "local";
                     var gitUrl = infoObj["gitUrl"]?.GetValue<string>();
                     var commit = infoObj["commit"]?.GetValue<string>();
+                    var marketplace = infoObj["marketplace"]?.GetValue<string>();
                     DateTimeOffset.TryParse(infoObj["installedAt"]?.GetValue<string>(), out var installedAt);
 
                     doc.InstalledVersions[name] = new PluginInstallInfo(
-                        version, source, gitUrl, commit, installedAt);
+                        version, source, gitUrl, commit, installedAt, marketplace);
                 }
             }
 
@@ -261,6 +262,11 @@ public sealed class PluginStateStore
             if (info.Commit is not null)
             {
                 infoObj["commit"] = info.Commit;
+            }
+
+            if (info.Marketplace is not null)
+            {
+                infoObj["marketplace"] = info.Marketplace;
             }
 
             versionsObj[name] = infoObj;

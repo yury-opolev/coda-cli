@@ -34,7 +34,7 @@ public sealed class SkillPhase5ReviewFix_I1_AtomicRegistryTests
     }
 
     [Fact]
-    public void ReplaceAll_and_ListSorted_are_safe_under_concurrent_access()
+    public async Task ReplaceAll_and_ListSorted_are_safe_under_concurrent_access()
     {
         // Build two non-overlapping skill sets large enough to stress the old Clear + re-add path.
         var skills1 = Enumerable.Range(0, 40).Select(i => Phase5Helpers.Skill($"skill-a{i}")).ToList();
@@ -70,7 +70,7 @@ public sealed class SkillPhase5ReviewFix_I1_AtomicRegistryTests
             }
         }, CancellationToken.None);
 
-        Task.WaitAll([readerTask, writerTask], TimeSpan.FromSeconds(3));
+        await Task.WhenAll(readerTask, writerTask).WaitAsync(TimeSpan.FromSeconds(3));
         Assert.Empty(errors);
     }
 
@@ -211,7 +211,7 @@ public sealed class SkillPhase5ReviewFix_M2_ReloadAccuracyTests
         var commands = SkillCommandRegistrar.BuildSkillCommands([helpSkill, goodSkill], builtIns);
 
         // "help" is excluded → actual count is 1, not 2.
-        Assert.Equal(1, commands.Count);
+        Assert.Single(commands);
         Assert.DoesNotContain(commands, c => c.Name == "help");
         Assert.Contains(commands, c => c.Name == "my-skill");
     }
@@ -226,7 +226,7 @@ public sealed class SkillPhase5ReviewFix_M2_ReloadAccuracyTests
 
         var commands = SkillCommandRegistrar.BuildSkillCommands([invalidSkill, goodSkill], builtIns);
 
-        Assert.Equal(1, commands.Count);
+        Assert.Single(commands);
         Assert.Contains(commands, c => c.Name == "my-skill");
     }
 
@@ -285,7 +285,7 @@ public sealed class SkillPhase5ReviewFix_M3_SummaryMarkerTests
     {
         // A skill with no description used to produce a cell with only "◆ " — now it's empty.
         var cmd = new SkillSlashCommand(Phase5Helpers.Skill("my-skill", description: ""));
-        Assert.False(cmd.Summary.Contains(SkillSlashCommand.SkillMarker));
+        Assert.DoesNotContain(SkillSlashCommand.SkillMarker, cmd.Summary);
     }
 
     [Fact]

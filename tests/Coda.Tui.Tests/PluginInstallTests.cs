@@ -289,8 +289,8 @@ public sealed class PluginInstallerGitUrlTests
         var userPluginsDir = Path.Combine(Path.GetTempPath(), $"coda-git-dot-{Guid.NewGuid():N}");
         try
         {
-            var (ok, message) = await PluginInstaller.InstallFromGitAsync(
-                userPluginsDir, "https://example.com/.", CancellationToken.None);
+            var (ok, message, _) = await PluginInstaller.InstallFromGitAsync(
+                userPluginsDir, "https://example.com/.", null, CancellationToken.None);
 
             Assert.False(ok);
             Assert.Contains("valid plugin name", message, StringComparison.OrdinalIgnoreCase);
@@ -315,9 +315,10 @@ public sealed class PluginInstallerGitUrlTests
         var userPluginsDir = Path.Combine(Path.GetTempPath(), $"coda-git-test-{Guid.NewGuid():N}");
         try
         {
-            var (ok, _) = await PluginInstaller.InstallFromGitAsync(
+            var (ok, _, _) = await PluginInstaller.InstallFromGitAsync(
                 userPluginsDir,
                 "https://localhost:9/nonexistent-repo.git",
+                null,
                 CancellationToken.None);
 
             // We don't assert ok == false strictly here because the machine may or may not have

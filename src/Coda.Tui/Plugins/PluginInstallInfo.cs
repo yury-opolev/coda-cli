@@ -15,8 +15,16 @@ public sealed record PluginInstallInfo(
 
     /// <summary>
     /// The resolved commit SHA at install time; <see langword="null"/> when not recorded.
+    /// For marketplace installs with a pinned <c>sha</c> field this is the pinned SHA;
+    /// for git installs without a pin it is the resolved HEAD SHA at clone time.
     /// </summary>
     string? Commit,
 
     /// <summary>UTC timestamp of installation.</summary>
-    DateTimeOffset InstalledAt);
+    DateTimeOffset InstalledAt,
+
+    /// <summary>
+    /// The marketplace name the plugin was installed from, or <see langword="null"/>
+    /// when installed directly (not via a marketplace).
+    /// </summary>
+    string? Marketplace = null);
