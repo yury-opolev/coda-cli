@@ -28,11 +28,17 @@ public static class UiReducer
         PendingSteeringRecalledEvent e => RemovePendingSteering(state, e.QueueEntryIds),
         TranscriptSeededEvent e => state with { Transcript = e.Blocks },
 
-        AssistantTextDeltaEvent e => AppendOrExtendAssistant(state, e.Delta),
-        AssistantTextCompletedEvent => CompleteAssistant(state),
+        AssistantTextDeltaEvent e => state.AssistantBuffer is { } buf
+            ? state with { AssistantBuffer = buf + e.Delta }
+            : AppendOrExtendAssistant(state, e.Delta),
+        AssistantTextCompletedEvent => state.AssistantBuffer is not null ? state : CompleteAssistant(state),
 
-        ThinkingDeltaEvent e => AppendOrExtendThinking(state, e.Delta, e.BurstStartedAt),
-        ThinkingCompleteEvent e => CompleteThinking(state, e.ElapsedMs, e.ThinkingTokens),
+        ThinkingDeltaEvent e => state.AssistantBuffer is not null
+            ? state  // suppress thinking output during buffered turn
+            : AppendOrExtendThinking(state, e.Delta, e.BurstStartedAt),
+        ThinkingCompleteEvent e => state.AssistantBuffer is not null
+            ? state  // suppress thinking output during buffered turn
+            : CompleteThinking(state, e.ElapsedMs, e.ThinkingTokens),
 
         ToolQueuedEvent e => ReduceActivity(
             state,
@@ -61,7 +67,13 @@ public static class UiReducer
             activity => ToolActivityState.Complete(activity, identity, e.ToolName, e.Result, e.Status)),
         ToolActivityCompletedEvent e => FinalizeActivity(state, e.Summary),
 
-        UsageEvent e => state with { SessionUsage = state.SessionUsage.Add(e.Usage) },
+        UsageEvent e => state.AssistantBuffer is not null
+            ? state with
+            {
+                SessionUsage = state.SessionUsage.Add(e.Usage),
+                BufferedOutputTokens = state.BufferedOutputTokens + e.Usage.OutputTokens,
+            }
+            : state with { SessionUsage = state.SessionUsage.Add(e.Usage) },
         StopReasonEvent e => state with { StopReason = e.StopReason },
 
         CommandOutputEvent e => Append(state, new CommandOutputTranscriptBlock(Guid.NewGuid(), e.Text)),
@@ -136,9 +148,16 @@ public static class UiReducer
                 e.Snapshot.Servers.Count(s => s.Info is null)),
         },
 
-        TurnStartedEvent e => state with { ActiveOperation = new ActiveOperation("turn", e.Prompt, null) },
+        TurnStartedEvent e => HandleTurnStarted(state, e),
         TurnCompletedEvent e => HandleTurnCompleted(state, e.Success),
         TurnInterruptedEvent => HandleTurnInterrupted(state),
+
+        // When a display-mutating AgentResponse hook rewrites the response, replace the buffered
+        // text with the hook's DisplayContent so the final render uses the cleaned output. When
+        // buffering is off the text was already streamed to the transcript, so this is a no-op.
+        ResponseRewrittenEvent e => state.AssistantBuffer is not null
+            ? state with { AssistantBuffer = e.DisplayContent, BufferRewrittenByHook = true }
+            : state,
 
         UiPromptRequestedEvent e => state with { PendingPrompt = e.Request },
         UiPromptResponseSubmittedEvent e => state.PendingPrompt?.Id == e.RequestId
@@ -459,11 +478,25 @@ public static class UiReducer
     private static UiSessionSnapshot HandleTurnCompleted(UiSessionSnapshot state, bool success)
     {
         var finalized = FinalizeOpenThinking(state);
+        // On success the hook has already run and rewrote the buffer; plain flush is correct.
+        // On failure the hook may not have had a chance to run; withhold raw text if unrewritten.
+        finalized = success ? FlushAssistantBuffer(finalized) : FlushOrWithholdAssistantBuffer(finalized);
         return success
-            ? RemoveAllPendingSteering(finalized) with { ActiveOperation = null }
+            ? RemoveAllPendingSteering(finalized) with
+            {
+                ActiveOperation = null,
+                AssistantBuffer = null,
+                BufferingStartedAt = null,
+                BufferedOutputTokens = 0,
+                BufferRewrittenByHook = false,
+            }
             : finalized with
             {
                 ActiveOperation = null,
+                AssistantBuffer = null,
+                BufferingStartedAt = null,
+                BufferedOutputTokens = 0,
+                BufferRewrittenByHook = false,
                 Notification = new UiNotification("Turn failed", UiNotificationLevel.Error),
                 Transcript = RemoveAllPendingSteering(finalized).Transcript,
             };
@@ -472,13 +505,86 @@ public static class UiReducer
     private static UiSessionSnapshot HandleTurnInterrupted(UiSessionSnapshot state)
     {
         var finalized = FinalizeOpenThinking(state);
+        // When buffering is active and the hook never ran, withhold the raw buffer to prevent
+        // leaking a secret the redaction hook was meant to sanitise.
+        finalized = FlushOrWithholdAssistantBuffer(finalized);
         return finalized with
         {
             ActiveOperation = null,
+            AssistantBuffer = null,
+            BufferingStartedAt = null,
+            BufferedOutputTokens = 0,
+            BufferRewrittenByHook = false,
             Notification = new UiNotification("Turn interrupted", UiNotificationLevel.Warning),
             PendingPrompt = null,
             Transcript = RemoveAllPendingSteering(finalized).Transcript,
         };
+    }
+
+    /// <summary>
+    /// Starts a new turn. When <see cref="UiSessionSnapshot.BufferAssistantText"/> is true, activates
+    /// the buffered-display mode by setting <see cref="UiSessionSnapshot.AssistantBuffer"/> to an empty
+    /// string and recording the turn start time for the animated placeholder.
+    /// </summary>
+    private static UiSessionSnapshot HandleTurnStarted(UiSessionSnapshot state, TurnStartedEvent e)
+    {
+        var withOperation = state with { ActiveOperation = new ActiveOperation("turn", e.Prompt, null) };
+        if (!withOperation.BufferAssistantText)
+        {
+            return withOperation;
+        }
+
+        return withOperation with
+        {
+            AssistantBuffer = string.Empty,
+            BufferingStartedAt = e.StartedAt ?? DateTimeOffset.UtcNow,
+            BufferedOutputTokens = 0,
+            BufferRewrittenByHook = false,
+        };
+    }
+
+    /// <summary>
+    /// If a non-empty <see cref="UiSessionSnapshot.AssistantBuffer"/> is present, appends a completed
+    /// <see cref="AssistantTranscriptBlock"/> to the transcript. An empty buffer produces no block so a
+    /// turn that contained only tool activity (no assistant text) does not leave an empty block behind.
+    /// </summary>
+    private static UiSessionSnapshot FlushAssistantBuffer(UiSessionSnapshot state)
+    {
+        if (state.AssistantBuffer is not { Length: > 0 } buffered)
+        {
+            return state;
+        }
+
+        return Append(state, new AssistantTranscriptBlock(Guid.NewGuid(), buffered, Complete: true));
+    }
+
+    /// <summary>
+    /// The fixed notice shown when a buffered turn is interrupted or fails before the
+    /// <c>AgentResponse</c> redaction hook could run. Keeps the raw model text off the screen.
+    /// </summary>
+    internal const string InterruptionMarker = "[response withheld — interrupted before the redaction hook ran]";
+
+    /// <summary>
+    /// Used on interruption and error termination: if the buffer contains raw model text that the
+    /// redaction hook never inspected (<see cref="UiSessionSnapshot.BufferRewrittenByHook"/> is
+    /// <see langword="false"/>), appends a <see cref="NoticeTranscriptBlock"/> warning instead of
+    /// leaking the raw content. When the hook already ran and rewrote the buffer, delegates to
+    /// <see cref="FlushAssistantBuffer"/> so the hook's display content (including an empty string
+    /// that fully suppresses output) reaches the transcript normally.
+    /// </summary>
+    private static UiSessionSnapshot FlushOrWithholdAssistantBuffer(UiSessionSnapshot state)
+    {
+        if (state.AssistantBuffer is null)
+        {
+            return state;
+        }
+
+        if (!state.BufferRewrittenByHook && state.AssistantBuffer.Length > 0)
+        {
+            return Append(state, new NoticeTranscriptBlock(Guid.NewGuid(), InterruptionMarker, UiNotificationLevel.Warning));
+        }
+
+        return FlushAssistantBuffer(state);
     }
 
     /// <summary>

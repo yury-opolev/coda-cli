@@ -17,6 +17,7 @@ public sealed class AgentSinkCompatibilityTests
         public void OnToolProgress(string toolName, long elapsedMs) => this.ToolProgresses++;
         public void OnToolResult(string toolName, ToolResult result) => this.ToolResults++;
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     [Fact]

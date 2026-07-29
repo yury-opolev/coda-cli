@@ -58,10 +58,10 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             lspDiagnostics,
             toolSearch,
             NullLoggerFactory.Instance,
-            (_, _, _) =>
+            (_, _, _, _, _) =>
             {
                 Interlocked.Increment(ref this.compactCalls);
-                return Task.CompletedTask;
+                return Task.FromResult(true);
             },
             scheduleRuntimeProvider ?? (() => null));
     }
@@ -75,6 +75,16 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         }
 
         public IReadOnlyList<ScheduleRuntimeSnapshot> GetSnapshot() => [];
+    }
+
+    private sealed class NullSink : IAgentSink
+    {
+        public void OnAssistantText(string delta) { }
+        public void OnAssistantTextComplete() { }
+        public void OnToolCall(string toolName, string inputJson) { }
+        public void OnToolResult(string toolName, ToolResult result) { }
+        public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private SessionOptions Options(
@@ -106,7 +116,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: true),
             this.Client(),
             CodaSettings.Empty);
-        Assert.IsType<LiveBypassClassifierPermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<LiveBypassClassifierPermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
@@ -117,7 +128,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
             this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: false),
             this.Client(),
             CodaSettings.Empty);
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
@@ -125,7 +137,8 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     {
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     // ---- Permissions: rules on/off (allow-only, deny-only, both, none) ----
@@ -149,11 +162,30 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     }
 
     [Fact]
-    public void No_rules_leave_the_base_prompt_unwrapped()
+    public void No_rules_always_wraps_with_rules_prompt()
     {
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
-        Assert.IsNotType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+    }
+
+    [Fact]
+    public void No_initial_rules_store_is_live_and_takes_effect_when_rules_added_mid_session()
+    {
+        // Regression: when no rules are pre-configured, the store must still be the live source of
+        // truth so a PermissionRequest hook can add a deny rule that takes effect on the next call.
+        var builder = this.NewBuilder();
+        var spec = builder.BuildSpec(this.Options(), this.Client(), CodaSettings.Empty);
+
+        // Store starts empty.
+        Assert.NotNull(spec.PermissionRules);
+        Assert.Null(spec.PermissionRules!.FindMatchedRule("danger", "{}"));
+
+        // Hook adds a deny rule mid-session.
+        spec.PermissionRules.AddDeny([PermissionRule.Parse("danger")]);
+
+        // The deny is now reflected by the live RulesPermissionPrompt.
+        Assert.Equal("deny:danger", spec.PermissionRules.FindMatchedRule("danger", "{}"));
     }
 
     // ---- Goal on/off ----
@@ -174,7 +206,7 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         var builder = this.NewBuilder();
         var spec = builder.BuildSpec(this.Options(goal: "ship it"), this.Client(), CodaSettings.Empty);
 
-        await spec.CompactAsync!([], CancellationToken.None);
+        await spec.CompactAsync!([], new NullSink(), CancellationToken.None);
 
         Assert.Equal(1, this.compactCalls);
     }
@@ -322,6 +354,43 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         Assert.Null(spec.UserHooks);
     }
 
+    [Fact]
+    public void BuildSpec_http_handler_is_wired_when_http_hooks_present()
+    {
+        // I2: verify the http handler is constructed and injected into HookBus.
+        var builder = this.NewBuilder();
+        var settings = new CodaSettings([], [], [
+            new UserHook("PreToolUse", null, HandlerType: "http", Url: "https://policy.example.com/check"),
+        ]) { HttpHookAllowlist = ["policy.example.com"] };
+
+        var spec = builder.BuildSpec(this.Options(), this.Client(), settings);
+
+        Assert.NotNull(spec.UserHooks);
+        var bus = spec.UserHooks!.BusForTest;
+        Assert.IsType<HttpHookHandler>(bus.HttpHandlerForTest);
+    }
+
+    [Fact]
+    public void BuildSpec_agent_handler_subagent_host_is_hook_free_by_construction()
+    {
+        // I2 + recursion invariant: the agent handler's SubagentHost must have userHooks: null
+        // so hook-spawned subagents are structurally hook-free. Impossible by construction,
+        // not by assertion.
+        var builder = this.NewBuilder();
+        var settings = new CodaSettings([], [], [
+            new UserHook("PreToolUse", null, HandlerType: "agent", HookPrompt: "Review this"),
+        ]);
+
+        var spec = builder.BuildSpec(this.Options(), this.Client(), settings);
+
+        Assert.NotNull(spec.UserHooks);
+        var bus = spec.UserHooks!.BusForTest;
+        var agentHandler = Assert.IsType<AgentHookHandler>(bus.AgentHandlerForTest);
+        var host = Assert.IsType<SubagentHost>(agentHandler.SubagentHostForTest);
+        Assert.True(host.IsHookFree,
+            "The SubagentHost given to AgentHookHandler must be hook-free (userHooks: null).");
+    }
+
     // ---- Stable collaborators threaded straight through ----
 
     [Fact]
@@ -421,22 +490,22 @@ public sealed class TurnPipelineBuilderTests : IDisposable
     {
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             null!, new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), null!, new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), null!, null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, () => null));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            null!, (_, _, _) => Task.CompletedTask, () => null));
+            null!, (_, _, _, _, _) => Task.FromResult(true), () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
             NullLoggerFactory.Instance, null!, () => null));
         Assert.Throws<ArgumentNullException>(() => new TurnPipelineBuilder(
             new TodoStore(), new ScheduledTaskStore(), new TaskManager(sessionId: "t", logRoot: null), null, null, null,
-            NullLoggerFactory.Instance, (_, _, _) => Task.CompletedTask, null!));
+            NullLoggerFactory.Instance, (_, _, _, _, _) => Task.FromResult(true), null!));
     }
 
     [Fact]

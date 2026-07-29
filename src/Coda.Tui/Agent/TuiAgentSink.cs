@@ -99,4 +99,41 @@ public sealed class TuiAgentSink : IAgentSink
         this.publisher.Publish(new SteeringDeliveredEvent(ids));
 
     public void OnError(string message) => this.publisher.Publish(new AgentErrorEvent(message));
+
+    public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+        this.publisher.Publish(new PromptRewrittenEvent(hookCommand, originalPrompt, modifiedPrompt));
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
+        this.publisher.Publish(new ResponseRewrittenEvent(hookCommand, originalResponse, displayContent, modifiedResponse));
+
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+        this.publisher.Publish(new ToolInputModifiedEvent(hookCommand, toolName, originalInput, modifiedInput));
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+        this.publisher.Publish(new ToolResultModifiedEvent(hookCommand, toolName, originalResult, modifiedResult));
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+        this.publisher.Publish(new PermissionDecidedEvent(hookCommand, toolName, decision));
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny) =>
+        this.publisher.Publish(new PermissionsUpdatedEvent(hookCommand, modeApplied, addedAllow, addedDeny));
+
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.publisher.Publish(new SubagentBlockedEvent(hookCommand, taskId, reason));
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.publisher.Publish(new SubagentResultModifiedEvent(hookCommand, taskId, originalResult, modifiedResult));
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.publisher.Publish(new CompactionCancelledUiEvent(hookCommand, trigger));
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.publisher.Publish(new PostCompactContextInjectedEvent(additionalContext));
+
+    /// <summary>Publishes a <see cref="WarningEvent"/> for advisory user-visible warnings.</summary>
+    public void OnWarning(string message) => this.publisher.Publish(new WarningEvent(message));
 }

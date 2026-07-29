@@ -3,6 +3,7 @@ using Coda.Agent.BackgroundTasks;
 using Coda.Agent.Tasks;
 using Coda.Agent.Compaction;
 using Coda.Agent.Goals;
+using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
@@ -13,6 +14,7 @@ using Coda.Common;
 using Coda.Sdk.Telemetry;
 using Coda.Sdk.Turns;
 using LlmAuth;
+using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
 using Microsoft.Extensions.Logging;
 
@@ -58,8 +60,67 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly ILogger logger;
     private readonly TurnPipelineBuilder turnPipelineBuilder;
     private readonly SteeringInbox steeringInbox = new();
+    /// <summary>
+    /// Test seam: when non-null, overrides the <see cref="UserHookRunner"/> produced by
+    /// <see cref="Turns.TurnPipelineBuilder"/> so unit tests can inject controlled hook behaviour
+    /// without spawning real processes or writing settings to disk. Null in production.
+    /// </summary>
+    private readonly UserHookRunner? userHookRunnerOverride;
+    private readonly List<UserHook> configuredHooks;
+    private readonly HookRunLog hookRunLog;
+    private readonly HookTrustGuard? trustGuard;
+    /// <summary>
+    /// Test seam: executor override forwarded to <see cref="sessionHookRunner"/> at construction.
+    /// Null in production (real <see cref="ShellHookExecutor"/> is used).
+    /// </summary>
+    private readonly Func<string, string, CancellationToken, Task<(int, string)>>? sessionExecOverride;
+    /// <summary>
+    /// Test seam: prompt handler override forwarded to <see cref="sessionHookRunner"/> at construction.
+    /// Null in production (real handler is wired in <see cref="RebuildSessionRunnerWithHandlers"/>).
+    /// </summary>
+    private readonly IHookHandler? sessionPromptHandlerOverride;
+    /// <summary>
+    /// Set to <see langword="true"/> once <see cref="RebuildSessionRunnerWithHandlers"/> has been
+    /// called so the upgrade runs at most once per session lifetime.
+    /// </summary>
+    private bool sessionRunnerHandlersUpgraded
+    {
+        get => this.sessionHooks.HandlersUpgraded;
+        set => this.sessionHooks.HandlersUpgraded = value;
+    }
+
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
+
+    // Prompt-cache hygiene tracking (Phase 2/3).
+    private string? lastResolvedSystemPrompt;
+    private int turnsWithZeroCacheActivity;
+    private bool cacheZeroActivityWarned;
+
+    /// <summary>
+    /// Number of consecutive turns with zero cache activity before a one-time warning is emitted.
+    /// Three turns is enough to rule out a first-turn cold-start write without false positives.
+    /// </summary>
+    public const int ZeroActivityWarnAfterTurns = 3;
+
+    /// <summary>
+    /// The session-level hook concern: the session hook runner, the SessionStart / SessionEnd /
+    /// Notification firings, and the session-scoped application of the SessionStart outputs.
+    /// </summary>
+    private readonly SessionLifecycleHooks sessionHooks;
+
+    /// <summary>Shorthand for the session hook runner owned by <see cref="sessionHooks"/>.</summary>
+    private UserHookRunner? sessionHookRunner
+    {
+        get => this.sessionHooks.Runner;
+        set => this.sessionHooks.Runner = value;
+    }
+
+    // Compaction hook runner (Phase 5). Set to loopSpec.UserHooks before each RunAsync turn so
+    // CompactHistoryAsync (called both pre-turn and by TurnPipelineBuilder's in-loop delegate)
+    // can fire Pre/PostCompact hooks. Shared single field; no race because RunAsync is not
+    // re-entrant (one user turn at a time).
+    private UserHookRunner? compactionHooks;
 
     // Reused across the incremental "record on the go" saves so the store's createdUtc cache
     // survives between turns (a fresh store per call would re-read the file every save).
@@ -86,7 +147,14 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         ILlmClientFactory? llmClientFactory = null,
         IAgentLoopFactory? agentLoopFactory = null,
         Func<SessionOptions>? currentOptionsProvider = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        UserHookRunner? userHookRunnerOverride = null,
+        HookTrustGuard? trustGuard = null,
+        HookRunLog? runLog = null,
+        IReadOnlyList<UserHook>? hookList = null,
+        Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null,
+        Func<string, string, CancellationToken, Task<(int, string)>>? sessionExecOverride = null,
+        Coda.Agent.Hooks.IHookHandler? sessionPromptHandlerOverride = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
@@ -98,8 +166,18 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // construction snapshot), so a mid-session model/effort/tool/permission change is picked up.
         this.currentOptionsProvider = currentOptionsProvider ?? (() => this.Options);
         this.timeProvider = timeProvider ?? TimeProvider.System;
+        this.userHookRunnerOverride = userHookRunnerOverride;
         this.history = history ?? [];
         this.SessionId = sessionId ?? SessionIds.NewId();
+        this.trustGuard = trustGuard;
+        this.hookRunLog = runLog ?? new HookRunLog();
+        this.sessionExecOverride = sessionExecOverride;
+        this.sessionPromptHandlerOverride = sessionPromptHandlerOverride;
+        this.sessionHooks = new SessionLifecycleHooks(this.SessionId);
+        if (options.SessionSource is { } src)
+        {
+            this.sessionHooks.Source = src;
+        }
         // The manager groups persistent task logs under the session id captured HERE. If the id
         // is later adopted (AdoptSessionId/Resume), the manager keeps this original grouping so
         // active task logs are never moved out from under open writers — see AdoptSessionId.
@@ -124,6 +202,12 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // Plugin keys are namespaced (plugin:<name>:<server>) so clashes with settings keys are rare;
         // settings always win on exact-key clashes.
         var settings = SettingsLoader.Load(options.WorkingDirectory);
+        // Use caller-provided hook list when available (supports /hooks enable/disable and
+        // the shared run log). Preserve the mutable-list contract: when the caller already
+        // gave us a List<UserHook>, reuse it so HookManagementService.SetEnabled mutations
+        // are visible inside this session. Otherwise copy. Falls back to settings hooks.
+        this.configuredHooks = (hookList as List<UserHook>)
+            ?? (hookList is not null ? new List<UserHook>(hookList) : new List<UserHook>(settings.Hooks));
 
         var userCodaPluginsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -173,6 +257,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.loggerFactory = loggerSetup.Factory;
         this.LogFilePath = loggerSetup.LogFilePath;
         this.logger = this.loggerFactory.CreateLogger("Coda.Session");
+        this.sessionHooks.Logger = this.loggerFactory.CreateLogger("Coda.Session.Hooks");
 
         // The schedules store was constructed above, before the logger factory existed (telemetry
         // is built last to avoid leaking a file handle on a wiring failure). Wire its logger now so
@@ -189,14 +274,61 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.lspDiagnostics,
             this.toolSearchCoordinator,
             this.loggerFactory,
-            this.CompactHistoryAsync,
+            // Wrap the 5-param method into the expected delegate signature.
+            (client, model, trigger, sink, ct) => this.CompactHistoryAsync(client, model, trigger, sink, ct),
             // Evaluated per turn, so once InitializeAsync starts the runtime the main schedule_list
             // sees the live view; it returns null before initialization and when scheduling is off.
-            () => this.scheduleRuntime);
+            () => this.scheduleRuntime,
+            sessionHookList: this.configuredHooks,
+            runLog: this.hookRunLog,
+            trustGuard: this.trustGuard,
+            subagentRegistry: subagentRegistry);
 
         this.logger.LogInformation(
             "Session {sessionId} started: provider {provider}, model {model}",
             this.SessionId, options.ProviderId, options.Model);
+
+        // Session-level hook runner for SessionStart / SessionEnd / Notification / Pre/PostCompact.
+        // Built for any configured hook so that compaction hooks (not session-lifecycle events)
+        // are also wired here — the old `hasSessionLevelHooks` guard was the IMPORTANT-1 bug.
+        // In tests, userHookRunnerOverride serves as both the per-turn and session-level runner;
+        // sessionExecOverride / sessionPromptHandlerOverride are minimal seams that inject only
+        // the executor or prompt handler without replacing the whole runner.
+        if (userHookRunnerOverride is not null)
+        {
+            this.sessionHookRunner = userHookRunnerOverride;
+            this.sessionRunnerHandlersUpgraded = true; // override already has whatever it needs
+        }
+        else if (this.configuredHooks.Count > 0)
+        {
+            // Build the session runner immediately with the available handlers.
+            // Prompt/agent handlers need an LLM client and are added later via
+            // RebuildSessionRunnerWithHandlers (called from RunAsync and CompactAsync).
+            // sessionPromptHandlerOverride lets tests inject a fake handler right now
+            // without needing the upgrade path.
+            var sessionHttpHandler = new Coda.Agent.Hooks.HttpHookHandler(
+                httpClient: null,
+                settings.HttpHookAllowlist,
+                logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
+            this.sessionHookRunner = new UserHookRunner(
+                this.configuredHooks,
+                execOverride: this.sessionExecOverride,
+                context: new HookContext(this.SessionId, options.WorkingDirectory),
+                logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
+                httpHandler: sessionHttpHandler,
+                promptHandler: this.sessionPromptHandlerOverride,
+                trustGuard: this.trustGuard,
+                runLog: this.hookRunLog);
+            // Mark upgraded only when the test seam already provided the prompt handler.
+            this.sessionRunnerHandlersUpgraded = this.sessionPromptHandlerOverride is not null;
+        }
+
+        // Wire task-complete notifications for background tasks. Scoped to the session lifetime
+        // so a late completion cannot spawn a hook subprocess after teardown has begun.
+        if (this.sessionHookRunner?.HasNotification == true)
+        {
+            this.tasks.NotificationCallback = this.sessionHooks.RunTaskNotificationAsync;
+        }
     }
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "transcript persistence failed (best-effort); the turn is unaffected: session={sessionId}")]
@@ -219,6 +351,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     /// <summary>The active telemetry log file, or null when telemetry is disabled.</summary>
     public string? LogFilePath { get; }
+
+    /// <summary>
+    /// The merged (user + project) list of hooks loaded from settings at construction time,
+    /// with scope and enabled annotations applied. Empty when no hooks are configured.
+    /// Exposed so the serve layer can enumerate hooks without direct access to the settings file.
+    /// </summary>
+    public IReadOnlyList<UserHook> ConfiguredHooks => this.configuredHooks;
 
     private volatile SessionOptions options;
 
@@ -301,6 +440,28 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     public void Reset() => this.history.Clear();
 
     /// <summary>
+    /// Sets the reason reported in the <c>SessionEnd</c> hook payload. Call this before
+    /// dispose when the exit is not a normal <c>/exit</c> — e.g. <c>"interrupt"</c> for
+    /// keyboard interrupt, <c>"error"</c> for an unrecoverable error, or <c>"shutdown"</c>
+    /// for a process-exit signal. The default is <c>"exit"</c>.
+    /// </summary>
+    public void SetSessionEndReason(string reason)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(reason);
+        this.sessionHooks.EndReason = reason;
+    }
+
+    /// <summary>
+    /// Fires the <c>SessionEnd</c> hook immediately (bounded by the 2 s deadline) without
+    /// waiting for the full <see cref="DisposeAsync"/>. Safe to call before or instead of
+    /// <see cref="Dispose"/>/<see cref="DisposeAsync"/>: the idempotency guard in
+    /// <see cref="FireSessionEndOnceAsync"/> ensures the hook fires at most once regardless
+    /// of the call order. Intended for the process-exit path where the runtime may be shut
+    /// down before the main-thread <c>using</c> block unwinds.
+    /// </summary>
+    public Task TriggerSessionEndAsync() => this.FireSessionEndOnceAsync();
+
+    /// <summary>
     /// Replace the conversation with a persisted transcript and adopt its id, so subsequent
     /// transcript saves target the same file. Used to resume a session in a fresh process.
     /// </summary>
@@ -317,7 +478,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(messages);
         ArgumentNullException.ThrowIfNull(metadata);
 
+        this.sessionHooks.MarkResumed(this.SessionId);
         this.SessionId = sessionId;
+        this.sessionHooks.SessionId = sessionId;
         this.history.Clear();
         this.history.AddRange(messages);
         this.Options = this.Options with
@@ -385,6 +548,61 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // A previous natural turn seals its inbox. Reopen before publishing the next loop spec,
         // without dropping a steer that raced a serve host's transition into this turn.
         this.steeringInbox.OpenForTurn();
+
+        // Upgrade the session runner with prompt/agent handlers before SessionStart fires.
+        // Best-effort: if the client cannot be created the runner stays as-is (prompt hooks will
+        // log "handler not configured" and fail-open, which is acceptable).
+        if (this.sessionHookRunner is not null && !this.sessionRunnerHandlersUpgraded && this.userHookRunnerOverride is null)
+        {
+            try
+            {
+                var earlyOpts = this.ResolveEffectiveOptions();
+                var earlyClient = this.llmClientFactory.Create(
+                    earlyOpts.ProviderId, this.credentials, this.fingerprint, this.http,
+                    this.loggerFactory, earlyOpts.LlmHttpTimeoutOverride, this.StreamProgressSink);
+                if (earlyClient is not null)
+                {
+                    var earlySettings = Coda.Agent.Settings.SettingsLoader.Load(earlyOpts.WorkingDirectory);
+                    this.RebuildSessionRunnerWithHandlers(earlyClient, earlySettings, earlyOpts);
+                    this.sessionRunnerHandlersUpgraded = true;
+                }
+            }
+            catch
+            {
+                // Best-effort: proceed with the partially-wired runner.
+            }
+        }
+
+        // Idempotent SessionStart hook: fires once regardless of whether InitializeAsync was called
+        // explicitly (composition sites) or skipped (headless callers). Does NOT start the schedule
+        // runtime or LSP — those require an explicit InitializeAsync call.
+        await this.ApplySessionStartHookAsync(cancellationToken).ConfigureAwait(false);
+
+        // Inject additionalContext from SessionStart exactly once, before the first user turn.
+        if (this.sessionHooks.TakeAdditionalContextOnce() is { } addCtx)
+        {
+            this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(addCtx)]));
+        }
+
+        // Run the initial user message from SessionStart before the real user's turn.
+        // The pending message is cleared atomically to guard against re-entry.
+        var initialMsg = this.sessionHooks.TakeInitialUserMessage();
+        if (initialMsg is not null)
+        {
+            try
+            {
+                await this.RunAsync([new TextBlock(initialMsg)], sink, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // A failing initial-message turn is non-fatal; proceed with the real user's turn.
+            }
+        }
+
         var rootToolActivity = ToolActivityContext.CreateRoot();
         var recording = new RecordingSink(sink);
         ToolActivitySummary? completedToolActivity = null;
@@ -435,6 +653,22 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 Gate = this.ExecutionGate,
                 ToolActivity = rootToolActivity,
             };
+            // Wire per-turn cache-hygiene and 1h-TTL state into the loop options.
+            loopSpec = loopSpec with
+            {
+                Options = loopSpec.Options with
+                {
+                    PreviousSystemPrompt = this.lastResolvedSystemPrompt,
+                    UseOnehourTtl = settings.CacheUse1hTtl,
+                },
+            };
+            // lastResolvedSystemPrompt is updated AFTER turnShape is finalized (inside the execution
+            // gate block, after session-level appends are merged) so it captures base + append.
+            // Test seam: override the settings-derived hook runner when injected. Null in production.
+            if (this.userHookRunnerOverride is not null)
+            {
+                loopSpec = loopSpec with { UserHooks = this.userHookRunnerOverride };
+            }
             loop = this.agentLoopFactory.Create(loopSpec);
         }
         catch
@@ -458,22 +692,143 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             // cancel — if the turn ends before offering a boundary the gate still reports "reached".
             using (this.ExecutionGate.BeginExecution())
             {
+                // Set the compaction hook runner from the turn's loopSpec (which already applies
+                // the test-seam override). CompactHistoryAsync reads this field so both the pre-turn
+                // path (here) and the in-loop delegate (TurnPipelineBuilder) share the same runner.
+                this.compactionHooks = loopSpec.UserHooks;
+
                 if (options.AutoCompactTokenThreshold > 0
                     && this.history.Count > 0
                     && TokenEstimator.Estimate(this.history) > options.AutoCompactTokenThreshold)
                 {
-                    await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
+                    var didCompact = await this.CompactHistoryAsync(client, options.Model, "auto", recording, cancellationToken).ConfigureAwait(false);
+
+                    // After pre-turn compaction, re-inject any skill bodies that were previously
+                    // loaded so the model does not silently lose its skills after compaction.
+                    // PostCompact additionalContext was already injected inside CompactHistoryAsync.
+                    // Order: PostCompact context first (inside CompactHistoryAsync), then skill
+                    // re-attach here — skill bodies are closest to the model's next turn.
+                    if (didCompact)
+                    {
+                        var reattachContent = options.SkillReattachContentProvider?.Invoke(options.AutoCompactTokenThreshold);
+                        if (!string.IsNullOrEmpty(reattachContent))
+                        {
+                            // Skip if adding reattach would bring history back up to the threshold,
+                            // which would trigger compaction again on the next iteration.
+                            var postCompactTokens = TokenEstimator.Estimate(this.history);
+                            var reattachTokenEstimate = reattachContent.Length / 4;
+                            var wouldExceedThreshold = postCompactTokens + reattachTokenEstimate >= options.AutoCompactTokenThreshold;
+
+                            // Skip if reattach is already the trailing message (exactly-once guard).
+                            var alreadyLastMessage = this.history.Count > 0
+                                && this.history[^1].Role == ChatRole.User
+                                && this.history[^1].Content is [TextBlock tbLast]
+                                && tbLast.Text == reattachContent;
+
+                            if (!wouldExceedThreshold && !alreadyLastMessage)
+                            {
+                                this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(reattachContent)]));
+                            }
+                        }
+                    }
                 }
 
                 snapshot = this.history.Count;
-                this.history.Add(new ChatMessage(ChatRole.User, userContent));
 
-                await loop.RunAsync(this.history, recording, cancellationToken).ConfigureAwait(false);
+                // USER PROMPT SUBMIT HOOK GATE: fires before the message is appended to history
+                // (§10 Phase 1 of the agent-hooks proposal). A fail-closed hook that blocks must
+                // prevent both the append and the loop, returning a clean non-exceptional RunResult.
+                TurnShape? turnShape = null;
+                var effectiveContent = userContent;
+
+                if (loopSpec.UserHooks is { } submitHooks && submitHooks.HasUserPromptSubmit)
+                {
+                    var originalPrompt = ExtractPromptText(userContent);
+                    var submitResult = await submitHooks.RunUserPromptSubmitAsync(
+                        originalPrompt,
+                        ExtractAttachmentKinds(userContent),
+                        this.history.Count,
+                        options.Model,
+                        PermissionModeToString(options.PermissionMode),
+                        cancellationToken).ConfigureAwait(false);
+
+                    if (submitResult.Block)
+                    {
+                        return new RunResult(false, string.Empty, [], null, submitResult.Reason ?? "blocked by hook")
+                        {
+                            RootTurnId = rootToolActivity.RootTurnId,
+                            ToolActivity = CompleteToolActivity(interrupted: false),
+                        };
+                    }
+
+                    if (submitResult.ModifiedPrompt is not null)
+                    {
+                        recording.OnPromptRewritten(
+                            submitResult.ModifiedByHookCommand ?? string.Empty,
+                            originalPrompt,
+                            submitResult.ModifiedPrompt);
+                        effectiveContent = ReplacePromptText(userContent, submitResult.ModifiedPrompt);
+                    }
+
+                    turnShape = submitResult.Shape;
+
+                    this.history.Add(new ChatMessage(ChatRole.User, effectiveContent));
+
+                    // additionalContext: a separate synthetic user message appended after the
+                    // main user message (not merged into it — mirrors the LSP diagnostics seam).
+                    if (submitResult.AdditionalContext is not null)
+                    {
+                        this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(submitResult.AdditionalContext)]));
+                    }
+                }
+                else
+                {
+                    this.history.Add(new ChatMessage(ChatRole.User, userContent));
+                }
+
+                // Merge session-level appendSystemPrompt from SessionStart into the turn shape.
+                // Session append (the "base") comes first; per-turn append follows.
+                turnShape = this.sessionHooks.ComposeAppendSystemPrompt(turnShape);
+
+                // M3: store the fully-resolved system prompt (base + any appends) so the next
+                // turn receives it as PreviousSystemPrompt and can compare like-for-like.
+                this.lastResolvedSystemPrompt = ResolveSystemPrompt(loopSpec.Options.SystemPrompt, turnShape);
+
+                await loop.RunAsync(this.history, recording, cancellationToken, turnShape).ConfigureAwait(false);
             }
 
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
             await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
+            this.sessionHooks.RecordTurn();
+
+            // Zero-counters warning: if both cache counters have been zero for several turns in a
+            // row the prefix is likely below the per-model minimum and cache is silently inactive.
+            // Emit once per session so the user has a chance to notice without repeated noise.
+            // Skipped for the Copilot provider: it does not report cache counters, so HasCacheActivity
+            // is permanently false and would fire a spurious warning on every Copilot session.
+            if (!this.cacheZeroActivityWarned
+                && !string.Equals(options.ProviderId, GitHubCopilotProvider.Id, StringComparison.Ordinal))
+            {
+                if (recording.Usage.HasCacheActivity)
+                {
+                    this.turnsWithZeroCacheActivity = 0;
+                }
+                else
+                {
+                    this.turnsWithZeroCacheActivity++;
+                    if (this.turnsWithZeroCacheActivity >= ZeroActivityWarnAfterTurns)
+                    {
+                        this.cacheZeroActivityWarned = true;
+                        sink?.OnWarning(
+                            "Prompt cache appears inactive: both cache read and write counters " +
+                            "have been zero for several consecutive turns. " +
+                            "The prefix may be below the per-model minimum size.");
+                    }
+                }
+            }
+
+            this.FireIdleNotificationBackground();
             var toolActivity = CompleteToolActivity(interrupted: false);
             return new RunResult(true, recording.FinalText, recording.ToolCalls, recording.StopReason, null)
             {
@@ -548,7 +903,20 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             return;
         }
 
-        await this.CompactHistoryAsync(client, options.Model, cancellationToken).ConfigureAwait(false);
+        // Upgrade session runner with prompt/agent handlers now that we have a client.
+        // This is the manual /compact path; RunAsync may not have been called yet.
+        if (this.sessionHookRunner is not null && !this.sessionRunnerHandlersUpgraded && this.userHookRunnerOverride is null)
+        {
+            var compactSettings = Coda.Agent.Settings.SettingsLoader.Load(options.WorkingDirectory);
+            this.RebuildSessionRunnerWithHandlers(client, compactSettings, options);
+            this.sessionRunnerHandlersUpgraded = true;
+        }
+
+        // For the manual /compact path, use the session hook runner (same as the per-turn runner
+        // for hooks that apply to the full session). The compactionHooks field may not be set yet
+        // if /compact is called before the first RunAsync turn.
+        this.compactionHooks = this.userHookRunnerOverride ?? this.sessionHookRunner;
+        await this.CompactHistoryAsync(client, options.Model, "manual", null, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>The nominal context window used for the /context breakdown and percentage.</summary>
@@ -753,20 +1121,172 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         return (int)(toolChars / 4);
     }
 
-    private async Task CompactHistoryAsync(ILlmClient client, string model, CancellationToken cancellationToken)
+    private async Task<bool> CompactHistoryAsync(
+        ILlmClient client,
+        string model,
+        string trigger,
+        IAgentSink? sink,
+        CancellationToken cancellationToken)
     {
         if (this.history.Count == 0)
+        {
+            return false;
+        }
+
+        var hooks = this.compactionHooks;
+        var tokensBefore = TokenEstimator.Estimate(this.history);
+        var messageCount = this.history.Count;
+
+        // PreCompact hook: fail-open, but a "block" decision cancels this compaction attempt.
+        // The caller must not immediately retry — the next trigger (auto threshold or /compact)
+        // offers a fresh chance.
+        if (hooks is { HasPreCompact: true })
+        {
+            PreCompactResult preResult;
+            try
+            {
+                preResult = await hooks.RunPreCompactAsync(
+                    trigger,
+                    tokensBefore,
+                    messageCount,
+                    instructions: null,
+                    depth: 0,
+                    taskId: null,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch
+            {
+                // Fail-open: a broken hook lets compaction proceed.
+                preResult = PreCompactResult.Allow;
+            }
+
+            if (preResult.Block)
+            {
+                sink?.OnCompactionCancelled(preResult.ByHookCommand ?? string.Empty, trigger);
+                return false; // compaction cancelled by hook
+            }
+
+            // Run compaction with possible instructions override.
+            var service = new CompactionService(new ForkedAgentRunner(client, model));
+            var (compacted, summary) = await service.CompactAsync(
+                this.history,
+                preResult.Instructions,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!ReferenceEquals(compacted, this.history))
+            {
+                this.history.Clear();
+                this.history.AddRange(compacted);
+
+                // PostCompact hook: injects additional context before skill re-attachment.
+                // Order: PostCompact context first, then skill re-attach — so skill bodies
+                // are closest to the model's next turn (deterministic, documented ordering).
+                if (hooks is { HasPostCompact: true } && summary is not null)
+                {
+                    await this.ApplyPostCompactHookAsync(
+                        tokensBefore,
+                        messageCount,
+                        summary,
+                        hooks,
+                        sink,
+                        cancellationToken).ConfigureAwait(false);
+                }
+            }
+
+            return !ReferenceEquals(compacted, this.history) || compacted.Count < messageCount;
+        }
+        else
+        {
+            // No PreCompact hooks: run compaction directly.
+            var service = new CompactionService(new ForkedAgentRunner(client, model));
+            var (compacted, summary) = await service.CompactAsync(
+                this.history,
+                instructionsOverride: null,
+                cancellationToken).ConfigureAwait(false);
+
+            if (!ReferenceEquals(compacted, this.history))
+            {
+                this.history.Clear();
+                this.history.AddRange(compacted);
+
+                if (hooks is { HasPostCompact: true } && summary is not null)
+                {
+                    await this.ApplyPostCompactHookAsync(
+                        tokensBefore,
+                        messageCount,
+                        summary,
+                        hooks,
+                        sink,
+                        cancellationToken).ConfigureAwait(false);
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Fires the <c>PostCompact</c> hook and injects <c>additionalContext</c> into history when
+    /// present. The injection is budget-guarded: if adding the context would bring the token count
+    /// back up to or beyond the compaction threshold, the injection is skipped so compaction is not
+    /// immediately undone. Exactly-once: the check is inside <see cref="CompactHistoryAsync"/>.
+    /// </summary>
+    private async Task ApplyPostCompactHookAsync(
+        int tokensBefore,
+        int messageCount,
+        string summary,
+        UserHookRunner hooks,
+        IAgentSink? sink,
+        CancellationToken cancellationToken)
+    {
+        var tokensAfter = TokenEstimator.Estimate(this.history);
+        PostCompactResult postResult;
+        try
+        {
+            postResult = await hooks.RunPostCompactAsync(
+                tokensBefore,
+                tokensAfter,
+                messageCount,
+                summary,
+                depth: 0,
+                taskId: null,
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException)
+        {
+            throw;
+        }
+        catch
+        {
+            // Fail-open: a broken PostCompact hook leaves history unchanged.
+            return;
+        }
+
+        if (string.IsNullOrEmpty(postResult.AdditionalContext))
         {
             return;
         }
 
-        var service = new CompactionService(new ForkedAgentRunner(client, model));
-        var compacted = await service.CompactAsync(this.history, cancellationToken).ConfigureAwait(false);
-        if (!ReferenceEquals(compacted, this.history))
+        // Budget guard: re-injecting more than compaction freed defeats the compaction.
+        var options = this.ResolveEffectiveOptions();
+        var threshold = options.AutoCompactTokenThreshold;
+        if (threshold > 0)
         {
-            this.history.Clear();
-            this.history.AddRange(compacted);
+            var contextTokens = postResult.AdditionalContext.Length / 4;
+            if (tokensAfter + contextTokens >= threshold)
+            {
+                return;
+            }
         }
+
+        this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(postResult.AdditionalContext)]));
+        sink?.OnPostCompactContextInjected(postResult.AdditionalContext);
     }
 
     private async Task PersistTranscriptAsync(CancellationToken cancellationToken)
@@ -810,7 +1330,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 TsUtc = DateTime.UtcNow,
                 Provider = options.ProviderId,
                 Model = options.Model,
-                InputTokens = recording.Usage.InputTokens,
+                InputTokens = recording.Usage.TotalInputTokens,
                 OutputTokens = recording.Usage.OutputTokens,
                 StopReason = recording.StopReason,
                 ToolCalls = recording.ToolCalls,
@@ -834,6 +1354,178 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         }
     }
 
+    // -------------------------------------------------------------------------
+    // UserPromptSubmit helpers
+    // -------------------------------------------------------------------------
+
+    private static string ExtractPromptText(IReadOnlyList<ContentBlock> content)
+    {
+        var parts = new List<string>();
+        foreach (var block in content)
+        {
+            if (block is TextBlock tb)
+            {
+                parts.Add(tb.Text);
+            }
+        }
+
+        return string.Concat(parts);
+    }
+
+    private static IReadOnlyList<string> ExtractAttachmentKinds(IReadOnlyList<ContentBlock> content)
+    {
+        var kinds = new List<string>();
+        foreach (var block in content)
+        {
+            if (block is ImageBlock)
+            {
+                kinds.Add("image");
+            }
+            else if (block is not TextBlock)
+            {
+                // Forward-compatible: surface other non-text block types by lowercased type name
+                // without the "Block" suffix (e.g. "thinkingBlock" → "thinking").
+                var typeName = block.GetType().Name;
+                var suffix = "Block";
+                var kind = typeName.EndsWith(suffix, StringComparison.Ordinal)
+                    ? typeName[..^suffix.Length].ToLowerInvariant()
+                    : typeName.ToLowerInvariant();
+                kinds.Add(kind);
+            }
+        }
+
+        return kinds.AsReadOnly();
+    }
+
+    /// <summary>
+    /// Replaces all <see cref="TextBlock"/> instances in <paramref name="content"/> with a
+    /// single <see cref="TextBlock"/> containing <paramref name="modifiedPrompt"/>. Non-text
+    /// blocks are preserved in their original positions. The replacement is inserted at the
+    /// location of the first text block; if there are no text blocks, it is prepended.
+    /// </summary>
+    private static IReadOnlyList<ContentBlock> ReplacePromptText(
+        IReadOnlyList<ContentBlock> content,
+        string modifiedPrompt)
+    {
+        var result = new List<ContentBlock>(content.Count);
+        var replaced = false;
+        foreach (var block in content)
+        {
+            if (block is TextBlock)
+            {
+                if (!replaced)
+                {
+                    result.Add(new TextBlock(modifiedPrompt));
+                    replaced = true;
+                }
+                // Skip subsequent TextBlocks — all are subsumed by the single modified prompt.
+            }
+            else
+            {
+                result.Add(block);
+            }
+        }
+
+        if (!replaced)
+        {
+            result.Insert(0, new TextBlock(modifiedPrompt));
+        }
+
+        return result.AsReadOnly();
+    }
+
+    internal static string PermissionModeToString(PermissionMode mode) => mode switch
+    {
+        PermissionMode.Default           => "default",
+        PermissionMode.AcceptEdits       => "acceptEdits",
+        PermissionMode.Plan              => "plan",
+        PermissionMode.BypassPermissions => "bypassPermissions",
+        _                                => mode.ToString().ToLowerInvariant(),
+    };
+
+    // -------------------------------------------------------------------------
+    // Session lifecycle helpers (Phase 2)
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Rebuilds <see cref="sessionHookRunner"/> adding a <c>promptHandler</c> now that an
+    /// <see cref="ILlmClient"/> is available. The executor override and all other construction
+    /// parameters are preserved from the original build so test seams stay effective.
+    /// Called at most once per session lifetime (guarded by <see cref="sessionRunnerHandlersUpgraded"/>).
+    /// Not called when <see cref="userHookRunnerOverride"/> is set (it already has whatever
+    /// handlers the test/production caller wants).
+    /// </summary>
+    private void RebuildSessionRunnerWithHandlers(
+        ILlmClient client,
+        Coda.Agent.Settings.CodaSettings settings,
+        SessionOptions options)
+    {
+        var httpHandler = new Coda.Agent.Hooks.HttpHookHandler(
+            httpClient: null,
+            settings.HttpHookAllowlist,
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
+        var promptHandler = new Coda.Agent.Hooks.PromptHookHandler(
+            new Coda.Agent.Watchers.ForkedAgentRunner(client, options.Model),
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Prompt"));
+        this.sessionHookRunner = new UserHookRunner(
+            this.configuredHooks,
+            execOverride: this.sessionExecOverride,
+            context: new HookContext(this.SessionId, options.WorkingDirectory),
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
+            httpHandler: httpHandler,
+            promptHandler: promptHandler,
+            trustGuard: this.trustGuard,
+            runLog: this.hookRunLog);
+    }
+
+    private static bool IsSessionLevelHookEvent(string eventName) =>
+        string.Equals(eventName, "SessionStart", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(eventName, "SessionEnd", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(eventName, "Notification", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Returns the fully-resolved system prompt: <paramref name="basePrompt"/> with any
+    /// <see cref="TurnShape.AppendSystemPrompt"/> appended, matching the logic in
+    /// <c>TurnShapeResolver</c>. Stored as <c>lastResolvedSystemPrompt</c> so the next turn
+    /// receives a like-for-like <see cref="AgentOptions.PreviousSystemPrompt"/>.
+    /// </summary>
+    private static string ResolveSystemPrompt(string basePrompt, TurnShape? shape) =>
+        shape?.AppendSystemPrompt is { } append ? $"{basePrompt}\n\n{append}" : basePrompt;
+
+    /// <summary>
+    /// Applies SessionStart hook outputs. Called once from <see cref="InitializeCoreAsync"/>.
+    /// Fail-open: a broken or timed-out hook is logged and ignored.
+    /// </summary>
+    internal Task ApplySessionStartHookAsync(CancellationToken cancellationToken)
+    {
+        var options = this.Options;
+        return this.sessionHooks.ApplySessionStartAsync(
+            new SessionStartPayloadContext(
+                options.Model,
+                PermissionModeToString(options.PermissionMode),
+                this.SessionTranscriptPath(options)),
+            cancellationToken);
+    }
+
+    /// <summary>The path this session's transcript is written to.</summary>
+    private string SessionTranscriptPath(SessionOptions options) =>
+        Path.Combine(options.WorkingDirectory, ".coda", "sessions", $"{this.SessionId}.json");
+
+    /// <summary>
+    /// Fires SessionEnd hooks exactly once. Hard-coded 2 s deadline; never throws.
+    /// </summary>
+    private Task FireSessionEndOnceAsync() =>
+        this.sessionHooks.FireSessionEndOnceAsync(
+            this.sessionUsage,
+            this.SessionTranscriptPath(this.Options));
+
+    /// <summary>
+    /// Fires a <c>Notification("idle")</c> hook in the background after a successful turn.
+    /// Fire-and-forget so notification latency never blocks the caller.
+    /// </summary>
+    private void FireIdleNotificationBackground() =>
+        this.sessionHooks.FireIdleNotificationBackground();
+
     /// <summary>
     /// Asynchronously tears the session down: shuts down LSP servers (bounded by
     /// <see cref="LspDisposeTimeout"/>) without any sync-over-async
@@ -843,6 +1535,14 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
+        // Stop and drain in-flight background Notification hooks BEFORE SessionEnd fires: an idle
+        // notification subprocess that outlived SessionEnd would invert the documented ordering.
+        await this.sessionHooks.DrainBackgroundNotificationsAsync().ConfigureAwait(false);
+
+        // Fire SessionEnd exactly once before teardown begins. The 2 s hard ceiling is
+        // enforced inside FireSessionEndOnceAsync; it never throws.
+        await this.FireSessionEndOnceAsync().ConfigureAwait(false);
+
         // Prevent/await the initialization race and dispose the schedule runtime FIRST: a due firing
         // can then never register work after the task-manager shutdown below has begun. The runtime's
         // own disposal cancels its loop and returns promptly, so this stays bounded.
@@ -869,6 +1569,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
         this.ownedHttpClient?.Dispose();
         this.loggerFactory.Dispose();
+        this.sessionHooks.Dispose();
     }
 
     /// <summary>

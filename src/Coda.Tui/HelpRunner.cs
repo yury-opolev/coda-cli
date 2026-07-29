@@ -1,6 +1,10 @@
 using System.Text;
 using System.Text.Json;
+using Coda.Tui.Commands;
+using Coda.Tui.Plugins;
 using Coda.Tui.Repl;
+using Coda.Tui.Skills;
+using Microsoft.Extensions.Logging;
 
 namespace Coda.Tui;
 
@@ -15,11 +19,30 @@ public static class HelpRunner
     public static async Task<int> RunAsync(string[] args, CancellationToken cancellationToken = default)
     {
         await Task.CompletedTask.ConfigureAwait(false);
-        return Run(args, Console.Out, Console.Error);
+        var cwd = Directory.GetCurrentDirectory();
+        var userCodaDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
+        var pluginStateStore = new PluginStateStore(userCodaDir);
+        var skills = SkillLoader.Load(cwd, pluginStateStore: pluginStateStore);
+        var errorLogger = new TextWriterLogger(Console.Error);
+        return Run(args, Console.Out, Console.Error, skills, errorLogger);
     }
 
     /// <summary>Testable core: writes to the provided writers, returns the exit code.</summary>
-    public static int Run(IReadOnlyList<string> args, TextWriter output, TextWriter error)
+    public static int Run(IReadOnlyList<string> args, TextWriter output, TextWriter error) =>
+        Run(args, output, error, skills: null, logger: null);
+
+    /// <summary>
+    /// Testable core with optional skill context: writes to the provided writers, returns
+    /// the exit code. When <paramref name="skills"/> is non-null, skill-derived commands are
+    /// included in the listing (same as the interactive <c>/help</c> output).
+    /// </summary>
+    public static int Run(
+        IReadOnlyList<string> args,
+        TextWriter output,
+        TextWriter error,
+        IReadOnlyList<SkillDefinition>? skills,
+        ILogger? logger = null)
     {
         var json = false;
         string? commandName = null;
@@ -47,7 +70,9 @@ public static class HelpRunner
             }
         }
 
-        var commands = SlashCommandCatalog.CreateAll();
+        var commands = skills is not null && skills.Count > 0
+            ? SlashCommandCatalog.CreateWithSkills(skills, logger)
+            : SlashCommandCatalog.CreateAll();
 
         if (commandName is null)
         {
@@ -86,10 +111,29 @@ public static class HelpRunner
 
     private static void WriteListText(IReadOnlyList<ISlashCommand> commands, TextWriter w)
     {
+        var builtIns = commands
+            .Where(c => c is not SkillSlashCommand)
+            .OrderBy(c => c.Name, StringComparer.Ordinal)
+            .ToList();
+        var skillCommands = commands
+            .OfType<SkillSlashCommand>()
+            .OrderBy(c => c.Name, StringComparer.Ordinal)
+            .ToList();
+
         w.WriteLine("Commands:");
-        foreach (var c in commands.OrderBy(c => c.Name, StringComparer.Ordinal))
+        foreach (var c in builtIns)
         {
             w.WriteLine($"  /{c.Name,-14} {c.Summary}");
+        }
+
+        if (skillCommands.Count > 0)
+        {
+            w.WriteLine();
+            w.WriteLine("Skill commands:");
+            foreach (var c in skillCommands)
+            {
+                w.WriteLine($"  /{c.Name,-14} {SkillSlashCommand.SkillMarker}{c.Summary}");
+            }
         }
 
         w.WriteLine();
@@ -212,5 +256,30 @@ public static class HelpRunner
         }
 
         w.WriteLine(Encoding.UTF8.GetString(stream.ToArray()));
+    }
+}
+
+/// <summary>
+/// Minimal <see cref="ILogger"/> adapter that routes <see cref="LogLevel.Warning"/> and above
+/// to a <see cref="TextWriter"/>. Used by <c>coda help</c> so collision and name-validation
+/// warnings appear on stderr.
+/// </summary>
+file sealed class TextWriterLogger(TextWriter writer) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel >= LogLevel.Warning)
+        {
+            writer.WriteLine(formatter(state, exception));
+        }
     }
 }

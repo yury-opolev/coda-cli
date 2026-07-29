@@ -46,6 +46,8 @@ internal class FullscreenTuiShell(
     Func<TaskBrowserProvider?>? taskBrowserProvider = null,
     Func<McpBrowserProvider?>? mcpBrowserProvider = null,
     Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
+    Func<Coda.Tui.Ui.Skills.SkillBrowserProvider?>? skillsBrowserProvider = null,
+    Func<Coda.Tui.Ui.Plugins.PluginBrowserProvider?>? pluginBrowserProvider = null,
     ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
     IUrlOpener? urlOpener = null,
     IPrivateBrowserResolver? privateBrowserResolver = null,
@@ -68,6 +70,8 @@ internal class FullscreenTuiShell(
         taskBrowserProvider: taskBrowserProvider,
         mcpBrowserProvider: mcpBrowserProvider,
         scheduleBrowserProvider: scheduleBrowserProvider,
+        skillsBrowserProvider: skillsBrowserProvider,
+        pluginBrowserProvider: pluginBrowserProvider,
         toolDisplayMode: toolDisplayMode,
         urlOpener: urlOpener,
         privateBrowserResolver: privateBrowserResolver,
@@ -224,6 +228,24 @@ internal class FullscreenTuiShell(
             scheduleOverlay.Width = Dim.Fill();
             scheduleOverlay.Height = Dim.Fill();
             this.Add(scheduleOverlay);
+        }
+
+        if (this.SkillsOverlay is { } skillsOverlay)
+        {
+            skillsOverlay.X = 0;
+            skillsOverlay.Y = 0;
+            skillsOverlay.Width = Dim.Fill();
+            skillsOverlay.Height = Dim.Fill();
+            this.Add(skillsOverlay);
+        }
+
+        if (this.PluginOverlay is { } pluginOverlay)
+        {
+            pluginOverlay.X = 0;
+            pluginOverlay.Y = 0;
+            pluginOverlay.Width = Dim.Fill();
+            pluginOverlay.Height = Dim.Fill();
+            this.Add(pluginOverlay);
         }
 
         this.Add(this.PromptOverlay);

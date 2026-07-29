@@ -109,7 +109,7 @@ public sealed class MarketplaceManagerTests : IDisposable
         var manager = this.CreateManager();
         await manager.AddAsync(this.fixtureDir, CancellationToken.None);
 
-        var (ok, message) = manager.Remove("fixture");
+        var (ok, message, _) = manager.Remove("fixture");
 
         Assert.True(ok, message);
         Assert.Empty(manager.List());
@@ -181,7 +181,7 @@ public sealed class MarketplaceManagerTests : IDisposable
     {
         var manager = this.CreateManager();
 
-        var (ok, message) = manager.Remove("nonexistent");
+        var (ok, message, _) = manager.Remove("nonexistent");
 
         Assert.False(ok);
         Assert.Contains("nonexistent", message, StringComparison.OrdinalIgnoreCase);

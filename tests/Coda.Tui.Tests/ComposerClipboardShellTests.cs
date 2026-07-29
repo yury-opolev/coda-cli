@@ -12,6 +12,7 @@ namespace Coda.Tui.Tests;
 /// precedence over a transcript selection, the shared success/failure copy path used by keyboard and
 /// pointer gestures, the modal/startup guards on pointer copy, and the grapheme-aware symbol count.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class ComposerClipboardShellTests
 {
     private static ImmutableArray<TranscriptBlock> Lines(int count) =>

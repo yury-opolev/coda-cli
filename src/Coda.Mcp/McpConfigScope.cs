@@ -8,4 +8,7 @@ public enum McpConfigScope
 
     /// <summary>Project-level <c>&lt;cwd&gt;/.mcp.json</c> — overrides a user entry of the same name.</summary>
     Project = 1,
+
+    /// <summary>Plugin-contributed server — lowest precedence, overridden by user and project entries.</summary>
+    Plugin = 2,
 }

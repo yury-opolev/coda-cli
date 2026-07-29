@@ -1,10 +1,12 @@
 using Coda.Agent;
+using Coda.Agent.Hooks;
 using Coda.Agent.Settings;
 using Coda.Mcp;
 using Coda.Sdk;
 using Coda.Sdk.Serve;
 using Coda.Sdk.Serve.Transport;
 using Coda.Sdk.Telemetry;
+using Coda.Tui.Plugins;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -176,6 +178,7 @@ public static class ServeRunner
     /// </summary>
     /// <param name="userMcpDir">Test/override seam for the user-level <c>.mcp.json</c> directory;
     /// null uses the default resolution (<c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c>).</param>
+    /// <param name="pluginServers">Plugin-contributed servers (lowest precedence). Null skips the plugin layer.</param>
     public static async Task<(IReadOnlyList<ITool> Tools, McpClientManager? Manager)> LoadMcpToolsAsync(
         bool enableMcp,
         string workingDirectory,
@@ -184,7 +187,8 @@ public static class ServeRunner
         CancellationToken cancellationToken,
         string? userMcpDir = null,
         ITokenStore? secretStore = null,
-        bool includeProjectMcp = true)
+        bool includeProjectMcp = true,
+        IReadOnlyDictionary<string, McpServerConfig>? pluginServers = null)
     {
         if (!enableMcp)
         {
@@ -193,7 +197,7 @@ public static class ServeRunner
 
         // Load config BEFORE constructing the manager: nothing to dispose when MCP is off or no
         // server is configured, and a failing config read can't leak a manager.
-        var servers = McpConfig.Load(workingDirectory, userMcpDir, includeProjectMcp);
+        var servers = McpConfig.LoadWithPlugins(workingDirectory, pluginServers, userMcpDir, includeProjectMcp);
         if (servers.Count == 0)
         {
             return ([], null);
@@ -243,18 +247,34 @@ public static class ServeRunner
         CredentialManager credentials,
         SessionOptions sessionOptions,
         string? expectedApiKey = null,
-        Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession>? factoryOverride = null)
+        Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession>? factoryOverride = null,
+        List<UserHook>? pluginHookList = null,
+        Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null)
     {
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> factory =
             factoryOverride ?? ((perm, question, plan) =>
-                new CodaSession(credentials, sessionOptions with
+            {
+                var trustGuard = new HookTrustGuard(
+                    new HookTrustStore(),
+                    sessionOptions.WorkingDirectory,
+                    promptCallback: null); // serve: no interactive callback — fail closed
+                return new CodaSession(credentials, sessionOptions with
                 {
                     InteractivePrompt = perm,
                     UserQuestionPrompt = question,
                     PlanApprover = plan,
-                }));
+                }, trustGuard: trustGuard,
+                   hookList: pluginHookList,
+                   subagentRegistry: subagentRegistry);
+            });
 
-        return new ServeHost(input, output, factory, expectedApiKey);
+        return new ServeHost(
+            input,
+            output,
+            factory,
+            expectedApiKey,
+            skillsProvider: ServeSkillPluginProviders.BuildSkillsProvider(),
+            pluginsProvider: ServeSkillPluginProviders.BuildPluginsProvider());
     }
 
     /// <summary>
@@ -430,6 +450,24 @@ public static class ServeRunner
                     options.EnableMcp, Environment.GetEnvironmentVariable("CODA_SERVE_DISABLE_MCP"));
                 var includeProjectMcp = ResolveProjectMcpEnabled(
                     options.EnableProjectMcp, Environment.GetEnvironmentVariable("CODA_DISABLE_PROJECT_MCP"));
+
+                // Load and compose plugins for this working directory.
+                var plugins = PluginLoader.Load(workingDirectory);
+                // Construct trust store and refuse project-scoped plugins without workspace trust
+                // (serve: no interactive prompt, workspace trust must have been pre-granted).
+                var serveHomeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var servePluginTrustStore = new PluginTrustStore(serveHomeDir);
+                var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory, trustStore: servePluginTrustStore);
+                var pluginRegistry = pluginComposition.Agents.Count > 0
+                    ? new Coda.Agent.Subagents.SubagentRegistry(pluginComposition.Agents)
+                    : null;
+                var pluginMcpServers = pluginComposition.McpServers.Count > 0
+                    ? pluginComposition.McpServers.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Config)
+                    : null;
+                List<UserHook>? servePluginHookList = pluginComposition.Hooks.Count > 0
+                    ? [.. pluginComposition.Hooks, .. settings.Hooks]
+                    : null;
+
                 using var mcpHttp = new HttpClient();
                 var mcpCredentialStore = CredentialStoreFactory.Create();
                 var mcpHttpFactory = new DefaultMcpHttpClientFactory(
@@ -438,12 +476,36 @@ public static class ServeRunner
                 var (mcpTools, mcpManager) = await LoadMcpToolsAsync(
                     enableMcp, options.WorkingDirectory!, mcpHttpFactory,
                     msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null,
-                    secretStore: mcpCredentialStore, includeProjectMcp: includeProjectMcp).ConfigureAwait(false);
+                    secretStore: mcpCredentialStore, includeProjectMcp: includeProjectMcp,
+                    pluginServers: pluginMcpServers).ConfigureAwait(false);
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
-                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, mcpTools, settings.EffortByModel);
+
+                // Load skills once per serve session; build the skill tool if any are model-invocable.
+                // Gate external-origin skills with a null-callback gate (refuses unattended).
+                var skillState = new Coda.Tui.Skills.SkillSessionState();
+                var serveSkillOriginGate = new Coda.Tui.Skills.SkillOriginGate(skillState, promptCallback: null);
+                var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
+                    Coda.Tui.Skills.SkillLoader.Load(options.WorkingDirectory!), skillState, options.WorkingDirectory!,
+                    originGate: serveSkillOriginGate);
+
+                var allExtraTools = skillTool is not null
+                    ? (IReadOnlyList<ITool>)[.. mcpTools, skillTool]
+                    : mcpTools;
+
+                Func<int, string>? skillReattach = skillTool is not null
+                    ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+                    : null;
+                Func<IReadOnlySet<string>?>? grantedDirs = skillTool is not null
+                    ? () => skillState.GetGrantedDirectories()
+                    : null;
+
+                var sessionOptions = BuildSessionOptions(options, settings.Telemetry, allExtraTools, settings.EffortByModel, skillReattach, grantedDirs,
+                    pluginOutputStyles: pluginComposition.OutputStyles);
 
                 var streams = await transport.AcceptAsync(cts.Token).ConfigureAwait(false);
-                await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey);
+                await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey,
+                    pluginHookList: servePluginHookList,
+                    subagentRegistry: pluginRegistry);
                 await host.RunAsync(cts.Token).ConfigureAwait(false);
                 return 0;
             }
@@ -472,7 +534,10 @@ public static class ServeRunner
         ServeOptions options,
         TelemetrySettings? baseTelemetry = null,
         IReadOnlyList<ITool>? extraTools = null,
-        IReadOnlyDictionary<string, string>? effortByModel = null) =>
+        IReadOnlyDictionary<string, string>? effortByModel = null,
+        Func<int, string>? skillReattachProvider = null,
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null,
+        IReadOnlyList<Coda.Agent.OutputStyles.OutputStyle>? pluginOutputStyles = null) =>
         new()
         {
             ProviderId = options.ProviderId!,
@@ -489,6 +554,8 @@ public static class ServeRunner
             GoalMaxContinuations = options.GoalMaxContinuations,
             // MCP (and any future host-supplied) tools. Empty unless serve connected MCP servers.
             ExtraTools = extraTools ?? [],
+            SkillReattachContentProvider = skillReattachProvider,
+            GrantedDirectoriesSource = grantedDirectoriesSource,
             // Serve owns the schedule runtime (parity with interactive) so persisted, project-scoped
             // schedules resume and fire as isolated agent runs. Headless one-shot (`coda run`) keeps
             // the default (false). ServeHost drives CodaSession.InitializeAsync to start it.
@@ -500,6 +567,7 @@ public static class ServeRunner
             // Persisted effort for the starting model, resolved through the capability resolver so
             // stale or unsupported stored levels are clamped/dropped, never sent verbatim.
             Effort = ResolveInitialEffort(options.ProviderId!, options.Model!, effortByModel),
+            PluginOutputStyles = pluginOutputStyles ?? [],
         };
 
     /// <summary>

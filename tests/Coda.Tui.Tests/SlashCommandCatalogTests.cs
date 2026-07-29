@@ -18,7 +18,7 @@ public sealed class SlashCommandCatalogTests
         Assert.Contains("theme", names);
         Assert.Contains("exit", names);
         Assert.Equal(names.Count, names.Distinct().Count()); // no duplicate names
-        Assert.Equal(39, names.Count);
+        Assert.Equal(40, names.Count);
         Assert.Equal("help", names[0]);   // first in display order
         Assert.Equal("exit", names[^1]);  // last in display order
     }

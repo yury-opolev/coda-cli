@@ -1,4 +1,5 @@
 using Coda.Tui.Commands;
+using Coda.Tui.Plugins;
 using Coda.Tui.Repl;
 using Coda.Tui.Skills;
 using LlmAuth;
@@ -513,6 +514,615 @@ public sealed class CommandResultTests
 
         Assert.False(result.ShouldExit);
         Assert.Equal("do something", result.PromptToRun);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SkillLoaderOriginAndPathTests — Origin and SourcePath stamped on each layer
+// ─────────────────────────────────────────────────────────────────────────────
+
+public sealed class SkillLoaderOriginAndPathTests : IDisposable
+{
+    private readonly string tempDir;
+
+    public SkillLoaderOriginAndPathTests()
+    {
+        this.tempDir = Path.Combine(Path.GetTempPath(), $"coda-origin-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(this.tempDir);
+    }
+
+    public void Dispose()
+    {
+        if (Directory.Exists(this.tempDir))
+        {
+            Directory.Delete(this.tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public void Project_skill_has_Origin_Project_and_SourcePath_set()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "project-skill");
+        Directory.CreateDirectory(skillDir);
+        var skillFile = Path.Combine(skillDir, "SKILL.md");
+        File.WriteAllText(skillFile,
+            "---\nname: project-skill\ndescription: A project skill\n---\nBody.\n");
+
+        var skills = SkillLoader.Load(
+            this.tempDir,
+            userSkillsDir: Path.Combine(this.tempDir, "_no_user"),
+            claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
+
+        var skill = Assert.Single(skills);
+        Assert.Equal(SkillOrigin.Project, skill.Origin);
+        Assert.Equal(skillFile, skill.SourcePath);
+    }
+
+    [Fact]
+    public void User_skill_has_Origin_User_and_SourcePath_set()
+    {
+        var userBase = Path.Combine(this.tempDir, "user-home");
+        var skillDir = Path.Combine(userBase, "skills", "user-skill");
+        Directory.CreateDirectory(skillDir);
+        var skillFile = Path.Combine(skillDir, "SKILL.md");
+        File.WriteAllText(skillFile,
+            "---\nname: user-skill\ndescription: A user skill\n---\nBody.\n");
+
+        var skills = SkillLoader.Load(
+            Path.Combine(this.tempDir, "empty-project"),
+            userSkillsDir: userBase,
+            claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
+
+        var skill = Assert.Single(skills);
+        Assert.Equal(SkillOrigin.User, skill.Origin);
+        Assert.Equal(skillFile, skill.SourcePath);
+    }
+
+    [Fact]
+    public void Claude_skill_has_Origin_Claude_and_SourcePath_set()
+    {
+        var claudeSkillsDir = Path.Combine(this.tempDir, "claude-skills");
+        var skillDir = Path.Combine(claudeSkillsDir, "claude-skill");
+        Directory.CreateDirectory(skillDir);
+        var skillFile = Path.Combine(skillDir, "SKILL.md");
+        File.WriteAllText(skillFile,
+            "---\nname: claude-skill\ndescription: A claude skill\n---\nBody.\n");
+
+        var skills = SkillLoader.Load(
+            Path.Combine(this.tempDir, "empty-project"),
+            userSkillsDir: Path.Combine(this.tempDir, "_no_user"),
+            claudeSkillsDir: claudeSkillsDir);
+
+        var skill = Assert.Single(skills);
+        Assert.Equal(SkillOrigin.Claude, skill.Origin);
+        Assert.Equal(skillFile, skill.SourcePath);
+    }
+
+    [Fact]
+    public void Plugin_skill_has_Origin_Plugin_and_SourcePath_set()
+    {
+        var userBase = Path.Combine(this.tempDir, "user-home");
+        var pluginDir = Path.Combine(userBase, "plugins", "test-plugin");
+        var pluginSkillDir = Path.Combine(pluginDir, "skills", "plugin-skill");
+        Directory.CreateDirectory(pluginSkillDir);
+        File.WriteAllText(
+            Path.Combine(pluginDir, "plugin.json"),
+            """{"name": "test-plugin", "version": "1.0.0", "description": "test"}""");
+        var skillFile = Path.Combine(pluginSkillDir, "SKILL.md");
+        File.WriteAllText(skillFile,
+            "---\nname: plugin-skill\ndescription: A plugin skill\n---\nBody.\n");
+
+        var skills = SkillLoader.Load(
+            Path.Combine(this.tempDir, "empty-project"),
+            userSkillsDir: userBase,
+            claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
+
+        var skill = Assert.Single(skills, s => s.Name == "plugin-skill");
+        Assert.Equal(SkillOrigin.Plugin, skill.Origin);
+        Assert.Equal(skillFile, skill.SourcePath);
+    }
+
+    [Fact]
+    public void Precedence_still_resolves_project_over_user()
+    {
+        // User skill
+        var userBase = Path.Combine(this.tempDir, "user-home");
+        var userSkillDir = Path.Combine(userBase, "skills", "shared");
+        Directory.CreateDirectory(userSkillDir);
+        File.WriteAllText(Path.Combine(userSkillDir, "SKILL.md"),
+            "---\nname: shared\ndescription: from user\n---\nUser body.\n");
+
+        // Project skill — higher precedence
+        var projectDir = this.tempDir;
+        var projectSkillDir = Path.Combine(projectDir, ".coda", "skills", "shared");
+        Directory.CreateDirectory(projectSkillDir);
+        File.WriteAllText(Path.Combine(projectSkillDir, "SKILL.md"),
+            "---\nname: shared\ndescription: from project\n---\nProject body.\n");
+
+        var skills = SkillLoader.Load(
+            projectDir,
+            userSkillsDir: userBase,
+            claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
+
+        var skill = Assert.Single(skills);
+        Assert.Equal("from project", skill.Description);
+        Assert.Equal(SkillOrigin.Project, skill.Origin);
+    }
+
+    [Fact]
+    public void When_to_use_and_argument_hint_stamped_from_frontmatter()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "rich-skill");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: rich-skill\ndescription: d\nwhen-to-use: use when X\nargument-hint: <file>\narguments:\n  - file\n---\nBody.\n");
+
+        var skills = SkillLoader.Load(
+            this.tempDir,
+            userSkillsDir: Path.Combine(this.tempDir, "_no_user"),
+            claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
+
+        var skill = Assert.Single(skills);
+        Assert.Equal("use when X", skill.WhenToUse);
+        Assert.Equal("<file>", skill.ArgumentHint);
+        Assert.Equal(["file"], skill.Arguments);
+    }
+
+    [Fact]
+    public void Unknown_frontmatter_fields_stamped_in_unknown_fields()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "ext-skill");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: ext-skill\ndescription: d\nversion: 2.1\n---\nBody.\n");
+
+        var skills = SkillLoader.Load(
+            this.tempDir,
+            userSkillsDir: Path.Combine(this.tempDir, "_no_user"),
+            claudeSkillsDir: Path.Combine(this.tempDir, "_no_claude"));
+
+        var skill = Assert.Single(skills);
+        Assert.True(skill.UnknownFields.ContainsKey("version"));
+        Assert.Equal("2.1", skill.UnknownFields["version"]);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SkillsCommandSubcommandTests — /skills list, validate, new
+// ─────────────────────────────────────────────────────────────────────────────
+
+[Collection("SkillSourceEnv")]
+public sealed class SkillsCommandSubcommandTests : IDisposable
+{
+    private readonly string tempDir;
+    private readonly SkillSourceEnvIsolation env;
+
+    public SkillsCommandSubcommandTests()
+    {
+        this.tempDir = Path.Combine(Path.GetTempPath(), $"coda-skillssub-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(this.tempDir);
+        this.env = new SkillSourceEnvIsolation(this.tempDir);
+    }
+
+    public void Dispose()
+    {
+        this.env.Dispose();
+        if (Directory.Exists(this.tempDir))
+        {
+            Directory.Delete(this.tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Skills_list_subcommand_behaves_same_as_bare_skills()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "my-skill");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: my-skill\ndescription: Test skill\n---\nBody.\n");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        var result = await command.ExecuteAsync(context, ["list"], CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Contains("my-skill", console.Output);
+    }
+
+    [Fact]
+    public async Task Skills_validate_on_good_file_shows_name_and_no_problems()
+    {
+        var skillDir = Path.Combine(this.tempDir, "validate-skill");
+        Directory.CreateDirectory(skillDir);
+        var skillFile = Path.Combine(skillDir, "SKILL.md");
+        File.WriteAllText(skillFile,
+            "---\nname: validate-skill\ndescription: A real description\n---\nBody here.\n");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        var result = await command.ExecuteAsync(context, ["validate", skillFile], CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        Assert.Null(result.PromptToRun);
+        Assert.Contains("validate-skill", console.Output);
+        // Problems row should say "none"
+        Assert.Contains("none", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Skills_validate_on_directory_looks_for_SKILL_md_inside()
+    {
+        var skillDir = Path.Combine(this.tempDir, "dir-skill");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: dir-skill\ndescription: ok\n---\nBody.\n");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        await command.ExecuteAsync(context, ["validate", skillDir], CancellationToken.None);
+
+        Assert.Contains("dir-skill", console.Output);
+    }
+
+    [Fact]
+    public async Task Skills_validate_on_file_with_unknown_keys_shows_them()
+    {
+        var skillFile = Path.Combine(this.tempDir, "unknown-keys.md");
+        File.WriteAllText(skillFile,
+            "---\nname: uk\ndescription: d\nversion: 1.0\ncategory: tools\n---\nBody.\n");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        await command.ExecuteAsync(context, ["validate", skillFile], CancellationToken.None);
+
+        // At least one of the unknown keys should appear in the output
+        var output = console.Output;
+        Assert.True(
+            output.Contains("version") || output.Contains("category"),
+            $"Expected unknown key names in output; got: {output}");
+    }
+
+    [Fact]
+    public async Task Skills_validate_on_missing_file_shows_error()
+    {
+        var missing = Path.Combine(this.tempDir, "does-not-exist", "SKILL.md");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        var result = await command.ExecuteAsync(context, ["validate", missing], CancellationToken.None);
+
+        Assert.False(result.ShouldExit);
+        // Should mention the missing path
+        Assert.Contains("not found", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Skills_new_creates_scaffold_SKILL_md()
+    {
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        await command.ExecuteAsync(context, ["new", "my-new-skill"], CancellationToken.None);
+
+        var expected = Path.Combine(this.tempDir, ".coda", "skills", "my-new-skill", "SKILL.md");
+        Assert.True(File.Exists(expected), $"Expected scaffold at {expected}");
+
+        var content = File.ReadAllText(expected);
+        Assert.Contains("name:", content);
+        Assert.Contains("description:", content);
+        Assert.Contains("my-new-skill", content);
+    }
+
+    [Fact]
+    public async Task Skills_new_refuses_if_directory_already_exists()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "existing");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(Path.Combine(skillDir, "SKILL.md"), "placeholder");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        await command.ExecuteAsync(context, ["new", "existing"], CancellationToken.None);
+
+        // Should not overwrite — warn and do nothing
+        Assert.Contains("existing", console.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("placeholder", File.ReadAllText(Path.Combine(skillDir, "SKILL.md")));
+    }
+
+    [Fact]
+    public async Task Skills_new_rejects_path_traversal_name()
+    {
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        await command.ExecuteAsync(context, ["new", "../evil"], CancellationToken.None);
+
+        // Skill directory must NOT have been created outside .coda/skills/
+        Assert.False(Directory.Exists(Path.Combine(this.tempDir, ".coda", "skills", "..", "evil")));
+        // Output should mention invalid name
+        Assert.Contains("invalid", console.Output, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Skills_new_rejects_name_with_path_separator()
+    {
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        // Use backslash — both separators must be rejected
+        await command.ExecuteAsync(context, ["new", "a/b"], CancellationToken.None);
+
+        Assert.Contains("invalid", console.Output, StringComparison.OrdinalIgnoreCase);
+        Assert.False(Directory.Exists(Path.Combine(this.tempDir, ".coda", "skills", "a")));
+    }
+
+    [Fact]
+    public async Task Skills_shows_argument_hint_in_listing()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "hinted");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: hinted\ndescription: d\nargument-hint: <file>\n---\nBody.\n");
+
+        var (console, context) = BuildContext(this.tempDir);
+        var command = new SkillsCommand();
+
+        await command.ExecuteAsync(context, [], CancellationToken.None);
+
+        Assert.Contains("<file>", console.Output);
+    }
+
+    private static (TestConsole Console, CommandContext Context) BuildContext(string workingDirectory)
+    {
+        var console = new TestConsole();
+        console.Profile.Width = 200;
+
+        var store = new InMemoryTokenStore();
+        var claude = new ClaudeAiProvider();
+        var credentials = new CredentialManager(store, new ICredentialProvider[] { claude });
+        var providers = new List<ProviderDescriptor>
+        {
+            new("claude-ai", "Claude.ai", LoginKind.OAuthLoopback, "claude-sonnet-4-6"),
+        };
+
+        var session = new SessionState("claude-ai", workingDirectory);
+        var registry = new SlashCommandRegistry(new ISlashCommand[]
+        {
+            new HelpCommand(), new SkillsCommand(), new SkillCommand(), new ExitCommand(),
+        });
+
+        var context = new CommandContext(console, credentials, session, providers, registry);
+        return (console, context);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SkillCommandArgsTests — /skill <name> arg1 arg2 substitution
+// ─────────────────────────────────────────────────────────────────────────────
+
+[Collection("SkillSourceEnv")]
+public sealed class SkillCommandArgsTests : IDisposable
+{
+    private readonly string tempDir;
+    private readonly SkillSourceEnvIsolation env;
+
+    public SkillCommandArgsTests()
+    {
+        this.tempDir = Path.Combine(Path.GetTempPath(), $"coda-skillargs-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(this.tempDir);
+        this.env = new SkillSourceEnvIsolation(this.tempDir);
+    }
+
+    public void Dispose()
+    {
+        this.env.Dispose();
+        if (Directory.Exists(this.tempDir))
+        {
+            Directory.Delete(this.tempDir, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SkillCommand_with_args_substitutes_positional_placeholders()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "translate");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: translate\ndescription: Translate text\narguments:\n  - lang\n  - text\n---\nTranslate '$text' to $lang.\n");
+
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillCommand();
+
+        var result = await command.ExecuteAsync(context, ["translate", "French", "Hello world"], CancellationToken.None);
+
+        Assert.NotNull(result.PromptToRun);
+        Assert.Contains("French", result.PromptToRun);
+        Assert.Contains("Hello world", result.PromptToRun);
+    }
+
+    [Fact]
+    public async Task SkillCommand_skill_without_placeholders_returns_body_unchanged()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "plain");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: plain\ndescription: Plain skill\n---\nDo the thing.\n");
+
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillCommand();
+
+        var result = await command.ExecuteAsync(context, ["plain", "unused-arg"], CancellationToken.None);
+
+        Assert.NotNull(result.PromptToRun);
+        Assert.Equal("Do the thing.", result.PromptToRun);
+    }
+
+    [Fact]
+    public async Task SkillCommand_ARGUMENTS_placeholder_receives_all_trailing_args()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "echo");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: echo\ndescription: Echo args\n---\nArgs: $ARGUMENTS\n");
+
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillCommand();
+
+        var result = await command.ExecuteAsync(context, ["echo", "one", "two", "three"], CancellationToken.None);
+
+        Assert.NotNull(result.PromptToRun);
+        Assert.Equal("Args: one two three", result.PromptToRun);
+    }
+
+    private static (TestConsole Console, CommandContext Context) BuildContext(string workingDirectory)
+    {
+        var console = new TestConsole();
+        console.Profile.Width = 200;
+
+        var store = new InMemoryTokenStore();
+        var claude = new ClaudeAiProvider();
+        var credentials = new CredentialManager(store, new ICredentialProvider[] { claude });
+        var providers = new List<ProviderDescriptor>
+        {
+            new("claude-ai", "Claude.ai", LoginKind.OAuthLoopback, "claude-sonnet-4-6"),
+        };
+
+        var session = new SessionState("claude-ai", workingDirectory);
+        var registry = new SlashCommandRegistry(new ISlashCommand[]
+        {
+            new HelpCommand(), new SkillsCommand(), new SkillCommand(), new ExitCommand(),
+        });
+
+        var context = new CommandContext(console, credentials, session, providers, registry);
+        return (console, context);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SkillCommandLiteralDollarTests — /skill <name> with literal-$ bodies and no args
+// ─────────────────────────────────────────────────────────────────────────────
+
+[Collection("SkillSourceEnv")]
+public sealed class SkillCommandLiteralDollarTests : IDisposable
+{
+    private readonly string tempDir;
+    private readonly SkillSourceEnvIsolation env;
+
+    public SkillCommandLiteralDollarTests()
+    {
+        this.tempDir = Path.Combine(Path.GetTempPath(), $"coda-skilldollar-test-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(this.tempDir);
+        this.env = new SkillSourceEnvIsolation(this.tempDir);
+    }
+
+    public void Dispose()
+    {
+        this.env.Dispose();
+        if (Directory.Exists(this.tempDir))
+        {
+            Directory.Delete(this.tempDir, recursive: true);
+        }
+    }
+
+    /// <summary>
+    /// When invoked with no arguments and the skill declares no arguments, bodies
+    /// containing literal <c>$</c> sequences must be passed through byte-identical.
+    /// </summary>
+    [Theory]
+    [InlineData("echo $HOME and $PATH")]
+    [InlineData("Run: git rebase -i HEAD~$1")]
+    [InlineData("PID is $$ in bash")]
+    [InlineData("Price is $10 today")]
+    [InlineData("Use $env:PATH on Windows")]
+    public async Task SkillCommand_literal_dollar_body_with_no_args_returns_body_unchanged(
+        string bodyContent)
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "dollar-test");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            $"---\nname: dollar-test\ndescription: Test\n---\n{bodyContent}\n");
+
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillCommand();
+
+        var result = await command.ExecuteAsync(context, ["dollar-test"], CancellationToken.None);
+
+        Assert.NotNull(result.PromptToRun);
+        Assert.Equal(bodyContent, result.PromptToRun);
+    }
+
+    [Fact]
+    public async Task SkillCommand_substitution_still_occurs_when_invoke_args_supplied()
+    {
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "sub-test");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: sub-test\ndescription: Test substitution\n---\nTranslate to $1\n");
+
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillCommand();
+
+        var result = await command.ExecuteAsync(context, ["sub-test", "French"], CancellationToken.None);
+
+        Assert.NotNull(result.PromptToRun);
+        Assert.Equal("Translate to French", result.PromptToRun);
+    }
+
+    [Fact]
+    public async Task SkillCommand_substitution_occurs_when_skill_declares_arguments_even_with_no_invoke_args()
+    {
+        // Skill declares arguments → Bind IS called even when the user supplies no invoke args.
+        // $lang has no corresponding value → resolved to empty string.
+        var skillDir = Path.Combine(this.tempDir, ".coda", "skills", "declared-args");
+        Directory.CreateDirectory(skillDir);
+        File.WriteAllText(
+            Path.Combine(skillDir, "SKILL.md"),
+            "---\nname: declared-args\ndescription: Test\narguments:\n  - lang\n---\nTranslate to $lang\n");
+
+        var (_, context) = BuildContext(this.tempDir);
+        var command = new SkillCommand();
+
+        var result = await command.ExecuteAsync(context, ["declared-args"], CancellationToken.None);
+
+        Assert.NotNull(result.PromptToRun);
+        Assert.Equal("Translate to ", result.PromptToRun);
+    }
+
+    private static (TestConsole Console, CommandContext Context) BuildContext(string workingDirectory)
+    {
+        var console = new TestConsole();
+        console.Profile.Width = 200;
+
+        var store = new InMemoryTokenStore();
+        var claude = new ClaudeAiProvider();
+        var credentials = new CredentialManager(store, new ICredentialProvider[] { claude });
+
+        var providers = new List<ProviderDescriptor>
+        {
+            new("claude-ai", "Claude.ai", LoginKind.OAuthLoopback, "claude-sonnet-4-6"),
+        };
+
+        var session = new SessionState("claude-ai", workingDirectory);
+        var registry = new SlashCommandRegistry(new ISlashCommand[]
+        {
+            new HelpCommand(), new SkillsCommand(), new SkillCommand(), new ExitCommand(),
+        });
+
+        var context = new CommandContext(console, credentials, session, providers, registry);
+        return (console, context);
     }
 }
 

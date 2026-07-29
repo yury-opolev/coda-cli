@@ -83,14 +83,15 @@ public sealed class UserHookRunnerTests
     [Fact]
     public async Task PreToolUse_exec_exception_returns_allow_without_throwing()
     {
-        // A broken hook command must not crash the turn — treat exec failure as Allow
+        // DELIBERATELY CHANGED from Phase 0: exec failures on PreToolUse now BLOCK (fail-closed).
+        // A policy gate that silently permits on error is no gate at all (see §8 of the proposal).
         var runner = new UserHookRunner(
             [new UserHook("PreToolUse", "bad-command", Matcher: null)],
             execOverride: (_, _, _) => throw new InvalidOperationException("process start failed"));
 
         var result = await runner.RunPreToolUseAsync("any_tool", "{}", CancellationToken.None);
 
-        Assert.False(result.Block);
+        Assert.True(result.Block);
     }
 
     [Fact]
@@ -420,6 +421,9 @@ public sealed class AgentLoopUserHookIntegrationTests
         private int turn;
         public string ProviderId => "fake";
 
+        /// <summary>Number of times the loop sampled the model.</summary>
+        public int Calls => this.turn;
+
         public async IAsyncEnumerable<AssistantStreamEvent> StreamAsync(
             ChatRequest request,
             [System.Runtime.CompilerServices.EnumeratorCancellation] CancellationToken cancellationToken = default)
@@ -441,6 +445,7 @@ public sealed class AgentLoopUserHookIntegrationTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class MutatingToolWithFlag : ITool
@@ -527,6 +532,69 @@ public sealed class AgentLoopUserHookIntegrationTests
     }
 
     [Fact]
+    public async Task PreToolUse_continue_false_aborts_the_run_not_just_the_one_tool()
+    {
+        // The scripted client keeps asking for the tool; only a genuine abort ends the run.
+        var toolTurn = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock("tu_1", "danger", "{}")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+
+        var dangerTool = new MutatingToolWithFlag();
+        var client = new ScriptedClient(toolTurn);
+        var userHooks = new UserHookRunner(
+            [new UserHook("PreToolUse", "abort the run", Matcher: null)],
+            execOverride: (_, _, _) => Task.FromResult(
+                (0, "{\"continue\":false,\"stopReason\":\"policy violation\"}")));
+
+        var loop = new AgentLoop(
+            client,
+            new ToolRegistry([dangerTool]),
+            new AllowAllPermissionPrompt(),
+            Options() with { MaxIterations = 5 },
+            userHooks: userHooks);
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("go") };
+        await loop.RunAsync(history, new NullSink(), CancellationToken.None);
+
+        Assert.False(dangerTool.Executed);
+
+        // continue:false aborts the run: the loop must not sample the model again.
+        Assert.Equal(1, client.Calls);
+    }
+
+    [Fact]
+    public async Task PreToolUse_decision_block_only_blocks_the_one_tool_and_the_run_goes_on()
+    {
+        var toolTurn = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock("tu_1", "danger", "{}")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+        var endTurn = new[] { AssistantStreamEvent.Finished("end_turn") };
+
+        var dangerTool = new MutatingToolWithFlag();
+        var client = new ScriptedClient(toolTurn, endTurn);
+        var userHooks = new UserHookRunner(
+            [new UserHook("PreToolUse", "block one", Matcher: null)],
+            execOverride: (_, _, _) => Task.FromResult((1, "hook says no")));
+
+        var loop = new AgentLoop(
+            client,
+            new ToolRegistry([dangerTool]),
+            new AllowAllPermissionPrompt(),
+            Options() with { MaxIterations = 5 },
+            userHooks: userHooks);
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("go") };
+        await loop.RunAsync(history, new NullSink(), CancellationToken.None);
+
+        Assert.False(dangerTool.Executed);
+        Assert.Equal(2, client.Calls);
+    }
+
+    [Fact]
     public async Task No_user_hooks_configured_tool_executes_normally()
     {
         // Regression: null userHooks must not change existing behavior
@@ -603,25 +671,22 @@ public sealed class AgentLoopUserHookIntegrationTests
     }
 
     // -------------------------------------------------------------------------
-    // Timeout path — cancellation notes
+    // Timeout vs. caller cancellation
     // -------------------------------------------------------------------------
-    // NOTE: The real ExecShellAsync re-throws OperationCanceledException when the
-    // caller's token fires (vs. the internal timeout token). Testing that path
-    // end-to-end requires actually spawning a process, which is not feasible
-    // cross-platform in a unit-test suite. Instead we verify the observable
-    // contract via the execOverride: a cancelled execOverride is swallowed (treated
-    // as Allow, same as any exec failure), so the runner always returns a result.
+    // The bus distinguishes the two by inspecting the caller's token in the
+    // `when (!ct.IsCancellationRequested)` filter: an OperationCanceledException raised
+    // while the caller's token is still live is a hook-local timeout (fail-closed for
+    // PreToolUse → block); one raised after the caller cancelled is genuine cancellation
+    // and is re-thrown so the agent loop can unwind.
     [Fact]
-    public async Task PreToolUse_cancelled_exec_override_is_swallowed_and_returns_allow()
+    public async Task PreToolUse_hook_timeout_blocks_fail_closed()
     {
-        using var cts = new CancellationTokenSource();
-
         var runner = new UserHookRunner(
             [new UserHook("PreToolUse", "loop", Matcher: null)],
             execOverride: async (_, _, token) =>
             {
-                // Simulate a long-running hook; throwing OperationCanceledException
-                // from the override goes through the "treat exec failure as Allow" path.
+                // Simulate a hook that exceeds its own timeout while the caller's token
+                // is still live: OperationCanceledException → fail-closed → block.
                 await Task.Delay(1, CancellationToken.None);
                 throw new OperationCanceledException("simulated timeout");
 #pragma warning disable CS0162 // unreachable
@@ -629,9 +694,30 @@ public sealed class AgentLoopUserHookIntegrationTests
 #pragma warning restore CS0162
             });
 
-        // Must not throw — exec failures are swallowed as Allow.
         var result = await runner.RunPreToolUseAsync("any_tool", "{}", CancellationToken.None);
-        Assert.False(result.Block);
+        Assert.True(result.Block);
+    }
+
+    [Fact]
+    public async Task PreToolUse_caller_cancellation_propagates_and_does_not_block()
+    {
+        using var cts = new CancellationTokenSource();
+
+        var runner = new UserHookRunner(
+            [new UserHook("PreToolUse", "loop", Matcher: null)],
+            execOverride: async (_, _, token) =>
+            {
+                // Genuine Ctrl+C: the caller's token is cancelled before the hook faults,
+                // so the bus must re-throw rather than synthesise a block decision.
+                await cts.CancelAsync();
+                token.ThrowIfCancellationRequested();
+#pragma warning disable CS0162 // unreachable
+                return (0, "");
+#pragma warning restore CS0162
+            });
+
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => runner.RunPreToolUseAsync("any_tool", "{}", cts.Token));
     }
 
     // -------------------------------------------------------------------------

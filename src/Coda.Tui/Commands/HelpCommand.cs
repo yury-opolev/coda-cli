@@ -1,3 +1,4 @@
+using Coda.Tui.Commands;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Spectre.Console;
@@ -36,14 +37,34 @@ public sealed class HelpCommand : ISlashCommand
 
     private void ShowList(CommandContext context)
     {
+        var allCommands = context.Commands.ListSorted();
+        var builtIns = allCommands.Where(c => c is not SkillSlashCommand).ToList();
+        var skillCommands = allCommands.OfType<SkillSlashCommand>().ToList();
+
         context.Console.MarkupLine(Theme.BoldMarkup("Commands"));
         var grid = new Grid().AddColumn().AddColumn();
-        foreach (var command in context.Commands.ListSorted())
+        foreach (var command in builtIns)
         {
             grid.AddRow(Theme.AccentMarkup($"/{command.Name}"), Theme.DimMarkup(command.Summary));
         }
 
         context.Console.Write(grid);
+
+        if (skillCommands.Count > 0)
+        {
+            context.Console.WriteLine();
+            context.Console.MarkupLine(Theme.BoldMarkup("Skill commands"));
+            var skillGrid = new Grid().AddColumn().AddColumn();
+            foreach (var command in skillCommands)
+            {
+                skillGrid.AddRow(
+                    Theme.AccentMarkup($"/{command.Name}"),
+                    Theme.DimMarkup(SkillSlashCommand.SkillMarker + command.Summary));
+            }
+
+            context.Console.Write(skillGrid);
+        }
+
         context.Console.WriteLine();
         context.Console.MarkupLine(Theme.DimMarkup("Type /help <command> or /<command> --help for details."));
     }

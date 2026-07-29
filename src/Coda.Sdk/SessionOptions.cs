@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.OutputStyles;
 using Coda.Agent.Settings;
 using LlmClient;
 
@@ -25,6 +26,17 @@ public sealed record SessionOptions
 
     /// <summary>Extra tools beyond the built-ins (e.g. MCP tools).</summary>
     public IReadOnlyList<ITool> ExtraTools { get; init; } = [];
+
+    /// <summary>
+    /// Optional callback invoked after in-loop or pre-turn compaction to obtain skill body content
+    /// that should be re-injected into history. The integer argument is the resolved
+    /// <see cref="AutoCompactTokenThreshold"/> for this turn; the lambda computes the character
+    /// budget via <c>SkillSessionState.DeriveReattachBudget</c> and calls
+    /// <c>SkillSessionState.GetReattachContent</c>. Returns the content to inject, or null/empty
+    /// when nothing needs re-injecting. Wires the <see cref="Coda.Tui.Skills.SkillSessionState"/>
+    /// into the compaction path without creating a dependency on <c>Coda.Tui</c> in this assembly.
+    /// </summary>
+    public Func<int, string>? SkillReattachContentProvider { get; init; }
 
     /// <summary>Interactive prompt used when the mode decides to Ask. Null = headless (Ask denies).</summary>
     public IPermissionPrompt? InteractivePrompt { get; init; }
@@ -77,6 +89,14 @@ public sealed record SessionOptions
     public string? OutputStyle { get; init; }
 
     /// <summary>
+    /// Session-scoped plugin output styles for this session. Checked before the static process-global
+    /// registry so serve sessions with different working directories resolve only their own plugin styles.
+    /// Empty by default (no plugin styles); the TUI/headless paths may populate this from
+    /// <see cref="Coda.Tui.Plugins.PluginComposition.OutputStyles"/> at session construction.
+    /// </summary>
+    public IReadOnlyList<OutputStyle> PluginOutputStyles { get; init; } = [];
+
+    /// <summary>
     /// Complete exact root system prompt. Null uses normal Coda construction; empty and whitespace are exact values.
     /// </summary>
     public string? SystemPromptOverride { get; init; }
@@ -103,4 +123,22 @@ public sealed record SessionOptions
     /// here, inside the client — not by any turn-level watchdog.
     /// </summary>
     public LlmHttpTimeoutConfig? LlmHttpTimeoutOverride { get; init; }
+
+    /// <summary>
+    /// Optional session source label for the <c>SessionStart</c> hook payload. When set, this
+    /// value is emitted as the <c>source</c> field instead of the default "new". Callers that
+    /// create sessions for a specific lifecycle context (e.g. a scheduled run) pass
+    /// <c>"scheduled"</c> here so hooks can distinguish those sessions from interactive ones.
+    /// Null emits "new" (the default). "resume" is set automatically when
+    /// <see cref="CodaSession.Resume"/> is called, regardless of this property.
+    /// </summary>
+    public string? SessionSource { get; init; }
+
+    /// <summary>
+    /// Factory that returns the current set of additional filesystem roots the file tools may
+    /// access beyond <see cref="WorkingDirectory"/>. Invoked per tool-batch so grants made
+    /// mid-session take effect on the next batch. Null means no additional roots.
+    /// Populated from <c>SkillSessionState.GetGrantedDirectories</c> at composition time.
+    /// </summary>
+    public Func<IReadOnlySet<string>?>? GrantedDirectoriesSource { get; init; }
 }

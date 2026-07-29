@@ -3,6 +3,7 @@ using Coda.Agent.Tasks;
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
+using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
 using Coda.Agent.ToolSearch;
 using Coda.Agent.Tools;
@@ -64,7 +65,7 @@ public sealed record AgentLoopSpec(
     LspDiagnosticRegistry? LspDiagnostics,
     ToolSearchCoordinator? ToolSearch,
     GoalSupervisor? Goal,
-    Func<List<ChatMessage>, CancellationToken, Task>? CompactAsync,
+    Func<List<ChatMessage>, IAgentSink, CancellationToken, Task<bool>>? CompactAsync,
     ILogger Logger,
     SteeringInbox? Steering = null,
     Func<CancellationToken, Task>? PersistTurnAsync = null,
@@ -79,4 +80,19 @@ public sealed record AgentLoopSpec(
     /// a single activity id from it when it executes the first tool batch.
     /// </summary>
     public ToolActivityContext? ToolActivity { get; init; }
+
+    /// <summary>
+    /// The live permission rule store shared with the permission prompt. The loop reads it to
+    /// compute the <c>matchedRule</c> field of the <c>PermissionRequest</c> hook payload and
+    /// mutates it when a hook returns session-scoped <c>updatedPermissions</c>.
+    /// </summary>
+    public PermissionRuleStore? PermissionRules { get; init; }
+
+    /// <summary>
+    /// Factory that returns the current set of additional filesystem roots the file tools may
+    /// access beyond the working directory. Invoked per tool-batch so grants made mid-session
+    /// take effect on the next batch. Null means no additional roots (the default).
+    /// Populated from skill directory-consent grants via <c>SkillSessionState.GetGrantedDirectories</c>.
+    /// </summary>
+    public Func<IReadOnlySet<string>?>? GrantedDirectoriesSource { get; init; }
 }

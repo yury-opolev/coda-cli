@@ -149,6 +149,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
     private readonly IUiEventPublisher events;
     private readonly IMcpConfigMutator configMutator;
     private readonly Action? afterPreparationEntriesRead;
+    private readonly IReadOnlyDictionary<string, McpServerConfig>? pluginMcpServers;
     private readonly SemaphoreSlim mutationGate = new(1, 1);
     private readonly HashSet<Guid> completedOperations = [];
 
@@ -160,7 +161,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
         IMcpOAuthReauthenticator oauth,
         IUiEventPublisher events,
         IMcpConfigMutator? configMutator = null,
-        Action? afterPreparationEntriesRead = null)
+        Action? afterPreparationEntriesRead = null,
+        IReadOnlyDictionary<string, McpServerConfig>? pluginMcpServers = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
         this.workingDirectory = workingDirectory;
@@ -171,6 +173,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
         this.events = events ?? throw new ArgumentNullException(nameof(events));
         this.configMutator = configMutator ?? McpConfigWriterMutator.Instance;
         this.afterPreparationEntriesRead = afterPreparationEntriesRead;
+        this.pluginMcpServers = pluginMcpServers;
     }
 
     public event Action? Changed;
@@ -408,7 +411,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             }
         }
 
-        var servers = McpConfig.Load(this.workingDirectory, this.userMcpDir);
+        var servers = McpConfig.LoadWithPlugins(this.workingDirectory, this.pluginMcpServers, this.userMcpDir);
         var resolvedServers = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
         var errors = new List<string>();
         foreach (var (serverName, rawConfig) in servers)
@@ -2140,7 +2143,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
     private IReadOnlyDictionary<string, McpServerConfig> LoadEffectiveConfigsForMutation()
     {
         this.ValidatePhysicalConfiguration(CancellationToken.None);
-        return McpConfig.Load(this.workingDirectory, this.userMcpDir);
+        return McpConfig.LoadWithPlugins(this.workingDirectory, this.pluginMcpServers, this.userMcpDir);
     }
 
     private bool RemoveWithExpectedRevision(

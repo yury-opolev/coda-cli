@@ -23,6 +23,8 @@ namespace Coda.Tui.Agent;
 public sealed class AgentRunner : IDisposable
 {
     private readonly Func<IReadOnlyList<ITool>>? extraToolsProvider;
+    private readonly Func<int, string>? skillReattachProvider;
+    private readonly Func<IReadOnlySet<string>?>? grantedDirectoriesSource;
     private readonly Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory;
     private readonly TimeProvider timeProvider;
     private readonly object turnGate = new();
@@ -45,12 +47,28 @@ public sealed class AgentRunner : IDisposable
     {
     }
 
+    /// <summary>
+    /// Creates an <see cref="AgentRunner"/> with an optional skill reattach content provider and
+    /// an optional granted-directories source for skill directory-consent enforcement.
+    /// </summary>
+    public AgentRunner(
+        Func<IReadOnlyList<ITool>>? extraToolsProvider,
+        Func<int, string>? skillReattachProvider,
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null)
+        : this(extraToolsProvider, DefaultSessionFactory, null, skillReattachProvider, grantedDirectoriesSource)
+    {
+    }
+
     internal AgentRunner(
         Func<IReadOnlyList<ITool>>? extraToolsProvider,
         Func<CommandContext, SessionOptions, Func<SessionOptions>, CodaSession> sessionFactory,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        Func<int, string>? skillReattachProvider = null,
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null)
     {
         this.extraToolsProvider = extraToolsProvider;
+        this.skillReattachProvider = skillReattachProvider;
+        this.grantedDirectoriesSource = grantedDirectoriesSource;
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.timeProvider = timeProvider ?? TimeProvider.System;
     }
@@ -145,6 +163,25 @@ public sealed class AgentRunner : IDisposable
     /// <summary>A fresh copy of the current session runtime snapshot, or null before the first turn.</summary>
     public SessionRuntimeSnapshot? GetRuntimeSnapshot() => this.session?.GetRuntimeSnapshot();
 
+    /// <summary>
+    /// Sets the reason reported in the <c>SessionEnd</c> hook payload. Call before <see cref="Dispose"/>
+    /// to override the default <c>"exit"</c> — e.g. <c>"interrupt"</c> for a keyboard-chord exit,
+    /// <c>"error"</c> for an unrecoverable failure, or <c>"shutdown"</c> for a process-exit signal.
+    /// No-op when called before the session is created.
+    /// </summary>
+    public void SetSessionEndReason(string reason) => this.session?.SetSessionEndReason(reason);
+
+    /// <summary>
+    /// Fires the <c>SessionEnd</c> hook immediately, bounded by its 2 s deadline, without waiting for
+    /// the full session disposal. This is the process-exit path: it lets the hook run within the
+    /// <c>AppDomain.ProcessExit</c> budget even when the main-thread <c>using</c> block may not unwind
+    /// in time. Safe to call concurrently with <see cref="Dispose"/>: the underlying idempotency guard
+    /// ensures the hook fires at most once regardless of call order.
+    /// No-op when called before the session is created.
+    /// </summary>
+    public Task TriggerSessionEndAsync() =>
+        this.session?.TriggerSessionEndAsync() ?? Task.CompletedTask;
+
     public async Task RunAsync(CommandContext context, string prompt, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(context);
@@ -156,7 +193,7 @@ public sealed class AgentRunner : IDisposable
             // status reflect the in-flight turn immediately. The send time is captured here (local) from the
             // injected TimeProvider so the transcript's send-time indicator is stable across redraws/resume.
             context.Events.Publish(new UserPromptSubmittedEvent(prompt, this.timeProvider.GetLocalNow()));
-            context.Events.Publish(new TurnStartedEvent(prompt));
+            context.Events.Publish(new TurnStartedEvent(prompt, this.timeProvider.GetUtcNow()));
 
             await this.EnsureSessionAsync(context, turnCts.Token).ConfigureAwait(false);
 
@@ -469,6 +506,10 @@ public sealed class AgentRunner : IDisposable
         PermissionModeState = context.Session.PermissionModes,
         // Re-read each turn so /mcp start|stop changes take effect from the next turn.
         ExtraTools = this.extraToolsProvider?.Invoke() ?? [],
+        // Stable callback captured once at construction; null when no skill state is wired.
+        SkillReattachContentProvider = this.skillReattachProvider,
+        // Stable factory captured at construction; null when no skill state is wired.
+        GrantedDirectoriesSource = this.grantedDirectoriesSource,
         InteractivePrompt = new TuiPermissionPrompt(context.Prompts, context.Events),
         UserQuestionPrompt = context.Prompts.IsInteractive
             ? new TuiUserQuestionPrompt(context.Prompts, context.Events)

@@ -35,7 +35,13 @@ public sealed class CompactCommand : ISlashCommand
         };
 
         context.Console.MarkupLine($"{Theme.DimMarkup("Compacting…")}");
-        using var session = new CodaSession(context.Credentials, options, history: context.Session.History);
+        using var session = new CodaSession(
+            context.Credentials,
+            options,
+            history: context.Session.History,
+            hookList: context.HookManagement?.Hooks,
+            trustGuard: context.HookManagement?.TrustGuard,
+            runLog: context.HookManagement?.RunLog);
         await session.CompactAsync(cancellationToken).ConfigureAwait(false);
 
         context.Console.MarkupLine($"{Theme.DimMarkup($"Conversation compacted ({context.Session.History.Count} messages kept).")}");

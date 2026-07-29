@@ -203,7 +203,7 @@ public sealed class RuntimeSnapshotTests
 
         public GoalStatus? LastGoalStatus { get; }
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             sink.OnAssistantText("ok");
             sink.OnAssistantTextComplete();
@@ -212,3 +212,4 @@ public sealed class RuntimeSnapshotTests
         }
     }
 }
+

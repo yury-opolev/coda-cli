@@ -170,6 +170,64 @@ public sealed class TstAutoThresholdTests
         Assert.NotNull(reminder);
     }
 
+    // ── G. Always-inline tools count towards the footprint ───────────────────
+
+    [Fact]
+    public void TstAuto_counts_always_inline_tool_definitions_in_the_budget()
+    {
+        // The skill tool is never deferred, yet its catalogue description can reach ~8 000
+        // characters of context. The TstAuto trigger measures the whole tool-definition
+        // footprint, so a large always-inline tool pushes a small deferred set over the line.
+        //
+        // threshold = floor(400 * (10/100.0) * 2.5) = 100 chars
+        // deferred alone: "mcp__x__tool"(12) + "d"(1) + "{}"(2) = 15  → below on its own
+        // plus always-inline: tool_search(17) + read_file(15) + skill catalogue(> 100) → above
+        var registry = new ToolRegistry([
+            MakeNonDeferredTool("tool_search"),
+            MakeNonDeferredTool("read_file"),
+            new StubTool("skill", new string('x', 200), "{}", shouldDefer: false),
+            MakeDeferredTool("mcp__x__tool", "d", "{}"),
+        ]);
+
+        var coordinator = new ToolSearchCoordinator(
+            ToolSearchMode.TstAuto, autoPercent: 10, contextWindowTokens: 400);
+
+        var wireNames = coordinator.BuildWireDefinitions(registry)
+            .Select(d => d.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.DoesNotContain("mcp__x__tool", wireNames);
+        Assert.Contains("skill", wireNames);
+        Assert.Contains("tool_search", wireNames);
+
+        var reminder = coordinator.BuildDeferredToolsReminder(registry);
+        Assert.NotNull(reminder);
+        Assert.Contains("mcp__x__tool", reminder);
+    }
+
+    [Fact]
+    public void TstAuto_stays_inline_when_the_whole_footprint_is_small()
+    {
+        // Same registry shape without the oversized always-inline description: the total
+        // footprint stays under the threshold, so nothing is deferred.
+        var registry = new ToolRegistry([
+            MakeNonDeferredTool("tool_search"),
+            MakeNonDeferredTool("read_file"),
+            new StubTool("skill", "small catalogue", "{}", shouldDefer: false),
+            MakeDeferredTool("mcp__x__tool", "d", "{}"),
+        ]);
+
+        var coordinator = new ToolSearchCoordinator(
+            ToolSearchMode.TstAuto, autoPercent: 10, contextWindowTokens: 400);
+
+        var wireNames = coordinator.BuildWireDefinitions(registry)
+            .Select(d => d.Name)
+            .ToHashSet(StringComparer.Ordinal);
+
+        Assert.Contains("mcp__x__tool", wireNames);
+        Assert.Null(coordinator.BuildDeferredToolsReminder(registry));
+    }
+
     // ── test helpers ─────────────────────────────────────────────────────────
 
     private sealed class StubTool : ITool

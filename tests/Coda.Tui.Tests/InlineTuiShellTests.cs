@@ -58,7 +58,8 @@ internal static class ShellTestFactory
             publisher ?? new RecordingUiEvents(),
             UiSessionSnapshot.Empty);
 }
-
+
+[Collection("TerminalGuiInit")]
 public sealed class InlineTuiShellTests
 {
     private static ImmutableArray<TranscriptBlock> Lines(int count) =>

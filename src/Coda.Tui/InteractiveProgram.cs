@@ -1,9 +1,13 @@
 using Coda.Agent;
+using Coda.Agent.Hooks;
+using Coda.Agent.Subagents;
 using Coda.Mcp.Auth;
 using Coda.Sdk;
 using Coda.Tui.Clipboard;
+using Coda.Tui.Commands;
 using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
+using Coda.Tui.Plugins;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Setup;
@@ -23,6 +27,7 @@ using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
+using Microsoft.Extensions.Logging;
 using Spectre.Console;
 
 namespace Coda.Tui;
@@ -280,19 +285,129 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             new Coda.Mcp.ListMcpResourcesTool(mcp), new Coda.Mcp.ReadMcpResourceTool(mcp),
             new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp),
         ];
+
+        // Construct the plugin state store once — shared across all plugin commands and skill loading.
+        var userCodaDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
+        var pluginStateStore = new Coda.Tui.Plugins.PluginStateStore(userCodaDir);
+
+        // Load and compose plugins for this working directory.
+        var plugins = PluginLoader.Load(cwd);
+
+        // Construct the plugin trust store (same home-directory convention as /plugin command).
+        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var pluginTrustStore = new Coda.Tui.Plugins.PluginTrustStore(homeDir);
+
+        // Prompt for workspace trust when there are project-scoped plugins not yet trusted.
+        // This runs before the TUI actor starts so we use a direct Spectre.Console prompt.
+        if (plugins.Any(p => p.IsEnabled && Coda.Tui.Plugins.PluginComponentComposer.IsProjectPlugin(p, cwd))
+            && !pluginTrustStore.IsWorkspaceTrusted(cwd))
+        {
+            var grant = AnsiConsole.Confirm(
+                "This workspace has project plugins. Trust this workspace to activate them?",
+                defaultValue: false);
+            if (grant)
+            {
+                pluginTrustStore.TrustWorkspace(cwd);
+            }
+        }
+
+        var pluginComposition = PluginComponentComposer.Compose(plugins, cwd, trustStore: pluginTrustStore);
+        var pluginRegistry = pluginComposition.Agents.Count > 0
+            ? new SubagentRegistry(pluginComposition.Agents)
+            : null;
+        var pluginMcpServers = pluginComposition.McpServers.Count > 0
+            ? pluginComposition.McpServers.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Config)
+            : (IReadOnlyDictionary<string, Coda.Mcp.McpServerConfig>?)null;
+
+        // Load skills once at session start and build the skill tool (model-invocable skills only).
+        // The session state is shared between the skill tool and the reattach callback so compaction
+        // re-injects exactly the bodies the model loaded in this session.
+        var skillState = new Coda.Tui.Skills.SkillSessionState();
+        var loadedSkills = Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore);
+        // Gate model invocations of Claude/Plugin-origin skills behind an interactive prompt.
+        // The lambda closes over actorPrompts; it is called only during live session turns
+        // (when the UI actor is already running), so there is no startup-time deadlock.
+        var skillOriginGate = new Coda.Tui.Skills.SkillOriginGate(
+            skillState,
+            promptCallback: async (skill, ct) =>
+            {
+                var response = await actorPrompts.RequestAsync(
+                    UiPromptRequest.Confirm(
+                        $"Trust skill? Origin: {skill.Origin}  Name: {skill.Name}",
+                        defaultValue: false),
+                    ct).ConfigureAwait(false);
+                return !response.Cancelled && response.SelectedIds.Contains("yes");
+            });
+        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
+            loadedSkills, skillState, cwd, originGate: skillOriginGate);
+
+        // Phase 5: register user-invocable skills as first-class /<name> slash commands.
+        // Plugin commands (loaded in pluginComposition.Commands) are registered alongside them
+        // so every enabled, approved plugin command becomes reachable as /<name> in the session.
+        // Thread a real logger so collision and name-validation warnings appear as TUI
+        // diagnostic notifications, visible to the skill author.
+        var skillCollisionLogger = new MailboxWarningLogger(mailbox);
+        registry.ReplaceAll(SlashCommandCatalog.CreateWithSkillsAndPluginCommands(
+            loadedSkills, pluginComposition.Commands, skillCollisionLogger));
+
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
-            mcp.Clients.Count > 0 ? [.. mcp.Tools, .. mcpHelperTools] : [];
+        {
+            var mcpTools = mcp.Clients.Count > 0
+                ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, .. mcpHelperTools]
+                : [];
+            return skillTool is not null ? [.. mcpTools, skillTool] : mcpTools;
+        };
         context.ExtraToolsProvider = agentToolsProvider;
         context.Mcp = mcp;
         context.CredentialStore = store;
+        context.PluginState = pluginStateStore;
         var mcpManagement = new McpManagementService(
             cwd,
             userMcpDir: null,
             mcp,
             store,
             new DefaultMcpOAuthReauthenticator(mcpHttp, store),
-            mailbox);
+            mailbox,
+            pluginMcpServers: pluginMcpServers);
         context.McpManagement = mcpManagement;
+
+        // Build the session-stable hook collaborators: a mutable hook list (frozen from startup
+        // settings), a shared run log, and a trust guard backed by the interactive prompt service.
+        // The same instances are given to both the session (via its CodaSession constructor) and
+        // HookManagementService so /hooks enable/disable and /hooks info operate on the live data.
+        // Plugin hooks are prepended so they are subject to the same trust guard as user hooks.
+        var hookList = pluginComposition.Hooks.Count > 0
+            ? new List<UserHook>([.. pluginComposition.Hooks, .. startupSettings.Hooks])
+            : new List<UserHook>(startupSettings.Hooks);
+        var hookRunLog = new HookRunLog();
+        var hookTrustStore = new HookTrustStore();
+        var hookTrustGuard = new HookTrustGuard(
+            hookTrustStore,
+            cwd,
+            promptCallback: async (hook, ct) =>
+            {
+                var response = await actorPrompts.RequestAsync(
+                    UiPromptRequest.Confirm(
+                        $"Trust project hook? Event: {hook.Event}  Handler: {hook.HandlerType ?? "command"}  Command: {hook.Command ?? hook.Url ?? "[" + hook.HandlerType + "]"}",
+                        defaultValue: false),
+                    ct).ConfigureAwait(false);
+                return !response.Cancelled && response.SelectedIds.Contains("yes");
+            });
+        var hookManagement = new Coda.Tui.Commands.HookManagementService(
+            hookList,
+            hookRunLog,
+            userSettingsDir: null,
+            trustGuard: hookTrustGuard);
+        context.HookManagement = hookManagement;
+
+        // Compute the static display-buffering flag from the MERGED hook set (§8.1, LOW-3 fix).
+        // Must be computed AFTER plugin hooks are merged into hookList so a plugin-contributed
+        // AgentResponse hook with mutates:["modifiedResponse"] is included. This is read once here
+        // at the composition root; the reducer/actor receive a plain bool.
+        var bufferAssistantText = hookList.Count > 0
+            && new UserHookRunner(hookList).AnyHookMutatesDisplay;
+        var initialSnapshot = UiSessionSnapshot.Empty with { BufferAssistantText = bufferAssistantText };
 
         // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
         // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only
@@ -313,7 +428,33 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             }
         }, hostToken);
 
-        using var agentRunner = new AgentRunner(agentToolsProvider);
+        var capturedHookList = hookList;
+        var capturedRunLog = hookRunLog;
+        var capturedTrustGuard = hookTrustGuard;
+        var capturedRegistry = pluginRegistry;
+        var capturedPluginOutputStyles = pluginComposition.OutputStyles;
+        Func<int, string>? skillReattach = skillTool is not null
+            ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+            : null;
+        Func<IReadOnlySet<string>?>? grantedDirs = skillTool is not null
+            ? () => skillState.GetGrantedDirectories()
+            : null;
+        using var agentRunner = new AgentRunner(
+            agentToolsProvider,
+            sessionFactory: (ctx, opts, currentOpts) =>
+                new CodaSession(
+                    ctx.Credentials,
+                    opts with { PluginOutputStyles = capturedPluginOutputStyles },
+                    history: ctx.Session.History,
+                    sessionId: ctx.Session.SessionId,
+                    currentOptionsProvider: currentOpts,
+                    hookList: capturedHookList,
+                    runLog: capturedRunLog,
+                    trustGuard: capturedTrustGuard,
+                    subagentRegistry: capturedRegistry),
+            timeProvider: null,
+            skillReattachProvider: skillReattach,
+            grantedDirectoriesSource: grantedDirs);
         using var app = new TuiApp(context, agentToolsProvider, agentRunner: agentRunner);
 
         // The command context and the browser both read the live session through agentRunner (a provider,
@@ -332,7 +473,17 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 ? new Coda.Tui.Ui.Schedule.ScheduleBrowserProvider(() => sc, actorPrompts)
                 : null;
 
-        using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, UiSessionSnapshot.Empty, hostToken);
+        // Skill and plugin browsers scan the live working directory on Open; the state/trust stores
+        // and updater are the same singletons the /skills and /plugin commands use, so overlay actions
+        // and typed subcommands stay consistent.
+        var pluginUpdater = new Coda.Tui.Plugins.PluginUpdater(userCodaDir);
+        Func<Coda.Tui.Ui.Skills.SkillBrowserProvider?> skillsBrowserProvider = () =>
+            new Coda.Tui.Ui.Skills.SkillBrowserProvider(context.Session.WorkingDirectory, pluginStateStore);
+        Func<Coda.Tui.Ui.Plugins.PluginBrowserProvider?> pluginBrowserProvider = () =>
+            new Coda.Tui.Ui.Plugins.PluginBrowserProvider(
+                context.Session.WorkingDirectory, pluginStateStore, pluginTrustStore, pluginUpdater);
+
+        using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, initialSnapshot, hostToken);
         var mcpBrowserProvider = InteractiveProgram.CreateMcpBrowserProvider(
             mcpManagement, actorPrompts, controller);
 
@@ -344,7 +495,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // The single actor keeps one switchable frame/observer sink for the whole session.
         var frameSink = new SwitchableUiFrameSink();
         var observer = new SwitchableUiEventObserver();
-        var actor = new UiActor(mailbox, frameSink, UiSessionSnapshot.Empty, observer, actorPrompts);
+        var actor = new UiActor(mailbox, frameSink, initialSnapshot, observer, actorPrompts);
         var actorTask = RunActorAsync(actor, error, hostToken);
 
         // Semantic commands (e.g. /status) and metadata republishes read the live actor snapshot, so
@@ -364,7 +515,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             try
             {
                 await SeedSessionAsync(context, options, mailbox, hostToken).ConfigureAwait(false);
-                await ConnectMcpAsync(context, mcp, store, mailbox, hostToken).ConfigureAwait(false);
+                await ConnectMcpAsync(context, mcp, store, mailbox, pluginMcpServers, hostToken).ConfigureAwait(false);
                 var ranSetup = await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
                 if (!ranSetup)
                 {
@@ -499,6 +650,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 mcpBrowserProvider: mcpBrowserProvider,
                 toolDisplayMode: toolDisplayMode,
                 scheduleBrowserProvider: scheduleBrowserProvider,
+                skillsBrowserProvider: skillsBrowserProvider,
+                pluginBrowserProvider: pluginBrowserProvider,
                 urlOpener: DefaultUrlOpener.Instance,
                 privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
                 linkPromptService: actorPrompts,
@@ -546,7 +699,22 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             ShellFactory,
             RunSpectreSessionAsync,
             RunPlainSessionAsync,
-            mouseDisabled: options.MouseDisabled);
+            mouseDisabled: options.MouseDisabled,
+            onProcessExit: () =>
+            {
+                // Process-exit path (SIGTERM / Ctrl-Break / container-stop): fire SessionEnd
+                // with reason "shutdown" before RequestStop tears down the TUI.  Bounded at
+                // 2 s so it never holds up the OS-imposed exit deadline.
+                agentRunner.SetSessionEndReason("shutdown");
+                try
+                {
+                    agentRunner.TriggerSessionEndAsync().Wait(TimeSpan.FromSeconds(2));
+                }
+                catch
+                {
+                    // Fail-open: never propagate from a process-exit callback.
+                }
+            });
         var host = new TuiHost(modeRunner, error, mailbox);
 
         return await this.RunHostToCleanExitAsync(
@@ -564,7 +732,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 await actorTask.ConfigureAwait(false);
             },
             hostToken,
-            cancellationToken).ConfigureAwait(false);
+            cancellationToken,
+            onExhausted: () => agentRunner.SetSessionEndReason("error")).ConfigureAwait(false);
     }
 
     internal static SessionState CreateSessionState(string providerId, TuiLaunchOptions options) =>
@@ -637,7 +806,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         Func<CancellationToken, Task> flushUi,
         Func<Task> finalize,
         CancellationToken hostToken,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        Action? onExhausted = null)
     {
         ArgumentNullException.ThrowIfNull(host);
         ArgumentNullException.ThrowIfNull(context);
@@ -669,6 +839,12 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             if (outcome == TuiHostOutcome.Exited)
             {
                 this.RenderExitSummary(context, exitConsole, startedAt);
+            }
+            else if (outcome == TuiHostOutcome.Exhausted)
+            {
+                // All fallback shells failed: the session ended unrecoverably.  Set the reason
+                // BEFORE the using-block disposes the session so SessionEnd carries "error".
+                onExhausted?.Invoke();
             }
         }
         finally
@@ -793,9 +969,10 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
     /// <summary>Connect configured MCP servers, routing status through MCP diagnostics.</summary>
     private static async Task ConnectMcpAsync(
-        CommandContext context, Coda.Mcp.McpClientManager mcp, ITokenStore store, UiEventMailbox mailbox, CancellationToken ct)
+        CommandContext context, Coda.Mcp.McpClientManager mcp, ITokenStore store, UiEventMailbox mailbox,
+        IReadOnlyDictionary<string, Coda.Mcp.McpServerConfig>? pluginMcpServers, CancellationToken ct)
     {
-        var mcpServers = Coda.Mcp.McpConfig.Load(context.Session.WorkingDirectory);
+        var mcpServers = Coda.Mcp.McpConfig.LoadWithPlugins(context.Session.WorkingDirectory, pluginMcpServers);
         if (mcpServers.Count == 0)
         {
             return;
@@ -879,4 +1056,34 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
     private int OffscreenHeight() => Math.Max(this.capabilities.Height, 24);
 }
 
+/// <summary>
+/// Minimal <see cref="ILogger"/> adapter that routes <see cref="LogLevel.Warning"/> and above
+/// to the <see cref="UiEventMailbox"/> as <see cref="DiagnosticEvent"/> notifications, so skill
+/// collision and name-validation warnings appear in the TUI diagnostic feed at session startup.
+/// </summary>
+file sealed class MailboxWarningLogger(UiEventMailbox mailbox) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel >= LogLevel.Warning)
+        {
+            try
+            {
+                mailbox.Publish(new DiagnosticEvent("skills", formatter(state, exception), UiNotificationLevel.Warning));
+            }
+            catch (ObjectDisposedException)
+            {
+                // Mailbox disposed during shutdown — silently discard.
+            }
+        }
+    }
+}

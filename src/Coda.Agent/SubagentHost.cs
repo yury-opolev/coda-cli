@@ -22,6 +22,7 @@ public sealed class SubagentHost : ISubagentHost
     private readonly UserHookRunner? userHooks;
     private readonly TaskManager tasks;
     private readonly TimeSpan? toolProgressInterval;
+    private readonly SubagentRegistry? subagentRegistry;
 
     public SubagentHost(
         ILlmClient client,
@@ -31,7 +32,8 @@ public sealed class SubagentHost : ISubagentHost
         TaskManager tasks,
         bool includeAnthropicSystemPrefix = true,
         UserHookRunner? userHooks = null,
-        TimeSpan? toolProgressInterval = null)
+        TimeSpan? toolProgressInterval = null,
+        SubagentRegistry? subagentRegistry = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -44,7 +46,11 @@ public sealed class SubagentHost : ISubagentHost
         // regression test can observe a pulse without waiting the production default. Null in
         // production → the child loop uses AgentLoop's own default interval.
         this.toolProgressInterval = toolProgressInterval;
+        this.subagentRegistry = subagentRegistry;
     }
+
+    /// <summary>Test seam: exposes the registry so integration tests can verify it was wired.</summary>
+    internal SubagentRegistry? SubagentRegistryForTest => this.subagentRegistry;
 
     /// <summary>
     /// The permission prompt shared with the parent loop. Subagents (foreground and background)
@@ -52,6 +58,15 @@ public sealed class SubagentHost : ISubagentHost
     /// observed by their next permission decision too.
     /// </summary>
     internal IPermissionPrompt Permissions => this.permissions;
+
+    /// <summary>Exposes the subagent tool registry for test inspection.</summary>
+    internal ToolRegistry SubagentTools => this.subagentTools;
+
+    /// <summary>
+    /// True when this host was constructed without a user hook runner.
+    /// Structural guarantee that hook-spawned subagents cannot trigger hooks recursively.
+    /// </summary>
+    internal bool IsHookFree => this.userHooks is null;
 
     public Task<string> RunSubagentAsync(
         string subagentType,
@@ -71,6 +86,27 @@ public sealed class SubagentHost : ISubagentHost
             parentActivity: null,
             cancellationToken: cancellationToken);
 
+    public Task<string> RunSubagentAsync(
+        string subagentType,
+        string prompt,
+        IAgentSink sink,
+        SteeringInbox steering,
+        string taskId,
+        int depth,
+        ToolActivityContext? parentActivity,
+        CancellationToken cancellationToken = default) =>
+        this.RunSubagentAsync(
+            subagentType,
+            prompt,
+            sink,
+            steering,
+            taskId,
+            depth,
+            parentActivity,
+            parentToolRestriction: null,
+            cancellationToken: cancellationToken);
+
+    /// <inheritdoc/>
     public async Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,
@@ -79,14 +115,81 @@ public sealed class SubagentHost : ISubagentHost
         string taskId,
         int depth,
         ToolActivityContext? parentActivity,
+        TurnShape? parentToolRestriction,
         CancellationToken cancellationToken = default)
     {
-        var definition = BuiltInAgents.Resolve(subagentType);
+        var definition = this.subagentRegistry?.Resolve(subagentType) ?? BuiltInAgents.Resolve(subagentType);
         var prefix = this.includeAnthropicSystemPrefix ? AnthropicModels.AnthropicSystemPrefix + "\n\n" : string.Empty;
         var systemPrompt = prefix
             + definition.SystemPromptBody
             + "\n\n# Environment\nWorking directory: "
             + this.baseOptions.WorkingDirectory;
+
+        // SubagentStart hook: fires before the first model call. Fail-closed: a broken hook
+        // blocks the subagent from running so it can never run unshaped.
+        var effectivePrompt = prompt;
+        var effectiveParentRestriction = parentToolRestriction;
+        string? appendSystemPromptFromHook = null;
+
+        if (this.userHooks is { HasSubagentStart: true })
+        {
+            var parentTaskId = this.tasks.Find(taskId)?.ParentId;
+            var childTools = ResolveChildTools(this.subagentTools, definition.ReadOnlyToolsOnly, depth);
+            var toolNames = childTools.All.Select(static t => t.Name).ToList();
+
+            SubagentStartResult startResult;
+            try
+            {
+                startResult = await this.userHooks.RunSubagentStartAsync(
+                    parentTaskId,
+                    taskId,
+                    depth,
+                    effectivePrompt,
+                    toolNames,
+                    parentToolRestriction,
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                // Fail-closed: an unexpected failure blocks the subagent.
+                throw new SubagentStartBlockedException($"SubagentStart hook failed: {ex.Message}");
+            }
+
+            if (startResult.Block)
+            {
+                sink.OnSubagentBlocked(startResult.ByHookCommand ?? string.Empty, taskId, startResult.Reason ?? "blocked by SubagentStart hook");
+                throw new SubagentStartBlockedException(startResult.Reason ?? "blocked by SubagentStart hook");
+            }
+
+            if (startResult.ModifiedPrompt is not null)
+            {
+                effectivePrompt = startResult.ModifiedPrompt;
+            }
+
+            if (startResult.AdditionalContext is not null)
+            {
+                effectivePrompt = startResult.AdditionalContext + "\n\n" + effectivePrompt;
+            }
+
+            if (startResult.AppendSystemPrompt is not null)
+            {
+                appendSystemPromptFromHook = startResult.AppendSystemPrompt;
+            }
+
+            if (startResult.Shape is not null)
+            {
+                effectiveParentRestriction = startResult.Shape;
+            }
+        }
+
+        if (appendSystemPromptFromHook is not null)
+        {
+            systemPrompt += "\n\n" + appendSystemPromptFromHook;
+        }
 
         var options = this.baseOptions with
         {
@@ -130,13 +233,66 @@ public sealed class SubagentHost : ISubagentHost
             toolProgressInterval: this.toolProgressInterval,
             toolActivity: childActivity);
 
-        var collecting = new CollectingSink(sink);
-        var history = new List<ChatMessage> { ChatMessage.UserText(prompt) };
+        // SubagentStop continuation loop: re-runs the agent when a Stop hook forces continuation.
+        // The outer SubagentStop counter (subagentStopContinuations) and the inner in-loop Stop
+        // hook counter are independent; the effective bound is outer × inner (multiplicative), which
+        // is still finite but potentially larger than MaxStopContinuations alone.
+        var subagentStopContinuations = 0;
+        string result;
 
-        await loop.RunAsync(history, collecting, cancellationToken).ConfigureAwait(false);
+        var history = new List<ChatMessage> { ChatMessage.UserText(effectivePrompt) };
 
-        var text = collecting.CollectedText;
-        return text.Length == 0 ? "(subagent produced no text output)" : text;
+        while (true)
+        {
+            var collecting = new CollectingSink(sink);
+
+            await loop.RunAsync(history, collecting, cancellationToken, shape: effectiveParentRestriction).ConfigureAwait(false);
+
+            var text = collecting.CollectedText;
+            result = text.Length == 0 ? "(subagent produced no text output)" : text;
+
+            if (this.userHooks is { HasSubagentStop: true }
+                && subagentStopContinuations < this.baseOptions.MaxStopContinuations)
+            {
+                SubagentStopResult stopResult;
+                try
+                {
+                    stopResult = await this.userHooks.RunSubagentStopAsync(
+                        taskId,
+                        depth,
+                        result,
+                        collecting.CapturedUsage,
+                        cancellationToken).ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch
+                {
+                    // Fail-open: a broken SubagentStop hook leaves the result intact.
+                    break;
+                }
+
+                if (stopResult.ModifiedResult is not null)
+                {
+                    var originalResult = result;
+                    result = stopResult.ModifiedResult;
+                    sink.OnSubagentResultModified(stopResult.ByHookCommand ?? string.Empty, taskId, originalResult, stopResult.ModifiedResult);
+                }
+
+                if (stopResult.Block && !string.IsNullOrWhiteSpace(stopResult.Reason))
+                {
+                    history.Add(ChatMessage.UserText(stopResult.Reason!));
+                    subagentStopContinuations++;
+                    continue;
+                }
+            }
+
+            break;
+        }
+
+        return result;
     }
 
     /// <summary>
@@ -186,6 +342,7 @@ public sealed class SubagentHost : ISubagentHost
     {
         private readonly IAgentSink parent;
         private readonly StringBuilder text = new();
+        private TokenUsage capturedUsage = TokenUsage.Zero;
 
         public CollectingSink(IAgentSink parent)
         {
@@ -193,6 +350,9 @@ public sealed class SubagentHost : ISubagentHost
         }
 
         public string CollectedText => this.text.ToString().Trim();
+
+        /// <summary>Accumulated token usage from all model calls made during the subagent run.</summary>
+        public TokenUsage CapturedUsage => this.capturedUsage;
 
         public void OnAssistantText(string delta)
         {
@@ -238,6 +398,37 @@ public sealed class SubagentHost : ISubagentHost
 
         public void OnStopReason(string? stopReason) => this.parent.OnStopReason(stopReason);
 
-        public void OnUsage(TokenUsage usage) => this.parent.OnUsage(usage);
+        public void OnUsage(TokenUsage usage)
+        {
+            this.capturedUsage = this.capturedUsage.Add(usage);
+            this.parent.OnUsage(usage);
+        }
+
+        public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+            this.parent.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
+
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
+            this.parent.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
+
+        public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+            this.parent.OnToolInputModified(hookCommand, toolName, originalInput, modifiedInput);
+
+        public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+            this.parent.OnToolResultModified(hookCommand, toolName, originalResult, modifiedResult);
+
+        public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+            this.parent.OnPermissionDecided(hookCommand, toolName, decision);
+
+        public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+            this.parent.OnSubagentBlocked(hookCommand, taskId, reason);
+
+        public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+            this.parent.OnSubagentResultModified(hookCommand, taskId, originalResult, modifiedResult);
+
+        public void OnCompactionCancelled(string hookCommand, string trigger) =>
+            this.parent.OnCompactionCancelled(hookCommand, trigger);
+
+        public void OnPostCompactContextInjected(string additionalContext) =>
+            this.parent.OnPostCompactContextInjected(additionalContext);
     }
 }

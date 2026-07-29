@@ -51,17 +51,28 @@ public sealed class TaskTool : ITool
         var description = ToolInput.GetString(input, "description") ?? subagentType;
         var parentSink = context.Sink ?? NullAgentSink.Instance;
 
-        var report = await context.Tasks
-            .RunSubagentForegroundAsync(
-                context.Subagents,
-                subagentType,
-                prompt,
-                description,
-                parentSink,
-                context.CurrentTaskId,
-                parentActivity: context.ToolActivity,
-                cancellationToken: cancellationToken)
-            .ConfigureAwait(false);
+        string report;
+        try
+        {
+            report = await context.Tasks
+                .RunSubagentForegroundAsync(
+                    context.Subagents,
+                    subagentType,
+                    prompt,
+                    description,
+                    parentSink,
+                    context.CurrentTaskId,
+                    parentActivity: context.ToolActivity,
+                    parentRestriction: context.ParentToolRestriction,
+                    cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (SubagentStartBlockedException ex)
+        {
+            // A SubagentStart hook (fail-closed) blocked this subagent. Return the reason as an
+            // error result so the parent agent sees an explicit rejection rather than a crash.
+            return new ToolResult(ex.Message, IsError: true);
+        }
 
         return new ToolResult(report);
     }
@@ -82,5 +93,6 @@ public sealed class TaskTool : ITool
         public void OnToolResult(ToolCallIdentity identity, string toolName, ToolResult result, ToolCallStatus status) { }
         public void OnToolActivityCompleted(ToolActivitySummary summary) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

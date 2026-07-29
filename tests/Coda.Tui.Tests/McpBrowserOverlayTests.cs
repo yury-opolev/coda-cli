@@ -6,7 +6,8 @@ using Coda.Tui.Mcp;
 using Coda.Tui.Ui.Mcp;
 
 namespace Coda.Tui.Tests;
-
+
+[Collection("TerminalGuiInit")]
 public sealed class McpBrowserOverlayTests : IDisposable
 {
     private readonly IApplication application = Application.Create();

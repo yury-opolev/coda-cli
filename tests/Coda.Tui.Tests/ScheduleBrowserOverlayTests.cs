@@ -12,6 +12,7 @@ namespace Coda.Tui.Tests;
 /// corrupts the terminal. Behavior lives in the headless controller; these tests assert the overlay
 /// renders that state and routes keys to the controller.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class ScheduleBrowserOverlayTests : IDisposable
 {
     private readonly IApplication _app;

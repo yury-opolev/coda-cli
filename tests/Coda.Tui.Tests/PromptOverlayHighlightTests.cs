@@ -9,6 +9,7 @@ namespace Coda.Tui.Tests;
 /// initial display and on every subsequent row change, while leaving it untouched for requests that
 /// do not supply a callback.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class PromptOverlayHighlightTests : IDisposable
 {
     private readonly IApplication application;

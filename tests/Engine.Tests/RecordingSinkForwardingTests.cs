@@ -63,6 +63,7 @@ public sealed class RecordingSinkForwardingTests
 
         public void OnToolActivityCompleted(ToolActivitySummary summary) =>
             this.Completions.Add(summary);
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class LegacyCapturingInner : IAgentSink
@@ -84,6 +85,7 @@ public sealed class RecordingSinkForwardingTests
         public void OnToolProgress(string toolName, long elapsedMs) => this.Progress++;
 
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class CapturingInner : IAgentSink
@@ -111,6 +113,7 @@ public sealed class RecordingSinkForwardingTests
         }
 
         public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.DeliveredIds.AddRange(ids);
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     [Fact]
@@ -376,5 +379,44 @@ public sealed class RecordingSinkForwardingTests
 
         Assert.NotEmpty(inner.Progress);
         Assert.Contains(inner.Progress, p => p.ToolName == "slow");
+    }
+
+    // =========================================================================
+    // I2 — OnResponseRewritten with modifiedResponse updates FinalText
+    // =========================================================================
+
+    /// <summary>
+    /// When a hook returns <c>modifiedResponse</c>, <see cref="RecordingSink.FinalText"/>
+    /// must reflect the rewritten text so every consumer of <see cref="RunResult.FinalText"/>
+    /// (headless, scheduled tasks, stream-json) sees the hook's output rather than the original.
+    /// </summary>
+    [Fact]
+    public void OnResponseRewritten_with_modifiedResponse_updates_FinalText()
+    {
+        var sink = new RecordingSink(null);
+        sink.OnAssistantText("original secret");
+        sink.OnAssistantTextComplete();
+        Assert.Equal("original secret", sink.FinalText);
+
+        sink.OnResponseRewritten("cmd", "original secret", "display text", "rewritten text");
+
+        Assert.Equal("rewritten text", sink.FinalText);
+    }
+
+    /// <summary>
+    /// When a hook returns only <c>displayContent</c> (display-only, no history change),
+    /// <see cref="RecordingSink.FinalText"/> must NOT be updated — it is display-only by design.
+    /// </summary>
+    [Fact]
+    public void OnResponseRewritten_with_displayContent_only_does_not_change_FinalText()
+    {
+        var sink = new RecordingSink(null);
+        sink.OnAssistantText("original text");
+        sink.OnAssistantTextComplete();
+        Assert.Equal("original text", sink.FinalText);
+
+        sink.OnResponseRewritten("cmd", "original text", "display only", null);
+
+        Assert.Equal("original text", sink.FinalText);
     }
 }

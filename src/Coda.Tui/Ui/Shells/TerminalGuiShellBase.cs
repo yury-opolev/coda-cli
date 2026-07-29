@@ -62,6 +62,10 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly McpBrowserOverlay? mcpOverlay;
     private readonly Coda.Tui.Ui.Schedule.ScheduleBrowserController? scheduleController;
     private readonly Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay? scheduleOverlay;
+    private readonly Coda.Tui.Ui.Skills.SkillBrowserController? skillsController;
+    private readonly Coda.Tui.Ui.Skills.SkillBrowserOverlay? skillsOverlay;
+    private readonly Coda.Tui.Ui.Plugins.PluginBrowserController? pluginController;
+    private readonly Coda.Tui.Ui.Plugins.PluginBrowserOverlay? pluginOverlay;
     private readonly bool followsRegistryTheme;
     private bool disposed;
 
@@ -95,6 +99,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         Func<TaskBrowserProvider?>? taskBrowserProvider = null,
         Func<McpBrowserProvider?>? mcpBrowserProvider = null,
         Func<Coda.Tui.Ui.Schedule.ScheduleBrowserProvider?>? scheduleBrowserProvider = null,
+        Func<Coda.Tui.Ui.Skills.SkillBrowserProvider?>? skillsBrowserProvider = null,
+        Func<Coda.Tui.Ui.Plugins.PluginBrowserProvider?>? pluginBrowserProvider = null,
         ToolDisplayMode toolDisplayMode = ToolDisplayModeResolver.Default,
         IUrlOpener? urlOpener = null,
         IPrivateBrowserResolver? privateBrowserResolver = null,
@@ -162,6 +168,20 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                 linkPromptService ?? PlainUiPromptService.Instance);
             this.scheduleOverlay = new Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay(
                 this.app, this.scheduleController, this.Theme, this.OnScheduleBrowserChanged);
+        }
+
+        if (skillsBrowserProvider is not null)
+        {
+            this.skillsController = new Coda.Tui.Ui.Skills.SkillBrowserController(skillsBrowserProvider);
+            this.skillsOverlay = new Coda.Tui.Ui.Skills.SkillBrowserOverlay(
+                this.app, this.skillsController, this.Theme, this.OnSkillsBrowserChanged);
+        }
+
+        if (pluginBrowserProvider is not null)
+        {
+            this.pluginController = new Coda.Tui.Ui.Plugins.PluginBrowserController(pluginBrowserProvider);
+            this.pluginOverlay = new Coda.Tui.Ui.Plugins.PluginBrowserOverlay(
+                this.app, this.pluginController, this.Theme, this.OnPluginBrowserChanged);
         }
 
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
@@ -250,6 +270,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The schedule browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
     internal Coda.Tui.Ui.Schedule.ScheduleBrowserController? ScheduleController => this.scheduleController;
 
+    /// <summary>The hosted <c>/skills</c> browser overlay, or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Skills.SkillBrowserOverlay? SkillsOverlay => this.skillsOverlay;
+
+    /// <summary>The skill browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Skills.SkillBrowserController? SkillsController => this.skillsController;
+
+    /// <summary>The hosted <c>/plugin</c> browser overlay, or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Plugins.PluginBrowserOverlay? PluginOverlay => this.pluginOverlay;
+
+    /// <summary>The plugin browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
+    internal Coda.Tui.Ui.Plugins.PluginBrowserController? PluginController => this.pluginController;
+
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
     /// position it (via <see cref="PlaceCompletion"/>) and add it to their view tree; it stays hidden with
@@ -297,6 +329,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.taskOverlay?.Hide();
         this.mcpOverlay?.Hide();
         this.scheduleOverlay?.Hide();
+        this.skillsOverlay?.Hide();
+        this.pluginOverlay?.Hide();
         this.RequestedExit = outcome;
         this.app.RequestStop();
     }
@@ -441,6 +475,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.TaskOverlay?.ApplyTheme(this.Theme);
         this.McpOverlay?.ApplyTheme(this.Theme);
         this.scheduleOverlay?.ApplyTheme(this.Theme);
+        this.skillsOverlay?.ApplyTheme(this.Theme);
+        this.pluginOverlay?.ApplyTheme(this.Theme);
     }
 
     protected override void Dispose(bool disposing)
@@ -479,6 +515,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.taskOverlay?.Hide();
             this.mcpOverlay?.Hide();
             this.scheduleOverlay?.Hide();
+            this.skillsOverlay?.Hide();
+            this.pluginOverlay?.Hide();
         }
 
         base.Dispose(disposing);
@@ -629,16 +667,22 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private bool HasVisibleBrowserOverlay() =>
         this.taskOverlay?.Visible == true ||
         this.mcpOverlay?.Visible == true ||
-        this.scheduleOverlay?.Visible == true;
+        this.scheduleOverlay?.Visible == true ||
+        this.skillsOverlay?.Visible == true ||
+        this.pluginOverlay?.Visible == true;
 
     private View? VisibleBrowserOverlay() =>
         this.scheduleOverlay?.Visible == true
             ? this.scheduleOverlay
-            : this.mcpOverlay?.Visible == true
-                ? this.mcpOverlay
-                : this.taskOverlay?.Visible == true
-                    ? this.taskOverlay
-                    : null;
+            : this.skillsOverlay?.Visible == true
+                ? this.skillsOverlay
+                : this.pluginOverlay?.Visible == true
+                    ? this.pluginOverlay
+                    : this.mcpOverlay?.Visible == true
+                        ? this.mcpOverlay
+                        : this.taskOverlay?.Visible == true
+                            ? this.taskOverlay
+                            : null;
 
     private bool TryHandleTranscriptNavigationKey(Key key)
     {
@@ -1528,6 +1572,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // was built once; before the first turn the provider returns null and the browser opens empty.
         this.mcpOverlay?.Hide();
         this.scheduleOverlay?.Hide();
+        this.skillsOverlay?.Hide();
+        this.pluginOverlay?.Hide();
         this.taskOverlay?.Show();
     }
 
@@ -1535,6 +1581,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         this.taskOverlay?.Hide();
         this.scheduleOverlay?.Hide();
+        this.skillsOverlay?.Hide();
+        this.pluginOverlay?.Hide();
         this.mcpOverlay?.Show();
     }
 
@@ -1543,7 +1591,29 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // Show() is idempotent: a repeated /schedule never double-Opens or double-pumps.
         this.taskOverlay?.Hide();
         this.mcpOverlay?.Hide();
+        this.skillsOverlay?.Hide();
+        this.pluginOverlay?.Hide();
         this.scheduleOverlay?.Show();
+    }
+
+    private void OpenSkillsBrowser()
+    {
+        // Show() is idempotent: a repeated /skills never double-Opens or double-pumps.
+        this.taskOverlay?.Hide();
+        this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
+        this.pluginOverlay?.Hide();
+        this.skillsOverlay?.Show();
+    }
+
+    private void OpenPluginBrowser()
+    {
+        // Show() is idempotent: a repeated /plugin never double-Opens or double-pumps.
+        this.taskOverlay?.Hide();
+        this.mcpOverlay?.Hide();
+        this.scheduleOverlay?.Hide();
+        this.skillsOverlay?.Hide();
+        this.pluginOverlay?.Show();
     }
 
     private void SetComposerAttachmentLock(bool locked)
@@ -1659,6 +1729,76 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
+    private void OnSkillsBrowserChanged()
+    {
+        if (this.skillsOverlay is null || this.disposed)
+        {
+            return;
+        }
+
+        if (this.skillsOverlay.Visible)
+        {
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.skillsOverlay.SetFocus();
+            }
+
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
+    private void OnPluginBrowserChanged()
+    {
+        if (this.pluginOverlay is null || this.disposed)
+        {
+            return;
+        }
+
+        if (this.pluginOverlay.Visible)
+        {
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.pluginOverlay.SetFocus();
+            }
+
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
     private void OnComposerSubmitted(object? sender, ComposerSubmissionEventArgs submission)
     {
         if (this.mcpOverlay is not null && McpBrowserController.IsOpenRequest(submission.OriginalDraft))
@@ -1671,6 +1811,19 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (this.scheduleOverlay is not null && Coda.Tui.Ui.Schedule.ScheduleBrowserController.IsOpenRequest(submission.OriginalDraft))
         {
             this.OpenScheduleBrowser();
+            return;
+        }
+
+        // Bare `/skills` and `/plugin` open their overlays; typed subcommands fall through to normal dispatch.
+        if (this.skillsOverlay is not null && Coda.Tui.Ui.Skills.SkillBrowserController.IsOpenRequest(submission.OriginalDraft))
+        {
+            this.OpenSkillsBrowser();
+            return;
+        }
+
+        if (this.pluginOverlay is not null && Coda.Tui.Ui.Plugins.PluginBrowserController.IsOpenRequest(submission.OriginalDraft))
+        {
+            this.OpenPluginBrowser();
             return;
         }
 

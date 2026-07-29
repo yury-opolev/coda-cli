@@ -62,7 +62,29 @@ public sealed record CodaSettings(
     public IReadOnlyDictionary<string, string> EffortByModel { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Hosts that may be contacted by <c>http</c>-type hooks
+    /// (e.g. <c>"policy.internal"</c>, <c>"localhost"</c>). An empty list
+    /// means no <c>http</c> hooks run (they are refused with a warning).
+    /// </summary>
+    public IReadOnlyList<string> HttpHookAllowlist { get; init; } = [];
+
+    /// <summary>
+    /// Content hashes of hooks the user has explicitly disabled. Applied at load time to set
+    /// <see cref="UserHook.Enabled"/> on the merged hook list. Populated only from user settings;
+    /// project settings cannot manage enable/disable overrides.
+    /// </summary>
+    public IReadOnlyList<string> HookDisabledHashes { get; init; } = [];
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
+
+    /// <summary>
+    /// When <see langword="true"/>, the stable-prefix prompt-cache breakpoints (tools and
+    /// system prompt) use a 1-hour TTL instead of the default 5-minute TTL.
+    /// Opt-in because a 1-hour write costs 2× the base input rate (vs 1.25× for 5-minute).
+    /// Set via <c>"cacheUse1hTtl": true</c> in <c>settings.json</c>. Default: <see langword="false"/>.
+    /// </summary>
+    public bool CacheUse1hTtl { get; init; }
 }
 

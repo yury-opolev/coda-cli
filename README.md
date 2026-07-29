@@ -92,12 +92,13 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
 - **Providers** — Claude.ai subscriber OAuth, Anthropic API key, and GitHub Copilot
   (device flow), with automatic token refresh.
 - **You stay in control** — permission modes (`default` / `acceptEdits` / `plan` /
-  `bypass`), allow/deny rules and lifecycle hooks from settings files, and an
+  `bypass`), allow/deny rules and [lifecycle hooks](docs/hooks.md) from settings files, and an
   interactive approve/deny prompt for risky actions.
 - **Autonomy helpers (opt-in)** — a background **session-memory** notes file, a
   **safety classifier** that vets actions in bypass mode, and an autonomous **goal
   loop** that keeps working until a judge says the goal is met. Plus automatic
   history **compaction**, output-style personas, and a plugin/skills marketplace.
+  See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for authoring skills and plugins.
 - **Programmatic & embeddable** — `coda serve` exposes the agent over JSON-RPC
   (bidirectional: it streams progress and can ask the caller permission/clarification
   questions), over stdio or an **API-key-authenticated local named pipe/Unix socket**; or embed the
@@ -855,7 +856,10 @@ back to `"summary"`.
 (including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and
 `~/.claude/skills/` (lowest precedence — your `~/.coda/skills` and project skills
 override by name). Override the skill source dirs with `CODA_CLAUDE_SKILLS_DIR` /
-`CODA_USER_SKILLS_DIR` (point at a missing path to opt out).
+`CODA_USER_SKILLS_DIR` (point at a missing path to opt out). Coda also reads foreign
+`.agents/skills/`, `~/.claude/agents/`, `~/.claude/commands/`, and `.claude-plugin/plugin.json`
+sources read-only. See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for the full
+authoring reference.
 
 > **Credential migration:** credentials previously lived under `%APPDATA%\LlmAuth`
 > (Windows) / `~/.config/LlmAuth` (other OS). On first run after upgrading, Coda
@@ -968,4 +972,5 @@ dotnet run --project samples/LlmAuth.Sample -- copilot-logout
 - **Authorization:** the Claude.ai subscription sign-in is subject to Anthropic's
   Terms of Service. Using your own `ANTHROPIC_API_KEY` (via `ApiKeyProvider`) is the
   most straightforward option and is unaffected.
-- GitHub Copilot and OpenAI providers are planned as additional `ICredentialProvider`s.
+- OpenAI is planned as an additional `ICredentialProvider`. GitHub Copilot is
+  already implemented (device flow, with automatic token refresh).

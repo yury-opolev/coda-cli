@@ -72,6 +72,11 @@ public static partial class MarketplaceInputParser
             var match = ShorthandRefRegex().Match(trimmed);
             var repo = match.Success ? match.Groups[1].Value : trimmed;
             var refValue = match.Success && match.Groups[2].Success ? match.Groups[2].Value : null;
+            // If the ref looks like a full 40-hex SHA, put it in Sha not Ref.
+            if (refValue is not null && MarketplaceNameValidator.IsValidSha(refValue))
+            {
+                return (new GithubSource(repo, null, null, refValue), null);
+            }
             return (new GithubSource(repo, refValue), null);
         }
 
@@ -91,7 +96,10 @@ public static partial class MarketplaceInputParser
         if (urlWithoutFragment.EndsWith(".git", StringComparison.OrdinalIgnoreCase) ||
             urlWithoutFragment.Contains("/_git/", StringComparison.OrdinalIgnoreCase))
         {
-            return (new GitSource(urlWithoutFragment, refValue), null);
+            // If refValue is a full SHA, put it in the sha slot.
+            string? shaVal = refValue is not null && MarketplaceNameValidator.IsValidSha(refValue) ? refValue : null;
+            string? refVal = shaVal is null ? refValue : null;
+            return (new GitSource(urlWithoutFragment, refVal, null, shaVal), null);
         }
 
         // Parse host to check for github.com
@@ -146,5 +154,29 @@ public static partial class MarketplaceInputParser
 
         // Must be a directory at this point
         return (new LocalDirectorySource(resolvedPath), null);
+    }
+
+    /// <summary>
+    /// Extracts the repository name from a git URL or GitHub shorthand.
+    /// For example, <c>https://github.com/org/my-repo.git</c> → <c>my-repo</c>.
+    /// </summary>
+    internal static string? ExtractRepoName(string source)
+    {
+        if (string.IsNullOrWhiteSpace(source))
+        {
+            return null;
+        }
+
+        // Take the last path segment and strip .git.
+        var trimmed = source.TrimEnd('/', '\\');
+        var lastSlash = trimmed.LastIndexOfAny(['/', '\\']);
+        var segment = lastSlash >= 0 ? trimmed[(lastSlash + 1)..] : trimmed;
+
+        if (segment.EndsWith(".git", StringComparison.OrdinalIgnoreCase))
+        {
+            segment = segment[..^4];
+        }
+
+        return string.IsNullOrEmpty(segment) ? null : segment;
     }
 }

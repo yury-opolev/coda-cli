@@ -94,6 +94,13 @@ public sealed partial class TaskManager : IDisposable
         }
     }
 
+    /// <summary>
+    /// Optional callback fired when a background task completes. Set by the session layer to
+    /// fire <c>Notification(task-complete)</c> hooks. The callback receives
+    /// <c>(kind, taskId)</c> and is invoked fire-and-forget; its returned task is discarded.
+    /// </summary>
+    public Func<string, string?, Task>? NotificationCallback { get; set; }
+
     public static string DefaultLogRoot =>
         Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -493,6 +500,13 @@ public sealed partial class TaskManager : IDisposable
         if (Find(id) is not { } t || !t.TryComplete(result, out var version)) return false;
         Publish(id, version, TaskChangeKind.Status);
         RaiseIdleStateChangedIfIdle();
+
+        // Fire task-complete notification for background tasks (fire-and-forget).
+        if (t.Mode == TaskExecutionMode.Background && this.NotificationCallback is { } cb)
+        {
+            _ = cb("task-complete", id);
+        }
+
         return true;
     }
 

@@ -12,19 +12,31 @@ public static partial class SkillLoader
     [LoggerMessage(Level = LogLevel.Debug, Message = "skipping malformed/unreadable skill file (best-effort); it is omitted from the loaded set: file={file}")]
     private static partial void LogSkillSkipped(ILogger logger, string file, Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Warning, Message = "skill '{skillName}' has both 'disable-model-invocation: true' and 'user-invocable: false'; it would be unreachable — treating as user-invocable so it can still be run via /skill")]
+    private static partial void LogBothExclusionsSet(ILogger logger, string skillName);
+
     /// <summary>
-    /// Loads skills from the Claude CLI (~/.claude/skills, read-only), user-level
-    /// (~/.coda/skills), plugin skill directories, and project-level (.coda/skills in
+    /// Loads skills from foreign ecosystem paths (<c>.agents/skills/</c>, <c>~/.claude/agents/</c>,
+    /// <c>~/.claude/commands/</c>, read-only), the Claude CLI (~/.claude/skills, read-only),
+    /// user-level (~/.coda/skills), plugin skill directories, and project-level (.coda/skills in
     /// <paramref name="workingDirectory"/>). Precedence (lowest to highest):
-    /// Claude &lt; user &lt; plugins &lt; project — later entries override by name, so Coda's
-    /// own skills always win. Missing directories are tolerated; malformed files are
+    /// foreign &lt; Claude &lt; user &lt; plugins &lt; project — later entries override by name, so
+    /// Coda's own skills always win. Missing directories are tolerated; malformed files are
     /// skipped or defaulted gracefully.
     /// </summary>
+    /// <param name="foreignSkillsDirs">
+    /// Overrides the foreign ecosystem directories scanned at lowest precedence (for testing).
+    /// When <see langword="null"/> the standard set is used: <c>&lt;workingDirectory&gt;/.agents/skills</c>,
+    /// <c>&lt;claudeBase&gt;/agents</c>, and <c>&lt;claudeBase&gt;/commands</c> (where <c>claudeBase</c> is the
+    /// parent of the resolved Claude skills directory). Pass an empty list to opt out entirely.
+    /// </param>
     public static IReadOnlyList<SkillDefinition> Load(
         string workingDirectory,
         string? userSkillsDir = null,
         string? claudeSkillsDir = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        Coda.Tui.Plugins.PluginStateStore? pluginStateStore = null,
+        IReadOnlyList<string>? foreignSkillsDirs = null)
     {
         var userBase = userSkillsDir
             ?? Environment.GetEnvironmentVariable("CODA_USER_SKILLS_DIR")
@@ -43,33 +55,50 @@ public static partial class SkillLoader
         var userSkillsPath = Path.Combine(userBase, "skills");
         var projectSkillsPath = Path.Combine(workingDirectory, RelativeSkillsPath);
 
-        // Precedence: Claude < user < plugins < project (each level overrides the previous by name).
+        // Foreign ecosystem directories (lowest precedence, read-only). The Claude agents/commands
+        // dirs are siblings of the Claude skills dir, so honoring the CODA_CLAUDE_SKILLS_DIR override
+        // (its parent) keeps them isolated in tests.
+        var foreignDirs = foreignSkillsDirs ?? DefaultForeignSkillsDirs(workingDirectory, claudeSkillsPath);
+
+        // Precedence: foreign < Claude < user < plugins < project (each level overrides the previous by name).
         var byName = new Dictionary<string, SkillDefinition>(StringComparer.OrdinalIgnoreCase);
 
-        // 0. Claude CLI skills (lowest precedence, read-only).
-        foreach (var skill in LoadFromDirectory(claudeSkillsPath, logger))
+        // -1. Foreign ecosystem skills (lowest precedence, read-only).
+        //     a. <cwd>/.agents/skills/ — project-level foreign (per-directory SKILL.md convention).
+        //     b. ~/.claude/agents/     — subagent defs (read as skills).
+        //     c. ~/.claude/commands/   — command defs (read as skills).
+        foreach (var foreignDir in foreignDirs)
+        {
+            foreach (var skill in LoadForeignFromDirectory(foreignDir, logger))
+            {
+                byName[skill.Name] = skill;
+            }
+        }
+
+        // 0. Claude CLI skills (read-only).
+        foreach (var skill in LoadFromDirectory(claudeSkillsPath, SkillOrigin.Claude, logger))
         {
             byName[skill.Name] = skill;
         }
 
         // 1. User skills (override Claude CLI skills).
-        foreach (var skill in LoadFromDirectory(userSkillsPath, logger))
+        foreach (var skill in LoadFromDirectory(userSkillsPath, SkillOrigin.User, logger))
         {
             byName[skill.Name] = skill;
         }
 
         // 2. Plugin skills (override user skills; project skills override plugins).
-        var pluginSkillDirs = PluginLoader.SkillDirsFor(workingDirectory, userBase);
+        var pluginSkillDirs = PluginLoader.SkillDirsFor(workingDirectory, userBase, pluginStateStore);
         foreach (var pluginSkillsDir in pluginSkillDirs)
         {
-            foreach (var skill in LoadFromDirectory(pluginSkillsDir, logger))
+            foreach (var skill in LoadFromDirectory(pluginSkillsDir, SkillOrigin.Plugin, logger))
             {
                 byName[skill.Name] = skill;
             }
         }
 
         // 3. Project skills (highest precedence).
-        foreach (var skill in LoadFromDirectory(projectSkillsPath, logger))
+        foreach (var skill in LoadFromDirectory(projectSkillsPath, SkillOrigin.Project, logger))
         {
             byName[skill.Name] = skill;
         }
@@ -77,7 +106,100 @@ public static partial class SkillLoader
         return [.. byName.Values.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)];
     }
 
-    private static IEnumerable<SkillDefinition> LoadFromDirectory(string skillsRoot, ILogger? logger)
+    private static IReadOnlyList<string> DefaultForeignSkillsDirs(string workingDirectory, string claudeSkillsPath)
+    {
+        var dirs = new List<string>(3)
+        {
+            Path.Combine(workingDirectory, ".agents", "skills"),
+        };
+
+        // The Claude agents/commands directories are siblings of the Claude skills directory.
+        var claudeBase = Path.GetDirectoryName(claudeSkillsPath);
+        if (!string.IsNullOrEmpty(claudeBase))
+        {
+            dirs.Add(Path.Combine(claudeBase, "agents"));
+            dirs.Add(Path.Combine(claudeBase, "commands"));
+        }
+
+        return dirs;
+    }
+
+    /// <summary>
+    /// Loads skills from a foreign ecosystem directory, tolerating both conventions: a
+    /// per-directory <c>&lt;name&gt;/SKILL.md</c> layout (as in <c>.agents/skills/</c>) and flat
+    /// <c>&lt;name&gt;.md</c> files (as in <c>~/.claude/agents/</c> and <c>~/.claude/commands/</c>).
+    /// Every returned skill carries <see cref="SkillOrigin.Foreign"/>.
+    /// </summary>
+    private static IEnumerable<SkillDefinition> LoadForeignFromDirectory(string root, ILogger? logger)
+    {
+        if (!Directory.Exists(root))
+        {
+            yield break;
+        }
+
+        // Per-directory SKILL.md layout.
+        foreach (var subDir in Directory.EnumerateDirectories(root))
+        {
+            var skillFile = Path.Combine(subDir, SkillFileName);
+            var skill = TryLoadForeignFile(skillFile, Path.GetFileName(subDir), logger);
+            if (skill is not null)
+            {
+                yield return skill;
+            }
+        }
+
+        // Flat *.md files (foreign agent/command definitions).
+        foreach (var mdFile in Directory.EnumerateFiles(root, "*.md"))
+        {
+            if (string.Equals(Path.GetFileName(mdFile), SkillFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var skill = TryLoadForeignFile(mdFile, Path.GetFileNameWithoutExtension(mdFile), logger);
+            if (skill is not null)
+            {
+                yield return skill;
+            }
+        }
+    }
+
+    private static SkillDefinition? TryLoadForeignFile(string file, string fallbackName, ILogger? logger)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(file);
+            if (!File.Exists(fullPath))
+            {
+                return null;
+            }
+
+            var content = File.ReadAllText(fullPath);
+            var skill = ParseSkillFile(content, fallbackName, fullPath, SkillOrigin.Foreign);
+
+            // A foreign skill with both exclusions unreachable is restored to user-invocable.
+            if (skill.DisableModelInvocation && !skill.UserInvocable)
+            {
+                skill = skill with { UserInvocable = true };
+            }
+
+            return skill;
+        }
+        catch (Exception ex)
+        {
+            if (logger is not null)
+            {
+                LogSkillSkipped(logger, file, ex);
+            }
+
+            return null;
+        }
+    }
+
+    private static IEnumerable<SkillDefinition> LoadFromDirectory(
+        string skillsRoot,
+        SkillOrigin origin,
+        ILogger? logger)
     {
         if (!Directory.Exists(skillsRoot))
         {
@@ -87,16 +209,17 @@ public static partial class SkillLoader
         foreach (var subDir in Directory.EnumerateDirectories(skillsRoot))
         {
             var skillFile = Path.Combine(subDir, SkillFileName);
-            if (!File.Exists(skillFile))
-            {
-                continue;
-            }
-
             SkillDefinition? skill = null;
             try
             {
+                skillFile = Path.GetFullPath(skillFile);
+                if (!File.Exists(skillFile))
+                {
+                    continue;
+                }
+
                 var content = File.ReadAllText(skillFile);
-                skill = ParseSkillFile(content, Path.GetFileName(subDir));
+                skill = ParseSkillFile(content, Path.GetFileName(subDir), skillFile, origin);
             }
             catch (Exception ex)
             {
@@ -109,84 +232,64 @@ public static partial class SkillLoader
 
             if (skill is not null)
             {
+                // A skill with both exclusions set to their exclusionary values is unreachable.
+                // Log a warning and restore user-invocability so /skill <name> still works.
+                if (skill.DisableModelInvocation && !skill.UserInvocable)
+                {
+                    if (logger is not null)
+                    {
+                        LogBothExclusionsSet(logger, skill.Name);
+                    }
+
+                    skill = skill with { UserInvocable = true };
+                }
+
                 yield return skill;
             }
         }
     }
 
     /// <summary>
-    /// Parses a SKILL.md file. Optional YAML-ish frontmatter is delimited by lines of <c>---</c>
-    /// at the top and may contain <c>name:</c> and <c>description:</c> keys. If no frontmatter,
-    /// the directory name is used as the skill name.
+    /// Parses a SKILL.md file using the YAML-subset frontmatter parser. If no frontmatter is
+    /// present, the directory name is used as the skill name and the whole file becomes the body.
     /// </summary>
-    internal static SkillDefinition ParseSkillFile(string content, string directoryName)
+    internal static SkillDefinition ParseSkillFile(
+        string content,
+        string directoryName,
+        string? sourcePath = null,
+        SkillOrigin origin = SkillOrigin.Project)
     {
-        var lines = content.ReplaceLineEndings("\n").Split('\n');
+        var fm = SkillFrontmatterParser.Parse(content);
 
-        // Check for frontmatter: first non-empty line must be "---"
-        var firstNonEmpty = Array.FindIndex(lines, l => l.Trim().Length > 0);
-        if (firstNonEmpty >= 0 && lines[firstNonEmpty].Trim() == "---")
+        if (!fm.HasFrontmatter)
         {
-            // Find closing "---"
-            var closingIndex = -1;
-            for (var i = firstNonEmpty + 1; i < lines.Length; i++)
+            return new SkillDefinition(directoryName, string.Empty, content.Trim())
             {
-                if (lines[i].Trim() == "---")
-                {
-                    closingIndex = i;
-                    break;
-                }
-            }
-
-            if (closingIndex > firstNonEmpty)
-            {
-                var name = string.Empty;
-                var description = string.Empty;
-
-                for (var i = firstNonEmpty + 1; i < closingIndex; i++)
-                {
-                    var line = lines[i];
-                    if (TryParseYamlValue(line, "name", out var nameVal))
-                    {
-                        name = nameVal;
-                    }
-                    else if (TryParseYamlValue(line, "description", out var descVal))
-                    {
-                        description = descVal;
-                    }
-                }
-
-                // Body is everything after the closing ---
-                var bodyLines = lines[(closingIndex + 1)..];
-                var body = string.Join("\n", bodyLines).Trim();
-
-                return new SkillDefinition(
-                    string.IsNullOrWhiteSpace(name) ? directoryName : name,
-                    description,
-                    body);
-            }
+                SourcePath = sourcePath,
+                Origin = origin,
+            };
         }
 
-        // No valid frontmatter — name = directory name, description = "", body = whole file.
-        return new SkillDefinition(directoryName, string.Empty, content.Trim());
-    }
-
-    private static bool TryParseYamlValue(string line, string key, out string value)
-    {
-        value = string.Empty;
-        var prefix = key + ":";
-        if (!line.TrimStart().StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+        return new SkillDefinition(
+            string.IsNullOrWhiteSpace(fm.Name) ? directoryName : fm.Name,
+            fm.Description ?? string.Empty,
+            fm.Body)
         {
-            return false;
-        }
-
-        var colonIndex = line.IndexOf(':', StringComparison.Ordinal);
-        if (colonIndex < 0 || colonIndex >= line.Length - 1)
-        {
-            return false;
-        }
-
-        value = line[(colonIndex + 1)..].Trim().Trim('"').Trim('\'');
-        return true;
+            WhenToUse = fm.WhenToUse,
+            ArgumentHint = fm.ArgumentHint,
+            Arguments = fm.Arguments,
+            SourcePath = sourcePath,
+            Origin = origin,
+            UnknownFields = fm.UnknownFields,
+            DisableModelInvocation = fm.DisableModelInvocation,
+            UserInvocable = fm.UserInvocable,
+            AllowedTools = fm.AllowedTools,
+            DisallowedTools = fm.DisallowedTools,
+            Model = fm.Model,
+            Effort = fm.Effort,
+            ContextMode = fm.ContextMode,
+            AgentType = fm.Agent,
+            Paths = fm.Paths,
+        };
     }
 }

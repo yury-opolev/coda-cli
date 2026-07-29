@@ -217,6 +217,52 @@ internal sealed class RecordingSink : IAgentSink
 
     public void OnSteeringDelivered(IReadOnlyList<string> ids) => this.inner?.OnSteeringDelivered(ids);
 
+    public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+        this.inner?.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse)
+    {
+        if (modifiedResponse is not null)
+        {
+            lock (this.gate)
+            {
+                this.finalText = modifiedResponse;
+            }
+        }
+
+        this.inner?.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
+    }
+
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+        this.inner?.OnToolInputModified(hookCommand, toolName, originalInput, modifiedInput);
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+        this.inner?.OnToolResultModified(hookCommand, toolName, originalResult, modifiedResult);
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+        this.inner?.OnPermissionDecided(hookCommand, toolName, decision);
+
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.inner?.OnSubagentBlocked(hookCommand, taskId, reason);
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.inner?.OnSubagentResultModified(hookCommand, taskId, originalResult, modifiedResult);
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.inner?.OnCompactionCancelled(hookCommand, trigger);
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.inner?.OnPostCompactContextInjected(additionalContext);
+
+    public void OnWarning(string message) => this.inner?.OnWarning(message);
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny) =>
+        this.inner?.OnPermissionsUpdated(hookCommand, modeApplied, addedAllow, addedDeny);
+
     public void OnUsage(TokenUsage usage)
     {
         lock (this.gate)

@@ -167,8 +167,72 @@ public sealed class WireAgentSink : IAgentSink
 
     public void OnUsage(TokenUsage usage)
     {
-        var node = ServeJson.ToNode(new UsageEvent(usage.InputTokens, usage.OutputTokens));
+        var node = ServeJson.ToNode(new UsageEvent(usage.TotalInputTokens, usage.OutputTokens));
         _ = this.SendAsync(ServeMethods.EventUsage, node);
+    }
+
+    public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt)
+    {
+        var node = ServeJson.ToNode(new PromptRewrittenEvent(hookCommand, originalPrompt, modifiedPrompt));
+        _ = this.SendAsync(ServeMethods.EventPromptRewritten, node);
+    }
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse)
+    {
+        var node = ServeJson.ToNode(new ResponseRewrittenEvent(hookCommand, originalResponse, displayContent, modifiedResponse));
+        _ = this.SendAsync(ServeMethods.EventResponseRewritten, node);
+    }
+
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput)
+    {
+        var node = ServeJson.ToNode(new ToolInputModifiedEvent(hookCommand, toolName, originalInput, modifiedInput));
+        _ = this.SendAsync(ServeMethods.EventToolInputModified, node);
+    }
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult)
+    {
+        var node = ServeJson.ToNode(new ToolResultModifiedEvent(hookCommand, toolName, originalResult, modifiedResult));
+        _ = this.SendAsync(ServeMethods.EventToolResultModified, node);
+    }
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision)
+    {
+        var node = ServeJson.ToNode(new PermissionDecidedEvent(hookCommand, toolName, decision));
+        _ = this.SendAsync(ServeMethods.EventPermissionDecided, node);
+    }
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny)
+    {
+        var node = ServeJson.ToNode(new PermissionsUpdatedEvent(hookCommand, modeApplied, addedAllow, addedDeny));
+        _ = this.SendAsync(ServeMethods.EventPermissionsUpdated, node);
+    }
+
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason)
+    {
+        var node = ServeJson.ToNode(new Messages.SubagentBlockedEvent(hookCommand, taskId, reason));
+        _ = this.SendAsync(ServeMethods.EventSubagentBlocked, node);
+    }
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult)
+    {
+        var node = ServeJson.ToNode(new Messages.SubagentResultModifiedEvent(hookCommand, taskId, originalResult, modifiedResult));
+        _ = this.SendAsync(ServeMethods.EventSubagentResultModified, node);
+    }
+
+    public void OnCompactionCancelled(string hookCommand, string trigger)
+    {
+        var node = ServeJson.ToNode(new Messages.CompactionCancelledEvent(hookCommand, trigger));
+        _ = this.SendAsync(ServeMethods.EventCompactionCancelled, node);
+    }
+
+    public void OnPostCompactContextInjected(string additionalContext)
+    {
+        var node = ServeJson.ToNode(new Messages.PostCompactContextInjectedEvent(additionalContext));
+        _ = this.SendAsync(ServeMethods.EventPostCompactContextInjected, node);
     }
 
     private void CoalesceText(string delta)

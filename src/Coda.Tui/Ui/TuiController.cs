@@ -619,6 +619,7 @@ public sealed class TuiController : IExclusiveIdleGate, IDisposable
                 this.TryInterruptActiveTurn();
                 break;
             case UiAction.Exit:
+                this.Runner?.SetSessionEndReason("interrupt");
                 this.RequestExit();
                 break;
             case UiAction.ToggleMode:

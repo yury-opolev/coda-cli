@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Hooks;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
 using Coda.Sdk.Turns;
@@ -34,6 +35,12 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
     private readonly ILoggerFactory loggerFactory;
     private readonly TurnPipelineBuilder pipeline;
     private readonly IStreamProgressSink? streamProgressSink;
+    /// <summary>
+    /// Test seam: when non-null, overrides the <see cref="UserHookRunner"/> assembled by
+    /// <see cref="TurnPipelineBuilder"/> so tests can inject a controlled hook without spawning
+    /// real processes. Null in all production paths.
+    /// </summary>
+    private readonly UserHookRunner? userHookRunnerForTesting;
 
     /// <summary>Creates the host with the session's stable scheduled-execution collaborators.</summary>
     /// <param name="currentOptions">Live accessor for the session options; evaluated per firing.</param>
@@ -54,7 +61,8 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         HttpClient http,
         ILoggerFactory loggerFactory,
         TurnPipelineBuilder pipeline,
-        IStreamProgressSink? streamProgressSink = null)
+        IStreamProgressSink? streamProgressSink = null,
+        UserHookRunner? userHookRunnerForTesting = null)
     {
         this.currentOptions = currentOptions ?? throw new ArgumentNullException(nameof(currentOptions));
         this.clientFactory = clientFactory ?? throw new ArgumentNullException(nameof(clientFactory));
@@ -65,6 +73,7 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         this.loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         this.pipeline = pipeline ?? throw new ArgumentNullException(nameof(pipeline));
         this.streamProgressSink = streamProgressSink;
+        this.userHookRunnerForTesting = userHookRunnerForTesting;
     }
 
     /// <inheritdoc />
@@ -97,6 +106,7 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         }
 
         ILlmClient? client = null;
+        UserHookRunner? hooksToRun = null;
         try
         {
             // Snapshot the live options AT ENTRY so a mid-firing mutation cannot tear the run.
@@ -126,6 +136,51 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
 
             var loop = this.loopFactory.Create(spec);
 
+            // USER PROMPT SUBMIT HOOK GATE: run before the loop for every scheduled firing.
+            // Scheduled runs are fully unattended; there is no answerer, so "ask" resolves to
+            // block exactly as it does at the session seam. On block the exception propagates to
+            // TaskManager.StartScheduledBackground, which calls Fail(task.Id, ex.Message) so the
+            // reason is recorded in the task log and visible in /tasks — not silent.
+            hooksToRun = this.userHookRunnerForTesting ?? spec.UserHooks;
+            if (hooksToRun is { } submitHooks && submitHooks.HasUserPromptSubmit)
+            {
+                var submitResult = await submitHooks.RunUserPromptSubmitAsync(
+                    prompt,
+                    attachments: [],
+                    historyLength: 0,
+                    model: options.Model,
+                    permissionMode: CodaSession.PermissionModeToString(options.PermissionMode),
+                    ct: cancellationToken,
+                    depth: depth,
+                    taskId: taskId).ConfigureAwait(false);
+
+                if (submitResult.Block)
+                {
+                    throw new InvalidOperationException(submitResult.Reason ?? "blocked by hook");
+                }
+            }
+
+            // Fire SessionStart with source="scheduled" so hooks filtering on that source
+            // actually trigger for unattended runs.
+            if (hooksToRun?.HasSessionStart == true)
+            {
+                using var sessionStartCts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+                try
+                {
+                    await hooksToRun.RunSessionStartAsync(
+                        "scheduled",
+                        options.Model,
+                        CodaSession.PermissionModeToString(options.PermissionMode),
+                        transcriptPath: null,
+                        resumedFrom: null,
+                        sessionStartCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // SessionStart is fail-open: a broken hook must not abort the scheduled run.
+                }
+            }
+
             // The scheduled run is ISOLATED: its history is exactly the firing's prompt. The session's
             // main history is never referenced or mutated here.
             var history = new List<ChatMessage> { ChatMessage.UserText(prompt) };
@@ -143,6 +198,27 @@ public sealed class ScheduledAgentHost : IScheduledAgentHost
         }
         finally
         {
+            // Fire SessionEnd after the run (success, failure, or cancellation) so hooks
+            // monitoring scheduled firings always receive a paired end event.
+            if (hooksToRun?.HasSessionEnd == true)
+            {
+                try
+                {
+                    using var sessionEndCts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+                    await hooksToRun.RunSessionEndAsync(
+                        "exit",
+                        durationMs: 0,
+                        turnCount: 0,
+                        usage: LlmClient.TokenUsage.Zero,
+                        transcriptPath: null,
+                        sessionEndCts.Token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    // SessionEnd is fail-open: never propagate during cleanup.
+                }
+            }
+
             // Dispose the per-execution client on success, failure, OR cancellation.
             if (client is IDisposable disposable)
             {

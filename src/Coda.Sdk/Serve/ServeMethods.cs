@@ -37,9 +37,29 @@ public static class ServeMethods
     public const string EventScheduleLifecycle = "event/scheduleLifecycle";
     public const string EventThinking = "event/thinking";
     public const string EventThinkingComplete = "event/thinkingComplete";
+    public const string EventPromptRewritten = "event/promptRewritten";
+    public const string EventResponseRewritten = "event/responseRewritten";
+    public const string EventToolInputModified = "event/toolInputModified";
+    public const string EventToolResultModified = "event/toolResultModified";
+    public const string EventPermissionDecided = "event/permissionDecided";
+    public const string EventPermissionsUpdated = "event/permissionsUpdated";
+    public const string EventSubagentBlocked = "event/subagentBlocked";
+    public const string EventSubagentResultModified = "event/subagentResultModified";
+    public const string EventCompactionCancelled = "event/compactionCancelled";
+    public const string EventPostCompactContextInjected = "event/postCompactContextInjected";
 
     // Server-initiated requests (Coda → orchestrator)
     public const string RequestPermission = "request/permission";
     public const string RequestQuestion = "request/question";
     public const string RequestPlanApproval = "request/planApproval";
+
+    // Hook management (orchestrator → Coda)
+    public const string HookList = "hooks/list";
+    public const string HookInfo = "hooks/info";
+    public const string HookTrust = "hooks/trust";
+
+    // Skills / plugins management (orchestrator → Coda)
+    public const string SkillList = "skills/list";
+    public const string PluginList = "plugins/list";
+    public const string SkillTrust = "skills/trust";
 }

@@ -1,6 +1,7 @@
 using System.Text.Json;
 using Coda.Agent;
 using Coda.Agent.Classifier;
+using Coda.Agent.Permissions;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Settings;
 using Coda.Agent.Tasks;
@@ -96,6 +97,7 @@ public sealed class PermissionModeStateTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     [Fact]
@@ -235,7 +237,9 @@ public sealed class PermissionModeStateTests
 
             var spec = builder.BuildSpec(options, new FakeClient(), CodaSettings.Empty);
 
-            var modePrompt = Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+            // After C1 fix, permissions is always wrapped in RulesPermissionPrompt.
+            var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+            var modePrompt = Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
             var host = Assert.IsType<SubagentHost>(spec.Subagents);
 
             // The foreground/background subagent host shares the exact same permission prompt instance,
@@ -337,7 +341,7 @@ public sealed class PermissionModeStateTests
         lspDiagnostics: null,
         toolSearchCoordinator: null,
         NullLoggerFactory.Instance,
-        (_, _, _) => Task.CompletedTask,
+        (_, _, _, _, _) => Task.FromResult(true),
         () => null);
 
     private sealed class FakeClient : ILlmClient

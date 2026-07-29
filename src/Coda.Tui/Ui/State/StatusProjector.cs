@@ -123,10 +123,10 @@ public static class StatusProjector
             : $"ctx {tilde}{Compact(context.UsedTokens)}/{Compact(context.MaxTokens)}";
     }
 
-    private static bool HasUsage(TokenUsage usage) => usage.InputTokens > 0 || usage.OutputTokens > 0;
+    private static bool HasUsage(TokenUsage usage) => usage.TotalInputTokens > 0 || usage.OutputTokens > 0;
 
     private static string FormatUsage(TokenUsage usage) =>
-        $"{Compact(usage.InputTokens)} in / {Compact(usage.OutputTokens)} out";
+        $"{Compact(usage.TotalInputTokens)} in / {Compact(usage.OutputTokens)} out";
 
     private static string FormatCost(decimal cost) =>
         "$" + cost.ToString("0.###", CultureInfo.InvariantCulture);

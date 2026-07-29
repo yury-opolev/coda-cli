@@ -64,10 +64,40 @@ public sealed record ToolContext(string WorkingDirectory)
 
     /// <summary>Callback invoked with matched tool names after a tool_search execution; null when not wired.</summary>
     public Action<IReadOnlyList<string>>? OnToolsDiscovered { get; init; }
+
+    /// <summary>
+    /// The tool restriction that was active for the parent turn, or <see langword="null"/> when
+    /// no restriction is in effect. Passed to child subagents so they can inherit at least the
+    /// same restriction, guaranteeing monotonic (never-less-restricted) security across nesting
+    /// levels. Only the restriction portion of the parent's <see cref="TurnShape"/> is threaded
+    /// through — system prompt, model, and effort overrides belong to the parent turn's context
+    /// and must not leak into a child's independent agent context.
+    /// </summary>
+    public TurnShape? ParentToolRestriction { get; init; }
+
+    /// <summary>
+    /// Additional filesystem roots that file tools may access, beyond <see cref="WorkingDirectory"/>.
+    /// Populated from skill directory-consent grants: when the user approves loading a skill from
+    /// an external directory (e.g. <c>~/.coda/skills/foo</c>), that canonical directory is added
+    /// here so the skill's bundled resource files can be read during the session.
+    /// <see langword="null"/> means no additional roots are permitted (the default).
+    /// </summary>
+    public IReadOnlySet<string>? GrantedDirectories { get; init; }
 }
 
 /// <summary>The outcome of running a tool, fed back to the model.</summary>
-public sealed record ToolResult(string Content, bool IsError = false);
+/// <param name="Content">The text or serialised output returned to the model.</param>
+/// <param name="IsError">When <see langword="true"/>, the model receives this as an error result.</param>
+public sealed record ToolResult(string Content, bool IsError = false)
+{
+    /// <summary>
+    /// Optional <see cref="TurnShape"/> delta that this tool wants applied to the current turn
+    /// after its execution. The caller (typically <see cref="AgentLoop"/>) accumulates and
+    /// layers deltas from all tools in a batch via <see cref="TurnShape.Layer"/>.
+    /// <see langword="null"/> means no change to the current turn's shape.
+    /// </summary>
+    public TurnShape? ShapeDelta { get; init; }
+}
 
 /// <summary>An executable tool the model can call.</summary>
 public interface ITool

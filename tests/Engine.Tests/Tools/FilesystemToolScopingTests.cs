@@ -90,4 +90,25 @@ public sealed class FilesystemToolScopingTests : IDisposable
         Assert.False(allowed.IsError);
         Assert.Contains("secret", allowed.Content);
     }
+
+    [Fact]
+    public async Task ReadFile_outside_root_is_accessible_via_GrantedDirectories()
+    {
+        // Simulates a skill whose directory is outside cwd and has been consent-granted.
+        var target = Path.Combine(this.outsideDir, "resource.txt");
+        await File.WriteAllTextAsync(target, "skill resource");
+        var readInput = JsonDocument.Parse($$"""{"path":{{JsonSerializer.Serialize(target)}}}""").RootElement;
+
+        // Without grant: blocked.
+        var blocked = await new ReadFileTool().ExecuteAsync(
+            readInput, new ToolContext(this.workingDir));
+        Assert.True(blocked.IsError);
+
+        // With the outside directory granted: allowed.
+        var grantedDirs = new HashSet<string> { this.outsideDir };
+        var allowed = await new ReadFileTool().ExecuteAsync(
+            readInput, new ToolContext(this.workingDir) { GrantedDirectories = grantedDirs });
+        Assert.False(allowed.IsError);
+        Assert.Contains("skill resource", allowed.Content);
+    }
 }

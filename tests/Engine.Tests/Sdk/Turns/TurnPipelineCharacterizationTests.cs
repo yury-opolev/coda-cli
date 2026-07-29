@@ -31,7 +31,7 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
     {
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             sink.OnStopReason("end_turn");
             return Task.CompletedTask;
@@ -95,35 +95,40 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
     public async Task Default_mode_yields_bare_ModePermissionPrompt()
     {
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.Default));
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
     public async Task AcceptEdits_mode_yields_bare_ModePermissionPrompt()
     {
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.AcceptEdits));
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
     public async Task Plan_mode_yields_bare_ModePermissionPrompt()
     {
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.Plan));
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
     public async Task Bypass_without_classifier_yields_ModePermissionPrompt()
     {
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: false));
-        Assert.IsType<ModePermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<ModePermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
     public async Task Bypass_with_classifier_yields_LiveBypassClassifierPermissionPrompt()
     {
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.BypassPermissions, enableBypassClassifier: true));
-        Assert.IsType<LiveBypassClassifierPermissionPrompt>(spec.Permissions);
+        var rulesPrompt = Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<LiveBypassClassifierPermissionPrompt>(rulesPrompt.Inner);
     }
 
     [Fact]
@@ -143,10 +148,12 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
     }
 
     [Fact]
-    public async Task No_rules_leaves_the_base_prompt_unwrapped()
+    public async Task No_rules_still_wraps_with_empty_store()
     {
+        // After the C1 fix, the RulesPermissionPrompt is always the outer wrapper.
+        // No initial rules means the store starts empty; it becomes populated mid-session by hooks.
         var spec = await this.CaptureSpecAsync(this.Options(mode: PermissionMode.Default));
-        Assert.IsNotType<RulesPermissionPrompt>(spec.Permissions);
+        Assert.IsType<RulesPermissionPrompt>(spec.Permissions);
     }
 
     // ---- Parent tool registry contents ----
@@ -258,3 +265,4 @@ public sealed class TurnPipelineCharacterizationTests : IDisposable
         try { Directory.Delete(this.root, recursive: true); } catch { /* ignore */ }
     }
 }
+

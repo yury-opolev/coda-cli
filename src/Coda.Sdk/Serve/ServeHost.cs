@@ -24,6 +24,8 @@ public sealed class ServeHost : IAsyncDisposable
     private readonly Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory;
     private readonly string? expectedApiKey;
     private readonly Func<CodaSession, CancellationToken, Task> initializeSession;
+    private readonly Func<CodaSession, IReadOnlyList<ServeSkillInfo>>? skillsProvider;
+    private readonly Func<CodaSession, IReadOnlyList<ServePluginInfo>>? pluginsProvider;
     private volatile bool authenticated;
     private readonly TaskCompletionSource shutdownTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -61,8 +63,10 @@ public sealed class ServeHost : IAsyncDisposable
         Stream input,
         Stream output,
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
-        string? expectedApiKey = null)
-        : this(input, output, sessionFactory, expectedApiKey, initializeSession: null)
+        string? expectedApiKey = null,
+        Func<CodaSession, IReadOnlyList<ServeSkillInfo>>? skillsProvider = null,
+        Func<CodaSession, IReadOnlyList<ServePluginInfo>>? pluginsProvider = null)
+        : this(input, output, sessionFactory, expectedApiKey, initializeSession: null, skillsProvider, pluginsProvider)
     {
     }
 
@@ -71,12 +75,16 @@ public sealed class ServeHost : IAsyncDisposable
         Stream output,
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
         string? expectedApiKey,
-        Func<CodaSession, CancellationToken, Task>? initializeSession = null)
+        Func<CodaSession, CancellationToken, Task>? initializeSession,
+        Func<CodaSession, IReadOnlyList<ServeSkillInfo>>? skillsProvider = null,
+        Func<CodaSession, IReadOnlyList<ServePluginInfo>>? pluginsProvider = null)
     {
         this.input = input ?? throw new ArgumentNullException(nameof(input));
         this.output = output ?? throw new ArgumentNullException(nameof(output));
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.expectedApiKey = expectedApiKey;
+        this.skillsProvider = skillsProvider;
+        this.pluginsProvider = pluginsProvider;
         this.initializeSession = initializeSession ?? (static (session, cancellationToken) =>
             session.InitializeAsync(cancellationToken));
         this.authenticated = expectedApiKey is null; // stdio: no auth required.
@@ -761,6 +769,128 @@ public sealed class ServeHost : IAsyncDisposable
             this.shutdownTcs.TrySetResult();
             return ServeJson.ToNode(new InterruptResult(true));
         });
+
+        // hooks/list → return all configured hooks as a JSON array.
+        // Hooks are loaded at construction time and available before initialization.
+        conn.OnRequest(ServeMethods.HookList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var hooks = sess.ConfiguredHooks;
+            var dtos = hooks.Select((h, i) => new
+            {
+                index = i,
+                @event = h.Event,
+                handlerType = h.HandlerType ?? "command",
+                matcher = h.Matcher ?? "*",
+                scope = h.Scope.ToString().ToLowerInvariant(),
+                enabled = h.Enabled,
+            }).ToArray();
+            return ServeJson.ToNode(new { hooks = dtos });
+        });
+
+        // hooks/info → return full detail for one hook by 0-based index.
+        conn.OnRequest(ServeMethods.HookInfo, p =>
+        {
+            this.EnsureAuthenticated();
+            var hooks = sess.ConfiguredHooks;
+            var index = p?["index"]?.GetValue<int>() ?? -1;
+            if (index < 0 || index >= hooks.Count)
+            {
+                throw new Coda.JsonRpc.JsonRpcRequestException(-32602, $"hook index out of range (0..{hooks.Count - 1})");
+            }
+
+            var h = hooks[index];
+            var detail = new
+            {
+                index,
+                @event = h.Event,
+                handlerType = h.HandlerType ?? "command",
+                command = h.Command,
+                url = h.Url,
+                matcher = h.Matcher ?? "*",
+                scope = h.Scope.ToString().ToLowerInvariant(),
+                enabled = h.Enabled,
+                timeoutSeconds = h.TimeoutSeconds,
+                failOpen = h.FailOpen,
+                unattendedDecision = h.UnattendedDecision,
+                allowSystemPromptReplace = h.AllowSystemPromptReplace,
+                mutates = h.Mutates,
+            };
+            return ServeJson.ToNode(detail);
+        });
+
+        // hooks/trust → record a trust decision for a project hook. The caller provides
+        // { projectPath, hookHash } in the params. When no callback is available (serve mode),
+        // the client must call this to grant trust; the host cannot prompt interactively.
+        conn.OnRequest(ServeMethods.HookTrust, p =>
+        {
+            this.EnsureAuthenticated();
+            var projectPath = p?["projectPath"]?.GetValue<string>();
+            var hookHash = p?["hookHash"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(projectPath) || string.IsNullOrWhiteSpace(hookHash))
+            {
+                throw new Coda.JsonRpc.JsonRpcRequestException(-32602, "projectPath and hookHash are required");
+            }
+
+            // L3: Validate the request against session state so an unauthenticated or
+            // pre-initialize caller cannot write arbitrary entries to the global trust file.
+            var validationError = ValidateHookTrustRequest(sess, projectPath!, hookHash!);
+            if (validationError is not null)
+            {
+                throw new Coda.JsonRpc.JsonRpcRequestException(-32600, validationError);
+            }
+
+            var store = new Coda.Agent.Hooks.HookTrustStore();
+            store.Trust(projectPath!, hookHash!);
+            return ServeJson.ToNode(new { ok = true, projectPath, hookHash });
+        });
+
+        // skills/list → enumerate discovered skills (name, description, origin, enabled). The skill
+        // inventory is provided by a delegate injected from the TUI layer; when absent, returns empty.
+        conn.OnRequest(ServeMethods.SkillList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var skills = this.skillsProvider?.Invoke(sess) ?? [];
+            var dtos = skills.Select(s => new
+            {
+                name = s.Name,
+                description = s.Description,
+                origin = s.Origin,
+                enabled = s.Enabled,
+                userInvocable = s.UserInvocable,
+                sourcePath = s.SourcePath,
+                argumentHint = s.ArgumentHint,
+            }).ToArray();
+            return ServeJson.ToNode(new { skills = dtos });
+        });
+
+        // plugins/list → enumerate discovered plugins (name, version, enabled, trusted, isExternal).
+        conn.OnRequest(ServeMethods.PluginList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var plugins = this.pluginsProvider?.Invoke(sess) ?? [];
+            var dtos = plugins.Select(p => new
+            {
+                name = p.Name,
+                version = p.Version,
+                enabled = p.Enabled,
+                trusted = p.Trusted,
+                isExternal = p.IsExternal,
+            }).ToArray();
+            return ServeJson.ToNode(new { plugins = dtos });
+        });
+
+        // skills/trust → a skill trust decision requires an interactive gate. In serve mode there is
+        // no interactive user, so the request is explicitly refused rather than silently granted
+        // (the unattended policy established for hooks). The model's own attempt to load an external
+        // skill body is refused by SkillOriginGate for the same reason.
+        conn.OnRequest(ServeMethods.SkillTrust, _ =>
+        {
+            this.EnsureAuthenticated();
+            throw new Coda.JsonRpc.JsonRpcRequestException(
+                -32600,
+                "trust decisions require an interactive session; grant skill trust via /skill <name> in the TUI");
+        });
     }
 
     private IReadOnlyList<WireMessage> MapHistory(CodaSession sess, int sinceIndex)
@@ -786,6 +916,49 @@ public sealed class ServeHost : IAsyncDisposable
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Returns an error message string when the <c>hooks/trust</c> request is invalid, or
+    /// <see langword="null"/> when it is acceptable. Validates:
+    /// <list type="bullet">
+    ///   <item>
+    ///     <c>projectPath</c> is the session's working directory (or a subdirectory), preventing
+    ///     a client from writing trust entries for unrelated projects.
+    ///   </item>
+    ///   <item>
+    ///     <c>hookHash</c> matches a configured project hook's content hash, preventing a client
+    ///     from pre-granting trust for hooks that do not exist in the session's configuration.
+    ///   </item>
+    /// </list>
+    /// </summary>
+    private static string? ValidateHookTrustRequest(CodaSession? sess, string projectPath, string hookHash)
+    {
+        if (sess is null)
+        {
+            return "Session is not available.";
+        }
+
+        // Constrain projectPath to the session's working directory.
+        var sessionCwd = Path.GetFullPath(sess.Options.WorkingDirectory);
+        var normalizedPath = Path.GetFullPath(projectPath);
+        if (!normalizedPath.Equals(sessionCwd, StringComparison.OrdinalIgnoreCase)
+            && !normalizedPath.StartsWith(sessionCwd + Path.DirectorySeparatorChar, StringComparison.OrdinalIgnoreCase))
+        {
+            return "projectPath is outside the session's working directory.";
+        }
+
+        // Validate hookHash against the configured project hooks' content hashes.
+        var knownHashes = sess.ConfiguredHooks
+            .Where(h => h.Scope == Coda.Agent.Hooks.HookScope.Project)
+            .Select(Coda.Agent.Hooks.HookContentHash.Compute)
+            .ToHashSet(StringComparer.Ordinal);
+        if (!knownHashes.Contains(hookHash))
+        {
+            return "hookHash does not match any configured project hook.";
+        }
+
+        return null;
     }
 
     private static WireGoalStatus? BuildWireGoalStatus(GoalStatus? goal)

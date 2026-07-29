@@ -5,7 +5,7 @@ using Spectre.Console;
 
 namespace Coda.Tui.Commands;
 
-/// <summary>Runs a named skill by injecting its body as an agent prompt.</summary>
+/// <summary>Runs a named skill by injecting its body as an agent prompt, with argument substitution.</summary>
 public sealed class SkillCommand : ISlashCommand
 {
     public string Name => "skill";
@@ -15,46 +15,61 @@ public sealed class SkillCommand : ISlashCommand
     public string Summary => "Run a skill by name (or list skills if no name given)";
 
     public CommandHelp Help => new(
-        Usage: "/skill [<name>]",
+        Usage: "/skill [<name> [args...]]",
         Description: "Runs the named skill by injecting its SKILL.md body as an agent prompt. " +
+            "Arguments after the name are substituted into $1, $2, $name, and $ARGUMENTS placeholders. " +
             "Skills are discovered from .coda/skills/<name>/ (project) and ~/.coda/skills/<name>/ (user). " +
             "With no argument, lists available skills (same as /skills).",
         Options:
         [
             ("<name>", "Name of the skill to run. Case-insensitive. Omit to list all available skills."),
+            ("[args...]", "Arguments substituted into $1, $2, $name, and $ARGUMENTS placeholders in the body."),
         ],
         Examples:
         [
             "/skill",
             "/skill code-review",
-            "/skill brainstorming",
+            "/skill translate French \"Hello world\"",
         ]);
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        var skills = SkillLoader.Load(context.Session.WorkingDirectory);
+        var skills = SkillLoader.Load(context.Session.WorkingDirectory, pluginStateStore: context.PluginState);
 
-        // No arguments → behave like /skills (list).
+        // No arguments → behave like /skills (list), showing only user-invocable skills.
         if (args.Count == 0)
         {
-            return ListSkillsAsync(context, skills);
+            return ListSkillsAsync(context, skills.Where(s => s.UserInvocable).ToList());
         }
 
         var requestedName = args[0];
+        IReadOnlyList<string> invokeArgs = args.Count > 1
+            ? [.. args.Skip(1)]
+            : [];
+
         var skill = skills.FirstOrDefault(s =>
             string.Equals(s.Name, requestedName, StringComparison.OrdinalIgnoreCase));
 
         if (skill is null)
         {
-            var available = skills.Count > 0
-                ? string.Join(", ", skills.Select(s => s.Name))
+            var userVisible = skills.Where(s => s.UserInvocable).ToList();
+            var available = userVisible.Count > 0
+                ? string.Join(", ", userVisible.Select(s => s.Name))
                 : "(none)";
             context.Console.MarkupLine(Theme.WarnMarkup(
                 $"Skill '{requestedName}' not found. Available: {available}"));
             return Task.FromResult(CommandResult.Continue);
         }
 
-        return Task.FromResult(CommandResult.RunPrompt(skill.Body));
+        if (!skill.UserInvocable)
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup(
+                $"Skill '{skill.Name}' is model-invocable only and cannot be run with /skill."));
+            return Task.FromResult(CommandResult.Continue);
+        }
+
+        var body = SkillArgumentBinder.BindOptIn(skill, invokeArgs);
+        return Task.FromResult(CommandResult.RunPrompt(body));
     }
 
     private static Task<CommandResult> ListSkillsAsync(CommandContext context, IReadOnlyList<SkillDefinition> skills)
@@ -73,7 +88,10 @@ public sealed class SkillCommand : ISlashCommand
             var description = string.IsNullOrWhiteSpace(skill.Description)
                 ? string.Empty
                 : skill.Description;
-            grid.AddRow(Theme.AccentMarkup(skill.Name), Theme.DimMarkup(description));
+            var hintSuffix = skill.ArgumentHint is not null
+                ? "  " + Theme.DimMarkup(skill.ArgumentHint)
+                : string.Empty;
+            grid.AddRow(Theme.AccentMarkup(skill.Name), Theme.DimMarkup(description) + hintSuffix);
         }
 
         context.Console.Write(grid);

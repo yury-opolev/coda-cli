@@ -42,6 +42,86 @@ public sealed class JsonStreamSink : IAgentSink
     public void OnError(string message) =>
         this.Emit(new JsonObject { ["type"] = "error", ["message"] = message });
 
+    public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "tool_input_modified",
+            ["hookCommand"] = hookCommand,
+            ["name"] = toolName,
+            ["originalInput"] = ParseInput(originalInput),
+            ["modifiedInput"] = ParseInput(modifiedInput),
+        });
+
+    public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "tool_result_modified",
+            ["hookCommand"] = hookCommand,
+            ["name"] = toolName,
+            ["originalResult"] = originalResult,
+            ["modifiedResult"] = modifiedResult,
+        });
+
+    public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "permission_decided",
+            ["hookCommand"] = hookCommand,
+            ["name"] = toolName,
+            ["decision"] = decision,
+        });
+
+    public void OnPermissionsUpdated(
+        string hookCommand,
+        string? modeApplied,
+        IReadOnlyList<string> addedAllow,
+        IReadOnlyList<string> addedDeny)
+    {
+        var obj = new JsonObject
+        {
+            ["type"] = "permissions_updated",
+            ["hookCommand"] = hookCommand,
+            ["modeApplied"] = modeApplied,
+            ["addedAllow"] = new System.Text.Json.Nodes.JsonArray(addedAllow.Select(r => (JsonNode?)JsonValue.Create(r)).ToArray()),
+            ["addedDeny"] = new System.Text.Json.Nodes.JsonArray(addedDeny.Select(r => (JsonNode?)JsonValue.Create(r)).ToArray()),
+        };
+        this.Emit(obj);
+    }
+
+    public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "subagent_blocked",
+            ["hookCommand"] = hookCommand,
+            ["taskId"] = taskId,
+            ["reason"] = reason,
+        });
+
+    public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "subagent_result_modified",
+            ["hookCommand"] = hookCommand,
+            ["taskId"] = taskId,
+            ["originalResult"] = originalResult,
+            ["modifiedResult"] = modifiedResult,
+        });
+
+    public void OnCompactionCancelled(string hookCommand, string trigger) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "compaction_cancelled",
+            ["hookCommand"] = hookCommand,
+            ["trigger"] = trigger,
+        });
+
+    public void OnPostCompactContextInjected(string additionalContext) =>
+        this.Emit(new JsonObject
+        {
+            ["type"] = "post_compact_context_injected",
+            ["additionalContext"] = additionalContext,
+        });
+
     /// <summary>Write the terminal result event (called once after the run).</summary>
     public void EmitResult(RunResult result)
     {
@@ -125,4 +205,9 @@ public sealed class JsonStreamSink : IAgentSink
         this.writer.WriteLine(obj.ToJsonString());
         this.writer.Flush();
     }
+
+    public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
+
+    public void OnWarning(string message) =>
+        this.Emit(new JsonObject { ["type"] = "warning", ["message"] = message });
 }

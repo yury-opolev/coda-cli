@@ -124,6 +124,10 @@ public sealed partial class CodaSession
         {
             await this.StartScheduleRuntimeAsync(cancellationToken).ConfigureAwait(false);
         }
+
+        // Fire SessionStart hooks last, after LSP and runtime are up (fail-open: a broken hook
+        // must not prevent LSP/runtime from being used).
+        await this.ApplySessionStartHookAsync(cancellationToken).ConfigureAwait(false);
     }
 
     private async Task StartScheduleRuntimeAsync(CancellationToken cancellationToken)

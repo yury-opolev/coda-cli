@@ -8,6 +8,7 @@ namespace Coda.Tui.Tests;
 /// Tests for the free-text affordance on <see cref="PromptOverlay"/> when
 /// <see cref="UiPromptRequest.AllowFreeText"/> is set.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class PromptOverlayFreeTextTests : IDisposable
 {
     private const string FreeTextRowMarker = "\u270e Type your own answer\u2026"; // ✎ Type your own answer…

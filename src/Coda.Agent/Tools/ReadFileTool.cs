@@ -25,7 +25,7 @@ public sealed class ReadFileTool : ITool
             return new ToolResult("Missing required 'path'.", IsError: true);
         }
 
-        if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, path, out var full, out var pathError, context.AllowOutsideWorkingDirectory))
+        if (!ToolInput.TryResolveWithinRoot(context.WorkingDirectory, path, out var full, out var pathError, context.AllowOutsideWorkingDirectory, context.GrantedDirectories))
         {
             return new ToolResult(pathError!, IsError: true);
         }

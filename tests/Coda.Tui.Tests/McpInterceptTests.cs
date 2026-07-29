@@ -3,7 +3,8 @@ using Coda.Tui.Ui.Mode;
 using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Tests;
-
+
+[Collection("TerminalGuiInit")]
 public sealed class McpInterceptTests
 {
     [Fact]

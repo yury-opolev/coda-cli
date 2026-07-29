@@ -154,4 +154,51 @@ public sealed class TuiAgentSinkTests
     {
         public void Publish(UiEvent uiEvent) => events.Add(uiEvent);
     }
+
+    // =========================================================================
+    // OnPromptRewritten — publishes PromptRewrittenEvent
+    // =========================================================================
+
+    [Fact]
+    public void OnPromptRewritten_publishes_PromptRewrittenEvent_with_all_fields()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+
+        sink.OnPromptRewritten("my-hook", "original text", "rewritten text");
+
+        var evt = Assert.IsType<PromptRewrittenEvent>(Assert.Single(events));
+        Assert.Equal("my-hook", evt.HookCommand);
+        Assert.Equal("original text", evt.OriginalPrompt);
+        Assert.Equal("rewritten text", evt.ModifiedPrompt);
+    }
+
+    [Fact]
+    public void OnPermissionsUpdated_publishes_PermissionsUpdatedEvent()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+        var addedAllow = new[] { "danger" };
+        var addedDeny = new[] { "safe(rm:*)" };
+
+        sink.OnPermissionsUpdated("rules-hook", "acceptEdits", addedAllow, addedDeny);
+
+        var evt = Assert.IsType<PermissionsUpdatedEvent>(Assert.Single(events));
+        Assert.Equal("rules-hook", evt.HookCommand);
+        Assert.Equal("acceptEdits", evt.ModeApplied);
+        Assert.Contains("danger", evt.AddedAllow);
+        Assert.Contains("safe(rm:*)", evt.AddedDeny);
+    }
+
+    [Fact]
+    public void OnWarning_publishes_WarningEvent()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+
+        sink.OnWarning("Prompt cache appears inactive");
+
+        var evt = Assert.IsType<WarningEvent>(Assert.Single(events));
+        Assert.Equal("Prompt cache appears inactive", evt.Message);
+    }
 }

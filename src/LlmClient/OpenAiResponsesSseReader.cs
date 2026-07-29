@@ -260,9 +260,34 @@ public static class OpenAiResponsesSseReader
             && output.ValueKind == JsonValueKind.Number
                 ? output.GetInt32()
                 : 0;
-        return inputTokens > 0 || outputTokens > 0
-            ? new TokenUsage(inputTokens, outputTokens)
-            : null;
+
+        // OpenAI convention (inverted from Anthropic): input_tokens is the TOTAL;
+        // input_tokens_details.cached_tokens (Responses API) or prompt_tokens_details.cached_tokens
+        // (Chat Completions, kept as fallback) is a SUBSET. Subtract cached from InputTokens so
+        // TotalInputTokens stays correct.
+        var cachedTokens = 0;
+        if (usage.TryGetProperty("input_tokens_details", out var details1)
+            && details1.ValueKind == JsonValueKind.Object
+            && details1.TryGetProperty("cached_tokens", out var c1)
+            && c1.ValueKind == JsonValueKind.Number)
+        {
+            cachedTokens = c1.GetInt32();
+        }
+        else if (usage.TryGetProperty("prompt_tokens_details", out var details2)
+            && details2.ValueKind == JsonValueKind.Object
+            && details2.TryGetProperty("cached_tokens", out var c2)
+            && c2.ValueKind == JsonValueKind.Number)
+        {
+            cachedTokens = c2.GetInt32();
+        }
+
+        if (inputTokens > 0 || outputTokens > 0)
+        {
+            var clamped = Math.Min(cachedTokens, inputTokens);
+            return new TokenUsage(inputTokens - clamped, outputTokens, CacheReadTokens: clamped);
+        }
+
+        return null;
     }
 
     private static string? MapIncompleteReason(JsonElement response)

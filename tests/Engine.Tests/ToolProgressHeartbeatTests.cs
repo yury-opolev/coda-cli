@@ -49,6 +49,7 @@ public sealed class ToolProgressHeartbeatTests
                 this.progress.Add((toolName, elapsedMs));
             }
         }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class HangTool : ITool

@@ -11,17 +11,55 @@ namespace LlmClient;
 /// </summary>
 public static class OpenAiRequest
 {
+    /// <summary>
+    /// Copilot proprietary cache-control field. Applied only on Anthropic-family models
+    /// (those whose model ID contains "claude"). This changes <em>latency only</em> —
+    /// Copilot bills premium requests, not tokens, so tool calls do not count and there
+    /// is no per-token cost saving from caching on this path.
+    /// </summary>
+    private const string CopilotCacheControlField = "copilot_cache_control";
+
     public static JsonObject Build(ChatRequest request)
     {
+        var isAnthropicFamily = IsAnthropicFamily(request.Model);
+
+        // Run the planner once; used for both tools and messages markers below.
+        var plan = isAnthropicFamily ? PromptCachePlanner.Plan(request) : CachePlan.None;
+
         var messages = new JsonArray();
         if (request.System is not null)
         {
-            messages.Add(new JsonObject { ["role"] = "system", ["content"] = request.System });
+            var systemMsg = new JsonObject { ["role"] = "system", ["content"] = request.System };
+            if (isAnthropicFamily)
+            {
+                // Slot 2 (system) is always marked on the Anthropic-family path.
+                systemMsg[CopilotCacheControlField] = new JsonObject { ["type"] = "ephemeral" };
+            }
+
+            messages.Add(systemMsg);
         }
 
-        foreach (var message in request.Messages)
+        // Track the last OpenAI message index that was emitted for each ChatMessage index,
+        // so we can add copilot_cache_control to the right position for anchor/rolling slots.
+        var lastOpenAiIdxForChatMsg = isAnthropicFamily
+            ? new Dictionary<int, int>()
+            : null;
+
+        for (var i = 0; i < request.Messages.Count; i++)
         {
-            AppendMessage(messages, message);
+            var before = messages.Count;
+            AppendMessage(messages, request.Messages[i]);
+            if (lastOpenAiIdxForChatMsg is not null && messages.Count > before)
+            {
+                lastOpenAiIdxForChatMsg[i] = messages.Count - 1;
+            }
+        }
+
+        // Apply copilot_cache_control to message-level breakpoints (slots 3 and 4).
+        if (isAnthropicFamily && lastOpenAiIdxForChatMsg is not null)
+        {
+            AddCopilotCacheMark(messages, plan.AnchorMessageIndex, lastOpenAiIdxForChatMsg);
+            AddCopilotCacheMark(messages, plan.RollingMessageIndex, lastOpenAiIdxForChatMsg);
         }
 
         // NOTE: max_tokens is intentionally omitted. Copilot's OpenAI-compatible API makes it
@@ -41,9 +79,10 @@ public static class OpenAiRequest
         if (request.Tools.Count > 0)
         {
             var tools = new JsonArray();
-            foreach (var tool in request.Tools)
+            for (var i = 0; i < request.Tools.Count; i++)
             {
-                tools.Add(new JsonObject
+                var tool = request.Tools[i];
+                var toolNode = new JsonObject
                 {
                     ["type"] = "function",
                     ["function"] = new JsonObject
@@ -52,13 +91,50 @@ public static class OpenAiRequest
                         ["description"] = tool.Description,
                         ["parameters"] = ParseOrEmpty(tool.InputSchemaJson),
                     },
-                });
+                };
+
+                // Slot 1 (last tool): mark only when the planner placed a tools breakpoint.
+                if (isAnthropicFamily && plan.ToolsBreakpoint && i == request.Tools.Count - 1)
+                {
+                    toolNode[CopilotCacheControlField] = new JsonObject { ["type"] = "ephemeral" };
+                }
+
+                tools.Add(toolNode);
             }
 
             body["tools"] = tools;
         }
 
         return body;
+    }
+
+    /// <summary>
+    /// Returns <see langword="true"/> when the model ID indicates an Anthropic (Claude) model.
+    /// Case-insensitive containment check on "claude".
+    /// </summary>
+    internal static bool IsAnthropicFamily(string model) =>
+        model.Contains("claude", StringComparison.OrdinalIgnoreCase);
+
+    private static void AddCopilotCacheMark(
+        JsonArray messages,
+        int? chatMsgIndex,
+        Dictionary<int, int> lastOpenAiIdxForChatMsg)
+    {
+        if (chatMsgIndex is null)
+        {
+            return;
+        }
+
+        if (!lastOpenAiIdxForChatMsg.TryGetValue(chatMsgIndex.Value, out var openAiIdx))
+        {
+            return;
+        }
+
+        if (messages[openAiIdx] is JsonObject msgNode
+            && msgNode[CopilotCacheControlField] is null)
+        {
+            msgNode[CopilotCacheControlField] = new JsonObject { ["type"] = "ephemeral" };
+        }
     }
 
     private static void AppendMessage(JsonArray messages, ChatMessage message)

@@ -17,6 +17,7 @@ public class SubagentManagerTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A parent sink that records how many times each event reached it.</summary>
@@ -41,6 +42,7 @@ public class SubagentManagerTests
         public void OnLimitReached(string kind, string message) => this.LimitReached++;
         public void OnStopReason(string? stopReason) => this.StopReason++;
         public void OnUsage(TokenUsage usage) => this.Usage++;
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A host that emits exactly one of every IAgentSink event before returning.</summary>
@@ -351,6 +353,7 @@ public class SubagentManagerTests
         public void OnError(string message) { }
         public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
         public void OnThinkingComplete(int? thinkingTokens = null) => this.ThinkingCompleteCount++;
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     [Fact]

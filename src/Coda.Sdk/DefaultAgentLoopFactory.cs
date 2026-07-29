@@ -39,6 +39,8 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             gate: spec.Gate,
             currentTaskId: spec.CurrentTaskId,
             currentDepth: spec.CurrentDepth,
-            toolActivity: spec.ToolActivity);
+            toolActivity: spec.ToolActivity,
+            permissionRules: spec.PermissionRules,
+            grantedDirectoriesSource: spec.GrantedDirectoriesSource);
     }
 }

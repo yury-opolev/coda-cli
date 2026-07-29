@@ -42,8 +42,9 @@ public static class MarketplaceManifestParser
         var ownerName = ParseOwnerName(rootObj["owner"]);
         var pluginRoot = ParsePluginRoot(rootObj["metadata"]);
         var plugins = ParsePlugins(pluginsArray);
+        var renames = ParseRenames(rootObj["renames"]);
 
-        var manifest = new MarketplaceManifest(name, ownerName, pluginRoot, plugins);
+        var manifest = new MarketplaceManifest(name, ownerName, pluginRoot, plugins, renames);
         return (manifest, null);
     }
 
@@ -101,7 +102,7 @@ public static class MarketplaceManifestParser
             return null;
         }
 
-        var source = ResolveSource(entryObj["source"]);
+        var (source, sourceSha) = ResolveSource(entryObj["source"]);
         if (string.IsNullOrEmpty(source))
         {
             return null;
@@ -111,36 +112,67 @@ public static class MarketplaceManifestParser
         var version = entryObj["version"] is JsonValue vv && vv.TryGetValue<string>(out var vs) ? vs : null;
         var category = entryObj["category"] is JsonValue cv && cv.TryGetValue<string>(out var cs) ? cs : null;
         var tags = ParseTags(entryObj["tags"]);
+        var migratedTo = entryObj["migratedTo"] is JsonValue mv && mv.TryGetValue<string>(out var ms) ? ms : null;
 
-        return new MarketplacePluginEntry(entryName, source, description, version, category, tags);
+        return new MarketplacePluginEntry(entryName, source, description, version, category, tags, migratedTo, sourceSha);
     }
 
-    private static string? ResolveSource(JsonNode? sourceNode)
+    private static (string? Source, string? Sha) ResolveSource(JsonNode? sourceNode)
     {
         if (sourceNode is null)
         {
-            return null;
+            return (null, null);
         }
 
         if (sourceNode is JsonValue sourceValue)
         {
             var str = sourceValue.GetValue<string>();
-            return string.IsNullOrEmpty(str) ? null : str;
+            return (string.IsNullOrEmpty(str) ? null : str, null);
         }
 
         if (sourceNode is JsonObject sourceObj)
         {
             var kind = sourceObj["source"]?.GetValue<string>();
-            return kind switch
+            var sha = sourceObj["sha"] is JsonValue sv && sv.TryGetValue<string>(out var ss) ? ss : null;
+            var sourceStr = kind switch
             {
                 "github" => sourceObj["repo"]?.GetValue<string>(),
                 "git" => sourceObj["url"]?.GetValue<string>(),
                 "directory" or "file" => sourceObj["path"]?.GetValue<string>(),
                 _ => null
             };
+            return (sourceStr, sha);
         }
 
-        return null;
+        return (null, null);
+    }
+
+    private static IReadOnlyDictionary<string, string?>? ParseRenames(JsonNode? renamesNode)
+    {
+        if (renamesNode is not JsonObject renamesObj)
+        {
+            return null;
+        }
+
+        var result = new Dictionary<string, string?>(StringComparer.OrdinalIgnoreCase);
+        foreach (var (key, value) in renamesObj)
+        {
+            if (value is null || value is JsonValue nullValue && nullValue.TryGetValue<object>(out _) == false)
+            {
+                result[key] = null;
+            }
+            else if (value is JsonValue strValue && strValue.TryGetValue<string>(out var str))
+            {
+                result[key] = str;
+            }
+            else
+            {
+                // null JSON value → retire
+                result[key] = null;
+            }
+        }
+
+        return result.Count > 0 ? result : null;
     }
 
     private static IReadOnlyList<string> ParseTags(JsonNode? tagsNode)

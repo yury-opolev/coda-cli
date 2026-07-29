@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Microsoft.Extensions.Logging;
 using TgColor = Terminal.Gui.Drawing.Color;
 using TgName = Terminal.Gui.Drawing.ColorName16;
 
@@ -131,11 +132,42 @@ internal static class CodaThemes
         theme => theme,
         StringComparer.OrdinalIgnoreCase);
 
+    // Plugin themes live in an instance-scoped registry. The static field only names the registry
+    // the process is currently using, so a fresh plugin composition replaces the previous set
+    // rather than accumulating on top of it.
+    private static PluginThemeRegistry pluginThemes = new();
+
     public static IReadOnlyList<CodaTheme> All => all;
 
     public static CodaTheme Current { get; private set; } = Default;
 
     public static event Action? Changed;
+
+    /// <summary>Returns true when <paramref name="name"/> is one of the built-in theme names.</summary>
+    public static bool IsBuiltIn(string name) => byName.ContainsKey(name);
+
+    /// <summary>
+    /// Replaces the plugin theme registry the process resolves against. Called once per plugin
+    /// composition with that composition's own registry.
+    /// </summary>
+    public static void UsePluginRegistry(PluginThemeRegistry registry)
+    {
+        ArgumentNullException.ThrowIfNull(registry);
+        Interlocked.Exchange(ref pluginThemes, registry);
+    }
+
+    /// <summary>
+    /// Registers a plugin-contributed theme into the current registry. If the name collides with a
+    /// built-in theme, the registration is dropped and the supplied logger receives a warning.
+    /// </summary>
+    public static bool RegisterPlugin(CodaTheme theme, Microsoft.Extensions.Logging.ILogger? logger = null) =>
+        Volatile.Read(ref pluginThemes).Register(theme, logger);
+
+    /// <summary>Removes all plugin-registered themes. Called at test teardown or on plugin reload.</summary>
+    public static void ClearPluginThemes() => Volatile.Read(ref pluginThemes).Clear();
+
+    /// <summary>Returns plugin-registered themes (not including built-ins).</summary>
+    public static IReadOnlyList<CodaTheme> GetPluginThemes() => Volatile.Read(ref pluginThemes).All;
 
     public static bool TryGet(string name, out CodaTheme theme)
     {
@@ -145,7 +177,18 @@ internal static class CodaThemes
             return false;
         }
 
-        return byName.TryGetValue(name.Trim(), out theme!);
+        if (byName.TryGetValue(name.Trim(), out theme!))
+        {
+            return true;
+        }
+
+        if (Volatile.Read(ref pluginThemes).TryGet(name.Trim(), out theme!))
+        {
+            return true;
+        }
+
+        theme = Default;
+        return false;
     }
 
     public static void Set(CodaTheme theme)

@@ -49,6 +49,7 @@ public sealed class TransportRetryTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private sealed class UsageCountingSink : IAgentSink
@@ -61,6 +62,7 @@ public sealed class TransportRetryTests
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
         public void OnUsage(TokenUsage usage) => this.UsageCalls++;
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     // transportRetryDelay: Zero keeps these tests off the real 0.5s/2s backoff ladder.

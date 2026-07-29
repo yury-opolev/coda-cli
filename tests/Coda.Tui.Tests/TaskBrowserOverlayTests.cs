@@ -14,6 +14,7 @@ namespace Coda.Tui.Tests;
 /// suite is deterministic and never corrupts the terminal. Behavior lives in the headless controller/key
 /// map/state; these tests assert the overlay renders that state and routes keys to the controller.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class TaskBrowserOverlayTests : IDisposable
 {
     private readonly string _dir = Path.Combine(Path.GetTempPath(), "coda-ovl-" + Guid.NewGuid().ToString("N"));

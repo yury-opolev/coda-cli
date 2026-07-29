@@ -20,7 +20,8 @@ using LlmAuth.Providers.ClaudeAi;
 using LlmClient;
 
 namespace Coda.Tui.Tests;
-
+
+[Collection("TerminalGuiInit")]
 public sealed class CliTuiMcpSpecComplianceTests
 {
     [Theory]

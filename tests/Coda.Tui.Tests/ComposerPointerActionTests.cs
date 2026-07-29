@@ -12,6 +12,7 @@ namespace Coda.Tui.Tests;
 /// caret are genuinely exercised, and assert that the composer only classifies the gesture (copy, paste,
 /// context menu) — it performs no clipboard I/O itself.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class ComposerPointerActionTests
 {
     private static ComposerController CreateController(params ISlashCommand[] commands) =>

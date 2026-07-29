@@ -14,6 +14,7 @@ namespace Coda.Tui.Tests;
 /// or focus-driven visibility. <see cref="TextView.DefaultCursorStyle"/> is a process-global static, so
 /// every test seeds and restores it in a finally block to keep test order from leaking.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class ComposerCursorStyleTests
 {
     private static ComposerController CreateController() =>

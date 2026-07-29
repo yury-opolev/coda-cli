@@ -47,6 +47,7 @@ public sealed class BackgroundTaskToolsMigrationTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A host that writes output then blocks until an optional gate is released.</summary>

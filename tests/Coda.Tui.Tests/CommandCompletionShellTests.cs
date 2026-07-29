@@ -14,6 +14,7 @@ namespace Coda.Tui.Tests;
 /// it overlays the bottom of the transcript directly above the composer without moving the composer/status,
 /// and inline mode reuses the same retained overlay geometry in the terminal's primary buffer.
 /// </summary>
+[Collection("TerminalGuiInit")]
 public sealed class CommandCompletionShellTests
 {
     private static ISlashCommand[] Commands() =>

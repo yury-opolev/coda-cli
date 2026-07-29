@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Coda.Common;
 
 namespace Coda.Tui.Plugins;
 
@@ -60,25 +61,41 @@ public static class PluginInstaller
     /// Clones a git repository URL into <paramref name="userPluginsDir"/> as a new plugin.
     /// The cloned directory must contain a <c>plugin.json</c>.
     /// </summary>
-    public static async Task<(bool Ok, string Message)> InstallFromGitAsync(
+    /// <param name="sha">
+    /// Optional full 40-character commit SHA to check out. When set, the clone uses
+    /// <c>--no-checkout</c> followed by <c>git checkout &lt;sha&gt;</c> so the working
+    /// tree is pinned to that exact commit. When absent, the branch HEAD is cloned and
+    /// the resolved HEAD SHA is captured and returned as <c>ResolvedCommit</c>.
+    /// </param>
+    /// <returns>A 3-tuple with success flag, message, and the resolved commit SHA (or <see langword="null"/>).</returns>
+    public static async Task<(bool Ok, string Message, string? ResolvedCommit)> InstallFromGitAsync(
         string userPluginsDir,
         string gitUrl,
+        string? sha,
         CancellationToken ct)
     {
+        if (sha is not null && !MarketplaceNameValidator.IsValidSha(sha))
+        {
+            return (false,
+                $"SHA '{sha}' is invalid: must be exactly 40 hexadecimal characters. " +
+                "Abbreviated SHAs are not accepted — they are not collision-safe.",
+                null);
+        }
+
         var pluginName = DeriveNameFromGitUrl(gitUrl);
 
         // DeriveNameFromGitUrl works on an untrusted URL — reject anything that
         // isn't a safe single-segment directory name before building a path.
         if (!IsValidPluginName(pluginName))
         {
-            return (false, $"Could not derive a valid plugin name from URL: '{gitUrl}'");
+            return (false, $"Could not derive a valid plugin name from URL: '{gitUrl}'", null);
         }
 
         var targetDir = Path.Combine(userPluginsDir, pluginName);
 
         if (Directory.Exists(targetDir))
         {
-            return (false, $"Plugin '{pluginName}' is already installed");
+            return (false, $"Plugin '{pluginName}' is already installed", null);
         }
 
         Directory.CreateDirectory(userPluginsDir);
@@ -95,6 +112,16 @@ public static class PluginInstaller
                 CreateNoWindow = true,
             };
             process.StartInfo.ArgumentList.Add("clone");
+            if (sha is not null)
+            {
+                // When pinning to a specific SHA, avoid checking out branch HEAD only
+                // to discard it. Clone the objects without materialising the working tree.
+                process.StartInfo.ArgumentList.Add("--no-checkout");
+            }
+
+            // End-of-options separator: without it a URL beginning with '-' would be
+            // parsed by git as an option rather than as the repository to clone.
+            process.StartInfo.ArgumentList.Add("--");
             process.StartInfo.ArgumentList.Add(gitUrl);
             process.StartInfo.ArgumentList.Add(targetDir);
 
@@ -123,7 +150,7 @@ public static class PluginInstaller
                     // Best effort.
                 }
 
-                return (false, "git clone timed out after 60s");
+                return (false, "git clone timed out after 60s", null);
             }
 
             await stdoutTask.ConfigureAwait(false);
@@ -134,7 +161,17 @@ public static class PluginInstaller
                 var errorMessage = string.IsNullOrWhiteSpace(stderr)
                     ? "git clone failed"
                     : stderr.Trim();
-                return (false, $"git clone failed: {errorMessage}");
+                return (false, $"git clone failed: {errorMessage}", null);
+            }
+
+            if (sha is not null)
+            {
+                var checkoutResult = await GitCheckoutInDirAsync(targetDir, sha, ct).ConfigureAwait(false);
+                if (!checkoutResult.Ok)
+                {
+                    try { Directory.Delete(targetDir, recursive: true); } catch { }
+                    return (false, checkoutResult.Message, null);
+                }
             }
 
             var pluginJsonPath = Path.Combine(targetDir, PluginFileName);
@@ -150,19 +187,92 @@ public static class PluginInstaller
                     // Best effort cleanup.
                 }
 
-                return (false, "Not a valid plugin: missing plugin.json");
+                return (false, "Not a valid plugin: missing plugin.json", null);
             }
 
-            return (true, $"Installed {pluginName}");
+            // Capture the commit that is currently checked out so callers can record it.
+            var resolvedCommit = await GitRevParseHeadAsync(targetDir, ct).ConfigureAwait(false);
+            return (true, $"Installed {pluginName}", resolvedCommit);
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or FileNotFoundException)
         {
-            return (false, "git not found. Make sure git is installed and on your PATH.");
+            return (false, "git not found. Make sure git is installed and on your PATH.", null);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            return (false, $"Failed to install plugin: {ex.Message}");
+            return (false, $"Failed to install plugin: {ex.Message}", null);
         }
+    }
+
+    private static async Task<(bool Ok, string Message)> GitCheckoutInDirAsync(
+        string repoDir,
+        string sha,
+        CancellationToken ct)
+    {
+        try
+        {
+            using var process = new Process();
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "git",
+                WorkingDirectory = repoDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            process.StartInfo.ArgumentList.Add("checkout");
+            process.StartInfo.ArgumentList.Add(sha);
+
+            // Trailing end-of-options separator: disambiguates the revision from a
+            // pathspec. A leading '--' would instead make git treat the SHA as a path.
+            process.StartInfo.ArgumentList.Add("--");
+            process.Start();
+            await process.StandardOutput.ReadToEndAsync(ct).ConfigureAwait(false);
+            var stderr = await process.StandardError.ReadToEndAsync(ct).ConfigureAwait(false);
+            await process.WaitForExitAsync(ct).ConfigureAwait(false);
+            return process.ExitCode == 0
+                ? (true, string.Empty)
+                : (false, $"git checkout failed: {(string.IsNullOrWhiteSpace(stderr) ? sha : stderr.Trim())}");
+        }
+        catch (Exception ex)
+        {
+            return (false, $"git checkout failed: {ex.Message}");
+        }
+    }
+
+    private static async Task<string?> GitRevParseHeadAsync(string repoDir, CancellationToken ct)
+    {
+        try
+        {
+            using var process = new Process();
+            process.StartInfo = new ProcessStartInfo
+            {
+                FileName = "git",
+                WorkingDirectory = repoDir,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            process.StartInfo.ArgumentList.Add("rev-parse");
+            process.StartInfo.ArgumentList.Add("HEAD");
+            process.Start();
+            var stdout = await process.StandardOutput.ReadToEndAsync(ct).ConfigureAwait(false);
+            await process.StandardError.ReadToEndAsync(ct).ConfigureAwait(false);
+            await process.WaitForExitAsync(ct).ConfigureAwait(false);
+            if (process.ExitCode == 0)
+            {
+                var candidate = stdout.Trim();
+                return MarketplaceNameValidator.IsValidSha(candidate) ? candidate : null;
+            }
+        }
+        catch
+        {
+            // Best effort — caller treats null as "unknown".
+        }
+
+        return null;
     }
 
     /// <summary>
@@ -195,36 +305,14 @@ public static class PluginInstaller
 
     /// <summary>
     /// Returns true when <paramref name="name"/> is a safe single-segment plugin name
-    /// (no path separators, no <c>..</c>, no invalid filename characters).
+    /// (no path separators, no <c>..</c>, no invalid filename characters, no reserved
+    /// Windows device name, no trailing dot or surrounding whitespace).
     /// </summary>
-    public static bool IsValidPluginName(string name)
-    {
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            return false;
-        }
-
-        if (name == ".." || name == ".")
-        {
-            return false;
-        }
-
-        if (name.Contains('/') || name.Contains('\\'))
-        {
-            return false;
-        }
-
-        var invalidChars = Path.GetInvalidFileNameChars();
-        foreach (var c in name)
-        {
-            if (Array.IndexOf(invalidChars, c) >= 0)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
+    /// <remarks>
+    /// Delegates to <see cref="SafeNameValidator.IsValidName"/> — the same validator
+    /// <c>/skills new</c> uses, so the two can never drift apart.
+    /// </remarks>
+    public static bool IsValidPluginName(string name) => SafeNameValidator.IsValidName(name);
 
     /// <summary>Derives a directory name from a git URL (last path segment, minus .git suffix).</summary>
     public static string DeriveNameFromGitUrl(string gitUrl)

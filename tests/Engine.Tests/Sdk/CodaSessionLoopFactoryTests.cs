@@ -35,7 +35,7 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
 
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             sink.OnAssistantText(CannedText);
             sink.OnAssistantTextComplete();
@@ -79,7 +79,7 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
     {
         public GoalStatus? LastGoalStatus => null;
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default) =>
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null) =>
             body(sink, activity.EnsureActivity().ForCall("provider-call-id"));
     }
 
@@ -94,6 +94,7 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
         public void OnError(string message) { }
 
         public void OnToolActivityCompleted(ToolActivitySummary summary) => this.Completions.Add(summary);
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private static Task EmitSucceededToolAsync(IAgentSink sink, ToolCallIdentity identity)
@@ -374,6 +375,7 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     public void Dispose()
@@ -381,3 +383,4 @@ public sealed class CodaSessionLoopFactoryTests : IDisposable
         try { Directory.Delete(this.root, recursive: true); } catch { /* ignore */ }
     }
 }
+

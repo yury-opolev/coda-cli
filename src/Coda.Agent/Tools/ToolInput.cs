@@ -68,25 +68,48 @@ internal static class ToolInput
     }
 
     /// <summary>
-    /// Resolve a path and confirm it stays within the working directory. Blocks the
-    /// model from reading/writing arbitrary files (e.g. credential stores) outside cwd.
+    /// Resolve a path and confirm it stays within the working directory or any additional granted
+    /// roots. Blocks the model from reading/writing arbitrary files (e.g. credential stores) outside
+    /// permitted roots.
     /// </summary>
     /// <param name="allowOutsideRoot">
     /// When true (bypass/"yolo" mode), the containment check is skipped so the model
     /// may read/write anywhere the process can — the path is still resolved to a full
     /// path. Defaults to false so every non-bypass caller keeps the cwd sandbox.
     /// </param>
-    public static bool TryResolveWithinRoot(string root, string path, out string fullPath, out string? error, bool allowOutsideRoot = false)
+    /// <param name="additionalRoots">
+    /// Additional roots (e.g. granted skill directories) the path may live under.
+    /// Checked only after the primary root check fails; null means no extra roots.
+    /// </param>
+    public static bool TryResolveWithinRoot(string root, string path, out string fullPath, out string? error, bool allowOutsideRoot = false, IReadOnlySet<string>? additionalRoots = null)
     {
         fullPath = ResolvePath(root, path);
-        if (!allowOutsideRoot && !IsWithinRoot(root, fullPath))
+        if (allowOutsideRoot)
         {
-            error = $"Path '{path}' is outside the working directory and is not allowed. "
-                + "Switch to bypass permissions (/yolo) to allow paths outside the working directory.";
-            return false;
+            error = null;
+            return true;
         }
 
-        error = null;
-        return true;
+        if (IsWithinRoot(root, fullPath))
+        {
+            error = null;
+            return true;
+        }
+
+        if (additionalRoots is { Count: > 0 })
+        {
+            foreach (var extra in additionalRoots)
+            {
+                if (IsWithinRoot(extra, fullPath))
+                {
+                    error = null;
+                    return true;
+                }
+            }
+        }
+
+        error = $"Path '{path}' is outside the working directory and is not allowed. "
+            + "Switch to bypass permissions (/yolo) to allow paths outside the working directory.";
+        return false;
     }
 }

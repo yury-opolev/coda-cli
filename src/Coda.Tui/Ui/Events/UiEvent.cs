@@ -194,8 +194,12 @@ public sealed record ContextChangedEvent(ContextStatus Context) : UiEvent;
 /// <summary>The UI mode changed.</summary>
 public sealed record ModeChangedEvent(string Mode) : UiEvent;
 
-/// <summary>A turn started for a prompt.</summary>
-public sealed record TurnStartedEvent(string Prompt) : UiEvent;
+/// <summary>
+/// A turn started for a prompt. <see cref="StartedAt"/> is captured at event creation from a testable
+/// <see cref="TimeProvider"/> seam (UTC), so the reducer can set
+/// <see cref="UiSessionSnapshot.BufferingStartedAt"/> to a stable value in tests.
+/// </summary>
+public sealed record TurnStartedEvent(string Prompt, DateTimeOffset? StartedAt = null) : UiEvent;
 
 /// <summary>A turn completed (successfully or not).</summary>
 public sealed record TurnCompletedEvent(bool Success) : UiEvent;
@@ -211,6 +215,98 @@ public sealed record UiPromptResponseSubmittedEvent(Guid RequestId, UiPromptResp
 
 /// <summary>Set or clear the active operation shown in the status bar (e.g. a startup spinner).</summary>
 public sealed record ActiveOperationChangedEvent(ActiveOperation? Operation) : UiEvent;
+
+/// <summary>
+/// A <c>UserPromptSubmit</c> hook rewrote the user's prompt before the model saw it.
+/// The original text is available for display so the user can see what changed.
+/// </summary>
+public sealed record PromptRewrittenEvent(
+    string HookCommand,
+    string OriginalPrompt,
+    string ModifiedPrompt) : UiEvent;
+
+/// <summary>
+/// An <c>AgentResponse</c> hook rewrote the assistant's response. The original response
+/// is available for comparison; the display and history may differ when both
+/// <see cref="DisplayContent"/> and <see cref="ModifiedResponse"/> are set.
+/// </summary>
+public sealed record ResponseRewrittenEvent(
+    string HookCommand,
+    string OriginalResponse,
+    string DisplayContent,
+    string? ModifiedResponse) : UiEvent;
+
+/// <summary>
+/// A <c>PreToolUse</c> or <c>PermissionRequest</c> hook replaced the arguments a tool ran with.
+/// The replacement is total — <see cref="ModifiedInput"/> is exactly what the tool executed.
+/// </summary>
+public sealed record ToolInputModifiedEvent(
+    string HookCommand,
+    string ToolName,
+    string OriginalInput,
+    string ModifiedInput) : UiEvent;
+
+/// <summary>
+/// A <c>PostToolUse</c> hook replaced the result text reported to the model. The tool already
+/// ran; only what the model sees changed.
+/// </summary>
+public sealed record ToolResultModifiedEvent(
+    string HookCommand,
+    string ToolName,
+    string OriginalResult,
+    string ModifiedResult) : UiEvent;
+
+/// <summary>
+/// A <c>PermissionRequest</c> hook decided a pending approval without the interactive prompt.
+/// <see cref="Decision"/> is either <c>"allow"</c> or <c>"deny"</c>.
+/// </summary>
+public sealed record PermissionDecidedEvent(
+    string HookCommand,
+    string ToolName,
+    string Decision) : UiEvent;
+
+/// <summary>
+/// A <c>PermissionRequest</c> hook's <c>updatedPermissions</c> was applied to the live session.
+/// Emitted for auditability whenever a mode change or rule additions take effect.
+/// </summary>
+public sealed record PermissionsUpdatedEvent(
+    string HookCommand,
+    string? ModeApplied,
+    IReadOnlyList<string> AddedAllow,
+    IReadOnlyList<string> AddedDeny) : UiEvent;
+
+/// <summary>
+/// A <c>SubagentStart</c> hook blocked a subagent from running. The <c>task</c> tool will
+/// surface <see cref="Reason"/> as an error result.
+/// </summary>
+public sealed record SubagentBlockedEvent(
+    string HookCommand,
+    string TaskId,
+    string Reason) : UiEvent;
+
+/// <summary>
+/// A <c>SubagentStop</c> hook replaced the result a subagent returned to its parent.
+/// The parent agent cannot distinguish a modified result from the original.
+/// </summary>
+public sealed record SubagentResultModifiedEvent(
+    string HookCommand,
+    string TaskId,
+    string OriginalResult,
+    string ModifiedResult) : UiEvent;
+
+/// <summary>
+/// A <c>PreCompact</c> hook cancelled a compaction attempt. The next trigger
+/// (auto threshold or <c>/compact</c>) will offer a fresh chance.
+/// </summary>
+public sealed record CompactionCancelledUiEvent(
+    string HookCommand,
+    string Trigger) : UiEvent;
+
+/// <summary>
+/// A <c>PostCompact</c> hook injected additional context into history after compaction.
+/// Fires before skill re-attachment; together they represent the total post-compaction injection.
+/// </summary>
+public sealed record PostCompactContextInjectedEvent(string AdditionalContext) : UiEvent;
 
 /// <summary>
 /// An internal ordering barrier published through the mailbox by <see cref="UiActor.FlushAsync"/>. The

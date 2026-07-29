@@ -98,7 +98,7 @@ public sealed class CodaSessionRunAsyncTests : IDisposable
 
         public List<ChatMessage>? DrivenHistory { get; private set; }
 
-        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default)
+        public Task RunAsync(List<ChatMessage> history, IAgentSink sink, CancellationToken cancellationToken = default, TurnShape? shape = null)
         {
             this.RunCalls++;
             this.DrivenHistory = history;
@@ -361,3 +361,4 @@ public sealed class CodaSessionRunAsyncTests : IDisposable
         try { Directory.Delete(this.root, recursive: true); } catch { /* ignore */ }
     }
 }
+

@@ -25,6 +25,7 @@ public sealed partial class TaskManager
             parentSink,
             parentTaskId,
             parentActivity: null,
+            parentRestriction: null,
             cancellationToken: cancellationToken);
 
     /// <summary>
@@ -38,6 +39,7 @@ public sealed partial class TaskManager
         IAgentSink parentSink,
         string? parentTaskId,
         ToolActivityContext? parentActivity,
+        TurnShape? parentRestriction = null,
         CancellationToken cancellationToken = default)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Foreground);
@@ -49,7 +51,7 @@ public sealed partial class TaskManager
         try
         {
             var result = await host
-                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity, linked.Token)
+                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity, parentRestriction, linked.Token)
                 .ConfigureAwait(false);
             Complete(task.Id, result);
             return result;
@@ -70,6 +72,13 @@ public sealed partial class TaskManager
             Stop(task.Id);
             return "(subagent stopped)";
         }
+        catch (SubagentStartBlockedException)
+        {
+            // A SubagentStart hook (fail-closed) blocked this subagent. Fail the task and
+            // rethrow so TaskTool can surface the reason as an error ToolResult.
+            Fail(task.Id, "blocked by SubagentStart hook");
+            throw;
+        }
         catch (Exception ex)
         {
             Fail(task.Id, ex.Message);
@@ -86,7 +95,8 @@ public sealed partial class TaskManager
         string subagentType,
         string prompt,
         string description,
-        string? parentTaskId)
+        string? parentTaskId,
+        TurnShape? parentRestriction = null)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Background);
         var steering = new SteeringInbox();
@@ -98,7 +108,7 @@ public sealed partial class TaskManager
             try
             {
                 var result = await host
-                    .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, task.Token)
+                    .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity: null, parentRestriction, task.Token)
                     .ConfigureAwait(false);
                 Complete(task.Id, result);
             }
@@ -382,6 +392,33 @@ public sealed partial class TaskManager
         // Token usage: forwarded for accounting, but kept out of the ring/log as it is
         // per-iteration accounting noise rather than readable transcript content.
         public void OnUsage(TokenUsage usage) => _parent.OnUsage(usage);
+
+        public void OnPromptRewritten(string hookCommand, string originalPrompt, string modifiedPrompt) =>
+            _parent.OnPromptRewritten(hookCommand, originalPrompt, modifiedPrompt);
+
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) =>
+            _parent.OnResponseRewritten(hookCommand, originalResponse, displayContent, modifiedResponse);
+
+        public void OnToolInputModified(string hookCommand, string toolName, string originalInput, string modifiedInput) =>
+            _parent.OnToolInputModified(hookCommand, toolName, originalInput, modifiedInput);
+
+        public void OnToolResultModified(string hookCommand, string toolName, string originalResult, string modifiedResult) =>
+            _parent.OnToolResultModified(hookCommand, toolName, originalResult, modifiedResult);
+
+        public void OnPermissionDecided(string hookCommand, string toolName, string decision) =>
+            _parent.OnPermissionDecided(hookCommand, toolName, decision);
+
+        public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
+            _parent.OnSubagentBlocked(hookCommand, taskId, reason);
+
+        public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
+            _parent.OnSubagentResultModified(hookCommand, taskId, originalResult, modifiedResult);
+
+        public void OnCompactionCancelled(string hookCommand, string trigger) =>
+            _parent.OnCompactionCancelled(hookCommand, trigger);
+
+        public void OnPostCompactContextInjected(string additionalContext) =>
+            _parent.OnPostCompactContextInjected(additionalContext);
     }
 
     /// <summary>An IAgentSink that discards everything — used as the parent for background subagents.</summary>
@@ -404,5 +441,6 @@ public sealed partial class TaskManager
         public void OnLimitReached(string kind, string message) { }
         public void OnStopReason(string? stopReason) { }
         public void OnUsage(TokenUsage usage) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

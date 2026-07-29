@@ -27,6 +27,26 @@ public sealed class KnownMarketplacesStore
         return this.LoadEntries();
     }
 
+    /// <summary>
+    /// Returns all known marketplace entries with a reserved-name check applied on every call.
+    /// Entries whose names match a reserved name (or a lookalike) carry a non-null
+    /// <c>BlockReason</c>; permitted entries carry <see langword="null"/>.
+    /// </summary>
+    public IReadOnlyList<(string Name, KnownMarketplaceEntry Entry, string? BlockReason)> ListWithBlockStatus()
+    {
+        var entries = this.LoadEntries();
+        var result = new List<(string Name, KnownMarketplaceEntry Entry, string? BlockReason)>(entries.Count);
+
+        foreach (var (name, entry) in entries)
+        {
+            var blockReason = MarketplaceNameValidator.CheckReserved(name);
+            result.Add((name, entry, blockReason));
+        }
+
+        result.Sort((a, b) => StringComparer.OrdinalIgnoreCase.Compare(a.Name, b.Name));
+        return result;
+    }
+
     /// <summary>Tries to get a marketplace entry by name.</summary>
     public bool TryGet(string name, out KnownMarketplaceEntry? entry)
     {
@@ -161,8 +181,8 @@ public sealed class KnownMarketplacesStore
     {
         return source switch
         {
-            GithubSource g => new SourceDto { Kind = "github", Repo = g.Repo, Ref = g.Ref, ManifestPath = g.Path },
-            GitSource g => new SourceDto { Kind = "git", Url = g.Url, Ref = g.Ref, ManifestPath = g.Path },
+            GithubSource g => new SourceDto { Kind = "github", Repo = g.Repo, Ref = g.Ref, ManifestPath = g.Path, Sha = g.Sha },
+            GitSource g => new SourceDto { Kind = "git", Url = g.Url, Ref = g.Ref, ManifestPath = g.Path, Sha = g.Sha },
             LocalFileSource f => new SourceDto { Kind = "file", Path = f.Path },
             LocalDirectorySource d => new SourceDto { Kind = "directory", Path = d.Path },
             _ => new SourceDto { Kind = "unknown" },
@@ -178,8 +198,8 @@ public sealed class KnownMarketplacesStore
 
         return dto.Kind switch
         {
-            "github" when dto.Repo is not null => new GithubSource(dto.Repo, dto.Ref, dto.ManifestPath),
-            "git" when dto.Url is not null => new GitSource(dto.Url, dto.Ref, dto.ManifestPath),
+            "github" when dto.Repo is not null => new GithubSource(dto.Repo, dto.Ref, dto.ManifestPath, dto.Sha),
+            "git" when dto.Url is not null => new GitSource(dto.Url, dto.Ref, dto.ManifestPath, dto.Sha),
             "file" when dto.Path is not null => new LocalFileSource(dto.Path),
             "directory" when dto.Path is not null => new LocalDirectorySource(dto.Path),
             _ => null,
@@ -217,5 +237,8 @@ public sealed class KnownMarketplacesStore
 
         [JsonPropertyName("manifestPath")]
         public string? ManifestPath { get; set; }
+
+        [JsonPropertyName("sha")]
+        public string? Sha { get; set; }
     }
 }

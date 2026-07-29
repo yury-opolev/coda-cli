@@ -48,6 +48,7 @@ public sealed class GoalLoopTests
         public void OnToolCall(string toolName, string inputJson) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>A judge whose responses are scripted from a queue; defaults to "DONE" when empty.</summary>
@@ -172,10 +173,10 @@ public sealed class GoalLoopTests
     {
         var compactCalled = false;
 
-        Task CompactAsync(List<ChatMessage> h, CancellationToken ct)
+        Task<bool> CompactAsync(List<ChatMessage> h, IAgentSink sink, CancellationToken ct)
         {
             compactCalled = true;
-            return Task.CompletedTask;
+            return Task.FromResult(true);
         }
 
         // Use a threshold of 1 token so any non-empty history triggers compaction.
@@ -214,7 +215,7 @@ public sealed class GoalLoopTests
     {
         // compactAsync throws → the run must continue (best-effort) AND a Debug
         // line must surface the swallowed failure.
-        static Task CompactAsync(List<ChatMessage> h, CancellationToken ct)
+        static Task<bool> CompactAsync(List<ChatMessage> h, IAgentSink sink, CancellationToken ct)
             => throw new InvalidOperationException("compaction boom");
 
         var judge = new FakeJudge("DONE");

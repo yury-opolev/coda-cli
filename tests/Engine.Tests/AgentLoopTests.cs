@@ -128,6 +128,7 @@ public sealed class AgentLoopTests
         public void OnToolCall(string toolName, string inputPreview) { }
         public void OnToolResult(string toolName, ToolResult result) { }
         public void OnError(string message) { }
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>Captures OnThinking / OnThinkingComplete calls for assertion.</summary>
@@ -143,6 +144,7 @@ public sealed class AgentLoopTests
         public void OnError(string message) { }
         public void OnThinking(string delta) => this.ThinkingDeltas.Add(delta);
         public void OnThinkingComplete(int? thinkingTokens = null) => this.ThinkingCompleteCount++;
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     /// <summary>Records error and limit-reached signals for assertion.</summary>
@@ -159,6 +161,7 @@ public sealed class AgentLoopTests
         public void OnError(string message) => this.Errors.Add(message);
         public void OnLimitReached(string kind, string message) => this.Limits.Add((kind, message));
         public void OnSteeringDelivered(IReadOnlyList<string> messageIds) => this.Delivered.Add(messageIds);
+        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 
     private static AgentOptions Options() => new() { SystemPrompt = "sys", WorkingDirectory = ".", Model = "m" };

@@ -163,6 +163,16 @@ public sealed class EffortCommand : ISlashCommand
             ? null
             : ReasoningCapabilityResolver.ResolveAppliedLevel(capability, level);
 
+        // Warn when effort changes mid-session: the effort value is part of the cache key on the
+        // Anthropic path, so the tools and system cache entries will be rebuilt on the next turn.
+        var previousEffort = context.Session.Effort;
+        if (!string.Equals(applied, previousEffort, StringComparison.OrdinalIgnoreCase)
+            && context.Session.History.Count > 0)
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup(
+                "Prompt cache will be rebuilt on the next turn (effort changed)."));
+        }
+
         context.Session.Effort = applied;
 
         // Persist using the raw user input (e.g. "max" on Opus even if it maps the same wire value).

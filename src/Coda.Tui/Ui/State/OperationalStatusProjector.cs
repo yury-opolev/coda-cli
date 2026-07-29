@@ -1,3 +1,4 @@
+using System.Globalization;
 using Coda.Agent;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
@@ -43,6 +44,17 @@ internal static class OperationalStatusProjector
         {
             if (operation.Kind == "turn")
             {
+                // When a display-mutating AgentResponse hook is registered the assistant text is buffered
+                // rather than streamed, so we show a "Writing" placeholder with elapsed time and token
+                // count so the user can see that the model is working even without visible text output.
+                if (snapshot.BufferingStartedAt is { } startedAt)
+                {
+                    var text = snapshot.BufferedOutputTokens > 0
+                        ? $"Writing · {CompactTokens(snapshot.BufferedOutputTokens)} out"
+                        : "Writing";
+                    return new(text, OperationalTone.Working, Animated: true, StartedAt: startedAt);
+                }
+
                 // A running turn shows a concise, generic status. High/max effort may still surface the
                 // "Thinking deeply" hint, but the turn's label (the last submitted prompt) is never echoed
                 // beside "Working" — that just repeats the user's input while work is in flight.
@@ -105,5 +117,32 @@ internal static class OperationalStatusProjector
         var sanitized = TerminalTextSanitizer.Sanitize(value);
         var newline = sanitized.IndexOf('\n');
         return (newline < 0 ? sanitized : sanitized[..newline]).Trim();
+    }
+
+    /// <summary>
+    /// Formats a token count as a compact invariant string: values below 1 000 are left as-is;
+    /// thousands are shown with one decimal place and a "k" suffix; millions with "m".
+    /// </summary>
+    private static string CompactTokens(int value)
+    {
+        if (value < 1_000)
+        {
+            return value.ToString(CultureInfo.InvariantCulture);
+        }
+
+        if (value < 1_000_000)
+        {
+            var scaled = value / 1_000.0;
+            var rounded = Math.Round(scaled, 1, MidpointRounding.AwayFromZero);
+            return rounded == Math.Truncate(rounded)
+                ? ((long)rounded).ToString(CultureInfo.InvariantCulture) + "k"
+                : rounded.ToString("0.0", CultureInfo.InvariantCulture) + "k";
+        }
+
+        var mScaled = value / 1_000_000.0;
+        var mRounded = Math.Round(mScaled, 1, MidpointRounding.AwayFromZero);
+        return mRounded == Math.Truncate(mRounded)
+            ? ((long)mRounded).ToString(CultureInfo.InvariantCulture) + "m"
+            : mRounded.ToString("0.0", CultureInfo.InvariantCulture) + "m";
     }
 }
