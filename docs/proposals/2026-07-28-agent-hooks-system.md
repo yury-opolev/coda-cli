@@ -1,7 +1,7 @@
 # Proposal: Agent hooks system
 
 - **Date:** 2026-07-28
-- **Status:** Backlog — not started. Contract agreed; no code written.
+- **Status:** Completed. All 8 phases (35 items) implemented; see [`docs/hooks.md`](../hooks.md).
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** `Coda.Agent` (hook bus, runner, payloads, `AgentLoop` seams, `AgentOptions`,
   `SubagentHost`, settings schema), `Coda.Sdk` (`CodaSession` turn entry, `TurnPipelineBuilder`),

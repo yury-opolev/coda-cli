@@ -1,7 +1,8 @@
 # Proposal: Skills, plugins and marketplaces
 
 - **Date:** 2026-07-28
-- **Status:** Backlog — not started. No code written.
+- **Status:** Completed. All 9 phases (41 items) implemented; see
+  [`docs/skills-and-plugins.md`](../skills-and-plugins.md).
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** `Coda.Tui` (`Skills/`, `Plugins/`, the five existing commands), `Coda.Agent` (a skill
   tool, per-skill tool scoping, subagent forking), `Coda.Sdk` (session wiring).

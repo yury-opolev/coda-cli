@@ -1,7 +1,7 @@
 # Proposal: Prompt caching
 
 - **Date:** 2026-07-28
-- **Status:** Backlog — not started. Partial implementation exists; see §2.
+- **Status:** Completed. All 4 phases (19 items) implemented.
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** `LlmClient` (`AnthropicMessagesClient.BuildBody`, `AnthropicSseReader`,
   `CopilotChatClient`), `Coda.Sdk` (`Pricing`, `CatalogModel`, `TokenUsage`), `Coda.Agent`

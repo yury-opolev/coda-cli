@@ -1,7 +1,8 @@
 # Proposal: MCP servers in the coda serve path (host MCP for orchestrator-driven coda)
 
 - **Date:** 2026-07-03
-- **Status:** Draft / design exploration
+- **Status:** Completed. Shipped — `ServeOptions.EnableMcp` defaults to true, with `--no-mcp` and
+  `--no-project-mcp` to opt out.
 - **Author:** Yury Opolev (design exploration, Coda)
 - **Scope:** `Coda.Tui` (`ServeRunner`, `ServeOptions`), `Coda.Mcp` wiring; downstream note for
   Cortex Bridge (`CodaServeArgsBuilder`)
