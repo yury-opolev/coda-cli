@@ -11,7 +11,7 @@ namespace Coda.Agent.Hooks;
 /// The caller (<see cref="HookBus"/>) is responsible for applying a timeout via the
 /// <paramref name="ct"/> parameter; this executor just honours cancellation.
 /// </remarks>
-internal sealed class ShellHookExecutor : IHookExecutor
+public sealed class ShellHookExecutor : IHookExecutor
 {
     /// <summary>
     /// Maximum characters accumulated per stream.  A hook that emits more is truncated at

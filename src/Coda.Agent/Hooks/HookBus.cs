@@ -38,6 +38,8 @@ public sealed partial class HookBus
     private readonly IHookHandler? httpHandler;
     private readonly IHookHandler? promptHandler;
     private readonly IHookHandler? agentHandler;
+    private readonly HookTrustGuard? trustGuard;
+    private readonly HookRunLog? runLog;
     private int spillCounter;
 
     /// <summary>
@@ -64,6 +66,14 @@ public sealed partial class HookBus
     /// <param name="httpHandler">Handler for <c>http</c>-type hooks. When <see langword="null"/>, http hooks apply fail-open policy.</param>
     /// <param name="promptHandler">Handler for <c>prompt</c>-type hooks. When <see langword="null"/>, prompt hooks apply fail-open policy.</param>
     /// <param name="agentHandler">Handler for <c>agent</c>-type hooks. When <see langword="null"/>, agent hooks apply fail-open policy.</param>
+    /// <param name="trustGuard">
+    /// Optional trust guard for project-scoped hooks. When <see langword="null"/>, all project
+    /// hooks run without a trust check (backward-compatible with existing callers that pre-date Phase 7).
+    /// </param>
+    /// <param name="runLog">
+    /// Optional session-scoped run log. When non-null, each completed hook execution is recorded
+    /// so the <c>/hooks info</c> command can report the last run.
+    /// </param>
     public HookBus(
         IReadOnlyList<UserHook> hooks,
         IHookExecutor? executor = null,
@@ -73,7 +83,9 @@ public sealed partial class HookBus
         ILogger? logger = null,
         IHookHandler? httpHandler = null,
         IHookHandler? promptHandler = null,
-        IHookHandler? agentHandler = null)
+        IHookHandler? agentHandler = null,
+        HookTrustGuard? trustGuard = null,
+        HookRunLog? runLog = null)
     {
         this.hooks = hooks ?? throw new ArgumentNullException(nameof(hooks));
         this.executor = executor ?? new ShellHookExecutor();
@@ -84,6 +96,8 @@ public sealed partial class HookBus
         this.httpHandler = httpHandler;
         this.promptHandler = promptHandler;
         this.agentHandler = agentHandler;
+        this.trustGuard = trustGuard;
+        this.runLog = runLog;
         this.HasPreToolUse = hooks.Any(h => string.Equals(h.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase));
         this.HasPostToolUse = hooks.Any(h => string.Equals(h.Event, "PostToolUse", StringComparison.OrdinalIgnoreCase));
         this.HasPermissionRequest = hooks.Any(h => string.Equals(h.Event, "PermissionRequest", StringComparison.OrdinalIgnoreCase));
@@ -830,17 +844,40 @@ public sealed partial class HookBus
         var failOpen = hook.FailOpen ?? policy.FailOpen;
         var hookId = GetHookIdentifier(hook);
 
+        // Trust check for project-scoped hooks (Phase 7).
+        if (this.trustGuard is not null && hook.Scope == HookScope.Project)
+        {
+            var canRun = await this.trustGuard.CanRunAsync(hook, ct).ConfigureAwait(false);
+            if (!canRun)
+            {
+                this.LogUntrustedProjectHookSkipped(hookId, eventName);
+                var skippedOutcome = failOpen
+                    ? HookOutput.NoOp
+                    : new HookOutput { Decision = "block", Reason = $"untrusted project hook ('{hookId}') was not granted trust" };
+                this.RecordRun(hook, "skipped", 0);
+                return skippedOutcome;
+            }
+        }
+
         using var hookCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         hookCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
+        var sw = System.Diagnostics.Stopwatch.StartNew();
+        string outcome = "allow";
         try
         {
-            return await this.DispatchHookAsync(hook, eventName, payload, failOpen, hookCts.Token).ConfigureAwait(false);
+            var result = await this.DispatchHookAsync(hook, eventName, payload, failOpen, hookCts.Token).ConfigureAwait(false);
+            outcome = result.Continue == false ? "abort"
+                : string.Equals(result.Decision, "block", StringComparison.OrdinalIgnoreCase) ? "blocked"
+                : string.Equals(result.Decision, "deny", StringComparison.OrdinalIgnoreCase) ? "blocked"
+                : "allow";
+            return result;
         }
         catch (HttpHookNonSuccessException ex)
         {
             // Non-2xx maps to non-zero exit semantics — apply fail-open policy.
             this.LogHookNonZeroExit(hookId, ex.StatusCode, eventName);
+            outcome = "error";
             return failOpen
                 ? HookOutput.NoOp
                 : new HookOutput { Decision = "block", Reason = $"HTTP hook returned status {ex.StatusCode}" };
@@ -849,22 +886,70 @@ public sealed partial class HookBus
         {
             // Hook-specific timeout fired, not the caller's cancellation.
             this.LogHookTimeout(hookId, timeoutSeconds, eventName);
+            outcome = "timeout";
             return failOpen
                 ? HookOutput.NoOp
                 : new HookOutput { Decision = "block", Reason = $"hook timed out after {timeoutSeconds}s" };
         }
         catch (OperationCanceledException)
         {
-            // Caller cancellation — propagate.
+            // Caller cancellation — propagate without recording.
+            outcome = "cancelled";
             throw;
         }
         catch (Exception ex)
         {
             this.LogHookException(hookId, eventName, ex);
+            outcome = "error";
             return failOpen
                 ? HookOutput.NoOp
                 : new HookOutput { Decision = "block", Reason = $"hook execution failed: {ex.Message}" };
         }
+        finally
+        {
+            sw.Stop();
+            // Record run only when the hook actually executed (not when caller-cancelled).
+            if (!string.Equals(outcome, "cancelled", StringComparison.Ordinal))
+            {
+                this.RecordRun(hook, outcome, sw.ElapsedMilliseconds);
+            }
+        }
+    }
+
+    private void RecordRun(UserHook hook, string outcome, long durationMs)
+    {
+        if (this.runLog is null)
+        {
+            return;
+        }
+
+        var idx = IndexOf(hook);
+        if (idx >= 0)
+        {
+            this.runLog.Record(idx, new HookRunEntry(DateTimeOffset.UtcNow, outcome, durationMs));
+        }
+    }
+
+    private int IndexOf(UserHook hook)
+    {
+        for (var i = 0; i < this.hooks.Count; i++)
+        {
+            if (ReferenceEquals(this.hooks[i], hook))
+            {
+                return i;
+            }
+        }
+
+        // Fall back to value equality (hook records that have been replaced via management).
+        for (var i = 0; i < this.hooks.Count; i++)
+        {
+            if (this.hooks[i] == hook)
+            {
+                return i;
+            }
+        }
+
+        return -1;
     }
 
     private async Task<HookOutput> DispatchHookAsync(
@@ -2571,6 +2656,11 @@ public sealed partial class HookBus
         var result = new List<UserHook>();
         foreach (var hook in this.hooks)
         {
+            if (!hook.Enabled)
+            {
+                continue;
+            }
+
             if (!string.Equals(hook.Event, eventName, StringComparison.OrdinalIgnoreCase))
             {
                 continue;
@@ -2655,6 +2745,11 @@ public sealed partial class HookBus
         Level = LogLevel.Warning,
         Message = "command hook for event '{eventName}' has no 'command' field — skipping")]
     private partial void LogMissingCommand(string eventName);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "project hook '{hookId}' for event '{eventName}' is untrusted — skipping; apply the event's fail-open policy")]
+    private partial void LogUntrustedProjectHookSkipped(string hookId, string eventName);
 
     // -------------------------------------------------------------------------
     // Internal test seams

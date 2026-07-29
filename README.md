@@ -92,7 +92,7 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
 - **Providers** — Claude.ai subscriber OAuth, Anthropic API key, and GitHub Copilot
   (device flow), with automatic token refresh.
 - **You stay in control** — permission modes (`default` / `acceptEdits` / `plan` /
-  `bypass`), allow/deny rules and lifecycle hooks from settings files, and an
+  `bypass`), allow/deny rules and [lifecycle hooks](docs/hooks.md) from settings files, and an
   interactive approve/deny prompt for risky actions.
 - **Autonomy helpers (opt-in)** — a background **session-memory** notes file, a
   **safety classifier** that vets actions in bypass mode, and an autonomous **goal

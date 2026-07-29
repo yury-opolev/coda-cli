@@ -54,7 +54,9 @@ public sealed class UserHookRunner
         ILogger? logger = null,
         IHookHandler? httpHandler = null,
         IHookHandler? promptHandler = null,
-        IHookHandler? agentHandler = null)
+        IHookHandler? agentHandler = null,
+        HookTrustGuard? trustGuard = null,
+        HookRunLog? runLog = null)
     {
         ArgumentNullException.ThrowIfNull(hooks);
 
@@ -63,7 +65,8 @@ public sealed class UserHookRunner
             : new ShellHookExecutor();
 
         this.bus = new HookBus(hooks, executor, context, logger: logger,
-            httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler);
+            httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler,
+            trustGuard: trustGuard, runLog: runLog);
     }
 
     /// <summary>
@@ -77,12 +80,15 @@ public sealed class UserHookRunner
         ILogger? logger = null,
         IHookHandler? httpHandler = null,
         IHookHandler? promptHandler = null,
-        IHookHandler? agentHandler = null)
+        IHookHandler? agentHandler = null,
+        HookTrustGuard? trustGuard = null,
+        HookRunLog? runLog = null)
     {
         ArgumentNullException.ThrowIfNull(hooks);
         ArgumentNullException.ThrowIfNull(executor);
         this.bus = new HookBus(hooks, executor, context, logger: logger,
-            httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler);
+            httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler,
+            trustGuard: trustGuard, runLog: runLog);
     }
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>

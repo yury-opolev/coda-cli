@@ -41,6 +41,7 @@ public static class SlashCommandCatalog
         new InitCommand(),
         new MemoryCommand(),
         new McpCommand(),
+        new HooksCommand(),
         new CompactCommand(),
         new ContextCommand(),
         new CostCommand(),

@@ -1,6 +1,7 @@
 using Coda.Agent;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Tasks;
+using Coda.Tui.Commands;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.State;
@@ -134,6 +135,12 @@ public sealed class CommandContext
     /// Null in contexts that do not construct an interactive MCP runtime.
     /// </summary>
     internal Coda.Tui.Mcp.IMcpManagementService? McpManagement { get; set; }
+
+    /// <summary>
+    /// Hook management service for the current session, used by <c>/hooks</c>.
+    /// Null in contexts where no hooks are configured or no management surface is needed.
+    /// </summary>
+    public IHookManagementService? HookManagement { get; set; }
 
     public ProviderDescriptor? FindProvider(string id) =>
         this.Providers.FirstOrDefault(p => string.Equals(p.Id, id, StringComparison.OrdinalIgnoreCase));

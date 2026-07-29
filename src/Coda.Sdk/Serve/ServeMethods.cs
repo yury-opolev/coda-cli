@@ -52,4 +52,9 @@ public static class ServeMethods
     public const string RequestPermission = "request/permission";
     public const string RequestQuestion = "request/question";
     public const string RequestPlanApproval = "request/planApproval";
+
+    // Hook management (orchestrator → Coda)
+    public const string HookList = "hooks/list";
+    public const string HookInfo = "hooks/info";
+    public const string HookTrust = "hooks/trust";
 }

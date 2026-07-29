@@ -65,6 +65,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// without spawning real processes or writing settings to disk. Null in production.
     /// </summary>
     private readonly UserHookRunner? userHookRunnerOverride;
+    private readonly List<UserHook> configuredHooks;
+    private readonly HookRunLog hookRunLog;
+    private readonly HookTrustGuard? trustGuard;
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
 
@@ -114,7 +117,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         IAgentLoopFactory? agentLoopFactory = null,
         Func<SessionOptions>? currentOptionsProvider = null,
         TimeProvider? timeProvider = null,
-        UserHookRunner? userHookRunnerOverride = null)
+        UserHookRunner? userHookRunnerOverride = null,
+        HookTrustGuard? trustGuard = null,
+        HookRunLog? runLog = null,
+        List<UserHook>? hookList = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
@@ -129,6 +135,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.userHookRunnerOverride = userHookRunnerOverride;
         this.history = history ?? [];
         this.SessionId = sessionId ?? SessionIds.NewId();
+        this.trustGuard = trustGuard;
+        this.hookRunLog = runLog ?? new HookRunLog();
         if (options.SessionSource is { } src)
         {
             this.sessionSource = src;
@@ -157,6 +165,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // Plugin keys are namespaced (plugin:<name>:<server>) so clashes with settings keys are rare;
         // settings always win on exact-key clashes.
         var settings = SettingsLoader.Load(options.WorkingDirectory);
+        // Use caller-provided hook list when available (supports /hooks enable/disable and
+        // the shared run log). Fall back to a fresh copy of the settings hooks otherwise.
+        this.configuredHooks = hookList ?? new List<UserHook>(settings.Hooks);
 
         var userCodaPluginsDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
@@ -226,7 +237,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             (client, model, trigger, sink, ct) => this.CompactHistoryAsync(client, model, trigger, sink, ct),
             // Evaluated per turn, so once InitializeAsync starts the runtime the main schedule_list
             // sees the live view; it returns null before initialization and when scheduling is off.
-            () => this.scheduleRuntime);
+            () => this.scheduleRuntime,
+            sessionHookList: this.configuredHooks,
+            runLog: this.hookRunLog,
+            trustGuard: this.trustGuard);
 
         this.logger.LogInformation(
             "Session {sessionId} started: provider {provider}, model {model}",
@@ -239,26 +253,25 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             this.sessionHookRunner = userHookRunnerOverride;
         }
-        else if (settings.Hooks.Count > 0)
+        else if (this.configuredHooks.Count > 0)
         {
-            var sessionHooks = settings.Hooks
-                .Where(h => IsSessionLevelHookEvent(h.Event))
-                .ToList();
-            if (sessionHooks.Count > 0)
+            // Use the full configuredHooks list so run-log indices are consistent with
+            // HookManagementService (which also indexes into configuredHooks). The bus's
+            // GetMatchingHooks filters to the relevant event names on each call.
+            var hasSessionLevelHooks = this.configuredHooks.Any(h => IsSessionLevelHookEvent(h.Event));
+            if (hasSessionLevelHooks)
             {
-                // Wire the http handler so http-type session hooks can fire.
-                // prompt/agent handlers are unavailable at session-construction time (no client yet);
-                // session-level events (SessionStart/SessionEnd/Notification) are all fail-open, so
-                // null prompt/agent handlers result in safe NoOp behaviour for those types.
                 var sessionHttpHandler = new Coda.Agent.Hooks.HttpHookHandler(
                     httpClient: null,
                     settings.HttpHookAllowlist,
                     logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
                 this.sessionHookRunner = new UserHookRunner(
-                    sessionHooks,
+                    this.configuredHooks,
                     context: new HookContext(this.SessionId, options.WorkingDirectory),
                     logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
-                    httpHandler: sessionHttpHandler);
+                    httpHandler: sessionHttpHandler,
+                    trustGuard: this.trustGuard,
+                    runLog: this.hookRunLog);
             }
         }
 
@@ -303,6 +316,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     /// <summary>The active telemetry log file, or null when telemetry is disabled.</summary>
     public string? LogFilePath { get; }
+
+    /// <summary>
+    /// The merged (user + project) list of hooks loaded from settings at construction time,
+    /// with scope and enabled annotations applied. Empty when no hooks are configured.
+    /// Exposed so the serve layer can enumerate hooks without direct access to the settings file.
+    /// </summary>
+    public IReadOnlyList<UserHook> ConfiguredHooks => this.configuredHooks;
 
     private volatile SessionOptions options;
 

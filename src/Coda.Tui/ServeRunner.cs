@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.Hooks;
 using Coda.Agent.Settings;
 using Coda.Mcp;
 using Coda.Sdk;
@@ -247,12 +248,18 @@ public static class ServeRunner
     {
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> factory =
             factoryOverride ?? ((perm, question, plan) =>
-                new CodaSession(credentials, sessionOptions with
+            {
+                var trustGuard = new HookTrustGuard(
+                    new HookTrustStore(),
+                    sessionOptions.WorkingDirectory,
+                    promptCallback: null); // serve: no interactive callback — fail closed
+                return new CodaSession(credentials, sessionOptions with
                 {
                     InteractivePrompt = perm,
                     UserQuestionPrompt = question,
                     PlanApprover = plan,
-                }));
+                }, trustGuard: trustGuard);
+            });
 
         return new ServeHost(input, output, factory, expectedApiKey);
     }

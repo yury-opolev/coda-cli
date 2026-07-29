@@ -108,7 +108,33 @@ public static class SettingsLoader
 
         List<string> allow = [.. userSettings.Allow, .. projectSettings.Allow];
         List<string> deny = [.. userSettings.Deny, .. projectSettings.Deny];
-        List<UserHook> hooks = [.. userSettings.Hooks, .. projectSettings.Hooks];
+
+        // Build the disabled-hashes set from user settings (project settings cannot manage overrides).
+        var disabledHashes = userSettings.HookDisabledHashes.Count > 0
+            ? new HashSet<string>(userSettings.HookDisabledHashes, StringComparer.Ordinal)
+            : null;
+
+        // Annotate each hook with its source scope and apply per-hash enable/disable overrides.
+        var hooks = new List<UserHook>(userSettings.Hooks.Count + projectSettings.Hooks.Count);
+        foreach (var h in userSettings.Hooks)
+        {
+            var hash = HookContentHash.Compute(h);
+            hooks.Add(h with
+            {
+                Scope = HookScope.User,
+                Enabled = disabledHashes is null || !disabledHashes.Contains(hash),
+            });
+        }
+
+        foreach (var h in projectSettings.Hooks)
+        {
+            var hash = HookContentHash.Compute(h);
+            hooks.Add(h with
+            {
+                Scope = HookScope.Project,
+                Enabled = disabledHashes is null || !disabledHashes.Contains(hash),
+            });
+        }
 
         // Merge LSP servers: user entries first, then project entries overlay by name.
         var mergedLsp = new Dictionary<string, LspServerConfig>(userSettings.LspServers);
@@ -163,6 +189,7 @@ public static class SettingsLoader
                 ToolDisplayMode = MigrateDisplayMode(doc?.ToolDisplayMode),
                 EffortByModel = ParseEffortByModel(doc?.EffortByModel),
                 HttpHookAllowlist = ParseHttpHookAllowlist(doc?.HttpHookAllowlist),
+                HookDisabledHashes = ParseHookDisabledHashes(doc?.HookDisabledHashes),
             };
         }
         catch (Exception ex) when (ex is JsonException or IOException)
@@ -483,6 +510,27 @@ public static class SettingsLoader
 
     private static readonly IReadOnlyList<string> emptyAllowlist = [];
 
+    /// <summary>Parses the <c>hookDisabledHashes</c> array, dropping blank entries.</summary>
+    private static IReadOnlyList<string> ParseHookDisabledHashes(List<string>? raw)
+    {
+        if (raw is not { Count: > 0 })
+        {
+            return [];
+        }
+
+        var result = new List<string>(raw.Count);
+        foreach (var hash in raw)
+        {
+            var trimmed = hash?.Trim();
+            if (!string.IsNullOrEmpty(trimmed))
+            {
+                result.Add(trimmed);
+            }
+        }
+
+        return result.Count > 0 ? result.AsReadOnly() : [];
+    }
+
     /// <summary>Parses the <c>httpHookAllowlist</c> array, dropping blank entries.</summary>
     private static IReadOnlyList<string> ParseHttpHookAllowlist(List<string>? raw)
     {
@@ -559,6 +607,8 @@ public static class SettingsLoader
         public Dictionary<string, string>? EffortByModel { get; set; }
         [JsonPropertyName("httpHookAllowlist")]
         public List<string>? HttpHookAllowlist { get; set; }
+        [JsonPropertyName("hookDisabledHashes")]
+        public List<string>? HookDisabledHashes { get; set; }
     }
 
     private sealed class GoalSection

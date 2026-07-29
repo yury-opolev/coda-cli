@@ -3,6 +3,7 @@ using Coda.Agent.Hooks;
 using Coda.Mcp.Auth;
 using Coda.Sdk;
 using Coda.Tui.Clipboard;
+using Coda.Tui.Commands;
 using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
 using Coda.Tui.Rendering;
@@ -314,6 +315,32 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             mailbox);
         context.McpManagement = mcpManagement;
 
+        // Build the session-stable hook collaborators: a mutable hook list (frozen from startup
+        // settings), a shared run log, and a trust guard backed by the interactive prompt service.
+        // The same instances are given to both the session (via its CodaSession constructor) and
+        // HookManagementService so /hooks enable/disable and /hooks info operate on the live data.
+        var hookList = new List<UserHook>(startupSettings.Hooks);
+        var hookRunLog = new HookRunLog();
+        var hookTrustStore = new HookTrustStore();
+        var hookTrustGuard = new HookTrustGuard(
+            hookTrustStore,
+            cwd,
+            promptCallback: async (hook, ct) =>
+            {
+                var response = await actorPrompts.RequestAsync(
+                    UiPromptRequest.Confirm(
+                        $"Trust project hook? Event: {hook.Event}  Handler: {hook.HandlerType ?? "command"}  Command: {hook.Command ?? hook.Url ?? "[" + hook.HandlerType + "]"}",
+                        defaultValue: false),
+                    ct).ConfigureAwait(false);
+                return !response.Cancelled && response.SelectedIds.Contains("yes");
+            });
+        var hookManagement = new Coda.Tui.Commands.HookManagementService(
+            hookList,
+            hookRunLog,
+            userSettingsDir: null,
+            trustGuard: hookTrustGuard);
+        context.HookManagement = hookManagement;
+
         // Wire the real turn-scoped context-window cache. It stays lazy — no analysis at startup — and is
         // populated by the existing post-turn refresh (AgentRunner) and /context. The exit card reads only
         // its already-computed Current report, so shutdown never triggers a fresh analysis.
@@ -333,11 +360,28 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             }
         }, hostToken);
 
+        // Use the internal constructor with a custom session factory so the hook list,
+        // run log, and trust guard are threaded into every CodaSession the runner creates.
+        var capturedHookList = hookList;
+        var capturedRunLog = hookRunLog;
+        var capturedTrustGuard = hookTrustGuard;
+        Func<int, string>? skillReattach = skillTool is not null
+            ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
+            : null;
         using var agentRunner = new AgentRunner(
             agentToolsProvider,
-            skillReattachProvider: skillTool is not null
-                ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
-                : null);
+            sessionFactory: (ctx, opts, currentOpts) =>
+                new CodaSession(
+                    ctx.Credentials,
+                    opts,
+                    history: ctx.Session.History,
+                    sessionId: ctx.Session.SessionId,
+                    currentOptionsProvider: currentOpts,
+                    hookList: capturedHookList,
+                    runLog: capturedRunLog,
+                    trustGuard: capturedTrustGuard),
+            timeProvider: null,
+            skillReattachProvider: skillReattach);
         using var app = new TuiApp(context, agentToolsProvider, agentRunner: agentRunner);
 
         // The command context and the browser both read the live session through agentRunner (a provider,

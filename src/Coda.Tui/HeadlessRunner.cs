@@ -1,4 +1,5 @@
 using Coda.Agent.Goals;
+using Coda.Agent.Hooks;
 using Coda.Mcp;
 using Coda.Sdk;
 using LlmAuth;
@@ -164,7 +165,12 @@ public static class HeadlessRunner
             SystemPromptOverride = ResolveInitialSystemPromptOverride(options, resolvedTarget),
         };
 
-        using var session = new CodaSession(credentials, sessionOptions, history: seedHistory, sessionId: seedSessionId);
+        using var session = new CodaSession(
+            credentials,
+            sessionOptions,
+            history: seedHistory,
+            sessionId: seedSessionId,
+            trustGuard: new HookTrustGuard(new HookTrustStore(), workingDirectory, promptCallback: null));
         if (rootResumeTarget is not null)
         {
             // Apply persisted root metadata against CodaSession's constructor-captured startup authority.

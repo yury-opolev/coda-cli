@@ -64,4 +64,6 @@ public sealed record UserHook(
     string? HandlerType = null,
     string? Url = null,
     string? HookPrompt = null,
-    string? AgentType = null);
+    string? AgentType = null,
+    bool Enabled = true,
+    HookScope Scope = HookScope.User);

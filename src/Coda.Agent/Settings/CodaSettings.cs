@@ -69,6 +69,13 @@ public sealed record CodaSettings(
     /// </summary>
     public IReadOnlyList<string> HttpHookAllowlist { get; init; } = [];
 
+    /// <summary>
+    /// Content hashes of hooks the user has explicitly disabled. Applied at load time to set
+    /// <see cref="UserHook.Enabled"/> on the merged hook list. Populated only from user settings;
+    /// project settings cannot manage enable/disable overrides.
+    /// </summary>
+    public IReadOnlyList<string> HookDisabledHashes { get; init; } = [];
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
 }

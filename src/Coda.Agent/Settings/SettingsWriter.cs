@@ -291,20 +291,68 @@ public static class SettingsWriter
         permissions[key] = array;
     }
 
-    private static void ApplyKey(JsonObject root, string key, string? value)
+    /// <summary>
+    /// Persists a hook enable/disable override keyed by content hash to the user settings file.
+    /// When <paramref name="enabled"/> is <see langword="false"/>, the hash is added to
+    /// <c>hookDisabledHashes</c>; when <see langword="true"/>, it is removed. Atomic (temp file + move),
+    /// preserving all other keys. This is what <c>/hooks enable</c> and <c>/hooks disable</c> write.
+    /// </summary>
+    public static void SetHookEnabled(string hookHash, bool enabled, string? userSettingsDir = null)
     {
-        if (value is null)
-        {
-            return; // leave unchanged
-        }
+        ArgumentException.ThrowIfNullOrWhiteSpace(hookHash);
 
-        if (value.Length == 0)
+        var homeDir = userSettingsDir
+            ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
+            ?? Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var dir = Path.Combine(homeDir, ".coda");
+        var file = Path.Combine(dir, "settings.json");
+
+        JsonObject root;
+        try
         {
-            root.Remove(key); // explicit clear
+            root = (File.Exists(file) ? JsonNode.Parse(File.ReadAllText(file)) as JsonObject : null) ?? new JsonObject();
+        }
+        catch (JsonException)
+        {
+            // Corrupt settings file: abort rather than truncating the user's other settings keys.
+            return;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Unreadable settings: fail silently.
             return;
         }
 
-        root[key] = value;
+        var disabledArray = root["hookDisabledHashes"] as JsonArray ?? [];
+        var hashes = new HashSet<string>(
+            disabledArray.Select(n => n is JsonValue v && v.TryGetValue<string>(out var s) ? s : null)
+                         .Where(s => s is not null)!,
+            StringComparer.Ordinal);
+
+        if (!enabled)
+        {
+            hashes.Add(hookHash);
+        }
+        else
+        {
+            hashes.Remove(hookHash);
+        }
+
+        if (hashes.Count > 0)
+        {
+            root["hookDisabledHashes"] = new JsonArray(
+                hashes.Order().Select(h => (JsonNode?)JsonValue.Create(h)).ToArray());
+        }
+        else
+        {
+            root.Remove("hookDisabledHashes");
+        }
+
+        Directory.CreateDirectory(dir);
+        var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
+        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
+        File.WriteAllText(tmp, json);
+        File.Move(tmp, file, overwrite: true);
     }
 
     /// <summary>
@@ -360,6 +408,22 @@ public static class SettingsWriter
         var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
         File.WriteAllText(tmp, json);
         File.Move(tmp, file, overwrite: true);
+    }
+
+    private static void ApplyKey(JsonObject root, string key, string? value)
+    {
+        if (value is null)
+        {
+            return; // leave unchanged
+        }
+
+        if (value.Length == 0)
+        {
+            root.Remove(key); // explicit clear
+            return;
+        }
+
+        root[key] = value;
     }
 }
 

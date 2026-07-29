@@ -44,6 +44,13 @@ public sealed class TurnPipelineBuilder
     private readonly Func<ILlmClient, string, string, IAgentSink?, CancellationToken, Task<bool>> compactHistoryAsync;
     private readonly Func<IScheduleRuntimeView?> scheduleRuntimeProvider;
 
+    // Session-stable hook collaborators. When provided, these replace the per-turn
+    // settings.Hooks reload so enable/disable changes take effect without a restart,
+    // and the run log is shared with HookManagementService for /hooks info.
+    private readonly List<UserHook>? sessionHookList;
+    private readonly HookRunLog? runLog;
+    private readonly HookTrustGuard? trustGuard;
+
     /// <summary>
     /// Creates the builder with the session's stable per-session collaborators. These do not
     /// change between turns, so the builder is constructed once in the session ctor.
@@ -66,6 +73,18 @@ public sealed class TurnPipelineBuilder
     /// <see cref="BuildSpec"/> call (not captured once) because the runtime is created after the
     /// builder — it returns null until the runtime starts, then the live view.
     /// </param>
+    /// <param name="sessionHookList">
+    /// Mutable hook list frozen at session start. When provided, <see cref="BuildSpec"/> uses this
+    /// list instead of reloading from settings each turn, so <c>/hooks enable/disable</c> takes
+    /// effect immediately. Must be the same instance given to <c>HookManagementService</c>.
+    /// </param>
+    /// <param name="runLog">
+    /// Session-scoped run log shared with <c>HookManagementService</c> for <c>/hooks info</c>.
+    /// </param>
+    /// <param name="trustGuard">
+    /// Trust guard for project-scoped hooks. When non-null, every project-scoped hook is
+    /// checked before execution; untrusted hooks are blocked per their fail-open/closed policy.
+    /// </param>
     public TurnPipelineBuilder(
         TodoStore todos,
         ScheduledTaskStore schedules,
@@ -75,7 +94,10 @@ public sealed class TurnPipelineBuilder
         ToolSearchCoordinator? toolSearchCoordinator,
         ILoggerFactory loggerFactory,
         Func<ILlmClient, string, string, IAgentSink?, CancellationToken, Task<bool>> compactHistoryAsync,
-        Func<IScheduleRuntimeView?> scheduleRuntimeProvider)
+        Func<IScheduleRuntimeView?> scheduleRuntimeProvider,
+        List<UserHook>? sessionHookList = null,
+        HookRunLog? runLog = null,
+        HookTrustGuard? trustGuard = null)
     {
         this.todos = todos ?? throw new ArgumentNullException(nameof(todos));
         this.schedules = schedules ?? throw new ArgumentNullException(nameof(schedules));
@@ -86,6 +108,9 @@ public sealed class TurnPipelineBuilder
         this.loggerFactory = loggerFactory ?? throw new ArgumentNullException(nameof(loggerFactory));
         this.compactHistoryAsync = compactHistoryAsync ?? throw new ArgumentNullException(nameof(compactHistoryAsync));
         this.scheduleRuntimeProvider = scheduleRuntimeProvider ?? throw new ArgumentNullException(nameof(scheduleRuntimeProvider));
+        this.sessionHookList = sessionHookList;
+        this.runLog = runLog;
+        this.trustGuard = trustGuard;
     }
 
     /// <summary>
@@ -123,13 +148,17 @@ public sealed class TurnPipelineBuilder
         var hookContext = new HookContext(
             SessionId: this.tasks.SessionId,
             Cwd: agentOptions.WorkingDirectory);
-        var (httpHandler, promptHandler, agentHandler) = settings.Hooks.Count > 0
+        // Use the session-frozen hook list when provided (supports /hooks enable/disable);
+        // fall back to the per-turn settings load for backward-compat when no list is injected.
+        var hookList = (IReadOnlyList<UserHook>?)this.sessionHookList ?? settings.Hooks;
+        var (httpHandler, promptHandler, agentHandler) = hookList.Count > 0
             ? this.BuildHookHandlers(client, settings, options, agentOptions, permissions, includeAnthropicSystemPrefix)
             : default;
-        var userHooks = settings.Hooks.Count > 0
-            ? new UserHookRunner(settings.Hooks, context: hookContext,
+        var userHooks = hookList.Count > 0
+            ? new UserHookRunner(hookList, context: hookContext,
                 logger: this.loggerFactory.CreateLogger("Coda.Hooks"),
-                httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler)
+                httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler,
+                trustGuard: this.trustGuard, runLog: this.runLog)
             : null;
 
         var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks);
@@ -271,13 +300,15 @@ public sealed class TurnPipelineBuilder
         var hookContext = new HookContext(
             SessionId: this.tasks.SessionId,
             Cwd: agentOptions.WorkingDirectory);
-        var (httpHandler, promptHandler, agentHandler) = settings.Hooks.Count > 0
+        var hookList = (IReadOnlyList<UserHook>?)this.sessionHookList ?? settings.Hooks;
+        var (httpHandler, promptHandler, agentHandler) = hookList.Count > 0
             ? this.BuildHookHandlers(client, settings, options, agentOptions, permissions, includeAnthropicSystemPrefix)
             : default;
-        var userHooks = settings.Hooks.Count > 0
-            ? new UserHookRunner(settings.Hooks, context: hookContext,
+        var userHooks = hookList.Count > 0
+            ? new UserHookRunner(hookList, context: hookContext,
                 logger: this.loggerFactory.CreateLogger("Coda.Hooks"),
-                httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler)
+                httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler,
+                trustGuard: this.trustGuard, runLog: this.runLog)
             : null;
 
         // A normal child host so the scheduled root (depth 1) can create depth-2 children; depth-3
