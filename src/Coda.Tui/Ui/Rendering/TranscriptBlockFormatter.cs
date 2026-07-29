@@ -104,6 +104,10 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     /// </summary>
     public IReadOnlyList<LinkSpan>? Links { get; init; }
 
+    /// <summary>Where this row sits in the transcript's gutter/tree shape. Set while the block is being
+    /// projected and consumed by the final shaping pass, which turns it into the row's literal prefix.</summary>
+    public TranscriptGutterKind Gutter { get; init; }
+
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
 
@@ -118,6 +122,7 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
         this.RightTextTrailingCells == other.RightTextTrailingCells &&
         this.PrefixCells == other.PrefixCells &&
         this.PrefixRole == other.PrefixRole &&
+        this.Gutter == other.Gutter &&
         LinksContentEqual(this.Links, other.Links);
 
     private static bool LinksContentEqual(IReadOnlyList<LinkSpan>? a, IReadOnlyList<LinkSpan>? b)
@@ -137,7 +142,7 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     {
         var hash = HashCode.Combine(
             this.Text, (int)this.Role, this.FillWidth, this.RightText,
-            this.RightTextTrailingCells, this.PrefixCells, (int)this.PrefixRole);
+            this.RightTextTrailingCells, this.PrefixCells, (int)this.PrefixRole, (int)this.Gutter);
         if (this.Links is not null)
         {
             foreach (var link in this.Links)
@@ -173,36 +178,43 @@ public static class TranscriptBlockFormatter
         TranscriptBlock block,
         int width,
         ToolDisplayMode toolDisplayMode,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        TranscriptGlyphs? glyphs = null)
     {
         ArgumentNullException.ThrowIfNull(block);
 
+        var effectiveGlyphs = glyphs ?? TranscriptGlyphs.Unicode;
         var safeWidth = width > 0 ? width : 1;
+        var reserved = GutterReservedCells(block, toolDisplayMode);
+        var contentWidth = Math.Max(1, safeWidth - reserved);
         var lines = new List<TranscriptRenderLine>();
 
         switch (block)
         {
             case AssistantTranscriptBlock assistant:
-                AppendMarkdown(lines, assistant.Text, safeWidth);
+                AppendMarkdown(lines, assistant.Text, contentWidth);
+                TagMessageRows(lines, assistant.Complete ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.AgentActive);
                 break;
 
             case UserTranscriptBlock user:
-                AppendUser(lines, user, safeWidth);
+                AppendUser(lines, user, contentWidth);
+                TagMessageRows(lines, TranscriptGutterKind.UserMarker);
                 break;
 
             case PendingUserTranscriptBlock pending:
-                AppendPendingUser(lines, pending, safeWidth);
+                AppendPendingUser(lines, pending, contentWidth);
+                TagMessageRows(lines, TranscriptGutterKind.UserMarker);
                 break;
 
             case ToolTranscriptBlock tool:
                 if (toolDisplayMode != ToolDisplayMode.Hidden)
                 {
-                    AppendTool(lines, tool, safeWidth, toolDisplayMode);
+                    AppendTool(lines, tool, contentWidth, toolDisplayMode);
                 }
                 break;
 
             case ToolActivityTranscriptBlock activity:
-                AppendToolActivity(lines, activity, safeWidth, toolDisplayMode);
+                AppendToolActivity(lines, activity, contentWidth, toolDisplayMode);
                 break;
 
             case CommandOutputTranscriptBlock command:
@@ -236,12 +248,14 @@ public static class TranscriptBlockFormatter
             case ThinkingTranscriptBlock thinking:
                 if (toolDisplayMode != ToolDisplayMode.Hidden)
                 {
-                    AppendThinking(lines, thinking, safeWidth, toolDisplayMode, timeProvider);
+                    AppendThinking(lines, thinking, contentWidth, toolDisplayMode, timeProvider);
+                    TagMessageRows(lines, thinking.Complete ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.AgentActive);
                 }
 
                 break;
         }
 
+        ApplyGutters(lines, effectiveGlyphs);
         return lines;
     }
 
@@ -249,8 +263,122 @@ public static class TranscriptBlockFormatter
     public static string FormatPlainText(
         TranscriptBlock block,
         int width,
-        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Full) =>
-        string.Join('\n', Format(block, width, toolDisplayMode).Select(line => line.Text));
+        ToolDisplayMode toolDisplayMode = ToolDisplayMode.Full,
+        TranscriptGlyphs? glyphs = null) =>
+        string.Join('\n', Format(block, width, toolDisplayMode, null, glyphs).Select(line => line.Text));
+
+    /// <summary>Cells the gutter reserves for <paramref name="block"/>, so content is wrapped narrow enough
+    /// that the prefix always fits inside the viewport width.</summary>
+    internal static int GutterReservedCells(TranscriptBlock block, ToolDisplayMode toolDisplayMode) => block switch
+    {
+        UserTranscriptBlock => TranscriptGlyphs.MarkerCells,
+        PendingUserTranscriptBlock => TranscriptGlyphs.MarkerCells,
+        AssistantTranscriptBlock => TranscriptGlyphs.MarkerCells,
+        ThinkingTranscriptBlock => TranscriptGlyphs.MarkerCells,
+        ToolTranscriptBlock => TranscriptGlyphs.ChildCells,
+        ToolActivityTranscriptBlock => TranscriptGlyphs.ChildCells,
+        _ => 0,
+    };
+
+    /// <summary>
+    /// Applies gutter prefixes to all tagged rows in <paramref name="lines"/>, mutating text and adjusting
+    /// <see cref="TranscriptRenderLine.PrefixCells"/> and <see cref="TranscriptRenderLine.Links"/> offsets.
+    /// </summary>
+    internal static void ApplyGutters(List<TranscriptRenderLine> lines, TranscriptGlyphs glyphs)
+    {
+        for (var i = 0; i < lines.Count; i++)
+        {
+            var line = lines[i];
+            var kind = line.Gutter;
+            if (kind == TranscriptGutterKind.None)
+            {
+                continue;
+            }
+
+            // An empty row never takes an indent or a connector: a whitespace-only row would add trailing
+            // whitespace to copied text and hang a connector off a blank line. Marker rows are the exception
+            // — the marker is what identifies the entry, so it is drawn even with no text beside it.
+            if (line.Text.Length == 0 && !IsMarkerKind(kind))
+            {
+                continue;
+            }
+
+            var prefix = glyphs.Prefix(kind);
+            var shift = TerminalCellText.Width(prefix);
+            var newPrefixCells = line.PrefixCells > 0 ? line.PrefixCells + shift : 0;
+            lines[i] = line with
+            {
+                Text = prefix + line.Text,
+                PrefixCells = newPrefixCells,
+                Links = ShiftLinkSpans(line.Links, shift),
+            };
+        }
+    }
+
+    /// <summary>Whether <paramref name="kind"/> opens an entry (and so always draws its marker).</summary>
+    private static bool IsMarkerKind(TranscriptGutterKind kind) =>
+        kind is TranscriptGutterKind.UserMarker
+            or TranscriptGutterKind.AgentActive
+            or TranscriptGutterKind.AgentComplete;
+
+    /// <summary>
+    /// Tags rows from <paramref name="start"/> to the end of <paramref name="lines"/> as dependent child
+    /// rows, terminating the tree on the last row that actually carries content. Text ending in a newline
+    /// yields a trailing empty row (command output almost always does), so choosing the terminator by
+    /// physical index alone would hang the closing connector off a blank line while the last visible row
+    /// kept a continuing one.
+    /// </summary>
+    private static void TagChildRows(List<TranscriptRenderLine> lines, int start)
+    {
+        var last = -1;
+        for (var i = start; i < lines.Count; i++)
+        {
+            if (lines[i].Text.Length > 0)
+            {
+                last = i;
+            }
+        }
+
+        for (var i = start; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with
+            {
+                Gutter = i == last ? TranscriptGutterKind.LastChild : TranscriptGutterKind.Child,
+            };
+        }
+    }
+
+    /// <summary>
+    /// Tags row 0 of <paramref name="lines"/> with <paramref name="firstRowKind"/> and all subsequent rows
+    /// with <see cref="TranscriptGutterKind.Continuation"/>. Used for message-level blocks (user, assistant,
+    /// thinking) where every wrapped row is a continuation of the same entry.
+    /// </summary>
+    internal static void TagMessageRows(List<TranscriptRenderLine> lines, TranscriptGutterKind firstRowKind)
+    {
+        for (var i = 0; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with
+            {
+                Gutter = i == 0 ? firstRowKind : TranscriptGutterKind.Continuation,
+            };
+        }
+    }
+
+    /// <summary>
+    /// Formats the text of an assistant block at <paramref name="contentWidth"/> without tagging or applying
+    /// gutters. Used by <see cref="IncrementalMarkdownFormatter"/> to format individual segments before the
+    /// final gutter pass over the assembled result.
+    /// </summary>
+    internal static IReadOnlyList<TranscriptRenderLine> FormatAssistantContent(string text, int contentWidth)
+    {
+        var lines = new List<TranscriptRenderLine>();
+        AppendMarkdown(lines, text, contentWidth);
+        return lines;
+    }
+
+    /// <summary>Returns true when <paramref name="status"/> is a terminal (non-running) tool call status.</summary>
+    private static bool IsTerminalStatus(ToolCallStatus status) =>
+        status is ToolCallStatus.Succeeded or ToolCallStatus.Failed or ToolCallStatus.Cancelled or ToolCallStatus.Skipped;
 
     /// <summary>
     /// The canonical semantic style for each <c>/context</c> category: a distinct, shape-legible glyph and
@@ -702,8 +830,16 @@ public static class TranscriptBlockFormatter
 
         AppendPreformatted(lines, header.ToString(), width, role);
 
+        // Tag the header rows: first = AgentComplete/AgentActive, the rest = Continuation.
+        var headerKind = tool.Complete ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.AgentActive;
+        for (var i = 0; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with { Gutter = i == 0 ? headerKind : TranscriptGutterKind.Continuation };
+        }
+
         if (toolDisplayMode == ToolDisplayMode.Full && tool.Result is { Length: > 0 } result)
         {
+            var resultStart = lines.Count;
             foreach (var line in SplitLines(result))
             {
                 foreach (var wrapped in WrapPreformatted(line, width))
@@ -711,6 +847,8 @@ public static class TranscriptBlockFormatter
                     lines.Add(new TranscriptRenderLine(wrapped, role));
                 }
             }
+
+            TagChildRows(lines, resultStart);
         }
     }
 
@@ -843,7 +981,14 @@ public static class TranscriptBlockFormatter
             var role = summary.FailedCalls > 0
                 ? TranscriptRole.Error
                 : summary.Cancelled ? TranscriptRole.Warning : TranscriptRole.Tool;
+            var headerStart = lines.Count;
             AppendActivityLine(lines, ToolActivityPreview.CompletedText(summary), width, role);
+            // Tag the header row as complete.
+            for (var i = headerStart; i < lines.Count; i++)
+            {
+                lines[i] = lines[i] with { Gutter = TranscriptGutterKind.AgentComplete };
+            }
+
             return;
         }
 
@@ -852,19 +997,29 @@ public static class TranscriptBlockFormatter
         var noun = shellCommands
             ? activity.Calls.Length == 1 ? "shell command" : "shell commands"
             : activity.Calls.Length == 1 ? "tool" : "tools";
+        var headerLineStart = lines.Count;
         AppendActivityLine(lines, $"Running {activity.Calls.Length} {noun}...", width, TranscriptRole.Tool);
+        for (var i = headerLineStart; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with { Gutter = TranscriptGutterKind.AgentActive };
+        }
 
         var running = activity.Calls.Where(call => call.Status == ToolCallStatus.Running).ToArray();
         if (running.Length <= 5)
         {
             for (var index = 0; index < running.Length; index++)
             {
-                var prefix = index == running.Length - 1 ? "`-" : "|-";
+                var childStart = lines.Count;
                 AppendActivityLine(
                     lines,
-                    $"{prefix} {ToolActivityPreview.Create(running[index].ToolName, running[index].InputJson)}",
+                    ToolActivityPreview.Create(running[index].ToolName, running[index].InputJson),
                     width,
                     TranscriptRole.Tool);
+                var isLast = index == running.Length - 1;
+                for (var i = childStart; i < lines.Count; i++)
+                {
+                    lines[i] = lines[i] with { Gutter = isLast ? TranscriptGutterKind.LastChild : TranscriptGutterKind.Child };
+                }
             }
 
             return;
@@ -872,14 +1027,24 @@ public static class TranscriptBlockFormatter
 
         for (var index = 0; index < 4; index++)
         {
+            var childStart = lines.Count;
             AppendActivityLine(
                 lines,
-                $"|- {ToolActivityPreview.Create(running[index].ToolName, running[index].InputJson)}",
+                ToolActivityPreview.Create(running[index].ToolName, running[index].InputJson),
                 width,
                 TranscriptRole.Tool);
+            for (var i = childStart; i < lines.Count; i++)
+            {
+                lines[i] = lines[i] with { Gutter = TranscriptGutterKind.Child };
+            }
         }
 
-        AppendActivityLine(lines, $"`- ...and {running.Length - 4} more", width, TranscriptRole.Tool);
+        var overflowStart = lines.Count;
+        AppendActivityLine(lines, $"...and {running.Length - 4} more", width, TranscriptRole.Tool);
+        for (var i = overflowStart; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with { Gutter = TranscriptGutterKind.LastChild };
+        }
     }
 
     private static void AppendToolActivityCompact(
@@ -892,11 +1057,17 @@ public static class TranscriptBlockFormatter
             var elapsed = call.ElapsedMs is { } milliseconds
                 ? $" ({milliseconds.ToString(CultureInfo.InvariantCulture)}ms)"
                 : string.Empty;
+            var callStart = lines.Count;
             AppendActivityLine(
                 lines,
                 $"{ToolActivityPreview.Create(call.ToolName, call.InputJson)} [{ActivityStatusText(call.Status)}]{elapsed}",
                 width,
                 RoleFor(call));
+            var gutter = IsTerminalStatus(call.Status) ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.AgentActive;
+            for (var i = callStart; i < lines.Count; i++)
+            {
+                lines[i] = lines[i] with { Gutter = gutter };
+            }
         }
     }
 
@@ -921,7 +1092,15 @@ public static class TranscriptBlockFormatter
             }
 
             var role = RoleFor(call);
+            var headerStart = lines.Count;
             AppendPreformatted(lines, header.ToString(), width, role);
+            var headerKind = IsTerminalStatus(call.Status) ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.AgentActive;
+            for (var i = headerStart; i < lines.Count; i++)
+            {
+                lines[i] = lines[i] with { Gutter = i == headerStart ? headerKind : TranscriptGutterKind.Continuation };
+            }
+
+            var childStart = lines.Count;
             if (!string.IsNullOrEmpty(call.Result))
             {
                 AppendPreformatted(lines, TerminalTextSanitizer.Sanitize(call.Result), width, role);
@@ -931,6 +1110,8 @@ public static class TranscriptBlockFormatter
             {
                 AppendPreformatted(lines, $"Error: {TerminalTextSanitizer.Sanitize(call.Error)}", width, role);
             }
+
+            TagChildRows(lines, childStart);
         }
     }
 

@@ -628,6 +628,10 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             return $"[Image {label}]";
         };
 
+        // Resolve the glyph set once from the terminal capabilities — Unicode for UTF-8 terminals, ASCII
+        // fallback otherwise — so the transcript gutter uses the right characters for this session.
+        var transcriptGlyphs = TranscriptGlyphs.For(this.capabilities.UnicodeOutput);
+
         // The Terminal.Gui shell factory: wire the composer to the controller, point the actor's frame
         // sink at the shell, and (once the loop is pumping) run startup and enable submission.
         TerminalGuiShellBase ShellFactory(TuiRunMode shellMode, IApplication tgApp, ComposerState composer)
@@ -645,7 +649,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 mailbox,
                 controller.CurrentSnapshot,
                 hasActiveWork: () => controller.HasActiveWork,
-                transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode),
+                transcriptFormatter: (block, width) => TranscriptBlockFormatter.Format(block, width, toolDisplayMode, null, transcriptGlyphs),
                 taskBrowserProvider: taskBrowserProvider,
                 mcpBrowserProvider: mcpBrowserProvider,
                 toolDisplayMode: toolDisplayMode,

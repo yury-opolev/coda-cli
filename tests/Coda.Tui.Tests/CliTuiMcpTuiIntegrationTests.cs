@@ -280,7 +280,7 @@ public sealed class CliTuiMcpTuiIntegrationTests
             .Where(row => row.BlockId == activityId && !row.IsSeparator)
             .Select(row => row.Text)
             .ToArray();
-        Assert.Equal(["Ran 2 tools - 1 failed"], summaryRows);
+        Assert.Equal([" \u25cf Ran 2 tools - 1 failed"], summaryRows);
     }
 
     [Theory]

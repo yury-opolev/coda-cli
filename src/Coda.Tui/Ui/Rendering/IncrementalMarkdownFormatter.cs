@@ -1,5 +1,4 @@
 using System.Collections.Generic;
-using Coda.Tui.Ui.State;
 
 namespace Coda.Tui.Ui.Rendering;
 
@@ -34,6 +33,7 @@ internal sealed class IncrementalMarkdownFormatter
 {
     private static readonly TranscriptRenderLine Separator = new(string.Empty, TranscriptRole.Assistant);
 
+    private readonly TranscriptGlyphs glyphs;
     private Guid blockId;
     private int width = -1;
 
@@ -48,6 +48,12 @@ internal sealed class IncrementalMarkdownFormatter
     private int pendingSealOffset; // latest confirmed block boundary (>= finalizedOffset)
     private bool frozen;
 
+    /// <summary>Initializes a new instance with optional glyph set (defaults to Unicode).</summary>
+    internal IncrementalMarkdownFormatter(TranscriptGlyphs? glyphs = null)
+    {
+        this.glyphs = glyphs ?? TranscriptGlyphs.Unicode;
+    }
+
     /// <summary>
     /// Projects the assistant block <paramref name="id"/>'s accumulated <paramref name="text"/> at the given
     /// cell width, reusing the formatting of already-completed leading blocks. The result is identical to
@@ -57,6 +63,7 @@ internal sealed class IncrementalMarkdownFormatter
     public IReadOnlyList<TranscriptRenderLine> Update(Guid id, string? text, int width)
     {
         var safeWidth = width > 0 ? width : 1;
+        var contentWidth = Math.Max(1, safeWidth - TranscriptGlyphs.MarkerCells);
         var normalized = NormalizeNewlines(text ?? string.Empty);
 
         // Reset whenever the assumption of append-only growth for a single block breaks: a different block,
@@ -82,7 +89,7 @@ internal sealed class IncrementalMarkdownFormatter
                         this.committedLines.Add(Separator);
                     }
 
-                    this.committedLines.AddRange(FormatAssistant(segment, safeWidth));
+                    this.committedLines.AddRange(TranscriptBlockFormatter.FormatAssistantContent(segment, contentWidth));
                     this.committedHasBlock |= segmentHasBlock;
                     this.finalizedOffset = this.pendingSealOffset;
                 }
@@ -100,7 +107,7 @@ internal sealed class IncrementalMarkdownFormatter
         // frame so the tail always sees its real predecessor. It is bounded by roughly one block plus the
         // growing tail — never the whole prefix.
         var active = normalized[this.finalizedOffset..];
-        var activeLines = FormatAssistant(active, safeWidth);
+        var activeLines = TranscriptBlockFormatter.FormatAssistantContent(active, contentWidth);
         var activeHasBlock = HasBlock(active);
 
         var result = new List<TranscriptRenderLine>(this.committedLines.Count + activeLines.Count + 1);
@@ -111,6 +118,10 @@ internal sealed class IncrementalMarkdownFormatter
         }
 
         result.AddRange(activeLines);
+
+        // Apply the message gutter shaping once over the whole assembled result.
+        TranscriptBlockFormatter.TagMessageRows(result, TranscriptGutterKind.AgentActive);
+        TranscriptBlockFormatter.ApplyGutters(result, this.glyphs);
         return result;
     }
 
@@ -124,9 +135,6 @@ internal sealed class IncrementalMarkdownFormatter
         this.pendingSealOffset = 0;
         this.frozen = false;
     }
-
-    private static IReadOnlyList<TranscriptRenderLine> FormatAssistant(string text, int width) =>
-        TranscriptBlockFormatter.Format(new AssistantTranscriptBlock(Guid.Empty, text, Complete: false), width);
 
     /// <summary>Whether <paramref name="text"/> contains at least one Markdown block (any non-whitespace).</summary>
     private static bool HasBlock(string text)

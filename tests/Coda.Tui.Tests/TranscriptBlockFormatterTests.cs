@@ -21,7 +21,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 40);
 
-        Assert.Equal(["Heading", string.Empty, "bold text"], lines.Select(line => line.Text));
+        Assert.Equal([" ● Heading", string.Empty, "   bold text"], lines.Select(line => line.Text));
         Assert.Equal(TranscriptRole.Heading, lines[0].Role);
         Assert.Equal(TranscriptRole.Assistant, lines[2].Role);
         Assert.DoesNotContain(lines, line => line.Text.Contains("\u001b[", StringComparison.Ordinal));
@@ -35,7 +35,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 40);
 
         var line = Assert.Single(lines);
-        Assert.Equal("hello world", line.Text);
+        Assert.Equal(" > hello world", line.Text);
         Assert.Equal(TranscriptRole.User, line.Role);
         // A user message renders as a full-width background block.
         Assert.True(line.FillWidth);
@@ -52,13 +52,13 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 40);
 
         var line = Assert.Single(lines);
-        Assert.Equal("hello", line.Text);
+        Assert.Equal(" > hello", line.Text);
         Assert.True(line.FillWidth);
         // The sent time is attached to the block (HH:mm), drawn as a right annotation — never mixed into the
         // copyable text.
         Assert.Equal("09:05", line.RightText);
         Assert.Equal(1, line.RightTextTrailingCells);
-        Assert.DoesNotContain(":", line.Text);
+        Assert.DoesNotContain("09:05", line.Text, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -112,8 +112,8 @@ public sealed class TranscriptBlockFormatterTests
 
         Assert.Equal(TranscriptRole.Tool, lines[0].Role);
         Assert.Contains(lines, line => line.Text.Contains("grep", StringComparison.Ordinal));
-        Assert.Contains(lines, line => line.Text == "match one");
-        Assert.Contains(lines, line => line.Text == "match two");
+        Assert.Contains(lines, line => line.Text == "   │ match one");
+        Assert.Contains(lines, line => line.Text == "   └ match two");
         Assert.DoesNotContain(lines, line => line.Text.Contains("\u001b[", StringComparison.Ordinal));
     }
 
@@ -133,7 +133,7 @@ public sealed class TranscriptBlockFormatterTests
         Assert.DoesNotContain("secret result", text, StringComparison.Ordinal);
         Assert.DoesNotContain('\u001b', text);
         Assert.DoesNotContain('\n', text);
-        Assert.True(text.Length <= 128 + "grep  [success]".Length);
+        Assert.True(text.Length <= 128 + "grep  [success]".Length + " ● ".Length);
         Assert.Equal(input, block.InputJson);
     }
 
@@ -158,7 +158,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 80, ToolDisplayMode.Compact);
 
-        Assert.Equal("write_file {} [error]", Assert.Single(lines).Text);
+        Assert.Equal(" ● write_file {} [error]", Assert.Single(lines).Text);
     }
 
     [Fact]
@@ -227,8 +227,8 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
-        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == "code line1");
-        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == "code line2");
+        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == " ● code line1");
+        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == "   code line2");
     }
 
     [Fact]
@@ -248,20 +248,22 @@ public sealed class TranscriptBlockFormatterTests
     {
         var block = new AssistantTranscriptBlock(Guid.NewGuid(), "\u4f60\u597d\u4e16\u754c", true);
 
-        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+        // width=7: contentWidth=4 so each pair of 2-cell wide chars fits on its own row.
+        var lines = TranscriptBlockFormatter.Format(block, width: 7);
 
-        Assert.Equal(["\u4f60\u597d", "\u4e16\u754c"], lines.Select(line => line.Text));
+        Assert.Equal([" \u25cf \u4f60\u597d", "   \u4e16\u754c"], lines.Select(line => line.Text));
     }
 
     [Fact]
     public void User_block_wraps_wide_runs_by_display_cells()
     {
         // "界界é": 界 and 界 fill four cells, é (one cell) overflows to the next row.
+        // width=7: contentWidth=4 so "界界" (4 cells) wraps before "é".
         var block = new UserTranscriptBlock(Guid.NewGuid(), "\u754c\u754c\u00e9");
 
-        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+        var lines = TranscriptBlockFormatter.Format(block, width: 7);
 
-        Assert.Equal(["\u754c\u754c", "\u00e9"], lines.Select(line => line.Text));
+        Assert.Equal([" > \u754c\u754c", "   \u00e9"], lines.Select(line => line.Text));
         Assert.All(lines, line => Assert.Equal(TranscriptRole.User, line.Role));
     }
 
@@ -273,18 +275,19 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 1);
 
-        Assert.Equal(["a\u0301", "b\u0301"], lines.Select(line => line.Text));
+        Assert.Equal([" \u25cf a\u0301", "   b\u0301"], lines.Select(line => line.Text));
     }
 
     [Fact]
     public void Formatter_uses_shared_cell_width_for_wide_and_combining_graphemes()
     {
         // 界界 fills four cells; the combining acute stays attached to e, which overflows to the next row.
+        // width=7: contentWidth=4 so "界界" (4 cells) wraps before "é".
         var block = new UserTranscriptBlock(Guid.NewGuid(), "\u754c\u754ce\u0301");
 
-        var lines = TranscriptBlockFormatter.Format(block, width: 4);
+        var lines = TranscriptBlockFormatter.Format(block, width: 7);
 
-        Assert.Equal(["\u754c\u754c", "e\u0301"], lines.Select(line => line.Text));
+        Assert.Equal([" > \u754c\u754c", "   e\u0301"], lines.Select(line => line.Text));
     }
 
     [Fact]
@@ -315,7 +318,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
-        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == "    return 1");
+        Assert.Contains(lines, line => line.Role == TranscriptRole.Code && line.Text == "       return 1");
     }
 
     [Fact]
@@ -406,9 +409,9 @@ public sealed class TranscriptBlockFormatterTests
             ToolDisplayMode.Summary);
 
         Assert.Equal(count + 1, lines.Count);
-        Assert.Equal($"Running {count} tool{(count == 1 ? "" : "s")}...", lines[0].Text);
-        Assert.Equal(count == 1 ? "`- Reading file-0" : "|- Reading file-0", lines[1].Text);
-        Assert.Equal($"`- Reading file-{count - 1}", lines[^1].Text);
+        Assert.Equal($" \u25cb Running {count} tool{(count == 1 ? "" : "s")}...", lines[0].Text);
+        Assert.Equal(count == 1 ? "   \u2514 Reading file-0" : "   \u2502 Reading file-0", lines[1].Text);
+        Assert.Equal($"   \u2514 Reading file-{count - 1}", lines[^1].Text);
     }
 
     [Fact]
@@ -420,10 +423,10 @@ public sealed class TranscriptBlockFormatterTests
             ToolDisplayMode.Summary);
 
         Assert.Equal(6, lines.Count);
-        Assert.Equal("Running 6 tools...", lines[0].Text);
-        Assert.Equal("|- Reading file-0", lines[1].Text);
-        Assert.Equal("|- Reading file-3", lines[4].Text);
-        Assert.Equal("`- ...and 2 more", lines[^1].Text);
+        Assert.Equal(" \u25cb Running 6 tools...", lines[0].Text);
+        Assert.Equal("   \u2502 Reading file-0", lines[1].Text);
+        Assert.Equal("   \u2502 Reading file-3", lines[4].Text);
+        Assert.Equal("   \u2514 ...and 2 more", lines[^1].Text);
     }
 
     [Fact]
@@ -439,7 +442,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
 
         Assert.Equal(
-            ["Running 4 tools...", "|- Reading first", "`- Searching for second"],
+            [" \u25cb Running 4 tools...", "   \u2502 Reading first", "   \u2514 Searching for second"],
             lines.Select(line => line.Text));
     }
 
@@ -455,8 +458,8 @@ public sealed class TranscriptBlockFormatterTests
             width: 120,
             ToolDisplayMode.Summary);
 
-        Assert.Equal("Running 1 shell command...", oneRunning[0].Text);
-        Assert.Equal("Running 2 shell commands...", manyRunning[0].Text);
+        Assert.Equal(" \u25cb Running 1 shell command...", oneRunning[0].Text);
+        Assert.Equal(" \u25cb Running 2 shell commands...", manyRunning[0].Text);
 
         var oneCompleted = Activity(
             ToolActivityCompletionState.Completed,
@@ -473,10 +476,10 @@ public sealed class TranscriptBlockFormatterTests
             Call("read_file", """{"path":"one"}""", ToolCallStatus.Succeeded),
             Call("grep", """{"pattern":"two"}""", ToolCallStatus.Succeeded));
 
-        Assert.Equal("Ran 1 shell command", Assert.Single(TranscriptBlockFormatter.Format(oneCompleted, 120, ToolDisplayMode.Summary)).Text);
-        Assert.Equal("Ran 2 shell commands", Assert.Single(TranscriptBlockFormatter.Format(manyCompleted, 120, ToolDisplayMode.Summary)).Text);
-        Assert.Equal("Ran 1 tool", Assert.Single(TranscriptBlockFormatter.Format(homogeneousOther, 120, ToolDisplayMode.Summary)).Text);
-        Assert.Equal("Ran 2 tools", Assert.Single(TranscriptBlockFormatter.Format(mixed, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal(" \u25cf Ran 1 shell command", Assert.Single(TranscriptBlockFormatter.Format(oneCompleted, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal(" \u25cf Ran 2 shell commands", Assert.Single(TranscriptBlockFormatter.Format(manyCompleted, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal(" \u25cf Ran 1 tool", Assert.Single(TranscriptBlockFormatter.Format(homogeneousOther, 120, ToolDisplayMode.Summary)).Text);
+        Assert.Equal(" \u25cf Ran 2 tools", Assert.Single(TranscriptBlockFormatter.Format(mixed, 120, ToolDisplayMode.Summary)).Text);
     }
 
     [Fact]
@@ -490,9 +493,9 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
 
-        Assert.Equal("Ran 3 tools - 1 failed, cancelled", Assert.Single(lines).Text);
+        Assert.Equal(" \u25cf Ran 3 tools - 1 failed, cancelled", Assert.Single(lines).Text);
         Assert.Equal(
-            "Ran 1 tool",
+            " \u25cf Ran 1 tool",
             Assert.Single(TranscriptBlockFormatter.Format(
                 Activity(
                     ToolActivityCompletionState.Completed,
@@ -500,7 +503,7 @@ public sealed class TranscriptBlockFormatterTests
                 120,
                 ToolDisplayMode.Summary)).Text);
         Assert.Equal(
-            "Ran 1 tool - cancelled",
+            " \u25cf Ran 1 tool - cancelled",
             Assert.Single(TranscriptBlockFormatter.Format(
                 Activity(
                     ToolActivityCompletionState.Cancelled,
@@ -577,9 +580,9 @@ public sealed class TranscriptBlockFormatterTests
         Assert.Empty(tiny);
         Assert.Contains(
             TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Full),
-            line => line.Text == "legacy result");
+            line => line.Text == "   \u2514 legacy result");
         Assert.Equal(
-            "grep {} [success]",
+            " \u25cf grep {} [success]",
             Assert.Single(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Compact)).Text);
         Assert.Empty(TranscriptBlockFormatter.Format(legacy, 120, ToolDisplayMode.Hidden));
     }
@@ -603,7 +606,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
         var line = Assert.Single(lines);
-        Assert.StartsWith("[pending] ", line.Text, StringComparison.Ordinal);
+        Assert.StartsWith(" > [pending] ", line.Text, StringComparison.Ordinal);
         Assert.Contains("queued message", line.Text, StringComparison.Ordinal);
     }
 
@@ -636,8 +639,8 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
         Assert.True(lines.Count >= 3, "multi-line message must produce at least three lines");
-        Assert.StartsWith("[pending] ", lines[0].Text, StringComparison.Ordinal);
-        Assert.All(lines.Skip(1), line => Assert.False(line.Text.StartsWith("[pending]", StringComparison.Ordinal)));
+        Assert.StartsWith(" > [pending] ", lines[0].Text, StringComparison.Ordinal);
+        Assert.All(lines.Skip(1), line => Assert.False(line.Text.Contains("[pending]", StringComparison.Ordinal)));
     }
 
     [Fact]
@@ -649,7 +652,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var line = Assert.Single(lines);
         Assert.Equal(TranscriptRole.User, line.Role);
-        Assert.Equal("sent message", line.Text);
+        Assert.Equal(" > sent message", line.Text);
         Assert.True(line.FillWidth);
         Assert.DoesNotContain("[pending]", line.Text, StringComparison.Ordinal);
     }
