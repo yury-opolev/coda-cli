@@ -59,7 +59,21 @@ public static class OpenAiSseReader
                 var completionTokens = usageEl.TryGetProperty("completion_tokens", out var ct) && ct.ValueKind == JsonValueKind.Number ? ct.GetInt32() : 0;
                 if (promptTokens > 0 || completionTokens > 0)
                 {
-                    usage = new TokenUsage(promptTokens, completionTokens);
+                    // OpenAI convention (inverted from Anthropic): prompt_tokens is the TOTAL;
+                    // prompt_tokens_details.cached_tokens is a SUBSET of it. Subtract the cached
+                    // portion from InputTokens so TotalInputTokens = InputTokens + CacheReadTokens
+                    // stays equal to the original prompt_tokens. Getting this wrong double-counts.
+                    var cachedTokens = 0;
+                    if (usageEl.TryGetProperty("prompt_tokens_details", out var details)
+                        && details.ValueKind == JsonValueKind.Object
+                        && details.TryGetProperty("cached_tokens", out var cachedEl)
+                        && cachedEl.ValueKind == JsonValueKind.Number)
+                    {
+                        cachedTokens = cachedEl.GetInt32();
+                    }
+
+                    var clamped = Math.Min(cachedTokens, promptTokens);
+                    usage = new TokenUsage(promptTokens - clamped, completionTokens, CacheReadTokens: clamped);
                 }
             }
 

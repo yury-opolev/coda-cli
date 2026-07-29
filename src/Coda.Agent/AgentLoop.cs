@@ -175,6 +175,12 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Debug, Message = "turn end: iteration={iteration}, stop={stopReason}, toolCalls={toolCount}, textChars={textLength}")]
     private partial void LogTurnEnd(int iteration, string stopReason, int toolCount, int textLength);
 
+    [LoggerMessage(Level = LogLevel.Debug, Message = "cache: system prompt prefix changed from previous turn; reason={reason}")]
+    private partial void LogCachePrefixChanged(string reason);
+
+    [LoggerMessage(Level = LogLevel.Debug, Message = "cache: turn={iteration} read={readTokens} write={writeTokens} hitRate={hitRate:P1}")]
+    private partial void LogCacheTurnStats(int iteration, int readTokens, int writeTokens, double hitRate);
+
     // Log the ACTUAL command each tool call carries (secrets redacted) at Information so the
     // telemetry file shows what a session was doing — even one later killed mid-tool. Without
     // this the log only records aggregate "toolCalls=N" and the command is unrecoverable.
@@ -241,6 +247,17 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Debug, Message = "Stop user hooks failed (best-effort); completing the turn")]
     private partial void LogStopHooksFailed(Exception ex);
 
+    /// <summary>
+    /// Classifies why the resolved system prompt changed from the previous turn so the log entry
+    /// is actionable. If the shape has an <c>AppendSystemPrompt</c>, that is the most likely
+    /// volatile cause; a full <c>SystemPrompt</c> replacement is the next; otherwise a session-
+    /// level change (e.g. <c>/output-style</c> or <c>/cwd</c>) is reported.
+    /// </summary>
+    private static string DeterminePromptChangeReason(TurnShape? shape) =>
+        shape?.AppendSystemPrompt is not null ? "append" :
+        shape?.SystemPrompt is not null ? "replace" :
+        "session";
+
     [LoggerMessage(Level = LogLevel.Information, Message = "Skill shape delta applied: model={Model}, effort={Effort}")]
     private partial void LogSkillShapeDeltaApplied(string model, string? effort);
 
@@ -288,6 +305,16 @@ public sealed partial class AgentLoop : IAgentLoop
             this.options.Effort,
             this.tools,
             shape);
+
+        // Detect when the resolved system prompt changed from the previous turn so the user
+        // (and a developer reading telemetry) can tell the prompt-cache prefix shifted.
+        // A changed prefix means the model will write a fresh cache entry instead of reading one.
+        if (this.options.PreviousSystemPrompt is { } prevPrompt
+            && !string.Equals(resolution.SystemPrompt, prevPrompt, StringComparison.Ordinal))
+        {
+            var reason = DeterminePromptChangeReason(shape);
+            this.LogCachePrefixChanged(reason);
+        }
 
         var pendingHookTasks = new List<Task>();
         var stopContinuations = 0;
@@ -423,6 +450,7 @@ public sealed partial class AgentLoop : IAgentLoop
                     Effort = resolution.Effort,
                     ToolsVolatile = this.toolSearch is not null && this.toolSearch.IsActive,
                     ToolChoice = resolution.ToolChoice,
+                    UseOnehourTtl = this.options.UseOnehourTtl,
                 };
 
                 var text = new StringBuilder();
@@ -465,6 +493,19 @@ public sealed partial class AgentLoop : IAgentLoop
                                     {
                                         sink.OnUsage(turnUsage);
                                         capturedUsage = turnUsage;
+
+                                        // Log cache hit rate only when the turn has cache activity.
+                                        if (turnUsage.HasCacheActivity)
+                                        {
+                                            var hitRate = turnUsage.TotalInputTokens > 0
+                                                ? (double)turnUsage.CacheReadTokens / turnUsage.TotalInputTokens
+                                                : 0.0;
+                                            this.LogCacheTurnStats(
+                                                iteration,
+                                                turnUsage.CacheReadTokens,
+                                                turnUsage.CacheWriteTokens,
+                                                hitRate);
+                                        }
                                     }
 
                                     break;

@@ -78,5 +78,13 @@ public sealed record CodaSettings(
 
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
+
+    /// <summary>
+    /// When <see langword="true"/>, the stable-prefix prompt-cache breakpoints (tools and
+    /// system prompt) use a 1-hour TTL instead of the default 5-minute TTL.
+    /// Opt-in because a 1-hour write costs 2× the base input rate (vs 1.25× for 5-minute).
+    /// Set via <c>"cacheUse1hTtl": true</c> in <c>settings.json</c>. Default: <see langword="false"/>.
+    /// </summary>
+    public bool CacheUse1hTtl { get; init; }
 }
 

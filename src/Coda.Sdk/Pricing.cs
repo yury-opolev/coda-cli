@@ -10,9 +10,16 @@ public static class Pricing
     private static readonly (decimal In, decimal Out) OpusPricing = (15.00m, 75.00m);
     private static readonly (decimal In, decimal Out) HaikuPricing = (0.80m, 4.00m);
 
-    private const decimal CacheReadMultiplier = 0.10m;
+    private const decimal CacheReadMultiplier = 0.10m;       // Anthropic: 10% of base input rate
+    private const decimal CacheReadOpenAiMultiplier = 0.50m; // OpenAI: 50% of base input rate
     private const decimal CacheWrite5mMultiplier = 1.25m;
     private const decimal CacheWrite1hMultiplier = 2.00m;
+
+    private static bool IsOpenAiFamily(string model) =>
+        model.StartsWith("gpt-", StringComparison.OrdinalIgnoreCase)
+        || model.StartsWith("o1-", StringComparison.OrdinalIgnoreCase)
+        || model.StartsWith("o3-", StringComparison.OrdinalIgnoreCase)
+        || model.StartsWith("o4-", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>Returns (inPerMTok, outPerMTok) in USD for the given model, defaulting to Sonnet pricing.</summary>
     public static (decimal InPerMTok, decimal OutPerMTok) For(string model)
@@ -62,7 +69,8 @@ public static class Pricing
         }
 
         var baseInRate = inRate.Value;
-        var cacheReadRate = catalog?.CacheReadPerMTok ?? baseInRate * CacheReadMultiplier;
+        var cacheReadFallback = IsOpenAiFamily(model) ? CacheReadOpenAiMultiplier : CacheReadMultiplier;
+        var cacheReadRate = catalog?.CacheReadPerMTok ?? baseInRate * cacheReadFallback;
         var cacheWrite5mRate = catalog?.CacheWritePerMTok ?? baseInRate * CacheWrite5mMultiplier;
         var cacheWrite1hRate = baseInRate * CacheWrite1hMultiplier;
 

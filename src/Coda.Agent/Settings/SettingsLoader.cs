@@ -101,7 +101,9 @@ public static class SettingsLoader
             && userSettings.Theme is null
             && userSettings.ToolDisplayMode is null
             && effortByModel.Count == 0
-            && httpHookAllowlist.Count == 0)
+            && httpHookAllowlist.Count == 0
+            && !userSettings.CacheUse1hTtl
+            && !projectSettings.CacheUse1hTtl)
         {
             return CodaSettings.Empty;
         }
@@ -155,6 +157,8 @@ public static class SettingsLoader
             ToolDisplayMode = userSettings.ToolDisplayMode,
             EffortByModel = effortByModel,
             HttpHookAllowlist = httpHookAllowlist,
+            // CacheUse1hTtl: project setting wins; user setting is the fallback.
+            CacheUse1hTtl = projectSettings.CacheUse1hTtl || userSettings.CacheUse1hTtl,
         };
     }
 
@@ -190,6 +194,7 @@ public static class SettingsLoader
                 EffortByModel = ParseEffortByModel(doc?.EffortByModel),
                 HttpHookAllowlist = ParseHttpHookAllowlist(doc?.HttpHookAllowlist),
                 HookDisabledHashes = ParseHookDisabledHashes(doc?.HookDisabledHashes),
+                CacheUse1hTtl = doc?.CacheUse1hTtl ?? false,
             };
         }
         catch (Exception ex) when (ex is JsonException or IOException)
@@ -609,6 +614,8 @@ public static class SettingsLoader
         public List<string>? HttpHookAllowlist { get; set; }
         [JsonPropertyName("hookDisabledHashes")]
         public List<string>? HookDisabledHashes { get; set; }
+        [JsonPropertyName("cacheUse1hTtl")]
+        public bool? CacheUse1hTtl { get; set; }
     }
 
     private sealed class GoalSection

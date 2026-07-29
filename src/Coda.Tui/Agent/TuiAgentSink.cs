@@ -133,4 +133,7 @@ public sealed class TuiAgentSink : IAgentSink
 
     public void OnPostCompactContextInjected(string additionalContext) =>
         this.publisher.Publish(new PostCompactContextInjectedEvent(additionalContext));
+
+    /// <summary>Publishes a <see cref="WarningEvent"/> for advisory user-visible warnings.</summary>
+    public void OnWarning(string message) => this.publisher.Publish(new WarningEvent(message));
 }

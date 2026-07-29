@@ -235,4 +235,17 @@ public sealed class CacheUsageTests
 
         Assert.Equal(1.00m, cost);
     }
+
+    [Fact]
+    public void Pricing_gpt_model_cache_read_uses_50pct_not_10pct_without_catalog()
+    {
+        // OpenAI cached tokens are billed at ~50% of base, not 10% (Anthropic's rate).
+        // Without a catalog rate, gpt-* models must use the 50% fallback.
+        // gpt-5.6-sol → Sonnet pricing ($3.00/MTok base) → cache read = $1.50/MTok.
+        var usage = new TokenUsage(0, 0, CacheReadTokens: 1_000_000);
+
+        decimal cost = Pricing.EstimateUsd("gpt-5.6-sol", usage);
+
+        Assert.Equal(1.50m, cost);   // $3.00 * 0.50 = $1.50 per MTok
+    }
 }

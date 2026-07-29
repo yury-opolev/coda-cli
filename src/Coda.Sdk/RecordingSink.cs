@@ -254,6 +254,8 @@ internal sealed class RecordingSink : IAgentSink
     public void OnPostCompactContextInjected(string additionalContext) =>
         this.inner?.OnPostCompactContextInjected(additionalContext);
 
+    public void OnWarning(string message) => this.inner?.OnWarning(message);
+
     public void OnPermissionsUpdated(
         string hookCommand,
         string? modeApplied,

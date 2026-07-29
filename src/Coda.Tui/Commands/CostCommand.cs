@@ -2,6 +2,7 @@ using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Events;
+using LlmClient;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -43,6 +44,16 @@ public sealed class CostCommand : ISlashCommand
                 : 0m;
             var cacheDetail = $"Cache read: {usage.CacheReadTokens:N0} tokens · Cache write: {usage.CacheWriteTokens:N0} tokens · Hit rate: {hitRate:N1}%";
             context.Console.MarkupLine(Theme.DimMarkup(cacheDetail));
+
+            // Show what caching saved vs paying full uncached input rate for every token.
+            var uncachedUsage = new TokenUsage(usage.TotalInputTokens, usage.OutputTokens);
+            var uncachedCost = Pricing.EstimateUsd(model, uncachedUsage, catalog);
+            var savings = uncachedCost - estimatedUsd;
+            if (savings > 0m)
+            {
+                context.Console.MarkupLine(Theme.DimMarkup(
+                    $"Cache savings: ${savings:F4} vs ${uncachedCost:F4} uncached"));
+            }
         }
 
         context.Events.Publish(new CostEstimateChangedEvent(estimatedUsd));

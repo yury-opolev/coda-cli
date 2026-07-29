@@ -185,4 +185,10 @@ public interface IAgentSink
     /// </summary>
     /// <param name="additionalContext">The text injected as a synthetic user message.</param>
     void OnPostCompactContextInjected(string additionalContext) { }
+
+    /// <summary>
+    /// An advisory warning to show the user — less severe than <see cref="OnError"/>.
+    /// Default: no-op; the TUI overrides to surface messages to the user.
+    /// </summary>
+    void OnWarning(string message) { }
 }

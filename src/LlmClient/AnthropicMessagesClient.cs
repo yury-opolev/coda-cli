@@ -231,13 +231,15 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         {
             // System as a text block with cache_control (slot 2 — always placed so the long,
             // stable system prompt is cached on every call regardless of message count).
+            // When UseOnehourTtl is set, the stable prefix uses a 1-hour TTL so it survives
+            // a human-in-the-loop pause that exceeds the default 5-minute window.
             body["system"] = new JsonArray
             {
                 new JsonObject
                 {
                     ["type"] = "text",
                     ["text"] = request.System,
-                    ["cache_control"] = new JsonObject { ["type"] = "ephemeral" },
+                    ["cache_control"] = BuildCacheControl(request.UseOnehourTtl, stablePrefix: true),
                 },
             };
         }
@@ -268,7 +270,9 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
                 };
                 if (plan.ToolsBreakpoint && i == request.Tools.Count - 1)
                 {
-                    toolNode["cache_control"] = new JsonObject { ["type"] = "ephemeral" };
+                    // Slot 1 (tools) uses 1h TTL when opted in — the stable prefix benefits most from
+                    // surviving a human-in-the-loop pause. Message breakpoints always use the 5m default.
+                    toolNode["cache_control"] = BuildCacheControl(request.UseOnehourTtl, stablePrefix: true);
                 }
 
                 tools.Add(toolNode);
@@ -542,6 +546,23 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         }
 
         return obj;
+    }
+
+    /// <summary>
+    /// Builds a <c>cache_control</c> object. When <paramref name="use1hTtl"/> is
+    /// <see langword="true"/> and <paramref name="stablePrefix"/> is <see langword="true"/>
+    /// (tools and system), emits <c>{"type":"ephemeral","ttl":"1h"}</c>. Otherwise the default
+    /// 5-minute TTL is used (no explicit <c>ttl</c> field). Message breakpoints always pass
+    /// <paramref name="stablePrefix"/> = <see langword="false"/> so they remain at 5 minutes.
+    /// </summary>
+    private static JsonObject BuildCacheControl(bool use1hTtl, bool stablePrefix)
+    {
+        if (use1hTtl && stablePrefix)
+        {
+            return new JsonObject { ["type"] = "ephemeral", ["ttl"] = "1h" };
+        }
+
+        return new JsonObject { ["type"] = "ephemeral" };
     }
 
     private static JsonNode ParseOrEmpty(string json)

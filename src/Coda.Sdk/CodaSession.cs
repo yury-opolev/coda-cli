@@ -14,6 +14,7 @@ using Coda.Common;
 using Coda.Sdk.Telemetry;
 using Coda.Sdk.Turns;
 using LlmAuth;
+using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
 using Microsoft.Extensions.Logging;
 
@@ -70,6 +71,17 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly HookTrustGuard? trustGuard;
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
+
+    // Prompt-cache hygiene tracking (Phase 2/3).
+    private string? lastResolvedSystemPrompt;
+    private int turnsWithZeroCacheActivity;
+    private bool cacheZeroActivityWarned;
+
+    /// <summary>
+    /// Number of consecutive turns with zero cache activity before a one-time warning is emitted.
+    /// Three turns is enough to rule out a first-turn cold-start write without false positives.
+    /// </summary>
+    public const int ZeroActivityWarnAfterTurns = 3;
 
     // Session lifecycle hook fields (Phase 2).
     private string sessionSource = "new";
@@ -598,6 +610,17 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 Gate = this.ExecutionGate,
                 ToolActivity = rootToolActivity,
             };
+            // Wire per-turn cache-hygiene and 1h-TTL state into the loop options.
+            loopSpec = loopSpec with
+            {
+                Options = loopSpec.Options with
+                {
+                    PreviousSystemPrompt = this.lastResolvedSystemPrompt,
+                    UseOnehourTtl = settings.CacheUse1hTtl,
+                },
+            };
+            // lastResolvedSystemPrompt is updated AFTER turnShape is finalized (inside the execution
+            // gate block, after session-level appends are merged) so it captures base + append.
             // Test seam: override the settings-derived hook runner when injected. Null in production.
             if (this.userHookRunnerOverride is not null)
             {
@@ -729,6 +752,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                     turnShape = (turnShape ?? TurnShape.None) with { AppendSystemPrompt = mergedAsp };
                 }
 
+                // M3: store the fully-resolved system prompt (base + any appends) so the next
+                // turn receives it as PreviousSystemPrompt and can compare like-for-like.
+                this.lastResolvedSystemPrompt = ResolveSystemPrompt(loopSpec.Options.SystemPrompt, turnShape);
+
                 await loop.RunAsync(this.history, recording, cancellationToken, turnShape).ConfigureAwait(false);
             }
 
@@ -736,6 +763,33 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
             System.Threading.Interlocked.Increment(ref this.turnCount);
+
+            // Zero-counters warning: if both cache counters have been zero for several turns in a
+            // row the prefix is likely below the per-model minimum and cache is silently inactive.
+            // Emit once per session so the user has a chance to notice without repeated noise.
+            // Skipped for the Copilot provider: it does not report cache counters, so HasCacheActivity
+            // is permanently false and would fire a spurious warning on every Copilot session.
+            if (!this.cacheZeroActivityWarned
+                && !string.Equals(options.ProviderId, GitHubCopilotProvider.Id, StringComparison.Ordinal))
+            {
+                if (recording.Usage.HasCacheActivity)
+                {
+                    this.turnsWithZeroCacheActivity = 0;
+                }
+                else
+                {
+                    this.turnsWithZeroCacheActivity++;
+                    if (this.turnsWithZeroCacheActivity >= ZeroActivityWarnAfterTurns)
+                    {
+                        this.cacheZeroActivityWarned = true;
+                        sink?.OnWarning(
+                            "Prompt cache appears inactive: both cache read and write counters " +
+                            "have been zero for several consecutive turns. " +
+                            "The prefix may be below the per-model minimum size.");
+                    }
+                }
+            }
+
             this.FireIdleNotificationBackground();
             var toolActivity = CompleteToolActivity(interrupted: false);
             return new RunResult(true, recording.FinalText, recording.ToolCalls, recording.StopReason, null)
@@ -1350,6 +1404,15 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         string.Equals(eventName, "SessionStart", StringComparison.OrdinalIgnoreCase)
         || string.Equals(eventName, "SessionEnd", StringComparison.OrdinalIgnoreCase)
         || string.Equals(eventName, "Notification", StringComparison.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Returns the fully-resolved system prompt: <paramref name="basePrompt"/> with any
+    /// <see cref="TurnShape.AppendSystemPrompt"/> appended, matching the logic in
+    /// <c>TurnShapeResolver</c>. Stored as <c>lastResolvedSystemPrompt</c> so the next turn
+    /// receives a like-for-like <see cref="AgentOptions.PreviousSystemPrompt"/>.
+    /// </summary>
+    private static string ResolveSystemPrompt(string basePrompt, TurnShape? shape) =>
+        shape?.AppendSystemPrompt is { } append ? $"{basePrompt}\n\n{append}" : basePrompt;
 
     /// <summary>
     /// Applies SessionStart hook outputs. Called once from <see cref="InitializeCoreAsync"/>.

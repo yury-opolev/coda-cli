@@ -207,4 +207,7 @@ public sealed class JsonStreamSink : IAgentSink
     }
 
     public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
+
+    public void OnWarning(string message) =>
+        this.Emit(new JsonObject { ["type"] = "warning", ["message"] = message });
 }

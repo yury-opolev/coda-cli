@@ -50,4 +50,13 @@ public sealed record ChatRequest
     /// </para>
     /// </summary>
     public string? ToolChoice { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/>, the stable prefix breakpoints (tools and system prompt) use a
+    /// 1-hour TTL (<c>{"type":"ephemeral","ttl":"1h"}</c>) instead of the default 5-minute TTL.
+    /// The longer TTL benefits sessions with pauses that exceed five minutes; it costs 2× the base
+    /// input rate per write versus 1.25×. Message breakpoints always stay at 5 minutes.
+    /// Default: <see langword="false"/>.
+    /// </summary>
+    public bool UseOnehourTtl { get; init; }
 }

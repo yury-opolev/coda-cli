@@ -81,6 +81,8 @@ public sealed class PlainTextSink : IAgentSink
     public void OnSubagentBlocked(string hookCommand, string taskId, string reason) =>
         this.error.WriteLine($"  ✗ subagent {taskId} blocked by hook {hookCommand}: {reason}");
 
+    public void OnWarning(string message) => this.error.WriteLine(message);
+
     public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult) =>
         this.error.WriteLine($"  ↺ subagent {taskId} result rewritten by hook {hookCommand}");
 

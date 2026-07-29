@@ -189,4 +189,16 @@ public sealed class TuiAgentSinkTests
         Assert.Contains("danger", evt.AddedAllow);
         Assert.Contains("safe(rm:*)", evt.AddedDeny);
     }
+
+    [Fact]
+    public void OnWarning_publishes_WarningEvent()
+    {
+        var events = new List<UiEvent>();
+        IAgentSink sink = new TuiAgentSink(new CollectingPublisher(events));
+
+        sink.OnWarning("Prompt cache appears inactive");
+
+        var evt = Assert.IsType<WarningEvent>(Assert.Single(events));
+        Assert.Equal("Prompt cache appears inactive", evt.Message);
+    }
 }

@@ -58,4 +58,25 @@ public sealed record AgentOptions
     /// <summary>Estimated-token threshold above which the loop compacts mid-run. Resolved from the
     /// model's context window upstream (CodaSession); 0 here means none was resolved (no compaction).</summary>
     public int AutoCompactTokenThreshold { get; init; } = 0;
+
+    /// <summary>
+    /// The fully-resolved system prompt from the previous user turn (base + any appends from
+    /// <see cref="TurnShape.AppendSystemPrompt"/> or session-level hooks), or <see langword="null"/>
+    /// on the first turn. Used by <see cref="AgentLoop"/> to detect when the resolved system prompt
+    /// changed between turns so it can log a debug note that the prompt-cache prefix shifted.
+    /// A change means the model will write a fresh cache entry rather than reading an existing one.
+    /// Callers must store the resolved value (not just the base) so a stable per-turn append does
+    /// not produce a false-positive prefix-change log on every subsequent turn.
+    /// </summary>
+    public string? PreviousSystemPrompt { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/>, the stable prefix breakpoints (tools and system prompt) use a
+    /// 1-hour TTL (<c>{"type":"ephemeral","ttl":"1h"}</c>) instead of the default 5-minute TTL.
+    /// The longer TTL is useful when a human-in-the-loop pause between turns may exceed five minutes.
+    /// A 1-hour write costs 2× the base input rate versus 1.25× for 5-minute, so this is opt-in.
+    /// Message breakpoints always use the 5-minute TTL regardless of this setting.
+    /// Default: <see langword="false"/>.
+    /// </summary>
+    public bool UseOnehourTtl { get; init; }
 }

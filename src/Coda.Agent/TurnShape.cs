@@ -15,6 +15,13 @@ public sealed record TurnShape
     /// <see cref="AppendSystemPrompt"/> for additive changes that leave the tool contract intact.
     /// When both this property and <see cref="AppendSystemPrompt"/> are set, replacement happens
     /// first and then the append is applied to the replaced prompt.
+    /// <para>
+    /// <strong>Prompt-cache note:</strong> replacing the system prompt changes the resolved prompt
+    /// seen by the model, which invalidates the <c>system</c> and <c>tools</c> cache entries for
+    /// that turn. If this value varies per turn the stable-prefix cache will never be read back —
+    /// a new entry is written on every call. Set this only for a genuinely different per-session
+    /// or per-context prompt, not for per-turn dynamic content.
+    /// </para>
     /// </summary>
     public string? SystemPrompt { get; init; }
 
@@ -25,6 +32,13 @@ public sealed record TurnShape
     /// wholesale via <see cref="SystemPrompt"/> while leaving tools enabled risks producing a
     /// model that ignores its tools. When both properties are set, replacement happens first,
     /// then this append is applied.
+    /// <para>
+    /// <strong>Prompt-cache note:</strong> any value appended here changes the resolved system
+    /// prompt, invalidating the stable-prefix cache entries for that turn. If this value varies
+    /// per turn (e.g. a per-turn timestamp or dynamic skill content) the cache will be written
+    /// on every call and never read back. Use a stable, session-constant value or leave this
+    /// null to preserve cache reads across turns.
+    /// </para>
     /// </summary>
     public string? AppendSystemPrompt { get; init; }
 
