@@ -34,7 +34,7 @@ public sealed class SkillCommand : ISlashCommand
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        var skills = SkillLoader.Load(context.Session.WorkingDirectory);
+        var skills = SkillLoader.Load(context.Session.WorkingDirectory, pluginStateStore: context.PluginState);
 
         // No arguments → behave like /skills (list), showing only user-invocable skills.
         if (args.Count == 0)
@@ -68,9 +68,7 @@ public sealed class SkillCommand : ISlashCommand
             return Task.FromResult(CommandResult.Continue);
         }
 
-        var body = (invokeArgs.Count > 0 || skill.Arguments.Count > 0)
-            ? SkillArgumentBinder.Bind(skill.Body, skill.Arguments, invokeArgs)
-            : skill.Body;
+        var body = SkillArgumentBinder.BindOptIn(skill, invokeArgs);
         return Task.FromResult(CommandResult.RunPrompt(body));
     }
 

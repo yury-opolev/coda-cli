@@ -1,4 +1,6 @@
 using Coda.Tui.Commands;
+using Coda.Tui.Skills;
+using Microsoft.Extensions.Logging;
 
 namespace Coda.Tui.Repl;
 
@@ -53,6 +55,22 @@ public static class SlashCommandCatalog
         new VersionCommand(),
         new ExitCommand(),
     ];
+
+    /// <summary>
+    /// Creates the full command set: all built-ins (from <see cref="CreateAll"/>) plus
+    /// one <see cref="Coda.Tui.Commands.SkillSlashCommand"/> per user-invocable skill in
+    /// <paramref name="skills"/> that does not collide with a built-in name or alias.
+    /// This is the composition root entry point for skill-derived slash commands.
+    /// </summary>
+    /// <param name="skills">Discovered, precedence-resolved skills for the current session.</param>
+    /// <param name="logger">Optional logger for name-collision warnings.</param>
+    public static IReadOnlyList<ISlashCommand> CreateWithSkills(
+        IReadOnlyList<SkillDefinition> skills,
+        ILogger? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(skills);
+        var builtIns = CreateAll();
+        var skillCommands = SkillCommandRegistrar.BuildSkillCommands(skills, builtIns, logger);
+        return [.. builtIns, .. skillCommands];
+    }
 }
-
-

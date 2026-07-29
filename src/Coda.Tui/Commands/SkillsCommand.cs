@@ -2,8 +2,8 @@ using Coda.Tui.Plugins;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Skills;
+using Microsoft.Extensions.Logging;
 using Spectre.Console;
-
 namespace Coda.Tui.Commands;
 
 /// <summary>Lists, validates, and scaffolds skills from project and user skill directories.</summary>
@@ -18,13 +18,14 @@ public sealed class SkillsCommand : ISlashCommand
     public string Summary => "List, validate, and scaffold skills";
 
     public CommandHelp Help => new(
-        Usage: "/skills [list | validate <path> | new <name>]",
-        Description: "Lists, validates, and scaffolds skills. Without arguments, lists all discovered skills " +
+        Usage: "/skills [list | reload | validate <path> | new <name>]",
+        Description: "Lists, validates, scaffolds, and reloads skills. Without arguments, lists all discovered skills " +
             "from the project (.coda/skills/) and user (~/.coda/skills/) skill directories. " +
-            "Each skill is a SKILL.md file that can be run via /skill <name>.",
+            "Each skill is a SKILL.md file that can be run via /skill <name> or, for user-invocable skills, directly as /<name>.",
         Options:
         [
             ("(no args) / list", "List all discovered skills with name, description, and argument hint."),
+            ("reload", "Re-scan skill directories and re-register skill-derived slash commands."),
             ("validate <path>", "Parse and validate the SKILL.md at <path> (or <path>/SKILL.md if a directory)."),
             ("new <name>", "Scaffold a new skill at <cwd>/.coda/skills/<name>/SKILL.md."),
         ],
@@ -32,6 +33,7 @@ public sealed class SkillsCommand : ISlashCommand
         [
             "/skills",
             "/skills list",
+            "/skills reload",
             "/skills validate .coda/skills/my-skill",
             "/skills new my-feature",
         ]);
@@ -44,6 +46,7 @@ public sealed class SkillsCommand : ISlashCommand
         return subcommand switch
         {
             "list" or "" => this.ListAsync(context),
+            "reload" => ReloadAsync(context),
             "validate" => ValidateAsync(context, tail),
             "new" => NewAsync(context, tail, context.Session.WorkingDirectory),
             _ => this.ListAsync(context),
@@ -79,6 +82,37 @@ public sealed class SkillsCommand : ISlashCommand
 
         context.Console.Write(grid);
         context.Console.WriteLine();
+        return Task.FromResult(CommandResult.Continue);
+    }
+
+    // ── reload ────────────────────────────────────────────────────────────
+
+    private static Task<CommandResult> ReloadAsync(CommandContext context)
+    {
+        var skills = SkillLoader.Load(context.Session.WorkingDirectory, pluginStateStore: context.PluginState);
+        var builtIns = SlashCommandCatalog.CreateAll();
+
+        // Thread a real logger so collision and name-validation warnings appear as
+        // user-visible messages rather than being silently swallowed.
+        var logger = new AnsiConsoleLogger(context.Console);
+        var skillCommands = SkillCommandRegistrar.BuildSkillCommands(skills, builtIns, logger);
+        context.Commands.ReplaceAll([.. builtIns, .. skillCommands]);
+
+        // Report the actual registered count (not the raw user-invocable count), plus any
+        // skill names that were skipped so the author can see why their /name did not appear.
+        var registeredCount = skillCommands.Count;
+        var skippedNames = skills
+            .Where(s => s.UserInvocable && !string.IsNullOrWhiteSpace(s.Name))
+            .Select(s => s.Name)
+            .Except(skillCommands.Select(c => c.Name), StringComparer.OrdinalIgnoreCase)
+            .ToList();
+
+        var message = skippedNames.Count > 0
+            ? $"Skills reloaded. {registeredCount} skill command(s) registered. " +
+              $"Skipped: {string.Join(", ", skippedNames.Select(n => "/" + n))}."
+            : $"Skills reloaded. {registeredCount} skill command(s) registered.";
+
+        context.Console.MarkupLine(Theme.SuccessMarkup(message));
         return Task.FromResult(CommandResult.Continue);
     }
 
@@ -244,4 +278,29 @@ public sealed class SkillsCommand : ISlashCommand
 
     private static string BuildTemplate(string name) =>
         $"---{Environment.NewLine}name: {name}{Environment.NewLine}description: Describe your skill here.{Environment.NewLine}---{Environment.NewLine}# {name}{Environment.NewLine}{Environment.NewLine}Add your skill prompt body here.{Environment.NewLine}";
+}
+
+/// <summary>
+/// Minimal <see cref="ILogger"/> adapter that routes <see cref="LogLevel.Warning"/> and above
+/// to the Spectre.Console <see cref="IAnsiConsole"/> as styled warning markup. Used by
+/// <c>/skills reload</c> so collision and name-validation warnings are visible to the user.
+/// </summary>
+file sealed class AnsiConsoleLogger(IAnsiConsole console) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel >= LogLevel.Warning)
+        {
+            console.MarkupLine(Theme.WarnMarkup(formatter(state, exception)));
+        }
+    }
 }

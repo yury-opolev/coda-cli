@@ -158,6 +158,23 @@ public static class SkillArgumentBinder
     }
 
     /// <summary>
+    /// Applies the opt-in substitution rule: substitution runs only when at least one argument
+    /// is supplied at invocation time, or when the skill itself declares named
+    /// <c>arguments</c> in its frontmatter. When neither condition holds the body is returned
+    /// unchanged, so literal dollar signs in skill bodies (e.g. <c>$100</c>) are preserved.
+    /// </summary>
+    /// <param name="skill">The skill whose body and argument declarations to use.</param>
+    /// <param name="values">Values provided by the caller at invocation time.</param>
+    public static string BindOptIn(SkillDefinition skill, IReadOnlyList<string> values)
+    {
+        ArgumentNullException.ThrowIfNull(skill);
+        ArgumentNullException.ThrowIfNull(values);
+        return (values.Count > 0 || skill.Arguments.Count > 0)
+            ? Bind(skill.Body, skill.Arguments, values)
+            : skill.Body;
+    }
+
+    /// <summary>
     /// Returns <see langword="true"/> when <paramref name="c"/> is a valid identifier character
     /// (letter, digit, or underscore).
     /// </summary>

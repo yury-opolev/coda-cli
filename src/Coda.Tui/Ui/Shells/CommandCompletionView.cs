@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using Coda.Tui.Commands;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Rendering;
 using TgAttribute = Terminal.Gui.Drawing.Attribute;
@@ -154,7 +155,12 @@ internal sealed class CommandCompletionView : View
     {
         var command = this.suggestions[index];
         var marker = index == this.selectedIndex ? "> " : "  ";
-        var summary = string.IsNullOrWhiteSpace(command.Summary) ? string.Empty : "  " + command.Summary;
+        // Prepend the skill glyph for skill-derived entries so they are visually
+        // distinguishable from built-ins in the live menu (M3: marker at render time only).
+        var summaryPrefix = command is SkillSlashCommand ? SkillSlashCommand.SkillMarker : string.Empty;
+        var summary = string.IsNullOrWhiteSpace(command.Summary)
+            ? (string.IsNullOrEmpty(summaryPrefix) ? string.Empty : "  " + summaryPrefix.TrimEnd())
+            : "  " + summaryPrefix + command.Summary;
         return $"{marker}/{command.Name}{summary}";
     }
 

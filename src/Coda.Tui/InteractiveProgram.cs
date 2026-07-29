@@ -27,6 +27,7 @@ using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
 using LlmClient;
+using Microsoft.Extensions.Logging;
 using Spectre.Console;
 
 namespace Coda.Tui;
@@ -310,8 +311,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // The session state is shared between the skill tool and the reattach callback so compaction
         // re-injects exactly the bodies the model loaded in this session.
         var skillState = new Coda.Tui.Skills.SkillSessionState();
-        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
-            Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore), skillState, cwd);
+        var loadedSkills = Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore);
+        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(loadedSkills, skillState, cwd);
+
+        // Phase 5: register user-invocable skills as first-class /<name> slash commands.
+        // Thread a real logger so collision and name-validation warnings appear as TUI
+        // diagnostic notifications, visible to the skill author.
+        var skillCollisionLogger = new MailboxWarningLogger(mailbox);
+        registry.ReplaceAll(SlashCommandCatalog.CreateWithSkills(loadedSkills, skillCollisionLogger));
 
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
         {
@@ -998,4 +1005,34 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
     private int OffscreenHeight() => Math.Max(this.capabilities.Height, 24);
 }
 
+/// <summary>
+/// Minimal <see cref="ILogger"/> adapter that routes <see cref="LogLevel.Warning"/> and above
+/// to the <see cref="UiEventMailbox"/> as <see cref="DiagnosticEvent"/> notifications, so skill
+/// collision and name-validation warnings appear in the TUI diagnostic feed at session startup.
+/// </summary>
+file sealed class MailboxWarningLogger(UiEventMailbox mailbox) : ILogger
+{
+    public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
 
+    public bool IsEnabled(LogLevel logLevel) => logLevel >= LogLevel.Warning;
+
+    public void Log<TState>(
+        LogLevel logLevel,
+        EventId eventId,
+        TState state,
+        Exception? exception,
+        Func<TState, Exception?, string> formatter)
+    {
+        if (logLevel >= LogLevel.Warning)
+        {
+            try
+            {
+                mailbox.Publish(new DiagnosticEvent("skills", formatter(state, exception), UiNotificationLevel.Warning));
+            }
+            catch (ObjectDisposedException)
+            {
+                // Mailbox disposed during shutdown — silently discard.
+            }
+        }
+    }
+}
