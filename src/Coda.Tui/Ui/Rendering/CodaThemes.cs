@@ -1,4 +1,5 @@
 using System.Collections.ObjectModel;
+using Microsoft.Extensions.Logging;
 using TgColor = Terminal.Gui.Drawing.Color;
 using TgName = Terminal.Gui.Drawing.ColorName16;
 
@@ -131,11 +132,58 @@ internal static class CodaThemes
         theme => theme,
         StringComparer.OrdinalIgnoreCase);
 
+    // Plugin themes — registered at startup, never overlap with built-ins.
+    private static readonly object PluginLock = new();
+    private static readonly Dictionary<string, CodaTheme> pluginThemesByName =
+        new(StringComparer.OrdinalIgnoreCase);
+
     public static IReadOnlyList<CodaTheme> All => all;
 
     public static CodaTheme Current { get; private set; } = Default;
 
     public static event Action? Changed;
+
+    /// <summary>
+    /// Registers a plugin-contributed theme. If the name collides with a built-in theme,
+    /// the registration is silently dropped and the supplied logger receives a warning.
+    /// </summary>
+    public static bool RegisterPlugin(CodaTheme theme, Microsoft.Extensions.Logging.ILogger? logger = null)
+    {
+        ArgumentNullException.ThrowIfNull(theme);
+
+        if (byName.ContainsKey(theme.Name))
+        {
+            logger?.LogWarning(
+                "Plugin theme '{Name}' collides with a built-in theme and will be ignored.",
+                theme.Name);
+            return false;
+        }
+
+        lock (PluginLock)
+        {
+            pluginThemesByName[theme.Name] = theme;
+        }
+
+        return true;
+    }
+
+    /// <summary>Removes all plugin-registered themes. Called at test teardown or on plugin reload.</summary>
+    public static void ClearPluginThemes()
+    {
+        lock (PluginLock)
+        {
+            pluginThemesByName.Clear();
+        }
+    }
+
+    /// <summary>Returns plugin-registered themes (not including built-ins).</summary>
+    public static IReadOnlyList<CodaTheme> GetPluginThemes()
+    {
+        lock (PluginLock)
+        {
+            return [.. pluginThemesByName.Values];
+        }
+    }
 
     public static bool TryGet(string name, out CodaTheme theme)
     {
@@ -145,7 +193,21 @@ internal static class CodaThemes
             return false;
         }
 
-        return byName.TryGetValue(name.Trim(), out theme!);
+        if (byName.TryGetValue(name.Trim(), out theme!))
+        {
+            return true;
+        }
+
+        lock (PluginLock)
+        {
+            if (pluginThemesByName.TryGetValue(name.Trim(), out theme!))
+            {
+                return true;
+            }
+        }
+
+        theme = Default;
+        return false;
     }
 
     public static void Set(CodaTheme theme)

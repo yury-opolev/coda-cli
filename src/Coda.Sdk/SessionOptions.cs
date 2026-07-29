@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Agent.OutputStyles;
 using Coda.Agent.Settings;
 using LlmClient;
 
@@ -86,6 +87,14 @@ public sealed record SessionOptions
 
     /// <summary>Named output style persona (e.g. "concise", "explanatory", "code-reviewer"). Null or "default" = no change.</summary>
     public string? OutputStyle { get; init; }
+
+    /// <summary>
+    /// Session-scoped plugin output styles for this session. Checked before the static process-global
+    /// registry so serve sessions with different working directories resolve only their own plugin styles.
+    /// Empty by default (no plugin styles); the TUI/headless paths may populate this from
+    /// <see cref="Coda.Tui.Plugins.PluginComposition.OutputStyles"/> at session construction.
+    /// </summary>
+    public IReadOnlyList<OutputStyle> PluginOutputStyles { get; init; } = [];
 
     /// <summary>
     /// Complete exact root system prompt. Null uses normal Coda construction; empty and whitespace are exact values.

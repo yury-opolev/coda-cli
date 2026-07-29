@@ -120,7 +120,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         UserHookRunner? userHookRunnerOverride = null,
         HookTrustGuard? trustGuard = null,
         HookRunLog? runLog = null,
-        List<UserHook>? hookList = null)
+        List<UserHook>? hookList = null,
+        Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
@@ -240,7 +241,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             () => this.scheduleRuntime,
             sessionHookList: this.configuredHooks,
             runLog: this.hookRunLog,
-            trustGuard: this.trustGuard);
+            trustGuard: this.trustGuard,
+            subagentRegistry: subagentRegistry);
 
         this.logger.LogInformation(
             "Session {sessionId} started: provider {provider}, model {model}",

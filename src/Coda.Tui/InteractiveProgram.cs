@@ -1,11 +1,13 @@
 using Coda.Agent;
 using Coda.Agent.Hooks;
+using Coda.Agent.Subagents;
 using Coda.Mcp.Auth;
 using Coda.Sdk;
 using Coda.Tui.Clipboard;
 using Coda.Tui.Commands;
 using Coda.Tui.Mcp;
 using Coda.Tui.Agent;
+using Coda.Tui.Plugins;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Setup;
@@ -294,6 +296,16 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
         var pluginStateStore = new Coda.Tui.Plugins.PluginStateStore(userCodaDir);
 
+        // Load and compose plugins for this working directory.
+        var plugins = PluginLoader.Load(cwd);
+        var pluginComposition = PluginComponentComposer.Compose(plugins, cwd);
+        var pluginRegistry = pluginComposition.Agents.Count > 0
+            ? new SubagentRegistry(pluginComposition.Agents)
+            : null;
+        var pluginMcpServers = pluginComposition.McpServers.Count > 0
+            ? pluginComposition.McpServers.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Config)
+            : (IReadOnlyDictionary<string, Coda.Mcp.McpServerConfig>?)null;
+
         // Load skills once at session start and build the skill tool (model-invocable skills only).
         // The session state is shared between the skill tool and the reattach callback so compaction
         // re-injects exactly the bodies the model loaded in this session.
@@ -318,14 +330,18 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             mcp,
             store,
             new DefaultMcpOAuthReauthenticator(mcpHttp, store),
-            mailbox);
+            mailbox,
+            pluginMcpServers: pluginMcpServers);
         context.McpManagement = mcpManagement;
 
         // Build the session-stable hook collaborators: a mutable hook list (frozen from startup
         // settings), a shared run log, and a trust guard backed by the interactive prompt service.
         // The same instances are given to both the session (via its CodaSession constructor) and
         // HookManagementService so /hooks enable/disable and /hooks info operate on the live data.
-        var hookList = new List<UserHook>(startupSettings.Hooks);
+        // Plugin hooks are prepended so they are subject to the same trust guard as user hooks.
+        var hookList = pluginComposition.Hooks.Count > 0
+            ? new List<UserHook>([.. pluginComposition.Hooks, .. startupSettings.Hooks])
+            : new List<UserHook>(startupSettings.Hooks);
         var hookRunLog = new HookRunLog();
         var hookTrustStore = new HookTrustStore();
         var hookTrustGuard = new HookTrustGuard(
@@ -366,11 +382,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             }
         }, hostToken);
 
-        // Use the internal constructor with a custom session factory so the hook list,
-        // run log, and trust guard are threaded into every CodaSession the runner creates.
         var capturedHookList = hookList;
         var capturedRunLog = hookRunLog;
         var capturedTrustGuard = hookTrustGuard;
+        var capturedRegistry = pluginRegistry;
+        var capturedPluginOutputStyles = pluginComposition.OutputStyles;
         Func<int, string>? skillReattach = skillTool is not null
             ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
             : null;
@@ -382,13 +398,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             sessionFactory: (ctx, opts, currentOpts) =>
                 new CodaSession(
                     ctx.Credentials,
-                    opts,
+                    opts with { PluginOutputStyles = capturedPluginOutputStyles },
                     history: ctx.Session.History,
                     sessionId: ctx.Session.SessionId,
                     currentOptionsProvider: currentOpts,
                     hookList: capturedHookList,
                     runLog: capturedRunLog,
-                    trustGuard: capturedTrustGuard),
+                    trustGuard: capturedTrustGuard,
+                    subagentRegistry: capturedRegistry),
             timeProvider: null,
             skillReattachProvider: skillReattach,
             grantedDirectoriesSource: grantedDirs);
@@ -442,7 +459,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             try
             {
                 await SeedSessionAsync(context, options, mailbox, hostToken).ConfigureAwait(false);
-                await ConnectMcpAsync(context, mcp, store, mailbox, hostToken).ConfigureAwait(false);
+                await ConnectMcpAsync(context, mcp, store, mailbox, pluginMcpServers, hostToken).ConfigureAwait(false);
                 var ranSetup = await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
                 if (!ranSetup)
                 {
@@ -894,9 +911,10 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
     /// <summary>Connect configured MCP servers, routing status through MCP diagnostics.</summary>
     private static async Task ConnectMcpAsync(
-        CommandContext context, Coda.Mcp.McpClientManager mcp, ITokenStore store, UiEventMailbox mailbox, CancellationToken ct)
+        CommandContext context, Coda.Mcp.McpClientManager mcp, ITokenStore store, UiEventMailbox mailbox,
+        IReadOnlyDictionary<string, Coda.Mcp.McpServerConfig>? pluginMcpServers, CancellationToken ct)
     {
-        var mcpServers = Coda.Mcp.McpConfig.Load(context.Session.WorkingDirectory);
+        var mcpServers = Coda.Mcp.McpConfig.LoadWithPlugins(context.Session.WorkingDirectory, pluginMcpServers);
         if (mcpServers.Count == 0)
         {
             return;

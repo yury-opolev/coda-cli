@@ -39,6 +39,26 @@ public static class BuiltInAgents
     ];
 
     /// <summary>
+    /// Returns <see langword="true"/> when <paramref name="type"/> matches a built-in agent type
+    /// (case-insensitive). Used by <c>PluginComponentComposer</c> to protect built-in names from
+    /// being shadowed by plugin-contributed agents.
+    /// </summary>
+    public static bool IsBuiltInType(string? type)
+    {
+        if (string.IsNullOrWhiteSpace(type)) return false;
+
+        foreach (var definition in All)
+        {
+            if (string.Equals(definition.Type, type, StringComparison.OrdinalIgnoreCase))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    /// <summary>
     /// Resolves a subagent type name (case-insensitive) to its definition.
     /// Unknown or null values fall back to general-purpose.
     /// </summary>

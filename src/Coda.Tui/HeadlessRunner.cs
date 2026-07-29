@@ -1,7 +1,9 @@
 using Coda.Agent.Goals;
 using Coda.Agent.Hooks;
+using Coda.Agent.Subagents;
 using Coda.Mcp;
 using Coda.Sdk;
+using Coda.Tui.Plugins;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
 using LlmAuth.Providers.GitHubCopilot;
@@ -89,6 +91,16 @@ public static class HeadlessRunner
             return 1;
         }
 
+        // Load and compose plugins for this working directory.
+        var plugins = PluginLoader.Load(workingDirectory);
+        var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory);
+        var pluginRegistry = pluginComposition.Agents.Count > 0
+            ? new SubagentRegistry(pluginComposition.Agents)
+            : null;
+
+        // Plugin hooks prepended to settings hooks so they are frozen with the session.
+        var pluginHooks = pluginComposition.Hooks;
+
         // HTTP MCP servers run non-interactively here: stored tokens still work, but a
         // server that needs a fresh browser sign-in is skipped (logged), never blocking.
         using var mcpHttp = new HttpClient();
@@ -96,7 +108,9 @@ public static class HeadlessRunner
         var mcpHttpFactory = new DefaultMcpHttpClientFactory(
             mcpHttp, mcpCredentialStore, interactive: false, msg => Console.Error.WriteLine(msg));
         await using var mcp = new McpClientManager(mcpHttpFactory);
-        var mcpServers = McpConfig.Load(workingDirectory);
+        var pluginMcpServers = pluginComposition.McpServers.ToDictionary(
+            kvp => kvp.Key, kvp => kvp.Value.Config);
+        var mcpServers = McpConfig.LoadWithPlugins(workingDirectory, pluginMcpServers);
         if (mcpServers.Count > 0)
         {
             // Resolve coda-secret:/${VAR} references before connecting (never plaintext in config).
@@ -166,14 +180,22 @@ public static class HeadlessRunner
             EnableSessionMemory = options.EnableSessionMemory,
             MaxStopContinuations = options.MaxStopContinuations,
             SystemPromptOverride = ResolveInitialSystemPromptOverride(options, resolvedTarget),
+            PluginOutputStyles = pluginComposition.OutputStyles,
         };
+
+        // Merge plugin hooks before settings hooks so they are subject to the same trust guard.
+        List<UserHook>? hookList = pluginHooks.Count > 0
+            ? [.. pluginHooks, .. Coda.Agent.Settings.SettingsLoader.Load(workingDirectory).Hooks]
+            : null;
 
         using var session = new CodaSession(
             credentials,
             sessionOptions,
             history: seedHistory,
             sessionId: seedSessionId,
-            trustGuard: new HookTrustGuard(new HookTrustStore(), workingDirectory, promptCallback: null));
+            trustGuard: new HookTrustGuard(new HookTrustStore(), workingDirectory, promptCallback: null),
+            hookList: hookList,
+            subagentRegistry: pluginRegistry);
         if (rootResumeTarget is not null)
         {
             // Apply persisted root metadata against CodaSession's constructor-captured startup authority.

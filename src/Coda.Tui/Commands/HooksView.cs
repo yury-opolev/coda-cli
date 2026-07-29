@@ -23,7 +23,7 @@ public static class HooksView
         {
             var hook = hooks[i];
             var enabled = hook.Enabled ? "enabled" : "disabled";
-            var scope = hook.Scope == HookScope.Project ? "project" : "user";
+            var scope = OriginLabel(hook);
             var matcher = string.IsNullOrEmpty(hook.Matcher) ? "*" : hook.Matcher;
             var handlerType = hook.HandlerType ?? "command";
             builder.Append($"  {i + 1,2}.")
@@ -44,7 +44,7 @@ public static class HooksView
         ArgumentNullException.ThrowIfNull(hook);
         var builder = new StringBuilder();
         var enabled = hook.Enabled ? "enabled" : "disabled";
-        var scope = hook.Scope == HookScope.Project ? "project" : "user";
+        var scope = OriginLabel(hook);
         var matcher = string.IsNullOrEmpty(hook.Matcher) ? "*" : hook.Matcher;
         var handlerType = hook.HandlerType ?? "command";
 
@@ -160,4 +160,15 @@ public static class HooksView
 
     private static string FreeText(string? value) =>
         SecretRedactor.Redact(TerminalTextSanitizer.SanitizeSingleLine(SecretRedactor.Redact(value)));
+
+    /// <summary>Returns the display label for a hook's origin (scope or plugin identity).</summary>
+    private static string OriginLabel(UserHook hook)
+    {
+        if (hook.PluginOrigin is { } origin)
+        {
+            return $"plugin:{Identifier(origin.Name)}@{Identifier(origin.Version)}";
+        }
+
+        return hook.Scope == HookScope.Project ? "project" : "user";
+    }
 }

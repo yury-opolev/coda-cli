@@ -38,7 +38,7 @@ public sealed class OutputStyleCommand : ISlashCommand
             var resolved = BuiltInOutputStyles.Resolve(requested);
 
             // Check if the name was actually recognized (not silently fallen back to default).
-            var isKnown = BuiltInOutputStyles.All.Any(s => string.Equals(s.Name, requested, StringComparison.OrdinalIgnoreCase));
+            var isKnown = BuiltInOutputStyles.IsKnown(requested);
 
             if (!isKnown)
             {
@@ -60,6 +60,14 @@ public sealed class OutputStyleCommand : ISlashCommand
                 ? " (active)"
                 : string.Empty;
             context.Console.MarkupLine($"  {Theme.AccentMarkup(style.Name)}{Theme.DimMarkup(marker)} — {Markup.Escape(style.Description)}");
+        }
+
+        foreach (var style in BuiltInOutputStyles.GetPluginStyles())
+        {
+            var marker = string.Equals(style.Name, context.Session.OutputStyle, StringComparison.OrdinalIgnoreCase)
+                ? " (active)"
+                : string.Empty;
+            context.Console.MarkupLine($"  {Theme.AccentMarkup(style.Name)}{Theme.DimMarkup(marker)} — {Markup.Escape(style.Description)} {Theme.DimMarkup("(plugin)")}");
         }
 
         return Task.FromResult(CommandResult.Continue);

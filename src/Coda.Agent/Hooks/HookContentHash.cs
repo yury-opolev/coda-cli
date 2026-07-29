@@ -32,6 +32,8 @@ public static class HookContentHash
 
         // Canonical representation of the fields that determine what the hook does.
         // Order is fixed; null fields are serialised as JSON null so the hash is stable.
+        // PluginOrigin is included so updating a plugin re-prompts rather than inheriting
+        // approval granted to the previous version's hooks.
         var canonical = new
         {
             @event = hook.Event?.ToLowerInvariant(),
@@ -46,6 +48,8 @@ public static class HookContentHash
             unattendedDecision = hook.UnattendedDecision?.ToLowerInvariant(),
             allowSystemPromptReplace = hook.AllowSystemPromptReplace,
             mutates = hook.Mutates is null ? null : hook.Mutates.OrderBy(m => m, StringComparer.Ordinal).ToArray(),
+            pluginName = hook.PluginOrigin?.Name,
+            pluginVersion = hook.PluginOrigin?.Version,
         };
 
         var json = JsonSerializer.Serialize(canonical, JsonOptions);

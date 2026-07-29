@@ -66,4 +66,9 @@ public sealed record UserHook(
     string? HookPrompt = null,
     string? AgentType = null,
     bool Enabled = true,
-    HookScope Scope = HookScope.User);
+    HookScope Scope = HookScope.User,
+    /// <summary>
+    /// When non-null, identifies the plugin that contributed this hook.
+    /// The version is included so updating a plugin changes the trust hash.
+    /// </summary>
+    (string Name, string Version)? PluginOrigin = null);

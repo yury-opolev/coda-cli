@@ -22,6 +22,7 @@ public sealed class SubagentHost : ISubagentHost
     private readonly UserHookRunner? userHooks;
     private readonly TaskManager tasks;
     private readonly TimeSpan? toolProgressInterval;
+    private readonly SubagentRegistry? subagentRegistry;
 
     public SubagentHost(
         ILlmClient client,
@@ -31,7 +32,8 @@ public sealed class SubagentHost : ISubagentHost
         TaskManager tasks,
         bool includeAnthropicSystemPrefix = true,
         UserHookRunner? userHooks = null,
-        TimeSpan? toolProgressInterval = null)
+        TimeSpan? toolProgressInterval = null,
+        SubagentRegistry? subagentRegistry = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -44,7 +46,11 @@ public sealed class SubagentHost : ISubagentHost
         // regression test can observe a pulse without waiting the production default. Null in
         // production → the child loop uses AgentLoop's own default interval.
         this.toolProgressInterval = toolProgressInterval;
+        this.subagentRegistry = subagentRegistry;
     }
+
+    /// <summary>Test seam: exposes the registry so integration tests can verify it was wired.</summary>
+    internal SubagentRegistry? SubagentRegistryForTest => this.subagentRegistry;
 
     /// <summary>
     /// The permission prompt shared with the parent loop. Subagents (foreground and background)
@@ -112,7 +118,7 @@ public sealed class SubagentHost : ISubagentHost
         TurnShape? parentToolRestriction,
         CancellationToken cancellationToken = default)
     {
-        var definition = BuiltInAgents.Resolve(subagentType);
+        var definition = this.subagentRegistry?.Resolve(subagentType) ?? BuiltInAgents.Resolve(subagentType);
         var prefix = this.includeAnthropicSystemPrefix ? AnthropicModels.AnthropicSystemPrefix + "\n\n" : string.Empty;
         var systemPrompt = prefix
             + definition.SystemPromptBody

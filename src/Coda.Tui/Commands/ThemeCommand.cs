@@ -96,6 +96,8 @@ public sealed class ThemeCommand : ISlashCommand
         var current = CodaThemes.Current;
         var options = CodaThemes.All
             .Select(theme => new UiPromptOption(theme.Name, theme.Name, theme.DisplayName, theme == current))
+            .Concat(CodaThemes.GetPluginThemes()
+                .Select(theme => new UiPromptOption(theme.Name, theme.Name, $"{theme.DisplayName} (plugin)", theme == current)))
             .ToList();
 
         var response = await context.Prompts.RequestAsync(
@@ -128,6 +130,13 @@ public sealed class ThemeCommand : ISlashCommand
             var marker = theme == CodaThemes.Current ? " (active)" : string.Empty;
             context.Console.MarkupLine(
                 $"  {Theme.AccentMarkup(theme.Name)}{Theme.DimMarkup(marker)} — {Markup.Escape(theme.DisplayName)}");
+        }
+
+        foreach (var theme in CodaThemes.GetPluginThemes())
+        {
+            var marker = theme == CodaThemes.Current ? " (active)" : string.Empty;
+            context.Console.MarkupLine(
+                $"  {Theme.AccentMarkup(theme.Name)}{Theme.DimMarkup(marker)} — {Markup.Escape(theme.DisplayName)}{Theme.DimMarkup(" (plugin)")}");
         }
     }
 

@@ -58,9 +58,120 @@ public static class McpConfig
     }
 
     /// <summary>
-    /// Like <see cref="Load"/> but tags each server with the <see cref="McpConfigScope"/> it was
-    /// resolved from (project overrides user). For display and scope-aware editing.
+    /// Like <see cref="Load"/> but also accepts plugin-contributed servers as a third source at the
+    /// lowest precedence. User and project entries with the same name override plugin entries.
     /// </summary>
+    /// <param name="workingDirectory">The project directory holding <c>.mcp.json</c>.</param>
+    /// <param name="pluginServers">
+    /// Pre-parsed plugin-contributed server map (name → config). Pass an empty dictionary or null
+    /// to skip the plugin layer. Disabled servers in this layer are ignored by the caller before
+    /// this method is reached (disabled plugins contribute nothing).
+    /// </param>
+    /// <param name="userMcpDir">
+    /// The directory holding the user-level <c>.mcp.json</c>. Defaults to
+    /// <c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c> when null.
+    /// </param>
+    /// <param name="includeProject">When false, the project layer is ignored.</param>
+    public static IReadOnlyDictionary<string, McpServerConfig> LoadWithPlugins(
+        string workingDirectory,
+        IReadOnlyDictionary<string, McpServerConfig>? pluginServers = null,
+        string? userMcpDir = null,
+        bool includeProject = true)
+    {
+        var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
+
+        // Build merged map: plugin (lowest) → user → project (highest).
+        var merged = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
+
+        if (pluginServers is not null)
+        {
+            foreach (var (name, config) in pluginServers)
+            {
+                merged[name] = config;
+            }
+        }
+
+        foreach (var (name, config) in userServers)
+        {
+            merged[name] = config;
+        }
+
+        if (includeProject)
+        {
+            foreach (var (name, config) in projectServers)
+            {
+                merged[name] = config;
+            }
+        }
+
+        var connectable = new Dictionary<string, McpServerConfig>(StringComparer.Ordinal);
+        foreach (var (name, config) in merged)
+        {
+            if (!config.Disabled)
+            {
+                connectable[name] = config;
+            }
+        }
+
+        return connectable;
+    }
+
+    /// <summary>
+    /// Like <see cref="LoadEntries"/> but includes plugin-contributed servers tagged with
+    /// <see cref="McpConfigScope.Plugin"/> and their originating plugin name.
+    /// Plugin entries are listed first so the display order reflects precedence.
+    /// User/project entries with the same name as a plugin entry shadow the plugin entry.
+    /// </summary>
+    /// <param name="workingDirectory">The project directory holding <c>.mcp.json</c>.</param>
+    /// <param name="pluginServersByName">
+    /// Map from server name to (config, pluginName). Null or empty skips the plugin layer.
+    /// </param>
+    /// <param name="userMcpDir">Override for the user MCP directory.</param>
+    public static IReadOnlyList<McpServerEntry> LoadEntriesWithPlugins(
+        string workingDirectory,
+        IReadOnlyDictionary<string, (McpServerConfig Config, string PluginName)>? pluginServersByName = null,
+        string? userMcpDir = null)
+    {
+        var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
+
+        // Collect all names defined at user/project level so plugin entries with the same
+        // name can be shown as shadowed (or simply omitted from the effective list).
+        var definedAbove = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var name in userServers.Keys) definedAbove.Add(name);
+        foreach (var name in projectServers.Keys) definedAbove.Add(name);
+
+        var entries = new List<McpServerEntry>();
+
+        if (pluginServersByName is not null)
+        {
+            foreach (var (name, (config, pluginName)) in pluginServersByName)
+            {
+                if (!definedAbove.Contains(name))
+                {
+                    entries.Add(new McpServerEntry(name, config, McpConfigScope.Plugin) { PluginName = pluginName });
+                }
+            }
+        }
+
+        // User entries that are not overridden by project.
+        foreach (var (name, config) in userServers)
+        {
+            if (!projectServers.ContainsKey(name))
+            {
+                entries.Add(new McpServerEntry(name, config, McpConfigScope.User));
+            }
+        }
+
+        // Project entries always win.
+        foreach (var (name, config) in projectServers)
+        {
+            entries.Add(new McpServerEntry(name, config, McpConfigScope.Project));
+        }
+
+        return entries;
+    }
+
+
     public static IReadOnlyList<McpServerEntry> LoadEntries(string workingDirectory, string? userMcpDir = null)
     {
         var (userServers, projectServers) = LoadLayers(workingDirectory, userMcpDir);
