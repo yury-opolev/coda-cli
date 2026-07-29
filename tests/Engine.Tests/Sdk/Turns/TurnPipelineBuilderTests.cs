@@ -354,6 +354,43 @@ public sealed class TurnPipelineBuilderTests : IDisposable
         Assert.Null(spec.UserHooks);
     }
 
+    [Fact]
+    public void BuildSpec_http_handler_is_wired_when_http_hooks_present()
+    {
+        // I2: verify the http handler is constructed and injected into HookBus.
+        var builder = this.NewBuilder();
+        var settings = new CodaSettings([], [], [
+            new UserHook("PreToolUse", null, HandlerType: "http", Url: "https://policy.example.com/check"),
+        ]) { HttpHookAllowlist = ["policy.example.com"] };
+
+        var spec = builder.BuildSpec(this.Options(), this.Client(), settings);
+
+        Assert.NotNull(spec.UserHooks);
+        var bus = spec.UserHooks!.BusForTest;
+        Assert.IsType<HttpHookHandler>(bus.HttpHandlerForTest);
+    }
+
+    [Fact]
+    public void BuildSpec_agent_handler_subagent_host_is_hook_free_by_construction()
+    {
+        // I2 + recursion invariant: the agent handler's SubagentHost must have userHooks: null
+        // so hook-spawned subagents are structurally hook-free. Impossible by construction,
+        // not by assertion.
+        var builder = this.NewBuilder();
+        var settings = new CodaSettings([], [], [
+            new UserHook("PreToolUse", null, HandlerType: "agent", HookPrompt: "Review this"),
+        ]);
+
+        var spec = builder.BuildSpec(this.Options(), this.Client(), settings);
+
+        Assert.NotNull(spec.UserHooks);
+        var bus = spec.UserHooks!.BusForTest;
+        var agentHandler = Assert.IsType<AgentHookHandler>(bus.AgentHandlerForTest);
+        var host = Assert.IsType<SubagentHost>(agentHandler.SubagentHostForTest);
+        Assert.True(host.IsHookFree,
+            "The SubagentHost given to AgentHookHandler must be hook-free (userHooks: null).");
+    }
+
     // ---- Stable collaborators threaded straight through ----
 
     [Fact]

@@ -35,6 +35,9 @@ public sealed partial class HookBus
     private readonly Func<DateTimeOffset>? clock;
     private readonly Func<string>? spillDirFactory;
     private readonly ILogger logger;
+    private readonly IHookHandler? httpHandler;
+    private readonly IHookHandler? promptHandler;
+    private readonly IHookHandler? agentHandler;
     private int spillCounter;
 
     /// <summary>
@@ -58,13 +61,19 @@ public sealed partial class HookBus
     /// Defaults to <c>~/.coda/hook-output</c>. Inject a temp path in tests.
     /// </param>
     /// <param name="logger">Logger for warnings and override notifications.</param>
+    /// <param name="httpHandler">Handler for <c>http</c>-type hooks. When <see langword="null"/>, http hooks apply fail-open policy.</param>
+    /// <param name="promptHandler">Handler for <c>prompt</c>-type hooks. When <see langword="null"/>, prompt hooks apply fail-open policy.</param>
+    /// <param name="agentHandler">Handler for <c>agent</c>-type hooks. When <see langword="null"/>, agent hooks apply fail-open policy.</param>
     public HookBus(
         IReadOnlyList<UserHook> hooks,
         IHookExecutor? executor = null,
         HookContext? context = null,
         Func<DateTimeOffset>? clock = null,
         Func<string>? spillDirFactory = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        IHookHandler? httpHandler = null,
+        IHookHandler? promptHandler = null,
+        IHookHandler? agentHandler = null)
     {
         this.hooks = hooks ?? throw new ArgumentNullException(nameof(hooks));
         this.executor = executor ?? new ShellHookExecutor();
@@ -72,6 +81,9 @@ public sealed partial class HookBus
         this.clock = clock;
         this.spillDirFactory = spillDirFactory;
         this.logger = logger ?? NullLogger.Instance;
+        this.httpHandler = httpHandler;
+        this.promptHandler = promptHandler;
+        this.agentHandler = agentHandler;
         this.HasPreToolUse = hooks.Any(h => string.Equals(h.Event, "PreToolUse", StringComparison.OrdinalIgnoreCase));
         this.HasPostToolUse = hooks.Any(h => string.Equals(h.Event, "PostToolUse", StringComparison.OrdinalIgnoreCase));
         this.HasPermissionRequest = hooks.Any(h => string.Equals(h.Event, "PermissionRequest", StringComparison.OrdinalIgnoreCase));
@@ -289,7 +301,7 @@ public sealed partial class HookBus
             {
                 Decision = PermissionDecisions.Deny,
                 Reason = $"permission hook failed: {ex.Message}",
-                ByHookCommand = matching[0].Command,
+                ByHookCommand = GetHookIdentifier(matching[0]),
             };
         }
 
@@ -816,55 +828,27 @@ public sealed partial class HookBus
         var policy = HookEventPolicy.Get(eventName);
         var timeoutSeconds = hook.TimeoutSeconds ?? policy.TimeoutSeconds;
         var failOpen = hook.FailOpen ?? policy.FailOpen;
+        var hookId = GetHookIdentifier(hook);
 
         using var hookCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
         hookCts.CancelAfter(TimeSpan.FromSeconds(timeoutSeconds));
 
         try
         {
-            var (exitCode, rawStdout, rawStderr) = await this.executor
-                .ExecAsync(hook.Command, payload, hookCts.Token)
-                .ConfigureAwait(false);
-
-            if (exitCode == 0)
-            {
-                // Apply cap/spill for the display/logging side effect (creates a spill file
-                // when the output is large) but parse the full, bounded stdout so that a
-                // valid JSON {"decision":"block",...} longer than OutputCap characters is
-                // never silently truncated into invalid JSON and downgraded to allow.
-                this.ApplyCapWithSpill(rawStdout, eventName, "stdout");
-                this.ApplyCapWithSpill(rawStderr, eventName, "stderr");
-                return HookOutputParser.Parse(rawStdout);
-            }
-
-            // For non-zero exits the capped copy is the human-facing reason.
-            var stdout = this.ApplyCapWithSpill(rawStdout, eventName, "stdout");
-            var stderr = this.ApplyCapWithSpill(rawStderr, eventName, "stderr");
-
-            if (exitCode == 2)
-            {
-                var reason = !string.IsNullOrWhiteSpace(stderr) ? stderr.Trim()
-                    : !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim()
-                    : "blocked by hook (exit 2)";
-                return new HookOutput { Decision = "block", Reason = reason };
-            }
-
-            // Other non-zero exit: warn, apply fail-open policy.
-            this.LogHookNonZeroExit(hook.Command, exitCode, eventName);
-            if (failOpen)
-            {
-                return HookOutput.NoOp;
-            }
-
-            var blockReason = !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim()
-                : !string.IsNullOrWhiteSpace(stderr) ? stderr.Trim()
-                : $"hook exited with code {exitCode}";
-            return new HookOutput { Decision = "block", Reason = blockReason };
+            return await this.DispatchHookAsync(hook, eventName, payload, failOpen, hookCts.Token).ConfigureAwait(false);
+        }
+        catch (HttpHookNonSuccessException ex)
+        {
+            // Non-2xx maps to non-zero exit semantics — apply fail-open policy.
+            this.LogHookNonZeroExit(hookId, ex.StatusCode, eventName);
+            return failOpen
+                ? HookOutput.NoOp
+                : new HookOutput { Decision = "block", Reason = $"HTTP hook returned status {ex.StatusCode}" };
         }
         catch (OperationCanceledException) when (!ct.IsCancellationRequested)
         {
             // Hook-specific timeout fired, not the caller's cancellation.
-            this.LogHookTimeout(hook.Command, timeoutSeconds, eventName);
+            this.LogHookTimeout(hookId, timeoutSeconds, eventName);
             return failOpen
                 ? HookOutput.NoOp
                 : new HookOutput { Decision = "block", Reason = $"hook timed out after {timeoutSeconds}s" };
@@ -876,11 +860,144 @@ public sealed partial class HookBus
         }
         catch (Exception ex)
         {
-            this.LogHookException(hook.Command, eventName, ex);
+            this.LogHookException(hookId, eventName, ex);
             return failOpen
                 ? HookOutput.NoOp
                 : new HookOutput { Decision = "block", Reason = $"hook execution failed: {ex.Message}" };
         }
+    }
+
+    private async Task<HookOutput> DispatchHookAsync(
+        UserHook hook,
+        string eventName,
+        string payload,
+        bool failOpen,
+        CancellationToken ct)
+    {
+        var handlerType = hook.HandlerType ?? "command";
+
+        switch (handlerType)
+        {
+            case "http":
+                if (this.httpHandler is null)
+                {
+                    this.LogNoHttpHandler(GetHookIdentifier(hook), eventName);
+                    return failOpen
+                        ? HookOutput.NoOp
+                        : new HookOutput { Decision = "block", Reason = "http handler not configured" };
+                }
+
+                return await this.httpHandler.HandleAsync(hook, payload, ct).ConfigureAwait(false);
+
+            case "prompt":
+                if (this.promptHandler is null)
+                {
+                    this.LogNoPromptHandler(GetHookIdentifier(hook), eventName);
+                    return failOpen
+                        ? HookOutput.NoOp
+                        : new HookOutput { Decision = "block", Reason = "prompt handler not configured" };
+                }
+
+                return await this.promptHandler.HandleAsync(hook, payload, ct).ConfigureAwait(false);
+
+            case "agent":
+                if (this.agentHandler is null)
+                {
+                    this.LogNoAgentHandler(GetHookIdentifier(hook), eventName);
+                    return failOpen
+                        ? HookOutput.NoOp
+                        : new HookOutput { Decision = "block", Reason = "agent handler not configured" };
+                }
+
+                return await this.agentHandler.HandleAsync(hook, payload, ct).ConfigureAwait(false);
+
+            default:
+                if (!string.Equals(handlerType, "command", StringComparison.OrdinalIgnoreCase))
+                {
+                    this.LogUnknownHandlerType(GetHookIdentifier(hook), handlerType, eventName);
+                    return failOpen
+                        ? HookOutput.NoOp
+                        : new HookOutput { Decision = "block", Reason = $"unknown handler type '{handlerType}'" };
+                }
+
+                return await this.RunCommandHookAsync(hook, eventName, payload, failOpen, ct).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<HookOutput> RunCommandHookAsync(
+        UserHook hook,
+        string eventName,
+        string payload,
+        bool failOpen,
+        CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(hook.Command))
+        {
+            this.LogMissingCommand(eventName);
+            return failOpen
+                ? HookOutput.NoOp
+                : new HookOutput { Decision = "block", Reason = "hook is missing 'command'" };
+        }
+
+        var hookId = hook.Command;
+        var (exitCode, rawStdout, rawStderr) = await this.executor
+            .ExecAsync(hook.Command, payload, ct)
+            .ConfigureAwait(false);
+
+        if (exitCode == 0)
+        {
+            // Apply cap/spill for the display/logging side effect (creates a spill file
+            // when the output is large) but parse the full, bounded stdout so that a
+            // valid JSON {"decision":"block",...} longer than OutputCap characters is
+            // never silently truncated into invalid JSON and downgraded to allow.
+            this.ApplyCapWithSpill(rawStdout, eventName, "stdout");
+            this.ApplyCapWithSpill(rawStderr, eventName, "stderr");
+            return HookOutputParser.Parse(rawStdout);
+        }
+
+        // For non-zero exits the capped copy is the human-facing reason.
+        var stdout = this.ApplyCapWithSpill(rawStdout, eventName, "stdout");
+        var stderr = this.ApplyCapWithSpill(rawStderr, eventName, "stderr");
+
+        if (exitCode == 2)
+        {
+            var reason = !string.IsNullOrWhiteSpace(stderr) ? stderr.Trim()
+                : !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim()
+                : "blocked by hook (exit 2)";
+            return new HookOutput { Decision = "block", Reason = reason };
+        }
+
+        // Other non-zero exit: warn, apply fail-open policy.
+        this.LogHookNonZeroExit(hookId, exitCode, eventName);
+        if (failOpen)
+        {
+            return HookOutput.NoOp;
+        }
+
+        var blockReason = !string.IsNullOrWhiteSpace(stdout) ? stdout.Trim()
+            : !string.IsNullOrWhiteSpace(stderr) ? stderr.Trim()
+            : $"hook exited with code {exitCode}";
+        return new HookOutput { Decision = "block", Reason = blockReason };
+    }
+
+    /// <summary>Returns a human-readable identifier for a hook for use in log messages.</summary>
+    private static string GetHookIdentifier(UserHook hook)
+    {
+        if (hook.Command is { } cmd)
+        {
+            return cmd;
+        }
+
+        if (hook.Url is { } url)
+        {
+            return url;
+        }
+
+        var type = hook.HandlerType ?? "command";
+        var snippet = hook.HookPrompt is { Length: > 0 } p
+            ? ":" + p[..Math.Min(p.Length, 20)]
+            : string.Empty;
+        return $"[{type}{snippet}]";
     }
 
     // -------------------------------------------------------------------------
@@ -1048,13 +1165,13 @@ public sealed partial class HookBus
             }
 
             modifiedResult = mr;
-            byHookCommand = i < matching.Count ? matching[i].Command : null;
+            byHookCommand = i < matching.Count ? GetHookIdentifier(matching[i]) : null;
         }
 
         if (IsBlockingDecision(merged.Decision))
         {
             var reason = merged.Reason ?? "blocked by hook";
-            return new PostToolUseResult(Block: true, reason, modifiedResult, byHookCommand ?? matching[0].Command);
+            return new PostToolUseResult(Block: true, reason, modifiedResult, byHookCommand ?? GetHookIdentifier(matching[0]));
         }
 
         return modifiedResult is null
@@ -1085,7 +1202,7 @@ public sealed partial class HookBus
         for (var i = 0; i < outputs.Count; i++)
         {
             var output = outputs[i];
-            var hookCommand = i < matching.Count ? matching[i].Command : null;
+            var hookCommand = i < matching.Count ? GetHookIdentifier(matching[i]) : null;
 
             // Continue:false is a hard stop — treat it as a denial rather than a silent allow.
             var candidate = output.Continue
@@ -1201,7 +1318,7 @@ public sealed partial class HookBus
                 continue;
             }
 
-            var hookCommand = i < matching.Count ? matching[i].Command : string.Empty;
+            var hookCommand = i < matching.Count ? GetHookIdentifier(matching[i]) : string.Empty;
             if (node is not JsonObject obj)
             {
                 this.LogNonObjectHookField(key, hookCommand, node.GetValueKind().ToString());
@@ -1246,7 +1363,7 @@ public sealed partial class HookBus
                 continue;
             }
 
-            var hookCommand = i < matching.Count ? matching[i].Command : null;
+            var hookCommand = i < matching.Count ? GetHookIdentifier(matching[i]) : null;
 
             if (TryGetStringAllowEmpty(specific, "displayContent", out var dc))
             {
@@ -1368,7 +1485,7 @@ public sealed partial class HookBus
                 }
 
                 modifiedPrompt = mp;
-                modifiedPromptHookCommand = hook.Command;
+                modifiedPromptHookCommand = GetHookIdentifier(hook);
             }
 
             // systemPrompt — last writer wins, only when AllowSystemPromptReplace.
@@ -1376,7 +1493,7 @@ public sealed partial class HookBus
             {
                 if (!hook.AllowSystemPromptReplace)
                 {
-                    this.LogSystemPromptIgnored(hook.Command);
+                    this.LogSystemPromptIgnored(GetHookIdentifier(hook));
                 }
                 else
                 {
@@ -1668,8 +1785,8 @@ public sealed partial class HookBus
                 }
 
                 modifiedPrompt = mp;
-                modifiedPromptHookCommand = hook.Command;
-                byHookCommand = hook.Command;
+                modifiedPromptHookCommand = GetHookIdentifier(hook);
+                byHookCommand = GetHookIdentifier(hook);
             }
 
             if (TryGetString(specific, "additionalContext", out var ac))
@@ -1849,7 +1966,7 @@ public sealed partial class HookBus
             }
 
             modifiedResult = mr;
-            byHookCommand = i < matching.Count ? matching[i].Command : null;
+            byHookCommand = i < matching.Count ? GetHookIdentifier(matching[i]) : null;
         }
 
         // A block decision forces the subagent to continue; reason is injected as next instruction.
@@ -1860,7 +1977,7 @@ public sealed partial class HookBus
                 Block = true,
                 Reason = merged.Reason,
                 ModifiedResult = modifiedResult,
-                ByHookCommand = byHookCommand ?? (matching.Count > 0 ? matching[0].Command : null),
+                ByHookCommand = byHookCommand ?? (matching.Count > 0 ? GetHookIdentifier(matching[0]) : null),
             };
         }
 
@@ -1892,7 +2009,7 @@ public sealed partial class HookBus
             {
                 if (IsBlockingDecision(outputs[i].Decision))
                 {
-                    byHookCommand = matching[i].Command;
+                    byHookCommand = GetHookIdentifier(matching[i]);
                     break;
                 }
             }
@@ -2513,4 +2630,42 @@ public sealed partial class HookBus
         Level = LogLevel.Warning,
         Message = "AgentResponse hook '{command}' returned '{field}' but did not declare it in 'mutates'; buffering may be off and the raw response may already have streamed — add \"{field}\" to the hook's mutates list to enable buffered redaction")]
     private partial void LogUndeclaredMutation(string command, string field);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "http hook '{hookId}' for event '{eventName}' skipped — no http handler is configured")]
+    private partial void LogNoHttpHandler(string hookId, string eventName);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "prompt hook '{hookId}' for event '{eventName}' skipped — no prompt handler is configured")]
+    private partial void LogNoPromptHandler(string hookId, string eventName);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "agent hook '{hookId}' for event '{eventName}' skipped — no agent handler is configured")]
+    private partial void LogNoAgentHandler(string hookId, string eventName);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "hook '{hookId}' for event '{eventName}' has unknown handler type '{handlerType}' — skipping")]
+    private partial void LogUnknownHandlerType(string hookId, string handlerType, string eventName);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "command hook for event '{eventName}' has no 'command' field — skipping")]
+    private partial void LogMissingCommand(string eventName);
+
+    // -------------------------------------------------------------------------
+    // Internal test seams
+    // -------------------------------------------------------------------------
+
+    /// <summary>Exposed for testing: the http hook handler injected at construction.</summary>
+    internal IHookHandler? HttpHandlerForTest => this.httpHandler;
+
+    /// <summary>Exposed for testing: the prompt hook handler injected at construction.</summary>
+    internal IHookHandler? PromptHandlerForTest => this.promptHandler;
+
+    /// <summary>Exposed for testing: the agent hook handler injected at construction.</summary>
+    internal IHookHandler? AgentHandlerForTest => this.agentHandler;
 }

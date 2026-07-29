@@ -246,10 +246,19 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
                 .ToList();
             if (sessionHooks.Count > 0)
             {
+                // Wire the http handler so http-type session hooks can fire.
+                // prompt/agent handlers are unavailable at session-construction time (no client yet);
+                // session-level events (SessionStart/SessionEnd/Notification) are all fail-open, so
+                // null prompt/agent handlers result in safe NoOp behaviour for those types.
+                var sessionHttpHandler = new Coda.Agent.Hooks.HttpHookHandler(
+                    httpClient: null,
+                    settings.HttpHookAllowlist,
+                    logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
                 this.sessionHookRunner = new UserHookRunner(
                     sessionHooks,
                     context: new HookContext(this.SessionId, options.WorkingDirectory),
-                    logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"));
+                    logger: this.loggerFactory.CreateLogger("Coda.Hooks.Session"),
+                    httpHandler: sessionHttpHandler);
             }
         }
 

@@ -56,6 +56,12 @@ public sealed class SubagentHost : ISubagentHost
     /// <summary>Exposes the subagent tool registry for test inspection.</summary>
     internal ToolRegistry SubagentTools => this.subagentTools;
 
+    /// <summary>
+    /// True when this host was constructed without a user hook runner.
+    /// Structural guarantee that hook-spawned subagents cannot trigger hooks recursively.
+    /// </summary>
+    internal bool IsHookFree => this.userHooks is null;
+
     public Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,

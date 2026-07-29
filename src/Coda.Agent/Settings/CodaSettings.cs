@@ -62,6 +62,13 @@ public sealed record CodaSettings(
     public IReadOnlyDictionary<string, string> EffortByModel { get; init; } =
         new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
+    /// <summary>
+    /// Hosts that may be contacted by <c>http</c>-type hooks
+    /// (e.g. <c>"policy.internal"</c>, <c>"localhost"</c>). An empty list
+    /// means no <c>http</c> hooks run (they are refused with a warning).
+    /// </summary>
+    public IReadOnlyList<string> HttpHookAllowlist { get; init; } = [];
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
 }

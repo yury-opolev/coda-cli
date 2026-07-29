@@ -54,7 +54,11 @@ public static class SettingsLoader
     /// The user-level settings root (the directory that contains the <c>.coda</c> subfolder).
     /// Defaults to the user's home directory when <see langword="null"/>.
     /// </param>
-    public static CodaSettings Load(string workingDirectory, string? userSettingsDir = null)
+    /// <param name="logger">
+    /// Optional logger for hook-parsing warnings (unknown types, missing fields).
+    /// Pass <see langword="null"/> to suppress warnings; warnings still fire when a real logger is supplied.
+    /// </param>
+    public static CodaSettings Load(string workingDirectory, string? userSettingsDir = null, ILogger? logger = null)
     {
         var homeDir = userSettingsDir
             ?? Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR")
@@ -63,8 +67,8 @@ public static class SettingsLoader
         var userFile = Path.Combine(homeDir, ".coda", "settings.json");
         var projectFile = Path.Combine(workingDirectory, ".coda", "settings.json");
 
-        var userSettings = TryLoadFile(userFile);
-        var projectSettings = TryLoadFile(projectFile);
+        var userSettings = TryLoadFile(userFile, logger);
+        var projectSettings = TryLoadFile(projectFile, logger);
 
         // Defaults: project overrides user when set.
         var defaultProvider = projectSettings.DefaultProvider ?? userSettings.DefaultProvider;
@@ -80,6 +84,9 @@ public static class SettingsLoader
         // effortByModel: project entries overlay user entries by key.
         var effortByModel = MergeEffortByModel(userSettings.EffortByModel, projectSettings.EffortByModel);
 
+        // httpHookAllowlist: union of user and project lists (deduplicated, case-insensitive).
+        var httpHookAllowlist = MergeHttpHookAllowlist(userSettings.HttpHookAllowlist, projectSettings.HttpHookAllowlist);
+
         if (userSettings.Allow.Count == 0 && userSettings.Deny.Count == 0
             && userSettings.Hooks.Count == 0
             && userSettings.LspServers.Count == 0
@@ -93,7 +100,8 @@ public static class SettingsLoader
             && telemetry is null
             && userSettings.Theme is null
             && userSettings.ToolDisplayMode is null
-            && effortByModel.Count == 0)
+            && effortByModel.Count == 0
+            && httpHookAllowlist.Count == 0)
         {
             return CodaSettings.Empty;
         }
@@ -120,10 +128,11 @@ public static class SettingsLoader
             Theme = userSettings.Theme,
             ToolDisplayMode = userSettings.ToolDisplayMode,
             EffortByModel = effortByModel,
+            HttpHookAllowlist = httpHookAllowlist,
         };
     }
 
-    private static CodaSettings TryLoadFile(string filePath)
+    private static CodaSettings TryLoadFile(string filePath, ILogger? logger = null)
     {
         if (!File.Exists(filePath))
         {
@@ -137,7 +146,7 @@ public static class SettingsLoader
 
             var allow = doc?.Permissions?.Allow ?? [];
             var deny = doc?.Permissions?.Deny ?? [];
-            var hooks = ParseHooks(doc?.Hooks);
+            var hooks = ParseHooks(doc?.Hooks, logger);
 
             // Parse lspServers from the raw JSON node to handle JsonNode? fields correctly.
             var lspServers = ParseLspServers(json);
@@ -153,6 +162,7 @@ public static class SettingsLoader
                 Theme = NullIfBlank(doc?.Theme),
                 ToolDisplayMode = MigrateDisplayMode(doc?.ToolDisplayMode),
                 EffortByModel = ParseEffortByModel(doc?.EffortByModel),
+                HttpHookAllowlist = ParseHttpHookAllowlist(doc?.HttpHookAllowlist),
             };
         }
         catch (Exception ex) when (ex is JsonException or IOException)
@@ -161,7 +171,7 @@ public static class SettingsLoader
         }
     }
 
-    private static List<UserHook> ParseHooks(Dictionary<string, List<HookEntry>>? section)
+    private static List<UserHook> ParseHooks(Dictionary<string, List<HookEntry>>? section, ILogger? logger = null)
     {
         if (section is null)
         {
@@ -171,13 +181,13 @@ public static class SettingsLoader
         var hooks = new List<UserHook>();
         foreach (var (eventName, entries) in section)
         {
-            AddHooksForEvent(hooks, eventName, entries);
+            AddHooksForEvent(hooks, eventName, entries, logger);
         }
 
         return hooks;
     }
 
-    private static void AddHooksForEvent(List<UserHook> target, string eventName, List<HookEntry>? entries)
+    private static void AddHooksForEvent(List<UserHook> target, string eventName, List<HookEntry>? entries, ILogger? logger = null)
     {
         if (entries is null)
         {
@@ -186,12 +196,126 @@ public static class SettingsLoader
 
         foreach (var entry in entries)
         {
-            if (string.IsNullOrWhiteSpace(entry.Command))
+            var handlerType = DetermineHandlerType(entry, eventName, logger);
+            if (!IsValidEntry(entry, handlerType, eventName, logger))
             {
                 continue;
             }
 
-            target.Add(new UserHook(eventName, entry.Command, entry.Matcher, entry.TimeoutSeconds, entry.FailOpen, entry.UnattendedDecision, entry.AllowSystemPromptReplace, entry.Mutates?.AsReadOnly()));
+            target.Add(new UserHook(
+                eventName,
+                entry.Command,
+                entry.Matcher,
+                entry.TimeoutSeconds,
+                entry.FailOpen,
+                entry.UnattendedDecision,
+                entry.AllowSystemPromptReplace,
+                entry.Mutates?.AsReadOnly(),
+                HandlerType: handlerType,
+                Url: entry.Url,
+                HookPrompt: entry.Prompt,
+                AgentType: entry.Agent));
+        }
+    }
+
+    /// <summary>
+    /// Determines the effective handler type for a <see cref="HookEntry"/>:
+    /// uses the explicit <c>type</c> field when present; otherwise infers <c>"command"</c>
+    /// when <c>command</c> is set; returns empty string when neither is usable.
+    /// </summary>
+    /// <remarks>
+    /// When <c>type</c> is set to an unrecognised value (e.g. a typo) but <c>command</c>
+    /// is also present, the method falls back to <c>"command"</c> with a warning so that a
+    /// previously-working shell hook is not silently dropped on an upgrade.
+    /// </remarks>
+    private static string DetermineHandlerType(HookEntry entry, string eventName, ILogger? logger)
+    {
+        if (string.IsNullOrWhiteSpace(entry.Type))
+        {
+            return !string.IsNullOrWhiteSpace(entry.Command) ? "command" : string.Empty;
+        }
+
+        var type = entry.Type.Trim().ToLowerInvariant();
+        if (KnownHandlerTypes.Contains(type))
+        {
+            return type;
+        }
+
+        // Unknown type: fall back to command when available so a typo or legacy value
+        // doesn't silently delete a security hook the operator relies on.
+        if (!string.IsNullOrWhiteSpace(entry.Command))
+        {
+            logger?.LogWarning(
+                "hooks.{Event}: unrecognised type '{Type}'; falling back to 'command' because 'command' is also present",
+                eventName,
+                entry.Type);
+            return "command";
+        }
+
+        // Unknown type, no command to fall back to — IsValidEntry will log and skip.
+        return type;
+    }
+
+    private static readonly HashSet<string> KnownHandlerTypes =
+        new(["command", "http", "prompt", "agent"], StringComparer.Ordinal);
+
+    /// <summary>
+    /// Returns <see langword="true"/> when the entry has all required fields for its handler type.
+    /// Logs a warning and returns <see langword="false"/> for unusable entries.
+    /// </summary>
+    private static bool IsValidEntry(HookEntry entry, string handlerType, string eventName, ILogger? logger)
+    {
+        switch (handlerType)
+        {
+            case "command":
+                if (!string.IsNullOrWhiteSpace(entry.Command))
+                {
+                    return true;
+                }
+
+                logger?.LogWarning(
+                    "hooks.{Event}: entry has type 'command' but no 'command' field — skipping",
+                    eventName);
+                return false;
+
+            case "http":
+                if (!string.IsNullOrWhiteSpace(entry.Url))
+                {
+                    return true;
+                }
+
+                logger?.LogWarning(
+                    "hooks.{Event}: entry has type 'http' but no 'url' field — skipping",
+                    eventName);
+                return false;
+
+            case "prompt":
+                if (!string.IsNullOrWhiteSpace(entry.Prompt))
+                {
+                    return true;
+                }
+
+                logger?.LogWarning(
+                    "hooks.{Event}: entry has type 'prompt' but no 'prompt' field — skipping",
+                    eventName);
+                return false;
+
+            case "agent":
+                if (!string.IsNullOrWhiteSpace(entry.Prompt))
+                {
+                    return true;
+                }
+
+                logger?.LogWarning(
+                    "hooks.{Event}: entry has type 'agent' but no 'prompt' field — skipping",
+                    eventName);
+                return false;
+
+            default:
+                logger?.LogWarning(
+                    "hooks.{Event}: entry has no usable handler configuration (no 'command', 'url', or 'prompt') — skipping",
+                    eventName);
+                return false;
         }
     }
 
@@ -357,6 +481,62 @@ public static class SettingsLoader
         return merged;
     }
 
+    private static readonly IReadOnlyList<string> emptyAllowlist = [];
+
+    /// <summary>Parses the <c>httpHookAllowlist</c> array, dropping blank entries.</summary>
+    private static IReadOnlyList<string> ParseHttpHookAllowlist(List<string>? raw)
+    {
+        if (raw is not { Count: > 0 })
+        {
+            return emptyAllowlist;
+        }
+
+        var result = new List<string>(raw.Count);
+        foreach (var host in raw)
+        {
+            var trimmed = host?.Trim();
+            if (!string.IsNullOrEmpty(trimmed))
+            {
+                result.Add(trimmed);
+            }
+        }
+
+        return result.Count > 0 ? result.AsReadOnly() : emptyAllowlist;
+    }
+
+    /// <summary>
+    /// Merges http hook allowlists: union of user and project lists (deduplicated, case-insensitive).
+    /// </summary>
+    private static IReadOnlyList<string> MergeHttpHookAllowlist(
+        IReadOnlyList<string> user, IReadOnlyList<string> project)
+    {
+        if (user.Count == 0 && project.Count == 0)
+        {
+            return emptyAllowlist;
+        }
+
+        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var result = new List<string>(user.Count + project.Count);
+
+        foreach (var host in user)
+        {
+            if (!string.IsNullOrWhiteSpace(host) && seen.Add(host.Trim()))
+            {
+                result.Add(host.Trim());
+            }
+        }
+
+        foreach (var host in project)
+        {
+            if (!string.IsNullOrWhiteSpace(host) && seen.Add(host.Trim()))
+            {
+                result.Add(host.Trim());
+            }
+        }
+
+        return result.Count > 0 ? result.AsReadOnly() : emptyAllowlist;
+    }
+
     private sealed class SettingsDocument
     {
         public PermissionsSection? Permissions { get; set; }
@@ -377,6 +557,8 @@ public static class SettingsLoader
         public string? ToolDisplayMode { get; set; }
         [JsonPropertyName("effortByModel")]
         public Dictionary<string, string>? EffortByModel { get; set; }
+        [JsonPropertyName("httpHookAllowlist")]
+        public List<string>? HttpHookAllowlist { get; set; }
     }
 
     private sealed class GoalSection
@@ -460,6 +642,18 @@ public static class SettingsLoader
     {
         public string? Command { get; set; }
         public string? Matcher { get; set; }
+
+        [JsonPropertyName("type")]
+        public string? Type { get; set; }
+
+        [JsonPropertyName("url")]
+        public string? Url { get; set; }
+
+        [JsonPropertyName("prompt")]
+        public string? Prompt { get; set; }
+
+        [JsonPropertyName("agent")]
+        public string? Agent { get; set; }
 
         [JsonPropertyName("timeoutSeconds")]
         public int? TimeoutSeconds { get; set; }

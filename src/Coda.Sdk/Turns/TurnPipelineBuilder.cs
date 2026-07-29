@@ -123,8 +123,13 @@ public sealed class TurnPipelineBuilder
         var hookContext = new HookContext(
             SessionId: this.tasks.SessionId,
             Cwd: agentOptions.WorkingDirectory);
+        var (httpHandler, promptHandler, agentHandler) = settings.Hooks.Count > 0
+            ? this.BuildHookHandlers(client, settings, options, agentOptions, permissions, includeAnthropicSystemPrefix)
+            : default;
         var userHooks = settings.Hooks.Count > 0
-            ? new UserHookRunner(settings.Hooks, context: hookContext)
+            ? new UserHookRunner(settings.Hooks, context: hookContext,
+                logger: this.loggerFactory.CreateLogger("Coda.Hooks"),
+                httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler)
             : null;
 
         var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks);
@@ -266,7 +271,14 @@ public sealed class TurnPipelineBuilder
         var hookContext = new HookContext(
             SessionId: this.tasks.SessionId,
             Cwd: agentOptions.WorkingDirectory);
-        var userHooks = settings.Hooks.Count > 0 ? new UserHookRunner(settings.Hooks, context: hookContext) : null;
+        var (httpHandler, promptHandler, agentHandler) = settings.Hooks.Count > 0
+            ? this.BuildHookHandlers(client, settings, options, agentOptions, permissions, includeAnthropicSystemPrefix)
+            : default;
+        var userHooks = settings.Hooks.Count > 0
+            ? new UserHookRunner(settings.Hooks, context: hookContext,
+                logger: this.loggerFactory.CreateLogger("Coda.Hooks"),
+                httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler)
+            : null;
 
         // A normal child host so the scheduled root (depth 1) can create depth-2 children; depth-3
         // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
@@ -447,6 +459,51 @@ public sealed class TurnPipelineBuilder
     {
         var subagentTools = StripSkillTool([.. BuiltInTools.All(), .. options.ExtraTools]);
         return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks);
+    }
+
+    /// <summary>
+    /// Builds the three handler instances (<c>http</c>, <c>prompt</c>, <c>agent</c>) used by
+    /// the session's <see cref="UserHookRunner"/>. Each handler is bound to the current
+    /// turn's resolved client and settings.
+    /// </summary>
+    /// <remarks>
+    /// Security invariants enforced here by construction:
+    /// <list type="bullet">
+    ///   <item>The <c>http</c> handler owns a non-redirecting <see cref="System.Net.Http.HttpClient"/>
+    ///     (passed as <see langword="null"/> so <see cref="HttpHookHandler"/> creates the safe default).
+    ///     </item>
+    ///   <item>The <c>agent</c> handler's <see cref="SubagentHost"/> is constructed with
+    ///     <c>userHooks: null</c> so hook-spawned subagents are structurally hook-free and
+    ///     recursive hook firing is impossible by construction, not by assertion.</item>
+    /// </list>
+    /// </remarks>
+    private (IHookHandler http, IHookHandler prompt, IHookHandler agent) BuildHookHandlers(
+        ILlmClient client,
+        CodaSettings settings,
+        SessionOptions options,
+        AgentOptions agentOptions,
+        IPermissionPrompt permissions,
+        bool includeAnthropicSystemPrefix)
+    {
+        var httpHandler = new HttpHookHandler(
+            httpClient: null, // non-redirecting default
+            settings.HttpHookAllowlist,
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Http"));
+
+        var promptHandler = new PromptHookHandler(
+            new ForkedAgentRunner(client, options.Model),
+            logger: this.loggerFactory.CreateLogger("Coda.Hooks.Prompt"));
+
+        // Hook-free by construction: userHooks: null prevents recursive hook firing inside
+        // hook-spawned subagents.
+        var hookFreeHost = BuildSubagentHost(
+            options, client, agentOptions, permissions, includeAnthropicSystemPrefix,
+            userHooks: null, this.tasks);
+        var agentHandler = new AgentHookHandler(
+            hookFreeHost,
+            this.loggerFactory.CreateLogger("Coda.Hooks.Agent"));
+
+        return (httpHandler, promptHandler, agentHandler);
     }
 
     /// <summary>

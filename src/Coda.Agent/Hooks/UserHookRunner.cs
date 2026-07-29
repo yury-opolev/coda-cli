@@ -44,11 +44,17 @@ public sealed class UserHookRunner
     /// (backward-compatible with callers that do not supply a context).
     /// </param>
     /// <param name="logger">Logger forwarded to the underlying <see cref="HookBus"/>.</param>
+    /// <param name="httpHandler">Optional handler for <c>http</c>-type hooks.</param>
+    /// <param name="promptHandler">Optional handler for <c>prompt</c>-type hooks.</param>
+    /// <param name="agentHandler">Optional handler for <c>agent</c>-type hooks.</param>
     public UserHookRunner(
         IReadOnlyList<UserHook> hooks,
         Func<string, string, CancellationToken, Task<(int exitCode, string stdout)>>? execOverride = null,
         HookContext? context = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        IHookHandler? httpHandler = null,
+        IHookHandler? promptHandler = null,
+        IHookHandler? agentHandler = null)
     {
         ArgumentNullException.ThrowIfNull(hooks);
 
@@ -56,7 +62,8 @@ public sealed class UserHookRunner
             ? new LegacyExecAdapter(execOverride)
             : new ShellHookExecutor();
 
-        this.bus = new HookBus(hooks, executor, context, logger: logger);
+        this.bus = new HookBus(hooks, executor, context, logger: logger,
+            httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler);
     }
 
     /// <summary>
@@ -67,11 +74,15 @@ public sealed class UserHookRunner
         IReadOnlyList<UserHook> hooks,
         IHookExecutor executor,
         HookContext? context = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        IHookHandler? httpHandler = null,
+        IHookHandler? promptHandler = null,
+        IHookHandler? agentHandler = null)
     {
         ArgumentNullException.ThrowIfNull(hooks);
         ArgumentNullException.ThrowIfNull(executor);
-        this.bus = new HookBus(hooks, executor, context, logger: logger);
+        this.bus = new HookBus(hooks, executor, context, logger: logger,
+            httpHandler: httpHandler, promptHandler: promptHandler, agentHandler: agentHandler);
     }
 
     /// <summary>True when at least one <c>PreToolUse</c> hook is configured.</summary>
@@ -340,6 +351,9 @@ public sealed class UserHookRunner
     // -------------------------------------------------------------------------
     // Legacy 2-tuple exec adapter
     // -------------------------------------------------------------------------
+
+    /// <summary>Exposed for testing: the underlying hook bus.</summary>
+    internal HookBus BusForTest => this.bus;
 
     /// <summary>
     /// Adapts the legacy <c>(exitCode, stdout)</c> test-override delegate to the
