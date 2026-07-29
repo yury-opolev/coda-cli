@@ -16,19 +16,27 @@ public static partial class SkillLoader
     private static partial void LogBothExclusionsSet(ILogger logger, string skillName);
 
     /// <summary>
-    /// Loads skills from the Claude CLI (~/.claude/skills, read-only), user-level
-    /// (~/.coda/skills), plugin skill directories, and project-level (.coda/skills in
+    /// Loads skills from foreign ecosystem paths (<c>.agents/skills/</c>, <c>~/.claude/agents/</c>,
+    /// <c>~/.claude/commands/</c>, read-only), the Claude CLI (~/.claude/skills, read-only),
+    /// user-level (~/.coda/skills), plugin skill directories, and project-level (.coda/skills in
     /// <paramref name="workingDirectory"/>). Precedence (lowest to highest):
-    /// Claude &lt; user &lt; plugins &lt; project — later entries override by name, so Coda's
-    /// own skills always win. Missing directories are tolerated; malformed files are
+    /// foreign &lt; Claude &lt; user &lt; plugins &lt; project — later entries override by name, so
+    /// Coda's own skills always win. Missing directories are tolerated; malformed files are
     /// skipped or defaulted gracefully.
     /// </summary>
+    /// <param name="foreignSkillsDirs">
+    /// Overrides the foreign ecosystem directories scanned at lowest precedence (for testing).
+    /// When <see langword="null"/> the standard set is used: <c>&lt;workingDirectory&gt;/.agents/skills</c>,
+    /// <c>&lt;claudeBase&gt;/agents</c>, and <c>&lt;claudeBase&gt;/commands</c> (where <c>claudeBase</c> is the
+    /// parent of the resolved Claude skills directory). Pass an empty list to opt out entirely.
+    /// </param>
     public static IReadOnlyList<SkillDefinition> Load(
         string workingDirectory,
         string? userSkillsDir = null,
         string? claudeSkillsDir = null,
         ILogger? logger = null,
-        Coda.Tui.Plugins.PluginStateStore? pluginStateStore = null)
+        Coda.Tui.Plugins.PluginStateStore? pluginStateStore = null,
+        IReadOnlyList<string>? foreignSkillsDirs = null)
     {
         var userBase = userSkillsDir
             ?? Environment.GetEnvironmentVariable("CODA_USER_SKILLS_DIR")
@@ -47,10 +55,27 @@ public static partial class SkillLoader
         var userSkillsPath = Path.Combine(userBase, "skills");
         var projectSkillsPath = Path.Combine(workingDirectory, RelativeSkillsPath);
 
-        // Precedence: Claude < user < plugins < project (each level overrides the previous by name).
+        // Foreign ecosystem directories (lowest precedence, read-only). The Claude agents/commands
+        // dirs are siblings of the Claude skills dir, so honoring the CODA_CLAUDE_SKILLS_DIR override
+        // (its parent) keeps them isolated in tests.
+        var foreignDirs = foreignSkillsDirs ?? DefaultForeignSkillsDirs(workingDirectory, claudeSkillsPath);
+
+        // Precedence: foreign < Claude < user < plugins < project (each level overrides the previous by name).
         var byName = new Dictionary<string, SkillDefinition>(StringComparer.OrdinalIgnoreCase);
 
-        // 0. Claude CLI skills (lowest precedence, read-only).
+        // -1. Foreign ecosystem skills (lowest precedence, read-only).
+        //     a. <cwd>/.agents/skills/ — project-level foreign (per-directory SKILL.md convention).
+        //     b. ~/.claude/agents/     — subagent defs (read as skills).
+        //     c. ~/.claude/commands/   — command defs (read as skills).
+        foreach (var foreignDir in foreignDirs)
+        {
+            foreach (var skill in LoadForeignFromDirectory(foreignDir, logger))
+            {
+                byName[skill.Name] = skill;
+            }
+        }
+
+        // 0. Claude CLI skills (read-only).
         foreach (var skill in LoadFromDirectory(claudeSkillsPath, SkillOrigin.Claude, logger))
         {
             byName[skill.Name] = skill;
@@ -79,6 +104,96 @@ public static partial class SkillLoader
         }
 
         return [.. byName.Values.OrderBy(s => s.Name, StringComparer.OrdinalIgnoreCase)];
+    }
+
+    private static IReadOnlyList<string> DefaultForeignSkillsDirs(string workingDirectory, string claudeSkillsPath)
+    {
+        var dirs = new List<string>(3)
+        {
+            Path.Combine(workingDirectory, ".agents", "skills"),
+        };
+
+        // The Claude agents/commands directories are siblings of the Claude skills directory.
+        var claudeBase = Path.GetDirectoryName(claudeSkillsPath);
+        if (!string.IsNullOrEmpty(claudeBase))
+        {
+            dirs.Add(Path.Combine(claudeBase, "agents"));
+            dirs.Add(Path.Combine(claudeBase, "commands"));
+        }
+
+        return dirs;
+    }
+
+    /// <summary>
+    /// Loads skills from a foreign ecosystem directory, tolerating both conventions: a
+    /// per-directory <c>&lt;name&gt;/SKILL.md</c> layout (as in <c>.agents/skills/</c>) and flat
+    /// <c>&lt;name&gt;.md</c> files (as in <c>~/.claude/agents/</c> and <c>~/.claude/commands/</c>).
+    /// Every returned skill carries <see cref="SkillOrigin.Foreign"/>.
+    /// </summary>
+    private static IEnumerable<SkillDefinition> LoadForeignFromDirectory(string root, ILogger? logger)
+    {
+        if (!Directory.Exists(root))
+        {
+            yield break;
+        }
+
+        // Per-directory SKILL.md layout.
+        foreach (var subDir in Directory.EnumerateDirectories(root))
+        {
+            var skillFile = Path.Combine(subDir, SkillFileName);
+            var skill = TryLoadForeignFile(skillFile, Path.GetFileName(subDir), logger);
+            if (skill is not null)
+            {
+                yield return skill;
+            }
+        }
+
+        // Flat *.md files (foreign agent/command definitions).
+        foreach (var mdFile in Directory.EnumerateFiles(root, "*.md"))
+        {
+            if (string.Equals(Path.GetFileName(mdFile), SkillFileName, StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            var skill = TryLoadForeignFile(mdFile, Path.GetFileNameWithoutExtension(mdFile), logger);
+            if (skill is not null)
+            {
+                yield return skill;
+            }
+        }
+    }
+
+    private static SkillDefinition? TryLoadForeignFile(string file, string fallbackName, ILogger? logger)
+    {
+        try
+        {
+            var fullPath = Path.GetFullPath(file);
+            if (!File.Exists(fullPath))
+            {
+                return null;
+            }
+
+            var content = File.ReadAllText(fullPath);
+            var skill = ParseSkillFile(content, fallbackName, fullPath, SkillOrigin.Foreign);
+
+            // A foreign skill with both exclusions unreachable is restored to user-invocable.
+            if (skill.DisableModelInvocation && !skill.UserInvocable)
+            {
+                skill = skill with { UserInvocable = true };
+            }
+
+            return skill;
+        }
+        catch (Exception ex)
+        {
+            if (logger is not null)
+            {
+                LogSkillSkipped(logger, file, ex);
+            }
+
+            return null;
+        }
     }
 
     private static IEnumerable<SkillDefinition> LoadFromDirectory(

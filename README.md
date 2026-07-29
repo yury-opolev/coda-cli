@@ -98,6 +98,7 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   **safety classifier** that vets actions in bypass mode, and an autonomous **goal
   loop** that keeps working until a judge says the goal is met. Plus automatic
   history **compaction**, output-style personas, and a plugin/skills marketplace.
+  See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for authoring skills and plugins.
 - **Programmatic & embeddable** — `coda serve` exposes the agent over JSON-RPC
   (bidirectional: it streams progress and can ask the caller permission/clarification
   questions), over stdio or an **API-key-authenticated local named pipe/Unix socket**; or embed the
@@ -855,7 +856,10 @@ back to `"summary"`.
 (including `~/.claude/CLAUDE.md`), `<project>/.mcp.json` MCP server config, and
 `~/.claude/skills/` (lowest precedence — your `~/.coda/skills` and project skills
 override by name). Override the skill source dirs with `CODA_CLAUDE_SKILLS_DIR` /
-`CODA_USER_SKILLS_DIR` (point at a missing path to opt out).
+`CODA_USER_SKILLS_DIR` (point at a missing path to opt out). Coda also reads foreign
+`.agents/skills/`, `~/.claude/agents/`, `~/.claude/commands/`, and `.claude-plugin/plugin.json`
+sources read-only. See [`docs/skills-and-plugins.md`](docs/skills-and-plugins.md) for the full
+authoring reference.
 
 > **Credential migration:** credentials previously lived under `%APPDATA%\LlmAuth`
 > (Windows) / `~/.config/LlmAuth` (other OS). On first run after upgrading, Coda

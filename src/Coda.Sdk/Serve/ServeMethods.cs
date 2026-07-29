@@ -57,4 +57,9 @@ public static class ServeMethods
     public const string HookList = "hooks/list";
     public const string HookInfo = "hooks/info";
     public const string HookTrust = "hooks/trust";
+
+    // Skills / plugins management (orchestrator → Coda)
+    public const string SkillList = "skills/list";
+    public const string PluginList = "plugins/list";
+    public const string SkillTrust = "skills/trust";
 }

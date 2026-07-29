@@ -3,6 +3,9 @@ namespace Coda.Tui.Skills;
 /// <summary>The source layer from which a skill was loaded, in ascending precedence order.</summary>
 public enum SkillOrigin
 {
+    /// <summary>Loaded from a foreign ecosystem path (.agents/skills/, .claude/agents/, etc.), read-only.</summary>
+    Foreign,
+
     /// <summary>Loaded from the Claude CLI's skill directory (<c>~/.claude/skills</c>), read-only.</summary>
     Claude,
 

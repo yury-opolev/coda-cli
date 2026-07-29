@@ -290,19 +290,20 @@ public static class PluginComponentComposer
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Determines whether <paramref name="plugin"/> is installed inside the project's
-    /// <c>.coda/plugins/</c> directory (project-scoped) or elsewhere (user-scoped).
+    /// Determines whether <paramref name="plugin"/> is installed inside the current workspace
+    /// directory (project-scoped) or outside it (user-scoped).  Any plugin whose canonical
+    /// directory path begins with the workspace root is treated as project-scoped — this
+    /// includes <c>.coda/plugins/</c> subdirectories and foreign manifests such as
+    /// <c>.claude-plugin/</c> that arrive with a <c>git clone</c>.
     /// </summary>
     public static bool IsProjectPlugin(PluginInfo plugin, string workingDirectory) =>
         IsProjectScoped(plugin, workingDirectory);
 
     private static bool IsProjectScoped(PluginInfo plugin, string workingDirectory)
     {
-        var projectPluginsPath = Path.GetFullPath(
-            Path.Combine(workingDirectory, ".coda", "plugins"))
-            + Path.DirectorySeparatorChar;
+        var workspacePath = Path.GetFullPath(workingDirectory) + Path.DirectorySeparatorChar;
         var pluginDir = Path.GetFullPath(plugin.Directory) + Path.DirectorySeparatorChar;
-        return pluginDir.StartsWith(projectPluginsPath, StringComparison.OrdinalIgnoreCase);
+        return pluginDir.StartsWith(workspacePath, StringComparison.OrdinalIgnoreCase);
     }
 
     /// <summary>

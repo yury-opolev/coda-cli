@@ -14,4 +14,8 @@ public sealed record PluginInfo(string Name, string Version, string Description,
     /// the three legacy fields (<c>name</c>, <c>version</c>, <c>description</c>).
     /// </summary>
     public PluginManifest? Manifest { get; init; }
+
+    /// <summary>When true, this plugin was loaded from a foreign-ecosystem manifest location
+    /// (.claude-plugin/plugin.json) rather than a Coda-native plugins directory.</summary>
+    public bool IsExternal { get; init; }
 }

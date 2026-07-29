@@ -116,32 +116,33 @@ public sealed class PluginPhase4ReviewFixTests : IDisposable
     }
 
     // =========================================================================
-    // M3 — DetermineScope: sibling directory must not be classified as Project
+    // M3 — DetermineScope: scope is determined by workspace containment
     // =========================================================================
 
     [Fact]
-    public void PluginHookLoader_sibling_plugins_dir_not_classified_as_project_scope()
+    public void PluginHookLoader_any_dir_inside_workspace_is_project_scope()
     {
-        // Create a sibling directory named ".coda/pluginsX" (note the extra 'X').
-        // Without trailing-separator fix, ".coda/pluginsX" would match ".coda/plugins" via
-        // StartsWith — yielding Project scope when the plugin is actually User-scoped.
+        // Phase 8 C1 fix: scope is now based on whether the plugin directory is anywhere
+        // inside the workspace root — not just under .coda/plugins/.  A plugin in
+        // ".coda/pluginsX" (a non-conventional subdirectory) arrived with the repo and
+        // therefore requires workspace trust, so it is Project-scoped.
         var projectDir = Path.Combine(this.tempDir, "myproject");
         Directory.CreateDirectory(projectDir);
 
-        // The sibling (evil) directory: <projectDir>/.coda/pluginsX/evil-plugin
+        // Any subdirectory inside the workspace root — including non-conventional ones.
         var siblingPluginDir = Directory.CreateDirectory(
-            Path.Combine(projectDir, ".coda", "pluginsX", "evil-plugin")).FullName;
+            Path.Combine(projectDir, ".coda", "pluginsX", "any-plugin")).FullName;
 
         var hookFile = Path.Combine(siblingPluginDir, "hooks.json");
         File.WriteAllText(hookFile, """{"PreToolUse":[{"command":"./hook.sh"}]}""");
 
         var manifest = new PluginManifest
         {
-            Name = "evil-plugin",
+            Name = "any-plugin",
             Version = "1.0.0",
             Hooks = ["hooks.json"],
         };
-        var plugin = new PluginInfo("evil-plugin", "1.0.0", "Evil", siblingPluginDir)
+        var plugin = new PluginInfo("any-plugin", "1.0.0", "Any", siblingPluginDir)
         {
             IsEnabled = true,
             Manifest = manifest,
@@ -150,8 +151,33 @@ public sealed class PluginPhase4ReviewFixTests : IDisposable
         var hooks = PluginHookLoader.Load(plugin, workingDirectory: projectDir);
 
         Assert.Single(hooks);
-        // Must be User-scoped, NOT Project, because the plugin is in ".coda/pluginsX"
-        // (a sibling dir), not ".coda/plugins".
+        // Must be Project-scoped because the plugin directory is inside the workspace root.
+        Assert.Equal(HookScope.Project, hooks[0].Scope);
+    }
+
+    [Fact]
+    public void PluginHookLoader_plugin_outside_workspace_root_is_user_scope()
+    {
+        // A plugin whose directory is completely outside the workspace root (e.g. installed in
+        // ~/.coda/plugins/) must remain User-scoped.
+        var workspaceDir = Path.Combine(this.tempDir, "workspace");
+        Directory.CreateDirectory(workspaceDir);
+        var userPluginDir = Directory.CreateDirectory(
+            Path.Combine(this.tempDir, "home", ".coda", "plugins", "user-plugin")).FullName;
+
+        var hookFile = Path.Combine(userPluginDir, "hooks.json");
+        File.WriteAllText(hookFile, """{"UserPromptSubmit":[{"command":"./check.sh"}]}""");
+
+        var manifest = new PluginManifest { Name = "user-plugin", Version = "1.0.0", Hooks = ["hooks.json"] };
+        var plugin = new PluginInfo("user-plugin", "1.0.0", "User", userPluginDir)
+        {
+            IsEnabled = true,
+            Manifest = manifest,
+        };
+
+        var hooks = PluginHookLoader.Load(plugin, workingDirectory: workspaceDir);
+
+        Assert.Single(hooks);
         Assert.Equal(HookScope.User, hooks[0].Scope);
     }
 

@@ -43,7 +43,7 @@ public sealed class PluginCommand : ISlashCommand
     public string Summary => "Manage plugins: install, remove, enable, disable, update, prune";
 
     public CommandHelp Help => new(
-        Usage: "/plugin [list | info <name> | install <source> | remove <name> | enable <name> | disable <name> | update <name> | prune | approve <name>]",
+        Usage: "/plugin [list | info <name> | install <source> | remove <name> | enable <name> | disable <name> | update <name> | prune | approve <name> | validate <path> | new <name>]",
         Description: "Manages plugins. Without a subcommand (or with 'list'), lists installed plugins. " +
             "'info' shows detailed information about a plugin including components and trust state. " +
             "'install' accepts a local directory path or a git URL (http/https/git@). " +
@@ -51,7 +51,9 @@ public sealed class PluginCommand : ISlashCommand
             "'enable'/'disable' toggle whether a plugin is active. " +
             "'update' fetches the latest version of a git-installed plugin. " +
             "'prune' reports dependency-only plugins that are no longer required. " +
-            "'approve' re-runs the per-class approval prompt for an already-installed plugin.",
+            "'approve' re-runs the per-class approval prompt for an already-installed plugin. " +
+            "'validate' parses and checks a plugin manifest. " +
+            "'new' scaffolds a new plugin directory.",
         Options:
         [
             ("list", "List all installed plugins (default when no subcommand is given)."),
@@ -63,6 +65,8 @@ public sealed class PluginCommand : ISlashCommand
             ("update <name>", "Update a git-installed plugin to the latest version."),
             ("prune", "List dependency-only plugins that are no longer required by anything."),
             ("approve <name>", "Re-run the per-class approval prompt for a plugin installed with withheld components."),
+            ("validate <path>", "Parse and validate the plugin.json at <path> (or <path>/.claude-plugin/plugin.json)."),
+            ("new <name>", "Scaffold a new plugin at <cwd>/.coda/plugins/<name>/plugin.json."),
         ],
         Examples:
         [
@@ -77,6 +81,8 @@ public sealed class PluginCommand : ISlashCommand
             "/plugin update my-plugin",
             "/plugin prune",
             "/plugin approve my-plugin",
+            "/plugin validate ./my-plugin",
+            "/plugin new my-plugin",
         ]);
 
     public async Task<CommandResult> ExecuteAsync(
@@ -168,9 +174,25 @@ public sealed class PluginCommand : ISlashCommand
                 }
                 return await this.ExecuteApproveAsync(context, args[1], cancellationToken).ConfigureAwait(false);
 
+            case "validate":
+                if (args.Count < 2)
+                {
+                    context.Console.MarkupLine(Theme.WarnMarkup("Usage: /plugin validate <path>"));
+                    return CommandResult.Continue;
+                }
+                return ExecuteValidate(context, args[1]);
+
+            case "new":
+                if (args.Count < 2)
+                {
+                    context.Console.MarkupLine(Theme.WarnMarkup("Usage: /plugin new <name>"));
+                    return CommandResult.Continue;
+                }
+                return ExecuteNew(context, args[1]);
+
             default:
                 context.Console.MarkupLine(Theme.WarnMarkup(
-                    $"Unknown subcommand '{subcommand}'. Usage: /plugin [list|info|install|remove|enable|disable|update|prune|approve]"));
+                    $"Unknown subcommand '{subcommand}'. Usage: /plugin [list|info|install|remove|enable|disable|update|prune|approve|validate|new]"));
                 return CommandResult.Continue;
         }
     }
@@ -378,7 +400,7 @@ public sealed class PluginCommand : ISlashCommand
         var stateStore = this.ResolveStateStore(context);
         var installInfo = stateStore?.GetInstalledInfo(plugin.Name);
         var trustStore = this.ResolveTrustStore();
-        var hash = PluginContentHash.Compute(plugin.Name, plugin.Version);
+        var hash = PluginContentHash.Compute(plugin);
         var approvedClasses = trustStore.GetApprovedClasses(hash);
 
         context.Console.MarkupLine(Theme.BoldMarkup(plugin.Name));
@@ -687,6 +709,129 @@ public sealed class PluginCommand : ISlashCommand
         var inventory = PluginInventory.FromManifest(manifest, pluginDir);
 
         await this.RecordApprovalAsync(context, name, hash, inventory, ct).ConfigureAwait(false);
+        return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// Parses and validates a plugin manifest at <paramref name="inputPath"/>, which may be a
+    /// <c>plugin.json</c> file, a Coda plugin directory (containing <c>plugin.json</c>), or a foreign
+    /// plugin directory (containing <c>.claude-plugin/plugin.json</c>).
+    /// </summary>
+    private static CommandResult ExecuteValidate(CommandContext context, string inputPath)
+    {
+        var manifestPath = ResolveManifestPath(inputPath);
+        if (manifestPath is null)
+        {
+            context.Console.MarkupLine(Theme.ErrorMarkup(
+                $"No plugin.json found at '{inputPath}' (looked for plugin.json and .claude-plugin/plugin.json)."));
+            return CommandResult.Continue;
+        }
+
+        string json;
+        try
+        {
+            json = File.ReadAllText(manifestPath);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            context.Console.MarkupLine(Theme.ErrorMarkup($"Cannot read manifest: {ex.Message}"));
+            return CommandResult.Continue;
+        }
+
+        context.Console.MarkupLine(Theme.BoldMarkup($"Validating {manifestPath}"));
+        var grid = new Grid().AddColumn().AddColumn();
+
+        try
+        {
+            var manifest = PluginManifestParser.Parse(json, Path.GetDirectoryName(manifestPath)!);
+            grid.AddRow(Theme.DimMarkup("name"), Theme.AccentMarkup(manifest.Name));
+            grid.AddRow(Theme.DimMarkup("version"), $"v{manifest.Version}");
+            if (!string.IsNullOrWhiteSpace(manifest.Description))
+            {
+                grid.AddRow(Theme.DimMarkup("description"), manifest.Description);
+            }
+
+            var inventory = PluginInventory.FromManifest(manifest, Path.GetDirectoryName(manifestPath)!);
+            grid.AddRow(Theme.DimMarkup("components"), inventory.IsEmpty ? "(none)" : inventory.ToDisplayString());
+            grid.AddRow(Theme.DimMarkup("problems"), Theme.SuccessMarkup("none"));
+            context.Console.Write(grid);
+        }
+        catch (PluginManifestPathException ex)
+        {
+            grid.AddRow(Theme.DimMarkup("problems"), Theme.ErrorMarkup($"path containment: {ex.Message}"));
+            context.Console.Write(grid);
+        }
+        catch (PluginManifestParseException ex)
+        {
+            grid.AddRow(Theme.DimMarkup("problems"), Theme.WarnMarkup(ex.Message));
+            context.Console.Write(grid);
+        }
+
+        context.Console.WriteLine();
+        return CommandResult.Continue;
+    }
+
+    private static string? ResolveManifestPath(string inputPath)
+    {
+        if (File.Exists(inputPath))
+        {
+            return inputPath;
+        }
+
+        if (Directory.Exists(inputPath))
+        {
+            var direct = Path.Combine(inputPath, "plugin.json");
+            if (File.Exists(direct))
+            {
+                return direct;
+            }
+
+            var foreign = Path.Combine(inputPath, ".claude-plugin", "plugin.json");
+            if (File.Exists(foreign))
+            {
+                return foreign;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>Scaffolds a new plugin at <c>&lt;cwd&gt;/.coda/plugins/&lt;name&gt;/plugin.json</c>.</summary>
+    private static CommandResult ExecuteNew(CommandContext context, string name)
+    {
+        if (!PluginInstaller.IsValidPluginName(name) || name.Contains("..", StringComparison.Ordinal))
+        {
+            context.Console.MarkupLine(Theme.ErrorMarkup(
+                $"Invalid plugin name '{name}': must not contain path separators, '..', or invalid characters."));
+            return CommandResult.Continue;
+        }
+
+        var pluginDir = Path.Combine(context.Session.WorkingDirectory, ".coda", "plugins", name);
+        if (Directory.Exists(pluginDir))
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup($"Plugin '{name}' already exists at {pluginDir}"));
+            return CommandResult.Continue;
+        }
+
+        try
+        {
+            Directory.CreateDirectory(pluginDir);
+            var manifestPath = Path.Combine(pluginDir, "plugin.json");
+            var nl = Environment.NewLine;
+            var template =
+                "{" + nl +
+                $"  \"name\": \"{name}\"," + nl +
+                "  \"version\": \"0.1.0\"," + nl +
+                "  \"description\": \"Describe your plugin here.\"" + nl +
+                "}" + nl;
+            File.WriteAllText(manifestPath, template);
+            context.Console.MarkupLine(Theme.SuccessMarkup($"Created {manifestPath}"));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            context.Console.MarkupLine(Theme.ErrorMarkup($"Failed to create plugin: {ex.Message}"));
+        }
+
         return CommandResult.Continue;
     }
 

@@ -46,8 +46,12 @@ public sealed class PluginHookTests : IDisposable
     [Fact]
     public void PluginHookLoader_user_installed_plugin_yields_user_scope()
     {
+        // A user-installed plugin lives outside the project workspace (e.g. in ~/.coda/plugins/).
+        // Use a separate "home" directory that is a sibling of (not inside) the workspace.
+        var workspaceDir = Directory.CreateDirectory(
+            Path.Combine(this.temp.Path, "workspace")).FullName;
         var userPluginsDir = Directory.CreateDirectory(
-            Path.Combine(this.temp.Path, "user", "plugins", "my-plugin")).FullName;
+            Path.Combine(this.temp.Path, "home", ".coda", "plugins", "my-plugin")).FullName;
 
         var hookFile = Path.Combine(userPluginsDir, "hooks.json");
         File.WriteAllText(hookFile,
@@ -60,8 +64,8 @@ public sealed class PluginHookTests : IDisposable
             Manifest = manifest,
         };
 
-        // Working directory different from user plugins dir → user scope.
-        var hooks = PluginHookLoader.Load(plugin, workingDirectory: this.temp.Path);
+        // Plugin is in sibling "home" tree, NOT inside workspaceDir → user scope.
+        var hooks = PluginHookLoader.Load(plugin, workingDirectory: workspaceDir);
 
         Assert.Single(hooks);
         Assert.Equal(HookScope.User, hooks[0].Scope);

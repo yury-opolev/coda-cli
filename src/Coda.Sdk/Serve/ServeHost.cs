@@ -24,6 +24,8 @@ public sealed class ServeHost : IAsyncDisposable
     private readonly Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory;
     private readonly string? expectedApiKey;
     private readonly Func<CodaSession, CancellationToken, Task> initializeSession;
+    private readonly Func<CodaSession, IReadOnlyList<ServeSkillInfo>>? skillsProvider;
+    private readonly Func<CodaSession, IReadOnlyList<ServePluginInfo>>? pluginsProvider;
     private volatile bool authenticated;
     private readonly TaskCompletionSource shutdownTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -61,8 +63,10 @@ public sealed class ServeHost : IAsyncDisposable
         Stream input,
         Stream output,
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
-        string? expectedApiKey = null)
-        : this(input, output, sessionFactory, expectedApiKey, initializeSession: null)
+        string? expectedApiKey = null,
+        Func<CodaSession, IReadOnlyList<ServeSkillInfo>>? skillsProvider = null,
+        Func<CodaSession, IReadOnlyList<ServePluginInfo>>? pluginsProvider = null)
+        : this(input, output, sessionFactory, expectedApiKey, initializeSession: null, skillsProvider, pluginsProvider)
     {
     }
 
@@ -71,12 +75,16 @@ public sealed class ServeHost : IAsyncDisposable
         Stream output,
         Func<IPermissionPrompt, IUserQuestionPrompt, IPlanApprover, CodaSession> sessionFactory,
         string? expectedApiKey,
-        Func<CodaSession, CancellationToken, Task>? initializeSession = null)
+        Func<CodaSession, CancellationToken, Task>? initializeSession,
+        Func<CodaSession, IReadOnlyList<ServeSkillInfo>>? skillsProvider = null,
+        Func<CodaSession, IReadOnlyList<ServePluginInfo>>? pluginsProvider = null)
     {
         this.input = input ?? throw new ArgumentNullException(nameof(input));
         this.output = output ?? throw new ArgumentNullException(nameof(output));
         this.sessionFactory = sessionFactory ?? throw new ArgumentNullException(nameof(sessionFactory));
         this.expectedApiKey = expectedApiKey;
+        this.skillsProvider = skillsProvider;
+        this.pluginsProvider = pluginsProvider;
         this.initializeSession = initializeSession ?? (static (session, cancellationToken) =>
             session.InitializeAsync(cancellationToken));
         this.authenticated = expectedApiKey is null; // stdio: no auth required.
@@ -835,6 +843,53 @@ public sealed class ServeHost : IAsyncDisposable
             var store = new Coda.Agent.Hooks.HookTrustStore();
             store.Trust(projectPath!, hookHash!);
             return ServeJson.ToNode(new { ok = true, projectPath, hookHash });
+        });
+
+        // skills/list → enumerate discovered skills (name, description, origin, enabled). The skill
+        // inventory is provided by a delegate injected from the TUI layer; when absent, returns empty.
+        conn.OnRequest(ServeMethods.SkillList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var skills = this.skillsProvider?.Invoke(sess) ?? [];
+            var dtos = skills.Select(s => new
+            {
+                name = s.Name,
+                description = s.Description,
+                origin = s.Origin,
+                enabled = s.Enabled,
+                userInvocable = s.UserInvocable,
+                sourcePath = s.SourcePath,
+                argumentHint = s.ArgumentHint,
+            }).ToArray();
+            return ServeJson.ToNode(new { skills = dtos });
+        });
+
+        // plugins/list → enumerate discovered plugins (name, version, enabled, trusted, isExternal).
+        conn.OnRequest(ServeMethods.PluginList, _ =>
+        {
+            this.EnsureAuthenticated();
+            var plugins = this.pluginsProvider?.Invoke(sess) ?? [];
+            var dtos = plugins.Select(p => new
+            {
+                name = p.Name,
+                version = p.Version,
+                enabled = p.Enabled,
+                trusted = p.Trusted,
+                isExternal = p.IsExternal,
+            }).ToArray();
+            return ServeJson.ToNode(new { plugins = dtos });
+        });
+
+        // skills/trust → a skill trust decision requires an interactive gate. In serve mode there is
+        // no interactive user, so the request is explicitly refused rather than silently granted
+        // (the unattended policy established for hooks). The model's own attempt to load an external
+        // skill body is refused by SkillOriginGate for the same reason.
+        conn.OnRequest(ServeMethods.SkillTrust, _ =>
+        {
+            this.EnsureAuthenticated();
+            throw new Coda.JsonRpc.JsonRpcRequestException(
+                -32600,
+                "trust decisions require an interactive session; grant skill trust via /skill <name> in the TUI");
         });
     }
 

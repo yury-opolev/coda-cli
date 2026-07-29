@@ -193,13 +193,13 @@ public static class PluginHookLoader
 
     private static HookScope DetermineScope(PluginInfo plugin, string workingDirectory)
     {
-        // Append the separator so ".coda/pluginsX/..." does not match ".coda/plugins".
-        var projectPluginsPath = Path.GetFullPath(
-            Path.Combine(workingDirectory, ".coda", "plugins"))
-            + Path.DirectorySeparatorChar;
+        // A plugin is project-scoped if its directory is anywhere inside the workspace root —
+        // including .coda/plugins/ subdirectories and foreign .claude-plugin/ manifests.
+        // Append the separator so a workspace at "C:\proj" does not match "C:\proj-extra\...".
+        var workspacePath = Path.GetFullPath(workingDirectory) + Path.DirectorySeparatorChar;
         var pluginDir = Path.GetFullPath(plugin.Directory) + Path.DirectorySeparatorChar;
 
-        return pluginDir.StartsWith(projectPluginsPath, StringComparison.OrdinalIgnoreCase)
+        return pluginDir.StartsWith(workspacePath, StringComparison.OrdinalIgnoreCase)
             ? HookScope.Project
             : HookScope.User;
     }

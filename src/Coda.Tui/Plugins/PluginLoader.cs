@@ -44,6 +44,13 @@ public static class PluginLoader
         // User plugins first, then project plugins override by name.
         var byName = new Dictionary<string, PluginInfo>(StringComparer.OrdinalIgnoreCase);
 
+        // Foreign .claude-plugin manifests are loaded first (lowest precedence) so a Coda-native
+        // plugin of the same name always wins.
+        foreach (var plugin in LoadForeignPlugins(workingDirectory))
+        {
+            byName[plugin.Name] = plugin;
+        }
+
         foreach (var plugin in LoadFromDirectory(userPluginsPath, stateStore))
         {
             byName[plugin.Name] = plugin;
@@ -139,6 +146,43 @@ public static class PluginLoader
         }
 
         return result;
+    }
+
+    /// <summary>
+    /// Discovers a foreign <c>.claude-plugin/plugin.json</c> manifest at the project level. Unlike
+    /// Coda-native plugins (a <c>plugins/*/</c> directory of plugins), a <c>.claude-plugin</c>
+    /// directory <em>is itself</em> a single plugin, with its manifest at
+    /// <c>.claude-plugin/plugin.json</c>. Loaded at the lowest precedence and flagged
+    /// <see cref="PluginInfo.IsExternal"/>.
+    /// </summary>
+    private static IEnumerable<PluginInfo> LoadForeignPlugins(string workingDirectory)
+    {
+        var dir = Path.Combine(workingDirectory, ".claude-plugin");
+        var file = Path.Combine(dir, PluginFileName);
+        if (!File.Exists(file))
+        {
+            yield break;
+        }
+
+        PluginInfo? plugin = null;
+        try
+        {
+            var json = File.ReadAllText(file);
+            plugin = ParsePluginJson(json, Path.GetFileName(dir), dir) with { IsExternal = true };
+        }
+        catch (PluginManifestPathException)
+        {
+            // Path containment violation — skip.
+        }
+        catch
+        {
+            plugin = new PluginInfo(".claude-plugin", "0.0.0", string.Empty, dir) { IsExternal = true };
+        }
+
+        if (plugin is not null)
+        {
+            yield return plugin;
+        }
     }
 
     private static IEnumerable<PluginInfo> LoadFromDirectory(

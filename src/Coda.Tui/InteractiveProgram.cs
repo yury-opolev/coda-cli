@@ -468,6 +468,16 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 ? new Coda.Tui.Ui.Schedule.ScheduleBrowserProvider(() => sc, actorPrompts)
                 : null;
 
+        // Skill and plugin browsers scan the live working directory on Open; the state/trust stores
+        // and updater are the same singletons the /skills and /plugin commands use, so overlay actions
+        // and typed subcommands stay consistent.
+        var pluginUpdater = new Coda.Tui.Plugins.PluginUpdater(userCodaDir);
+        Func<Coda.Tui.Ui.Skills.SkillBrowserProvider?> skillsBrowserProvider = () =>
+            new Coda.Tui.Ui.Skills.SkillBrowserProvider(context.Session.WorkingDirectory, pluginStateStore);
+        Func<Coda.Tui.Ui.Plugins.PluginBrowserProvider?> pluginBrowserProvider = () =>
+            new Coda.Tui.Ui.Plugins.PluginBrowserProvider(
+                context.Session.WorkingDirectory, pluginStateStore, pluginTrustStore, pluginUpdater);
+
         using var controller = new TuiController(app, agentRunner, mailbox, actorPrompts, initialSnapshot, hostToken);
         var mcpBrowserProvider = InteractiveProgram.CreateMcpBrowserProvider(
             mcpManagement, actorPrompts, controller);
@@ -635,6 +645,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 mcpBrowserProvider: mcpBrowserProvider,
                 toolDisplayMode: toolDisplayMode,
                 scheduleBrowserProvider: scheduleBrowserProvider,
+                skillsBrowserProvider: skillsBrowserProvider,
+                pluginBrowserProvider: pluginBrowserProvider,
                 urlOpener: DefaultUrlOpener.Instance,
                 privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
                 linkPromptService: actorPrompts,

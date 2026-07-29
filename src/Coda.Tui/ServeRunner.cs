@@ -268,7 +268,13 @@ public static class ServeRunner
                    subagentRegistry: subagentRegistry);
             });
 
-        return new ServeHost(input, output, factory, expectedApiKey);
+        return new ServeHost(
+            input,
+            output,
+            factory,
+            expectedApiKey,
+            skillsProvider: ServeSkillPluginProviders.BuildSkillsProvider(),
+            pluginsProvider: ServeSkillPluginProviders.BuildPluginsProvider());
     }
 
     /// <summary>

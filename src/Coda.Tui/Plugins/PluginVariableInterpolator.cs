@@ -36,6 +36,11 @@ public static class PluginVariableInterpolator
     private const string PluginDataVar = "${CODA_PLUGIN_DATA}";
     private const string ProjectDirVar = "${CODA_PROJECT_DIR}";
 
+    // Claude Code aliases — a manifest authored for Claude Code uses these names for the
+    // plugin root and data directories; they map onto the same expansions.
+    private const string ClaudePluginRootVar = "${CLAUDE_PLUGIN_ROOT}";
+    private const string ClaudePluginDataVar = "${CLAUDE_PLUGIN_DATA}";
+
     /// <summary>
     /// Substitutes the three standard variables in <paramref name="value"/>.
     /// Any <c>${...}</c> token that is not one of the three known variables is left unchanged.
@@ -56,7 +61,11 @@ public static class PluginVariableInterpolator
         return value
             .Replace(PluginRootVar, pluginRoot, StringComparison.Ordinal)
             .Replace(PluginDataVar, pluginDataDir, StringComparison.Ordinal)
-            .Replace(ProjectDirVar, projectDir, StringComparison.Ordinal);
+            .Replace(ProjectDirVar, projectDir, StringComparison.Ordinal)
+
+            // Also accept the Claude Code aliases so a manifest written for Claude Code interpolates correctly.
+            .Replace(ClaudePluginRootVar, pluginRoot, StringComparison.Ordinal)
+            .Replace(ClaudePluginDataVar, pluginDataDir, StringComparison.Ordinal);
     }
 
     /// <summary>
