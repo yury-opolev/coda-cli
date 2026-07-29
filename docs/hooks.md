@@ -387,6 +387,10 @@ compaction, etc.).  Observation-only.
 Fires once per model turn, after the response is received and before the turn result is
 surfaced to the caller.  Observation-only.
 
+It fires on **every** turn, including a tool-only turn whose final assistant text is empty —
+`response` is then `""`. This is an audit surface, and a turn that produced only tool calls is
+exactly the kind of turn an auditor needs to see.
+
 **Default policy:** fail-open, 10 s timeout.
 
 **Payload:**
@@ -406,6 +410,29 @@ surfaced to the caller.  Observation-only.
   "durationMs": 340
 }
 ```
+
+#### Scope of the redaction guarantee
+
+`AgentResponse` can rewrite what the user sees and what is persisted, but the guarantee is
+narrower than "nothing sensitive escapes":
+
+- **Covered:** the assistant's response text and its thinking. Both reach the hook in `response`
+  and can be replaced.
+- **Not covered:** model-authored *tool arguments*. A secret the model puts into a tool call never
+  passes through `AgentResponse`. Use `PreToolUse` with `hookSpecificOutput.modifiedInput` to
+  rewrite tool arguments before the tool runs — that is the only seam that sees them.
+- **Not covered:** tool *results*. Use `PostToolUse` with `hookSpecificOutput.modifiedResult`.
+
+The two rewrite fields differ in what they reach:
+
+| Field | Display | History / transcript |
+|-------|---------|----------------------|
+| `displayContent` | replaced | **unchanged — the original text stays in history and in the persisted transcript** |
+| `modifiedResponse` | replaced | replaced |
+
+So `displayContent` alone hides text from the screen but does not scrub persistence. A hook that
+must keep a secret out of the transcript has to set `modifiedResponse`. Setting both shows
+`displayContent` to the user while storing `modifiedResponse`.
 
 ---
 
@@ -542,7 +569,7 @@ Top-level fields:
 
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
-| `continue` | `bool` | `true` | `false` aborts the agent loop immediately (used by `Stop`). |
+| `continue` | `bool` | `true` | `false` is the protocol's hard stop — see the note below. |
 | `stopReason` | `string` | `null` | Surfaced to the caller as the stop reason. |
 | `systemMessage` | `string` | `null` | Informational message shown to the user alongside normal output. |
 | `suppressOutput` | `bool` | `false` | When `true`, the hook's stdout is excluded from the session transcript. |
@@ -562,6 +589,20 @@ Event-specific output fields must be nested inside `hookSpecificOutput`:
 }
 ```
 
+### `continue: false` per event
+
+`continue: false` is stronger than `decision: "block"`. A blocking decision fails the one thing
+under consideration and lets the model try again; `continue: false` ends the work.
+
+| Event | Effect of `continue: false` |
+|-------|-----------------------------|
+| `PreToolUse` | The tool is blocked **and** the run stops after the current tool batch. Remaining tools in the batch are reported as skipped and the model is not sampled again. `stopReason` (or `reason`) is surfaced to the caller. |
+| `UserPromptSubmit` | The turn does not run at all: the user message is not appended to history. |
+| `PermissionRequest` | Resolved as `deny`. |
+| `Stop` | Inverted by design: a `Stop` hook saying "do not stop yet" re-enters the loop (see the `Stop` section). |
+| `PostToolUse`, `AgentResponse`, `SubagentStop`, `PostCompact` | No effect — the work being observed has already happened. The field is still merged and logged. |
+| `SessionStart`, `SessionEnd`, `Notification` | No effect — observation-only events. |
+
 ---
 
 ## Exit-code semantics
@@ -569,10 +610,20 @@ Event-specific output fields must be nested inside `hookSpecificOutput`:
 | Exit code | Meaning |
 |-----------|---------|
 | `0` | Success. Stdout is parsed as output. |
-| Non-zero | Error. Stdout (if any) is still parsed. Stderr is logged. Whether the hook blocks or is silently ignored depends on `failOpen`. |
+| `2` | Blocking error. The hook blocks regardless of `failOpen`; the reason is taken from **stderr**, falling back to stdout. |
+| Other non-zero | Error. Stdout (if any) is still parsed. Stderr is logged. Whether the hook blocks or is silently ignored depends on `failOpen`. The reason is taken from **stdout**, falling back to stderr. |
 
 A non-zero exit with empty stdout and `failOpen: false` blocks the action.
 A non-zero exit with empty stdout and `failOpen: true` is silently treated as allow.
+
+> **Behaviour change — exit code 2 prefers stderr.**
+> Exit code 2 now reads the block reason from stderr first and only falls back to stdout.
+> A legacy hook that exits `2` while writing to *both* streams will surface its stderr text
+> instead of its stdout text. This is deliberate: exit 2 is the "hard block" signal and a
+> diagnostic message belongs on stderr. Hooks that want their stdout used as the reason
+> should either write the reason to stderr, or exit `1` with `failOpen: false` — the other
+> non-zero path still prefers stdout. Hooks that emit structured JSON on stdout are
+> unaffected: JSON output is only parsed on exit `0`.
 
 ---
 
@@ -643,6 +694,24 @@ can grant trust programmatically via `hooks/trust` (see [Serve protocol](#serve-
 > hook — the same class of issue as editing `.coda/settings.json` to add new hooks.  This is
 > a known limitation, not a secret backdoor; the trust model assumes the agent's tool-execution
 > permission gate (bypass vs. default vs. prompt mode) is the primary defence.
+
+### Credential scrubbing for project and plugin hooks
+
+A `command` hook inherits coda's process environment.  For a user-scoped hook that is intended —
+the operator wrote the command and already holds the secrets.  For **project-scoped** hooks and
+**plugin-contributed** hooks the author is not necessarily the operator, so the following
+environment variables are removed from the child process before it starts:
+
+`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `OPENAI_API_KEY`,
+`OPENAI_ORG_ID`, `AZURE_OPENAI_API_KEY`, `AZURE_API_KEY`, `GITHUB_TOKEN`, `GH_TOKEN`,
+`GITHUB_COPILOT_TOKEN`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`,
+`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `COHERE_API_KEY`,
+`DEEPSEEK_API_KEY`, `FIREWORKS_API_KEY`, `GROQ_API_KEY`, `HF_TOKEN`, `HUGGING_FACE_HUB_TOKEN`,
+`MISTRAL_API_KEY`, `OPENROUTER_API_KEY`, `PERPLEXITY_API_KEY`, `TOGETHER_API_KEY`, `XAI_API_KEY`,
+`CODA_SERVE_API_KEY`.
+
+The rest of the environment is passed through unchanged.  A project or plugin hook that genuinely
+needs a credential should read it from its own configuration rather than from coda's environment.
 
 ---
 

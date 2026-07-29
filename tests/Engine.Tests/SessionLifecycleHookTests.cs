@@ -794,6 +794,72 @@ public sealed class SessionLifecycleHookTests : IDisposable
     }
 
     [Fact]
+    public async Task Dispose_cancels_in_flight_idle_notification_before_SessionEnd()
+    {
+        var events = new List<string>();
+        var idleStarted = new TaskCompletionSource();
+
+        var executor = new DelegateExecutor(async (_, payload, ct) =>
+        {
+            using var doc = JsonDocument.Parse(payload);
+            var name = doc.RootElement.GetProperty("event").GetString() ?? string.Empty;
+
+            if (name == "Notification")
+            {
+                idleStarted.TrySetResult();
+                try
+                {
+                    await Task.Delay(TimeSpan.FromSeconds(30), ct);
+                }
+                catch (OperationCanceledException)
+                {
+                    lock (events)
+                    {
+                        events.Add("notification-cancelled");
+                    }
+
+                    throw;
+                }
+            }
+            else if (name == "SessionEnd")
+            {
+                lock (events)
+                {
+                    events.Add("session-end");
+                }
+            }
+
+            return (0, "{}", string.Empty);
+        });
+
+        var runner = new UserHookRunner(
+            [new UserHook("Notification", "cmd"), new UserHook("SessionEnd", "cmd")],
+            executor,
+            context: null);
+
+        var loopFactory = new CapturingLoopFactory();
+        using var http = new HttpClient(new SseTestHandler(TextTurn));
+        var session = new CodaSession(
+            SignedInClaude(),
+            this.Options(),
+            httpClient: http,
+            agentLoopFactory: loopFactory,
+            userHookRunnerOverride: runner);
+
+        await session.RunAsync("hello");
+        await idleStarted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await session.DisposeAsync();
+
+        lock (events)
+        {
+            // The idle notification must be cancelled and drained before SessionEnd fires,
+            // otherwise the end-of-life ordering the hook protocol promises is inverted.
+            Assert.Equal(["notification-cancelled", "session-end"], events);
+        }
+    }
+
+    [Fact]
     public async Task Notification_TaskComplete_FiresForBackgroundTask()
     {
         string? notifiedKind = null;

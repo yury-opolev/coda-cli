@@ -16,8 +16,12 @@ namespace Coda.Agent.Hooks;
 /// blow up the agent.
 /// </para>
 /// <para>
-/// Compiled regexes are cached per-pattern; compilation happens at most once
-/// per unique pattern string across the lifetime of the process.
+/// Regexes are cached per-pattern; construction happens at most once per unique pattern
+/// string across the lifetime of the process. The cache deliberately does not use
+/// <see cref="RegexOptions.Compiled"/>: patterns come from user, project, and plugin
+/// settings, and the native code the JIT emits for a compiled regex is never reclaimed —
+/// an unbounded, process-lifetime cache of them is a leak. Matching a tool name is not on
+/// a hot path, so the interpreted engine is fast enough.
 /// </para>
 /// </remarks>
 public static class HookMatcher
@@ -60,7 +64,7 @@ public static class HookMatcher
         {
             return new Regex(
                 "^(?:" + pattern + ")$",
-                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant | RegexOptions.Compiled,
+                RegexOptions.IgnoreCase | RegexOptions.CultureInvariant,
                 matchTimeout: TimeSpan.FromSeconds(1));
         }
         catch (ArgumentException)

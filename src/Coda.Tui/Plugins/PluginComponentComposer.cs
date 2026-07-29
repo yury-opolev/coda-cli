@@ -38,9 +38,9 @@ public sealed class PluginComposition
     public IReadOnlyList<OutputStyle> OutputStyles { get; init; } = [];
 
     /// <summary>
-    /// Themes contributed by enabled plugins. Registered into the static
-    /// <see cref="CodaThemes"/> registry as a side-effect of
-    /// <see cref="PluginComponentComposer.Compose"/>; this list is available for any future
+    /// Themes contributed by enabled plugins. <see cref="PluginComponentComposer.Compose"/> loads
+    /// them into a registry owned by the composition and publishes it via
+    /// <see cref="CodaThemes.UsePluginRegistry"/>; this list is the same set, available for any
     /// session-scoped theme resolution path.
     /// </summary>
     internal IReadOnlyList<CodaTheme> Themes { get; init; } = [];
@@ -312,18 +312,21 @@ public static class PluginComponentComposer
     }
 
     /// <summary>
-    /// Loads themes from all enabled plugins, registers them into the static registry,
-    /// and returns the list for discoverability via <see cref="CodaThemes.GetPluginThemes"/>.
+    /// Loads themes from all enabled plugins into a registry owned by this composition, then
+    /// publishes that registry as the one the process resolves against. Composing again therefore
+    /// replaces the previous composition's themes instead of accumulating on top of them.
     /// </summary>
     private static IReadOnlyList<CodaTheme> LoadThemes(
         IReadOnlyList<PluginInfo> plugins,
         ILogger? logger)
     {
-        // Delegate to the existing loader which handles the complex JSON parsing.
-        PluginThemeLoader.RegisterAll(plugins, logger);
+        var registry = new PluginThemeRegistry();
 
-        // Return a snapshot of newly registered themes for the composition result.
-        return [.. CodaThemes.GetPluginThemes()];
+        // Delegate to the existing loader which handles the complex JSON parsing.
+        PluginThemeLoader.RegisterAll(plugins, logger, registry);
+        CodaThemes.UsePluginRegistry(registry);
+
+        return registry.All;
     }
 
     private static string ResolveSubDirectory(PluginInfo plugin, string relativePath) =>

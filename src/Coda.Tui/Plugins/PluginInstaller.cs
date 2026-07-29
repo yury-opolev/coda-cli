@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using Coda.Common;
 
 namespace Coda.Tui.Plugins;
 
@@ -118,6 +119,9 @@ public static class PluginInstaller
                 process.StartInfo.ArgumentList.Add("--no-checkout");
             }
 
+            // End-of-options separator: without it a URL beginning with '-' would be
+            // parsed by git as an option rather than as the repository to clone.
+            process.StartInfo.ArgumentList.Add("--");
             process.StartInfo.ArgumentList.Add(gitUrl);
             process.StartInfo.ArgumentList.Add(targetDir);
 
@@ -219,6 +223,10 @@ public static class PluginInstaller
             };
             process.StartInfo.ArgumentList.Add("checkout");
             process.StartInfo.ArgumentList.Add(sha);
+
+            // Trailing end-of-options separator: disambiguates the revision from a
+            // pathspec. A leading '--' would instead make git treat the SHA as a path.
+            process.StartInfo.ArgumentList.Add("--");
             process.Start();
             await process.StandardOutput.ReadToEndAsync(ct).ConfigureAwait(false);
             var stderr = await process.StandardError.ReadToEndAsync(ct).ConfigureAwait(false);
@@ -297,36 +305,14 @@ public static class PluginInstaller
 
     /// <summary>
     /// Returns true when <paramref name="name"/> is a safe single-segment plugin name
-    /// (no path separators, no <c>..</c>, no invalid filename characters).
+    /// (no path separators, no <c>..</c>, no invalid filename characters, no reserved
+    /// Windows device name, no trailing dot or surrounding whitespace).
     /// </summary>
-    public static bool IsValidPluginName(string name)
-    {
-        if (string.IsNullOrWhiteSpace(name))
-        {
-            return false;
-        }
-
-        if (name == ".." || name == ".")
-        {
-            return false;
-        }
-
-        if (name.Contains('/') || name.Contains('\\'))
-        {
-            return false;
-        }
-
-        var invalidChars = Path.GetInvalidFileNameChars();
-        foreach (var c in name)
-        {
-            if (Array.IndexOf(invalidChars, c) >= 0)
-            {
-                return false;
-            }
-        }
-
-        return true;
-    }
+    /// <remarks>
+    /// Delegates to <see cref="SafeNameValidator.IsValidName"/> — the same validator
+    /// <c>/skills new</c> uses, so the two can never drift apart.
+    /// </remarks>
+    public static bool IsValidPluginName(string name) => SafeNameValidator.IsValidName(name);
 
     /// <summary>Derives a directory name from a git URL (last path segment, minus .git suffix).</summary>
     public static string DeriveNameFromGitUrl(string gitUrl)

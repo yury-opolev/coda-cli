@@ -20,9 +20,18 @@ public sealed class ShellHookExecutor : IHookExecutor
     internal const int ReadCeiling = 1_048_576;
 
     /// <inheritdoc/>
+    public Task<(int ExitCode, string Stdout, string Stderr)> ExecAsync(
+        string command,
+        string payload,
+        CancellationToken ct)
+        => this.ExecAsync(command, payload, HookScope.User, fromPlugin: false, ct);
+
+    /// <inheritdoc/>
     public async Task<(int ExitCode, string Stdout, string Stderr)> ExecAsync(
         string command,
         string payload,
+        HookScope scope,
+        bool fromPlugin,
         CancellationToken ct)
     {
         var (shell, args) = OperatingSystem.IsWindows()
@@ -42,6 +51,13 @@ public sealed class ShellHookExecutor : IHookExecutor
         foreach (var arg in args)
         {
             startInfo.ArgumentList.Add(arg);
+        }
+
+        // A hook authored by a repository or a plugin is not necessarily authored by the
+        // operator, so it must not inherit coda's provider credentials.
+        if (HookCredentialScrubber.ShouldScrub(scope, fromPlugin))
+        {
+            HookCredentialScrubber.Scrub(startInfo.Environment);
         }
 
         using var process = new Process { StartInfo = startInfo };

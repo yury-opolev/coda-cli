@@ -175,6 +175,79 @@ public sealed class CacheUsageTests
         Assert.Equal(0, done.Usage.CacheWrite1hTokens);
     }
 
+    [Fact]
+    public async Task AnthropicSseReader_reads_a_cache_creation_sub_object_with_only_one_ttl_member()
+    {
+        // Only the 5m member is present. The 1h bucket must stay zero and the 5m bucket must
+        // take the value from the sub-object, not the aggregate cache_creation_input_tokens.
+        const string sse = """
+            event: message_start
+            data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":30,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":30}}}}
+
+            event: message_delta
+            data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+
+            event: message_stop
+            data: {"type":"message_stop"}
+
+            """;
+
+        List<AssistantStreamEvent> events = await ReadAnthropicSse(sse);
+
+        AssistantStreamEvent done = events.Single(e => e.Kind == AssistantEventKind.Done);
+        Assert.NotNull(done.Usage);
+        Assert.Equal(10, done.Usage!.InputTokens);
+        Assert.Equal(30, done.Usage.CacheWrite5mTokens);
+        Assert.Equal(0, done.Usage.CacheWrite1hTokens);
+    }
+
+    [Fact]
+    public async Task AnthropicSseReader_reads_a_cache_creation_sub_object_with_only_the_1h_member()
+    {
+        const string sse = """
+            event: message_start
+            data: {"type":"message_start","message":{"usage":{"input_tokens":10,"cache_creation_input_tokens":45,"cache_read_input_tokens":0,"cache_creation":{"ephemeral_1h_input_tokens":45}}}}
+
+            event: message_delta
+            data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":5}}
+
+            event: message_stop
+            data: {"type":"message_stop"}
+
+            """;
+
+        List<AssistantStreamEvent> events = await ReadAnthropicSse(sse);
+
+        AssistantStreamEvent done = events.Single(e => e.Kind == AssistantEventKind.Done);
+        Assert.NotNull(done.Usage);
+        Assert.Equal(0, done.Usage!.CacheWrite5mTokens);
+        Assert.Equal(45, done.Usage.CacheWrite1hTokens);
+    }
+
+    [Fact]
+    public void TokenUsage_Add_accumulates_across_many_turns()
+    {
+        var total = TokenUsage.Zero;
+        for (var turn = 1; turn <= 10; turn++)
+        {
+            total = total.Add(new TokenUsage(
+                InputTokens: turn,
+                OutputTokens: turn * 2,
+                CacheReadTokens: turn * 3,
+                CacheWrite5mTokens: turn * 4,
+                CacheWrite1hTokens: turn * 5));
+        }
+
+        // Sum of 1..10 is 55.
+        Assert.Equal(55, total.InputTokens);
+        Assert.Equal(110, total.OutputTokens);
+        Assert.Equal(165, total.CacheReadTokens);
+        Assert.Equal(220, total.CacheWrite5mTokens);
+        Assert.Equal(275, total.CacheWrite1hTokens);
+        Assert.Equal(55 + 165 + 220 + 275, total.TotalInputTokens);
+        Assert.Equal(55 + 165 + 220 + 275 + 110, total.Total);
+    }
+
     // ── Pricing ────────────────────────────────────────────────────────────────
 
     [Fact]
@@ -247,5 +320,59 @@ public sealed class CacheUsageTests
         decimal cost = Pricing.EstimateUsd("gpt-5.6-sol", usage);
 
         Assert.Equal(1.50m, cost);   // $3.00 * 0.50 = $1.50 per MTok
+    }
+
+    [Fact]
+    public void Pricing_derives_the_1h_write_rate_from_the_catalog_write_rate()
+    {
+        // The catalog carries a single cache_write rate, which is the 5-minute tier. The 1-hour
+        // tier must be derived from it (x 2.00 / 1.25) rather than silently falling back to the
+        // base input rate — otherwise a catalog-priced model mixes two pricing sources.
+        var catalog = new CatalogModel(
+            "test-model",
+            InputPerMTok: 3.00m,
+            OutputPerMTok: 15.00m,
+            CacheWritePerMTok: 5.00m);
+
+        var write5m = new TokenUsage(0, 0, CacheWrite5mTokens: 1_000_000);
+        var write1h = new TokenUsage(0, 0, CacheWrite1hTokens: 1_000_000);
+
+        Assert.Equal(5.00m, Pricing.EstimateUsd("test-model", write5m, catalog));
+        Assert.Equal(8.00m, Pricing.EstimateUsd("test-model", write1h, catalog));
+    }
+
+    [Fact]
+    public void Pricing_1h_write_falls_back_to_the_multiplier_when_the_catalog_has_no_write_rate()
+    {
+        var catalog = new CatalogModel(
+            "test-model",
+            InputPerMTok: 3.00m,
+            OutputPerMTok: 15.00m);
+
+        var write1h = new TokenUsage(0, 0, CacheWrite1hTokens: 1_000_000);
+
+        Assert.Equal(6.00m, Pricing.EstimateUsd("test-model", write1h, catalog));
+    }
+
+    [Fact]
+    public void Pricing_combined_call_bills_each_term_at_its_own_rate()
+    {
+        // Guards against a cross-term rate swap: every counter carries a distinct token count so
+        // any two rates trading places changes the total.
+        //   input        200_000 x $3.00        = $0.60
+        //   cache read   400_000 x $0.30        = $0.12
+        //   5m write     100_000 x $3.75        = $0.375
+        //   1h write      50_000 x $6.00        = $0.30
+        //   output        20_000 x $15.00       = $0.30
+        var usage = new TokenUsage(
+            InputTokens: 200_000,
+            OutputTokens: 20_000,
+            CacheReadTokens: 400_000,
+            CacheWrite5mTokens: 100_000,
+            CacheWrite1hTokens: 50_000);
+
+        decimal cost = Pricing.EstimateUsd("claude-sonnet-4-6", usage);
+
+        Assert.Equal(1.695m, cost);
     }
 }

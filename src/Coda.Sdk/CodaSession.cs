@@ -83,7 +83,12 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// Set to <see langword="true"/> once <see cref="RebuildSessionRunnerWithHandlers"/> has been
     /// called so the upgrade runs at most once per session lifetime.
     /// </summary>
-    private bool sessionRunnerHandlersUpgraded;
+    private bool sessionRunnerHandlersUpgraded
+    {
+        get => this.sessionHooks.HandlersUpgraded;
+        set => this.sessionHooks.HandlersUpgraded = value;
+    }
+
     private TokenUsage sessionUsage = TokenUsage.Zero;
     private GoalStatus? lastGoalStatus;
 
@@ -98,19 +103,18 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public const int ZeroActivityWarnAfterTurns = 3;
 
-    // Session lifecycle hook fields (Phase 2).
-    private string sessionSource = "new";
-    private string? resumedFromId;
-    private int sessionEndFired;
-    private Task? sessionStartTask;
-    private volatile string sessionEndReason = "exit";
-    private readonly long sessionStartedAtMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
-    private int turnCount;
-    private bool additionalContextInjected;
-    private string? pendingAdditionalContext;
-    private string? pendingInitialUserMessage;
-    private string? sessionAppendSystemPrompt;
-    private UserHookRunner? sessionHookRunner;
+    /// <summary>
+    /// The session-level hook concern: the session hook runner, the SessionStart / SessionEnd /
+    /// Notification firings, and the session-scoped application of the SessionStart outputs.
+    /// </summary>
+    private readonly SessionLifecycleHooks sessionHooks;
+
+    /// <summary>Shorthand for the session hook runner owned by <see cref="sessionHooks"/>.</summary>
+    private UserHookRunner? sessionHookRunner
+    {
+        get => this.sessionHooks.Runner;
+        set => this.sessionHooks.Runner = value;
+    }
 
     // Compaction hook runner (Phase 5). Set to loopSpec.UserHooks before each RunAsync turn so
     // CompactHistoryAsync (called both pre-turn and by TurnPipelineBuilder's in-loop delegate)
@@ -169,9 +173,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.hookRunLog = runLog ?? new HookRunLog();
         this.sessionExecOverride = sessionExecOverride;
         this.sessionPromptHandlerOverride = sessionPromptHandlerOverride;
+        this.sessionHooks = new SessionLifecycleHooks(this.SessionId);
         if (options.SessionSource is { } src)
         {
-            this.sessionSource = src;
+            this.sessionHooks.Source = src;
         }
         // The manager groups persistent task logs under the session id captured HERE. If the id
         // is later adopted (AdoptSessionId/Resume), the manager keeps this original grouping so
@@ -252,6 +257,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.loggerFactory = loggerSetup.Factory;
         this.LogFilePath = loggerSetup.LogFilePath;
         this.logger = this.loggerFactory.CreateLogger("Coda.Session");
+        this.sessionHooks.Logger = this.loggerFactory.CreateLogger("Coda.Session.Hooks");
 
         // The schedules store was constructed above, before the logger factory existed (telemetry
         // is built last to avoid leaking a file handle on a wiring failure). Wire its logger now so
@@ -317,15 +323,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             this.sessionRunnerHandlersUpgraded = this.sessionPromptHandlerOverride is not null;
         }
 
-        // Wire task-complete notifications for background tasks.
+        // Wire task-complete notifications for background tasks. Scoped to the session lifetime
+        // so a late completion cannot spawn a hook subprocess after teardown has begun.
         if (this.sessionHookRunner?.HasNotification == true)
         {
-            this.tasks.NotificationCallback = (kind, taskId) =>
-                this.sessionHookRunner.RunNotificationAsync(
-                    kind,
-                    taskId is not null ? $"Background task {taskId} completed." : "A background task completed.",
-                    taskId,
-                    CancellationToken.None);
+            this.tasks.NotificationCallback = this.sessionHooks.RunTaskNotificationAsync;
         }
     }
 
@@ -343,15 +345,6 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "synchronous dispose worker failed (best-effort): session={sessionId}")]
     private partial void LogSyncDisposeFailed(string sessionId, Exception ex);
-
-    [LoggerMessage(Level = LogLevel.Warning, Message = "SessionStart hook failed (fail-open): session={sessionId}")]
-    private partial void LogSessionStartHookFailed(string sessionId, Exception ex);
-
-    [LoggerMessage(Level = LogLevel.Warning, Message = "SessionEnd hook failed (fail-open): session={sessionId}")]
-    private partial void LogSessionEndHookFailed(string sessionId, Exception ex);
-
-    [LoggerMessage(Level = LogLevel.Warning, Message = "Notification hook failed (fire-and-forget): session={sessionId}")]
-    private partial void LogNotificationHookFailed(string sessionId, Exception ex);
 
     /// <summary>Stable identifier for this session, used to persist/resume conversation transcripts.</summary>
     public string SessionId { get; private set; }
@@ -455,7 +448,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     public void SetSessionEndReason(string reason)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(reason);
-        this.sessionEndReason = reason;
+        this.sessionHooks.EndReason = reason;
     }
 
     /// <summary>
@@ -485,9 +478,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         ArgumentNullException.ThrowIfNull(messages);
         ArgumentNullException.ThrowIfNull(metadata);
 
-        this.resumedFromId = this.SessionId;
-        this.sessionSource = "resume";
+        this.sessionHooks.MarkResumed(this.SessionId);
         this.SessionId = sessionId;
+        this.sessionHooks.SessionId = sessionId;
         this.history.Clear();
         this.history.AddRange(messages);
         this.Options = this.Options with
@@ -586,16 +579,14 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         await this.ApplySessionStartHookAsync(cancellationToken).ConfigureAwait(false);
 
         // Inject additionalContext from SessionStart exactly once, before the first user turn.
-        if (!this.additionalContextInjected && this.pendingAdditionalContext is { } addCtx)
+        if (this.sessionHooks.TakeAdditionalContextOnce() is { } addCtx)
         {
-            this.additionalContextInjected = true;
-            this.pendingAdditionalContext = null;
             this.history.Add(new ChatMessage(ChatRole.User, [new TextBlock(addCtx)]));
         }
 
         // Run the initial user message from SessionStart before the real user's turn.
-        // pendingInitialUserMessage is cleared atomically to guard against re-entry.
-        var initialMsg = System.Threading.Interlocked.Exchange(ref this.pendingInitialUserMessage, null);
+        // The pending message is cleared atomically to guard against re-entry.
+        var initialMsg = this.sessionHooks.TakeInitialUserMessage();
         if (initialMsg is not null)
         {
             try
@@ -797,12 +788,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
                 // Merge session-level appendSystemPrompt from SessionStart into the turn shape.
                 // Session append (the "base") comes first; per-turn append follows.
-                if (this.sessionAppendSystemPrompt is { } sessionAsp)
-                {
-                    var perTurnAsp = turnShape?.AppendSystemPrompt;
-                    var mergedAsp = perTurnAsp is not null ? $"{sessionAsp}\n\n{perTurnAsp}" : sessionAsp;
-                    turnShape = (turnShape ?? TurnShape.None) with { AppendSystemPrompt = mergedAsp };
-                }
+                turnShape = this.sessionHooks.ComposeAppendSystemPrompt(turnShape);
 
                 // M3: store the fully-resolved system prompt (base + any appends) so the next
                 // turn receives it as PreviousSystemPrompt and can compare like-for-like.
@@ -814,7 +800,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             await this.PersistTranscriptAsync(cancellationToken).ConfigureAwait(false);
             await this.PersistAuditTurnAsync(options, recording, loopSpec.Options.SystemPrompt, loopSpec.Tools.Definitions, cancellationToken).ConfigureAwait(false);
             this.sessionUsage = this.sessionUsage.Add(recording.Usage);
-            System.Threading.Interlocked.Increment(ref this.turnCount);
+            this.sessionHooks.RecordTurn();
 
             // Zero-counters warning: if both cache counters have been zero for several turns in a
             // row the prefix is likely below the per-model minimum and cache is silently inactive.
@@ -1512,130 +1498,33 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     internal Task ApplySessionStartHookAsync(CancellationToken cancellationToken)
     {
-        if (this.sessionHookRunner?.HasSessionStart != true)
-        {
-            return Task.CompletedTask;
-        }
-
-        // Shared-task idempotency: every concurrent caller awaits the same Task so no caller
-        // can return before the outputs (sessionAppendSystemPrompt, pendingAdditionalContext,
-        // pendingInitialUserMessage) are applied — fixing the race where the old
-        // Interlocked guard was set BEFORE the await, allowing a concurrent caller to skip
-        // past and observe null outputs.
-        lock (this.initGate)
-        {
-            return this.sessionStartTask ??= this.ApplySessionStartHookCoreAsync(cancellationToken);
-        }
-    }
-
-    private async Task ApplySessionStartHookCoreAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            var options = this.Options;
-            var transcriptPath = Path.Combine(
-                options.WorkingDirectory, ".coda", "sessions", $"{this.SessionId}.json");
-
-            var result = await this.sessionHookRunner!.RunSessionStartAsync(
-                this.sessionSource,
+        var options = this.Options;
+        return this.sessionHooks.ApplySessionStartAsync(
+            new SessionStartPayloadContext(
                 options.Model,
                 PermissionModeToString(options.PermissionMode),
-                transcriptPath,
-                this.resumedFromId,
-                cancellationToken).ConfigureAwait(false);
-
-            if (result.AppendSystemPrompt is not null)
-            {
-                this.sessionAppendSystemPrompt = result.AppendSystemPrompt;
-            }
-
-            if (result.AdditionalContext is not null)
-            {
-                this.pendingAdditionalContext = result.AdditionalContext;
-            }
-
-            if (result.InitialUserMessage is not null)
-            {
-                this.pendingInitialUserMessage = result.InitialUserMessage;
-            }
-        }
-        catch (OperationCanceledException)
-        {
-            throw;
-        }
-        catch (Exception ex)
-        {
-            // SessionStart is fail-open — log and continue.
-            this.LogSessionStartHookFailed(this.SessionId, ex);
-        }
+                this.SessionTranscriptPath(options)),
+            cancellationToken);
     }
+
+    /// <summary>The path this session's transcript is written to.</summary>
+    private string SessionTranscriptPath(SessionOptions options) =>
+        Path.Combine(options.WorkingDirectory, ".coda", "sessions", $"{this.SessionId}.json");
 
     /// <summary>
     /// Fires SessionEnd hooks exactly once. Hard-coded 2 s deadline; never throws.
     /// </summary>
-    private async Task FireSessionEndOnceAsync()
-    {
-        if (System.Threading.Interlocked.Exchange(ref this.sessionEndFired, 1) != 0)
-        {
-            return;
-        }
-
-        if (this.sessionHookRunner?.HasSessionEnd != true)
-        {
-            return;
-        }
-
-        try
-        {
-            var options = this.Options;
-            var transcriptPath = Path.Combine(
-                options.WorkingDirectory, ".coda", "sessions", $"{this.SessionId}.json");
-            var durationMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds() - this.sessionStartedAtMs;
-
-            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
-            await this.sessionHookRunner.RunSessionEndAsync(
-                this.sessionEndReason,
-                durationMs,
-                this.turnCount,
-                this.sessionUsage,
-                transcriptPath,
-                cts.Token).ConfigureAwait(false);
-        }
-        catch (Exception ex)
-        {
-            // SessionEnd is fail-open and runs during shutdown — never propagate.
-            try { this.LogSessionEndHookFailed(this.SessionId, ex); } catch { }
-        }
-    }
+    private Task FireSessionEndOnceAsync() =>
+        this.sessionHooks.FireSessionEndOnceAsync(
+            this.sessionUsage,
+            this.SessionTranscriptPath(this.Options));
 
     /// <summary>
     /// Fires a <c>Notification("idle")</c> hook in the background after a successful turn.
     /// Fire-and-forget so notification latency never blocks the caller.
     /// </summary>
-    private void FireIdleNotificationBackground()
-    {
-        if (this.sessionHookRunner?.HasNotification != true)
-        {
-            return;
-        }
-
-        var sessionId = this.SessionId;
-        _ = Task.Run(async () =>
-        {
-            try
-            {
-                await this.sessionHookRunner.RunNotificationAsync(
-                    "idle",
-                    "Agent is ready.",
-                    taskId: null,
-                    CancellationToken.None).ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                try { this.LogNotificationHookFailed(sessionId, ex); } catch { }
-            }
-        });
-    }
+    private void FireIdleNotificationBackground() =>
+        this.sessionHooks.FireIdleNotificationBackground();
 
     /// <summary>
     /// Asynchronously tears the session down: shuts down LSP servers (bounded by
@@ -1646,6 +1535,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     /// </summary>
     public async ValueTask DisposeAsync()
     {
+        // Stop and drain in-flight background Notification hooks BEFORE SessionEnd fires: an idle
+        // notification subprocess that outlived SessionEnd would invert the documented ordering.
+        await this.sessionHooks.DrainBackgroundNotificationsAsync().ConfigureAwait(false);
+
         // Fire SessionEnd exactly once before teardown begins. The 2 s hard ceiling is
         // enforced inside FireSessionEndOnceAsync; it never throws.
         await this.FireSessionEndOnceAsync().ConfigureAwait(false);
@@ -1676,6 +1569,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
         this.ownedHttpClient?.Dispose();
         this.loggerFactory.Dispose();
+        this.sessionHooks.Dispose();
     }
 
     /// <summary>

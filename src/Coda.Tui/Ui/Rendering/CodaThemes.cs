@@ -132,10 +132,10 @@ internal static class CodaThemes
         theme => theme,
         StringComparer.OrdinalIgnoreCase);
 
-    // Plugin themes — registered at startup, never overlap with built-ins.
-    private static readonly object PluginLock = new();
-    private static readonly Dictionary<string, CodaTheme> pluginThemesByName =
-        new(StringComparer.OrdinalIgnoreCase);
+    // Plugin themes live in an instance-scoped registry. The static field only names the registry
+    // the process is currently using, so a fresh plugin composition replaces the previous set
+    // rather than accumulating on top of it.
+    private static PluginThemeRegistry pluginThemes = new();
 
     public static IReadOnlyList<CodaTheme> All => all;
 
@@ -143,47 +143,31 @@ internal static class CodaThemes
 
     public static event Action? Changed;
 
+    /// <summary>Returns true when <paramref name="name"/> is one of the built-in theme names.</summary>
+    public static bool IsBuiltIn(string name) => byName.ContainsKey(name);
+
     /// <summary>
-    /// Registers a plugin-contributed theme. If the name collides with a built-in theme,
-    /// the registration is silently dropped and the supplied logger receives a warning.
+    /// Replaces the plugin theme registry the process resolves against. Called once per plugin
+    /// composition with that composition's own registry.
     /// </summary>
-    public static bool RegisterPlugin(CodaTheme theme, Microsoft.Extensions.Logging.ILogger? logger = null)
+    public static void UsePluginRegistry(PluginThemeRegistry registry)
     {
-        ArgumentNullException.ThrowIfNull(theme);
-
-        if (byName.ContainsKey(theme.Name))
-        {
-            logger?.LogWarning(
-                "Plugin theme '{Name}' collides with a built-in theme and will be ignored.",
-                theme.Name);
-            return false;
-        }
-
-        lock (PluginLock)
-        {
-            pluginThemesByName[theme.Name] = theme;
-        }
-
-        return true;
+        ArgumentNullException.ThrowIfNull(registry);
+        Interlocked.Exchange(ref pluginThemes, registry);
     }
+
+    /// <summary>
+    /// Registers a plugin-contributed theme into the current registry. If the name collides with a
+    /// built-in theme, the registration is dropped and the supplied logger receives a warning.
+    /// </summary>
+    public static bool RegisterPlugin(CodaTheme theme, Microsoft.Extensions.Logging.ILogger? logger = null) =>
+        Volatile.Read(ref pluginThemes).Register(theme, logger);
 
     /// <summary>Removes all plugin-registered themes. Called at test teardown or on plugin reload.</summary>
-    public static void ClearPluginThemes()
-    {
-        lock (PluginLock)
-        {
-            pluginThemesByName.Clear();
-        }
-    }
+    public static void ClearPluginThemes() => Volatile.Read(ref pluginThemes).Clear();
 
     /// <summary>Returns plugin-registered themes (not including built-ins).</summary>
-    public static IReadOnlyList<CodaTheme> GetPluginThemes()
-    {
-        lock (PluginLock)
-        {
-            return [.. pluginThemesByName.Values];
-        }
-    }
+    public static IReadOnlyList<CodaTheme> GetPluginThemes() => Volatile.Read(ref pluginThemes).All;
 
     public static bool TryGet(string name, out CodaTheme theme)
     {
@@ -198,12 +182,9 @@ internal static class CodaThemes
             return true;
         }
 
-        lock (PluginLock)
+        if (Volatile.Read(ref pluginThemes).TryGet(name.Trim(), out theme!))
         {
-            if (pluginThemesByName.TryGetValue(name.Trim(), out theme!))
-            {
-                return true;
-            }
+            return true;
         }
 
         theme = Default;

@@ -1027,7 +1027,7 @@ public sealed partial class HookBus
 
         var hookId = hook.Command;
         var (exitCode, rawStdout, rawStderr) = await this.executor
-            .ExecAsync(hook.Command, payload, ct)
+            .ExecAsync(hook.Command, payload, hook.Scope, hook.PluginOrigin is not null, ct)
             .ConfigureAwait(false);
 
         if (exitCode == 0)
@@ -1205,11 +1205,23 @@ public sealed partial class HookBus
         && (string.Equals(decision, "block", StringComparison.OrdinalIgnoreCase)
             || string.Equals(decision, "deny", StringComparison.OrdinalIgnoreCase));
 
+    /// <summary>
+    /// Projects merged hook output onto the <c>PreToolUse</c> result.
+    /// </summary>
+    /// <remarks>
+    /// <c>continue:false</c> is the protocol's hard stop, so it is stronger than
+    /// <c>decision:"block"</c>: the tool is blocked and <see cref="UserHookResult.Abort"/> is set
+    /// so the agent loop ends the run after the current tool batch. A plain blocking decision only
+    /// fails this one call and lets the model try something else.
+    /// </remarks>
     private static UserHookResult ToUserHookResult(HookOutput merged)
     {
         if (!merged.Continue)
         {
-            return new UserHookResult(Block: true, merged.StopReason ?? merged.Reason ?? "hook requested stop");
+            return new UserHookResult(
+                Block: true,
+                merged.StopReason ?? merged.Reason ?? "hook requested stop",
+                Abort: true);
         }
 
         if (IsBlockingDecision(merged.Decision))

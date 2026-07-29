@@ -137,7 +137,9 @@ public sealed class HookManagementService : IHookManagementService
                 ParsedOutput: HookOutput.NoOp);
         }
 
-        var (exitCode, stdout, stderr) = await this.executor.ExecAsync(command, payload, ct).ConfigureAwait(false);
+        var (exitCode, stdout, stderr) = await this.executor
+            .ExecAsync(command, payload, hook.Scope, hook.PluginOrigin is not null, ct)
+            .ConfigureAwait(false);
         var parsed = HookOutputParser.Parse(stdout);
 
         return new HookTestResult(

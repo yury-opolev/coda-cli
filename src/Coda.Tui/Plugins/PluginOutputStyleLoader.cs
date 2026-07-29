@@ -22,76 +22,40 @@ public static class PluginOutputStyleLoader
         {
             if (!plugin.IsEnabled) continue;
 
-            var dir = ResolveDirectory(plugin);
-            if (!Directory.Exists(dir)) continue;
+            var dir = PluginResourceLoader.ResolvePath(plugin, plugin.Manifest?.OutputStyles ?? "output-styles");
+            var styles = PluginResourceLoader.LoadDirectory<OutputStyle>(
+                dir, "*.json", plugin.Name, "output style", file => TryLoad(file, plugin.Name, logger), logger);
 
-            foreach (var file in Directory.EnumerateFiles(dir, "*.json", SearchOption.TopDirectoryOnly))
+            foreach (var style in styles)
             {
-                var style = TryLoad(file, plugin.Name, logger);
-                if (style is not null)
-                {
-                    BuiltInOutputStyles.RegisterPlugin(style, logger);
-                }
+                BuiltInOutputStyles.RegisterPlugin(style, logger);
             }
         }
     }
 
     private static OutputStyle? TryLoad(string file, string pluginName, ILogger? logger)
     {
-        string json;
-        try
+        using var doc = PluginResourceLoader.TryReadJsonObject(file, pluginName, "output style", logger);
+        if (doc is null)
         {
-            json = File.ReadAllText(file);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            logger?.LogError(
-                "Plugin '{Plugin}': failed to read output style file '{File}': {Message}",
-                pluginName, file, ex.Message);
             return null;
         }
 
-        try
+        var name = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
+        if (string.IsNullOrWhiteSpace(name))
         {
-            using var doc = JsonDocument.Parse(json);
-
-            if (doc.RootElement.ValueKind != JsonValueKind.Object)
-            {
-                logger?.LogWarning(
-                    "Plugin '{Plugin}': output style file '{File}' must be a JSON object — skipped.",
-                    pluginName, file);
-                return null;
-            }
-
-            var name = doc.RootElement.TryGetProperty("name", out var n) ? n.GetString() : null;
-            if (string.IsNullOrWhiteSpace(name))
-            {
-                logger?.LogWarning(
-                    "Plugin '{Plugin}': output style file '{File}' has no 'name' field — skipped.",
-                    pluginName, file);
-                return null;
-            }
-
-            var description = doc.RootElement.TryGetProperty("description", out var d) ? d.GetString() : string.Empty;
-            var suffix = doc.RootElement.TryGetProperty("systemPromptSuffix", out var s) ? s.GetString() : string.Empty;
-
-            return new OutputStyle(
-                Name: name,
-                Description: description ?? string.Empty,
-                SystemPromptSuffix: suffix ?? string.Empty);
-        }
-        catch (JsonException ex)
-        {
-            logger?.LogError(
-                "Plugin '{Plugin}': output style file '{File}' contains invalid JSON: {Message}",
-                pluginName, file, ex.Message);
+            logger?.LogWarning(
+                "Plugin '{Plugin}': output style file '{File}' has no 'name' field — skipped.",
+                pluginName, file);
             return null;
         }
-    }
 
-    private static string ResolveDirectory(PluginInfo plugin)
-    {
-        var relativePath = plugin.Manifest?.OutputStyles ?? "output-styles";
-        return Path.GetFullPath(Path.Combine(plugin.Directory, relativePath));
+        var description = doc.RootElement.TryGetProperty("description", out var d) ? d.GetString() : string.Empty;
+        var suffix = doc.RootElement.TryGetProperty("systemPromptSuffix", out var s) ? s.GetString() : string.Empty;
+
+        return new OutputStyle(
+            Name: name,
+            Description: description ?? string.Empty,
+            SystemPromptSuffix: suffix ?? string.Empty);
     }
 }

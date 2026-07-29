@@ -1,3 +1,4 @@
+using Coda.Common;
 using Coda.Tui.Plugins;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -424,7 +425,8 @@ public sealed class SkillsCommand : ISlashCommand
         {
             context.Console.MarkupLine(Theme.ErrorMarkup(
                 $"Invalid skill name '{name}': must not contain path separators, '..', " +
-                "or characters that are invalid in a directory name."));
+                "characters that are invalid in a directory name, a trailing dot, " +
+                "surrounding whitespace, or a reserved device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9)."));
             return Task.FromResult(CommandResult.Continue);
         }
 
@@ -456,18 +458,10 @@ public sealed class SkillsCommand : ISlashCommand
 
     /// <summary>
     /// Returns <see langword="true"/> when <paramref name="name"/> is a safe single-segment skill
-    /// name: no <c>..</c> substring, no path separators, and no characters invalid in a directory
-    /// name. Mirrors the defensive validation in <see cref="PluginInstaller.IsValidPluginName"/>.
+    /// name. Delegates to <see cref="SafeNameValidator.IsValidName"/>, the same validator plugin
+    /// installation uses, so skill and plugin names cannot drift apart.
     /// </summary>
-    private static bool IsValidSkillName(string name)
-    {
-        if (name.Contains(".."))
-        {
-            return false; // path traversal
-        }
-
-        return PluginInstaller.IsValidPluginName(name);
-    }
+    private static bool IsValidSkillName(string name) => SafeNameValidator.IsValidName(name);
 
     private static string BuildTemplate(string name) =>
         $"---{Environment.NewLine}name: {name}{Environment.NewLine}description: Describe your skill here.{Environment.NewLine}---{Environment.NewLine}# {name}{Environment.NewLine}{Environment.NewLine}Add your skill prompt body here.{Environment.NewLine}";

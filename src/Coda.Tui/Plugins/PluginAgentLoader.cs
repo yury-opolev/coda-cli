@@ -32,7 +32,7 @@ public static class PluginAgentLoader
     {
         if (!plugin.IsEnabled) return [];
 
-        var agentsDir = ResolveAgentsDir(plugin);
+        var agentsDir = PluginResourceLoader.ResolvePath(plugin, plugin.Manifest?.Agents ?? "agents");
         return LoadFromDirectory(agentsDir, plugin.Name, logger);
     }
 
@@ -43,39 +43,14 @@ public static class PluginAgentLoader
     public static IReadOnlyList<SubagentDefinition> LoadFromDirectory(
         string agentsDir,
         string pluginName,
-        ILogger? logger = null)
-    {
-        if (!Directory.Exists(agentsDir))
-        {
-            return [];
-        }
-
-        var definitions = new List<SubagentDefinition>();
-
-        foreach (var file in Directory.EnumerateFiles(agentsDir, "*.md", SearchOption.TopDirectoryOnly))
-        {
-            var definition = TryLoadFile(file, pluginName, logger);
-            if (definition is not null)
-            {
-                definitions.Add(definition);
-            }
-        }
-
-        return definitions;
-    }
+        ILogger? logger = null) =>
+        PluginResourceLoader.LoadDirectory<SubagentDefinition>(
+            agentsDir, "*.md", pluginName, "agent", file => TryLoadFile(file, pluginName, logger), logger);
 
     private static SubagentDefinition? TryLoadFile(string file, string pluginName, ILogger? logger)
     {
-        string content;
-        try
+        if (PluginResourceLoader.TryReadText(file, pluginName, "agent", logger) is not { } content)
         {
-            content = File.ReadAllText(file);
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            logger?.LogError(
-                "Plugin '{Plugin}': failed to read agent file '{File}': {Message}",
-                pluginName, file, ex.Message);
             return null;
         }
 
@@ -133,11 +108,5 @@ public static class PluginAgentLoader
             Description: description,
             SystemPromptBody: frontmatter.Body,
             ReadOnlyToolsOnly: readOnlyToolsOnly);
-    }
-
-    private static string ResolveAgentsDir(PluginInfo plugin)
-    {
-        var relativePath = plugin.Manifest?.Agents ?? "agents";
-        return Path.GetFullPath(Path.Combine(plugin.Directory, relativePath));
     }
 }

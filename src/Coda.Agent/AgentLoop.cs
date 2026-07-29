@@ -273,6 +273,9 @@ public sealed partial class AgentLoop : IAgentLoop
     [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest user hooks failed; denying (fail-closed): tool={toolName}")]
     private partial void LogPermissionRequestHooksFailed(string toolName, Exception ex);
 
+    [LoggerMessage(Level = LogLevel.Information, Message = "run aborted by a hook returning continue:false: {reason}")]
+    private partial void LogRunAbortedByHook(string reason);
+
     [LoggerMessage(Level = LogLevel.Warning, Message = "PermissionRequest hook returned an unknown permission mode '{mode}' — ignoring")]
     private partial void LogUnknownPermissionMode(string mode);
 
@@ -781,9 +784,11 @@ public sealed partial class AgentLoop : IAgentLoop
                     }
 
                     // AgentResponse hooks: run after stop hooks agreed to stop, before display and
-                    // persistence. The final assistant text is now settled. Fail-open: a broken or
-                    // timed-out hook leaves the response completely unchanged.
-                    if (this.userHooks is { HasAgentResponse: true } && text.Length > 0)
+                    // persistence. The final assistant text is now settled. Fires on every turn —
+                    // including a tool-only turn whose final text is empty — because this is an
+                    // audit surface and a silent turn is exactly what an auditor needs to see.
+                    // Fail-open: a broken or timed-out hook leaves the response completely unchanged.
+                    if (this.userHooks is { HasAgentResponse: true })
                     {
                         var responseText = text.ToString();
                         var durationMs = (long)(Stopwatch.GetElapsedTime(iterationStartTick).TotalMilliseconds);
@@ -835,8 +840,19 @@ public sealed partial class AgentLoop : IAgentLoop
                 // direct result of a prior stop-hook continuation. Reset so stop hooks
                 // treat the next natural stop correctly.
                 stopHookActive = false;
-                var (resultBlocks, shapeDelta) = await this.RunToolsAsync(toolUses, activity, sink, resolution, cancellationToken).ConfigureAwait(false);
+                var (resultBlocks, shapeDelta, abortReason) = await this.RunToolsAsync(toolUses, activity, sink, resolution, cancellationToken).ConfigureAwait(false);
                 history.Add(new ChatMessage(ChatRole.User, resultBlocks));
+
+                // A PreToolUse hook returned continue:false — the protocol's hard stop. Persist
+                // what has happened so far and end the run without sampling the model again.
+                if (abortReason is not null)
+                {
+                    await this.MaybePersistTurnAsync(cancellationToken).ConfigureAwait(false);
+                    this.LogRunAbortedByHook(abortReason);
+                    sink.OnStopReason("hook_abort");
+                    sink.OnLimitReached("hook_abort", $"A hook stopped the run: {abortReason}");
+                    return;
+                }
 
                 // When a skill tool returned a shape delta, layer it onto the effective shape and
                 // re-resolve so subsequent iterations see the updated model/effort/tool restrictions.
@@ -926,7 +942,7 @@ public sealed partial class AgentLoop : IAgentLoop
         }
     }
 
-    private async Task<(List<ContentBlock> Blocks, TurnShape? ShapeDelta)> RunToolsAsync(
+    private async Task<(List<ContentBlock> Blocks, TurnShape? ShapeDelta, string? AbortReason)> RunToolsAsync(
         IReadOnlyList<ToolUseBlock> toolUses,
         ToolActivityContext activity,
         IAgentSink sink,
@@ -935,6 +951,7 @@ public sealed partial class AgentLoop : IAgentLoop
     {
         var results = new List<ContentBlock>();
         TurnShape? accumulatedDelta = null;
+        string? abortReason = null;
         var identities = toolUses.Select(toolUse => activity.ForCall(toolUse.Id)).ToArray();
         var context = new ToolContext(this.options.WorkingDirectory)
         {
@@ -1034,6 +1051,27 @@ public sealed partial class AgentLoop : IAgentLoop
                         IsError: true);
                     sink.OnToolResult(identity, toolUse.Name, blocked, ToolCallStatus.Failed);
                     results.Add(CreateToolResultBlock(identity, blocked, ToolCallStatus.Failed));
+
+                    // continue:false is the protocol's hard stop. Record the blocked call, then
+                    // skip the rest of the batch — the run ends instead of handing the block back
+                    // to the model for another attempt.
+                    if (hookResult.Abort)
+                    {
+                        abortReason = hookResult.Message ?? "hook requested stop";
+                        for (var skippedIndex = i + 1; skippedIndex < toolUses.Count; skippedIndex++)
+                        {
+                            var skipped = toolUses[skippedIndex];
+                            var skippedIdentity = identities[skippedIndex];
+                            var skippedResult = new ToolResult(
+                                "Skipped: a hook aborted the run before this tool started.",
+                                IsError: true);
+                            sink.OnToolResult(skippedIdentity, skipped.Name, skippedResult, ToolCallStatus.Skipped);
+                            results.Add(CreateToolResultBlock(skippedIdentity, skippedResult, ToolCallStatus.Skipped));
+                        }
+
+                        break;
+                    }
+
                     continue;
                 }
 
@@ -1313,7 +1351,7 @@ public sealed partial class AgentLoop : IAgentLoop
             }
         }
 
-        return (results, accumulatedDelta);
+        return (results, accumulatedDelta, abortReason);
     }
 
     /// <summary>

@@ -273,6 +273,59 @@ public sealed class AgentResponseHookTests : IDisposable
     // =========================================================================
 
     [Fact]
+    public async Task AgentResponse_fires_with_empty_response_on_a_tool_only_turn()
+    {
+        // The model calls a tool then finishes with no text at all: AgentResponse is an audit
+        // surface, so it must still fire — with an empty response — rather than be skipped.
+        var recorded = new List<string>();
+        var runner = new UserHookRunner(
+            [new UserHook("AgentResponse", "cmd")],
+            execOverride: (_, payload, _) =>
+            {
+                using var doc = JsonDocument.Parse(payload);
+                recorded.Add(doc.RootElement.GetProperty("response").GetString() ?? "<null>");
+                return Task.FromResult((0, "{}"));
+            });
+
+        var toolTurn = new[]
+        {
+            AssistantStreamEvent.Tool(new ToolUseBlock("tu_1", "echo", "{}")),
+            AssistantStreamEvent.Finished("tool_use"),
+        };
+        var silentEnd = new[] { AssistantStreamEvent.Finished("end_turn") };
+
+        var loop = new AgentLoop(
+            new ScriptedClient(toolTurn, silentEnd),
+            new ToolRegistry([new SilentEchoTool()]),
+            new AllowAllPermissionPrompt(),
+            Options(),
+            userHooks: runner);
+
+        var history = new List<ChatMessage> { ChatMessage.UserText("hi") };
+        await loop.RunAsync(history, new RecordingAgentSink(), CancellationToken.None);
+
+        Assert.Equal([string.Empty], recorded);
+    }
+
+    /// <summary>A trivial tool so the scripted tool-only turn has something to execute.</summary>
+    private sealed class SilentEchoTool : ITool
+    {
+        public string Name => "echo";
+
+        public string Description => "echo";
+
+        public string InputSchemaJson => "{\"type\":\"object\"}";
+
+        public bool IsReadOnly => true;
+
+        public Task<ToolResult> ExecuteAsync(
+            JsonElement input,
+            ToolContext context,
+            CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ToolResult("ok"));
+    }
+
+    [Fact]
     public async Task DisplayContent_changes_display_and_leaves_history_untouched()
     {
         var runner = new UserHookRunner(

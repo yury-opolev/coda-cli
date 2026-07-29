@@ -45,10 +45,10 @@ public static class PluginHookLoader
 
         foreach (var relativePath in hookPaths)
         {
-            var resolved = Path.GetFullPath(Path.Combine(plugin.Directory, relativePath));
+            var resolved = PluginResourceLoader.ResolvePath(plugin, relativePath);
 
             // Containment check: hook files must live inside the plugin directory.
-            if (!IsContained(resolved, plugin.Directory))
+            if (!PluginResourceLoader.IsContained(resolved, plugin.Directory))
             {
                 logger?.LogError(
                     "Plugin '{Plugin}': hook path '{Path}' escapes the plugin directory — skipped.",
@@ -202,14 +202,5 @@ public static class PluginHookLoader
         return pluginDir.StartsWith(workspacePath, StringComparison.OrdinalIgnoreCase)
             ? HookScope.Project
             : HookScope.User;
-    }
-
-    private static bool IsContained(string resolvedPath, string pluginDirectory)
-    {
-        var normalizedDir = Path.GetFullPath(pluginDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-            Path.DirectorySeparatorChar;
-        var normalizedPath = Path.GetFullPath(resolvedPath);
-        return normalizedPath.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase);
     }
 }

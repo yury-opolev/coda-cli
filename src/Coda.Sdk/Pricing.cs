@@ -53,9 +53,11 @@ public static class Pricing
     /// Estimates the USD cost, preferring catalog pricing (models.dev) when present
     /// and falling back to the built-in price table per rate that is missing.
     /// Cache reads are billed at <c>cacheReadRate</c> (catalog's <c>CacheReadPerMTok</c> when supplied,
-    /// otherwise <c>baseInRate * 0.10</c>). Cache writes use the catalog's <c>CacheWritePerMTok</c>
-    /// for the 5-minute tier, and <c>baseInRate * 2.00</c> for the 1-hour tier (the catalog carries
-    /// only one write rate). Uncached input tokens are billed at the base input rate.
+    /// otherwise <c>baseInRate * 0.10</c>). The catalog carries a single write rate, which is the
+    /// 5-minute tier; the 1-hour tier is derived from it by the ratio of the two multipliers so both
+    /// tiers honour the same pricing source. When the catalog has no write rate, each tier falls
+    /// back to its own multiplier over the base input rate. Uncached input tokens are billed at the
+    /// base input rate.
     /// </summary>
     public static decimal EstimateUsd(string model, TokenUsage usage, CatalogModel? catalog)
     {
@@ -72,7 +74,9 @@ public static class Pricing
         var cacheReadFallback = IsOpenAiFamily(model) ? CacheReadOpenAiMultiplier : CacheReadMultiplier;
         var cacheReadRate = catalog?.CacheReadPerMTok ?? baseInRate * cacheReadFallback;
         var cacheWrite5mRate = catalog?.CacheWritePerMTok ?? baseInRate * CacheWrite5mMultiplier;
-        var cacheWrite1hRate = baseInRate * CacheWrite1hMultiplier;
+        var cacheWrite1hRate = catalog?.CacheWritePerMTok is { } catalogWriteRate
+            ? catalogWriteRate * (CacheWrite1hMultiplier / CacheWrite5mMultiplier)
+            : baseInRate * CacheWrite1hMultiplier;
 
         return (baseInRate * usage.InputTokens
             + cacheReadRate * usage.CacheReadTokens

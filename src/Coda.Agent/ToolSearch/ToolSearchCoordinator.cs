@@ -33,10 +33,18 @@ public sealed class ToolSearchCoordinator
     /// <list type="bullet">
     ///   <item><see cref="ToolSearchMode.Standard"/> → always false.</item>
     ///   <item><see cref="ToolSearchMode.Tst"/> → always true.</item>
-    ///   <item><see cref="ToolSearchMode.TstAuto"/> → true only when the total character size of all
-    ///     deferred tools meets or exceeds <c>autoPercent</c>% of the context window (char-based heuristic).</item>
+    ///   <item><see cref="ToolSearchMode.TstAuto"/> → true only when the total character size of the
+    ///     registry's tool definitions meets or exceeds <c>autoPercent</c>% of the context window
+    ///     (char-based heuristic).</item>
     /// </list>
     /// </summary>
+    /// <remarks>
+    /// The TstAuto measure covers <em>every</em> tool definition, not only the deferrable ones.
+    /// Always-inline tools consume the same context window — the <c>skill</c> tool's catalogue
+    /// description alone can reach ~8 000 characters — so excluding them would let a large inline
+    /// footprint sit under the threshold while the deferrable tools it is competing with stay on
+    /// the wire. Deferred tools remain the only ones that can actually be reclaimed.
+    /// </remarks>
     private bool ShouldDeferNow(ToolRegistry registry)
     {
         switch (this.mode)
@@ -47,11 +55,10 @@ public sealed class ToolSearchCoordinator
                 return true;
             case ToolSearchMode.TstAuto:
             {
-                var deferredChars = registry.All
-                    .Where(DeferredTools.IsDeferred)
+                var definitionChars = registry.All
                     .Sum(t => t.Name.Length + t.Description.Length + t.InputSchemaJson.Length);
                 var thresholdChars = (int)Math.Floor(this.contextWindowTokens * (this.autoPercent / 100.0) * CharsPerToken);
-                return deferredChars >= thresholdChars;
+                return definitionChars >= thresholdChars;
             }
             default:
                 return false;

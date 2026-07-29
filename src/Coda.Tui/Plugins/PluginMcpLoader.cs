@@ -36,9 +36,9 @@ public static class PluginMcpLoader
 
             foreach (var relativePath in mcpPaths)
             {
-                var resolved = Path.GetFullPath(Path.Combine(plugin.Directory, relativePath));
+                var resolved = PluginResourceLoader.ResolvePath(plugin, relativePath);
 
-                if (!IsContained(resolved, plugin.Directory))
+                if (!PluginResourceLoader.IsContained(resolved, plugin.Directory))
                 {
                     logger?.LogError(
                         "Plugin '{Plugin}': MCP server path '{Path}' escapes the plugin directory — skipped.",
@@ -54,34 +54,16 @@ public static class PluginMcpLoader
                     continue;
                 }
 
-                string json;
-                try
+                // Validate the JSON explicitly: McpConfig.Parse silently returns empty on
+                // malformed JSON, so pre-validating is what produces the diagnostic log entry.
+                using var doc = PluginResourceLoader.TryReadJsonObject(
+                    resolved, plugin.Name, "MCP server", logger);
+                if (doc is null)
                 {
-                    json = File.ReadAllText(resolved);
-                }
-                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-                {
-                    logger?.LogError(
-                        "Plugin '{Plugin}': failed to read MCP server file '{Path}': {Message}",
-                        plugin.Name, resolved, ex.Message);
                     continue;
                 }
 
-                // Validate JSON explicitly: McpConfig.Parse silently returns empty on
-                // malformed JSON, so we pre-validate to produce a diagnostic log entry.
-                try
-                {
-                    using var _ = JsonDocument.Parse(json);
-                }
-                catch (JsonException ex)
-                {
-                    logger?.LogError(
-                        "Plugin '{Plugin}': MCP server file '{Path}' contains invalid JSON: {Message}",
-                        plugin.Name, resolved, ex.Message);
-                    continue;
-                }
-
-                var servers = McpConfig.Parse(json);
+                var servers = McpConfig.Parse(doc.RootElement.GetRawText());
                 foreach (var (name, config) in servers)
                 {
                     result[name] = (config, plugin.Name);
@@ -90,14 +72,5 @@ public static class PluginMcpLoader
         }
 
         return result;
-    }
-
-    private static bool IsContained(string resolvedPath, string pluginDirectory)
-    {
-        var normalizedDir = Path.GetFullPath(pluginDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-            Path.DirectorySeparatorChar;
-        var normalizedPath = Path.GetFullPath(resolvedPath);
-        return normalizedPath.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase);
     }
 }

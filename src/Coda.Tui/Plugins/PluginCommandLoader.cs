@@ -28,18 +28,16 @@ public static class PluginCommandLoader
         if (!plugin.IsEnabled) return [];
 
         var relativePath = plugin.Manifest?.Commands ?? "commands";
-        var commandsDir = Path.GetFullPath(Path.Combine(plugin.Directory, relativePath));
+        var commandsDir = PluginResourceLoader.ResolvePath(plugin, relativePath);
 
         // Containment guard: the commands directory must sit inside the plugin directory.
-        if (!IsContained(commandsDir, plugin.Directory))
+        if (!PluginResourceLoader.IsContained(commandsDir, plugin.Directory))
         {
             logger?.LogError(
                 "Plugin '{Plugin}': commands path '{Path}' escapes the plugin directory — skipped.",
                 plugin.Name, relativePath);
             return [];
         }
-
-        if (!Directory.Exists(commandsDir)) return [];
 
         return LoadFromDirectory(commandsDir, plugin.Name, logger);
     }
@@ -53,46 +51,16 @@ public static class PluginCommandLoader
     internal static IReadOnlyList<SkillDefinition> LoadFromDirectory(
         string commandsDir,
         string pluginName,
-        ILogger? logger = null)
-    {
-        var result = new List<SkillDefinition>();
-
-        foreach (var file in Directory.EnumerateFiles(commandsDir, "*.md", SearchOption.TopDirectoryOnly))
-        {
-            try
-            {
-                var content = File.ReadAllText(file);
-                var fallbackName = Path.GetFileNameWithoutExtension(file);
-                var definition = SkillLoader.ParseSkillFile(content, fallbackName, file, SkillOrigin.Plugin);
-                result.Add(definition);
-            }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-            {
-                logger?.LogError(
-                    "Plugin '{Plugin}': failed to read command file '{File}': {Message}",
-                    pluginName, file, ex.Message);
-            }
-            catch (Exception ex)
-            {
-                logger?.LogError(
-                    "Plugin '{Plugin}': failed to parse command file '{File}': {Message}",
-                    pluginName, file, ex.Message);
-            }
-        }
-
-        return result;
-    }
-
-    private static bool IsContained(string resolvedPath, string pluginDirectory)
-    {
-        var normalizedDir = Path.GetFullPath(pluginDirectory)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-            Path.DirectorySeparatorChar;
-        // Append separator to the candidate path so a plugin dir of "C:\a" does not match
-        // the sibling "C:\a-evil" (which would also start with "C:\a").
-        var normalizedPath = Path.GetFullPath(resolvedPath)
-            .TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar) +
-            Path.DirectorySeparatorChar;
-        return normalizedPath.StartsWith(normalizedDir, StringComparison.OrdinalIgnoreCase);
-    }
+        ILogger? logger = null) =>
+        PluginResourceLoader.LoadDirectory<SkillDefinition>(
+            commandsDir,
+            "*.md",
+            pluginName,
+            "command",
+            file => SkillLoader.ParseSkillFile(
+                File.ReadAllText(file),
+                Path.GetFileNameWithoutExtension(file),
+                file,
+                SkillOrigin.Plugin),
+            logger);
 }

@@ -796,22 +796,19 @@ public sealed class MarketplaceManager
                 if (MarketplaceNameValidator.IsValidSha(gitRef))
                 {
                     process.StartInfo.ArgumentList.Add("--no-checkout");
-                    process.StartInfo.ArgumentList.Add(gitUrl);
-                    process.StartInfo.ArgumentList.Add(targetDir);
                 }
                 else
                 {
                     process.StartInfo.ArgumentList.Add("--branch");
                     process.StartInfo.ArgumentList.Add(gitRef);
-                    process.StartInfo.ArgumentList.Add(gitUrl);
-                    process.StartInfo.ArgumentList.Add(targetDir);
                 }
             }
-            else
-            {
-                process.StartInfo.ArgumentList.Add(gitUrl);
-                process.StartInfo.ArgumentList.Add(targetDir);
-            }
+
+            // End-of-options separator: without it a URL beginning with '-' would be
+            // parsed by git as an option rather than as the repository to clone.
+            process.StartInfo.ArgumentList.Add("--");
+            process.StartInfo.ArgumentList.Add(gitUrl);
+            process.StartInfo.ArgumentList.Add(targetDir);
 
             process.Start();
 
@@ -889,6 +886,10 @@ public sealed class MarketplaceManager
             };
             process.StartInfo.ArgumentList.Add("checkout");
             process.StartInfo.ArgumentList.Add(sha);
+
+            // Trailing end-of-options separator: disambiguates the revision from a
+            // pathspec. A leading '--' would instead make git treat the SHA as a path.
+            process.StartInfo.ArgumentList.Add("--");
 
             process.Start();
             var stderrTask = process.StandardError.ReadToEndAsync(ct);
