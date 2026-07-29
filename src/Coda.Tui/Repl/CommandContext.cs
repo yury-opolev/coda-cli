@@ -137,6 +137,12 @@ public sealed class CommandContext
     internal Coda.Tui.Mcp.IMcpManagementService? McpManagement { get; set; }
 
     /// <summary>
+    /// Plugin state store for enable/disable overrides and install metadata.
+    /// Null in contexts that do not need plugin state management.
+    /// </summary>
+    public Coda.Tui.Plugins.PluginStateStore? PluginState { get; set; }
+
+    /// <summary>
     /// Hook management service for the current session, used by <c>/hooks</c>.
     /// Null in contexts where no hooks are configured or no management surface is needed.
     /// </summary>

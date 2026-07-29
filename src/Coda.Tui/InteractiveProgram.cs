@@ -289,12 +289,17 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp),
         ];
 
+        // Construct the plugin state store once — shared across all plugin commands and skill loading.
+        var userCodaDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
+        var pluginStateStore = new Coda.Tui.Plugins.PluginStateStore(userCodaDir);
+
         // Load skills once at session start and build the skill tool (model-invocable skills only).
         // The session state is shared between the skill tool and the reattach callback so compaction
         // re-injects exactly the bodies the model loaded in this session.
         var skillState = new Coda.Tui.Skills.SkillSessionState();
         var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
-            Coda.Tui.Skills.SkillLoader.Load(cwd), skillState, cwd);
+            Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore), skillState, cwd);
 
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
         {
@@ -306,6 +311,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         context.ExtraToolsProvider = agentToolsProvider;
         context.Mcp = mcp;
         context.CredentialStore = store;
+        context.PluginState = pluginStateStore;
         var mcpManagement = new McpManagementService(
             cwd,
             userMcpDir: null,

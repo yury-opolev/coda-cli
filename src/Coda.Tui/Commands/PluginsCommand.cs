@@ -26,7 +26,7 @@ public sealed class PluginsCommand : ISlashCommand
 
     public Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
-        var plugins = PluginLoader.Load(context.Session.WorkingDirectory);
+        var plugins = PluginLoader.Load(context.Session.WorkingDirectory, stateStore: context.PluginState);
 
         if (plugins.Count == 0)
         {

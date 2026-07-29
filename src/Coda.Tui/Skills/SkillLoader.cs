@@ -27,7 +27,8 @@ public static partial class SkillLoader
         string workingDirectory,
         string? userSkillsDir = null,
         string? claudeSkillsDir = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        Coda.Tui.Plugins.PluginStateStore? pluginStateStore = null)
     {
         var userBase = userSkillsDir
             ?? Environment.GetEnvironmentVariable("CODA_USER_SKILLS_DIR")
@@ -62,7 +63,7 @@ public static partial class SkillLoader
         }
 
         // 2. Plugin skills (override user skills; project skills override plugins).
-        var pluginSkillDirs = PluginLoader.SkillDirsFor(workingDirectory, userBase);
+        var pluginSkillDirs = PluginLoader.SkillDirsFor(workingDirectory, userBase, pluginStateStore);
         foreach (var pluginSkillsDir in pluginSkillDirs)
         {
             foreach (var skill in LoadFromDirectory(pluginSkillsDir, SkillOrigin.Plugin, logger))
