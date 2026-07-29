@@ -95,6 +95,25 @@ internal sealed class TranscriptLayoutIndex
     /// <summary>Number of blocks in the transcript.</summary>
     public int BlockCount => this.blocks.Length;
 
+    /// <summary>The most recent <see cref="UserTranscriptBlock"/> together with the global row range its
+    /// CONTENT occupies, or null when the transcript holds none. Used to pin the prompt driving the current
+    /// turn. The block's trailing synthetic separator row is excluded: it is blank, so counting it would
+    /// suppress the pin while only an empty row of the prompt is still on screen.</summary>
+    public (UserTranscriptBlock Block, int FirstRow, int EndRowExclusive)? LastUserBlock()
+    {
+        for (var i = this.blocks.Length - 1; i >= 0; i--)
+        {
+            if (this.blocks[i] is UserTranscriptBlock user)
+            {
+                var first = this.prefix[i];
+                var contentRows = Math.Max(0, this.rowCounts[i] - 1);
+                return (user, first, first + contentRows);
+            }
+        }
+
+        return null;
+    }
+
     /// <summary>The active wrap width.</summary>
     public int ActiveWidth => this.width;
 

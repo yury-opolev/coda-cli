@@ -48,7 +48,8 @@ internal sealed class InlineTuiShell(
     IPrivateBrowserResolver? privateBrowserResolver = null,
     IUiPromptService? linkPromptService = null,
     IClipboardImageReader? imageReader = null,
-    Func<ClipboardImage, string?>? imagePaste = null)
+    Func<ClipboardImage, string?>? imagePaste = null,
+    TranscriptGlyphs? transcriptGlyphs = null)
     : FullscreenTuiShell(
         app,
         controller,
@@ -73,7 +74,8 @@ internal sealed class InlineTuiShell(
         privateBrowserResolver: privateBrowserResolver,
         linkPromptService: linkPromptService,
         imageReader: imageReader,
-        imagePaste: imagePaste)
+        imagePaste: imagePaste,
+        transcriptGlyphs: transcriptGlyphs)
 {
     /// <summary>
     /// The fewest rows the inline region can occupy: header (1), operational (1), navigation (1),

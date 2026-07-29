@@ -30,6 +30,7 @@ internal sealed class VirtualizedTranscriptView : View
     private readonly TranscriptLayoutIndex index;
     private readonly TranscriptViewportState viewport = new();
     private readonly HashSet<Guid> expanded = new();
+    private readonly TranscriptGlyphs glyphs;
 
     private int currentWidth = DefaultWidth;
     private Guid? selectedBlockId;
@@ -53,13 +54,25 @@ internal sealed class VirtualizedTranscriptView : View
     private TgAttribute? linkAttributeCache;
     private TgAttribute? linkDeceptiveAttributeCache;
 
+    // Pin state tracked between draw and mouse handling.
+    private bool pinVisible;
+
+    // Composed-pin memo. The pin is drawn on every frame while a turn streams, and the source prompt can be
+    // an arbitrarily large paste, so the composition is cached against the (immutable) block instance and the
+    // width it was composed for. A replaced block is a new instance, which invalidates the memo by reference.
+    private UserTranscriptBlock? pinMemoBlock;
+    private int pinMemoWidth = -1;
+    private string? pinMemoText;
+
     public VirtualizedTranscriptView(
         IApplication app,
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null,
-        TuiTheme? theme = null)
+        TuiTheme? theme = null,
+        TranscriptGlyphs? glyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.theme = theme ?? CodaThemes.Current.Tui;
+        this.glyphs = glyphs ?? TranscriptGlyphs.Unicode;
         this.index = new TranscriptLayoutIndex(
             formatter ?? TranscriptBlockFormatter.Format,
             enableIncrementalAssistant: formatter is null);
@@ -146,6 +159,16 @@ internal sealed class VirtualizedTranscriptView : View
     internal bool ScrollbarDraggingForTest => this.scrollbarDragging;
 
     internal bool MouseCaptureActiveForTest => this.dragging || this.scrollbarDragging;
+
+    /// <summary>The active work callback; null is treated as false (no active work).</summary>
+    internal Func<bool>? HasActiveWork { get; set; }
+
+    /// <summary>The pin text drawn at screen row 0 during the last <see cref="OnDrawingContent"/> call, or
+    /// null when no pin was drawn. Exposed for tests.</summary>
+    internal string? PinnedPromptForTest { get; private set; }
+
+    /// <summary>Total number of times the prompt pin was drawn. Exposed for tests.</summary>
+    internal int PinnedPromptDrawCount { get; private set; }
 
     internal void ScrollToRowForTest(int row) =>
         this.viewport.ScrollToRow(row, this.index.AnchorAt(row));
@@ -393,8 +416,82 @@ internal sealed class VirtualizedTranscriptView : View
             this.DrawRow(row, screenRow);
         }
 
+        // Draw the prompt pin (screen row 0) when active work is running and the pinned prompt has
+        // scrolled entirely above the viewport. Must happen after the normal row loop so it paints on
+        // top, and before DrawScrollbar so the scrollbar still sits in the rightmost column.
+        this.DrawPin();
+
         this.DrawScrollbar();
         return true;
+    }
+
+    /// <summary>
+    /// Paints the one-line prompt pin at screen row 0 when the conditions defined by
+    /// <see cref="TranscriptPin.ShouldShow"/> are met.
+    /// </summary>
+    private void DrawPin()
+    {
+        var contentWidth = this.ContentWidth;
+        if (this.Viewport.Height <= 0 || contentWidth <= 0)
+        {
+            this.pinVisible = false;
+            this.PinnedPromptForTest = null;
+            return;
+        }
+
+        var pinned = this.index.LastUserBlock();
+        var show = TranscriptPin.ShouldShow(
+            this.HasActiveWork?.Invoke() == true,
+            pinned?.FirstRow,
+            pinned?.EndRowExclusive ?? 0,
+            this.viewport.TopRow,
+            this.Viewport.Height);
+
+        if (!show)
+        {
+            this.pinVisible = false;
+            this.PinnedPromptForTest = null;
+            return;
+        }
+
+        var text = this.ComposePin(pinned!.Value.Block, contentWidth);
+        this.PinnedPromptForTest = text;
+
+        if (text is null)
+        {
+            this.pinVisible = false;
+            return;
+        }
+
+        // Fill the full width with the user-block attribute so it reads as its own surface.
+        var attr = this.AttributeFor(TranscriptRole.User);
+        this.SetAttribute(attr);
+        this.Move(0, 0);
+        this.AddStr(new string(' ', contentWidth));
+
+        // Paint the pin text over the background.
+        this.Move(0, 0);
+        this.AddStr(text);
+
+        this.pinVisible = true;
+        this.PinnedPromptDrawCount++;
+    }
+
+    /// <summary>
+    /// The composed pin text for <paramref name="block"/> at <paramref name="contentWidth"/>, reusing the
+    /// previous composition when neither has changed. Composition scans and sanitizes the submitted prompt,
+    /// which is unbounded in size, so it must not run once per frame while a turn streams.
+    /// </summary>
+    private string? ComposePin(UserTranscriptBlock block, int contentWidth)
+    {
+        if (!ReferenceEquals(block, this.pinMemoBlock) || contentWidth != this.pinMemoWidth)
+        {
+            this.pinMemoText = TranscriptPin.Compose(block.Text, contentWidth, this.glyphs);
+            this.pinMemoBlock = block;
+            this.pinMemoWidth = contentWidth;
+        }
+
+        return this.pinMemoText;
     }
 
     /// <summary>
@@ -658,6 +755,20 @@ internal sealed class VirtualizedTranscriptView : View
         if (mouse.Flags.HasFlag(MouseFlags.WheeledDown))
         {
             this.ScrollBy(3);
+            return true;
+        }
+
+        // The pin row (screen row 0) is inert chrome when visible: consume fresh presses so neither
+        // selection nor expansion begins on the hidden content underneath. An active selection still wins,
+        // so copy-on-click keeps working uniformly on every row. Wheel events (handled above) are
+        // deliberately not blocked so scrolling still works while the pointer is over the pin.
+        if (this.pinVisible &&
+            local.Y == 0 &&
+            !this.dragging &&
+            !this.selection.HasSelection &&
+            mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
+            !mouse.Flags.HasFlag(MouseFlags.PositionReport))
+        {
             return true;
         }
 

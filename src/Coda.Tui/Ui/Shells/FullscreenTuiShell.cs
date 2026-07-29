@@ -53,7 +53,8 @@ internal class FullscreenTuiShell(
     IPrivateBrowserResolver? privateBrowserResolver = null,
     IUiPromptService? linkPromptService = null,
     IClipboardImageReader? imageReader = null,
-    Func<ClipboardImage, string?>? imagePaste = null)
+    Func<ClipboardImage, string?>? imagePaste = null,
+    TranscriptGlyphs? transcriptGlyphs = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -140,7 +141,7 @@ internal class FullscreenTuiShell(
         this.header.Width = Dim.Fill();
         this.header.Height = 1;
 
-        this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter);
+        this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter, glyphs: transcriptGlyphs);
         this.transcript.TranscriptScrolled += this.RefreshHeaderForViewport;
         this.BindTranscriptInput(this.transcript);
         this.transcript.X = 0;

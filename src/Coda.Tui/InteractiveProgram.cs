@@ -660,7 +660,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 privateBrowserResolver: DefaultPrivateBrowserResolver.Instance,
                 linkPromptService: actorPrompts,
                 imageReader: clipboardImageReader,
-                imagePaste: imagePaste);
+                imagePaste: imagePaste,
+                transcriptGlyphs: transcriptGlyphs);
 
             // Route /image (and any command staging an image) into this shell's live composer draft. Dispatch
             // is serialized by the controller, so a mode switch never leaves this pointing at a dead shell.

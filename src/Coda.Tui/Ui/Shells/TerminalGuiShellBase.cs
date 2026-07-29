@@ -437,6 +437,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         transcript.CopyRequested += this.HandleTranscriptCopyRequested;
         transcript.LinkActivated += this.HandleTranscriptLinkActivated;
         transcript.LinkContextMenuRequested += this.HandleTranscriptLinkContextMenuRequested;
+        transcript.HasActiveWork = this.hasActiveWork;
     }
 
     /// <summary>Unsubscribes a transcript previously bound with <see cref="BindTranscriptInput"/>.</summary>
@@ -447,6 +448,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         transcript.CopyRequested -= this.HandleTranscriptCopyRequested;
         transcript.LinkActivated -= this.HandleTranscriptLinkActivated;
         transcript.LinkContextMenuRequested -= this.HandleTranscriptLinkContextMenuRequested;
+        transcript.HasActiveWork = null;
     }
 
     /// <summary>Reconciles transcript presentation between two applied snapshots.</summary>
