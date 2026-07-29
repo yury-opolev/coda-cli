@@ -376,6 +376,77 @@ public sealed class HookTrustTests : IDisposable
     }
 
     // =========================================================================
+    // I2: Plugin-origin user-scope hooks require trust regardless of scope
+    // =========================================================================
+
+    [Fact]
+    public async Task UserScopedPluginHook_blocked_headless()
+    {
+        // A hook contributed by a third-party plugin is not the same as one the user
+        // authored in their own settings, even if both live under the user's home directory.
+        // PluginOrigin marks this distinction: plugin-origin hooks must go through the
+        // content-trust check regardless of scope.
+        var store = new HookTrustStore(this.tempDir);
+        var guard = new HookTrustGuard(
+            store,
+            projectPath: Path.Combine(this.tempDir, "p_plugin_origin"),
+            promptCallback: null); // headless → refuses
+
+        var hook = new UserHook("PreToolUse", "check.sh", Scope: HookScope.User,
+            PluginOrigin: ("evil-plugin", "1.0.0"));
+        var canRun = await guard.CanRunAsync(hook, CancellationToken.None);
+
+        Assert.False(canRun); // plugin-origin user hooks are not implicitly trusted
+    }
+
+    [Fact]
+    public async Task UserScopedPluginHook_trusted_after_interactive_grant()
+    {
+        // After the fix the guard must prompt for plugin-origin user hooks and
+        // persist the decision when the user approves.
+        var projectPath = Path.Combine(this.tempDir, "p_plugin_origin_interactive");
+        var store = new HookTrustStore(this.tempDir);
+        var prompted = 0;
+        var guard = new HookTrustGuard(
+            store,
+            projectPath: projectPath,
+            promptCallback: (_, _) => { prompted++; return Task.FromResult(true); });
+
+        var hook = new UserHook("PreToolUse", "check.sh", Scope: HookScope.User,
+            PluginOrigin: ("my-plugin", "1.0.0"));
+        var canRun = await guard.CanRunAsync(hook, CancellationToken.None);
+
+        Assert.True(canRun);
+        Assert.Equal(1, prompted);
+        // Decision must be persisted so the next session skips the prompt.
+        Assert.True(store.IsTrusted(projectPath, HookContentHash.Compute(hook)));
+    }
+
+    [Fact]
+    public async Task UserScopedNonPluginHook_still_trusted_implicitly()
+    {
+        // User-authored (non-plugin) user-scope hooks must remain implicitly trusted —
+        // the fix must not change their behaviour.
+        var store = new HookTrustStore(this.tempDir);
+        var promptedCount = 0;
+        var guard = new HookTrustGuard(
+            store,
+            projectPath: Path.Combine(this.tempDir, "p_user_authored"),
+            promptCallback: (_, _) =>
+            {
+                promptedCount++;
+                return Task.FromResult(true);
+            });
+
+        var hook = new UserHook("PreToolUse", "check.sh", Scope: HookScope.User);
+        // PluginOrigin is null → user-authored hook
+        var canRun = await guard.CanRunAsync(hook, CancellationToken.None);
+
+        Assert.True(canRun);
+        Assert.Equal(0, promptedCount); // still no prompt for user-authored hooks
+    }
+
+    // =========================================================================
     // L4: Denial caching — the prompt fires at most once per hook per session
     // =========================================================================
 

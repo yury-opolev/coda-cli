@@ -64,11 +64,17 @@ public static class PluginComponentComposer
     /// </param>
     /// <param name="userCodaDir">Override for the user <c>.coda</c> directory.</param>
     /// <param name="logger">Optional diagnostic logger.</param>
+    /// <param name="trustStore">
+    /// Optional trust store used to enforce workspace trust for project-scoped plugins and
+    /// per-class approval for all plugins. When <see langword="null"/>, no trust filtering is
+    /// applied (backward-compatible default used by tests and older callers).
+    /// </param>
     public static PluginComposition Compose(
         IReadOnlyList<PluginInfo> plugins,
         string workingDirectory,
         string? userCodaDir = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        PluginTrustStore? trustStore = null)
     {
         ArgumentNullException.ThrowIfNull(plugins);
         ArgumentException.ThrowIfNullOrWhiteSpace(workingDirectory);
@@ -80,50 +86,94 @@ public static class PluginComponentComposer
         {
             if (!plugin.IsEnabled) continue;
 
-            // Agents (M1: reject definitions that shadow a built-in type)
-            try
+            // ── Trust gate ────────────────────────────────────────────────
+            // When a trust store is provided, enforce workspace trust for project-scoped
+            // plugins and per-class approvals for all plugins.
+            PluginTrustFilter? trustFilter = null;
+            if (trustStore is not null)
             {
-                foreach (var definition in PluginAgentLoader.Load(plugin, logger))
+                trustFilter = BuildTrustFilter(plugin, workingDirectory, trustStore, logger);
+                if (trustFilter.BlocksAll)
                 {
-                    if (BuiltInAgents.IsBuiltInType(definition.Type))
-                    {
-                        logger?.LogWarning(
-                            "Plugin '{Plugin}': agent type '{Type}' collides with a built-in agent type " +
-                            "and will be ignored. Built-in agent types cannot be overridden by plugins.",
-                            plugin.Name, definition.Type);
-                    }
-                    else
-                    {
-                        agents.Add(definition);
-                    }
+                    // Project-scoped plugin without workspace trust; skip entirely.
+                    logger?.LogWarning(
+                        "Plugin '{Plugin}': skipped — workspace is not trusted. " +
+                        "Run interactively to grant workspace trust.",
+                        plugin.Name);
+                    continue;
                 }
             }
-            catch (Exception ex)
+
+            // Agents (M1: reject definitions that shadow a built-in type)
+            if (trustFilter is null || trustFilter.IsClassAllowed(PluginComponentClass.Subagent))
             {
-                logger?.LogError(
-                    "Plugin '{Plugin}': unexpected error loading agents: {Message}",
-                    plugin.Name, ex.Message);
+                try
+                {
+                    foreach (var definition in PluginAgentLoader.Load(plugin, logger))
+                    {
+                        if (BuiltInAgents.IsBuiltInType(definition.Type))
+                        {
+                            logger?.LogWarning(
+                                "Plugin '{Plugin}': agent type '{Type}' collides with a built-in agent type " +
+                                "and will be ignored. Built-in agent types cannot be overridden by plugins.",
+                                plugin.Name, definition.Type);
+                        }
+                        else
+                        {
+                            agents.Add(definition);
+                        }
+                    }
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogError(
+                        "Plugin '{Plugin}': unexpected error loading agents: {Message}",
+                        plugin.Name, ex.Message);
+                }
+            }
+            else
+            {
+                logger?.LogInformation(
+                    "Plugin '{Plugin}': subagents not loaded — class not approved.", plugin.Name);
             }
 
             // Hooks
-            try
+            if (trustFilter is null || trustFilter.IsClassAllowed(PluginComponentClass.Hook))
             {
-                var pluginHooks = PluginHookLoader.Load(plugin, workingDirectory, userCodaDir, logger);
-                hooks.AddRange(pluginHooks);
+                try
+                {
+                    var pluginHooks = PluginHookLoader.Load(plugin, workingDirectory, userCodaDir, logger);
+                    hooks.AddRange(pluginHooks);
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogError(
+                        "Plugin '{Plugin}': unexpected error loading hooks: {Message}",
+                        plugin.Name, ex.Message);
+                }
             }
-            catch (Exception ex)
+            else
             {
-                logger?.LogError(
-                    "Plugin '{Plugin}': unexpected error loading hooks: {Message}",
-                    plugin.Name, ex.Message);
+                logger?.LogInformation(
+                    "Plugin '{Plugin}': hooks not loaded — class not approved.", plugin.Name);
             }
         }
 
-        // MCP servers (merged across all plugins at once to handle shadowing).
+        // MCP servers — filter per-plugin by class approval before the merge pass.
+        var eligibleForMcp = trustStore is null
+            ? plugins
+            : plugins.Where(p =>
+            {
+                if (!p.IsEnabled) return false;
+                var filter = BuildTrustFilter(p, workingDirectory, trustStore, logger);
+                return !filter.BlocksAll && filter.IsClassAllowed(PluginComponentClass.McpServer);
+            }).ToList();
+
+        // MCP servers (merged across all eligible plugins to handle shadowing).
         IReadOnlyDictionary<string, (McpServerConfig Config, string PluginName)> mcpServers;
         try
         {
-            mcpServers = PluginMcpLoader.Load(plugins, logger);
+            mcpServers = PluginMcpLoader.Load(eligibleForMcp, logger);
         }
         catch (Exception ex)
         {
@@ -234,4 +284,87 @@ public static class PluginComponentComposer
 
     private static string ResolveSubDirectory(PluginInfo plugin, string relativePath) =>
         Path.GetFullPath(Path.Combine(plugin.Directory, relativePath));
+
+    // -------------------------------------------------------------------------
+    // Trust helpers
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Determines whether <paramref name="plugin"/> is installed inside the project's
+    /// <c>.coda/plugins/</c> directory (project-scoped) or elsewhere (user-scoped).
+    /// </summary>
+    public static bool IsProjectPlugin(PluginInfo plugin, string workingDirectory) =>
+        IsProjectScoped(plugin, workingDirectory);
+
+    private static bool IsProjectScoped(PluginInfo plugin, string workingDirectory)
+    {
+        var projectPluginsPath = Path.GetFullPath(
+            Path.Combine(workingDirectory, ".coda", "plugins"))
+            + Path.DirectorySeparatorChar;
+        var pluginDir = Path.GetFullPath(plugin.Directory) + Path.DirectorySeparatorChar;
+        return pluginDir.StartsWith(projectPluginsPath, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// <summary>
+    /// Builds a <see cref="PluginTrustFilter"/> for <paramref name="plugin"/> consulting
+    /// <paramref name="trustStore"/>. Returns a filter that blocks all components when the
+    /// plugin is project-scoped and the workspace is not trusted.
+    /// </summary>
+    private static PluginTrustFilter BuildTrustFilter(
+        PluginInfo plugin,
+        string workingDirectory,
+        PluginTrustStore trustStore,
+        ILogger? logger)
+    {
+        if (IsProjectScoped(plugin, workingDirectory))
+        {
+            if (!trustStore.IsWorkspaceTrusted(workingDirectory))
+            {
+                return PluginTrustFilter.BlockAll;
+            }
+        }
+
+        // User-installed or workspace-trusted project plugin: check per-class approvals.
+        var hash = PluginContentHash.Compute(plugin);
+
+        if (!trustStore.HasApprovalRecord(hash))
+        {
+            // No approval record. User plugins installed before Phase 7 are treated as
+            // all-approved for backward compatibility (the user explicitly installed them).
+            // Project-scoped plugins within a trusted workspace are treated the same way:
+            // they passed the workspace trust gate, so absence of a class record = all-approved.
+            return PluginTrustFilter.AllApproved;
+        }
+
+        var approvedClasses = trustStore.GetApprovedClasses(hash);
+        return new PluginTrustFilter(approvedClasses);
+    }
+}
+
+/// <summary>
+/// Captures the per-class approval state for a single plugin during composition.
+/// </summary>
+internal sealed class PluginTrustFilter
+{
+    /// <summary>A filter that blocks all components (workspace trust missing).</summary>
+    public static readonly PluginTrustFilter BlockAll = new(null);
+
+    /// <summary>A filter that allows all components (no approval record = backward compat).</summary>
+    public static readonly PluginTrustFilter AllApproved = new(
+        new HashSet<PluginComponentClass>(
+            Enum.GetValues<PluginComponentClass>()));
+
+    private readonly IReadOnlySet<PluginComponentClass>? _approved;
+
+    public PluginTrustFilter(IReadOnlySet<PluginComponentClass>? approved)
+    {
+        this._approved = approved;
+    }
+
+    /// <summary><see langword="true"/> when the entire plugin is blocked (workspace untrusted).</summary>
+    public bool BlocksAll => this._approved is null;
+
+    /// <summary>Returns <see langword="true"/> when <paramref name="cls"/> was approved.</summary>
+    public bool IsClassAllowed(PluginComponentClass cls) =>
+        this._approved is not null && this._approved.Contains(cls);
 }

@@ -93,7 +93,11 @@ public static class HeadlessRunner
 
         // Load and compose plugins for this working directory.
         var plugins = PluginLoader.Load(workingDirectory);
-        var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory);
+        // Construct trust store and refuse project-scoped plugins without workspace trust
+        // (headless: no interactive prompt, workspace trust must have been pre-granted).
+        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var pluginTrustStore = new PluginTrustStore(homeDir);
+        var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory, trustStore: pluginTrustStore);
         var pluginRegistry = pluginComposition.Agents.Count > 0
             ? new SubagentRegistry(pluginComposition.Agents)
             : null;
@@ -151,9 +155,12 @@ public static class HeadlessRunner
         }
 
         // Load skills and build the skill tool for headless runs as well.
+        // Gate external-origin skills with a null-callback gate (refuses unattended).
         var skillState = new Coda.Tui.Skills.SkillSessionState();
+        var skillOriginGate = new Coda.Tui.Skills.SkillOriginGate(skillState, promptCallback: null);
         var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
-            Coda.Tui.Skills.SkillLoader.Load(workingDirectory), skillState, workingDirectory);
+            Coda.Tui.Skills.SkillLoader.Load(workingDirectory), skillState, workingDirectory,
+            originGate: skillOriginGate);
         var allExtraTools = skillTool is not null
             ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, skillTool]
             : mcp.Tools;

@@ -19,13 +19,10 @@ namespace Coda.Tui.Skills;
 /// <see cref="CreateOrNull"/> to skip registration when no model-invocable skills exist.
 /// </para>
 /// <para>
-/// <strong>Trust gap (deferred):</strong> this tool auto-loads skill text from directories Coda
-/// does not own (<c>~/.claude/skills</c>, plugin directories, etc.) directly into the model's
-/// context without a permission prompt. This is intentional while <see cref="IsReadOnly"/> is
-/// <see langword="true"/>, but it means third-party skill content reaches the model silently.
-/// Origin-based trust gating (prompting the user before loading skills from external directories)
-/// is deferred to the Trust phase of the skills roadmap. Until then, callers must consider that
-/// model-invocable skills are an ambient injection vector for content Coda did not author.
+/// Skills whose <see cref="SkillDefinition.Origin"/> is <see cref="SkillOrigin.Claude"/> or
+/// <see cref="SkillOrigin.Plugin"/> require approval from the <see cref="SkillOriginGate"/>
+/// before the model may load their body. Explicit <c>/skill &lt;name&gt;</c> invocations by the
+/// user are not routed through this tool and are therefore never gated.
 /// </para>
 /// </remarks>
 public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
@@ -41,6 +38,7 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
     private readonly string _inputSchemaJson;
     private readonly string _description;
     private readonly ILogger _logger;
+    private readonly SkillOriginGate? _originGate;
 
     /// <summary>
     /// Initializes a new <see cref="SkillTool"/> with the provided <paramref name="modelInvocableSkills"/>
@@ -50,11 +48,17 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
     /// <param name="state">Per-session state that tracks loaded bodies and reattach content.</param>
     /// <param name="descriptionCap">Combined character cap for the description catalogue; injectable for tests.</param>
     /// <param name="logger">Logger for fork-degradation and consent-denial messages; null uses NullLogger.</param>
+    /// <param name="originGate">
+    /// Optional gate that controls whether the model may load skills from external origins
+    /// (<see cref="SkillOrigin.Claude"/> and <see cref="SkillOrigin.Plugin"/>). When
+    /// <see langword="null"/>, no origin gating is applied (backward-compatible default).
+    /// </param>
     public SkillTool(
         IReadOnlyList<SkillDefinition> modelInvocableSkills,
         SkillSessionState state,
         int descriptionCap = DefaultDescriptionCap,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        SkillOriginGate? originGate = null)
     {
         ArgumentNullException.ThrowIfNull(modelInvocableSkills);
         ArgumentNullException.ThrowIfNull(state);
@@ -62,6 +66,7 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
         this._skills = modelInvocableSkills;
         this._state = state;
         this._logger = logger ?? NullLogger.Instance;
+        this._originGate = originGate;
         this._inputSchemaJson = BuildSchema(modelInvocableSkills);
         this._description = BuildDescription(modelInvocableSkills, descriptionCap);
     }
@@ -92,12 +97,17 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
     /// </param>
     /// <param name="descriptionCap">Combined character cap for the description catalogue.</param>
     /// <param name="logger">Optional logger; null uses NullLogger.</param>
+    /// <param name="originGate">
+    /// Optional gate controlling whether the model may load skills from external origins.
+    /// See <see cref="SkillOriginGate"/>. When <see langword="null"/>, no origin gating is applied.
+    /// </param>
     public static SkillTool? CreateOrNull(
         IReadOnlyList<SkillDefinition> allSkills,
         SkillSessionState state,
         string? workingDirectory = null,
         int descriptionCap = DefaultDescriptionCap,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        SkillOriginGate? originGate = null)
     {
         ArgumentNullException.ThrowIfNull(allSkills);
         ArgumentNullException.ThrowIfNull(state);
@@ -108,7 +118,7 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
             .ToList();
 
         return modelInvocable.Count > 0
-            ? new SkillTool(modelInvocable, state, descriptionCap, logger)
+            ? new SkillTool(modelInvocable, state, descriptionCap, logger, originGate)
             : null;
     }
 
@@ -146,6 +156,22 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
         var body = (invokeArgs.Count > 0 || skill.Arguments.Count > 0)
             ? SkillArgumentBinder.Bind(skill.Body, skill.Arguments, invokeArgs)
             : skill.Body;
+
+        // ── Origin trust gate ──────────────────────────────────────────────
+        // Claude and Plugin origin skills require per-session approval before the model
+        // may load them. Project and User skills are trusted without a prompt.
+        if (this._originGate is not null)
+        {
+            var permitted = await this._originGate.MayLoadAsync(skill, cancellationToken)
+                .ConfigureAwait(false);
+            if (!permitted)
+            {
+                return new ToolResult(
+                    $"Skill '{skill.Name}' requires approval before the model may invoke it. " +
+                    $"Run /skill {skill.Name} to be prompted, or ask the user to approve it interactively.",
+                    IsError: false);
+            }
+        }
 
         // ── Directory consent ──────────────────────────────────────────────
         var directoryConsented = await this.ResolveDirectoryConsentAsync(

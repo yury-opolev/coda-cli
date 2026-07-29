@@ -21,6 +21,9 @@ public sealed class SkillSessionState
     private readonly Dictionary<string, string> _consentedSkills
         = new(StringComparer.OrdinalIgnoreCase);
 
+    private readonly HashSet<string> _originApprovedSkills
+        = new(StringComparer.OrdinalIgnoreCase);
+
     private int _nextOrder;
 
     /// <summary>
@@ -69,6 +72,22 @@ public sealed class SkillSessionState
     /// </summary>
     public void GrantDirectoryConsent(string skillName, string canonicalDir) =>
         this._consentedSkills[skillName] = canonicalDir;
+
+    /// <summary>
+    /// Returns <see langword="true"/> if the model has been approved to load
+    /// <paramref name="skillName"/> during this session. Used by the origin trust gate
+    /// to avoid re-prompting for skills already approved this session.
+    /// </summary>
+    public bool HasOriginConsent(string skillName) =>
+        this._originApprovedSkills.Contains(skillName);
+
+    /// <summary>
+    /// Records that the user has granted origin-trust for <paramref name="skillName"/>
+    /// for the remainder of this session. After this call
+    /// <see cref="HasOriginConsent"/> returns <see langword="true"/> for the skill.
+    /// </summary>
+    public void GrantOriginConsent(string skillName) =>
+        this._originApprovedSkills.Add(skillName);
 
     /// <summary>
     /// Returns the set of canonical directory paths that have been consented to this session.

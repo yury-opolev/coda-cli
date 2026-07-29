@@ -129,8 +129,11 @@ public sealed class PluginHookTests : IDisposable
     }
 
     [Fact]
-    public async Task HookTrustGuard_user_plugin_hook_is_trusted_implicitly()
+    public async Task HookTrustGuard_user_plugin_hook_requires_explicit_trust()
     {
+        // I2 fix: a hook contributed by a plugin is not the same as one the user authored.
+        // Even when the hook is user-scoped, PluginOrigin != null means it requires explicit
+        // trust rather than being implicitly trusted.
         var store = new HookTrustStore(this.temp.Path);
         var guard = new HookTrustGuard(store, this.temp.Path, promptCallback: null);
 
@@ -141,7 +144,7 @@ public sealed class PluginHookTests : IDisposable
             PluginOrigin: ("my-plugin", "1.0.0"));
 
         var canRun = await guard.CanRunAsync(hook, CancellationToken.None);
-        Assert.True(canRun); // user-scoped → trusted immediately
+        Assert.False(canRun); // plugin-origin hooks require explicit trust, not implicit
     }
 
     [Fact]

@@ -4,9 +4,11 @@ using Microsoft.Extensions.Logging.Abstractions;
 namespace Coda.Agent.Hooks;
 
 /// <summary>
-/// Enforces trust for project-scoped hooks before execution. User-scoped hooks are
-/// trusted implicitly — the user authored them. Project-scoped hooks require an explicit
-/// trust decision because cloning a repository must not grant execution.
+/// Enforces trust for project-scoped hooks and plugin-origin hooks before execution.
+/// User-authored hooks (user-scope with no <see cref="UserHook.PluginOrigin"/>) are trusted
+/// implicitly — the user wrote them. Project-scoped hooks and user-scoped hooks that originated
+/// from a third-party plugin require an explicit trust decision because cloning a repository
+/// or installing a plugin must not silently grant execution.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -71,8 +73,10 @@ public sealed partial class HookTrustGuard
     {
         ArgumentNullException.ThrowIfNull(hook);
 
-        // User-scoped hooks are trusted implicitly.
-        if (hook.Scope != HookScope.Project)
+        // User-authored hooks are trusted implicitly. Plugin-contributed hooks (PluginOrigin != null)
+        // are not — a third-party plugin's hook is not the same as one the user wrote themselves,
+        // even when both live under the user's home directory.
+        if (hook.Scope != HookScope.Project && hook.PluginOrigin is null)
         {
             return true;
         }

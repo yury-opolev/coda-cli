@@ -447,7 +447,11 @@ public static class ServeRunner
 
                 // Load and compose plugins for this working directory.
                 var plugins = PluginLoader.Load(workingDirectory);
-                var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory);
+                // Construct trust store and refuse project-scoped plugins without workspace trust
+                // (serve: no interactive prompt, workspace trust must have been pre-granted).
+                var serveHomeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var servePluginTrustStore = new PluginTrustStore(serveHomeDir);
+                var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory, trustStore: servePluginTrustStore);
                 var pluginRegistry = pluginComposition.Agents.Count > 0
                     ? new Coda.Agent.Subagents.SubagentRegistry(pluginComposition.Agents)
                     : null;
@@ -471,9 +475,12 @@ public static class ServeRunner
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
 
                 // Load skills once per serve session; build the skill tool if any are model-invocable.
+                // Gate external-origin skills with a null-callback gate (refuses unattended).
                 var skillState = new Coda.Tui.Skills.SkillSessionState();
+                var serveSkillOriginGate = new Coda.Tui.Skills.SkillOriginGate(skillState, promptCallback: null);
                 var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
-                    Coda.Tui.Skills.SkillLoader.Load(options.WorkingDirectory!), skillState, options.WorkingDirectory!);
+                    Coda.Tui.Skills.SkillLoader.Load(options.WorkingDirectory!), skillState, options.WorkingDirectory!,
+                    originGate: serveSkillOriginGate);
 
                 var allExtraTools = skillTool is not null
                     ? (IReadOnlyList<ITool>)[.. mcpTools, skillTool]

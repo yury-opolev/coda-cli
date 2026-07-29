@@ -299,7 +299,26 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
         // Load and compose plugins for this working directory.
         var plugins = PluginLoader.Load(cwd);
-        var pluginComposition = PluginComponentComposer.Compose(plugins, cwd);
+
+        // Construct the plugin trust store (same home-directory convention as /plugin command).
+        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        var pluginTrustStore = new Coda.Tui.Plugins.PluginTrustStore(homeDir);
+
+        // Prompt for workspace trust when there are project-scoped plugins not yet trusted.
+        // This runs before the TUI actor starts so we use a direct Spectre.Console prompt.
+        if (plugins.Any(p => p.IsEnabled && Coda.Tui.Plugins.PluginComponentComposer.IsProjectPlugin(p, cwd))
+            && !pluginTrustStore.IsWorkspaceTrusted(cwd))
+        {
+            var grant = AnsiConsole.Confirm(
+                "This workspace has project plugins. Trust this workspace to activate them?",
+                defaultValue: false);
+            if (grant)
+            {
+                pluginTrustStore.TrustWorkspace(cwd);
+            }
+        }
+
+        var pluginComposition = PluginComponentComposer.Compose(plugins, cwd, trustStore: pluginTrustStore);
         var pluginRegistry = pluginComposition.Agents.Count > 0
             ? new SubagentRegistry(pluginComposition.Agents)
             : null;
@@ -312,7 +331,22 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // re-injects exactly the bodies the model loaded in this session.
         var skillState = new Coda.Tui.Skills.SkillSessionState();
         var loadedSkills = Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore);
-        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(loadedSkills, skillState, cwd);
+        // Gate model invocations of Claude/Plugin-origin skills behind an interactive prompt.
+        // The lambda closes over actorPrompts; it is called only during live session turns
+        // (when the UI actor is already running), so there is no startup-time deadlock.
+        var skillOriginGate = new Coda.Tui.Skills.SkillOriginGate(
+            skillState,
+            promptCallback: async (skill, ct) =>
+            {
+                var response = await actorPrompts.RequestAsync(
+                    UiPromptRequest.Confirm(
+                        $"Trust skill? Origin: {skill.Origin}  Name: {skill.Name}",
+                        defaultValue: false),
+                    ct).ConfigureAwait(false);
+                return !response.Cancelled && response.SelectedIds.Contains("yes");
+            });
+        var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
+            loadedSkills, skillState, cwd, originGate: skillOriginGate);
 
         // Phase 5: register user-invocable skills as first-class /<name> slash commands.
         // Thread a real logger so collision and name-validation warnings appear as TUI

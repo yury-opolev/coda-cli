@@ -7,28 +7,33 @@ using Spectre.Console;
 namespace Coda.Tui.Commands;
 
 /// <summary>
-/// Manages plugins: install, remove, list, enable, disable, update, and prune.
+/// Manages plugins: install, remove, list, info, enable, disable, update, and prune.
 /// </summary>
 public sealed class PluginCommand : ISlashCommand
 {
     private readonly string? userPluginsDirOverride;
     private readonly PluginUpdater? updaterOverride;
+    private readonly PluginTrustStore? trustStoreOverride;
 
     /// <summary>Production constructor — resolves paths from the environment.</summary>
-    public PluginCommand() : this(null, null)
+    public PluginCommand() : this(null, null, null)
     {
     }
 
     /// <summary>Creates the command with an explicit plugins directory (for testing).</summary>
-    public PluginCommand(string? userPluginsDirOverride) : this(userPluginsDirOverride, null)
+    public PluginCommand(string? userPluginsDirOverride) : this(userPluginsDirOverride, null, null)
     {
     }
 
-    /// <summary>Creates the command with an explicit plugins directory and updater (for testing).</summary>
-    public PluginCommand(string? userPluginsDirOverride = null, PluginUpdater? updaterOverride = null)
+    /// <summary>Creates the command with explicit overrides including the trust store (for testing).</summary>
+    public PluginCommand(
+        string? userPluginsDirOverride = null,
+        PluginUpdater? updaterOverride = null,
+        PluginTrustStore? trustStoreOverride = null)
     {
         this.userPluginsDirOverride = userPluginsDirOverride;
         this.updaterOverride = updaterOverride;
+        this.trustStoreOverride = trustStoreOverride;
     }
 
     public string Name => "plugin";
@@ -38,27 +43,32 @@ public sealed class PluginCommand : ISlashCommand
     public string Summary => "Manage plugins: install, remove, enable, disable, update, prune";
 
     public CommandHelp Help => new(
-        Usage: "/plugin [list | install <source> | remove <name> | enable <name> | disable <name> | update <name> | prune]",
+        Usage: "/plugin [list | info <name> | install <source> | remove <name> | enable <name> | disable <name> | update <name> | prune | approve <name>]",
         Description: "Manages plugins. Without a subcommand (or with 'list'), lists installed plugins. " +
+            "'info' shows detailed information about a plugin including components and trust state. " +
             "'install' accepts a local directory path or a git URL (http/https/git@). " +
             "'remove' uninstalls a plugin. " +
             "'enable'/'disable' toggle whether a plugin is active. " +
             "'update' fetches the latest version of a git-installed plugin. " +
-            "'prune' reports dependency-only plugins that are no longer required.",
+            "'prune' reports dependency-only plugins that are no longer required. " +
+            "'approve' re-runs the per-class approval prompt for an already-installed plugin.",
         Options:
         [
             ("list", "List all installed plugins (default when no subcommand is given)."),
+            ("info <name>", "Show detailed information about a plugin including trust state and config."),
             ("install <source>", "Install a plugin from a local directory path or a git URL."),
             ("remove <name>", "Uninstall the named plugin from the user plugins directory."),
             ("enable <name>", "Enable a plugin (re-enable one that was disabled)."),
             ("disable <name>", "Disable a plugin without removing it."),
             ("update <name>", "Update a git-installed plugin to the latest version."),
             ("prune", "List dependency-only plugins that are no longer required by anything."),
+            ("approve <name>", "Re-run the per-class approval prompt for a plugin installed with withheld components."),
         ],
         Examples:
         [
             "/plugin",
             "/plugin list",
+            "/plugin info my-plugin",
             "/plugin install ./my-plugin",
             "/plugin install https://github.com/example/coda-plugin.git",
             "/plugin remove my-plugin",
@@ -66,6 +76,7 @@ public sealed class PluginCommand : ISlashCommand
             "/plugin disable my-plugin",
             "/plugin update my-plugin",
             "/plugin prune",
+            "/plugin approve my-plugin",
         ]);
 
     public async Task<CommandResult> ExecuteAsync(
@@ -97,6 +108,14 @@ public sealed class PluginCommand : ISlashCommand
         {
             case "list":
                 return this.ExecuteList(context);
+
+            case "info":
+                if (args.Count < 2)
+                {
+                    context.Console.MarkupLine(Theme.WarnMarkup("Usage: /plugin info <name>"));
+                    return CommandResult.Continue;
+                }
+                return this.ExecuteInfo(context, args[1]);
 
             case "install":
                 if (args.Count < 2)
@@ -141,9 +160,17 @@ public sealed class PluginCommand : ISlashCommand
             case "prune":
                 return this.ExecutePrune(context);
 
+            case "approve":
+                if (args.Count < 2)
+                {
+                    context.Console.MarkupLine(Theme.WarnMarkup("Usage: /plugin approve <name>"));
+                    return CommandResult.Continue;
+                }
+                return await this.ExecuteApproveAsync(context, args[1], cancellationToken).ConfigureAwait(false);
+
             default:
                 context.Console.MarkupLine(Theme.WarnMarkup(
-                    $"Unknown subcommand '{subcommand}'. Usage: /plugin [list|install|remove|enable|disable|update|prune]"));
+                    $"Unknown subcommand '{subcommand}'. Usage: /plugin [list|info|install|remove|enable|disable|update|prune|approve]"));
                 return CommandResult.Continue;
         }
     }
@@ -323,16 +350,147 @@ public sealed class PluginCommand : ISlashCommand
 
         context.Console.MarkupLine(Theme.SuccessMarkup(result.message));
 
-        // Record install metadata and call ConfigureAsync for any declared userConfig fields.
+        // Record install metadata, collect userConfig, and prompt for per-class approval.
         await this.PostInstallAsync(context, userPluginsDir, source, ct).ConfigureAwait(false);
 
         return CommandResult.Continue;
     }
 
     /// <summary>
-    /// After a successful install: record install metadata in the state store and call
-    /// <see cref="PluginUserConfigService.ConfigureAsync"/> for any declared <c>userConfig</c>
-    /// fields so that defaults are persisted immediately.
+    /// Shows detailed information about a named plugin: components, origin, pinned commit,
+    /// enabled and trust state, and <c>userConfig</c> values with secrets redacted.
+    /// </summary>
+    private CommandResult ExecuteInfo(CommandContext context, string name)
+    {
+        // Use the same user coda dir as the plugins dir so the injected dir is respected in tests.
+        var userCodaDir = this.ResolveUserCodaDirForLoad();
+        var plugins = PluginLoader.Load(context.Session.WorkingDirectory, userCodaDir: userCodaDir, stateStore: null);
+        var plugin = plugins.FirstOrDefault(p =>
+            string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase));
+
+        if (plugin is null)
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup(
+                $"Plugin '{name}' is not installed. Use /plugin list to see installed plugins."));
+            return CommandResult.Continue;
+        }
+
+        var stateStore = this.ResolveStateStore(context);
+        var installInfo = stateStore?.GetInstalledInfo(plugin.Name);
+        var trustStore = this.ResolveTrustStore();
+        var hash = PluginContentHash.Compute(plugin.Name, plugin.Version);
+        var approvedClasses = trustStore.GetApprovedClasses(hash);
+
+        context.Console.MarkupLine(Theme.BoldMarkup(plugin.Name));
+        var grid = new Grid().AddColumn().AddColumn();
+
+        // Version
+        grid.AddRow(Theme.DimMarkup("Version"), $"v{plugin.Version}");
+
+        // Description
+        if (!string.IsNullOrWhiteSpace(plugin.Manifest?.Description ?? plugin.Description))
+        {
+            grid.AddRow(Theme.DimMarkup("Description"), plugin.Manifest?.Description ?? plugin.Description);
+        }
+
+        // Components
+        var inventory = PluginInventory.FromManifest(plugin.Manifest, plugin.Directory);
+        grid.AddRow(Theme.DimMarkup("Components"), inventory.IsEmpty ? "(none)" : inventory.ToDisplayString());
+
+        // Origin
+        var origin = installInfo is null
+            ? "local"
+            : installInfo.Source == "git" && installInfo.GitUrl is not null
+                ? $"git: {installInfo.GitUrl}"
+                : installInfo.Marketplace is not null
+                    ? $"marketplace: {installInfo.Marketplace}"
+                    : $"local: {plugin.Directory}";
+        grid.AddRow(Theme.DimMarkup("Origin"), origin);
+
+        // Pinned commit
+        if (installInfo?.Commit is { } commit)
+        {
+            grid.AddRow(Theme.DimMarkup("Pinned commit"), commit);
+        }
+
+        // Enabled state
+        var isEnabled = stateStore?.IsEnabled(plugin.Name, plugin.Manifest?.DefaultEnabled ?? true) ?? plugin.IsEnabled;
+        grid.AddRow(Theme.DimMarkup("Enabled"), isEnabled ? Theme.SuccessMarkup("Yes") : Theme.WarnMarkup("No"));
+
+        // Workspace trust (project-scoped plugins only)
+        var workingDir = context.Session.WorkingDirectory;
+        var projectPluginsPath = Path.GetFullPath(Path.Combine(workingDir, ".coda", "plugins"))
+            + Path.DirectorySeparatorChar;
+        var pluginDirFull = Path.GetFullPath(plugin.Directory) + Path.DirectorySeparatorChar;
+        var isProjectScoped = pluginDirFull.StartsWith(projectPluginsPath, StringComparison.OrdinalIgnoreCase);
+        if (isProjectScoped)
+        {
+            var wsTrusted = trustStore.IsWorkspaceTrusted(workingDir);
+            grid.AddRow(Theme.DimMarkup("Workspace trust"), wsTrusted ? Theme.SuccessMarkup("Trusted") : Theme.WarnMarkup("Untrusted"));
+        }
+
+        // Per-class trust state
+        if (!inventory.IsEmpty)
+        {
+            var hasRecord = trustStore.HasApprovalRecord(hash);
+            if (!hasRecord)
+            {
+                grid.AddRow(Theme.DimMarkup("Class approvals"), Theme.DimMarkup("(legacy install — all implicitly approved)"));
+            }
+            else
+            {
+                var classLines = new List<string>();
+                foreach (var cls in inventory.PresentClasses.OrderBy(c => c.ToString()))
+                {
+                    var approved = approvedClasses.Contains(cls);
+                    classLines.Add(approved
+                        ? $"{cls}: {Theme.SuccessMarkup("approved")}"
+                        : $"{cls}: {Theme.WarnMarkup("refused")}");
+                }
+
+                grid.AddRow(Theme.DimMarkup("Class approvals"), string.Join(", ", classLines));
+            }
+        }
+
+        context.Console.Write(grid);
+
+        // userConfig values — secrets redacted
+        if (plugin.Manifest?.UserConfig is { Count: > 0 } userConfigFields && stateStore is not null)
+        {
+            var configValues = stateStore.GetPluginConfig(plugin.Name);
+            context.Console.WriteLine();
+            context.Console.MarkupLine(Theme.DimMarkup("Configuration:"));
+            var cfgGrid = new Grid().AddColumn().AddColumn();
+            foreach (var field in userConfigFields)
+            {
+                string displayValue;
+                if (field.Type == UserConfigFieldType.Secret)
+                {
+                    displayValue = Theme.DimMarkup("***");
+                }
+                else if (configValues.TryGetValue(field.Key, out var val))
+                {
+                    displayValue = val;
+                }
+                else
+                {
+                    displayValue = Theme.DimMarkup("(not set)");
+                }
+
+                cfgGrid.AddRow(Theme.DimMarkup(field.Key), displayValue);
+            }
+
+            context.Console.Write(cfgGrid);
+        }
+
+        context.Console.WriteLine();
+        return CommandResult.Continue;
+    }
+
+    /// <summary>
+    /// After a successful install: record install metadata, prompt for per-class approval,
+    /// and call <see cref="PluginUserConfigService.ConfigureAsync"/> for any declared
+    /// <c>userConfig</c> fields so that defaults are persisted immediately.
     /// </summary>
     private async Task PostInstallAsync(
         CommandContext context, string userPluginsDir, string source, CancellationToken ct)
@@ -343,8 +501,7 @@ public sealed class PluginCommand : ISlashCommand
             return;
         }
 
-        // Find the just-installed plugin by scanning the plugins directory for manifests we
-        // can parse — the plugin name is in the manifest.
+        var trustStore = this.ResolveTrustStore();
         var pluginSource = IsGitUrl(source) ? "git" : "local";
         var gitUrl = IsGitUrl(source) ? source : null;
 
@@ -366,6 +523,16 @@ public sealed class PluginCommand : ISlashCommand
                 {
                     stateStore.SetInstalledInfo(manifest.Name, new PluginInstallInfo(
                         manifest.Version, pluginSource, gitUrl, null, DateTimeOffset.UtcNow));
+
+                    // Show inventory and prompt for per-class approval.
+                    var inventory = PluginInventory.FromManifest(manifest, subDir);
+                    // Compute hash over the full component surface so in-place edits re-prompt.
+                    var pluginInfoForHash = new PluginInfo(
+                        manifest.Name, manifest.Version, manifest.Description, subDir)
+                        { Manifest = manifest };
+                    var hash = PluginContentHash.Compute(pluginInfoForHash);
+                    await this.RecordApprovalAsync(context, manifest.Name, hash, inventory, ct)
+                        .ConfigureAwait(false);
 
                     if (manifest.UserConfig.Count > 0 && context.CredentialStore is not null)
                     {
@@ -405,6 +572,124 @@ public sealed class PluginCommand : ISlashCommand
         }
     }
 
+    /// <summary>
+    /// Shows the component inventory and prompts interactively for per-class approval.
+    /// In unattended contexts, stores an empty approval set and reports withheld classes.
+    /// </summary>
+    private async Task RecordApprovalAsync(
+        CommandContext context,
+        string pluginName,
+        string hash,
+        PluginInventory inventory,
+        CancellationToken ct)
+    {
+        var trustStore = this.ResolveTrustStore();
+
+        if (inventory.IsEmpty)
+        {
+            // No components to approve; record an empty approval set silently.
+            trustStore.SetApprovedClasses(hash, []);
+            return;
+        }
+
+        // Display component inventory.
+        context.Console.WriteLine();
+        context.Console.MarkupLine(
+            Theme.BoldMarkup($"Plugin '{pluginName}' provides the following components:"));
+        context.Console.MarkupLine(inventory.ToDisplayString());
+        context.Console.WriteLine();
+
+        var approvedClasses = new List<PluginComponentClass>();
+        var withheldClasses = new List<PluginComponentClass>();
+
+        if (!context.Prompts.IsInteractive)
+        {
+            // Unattended: deny everything, report withheld.
+            withheldClasses.AddRange(inventory.PresentClasses);
+        }
+        else
+        {
+            // Interactive: prompt per present class.
+            foreach (var cls in inventory.PresentClasses.OrderBy(c => c.ToString()))
+            {
+                var description = cls switch
+                {
+                    PluginComponentClass.Skill => "Skills are prompts loaded into your context.",
+                    PluginComponentClass.Hook => "Hooks run as subprocesses on every conversation turn.",
+                    PluginComponentClass.McpServer => "MCP servers are long-lived processes that expose tools.",
+                    PluginComponentClass.Subagent => "Subagents can be invoked by the model as sub-conversations.",
+                    _ => string.Empty
+                };
+
+                context.Console.MarkupLine(Theme.DimMarkup(description));
+                var answer = await context.Prompts.RequestAsync(
+                    UiPromptRequest.Confirm($"Approve {cls} components?", true),
+                    ct).ConfigureAwait(false);
+
+                if (!answer.Cancelled && answer.SelectedIds.Contains("yes"))
+                {
+                    approvedClasses.Add(cls);
+                }
+                else
+                {
+                    withheldClasses.Add(cls);
+                }
+            }
+        }
+
+        trustStore.SetApprovedClasses(hash, approvedClasses);
+
+        if (withheldClasses.Count > 0)
+        {
+            var withheldNames = string.Join(", ", withheldClasses.Select(c => c.ToString().ToLowerInvariant()));
+            context.Console.MarkupLine(Theme.WarnMarkup(
+                $"Plugin installed without activating withheld components: {withheldNames}. " +
+                "Approve them interactively to activate."));
+        }
+    }
+
+    /// <summary>
+    /// Re-shows the component inventory for an installed plugin and records a fresh
+    /// per-class approval decision. Useful when a plugin was installed unattended
+    /// (all classes withheld) and the user wants to grant approval interactively.
+    /// </summary>
+    private async Task<CommandResult> ExecuteApproveAsync(
+        CommandContext context,
+        string name,
+        CancellationToken ct)
+    {
+        var userPluginsDir = this.ResolveUserPluginsDir();
+        var pluginDir = Path.Combine(userPluginsDir, name);
+        var pluginJsonPath = Path.Combine(pluginDir, "plugin.json");
+
+        if (!File.Exists(pluginJsonPath))
+        {
+            context.Console.MarkupLine(Theme.WarnMarkup($"Plugin '{name}' is not installed."));
+            return CommandResult.Continue;
+        }
+
+        string json;
+        PluginManifest manifest;
+        try
+        {
+            json = await File.ReadAllTextAsync(pluginJsonPath, ct).ConfigureAwait(false);
+            manifest = PluginManifestParser.Parse(json, pluginDir);
+        }
+        catch (Exception ex)
+        {
+            context.Console.MarkupLine(Theme.ErrorMarkup($"Failed to read plugin manifest: {ex.Message}"));
+            return CommandResult.Continue;
+        }
+
+        var pluginInfo = new PluginInfo(manifest.Name, manifest.Version, manifest.Description, pluginDir)
+            { Manifest = manifest };
+        var hash = PluginContentHash.Compute(pluginInfo);
+        var inventory = PluginInventory.FromManifest(manifest, pluginDir);
+
+        await this.RecordApprovalAsync(context, name, hash, inventory, ct).ConfigureAwait(false);
+        return CommandResult.Continue;
+    }
+
     private CommandResult ExecuteRemove(CommandContext context, string name)
     {
         var userPluginsDir = this.ResolveUserPluginsDir();
@@ -431,6 +716,32 @@ public sealed class PluginCommand : ISlashCommand
 
         var codaDir = this.ResolveUserCodaDir();
         return new PluginStateStore(codaDir);
+    }
+
+    private PluginTrustStore ResolveTrustStore()
+    {
+        if (this.trustStoreOverride is not null)
+        {
+            return this.trustStoreOverride;
+        }
+
+        var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        return new PluginTrustStore(homeDir);
+    }
+
+    /// <summary>
+    /// Derives the user <c>.coda</c> directory from <see cref="userPluginsDirOverride"/> (its parent),
+    /// so that <see cref="PluginLoader.Load"/> resolves plugins from the same base as install.
+    /// Returns <see langword="null"/> when no override is set, letting the loader use its default.
+    /// </summary>
+    private string? ResolveUserCodaDirForLoad()
+    {
+        if (this.userPluginsDirOverride is not null)
+        {
+            return Path.GetDirectoryName(Path.GetFullPath(this.userPluginsDirOverride));
+        }
+
+        return null;
     }
 
     private string ResolveUserCodaDir()
