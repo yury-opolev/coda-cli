@@ -17,6 +17,7 @@ another — though the first two meet at plugin-shipped hooks.
 | 1 | [Agent hooks system](../proposals/2026-07-28-agent-hooks-system.md) | 8 phases, 35 items | 13 lifecycle events that can observe, block, or **mutate** what flows through them — prompts, system prompt, toolset, tool arguments, tool results, responses |
 | 2 | [Skills, plugins and marketplaces](../proposals/2026-07-28-skills-plugins-marketplaces.md) | 9 phases, 41 items | Make skills **model-invocable**, widen what a plugin may carry, add lifecycle and trust, harden marketplaces |
 | 3 | [Prompt caching](../proposals/2026-07-28-prompt-caching.md) | 4 phases, 19 items | Use all four cache breakpoints instead of one, and fix cost accounting that bills cached reads at 10× their real price |
+| 4 | [TUI transcript and interaction polish](../proposals/2026-07-28-tui-transcript-polish.md) | 4 phases, 14 items | Message gutters and tree connectors, a pinned prompt during long turns, colour that distinguishes partial from total failure, right-click copy and a selectable session id |
 
 ### Why these three
 
