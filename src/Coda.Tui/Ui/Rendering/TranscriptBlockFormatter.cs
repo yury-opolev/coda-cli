@@ -899,6 +899,12 @@ public static class TranscriptBlockFormatter
 
     private static void AppendDiff(List<TranscriptRenderLine> lines, string patch, int width)
     {
+        // A patch is untrusted: its content is whatever the files in the user's repository contain, and
+        // its paths are whatever they are named. Strip escapes, controls and bidi overrides before any of
+        // it is parsed or drawn, matching how tool output is already treated. Sanitising here rather than
+        // per-line covers the structured path, the file headers and the unstructured fallback at once.
+        patch = TerminalTextSanitizer.Sanitize(patch);
+
         var files = UnifiedDiffParser.Parse(patch);
 
         if (files.Count == 0)

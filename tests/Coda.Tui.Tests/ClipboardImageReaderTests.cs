@@ -28,12 +28,37 @@ public sealed class ClipboardImageReaderTests
     // ── Windows ──────────────────────────────────────────────────────────────
 
     [Fact]
+    public void Windows_reader_does_not_start_a_process_when_the_clipboard_holds_no_image()
+    {
+        // Spawning PowerShell to load WinForms costs the better part of two seconds and blocks the UI
+        // thread, so the reader must answer "no image" from the cheap native check alone.
+        var runner = new FakeProcessRunner { Handler = (_, _) => ValidPngBase64() };
+
+        var image = new WindowsClipboardImageReader(runner, hasImage: () => false).TryRead();
+
+        Assert.Null(image);
+        Assert.Empty(runner.Calls);
+    }
+
+    [Fact]
+    public void Windows_reader_treats_a_failing_native_check_as_no_image()
+    {
+        var runner = new FakeProcessRunner { Handler = (_, _) => ValidPngBase64() };
+
+        var image = new WindowsClipboardImageReader(runner, hasImage: () => throw new InvalidOperationException())
+            .TryRead();
+
+        Assert.Null(image);
+        Assert.Empty(runner.Calls);
+    }
+
+    [Fact]
     public void Windows_reader_invokes_powershell_getimage_and_parses_base64()
     {
         var b64 = ValidPngBase64();
         var runner = new FakeProcessRunner { Handler = (_, _) => b64 };
 
-        var image = new WindowsClipboardImageReader(runner).TryRead();
+        var image = new WindowsClipboardImageReader(runner, hasImage: () => true).TryRead();
 
         Assert.NotNull(image);
         Assert.Equal("image/png", image!.MediaType);
@@ -49,14 +74,14 @@ public sealed class ClipboardImageReaderTests
     public void Windows_reader_returns_null_on_invalid_base64()
     {
         var runner = new FakeProcessRunner { Handler = (_, _) => "!!!not-base64!!!" };
-        Assert.Null(new WindowsClipboardImageReader(runner).TryRead());
+        Assert.Null(new WindowsClipboardImageReader(runner, hasImage: () => true).TryRead());
     }
 
     [Fact]
     public void Windows_reader_returns_null_when_process_returns_null()
     {
         var runner = new FakeProcessRunner { Handler = (_, _) => null };
-        Assert.Null(new WindowsClipboardImageReader(runner).TryRead());
+        Assert.Null(new WindowsClipboardImageReader(runner, hasImage: () => true).TryRead());
     }
 
     // ── macOS ────────────────────────────────────────────────────────────────
@@ -142,5 +167,31 @@ public sealed class ClipboardImageReaderTests
         Assert.NotNull(reader);
         // Never throws even when nothing is on the clipboard.
         Assert.Null(reader.TryRead());
+    }
+}
+
+/// <summary>
+/// Exercises the real native clipboard format check rather than a seam, so a broken P/Invoke signature
+/// or a missing entry point is caught here rather than by a user whose image paste silently stops working.
+/// </summary>
+public sealed class WindowsClipboardFormatsTests
+{
+    [Fact]
+    public void The_native_check_answers_without_throwing_and_without_blocking()
+    {
+        if (!OperatingSystem.IsWindows())
+        {
+            return;
+        }
+
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        var result = WindowsClipboardFormats.HasImage();
+        stopwatch.Stop();
+
+        // The whole point of the check is that it is cheap; the PowerShell probe it replaces took ~1.9s.
+        Assert.True(
+            stopwatch.ElapsedMilliseconds < 100,
+            $"the native clipboard check took {stopwatch.ElapsedMilliseconds}ms; it must stay far cheaper than the process probe");
+        Assert.True(result || !result);
     }
 }
