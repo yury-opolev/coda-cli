@@ -1,7 +1,9 @@
 # Proposal: TUI transcript and interaction polish
 
 - **Date:** 2026-07-28
-- **Status:** Backlog — not started. Queued behind the hooks, skills/plugins and caching work.
+- **Status:** Implemented on `feat/tui-transcript-polish`. All four phases shipped, plus two
+  additions made during implementation (a named theme palette, and mouse selection/copy in the
+  modal overlays). See §7 for what landed and where the design was decided differently.
 - **Author:** Yury Opolev (observed while running the autonomous implementation session)
 - **Scope:** `Coda.Tui` — `Ui/Rendering/TranscriptBlockFormatter.cs`, `ToolActivityPreview.cs`,
   `CodaTheme.cs`/`CodaThemes.cs`, `Ui/Shells/VirtualizedTranscriptView.cs`,
@@ -107,36 +109,69 @@ either `Ctrl+C` or right-click — it is the single most frequently copied strin
 
 ### Phase 1 — Transcript shape
 
-- [ ] One-space gutter plus role marker for user (`>`) and agent (`○`/`●`) messages
-- [ ] Tree connectors (`│`, `└`) for dependent lines, with an ASCII fallback via `TerminalCapabilities`
-- [ ] Apply the same shape to nested subagent output
+- [x] One-space gutter plus role marker for user (`>`) and agent (`○`/`●`) messages
+- [x] Tree connectors (`│`, `└`) for dependent lines, with an ASCII fallback via `TerminalCapabilities`
+- [x] Apply the same shape to nested subagent output
 
 ### Phase 2 — Pinned prompt
 
-- [ ] Pin the last user message (first line, elided) to the top of the viewport while output is produced
-- [ ] Hide the pin when the message is already visible
-- [ ] Verify it behaves under hooks-Phase-3 assistant-text buffering
+- [x] Pin the last user message (first line, elided) to the top of the viewport while output is produced
+- [x] Hide the pin when the message is already visible
+- [x] Verify it behaves under hooks-Phase-3 assistant-text buffering
 
 ### Phase 3 — Colour semantics
 
-- [ ] Theme roles for approved-tool and mixed-outcome states
-- [ ] Approved tool calls render orange/yellow, not red
-- [ ] Summary line: green all-succeeded, orange some-failed, red all-failed
-- [ ] Audit remaining red usages so red means only failure or rejection
+- [x] Theme roles for approved-tool and mixed-outcome states
+- [x] Approved tool calls render orange/yellow, not red
+- [x] Summary line: green all-succeeded, orange some-failed, red all-failed
+- [x] Audit remaining red usages so red means only failure or rejection
 
 ### Phase 4 — Selection and clipboard
 
-- [ ] Right-click copies a selection; `Ctrl+C` unchanged
-- [ ] Re-check the composer's right-click paste so the gestures do not conflict
-- [ ] Session id selectable and copyable via `Ctrl+C` or right-click
-- [ ] Update `README.md` mouse documentation to match
+- [x] Right-click copies a selection; `Ctrl+C` unchanged
+- [x] Re-check the composer's right-click paste so the gestures do not conflict
+- [x] Session id selectable and copyable via `Ctrl+C` or right-click
+- [x] Update `README.md` mouse documentation to match
 
-## 6. Open questions
+## 6. Open questions — resolved
 
-1. **Does the agent marker distinguish states?** `○` in-progress and `●` complete is proposed, but a
-   single marker may read more calmly. Worth trying both.
-2. **Should the pin show more than one line** for a multi-line prompt? One line elided is proposed;
-   a two-line cap may be better for prompts whose first line is a preamble.
-3. **Does right-click-to-copy conflict with the terminal's own context menu** on some hosts, and
-   should `--no-mouse` users get a keyboard route to the session id (a `/session id` command, or
-   focusing the header)?
+1. **Does the agent marker distinguish states?** Yes. `○` while an entry is in progress, `●` once it
+   completes, for assistant messages, thinking bursts and tool activity alike.
+2. **Should the pin show more than one line?** No. One line, elided with `…`. The ellipsis is also
+   shown when the prompt has further lines even if the first one fits, so it always reads as a
+   fragment of something longer.
+3. **Does right-click-to-copy conflict with the terminal's own context menu, and should `--no-mouse`
+   users get a keyboard route to the session id?** No keyboard route was added: the session id is
+   mouse-selectable only, by decision. `Shift`-drag still hands selection to the terminal, and
+   `--no-mouse` leaves selection and copy entirely native.
+
+## 7. What shipped
+
+Four phases plus two additions, each landed as its own reviewed commit on
+`feat/tui-transcript-polish`.
+
+### Decisions taken during implementation
+
+- **The gutter is a tagging pass, not a per-helper indent.** Rows are tagged with a
+  `TranscriptGutterKind` while a block is projected, and one shaping pass turns each tag into the
+  row's literal prefix — shifting link spans and callout prefix cells to match. Content is wrapped
+  at `width - reserved` so a prefixed row still fits the viewport.
+- **The closing connector lands on content.** Tool output almost always ends in a newline, which
+  yields a trailing empty row; picking the terminator by index would hang `└` off a blank line.
+- **The pin is memoised and survives re-renders.** A submitted prompt is unbounded in size and the
+  pin redraws every frame, so composition is cached against the block instance and width.
+- **Outcome colours resolve through a named palette.** Rather than each theme restating six roles,
+  `TuiPalette` (`Success`, `Caution`, `Danger`, `Info`) is the base a theme supplies once — the TUI
+  counterpart of `ConsolePalette`. `Caution` deliberately covers a partial failure, an approval and
+  a cancelled batch alike: all three mean "noteworthy, but nothing failed outright". The redundant
+  `PermissionApproval` role was removed, since a rejected permission is exactly `Danger`.
+- **Views never clear their own selection after a copy.** The host clears it, because it keeps the
+  selection when a clipboard write fails so the user can retry.
+- **Selection is a reusable surface.** `SelectableTextView` backs the session id and the modal
+  overlays, so every surface copies through one clipboard path and reports one status.
+
+### Addition: mouse selection and copy in the modal overlays
+
+Not in the original proposal; requested during implementation. The `/model`, `/skills`, `/mcp`,
+`/tasks`, `/schedule` and `/plugins` bodies render into `SelectableTextView` rather than a `Label`,
+so their text can be left-dragged and copied with a right-click or `Ctrl+C`.

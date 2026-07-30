@@ -28,7 +28,7 @@ namespace Coda.Tui.Ui.Shells;
 /// </remarks>
 internal class SelectableTextView : View
 {
-    private readonly IApplication app;
+    private readonly IApplication? app;
     private readonly TranscriptSelection selection = new();
     private bool dragging;
     private IReadOnlyList<string> lines = [];
@@ -43,10 +43,12 @@ internal class SelectableTextView : View
     /// </summary>
     /// <param name="app">
     /// The owning application; provides the mouse service for grab/release during drag selection.
+    /// May be <see langword="null"/> when mouse support is not needed (for example in unit tests that
+    /// exercise only keyboard behavior); mouse events return <see langword="false"/> in that case.
     /// </param>
-    public SelectableTextView(IApplication app)
+    public SelectableTextView(IApplication? app)
     {
-        this.app = app ?? throw new ArgumentNullException(nameof(app));
+        this.app = app;
         this.foreground = this.theme.TranscriptAssistant;
         this.background = this.theme.Background;
         this.normalAttribute = this.theme.Attribute(this.foreground, this.background, null);
@@ -62,6 +64,9 @@ internal class SelectableTextView : View
     /// Returns an empty string when no lines have been set.
     /// </summary>
     internal new string Text => this.lines.Count > 0 ? this.lines[0] : string.Empty;
+
+    /// <summary>All lines of content joined by <c>\n</c>, for consumers that need the full multi-line body text.</summary>
+    internal string AllText => string.Join('\n', this.lines);
 
     /// <summary>Whether at least one cell is currently selected.</summary>
     internal bool HasSelection => this.selection.HasSelection;
@@ -108,6 +113,24 @@ internal class SelectableTextView : View
     }
 
     /// <summary>
+    /// Fires <see cref="CopyRequested"/> with the current selection when one is active. Returns
+    /// <see langword="true"/> when a selection was present and the event was raised; returns
+    /// <see langword="false"/> when nothing is selected. Overlay key handlers call this so that
+    /// Ctrl+C inside a visible overlay with a selection routes through the shell's clipboard path
+    /// rather than arming the exit chord.
+    /// </summary>
+    internal bool TryCopySelection()
+    {
+        if (!this.HasSelection)
+        {
+            return false;
+        }
+
+        this.CopyRequested?.Invoke(this.SelectedText);
+        return true;
+    }
+
+    /// <summary>
     /// Ends any active mouse interaction and releases this view's grab if it holds one. Called before a
     /// shell exit or mode transition so a torn-down view never leaves the application grabbing a dead
     /// object.
@@ -122,22 +145,26 @@ internal class SelectableTextView : View
     internal event Action<string>? CopyRequested;
 
     /// <summary>
-    /// Replaces the content with <paramref name="lines"/> and requests a redraw. Each line is sanitized via
-    /// <see cref="TerminalTextSanitizer.SanitizeSingleLine"/> on the way in so no control sequence can reach
-    /// the terminal.
+    /// Replaces the content with <paramref name="lines"/> and requests a redraw. Each line is sanitized on
+    /// the way in so no control or escape sequence can reach the terminal.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Identical content is a no-op. Hosts re-apply their text on every frame — the header is rewritten on
     /// every scroll and every applied snapshot — so clearing unconditionally would destroy a selection the
     /// moment anything streamed. Content that genuinely changes does clear the selection, and ends any drag
     /// in progress rather than leaving it anchored at a row that no longer exists.
+    /// </para>
+    /// <para>
+    /// Sanitization goes through <see cref="TerminalTextSanitizer.Sanitize"/>, NOT the single-line form:
+    /// that one collapses every whitespace run to a single space, which would flatten the leading
+    /// indentation the browser overlays use to show hierarchy.
+    /// </para>
     /// </remarks>
     internal void SetLines(IReadOnlyList<string> lines)
     {
         ArgumentNullException.ThrowIfNull(lines);
-        var sanitized = lines
-            .Select(line => TerminalTextSanitizer.SanitizeSingleLine(line))
-            .ToList();
+        var sanitized = lines.SelectMany(SanitizeToRows).ToList();
 
         if (sanitized.SequenceEqual(this.lines, StringComparer.Ordinal))
         {
@@ -151,16 +178,19 @@ internal class SelectableTextView : View
     }
 
     /// <summary>
+    /// Strips escapes and control characters from <paramref name="value"/> while preserving spaces, then
+    /// splits it into rows. Tabs become a single space so a row's measured cell width always matches what
+    /// the terminal draws — a tab would otherwise measure as one cell but expand to a tab stop, putting
+    /// every selection column on that row out by several cells.
+    /// </summary>
+    private static IEnumerable<string> SanitizeToRows(string? value) =>
+        TerminalTextSanitizer.Sanitize(value).Replace('\t', ' ').Split('\n');
+
+    /// <summary>
     /// Convenience form of <see cref="SetLines"/>: normalises <c>\r\n</c>/<c>\r</c> to <c>\n</c>, splits
     /// on <c>\n</c>, and passes the result to <see cref="SetLines"/>.
     /// </summary>
-    internal void SetText(string? text)
-    {
-        var normalized = (text ?? string.Empty)
-            .Replace("\r\n", "\n", StringComparison.Ordinal)
-            .Replace('\r', '\n');
-        this.SetLines(normalized.Split('\n'));
-    }
+    internal void SetText(string? text) => this.SetLines([text ?? string.Empty]);
 
     /// <summary>
     /// Stores the theme and driver, recomputes the normal attribute using
@@ -258,7 +288,7 @@ internal class SelectableTextView : View
             return true;
         }
 
-        var mouseService = this.app.Mouse;
+        var mouseService = this.app?.Mouse;
         if (mouseService is null || mouseService.IsMouseDisabled || mouse.Flags.HasFlag(MouseFlags.Shift))
         {
             return false;
@@ -282,7 +312,7 @@ internal class SelectableTextView : View
             this.selection.Clear();
             this.selection.Begin(this.ToPosition(mouse));
             this.dragging = true;
-            mouseService.GrabMouse(this);
+            mouseService?.GrabMouse(this);
             return true;
         }
 
@@ -309,17 +339,34 @@ internal class SelectableTextView : View
          flags.HasFlag(MouseFlags.RightButtonDoubleClicked) ||
          flags.HasFlag(MouseFlags.RightButtonTripleClicked));
 
+    /// <summary>
+    /// Maps a mouse event to a cell position, clamped to the rows actually on screen.
+    /// </summary>
+    /// <remarks>
+    /// A grabbed view keeps receiving events once the pointer leaves it, and the coordinates are not
+    /// bounded — so dragging below the surface would otherwise extend the selection into rows that were
+    /// never drawn. Content longer than the viewport is not scrolled by this view, so those rows carry no
+    /// highlight; copying them would hand back text the user never saw.
+    /// </remarks>
     private TranscriptCellPosition ToPosition(Mouse mouse)
     {
         var local = mouse.Position ?? System.Drawing.Point.Empty;
-        var row = Math.Clamp(Math.Max(0, local.Y), 0, Math.Max(0, this.lines.Count - 1));
+
+        // Before the first layout the viewport has no height; fall back to the content so the surface is
+        // still usable (and testable) rather than pinning every press to row 0.
+        var height = this.Viewport.Height;
+        var lastRow = height > 0
+            ? Math.Min(this.lines.Count, height) - 1
+            : this.lines.Count - 1;
+
+        var row = Math.Clamp(Math.Max(0, local.Y), 0, Math.Max(0, lastRow));
         return new TranscriptCellPosition(row, Math.Max(0, local.X));
     }
 
     private void ReleaseMouseCapture()
     {
         this.dragging = false;
-        var mouseService = this.app.Mouse;
+        var mouseService = this.app?.Mouse;
         if (mouseService?.IsGrabbed(this) == true)
         {
             mouseService.UngrabMouse();

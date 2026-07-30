@@ -3,6 +3,7 @@ using System.Text;
 using Coda.Mcp;
 using Coda.Tui.Mcp;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Shells;
 
 namespace Coda.Tui.Ui.Mcp;
 
@@ -10,14 +11,14 @@ namespace Coda.Tui.Ui.Mcp;
 /// Full-screen Terminal.Gui view for the interactive MCP manager. The controller owns all state and
 /// asynchronous work; this view only renders sanitized state and dispatches input.
 /// </summary>
-internal sealed class McpBrowserOverlay : View
+internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 {
     private readonly IApplication app;
     private readonly McpBrowserController controller;
     private TuiTheme theme;
     private readonly Action? onChanged;
     private readonly Label header;
-    private readonly Label body;
+    private readonly SelectableTextView body;
     private readonly Label status;
     private readonly Label footer;
 
@@ -33,7 +34,8 @@ internal sealed class McpBrowserOverlay : View
         IApplication app,
         McpBrowserController controller,
         TuiTheme? theme = null,
-        Action? onChanged = null)
+        Action? onChanged = null,
+        Action<string, Action>? onCopyRequested = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -54,14 +56,18 @@ internal sealed class McpBrowserOverlay : View
             Height = 1,
             CanFocus = false,
         };
-        this.body = new Label
+        this.body = new SelectableTextView(app)
         {
             X = 0,
             Y = 1,
             Width = Dim.Fill(),
             Height = Dim.Fill(2),
-            CanFocus = false,
         };
+        if (onCopyRequested is not null)
+        {
+            this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
+        }
+
         this.status = new Label
         {
             X = 0,
@@ -99,6 +105,7 @@ internal sealed class McpBrowserOverlay : View
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
         {
             this.Render();
@@ -111,7 +118,7 @@ internal sealed class McpBrowserOverlay : View
 
     internal string HeaderText => this.header.Text ?? string.Empty;
 
-    internal string BodyText => this.body.Text ?? string.Empty;
+    internal string BodyText => this.body.AllText;
 
     internal string StatusText => this.status.Text ?? string.Empty;
 
@@ -119,6 +126,14 @@ internal sealed class McpBrowserOverlay : View
 
     /// <summary>Render-only test seam containing exactly the sanitized strings assigned to visible labels.</summary>
     internal string VisibleTextForTest { get; private set; } = string.Empty;
+
+    // ── ISelectableOverlay ────────────────────────────────────────────────────
+
+    bool ISelectableOverlay.HasSelection => this.body.HasSelection;
+
+    string ISelectableOverlay.SelectedText => this.body.SelectedText;
+
+    void ISelectableOverlay.ClearSelection() => this.body.ClearSelection();
 
     internal void Show()
     {
@@ -136,6 +151,7 @@ internal sealed class McpBrowserOverlay : View
 
         this.lifetime = new CancellationTokenSource();
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        this.body.ApplyTheme(this.theme, this.app.Driver);
         this.active = true;
         this.Visible = true;
         this.controller.Changed += this.OnControllerChanged;
@@ -162,6 +178,7 @@ internal sealed class McpBrowserOverlay : View
             return;
         }
 
+        this.body.CancelMouseInteraction();
         this.active = false;
         this.Visible = false;
 
@@ -185,6 +202,13 @@ internal sealed class McpBrowserOverlay : View
             return false;
         }
 
+        // The overlay holds focus and consumes every key while visible, so the shell's own Ctrl+C handler
+        // is unreachable from here — copy an active body selection before the key is swallowed.
+        if (key == Key.C.WithCtrl && this.body.TryCopySelection())
+        {
+            return true;
+        }
+
         var command = McpBrowserKeyMap.Map(key, this.controller.State.View);
         if (command == McpBrowserCommand.None &&
             this.controller.State.View == McpBrowserView.Detail &&
@@ -204,6 +228,13 @@ internal sealed class McpBrowserOverlay : View
         return true;
     }
 
+    /// <inheritdoc/>
+    /// <remarks>
+    /// Terminal.Gui hit-tests and delivers the event straight to the child under the pointer, so the
+    /// <see cref="SelectableTextView"/> body already gets its drag selections and right-click copies. This
+    /// override exists only to swallow whatever the body did not take, so mouse input cannot reach the
+    /// views behind a visible overlay.
+    /// </remarks>
     protected override bool OnMouseEvent(Mouse mouse) => this.Visible;
 
     private void OnControllerChanged()
@@ -257,7 +288,7 @@ internal sealed class McpBrowserOverlay : View
         this.VisibleTextForTest = string.Join(
             Environment.NewLine,
             this.header.Text ?? string.Empty,
-            this.body.Text ?? string.Empty,
+            this.body.AllText,
             this.status.Text ?? string.Empty,
             this.footer.Text ?? string.Empty);
         this.SetNeedsDraw();
@@ -296,7 +327,7 @@ internal sealed class McpBrowserOverlay : View
         var selectedLine = state.SelectedKey is not null
             ? lines.FindIndex(line => line.StartsWith("> ", StringComparison.Ordinal))
             : -1;
-        this.body.Text = Window(lines, ref this.listOffset, this.BodyViewportRows(), selectedLine);
+        this.body.SetText(Window(lines, ref this.listOffset, this.BodyViewportRows(), selectedLine));
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
@@ -355,7 +386,7 @@ internal sealed class McpBrowserOverlay : View
         }
 
         this.header.Text = SafeSingle($"MCP detail — {state.SelectedKey?.Name ?? "none"}");
-        this.body.Text = Window(lines, ref this.detailOffset, this.BodyViewportRows());
+        this.body.SetText(Window(lines, ref this.detailOffset, this.BodyViewportRows()));
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
@@ -392,7 +423,7 @@ internal sealed class McpBrowserOverlay : View
 
         lines.Add($"Busy: turn={(state.TurnBusy ? "yes" : "no")} action={(state.ActionBusy ? "yes" : "no")}");
         this.header.Text = SafeSingle($"MCP editor — {state.Editor?.Mode.ToString() ?? "unavailable"}");
-        this.body.Text = Window(lines, ref this.editorOffset, this.BodyViewportRows(), focusedLine);
+        this.body.SetText(Window(lines, ref this.editorOffset, this.BodyViewportRows(), focusedLine));
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
@@ -657,6 +688,7 @@ internal sealed class McpBrowserOverlay : View
         if (disposing && !this.disposed)
         {
             this.disposed = true;
+            this.body.CancelMouseInteraction();
             this.Hide();
         }
 

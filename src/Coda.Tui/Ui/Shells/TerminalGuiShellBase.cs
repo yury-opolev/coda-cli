@@ -142,7 +142,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.Chrome = new ComposerChromeView(this.Theme);
         this.Operational = new OperationalStatusView(app, this.Theme, addTimeout, removeTimeout);
         this.Status = new Label { CanFocus = false };
-        this.PromptOverlay = new PromptOverlay(publisher, this.Theme);
+        this.PromptOverlay = new PromptOverlay(publisher, this.Theme, app, onCopyRequested: this.CopyToClipboard);
         this.PromptOverlay.ApplyTheme(this.Theme, app.Driver);
         this.Completion = new CommandCompletionView(this.Theme);
 
@@ -152,13 +152,13 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (taskBrowserProvider is not null)
         {
             this.taskController = new TaskBrowserController(taskBrowserProvider, this.TimeSource);
-            this.taskOverlay = new TaskBrowserOverlay(this.app, this.taskController, this.Theme, this.OnTaskBrowserChanged);
+            this.taskOverlay = new TaskBrowserOverlay(this.app, this.taskController, this.Theme, this.OnTaskBrowserChanged, onCopyRequested: this.CopyToClipboard);
         }
 
         if (mcpBrowserProvider is not null)
         {
             this.mcpController = new McpBrowserController(mcpBrowserProvider);
-            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged);
+            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged, onCopyRequested: this.CopyToClipboard);
         }
 
         if (scheduleBrowserProvider is not null)
@@ -167,21 +167,21 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                 () => scheduleBrowserProvider()?.Control?.Invoke(),
                 linkPromptService ?? PlainUiPromptService.Instance);
             this.scheduleOverlay = new Coda.Tui.Ui.Schedule.ScheduleBrowserOverlay(
-                this.app, this.scheduleController, this.Theme, this.OnScheduleBrowserChanged);
+                this.app, this.scheduleController, this.Theme, this.OnScheduleBrowserChanged, onCopyRequested: this.CopyToClipboard);
         }
 
         if (skillsBrowserProvider is not null)
         {
             this.skillsController = new Coda.Tui.Ui.Skills.SkillBrowserController(skillsBrowserProvider);
             this.skillsOverlay = new Coda.Tui.Ui.Skills.SkillBrowserOverlay(
-                this.app, this.skillsController, this.Theme, this.OnSkillsBrowserChanged);
+                this.app, this.skillsController, this.Theme, this.OnSkillsBrowserChanged, onCopyRequested: this.CopyToClipboard);
         }
 
         if (pluginBrowserProvider is not null)
         {
             this.pluginController = new Coda.Tui.Ui.Plugins.PluginBrowserController(pluginBrowserProvider);
             this.pluginOverlay = new Coda.Tui.Ui.Plugins.PluginBrowserOverlay(
-                this.app, this.pluginController, this.Theme, this.OnPluginBrowserChanged);
+                this.app, this.pluginController, this.Theme, this.OnPluginBrowserChanged, onCopyRequested: this.CopyToClipboard);
         }
 
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
@@ -662,6 +662,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     {
         if (this.HasVisibleModalOverlay())
         {
+            if (key == Key.C.WithCtrl && this.TryCopyOverlaySelection())
+            {
+                return true;
+            }
+
             return false;
         }
 
@@ -690,6 +695,26 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                         : this.taskOverlay?.Visible == true
                             ? this.taskOverlay
                             : null;
+
+    private bool TryCopyOverlaySelection()
+    {
+        ISelectableOverlay? overlay =
+            this.PromptOverlay.Visible ? (ISelectableOverlay)this.PromptOverlay :
+            this.taskOverlay?.Visible == true ? (ISelectableOverlay)this.taskOverlay :
+            this.mcpOverlay?.Visible == true ? (ISelectableOverlay)this.mcpOverlay :
+            this.scheduleOverlay?.Visible == true ? (ISelectableOverlay)this.scheduleOverlay :
+            this.skillsOverlay?.Visible == true ? (ISelectableOverlay)this.skillsOverlay :
+            this.pluginOverlay?.Visible == true ? (ISelectableOverlay)this.pluginOverlay :
+            null;
+
+        if (overlay is null || !overlay.HasSelection)
+        {
+            return false;
+        }
+
+        this.CopyToClipboard(overlay.SelectedText, overlay.ClearSelection);
+        return true;
+    }
 
     private bool TryHandleTranscriptNavigationKey(Key key)
     {

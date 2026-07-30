@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using Coda.Agent.Tasks;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Shells;
 using Terminal.Gui.Drawing;
 
 namespace Coda.Tui.Ui.Tasks;
@@ -25,7 +26,7 @@ namespace Coda.Tui.Ui.Tasks;
 /// mirrors <see cref="Hide"/>'s safety-critical <see cref="Teardown"/> so a parent Dispose cascade still
 /// cancels the pump, unsubscribes, releases the pause lease, and closes the controller.</para>
 /// </summary>
-internal sealed class TaskBrowserOverlay : View
+internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 {
     private const int PageStep = 10;
     private const int OutputViewportFallback = 20;
@@ -36,7 +37,7 @@ internal sealed class TaskBrowserOverlay : View
     private readonly Action? onChanged;
 
     private readonly Label header;
-    private readonly Label body;
+    private readonly SelectableTextView body;
     private readonly Label footer;
 
     private CancellationTokenSource? pumpCts;
@@ -44,7 +45,7 @@ internal sealed class TaskBrowserOverlay : View
     private bool disposed;
     private List<string> visibleOutput = [];
 
-    public TaskBrowserOverlay(IApplication app, TaskBrowserController controller, TuiTheme? theme = null, Action? onChanged = null)
+    public TaskBrowserOverlay(IApplication app, TaskBrowserController controller, TuiTheme? theme = null, Action? onChanged = null, Action<string, Action>? onCopyRequested = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -58,8 +59,13 @@ internal sealed class TaskBrowserOverlay : View
         this.BorderStyle = LineStyle.Rounded;
 
         this.header = new Label { X = 0, Y = 0, Width = Dim.Fill(), Height = 1, CanFocus = false };
-        this.body = new Label { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1), CanFocus = false };
+        this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1) };
         this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+        if (onCopyRequested is not null)
+        {
+            this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
+        }
+
         this.Add(this.header);
         this.Add(this.body);
         this.Add(this.footer);
@@ -69,6 +75,7 @@ internal sealed class TaskBrowserOverlay : View
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
         {
             this.Render();
@@ -87,17 +94,26 @@ internal sealed class TaskBrowserOverlay : View
 
     internal string HeaderText => this.header.Text ?? string.Empty;
 
-    internal string BodyText => this.body.Text ?? string.Empty;
+    internal string BodyText => this.body.AllText;
 
     internal string FooterText => this.footer.Text ?? string.Empty;
 
     /// <summary>The exact windowed, clamped output lines drawn on the last detail render (for tests/diagnostics).</summary>
     internal IReadOnlyList<string> VisibleOutputLines => this.visibleOutput;
 
+    // ── ISelectableOverlay ────────────────────────────────────────────────────
+
+    bool ISelectableOverlay.HasSelection => this.body.HasSelection;
+
+    string ISelectableOverlay.SelectedText => this.body.SelectedText;
+
+    void ISelectableOverlay.ClearSelection() => this.body.ClearSelection();
+
     /// <summary>Opens the controller, subscribes to changes, starts a fresh pump, focuses, and renders.</summary>
     public void Show()
     {
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        this.body.ApplyTheme(this.theme, this.app.Driver);
 
         // Idempotent: a second Show while already active must never add a duplicate Changed handler,
         // subscription, pump, or CTS. Re-focus and re-render the existing session instead.
@@ -125,12 +141,12 @@ internal sealed class TaskBrowserOverlay : View
     public void Hide()
     {
         // Idempotent: if already hidden, do not tear down again or fire a duplicate onChanged notification.
-        // (Task 7 will restore composer focus to the shell here.)
         if (!this.active)
         {
             return;
         }
 
+        this.body.CancelMouseInteraction();
         this.Teardown();
         this.Visible = false;
         this.onChanged?.Invoke();
@@ -209,7 +225,13 @@ internal sealed class TaskBrowserOverlay : View
                 {
                     // Steering is fully modal: a printable key is draft text (never a task action), and
                     // every other unmapped key (Tab/arrows/Page/Home/Delete/F-keys) is swallowed so nothing
-                    // can escape the modal to move focus or reach the shell.
+                    // can escape the modal to move focus or reach the shell. Ctrl+C is the one exception —
+                    // it must still copy a body selection, since the shell can never see it from here.
+                    if (key == Key.C.WithCtrl && this.body.TryCopySelection())
+                    {
+                        return true;
+                    }
+
                     if (TryGetPrintable(key, out var text))
                     {
                         this.controller.AppendSteering(text);
@@ -303,7 +325,7 @@ internal sealed class TaskBrowserOverlay : View
         }
 
         AppendStatus(sb, state);
-        this.body.Text = sb.ToString();
+        this.body.SetText(sb.ToString());
         this.footer.Text = "↑/↓ move · PgUp/PgDn · Home/End · Enter open · x×2 stop · r dismiss · Esc close";
     }
 
@@ -325,7 +347,7 @@ internal sealed class TaskBrowserOverlay : View
         {
             this.visibleOutput = [];
             this.header.Text = "Task detail";
-            this.body.Text = "(no task selected)";
+            this.body.SetText("(no task selected)");
             this.footer.Text = "Esc back";
             return;
         }
@@ -362,7 +384,7 @@ internal sealed class TaskBrowserOverlay : View
             sb.AppendLine(line);
         }
 
-        this.body.Text = sb.ToString();
+        this.body.SetText(sb.ToString());
         this.footer.Text =
             "s steer · a attach · l source · ↑/↓ scroll · End newest · Ctrl+B/Esc back · x×2 stop · r dismiss";
     }
@@ -388,7 +410,7 @@ internal sealed class TaskBrowserOverlay : View
         sb.AppendLine();
 
         AppendStatus(sb, state);
-        this.body.Text = sb.ToString();
+        this.body.SetText(sb.ToString());
         this.footer.Text = "Enter send · Shift+Enter/Ctrl+Enter newline · Backspace delete · Esc cancel";
     }
 
@@ -533,6 +555,7 @@ internal sealed class TaskBrowserOverlay : View
         if (disposing && !this.disposed)
         {
             this.disposed = true;
+            this.body.CancelMouseInteraction();
 
             // Mirror Hide's safety-critical cleanup: a parent view Dispose cascade never calls Hide, so
             // Dispose itself must cancel/dispose the pump, unsubscribe Changed, release the attachment (no
