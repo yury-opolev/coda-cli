@@ -197,6 +197,50 @@ public sealed class SyntaxHighlightTests
     }
 
     [Fact]
+    public void A_comment_opened_on_a_removed_line_does_not_bleed_into_the_added_lines()
+    {
+        // The two sides of a hunk are alternative versions of the same region, not consecutive
+        // source, so an unterminated construct on one side must not colour the other.
+        var patch = string.Join('\n',
+            "diff --git a/Foo.cs b/Foo.cs",
+            "--- a/Foo.cs",
+            "+++ b/Foo.cs",
+            "@@ -1,4 +1,2 @@",
+            "-int old; /*",
+            "+int fresh;",
+            "-still commented */",
+            "+int alsoFresh;");
+
+        var lines = FormatDiff(patch);
+
+        foreach (var text in new[] { "int fresh;", "int alsoFresh;" })
+        {
+            var row = Assert.Single(lines, l => l.Text.Contains(text, StringComparison.Ordinal));
+            Assert.DoesNotContain(SpansOn(row), s => s.Kind == SyntaxTokenKind.Comment);
+            Assert.Contains(SpansOn(row), s => s.Kind == SyntaxTokenKind.Type);
+        }
+    }
+
+    [Fact]
+    public void A_comment_opened_on_a_removed_line_still_covers_the_later_removed_lines()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/Foo.cs b/Foo.cs",
+            "--- a/Foo.cs",
+            "+++ b/Foo.cs",
+            "@@ -1,3 +1,1 @@",
+            "-int old; /*",
+            "+int fresh;",
+            "-still commented");
+
+        var lines = FormatDiff(patch);
+        var row = Assert.Single(lines, l => l.Text.Contains("still commented", StringComparison.Ordinal));
+
+        var span = Assert.Single(SpansOn(row));
+        Assert.Equal(SyntaxTokenKind.Comment, span.Kind);
+    }
+
+    [Fact]
     public void Diff_header_and_summary_rows_carry_no_spans()
     {
         var lines = FormatDiff(CSharpPatch);

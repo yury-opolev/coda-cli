@@ -1083,58 +1083,95 @@ public static class TranscriptBlockFormatter
     /// Tokenises a diff body, returning one span list per entry in <see cref="DiffFile.Lines"/>.
     /// </summary>
     /// <remarks>
-    /// Section headings and no-newline markers are chrome rather than source, so they are never
-    /// highlighted and they also terminate the run around them: state carried by a block comment or a
-    /// triple-quoted string must not survive a hunk boundary, because the lines either side of one are
-    /// not adjacent in the real file.
+    /// A hunk is not a single source file: its removed and added lines are alternative versions of the
+    /// same region. So each side is tokenised as its own stream — removed lines with the context around
+    /// them, added lines with the same context — and a construct left open on one side never colours the
+    /// other. Section headings and no-newline markers are chrome rather than source: they are never
+    /// highlighted, and they end both streams, because the lines either side of a hunk boundary are not
+    /// adjacent in the real file.
     /// </remarks>
     private static IReadOnlyList<IReadOnlyList<SyntaxCharSpan>> TokenizeDiffBody(DiffFile file)
     {
         var result = new IReadOnlyList<SyntaxCharSpan>[file.Lines.Length];
+        Array.Fill(result, []);
+
         var language = SyntaxLanguageDetector.FromFilePath(file.Path);
         if (language == SyntaxLanguage.None)
         {
-            Array.Fill(result, []);
             return result;
         }
 
-        var runTexts = new List<string>();
-        var runIndices = new List<int>();
-
-        void FlushRun()
-        {
-            if (runTexts.Count == 0)
-            {
-                return;
-            }
-
-            var spans = SyntaxTokenizer.Tokenize(runTexts, language);
-            for (var i = 0; i < runIndices.Count; i++)
-            {
-                result[runIndices[i]] = spans[i];
-            }
-
-            runTexts.Clear();
-            runIndices.Clear();
-        }
+        var oldSide = new DiffSideTokenRun(language, result);
+        var newSide = new DiffSideTokenRun(language, result);
 
         for (var i = 0; i < file.Lines.Length; i++)
         {
             var line = file.Lines[i];
-            if (line.Kind is DiffLineKind.Added or DiffLineKind.Removed or DiffLineKind.Context)
+            switch (line.Kind)
             {
-                runTexts.Add(line.Text);
-                runIndices.Add(i);
-            }
-            else
-            {
-                result[i] = [];
-                FlushRun();
+                case DiffLineKind.Removed:
+                    oldSide.Add(i, line.Text);
+                    break;
+
+                case DiffLineKind.Added:
+                    newSide.Add(i, line.Text);
+                    break;
+
+                case DiffLineKind.Context:
+                    // Shared by both sides, so it advances both streams. The new side wins the row
+                    // itself, matching the new-side line number the gutter already shows.
+                    oldSide.Add(i, line.Text, claimsRow: false);
+                    newSide.Add(i, line.Text);
+                    break;
+
+                default:
+                    oldSide.Flush();
+                    newSide.Flush();
+                    break;
             }
         }
 
-        FlushRun();
+        oldSide.Flush();
+        newSide.Flush();
         return result;
+    }
+
+    /// <summary>
+    /// Accumulates one side of a diff hunk and scatters its tokenizer output back to the body rows that
+    /// asked for it. Lines added with <c>claimsRow: false</c> still advance the tokenizer's multi-line
+    /// state but do not own their row's spans, which is how a context line can participate in both sides
+    /// while being coloured only once.
+    /// </summary>
+    private sealed class DiffSideTokenRun(SyntaxLanguage language, IReadOnlyList<SyntaxCharSpan>[] result)
+    {
+        private readonly List<string> texts = [];
+        private readonly List<int> rows = [];
+
+        public void Add(int rowIndex, string text, bool claimsRow = true)
+        {
+            this.texts.Add(text);
+            this.rows.Add(claimsRow ? rowIndex : -1);
+        }
+
+        public void Flush()
+        {
+            if (this.texts.Count == 0)
+            {
+                return;
+            }
+
+            var spans = SyntaxTokenizer.Tokenize(this.texts, language);
+            for (var i = 0; i < this.rows.Count; i++)
+            {
+                if (this.rows[i] >= 0)
+                {
+                    result[this.rows[i]] = spans[i];
+                }
+            }
+
+            this.texts.Clear();
+            this.rows.Clear();
+        }
     }
 
     /// <summary>The narrowest line-number gutter, so a one-line file does not produce a single-digit column.</summary>
