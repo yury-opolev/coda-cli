@@ -1,6 +1,7 @@
 using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
+using Terminal.Gui.Text;
 
 namespace Coda.Tui.Ui.Rendering;
 
@@ -284,39 +285,36 @@ internal static class TerminalCellText
     }
 
     /// <summary>
-    /// Display width of a single grapheme cluster: combining and format runes contribute nothing, and the
-    /// cluster's width is the maximum of its runes' widths (wide runes are two cells, others one) rather
-    /// than the sum, so a multi-rune emoji or ZWJ sequence occupies a single wide glyph.
+    /// Display width of a single grapheme cluster, in the cells the driver will actually advance.
     /// </summary>
+    /// <remarks>
+    /// This MUST agree with the driver, because every position the transcript computes from it — wrap
+    /// points, the column each coloured segment is drawn at, the selection slice, the right-hand
+    /// annotation — is later handed back to the driver as a cell coordinate. A disagreement puts a draw
+    /// one column out and overwrites the character already there, which is how a stale fragment ends up
+    /// fused onto the front of a line.
+    /// <para>
+    /// The driver measures a cluster with <c>GetColumns()</c> (the sum of its runes' wcwidth) but always
+    /// advances at least one cell per cluster and at most two, so the result is clamped to that range.
+    /// A hand-rolled table was used here previously and under-counted common emoji — ✅ ❌ ⭐ measured
+    /// one cell but occupy two — and over-counted a few others.
+    /// </para>
+    /// </remarks>
     private static int ElementWidth(string element)
     {
-        var width = 0;
-        foreach (var rune in element.EnumerateRunes())
+        if (element.Length == 0)
         {
-            var category = Rune.GetUnicodeCategory(rune);
-            if (category is UnicodeCategory.NonSpacingMark or UnicodeCategory.EnclosingMark or UnicodeCategory.Format)
-            {
-                continue;
-            }
-
-            width = Math.Max(width, IsWide(rune.Value) ? 2 : 1);
+            return 0;
         }
 
-        return width;
-    }
+        // Fast path: plain ASCII (the overwhelming majority of transcript text) is always one cell and
+        // never needs segmentation or a width table.
+        if (element.Length == 1 && element[0] is >= ' ' and < (char)0x7F)
+        {
+            return 1;
+        }
 
-    private static bool IsWide(int codePoint) =>
-        (codePoint >= 0x1100 && codePoint <= 0x115F) ||   // Hangul Jamo
-        (codePoint >= 0x2E80 && codePoint <= 0x303E) ||   // CJK radicals, Kangxi
-        (codePoint >= 0x3041 && codePoint <= 0x33FF) ||   // Hiragana … CJK symbols
-        (codePoint >= 0x3400 && codePoint <= 0x4DBF) ||   // CJK Ext A
-        (codePoint >= 0x4E00 && codePoint <= 0x9FFF) ||   // CJK Unified
-        (codePoint >= 0xA000 && codePoint <= 0xA4CF) ||   // Yi
-        (codePoint >= 0xAC00 && codePoint <= 0xD7A3) ||   // Hangul syllables
-        (codePoint >= 0xF900 && codePoint <= 0xFAFF) ||   // CJK compatibility
-        (codePoint >= 0xFF00 && codePoint <= 0xFF60) ||   // Fullwidth forms
-        (codePoint >= 0xFFE0 && codePoint <= 0xFFE6) ||   // Fullwidth signs
-        (codePoint >= 0x1F1E6 && codePoint <= 0x1F1FF) || // Regional indicators (flags)
-        (codePoint >= 0x1F300 && codePoint <= 0x1FAFF) || // Emoji / symbols
-        (codePoint >= 0x20000 && codePoint <= 0x3FFFD);   // CJK Ext B+
+        var columns = element.GetColumns();
+        return columns > 1 ? 2 : 1;
+    }
 }

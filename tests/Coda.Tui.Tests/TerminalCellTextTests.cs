@@ -53,12 +53,13 @@ public sealed class TerminalCellTextTests
     [Fact]
     public void SliceByCells_includes_zero_width_grapheme_using_max_one_cell()
     {
-        // A lone combining mark measures zero cells; slicing must still treat it as occupying one cell
-        // (Math.Max(1, CellWidth)) so a [0, 1) request returns it rather than the empty string.
+        // A lone combining mark forms its own grapheme cluster, and the driver advances one cell for
+        // every cluster it draws — so the measurement must say one too, or every later column on the
+        // row is computed one cell short. Slicing a [0, 1) request still returns it.
         const string combining = "\u0301";
 
         var element = Assert.Single(TerminalCellText.Enumerate(combining));
-        Assert.Equal(0, element.CellWidth);
+        Assert.Equal(1, element.CellWidth);
         Assert.Equal(combining, TerminalCellText.SliceByCells(combining, 0, 1));
     }
 
