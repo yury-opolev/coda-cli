@@ -58,6 +58,15 @@ public enum TranscriptRole
     /// <summary>A queued user message that has not yet been delivered: rendered with a dim user foreground
     /// and a <c>[pending]</c> prefix on the first line so it reads as muted until sent.</summary>
     PendingUser,
+
+    /// <summary>A batch of tool calls where every call succeeded.</summary>
+    ToolSuccess,
+
+    /// <summary>A batch of tool calls where some, but not all, calls failed.</summary>
+    ToolPartialFailure,
+
+    /// <summary>A tool call whose permission was approved and executed.</summary>
+    PermissionApproved,
 }
 
 /// <summary>A single rendered transcript line: display text plus the role that colors it.</summary>
@@ -230,7 +239,7 @@ public static class TranscriptBlockFormatter
                 break;
 
             case PermissionTranscriptBlock permission:
-                AppendWrapped(lines, FormatPermission(permission), safeWidth, TranscriptRole.Permission);
+                AppendWrapped(lines, FormatPermission(permission), safeWidth, PermissionRole(permission.Allowed));
                 break;
 
             case UserQuestionTranscriptBlock question:
@@ -978,9 +987,7 @@ public static class TranscriptBlockFormatter
         var summary = ActivitySummary(activity);
         if (activity.CompletionState != ToolActivityCompletionState.Active)
         {
-            var role = summary.FailedCalls > 0
-                ? TranscriptRole.Error
-                : summary.Cancelled ? TranscriptRole.Warning : TranscriptRole.Tool;
+            var role = SummaryRole(summary);
             var headerStart = lines.Count;
             AppendActivityLine(lines, ToolActivityPreview.CompletedText(summary), width, role);
             // Tag the header row as complete.
@@ -1170,6 +1177,39 @@ public static class TranscriptBlockFormatter
         ToolCallStatus.Failed => TranscriptRole.Error,
         ToolCallStatus.Cancelled => TranscriptRole.Warning,
         _ => TranscriptRole.Tool,
+    };
+
+    /// <summary>The semantic role colouring a finished tool-activity summary line. Green only when every
+    /// call succeeded, red only when every call failed, orange for a mixed outcome; a cancelled batch with
+    /// no failures stays a warning.</summary>
+    internal static TranscriptRole SummaryRole(ToolActivitySummary summary)
+    {
+        if (summary.FailedCalls <= 0 && summary.Cancelled)
+        {
+            return TranscriptRole.Warning;
+        }
+
+        if (summary.FailedCalls <= 0)
+        {
+            return TranscriptRole.ToolSuccess;
+        }
+
+        if (summary.TotalCalls > 0 && summary.FailedCalls >= summary.TotalCalls)
+        {
+            return TranscriptRole.Error;
+        }
+
+        return TranscriptRole.ToolPartialFailure;
+    }
+
+    /// <summary>The semantic role colouring a permission transcript row based on the decision: approved
+    /// tools are orange/yellow (noteworthy, not a failure), rejected tools are red (a rejection is
+    /// exactly what red means), and pending decisions are a neutral question.</summary>
+    internal static TranscriptRole PermissionRole(bool? allowed) => allowed switch
+    {
+        true => TranscriptRole.PermissionApproved,
+        false => TranscriptRole.Permission,
+        null => TranscriptRole.Question,
     };
 
     private static void AppendPreformatted(List<TranscriptRenderLine> lines, string text, int width, TranscriptRole role)

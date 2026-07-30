@@ -1100,6 +1100,9 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.CalloutImportant => this.theme.CalloutImportant,
             TranscriptRole.CalloutWarning => this.theme.CalloutWarning,
             TranscriptRole.CalloutCaution => this.theme.CalloutCaution,
+            TranscriptRole.ToolSuccess => this.theme.ToolSuccess,
+            TranscriptRole.ToolPartialFailure => this.theme.ToolPartialFailure,
+            TranscriptRole.PermissionApproved => this.theme.PermissionApproved,
             _ => this.theme.TranscriptAssistant,
         };
 

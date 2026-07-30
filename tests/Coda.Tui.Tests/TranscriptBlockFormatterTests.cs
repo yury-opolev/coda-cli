@@ -190,7 +190,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
-        Assert.All(lines, line => Assert.Equal(TranscriptRole.Permission, line.Role));
+        Assert.All(lines, line => Assert.Equal(TranscriptRole.PermissionApproved, line.Role));
         Assert.Contains(lines, line => line.Text.Contains("write_file", StringComparison.Ordinal));
         Assert.Contains(lines, line => line.Text.Contains("allowed", StringComparison.Ordinal));
     }
