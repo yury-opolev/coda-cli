@@ -2,6 +2,7 @@ using System.Net;
 using System.Text;
 using System.Text.Json;
 using Coda.Agent;
+using Coda.Agent.ToolSearch;
 using Coda.Sdk;
 using LlmAuth;
 using LlmAuth.Providers.ClaudeAi;
@@ -325,4 +326,321 @@ public sealed class EffortAndContextTests
         Assert.False(ok);
         Assert.Contains("Invalid value for --effort", error);
     }
+
+    // ── Tool-search deferral: reported == transmitted ────────────────────────
+
+    /// <summary>
+    /// A realistic-scale fake MCP tool that opts into deferral.  Large Description and
+    /// InputSchemaJson ensure Standard mode produces hundreds of estimated tokens while
+    /// all-deferred mode produces zero, making magnitude assertions meaningful.
+    /// </summary>
+    private sealed class FakeDeferredTool(string name) : ITool
+    {
+        public string Name => name;
+        public string Description =>
+            "Executes a structured database operation and returns results as JSON. " +
+            "Supports SELECT, INSERT, UPDATE, and DELETE with named parameters. " +
+            "Large result sets are paginated automatically. " +
+            "Connections are pooled and returned after the query completes.";
+        public string InputSchemaJson =>
+            """{"type":"object","required":["query"],"properties":{"query":{"type":"string","description":"The SQL query string, optionally using named placeholders"},"params":{"type":"object","additionalProperties":true,"description":"Named parameters bound to the query placeholders"},"database":{"type":"string","description":"Target database name; defaults to the session default"},"timeout_ms":{"type":"integer","description":"Maximum execution time in milliseconds before the query is cancelled"},"page":{"type":"integer","description":"Zero-based page index for paginated results"},"page_size":{"type":"integer","description":"Rows per page; defaults to 100"}}}""";
+        public bool IsReadOnly => true;
+        public bool ShouldDefer => true;
+
+        public Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default) =>
+            Task.FromResult(new ToolResult("ok"));
+    }
+
+    private static FakeDeferredTool[] FiveLargeMcpTools() =>
+    [
+        new FakeDeferredTool("mcp__svc__tool1"),
+        new FakeDeferredTool("mcp__svc__tool2"),
+        new FakeDeferredTool("mcp__svc__tool3"),
+        new FakeDeferredTool("mcp__svc__tool4"),
+        new FakeDeferredTool("mcp__svc__tool5"),
+    ];
+
+    private SessionOptions McpOptions(params ITool[] extraTools) => new()
+    {
+        ProviderId = ClaudeAiProvider.Id,
+        Model = "test-only-unknown-model",
+        WorkingDirectory = this.root,
+        AutoCompactTokenThreshold = 0,
+        ExtraTools = extraTools,
+    };
+
+    [Fact]
+    public async Task AnalyzeContextAsync_tst_mode_all_deferred_estimate_branch_reports_zero_mcp_tokens()
+    {
+        // All-deferred mode: no tool schemas on the wire → zero MCP tokens, no "MCP tools" category.
+        // The informational deferred entry is present with 0 cost and excluded from UsedTokens.
+        var coordinator = new ToolSearchCoordinator(ToolSearchMode.Tst);
+        using var http = new HttpClient(new JsonHandler(HttpStatusCode.BadRequest, "{}"));
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(new FakeDeferredTool("mcp__svc__op")),
+            httpClient: http, toolSearchCoordinatorOverride: coordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        Assert.False(report.IsExact);
+        // No wire schemas → no "MCP tools" category.
+        Assert.DoesNotContain(report.Categories, c => c.Name == "MCP tools");
+        // Informational deferred entry with 0 cost.
+        Assert.Contains(report.Categories, c => c.Name == "MCP tools (deferred, 1 tools)" && c.Tokens == 0);
+        // UsedTokens excludes the 0-cost deferred entry.
+        var sumUsed = report.Categories
+            .Where(c => c.Name != "Free space"
+                     && c.Name != "Autocompact buffer"
+                     && !c.Name.StartsWith("MCP tools (deferred", StringComparison.Ordinal))
+            .Sum(c => c.Tokens);
+        Assert.Equal(report.UsedTokens, sumUsed);
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_standard_mode_estimate_branch_reports_full_mcp_schema()
+    {
+        // Standard mode: deferral is off, so every schema is on the wire.
+        using var http = new HttpClient(new JsonHandler(HttpStatusCode.BadRequest, "{}"));
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(FiveLargeMcpTools()),
+            httpClient: http,
+            toolSearchCoordinatorOverride: new ToolSearchCoordinator(ToolSearchMode.Standard));
+
+        var report = await session.AnalyzeContextAsync();
+
+        // Full schemas on wire → "MCP tools" category with substantial token cost.
+        var mcpCat = report.Categories.Single(c => c.Name == "MCP tools");
+        Assert.True(mcpCat.Tokens > 100, $"Expected > 100 tokens for 5 large schemas, got {mcpCat.Tokens}");
+        // No deferred entry (nothing was withheld).
+        Assert.DoesNotContain(report.Categories, c => c.Name.StartsWith("MCP tools (deferred", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_estimate_branch_deferred_mcp_is_dramatically_smaller_than_standard()
+    {
+        // With many large-schema tools, all-deferred mode charges zero MCP tokens while
+        // Standard mode charges hundreds — more than a 10× difference.
+        using var http = new HttpClient(new JsonHandler(HttpStatusCode.BadRequest, "{}"));
+        var tools = FiveLargeMcpTools();
+
+        using var deferredSession = new CodaSession(
+            SignedInClaude(), McpOptions(tools),
+            httpClient: http,
+            toolSearchCoordinatorOverride: new ToolSearchCoordinator(ToolSearchMode.Tst));
+
+        // Standard: deferral off, so every schema stays on the wire.
+        using var standardSession = new CodaSession(
+            SignedInClaude(), McpOptions(tools),
+            httpClient: http,
+            toolSearchCoordinatorOverride: new ToolSearchCoordinator(ToolSearchMode.Standard));
+
+        var deferredReport = await deferredSession.AnalyzeContextAsync();
+        var standardReport = await standardSession.AnalyzeContextAsync();
+
+        // All-deferred: no wire schemas → MCP category absent (reported as 0).
+        var deferredMcp = deferredReport.Categories.FirstOrDefault(c => c.Name == "MCP tools")?.Tokens ?? 0;
+        Assert.Equal(0, deferredMcp);
+
+        // Standard: all schemas on wire → clearly large MCP cost.
+        var standardMcp = standardReport.Categories.Single(c => c.Name == "MCP tools").Tokens;
+        Assert.True(standardMcp > 100, $"Expected > 100 MCP tokens in Standard mode, got {standardMcp}");
+
+        // Dramatic difference: all-deferred is more than 10× smaller.
+        Assert.True(deferredMcp < standardMcp / 10,
+            $"Expected deferred ({deferredMcp}) < standard/10 ({standardMcp / 10})");
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_tst_mode_after_discovered_estimate_branch_rises_by_schema()
+    {
+        // Once a tool is discovered, its schema joins the wire cost.
+        var coordinator = new ToolSearchCoordinator(ToolSearchMode.Tst);
+        coordinator.AddDiscovered(["mcp__svc__op"]);
+        using var http = new HttpClient(new JsonHandler(HttpStatusCode.BadRequest, "{}"));
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(new FakeDeferredTool("mcp__svc__op"), new FakeDeferredTool("mcp__svc__op2")),
+            httpClient: http, toolSearchCoordinatorOverride: coordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        // One discovered tool → "MCP tools" category with that tool's schema cost (> 0).
+        Assert.Contains(report.Categories, c => c.Name == "MCP tools" && c.Tokens > 0);
+        // One tool still deferred → informational entry with 0 tokens.
+        Assert.Contains(report.Categories, c => c.Name == "MCP tools (deferred, 1 tools)" && c.Tokens == 0);
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_tst_mode_all_deferred_exact_branch_reports_no_mcp_tokens()
+    {
+        // All-deferred: no mcpDefs on the wire → count-tokens is NOT called for MCP,
+        // no "MCP tools" category appears, and no reminder is submitted.
+        // Call order: baseline(10), system(200), builtin(500) — no MCP count call.
+        var coordinator = new ToolSearchCoordinator(ToolSearchMode.Tst);
+        var handler = new CountSeqHandler(10, 200, 500);
+        using var http = new HttpClient(handler);
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(new FakeDeferredTool("mcp__svc__op")),
+            httpClient: http, toolSearchCoordinatorOverride: coordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        Assert.True(report.IsExact);
+        // No wire definitions → no "MCP tools" category.
+        Assert.DoesNotContain(report.Categories, c => c.Name == "MCP tools");
+        // Informational deferred entry with 0 tokens.
+        Assert.Equal(0, report.Categories.Single(c => c.Name == "MCP tools (deferred, 1 tools)").Tokens);
+        // UsedTokens = system + builtin only; no MCP tokens counted.
+        Assert.Equal(190 + 490, report.UsedTokens);
+        // No body submitted the reminder to count-tokens (Finding 1: reminder removed from MCP figure).
+        Assert.DoesNotContain(handler.Bodies, b => b.Contains("<deferred-tools>", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_standard_mode_exact_branch_reports_full_mcp_schema()
+    {
+        // Standard mode: deferral is off, so all MCP schemas are on the wire and
+        // count-tokens captures them without a reminder.
+        // Call order: baseline(10), system(200), builtin(500), mcp-full-schema(120).
+        var handler = new CountSeqHandler(10, 200, 500, 120);
+        using var http = new HttpClient(handler);
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(new FakeDeferredTool("mcp__svc__op")),
+            httpClient: http,
+            toolSearchCoordinatorOverride: new ToolSearchCoordinator(ToolSearchMode.Standard));
+
+        var report = await session.AnalyzeContextAsync();
+
+        Assert.True(report.IsExact);
+        Assert.Equal(110, report.Categories.Single(c => c.Name == "MCP tools").Tokens); // 120 - 10
+        Assert.DoesNotContain(report.Categories, c => c.Name.StartsWith("MCP tools (deferred", StringComparison.Ordinal));
+        Assert.Equal(190 + 490 + 110, report.UsedTokens);
+        // The MCP count request carries the tool schema; no reminder is submitted (Finding 1).
+        Assert.Contains(handler.Bodies, b => b.Contains("mcp__svc__op", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Bodies, b => b.Contains("<deferred-tools>", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_tst_mode_after_discovered_exact_branch_rises_by_schema()
+    {
+        // After discovery, the wire includes that tool's schema only — no reminder (Finding 1).
+        // 2 deferred tools, 1 discovered → mcpDefs has 1 tool.
+        // Call order: baseline(10), system(200), builtin(500), mcp-schema-only(80).
+        var coordinator = new ToolSearchCoordinator(ToolSearchMode.Tst);
+        coordinator.AddDiscovered(["mcp__svc__op"]);
+        var handler = new CountSeqHandler(10, 200, 500, 80);
+        using var http = new HttpClient(handler);
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(new FakeDeferredTool("mcp__svc__op"), new FakeDeferredTool("mcp__svc__op2")),
+            httpClient: http, toolSearchCoordinatorOverride: coordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        Assert.True(report.IsExact);
+        // Schema cost only (80 - 10 = 70), no reminder overhead.
+        Assert.Equal(70, report.Categories.Single(c => c.Name == "MCP tools").Tokens);
+        // The other tool is still deferred.
+        Assert.Equal(0, report.Categories.Single(c => c.Name == "MCP tools (deferred, 1 tools)").Tokens);
+        Assert.Equal(190 + 490 + 70, report.UsedTokens);
+        // The MCP count request carries only the discovered tool's schema — no reminder, no other tool.
+        Assert.Contains(handler.Bodies, b => b.Contains("mcp__svc__op", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Bodies, b => b.Contains("mcp__svc__op2", StringComparison.Ordinal));
+        Assert.DoesNotContain(handler.Bodies, b => b.Contains("<deferred-tools>", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_null_coordinator_reports_full_mcp_schema()
+    {
+        // The production path where no coordinator exists at all: ENABLE_TOOL_SEARCH explicitly off
+        // makes CodaSession leave toolSearchCoordinator null, so AnalyzeContextAsync falls back to
+        // registry.Definitions. Nothing is withheld, so the full schema is reported and no
+        // informational deferred entry appears.
+        using var env = new EnvVarScope("ENABLE_TOOL_SEARCH", "false");
+        using var http = new HttpClient(new JsonHandler(HttpStatusCode.BadRequest, "{}"));
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(FiveLargeMcpTools()), httpClient: http);
+
+        Assert.Null(session.ToolSearchCoordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        var mcpCat = report.Categories.Single(c => c.Name == "MCP tools");
+        Assert.True(mcpCat.Tokens > 100, $"Expected > 100 tokens for 5 large schemas, got {mcpCat.Tokens}");
+        Assert.DoesNotContain(report.Categories, c => c.Name.StartsWith("MCP tools (deferred", StringComparison.Ordinal));
+    }
+
+    /// <summary>Sets an environment variable for the duration of a test and restores it afterwards.</summary>
+    private sealed class EnvVarScope : IDisposable
+    {
+        private readonly string name;
+        private readonly string? original;
+
+        public EnvVarScope(string name, string? value)
+        {
+            this.name = name;
+            this.original = Environment.GetEnvironmentVariable(name);
+            Environment.SetEnvironmentVariable(name, value);
+        }
+
+        public void Dispose() => Environment.SetEnvironmentVariable(this.name, this.original);
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_deferred_category_zero_tokens_excluded_from_used_tokens()
+    {
+        // The "MCP tools (deferred, N tools)" category is purely informational:
+        // its 0 tokens must not be added to UsedTokens or affect the Free space computation.
+        // Call order: baseline(10), system(200), builtin(500) — no MCP count (all-deferred).
+        var coordinator = new ToolSearchCoordinator(ToolSearchMode.Tst);
+        using var http = new HttpClient(new CountSeqHandler(10, 200, 500));
+        using var session = new CodaSession(
+            SignedInClaude(), McpOptions(new FakeDeferredTool("mcp__svc__op")),
+            httpClient: http, toolSearchCoordinatorOverride: coordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        var deferredCat = Assert.Single(report.Categories, c => c.Name.StartsWith("MCP tools (deferred", StringComparison.Ordinal));
+        Assert.Equal(0, deferredCat.Tokens);
+
+        // UsedTokens is the sum of cost-bearing categories only —
+        // free space, autocompact buffer, and the deferred informational entry are excluded.
+        var sumUsed = report.Categories
+            .Where(c => c.Name != "Free space"
+                     && c.Name != "Autocompact buffer"
+                     && !c.Name.StartsWith("MCP tools (deferred", StringComparison.Ordinal))
+            .Sum(c => c.Tokens);
+        Assert.Equal(report.UsedTokens, sumUsed);
+
+        // Free space = MaxTokens - UsedTokens - autocompact reserve (if any).
+        var freeCat = report.Categories.Single(c => c.Name == "Free space");
+        var autocompactCat = report.Categories.FirstOrDefault(c => c.Name == "Autocompact buffer");
+        Assert.Equal(report.MaxTokens - report.UsedTokens - (autocompactCat?.Tokens ?? 0), freeCat.Tokens);
+    }
+
+    [Fact]
+    public async Task AnalyzeContextAsync_discovered_tool_schema_is_on_wire_and_deferred_count_excludes_it()
+    {
+        // Finding 2 seam: a coordinator whose discovered set already contains a tool causes
+        // that tool's schema to appear on the wire (positive MCP tokens) while the remaining
+        // tools are reported in the informational deferred category with count = total - discovered.
+        var coordinator = new ToolSearchCoordinator(ToolSearchMode.Tst);
+        coordinator.AddDiscovered(["mcp__svc__op"]);
+        using var http = new HttpClient(new JsonHandler(HttpStatusCode.BadRequest, "{}"));
+        using var session = new CodaSession(
+            SignedInClaude(),
+            McpOptions(
+                new FakeDeferredTool("mcp__svc__op"),
+                new FakeDeferredTool("mcp__svc__op2"),
+                new FakeDeferredTool("mcp__svc__op3")),
+            httpClient: http, toolSearchCoordinatorOverride: coordinator);
+
+        var report = await session.AnalyzeContextAsync();
+
+        // Discovered tool's schema is on the wire → positive MCP token cost.
+        Assert.Contains(report.Categories, c => c.Name == "MCP tools" && c.Tokens > 0);
+        // 2 of 3 tools remain deferred → deferredCount = 2.
+        Assert.Contains(report.Categories, c => c.Name == "MCP tools (deferred, 2 tools)" && c.Tokens == 0);
+        // No "deferred, 3 tools" entry — the discovered tool is excluded from the deferred count.
+        Assert.DoesNotContain(report.Categories, c => c.Name == "MCP tools (deferred, 3 tools)");
+    }
 }
+

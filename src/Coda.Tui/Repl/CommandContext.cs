@@ -1,6 +1,7 @@
 using Coda.Agent;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Tasks;
+using Coda.Agent.ToolSearch;
 using Coda.Tui.Commands;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Prompts;
@@ -117,6 +118,15 @@ public sealed class CommandContext
     /// that have no running agent; the <c>/schedule</c> command then renders an empty list.
     /// </summary>
     public Func<IScheduleControl?>? ScheduleControlProvider { get; set; }
+
+    /// <summary>
+    /// Live source of the session's <see cref="ToolSearchCoordinator"/> (a provider, not a snapshot, so
+    /// it reflects the session that only exists after the first turn). Null in non-interactive/plain
+    /// contexts, or when tool search is inactive. <c>/context</c> passes the coordinator into the analysis
+    /// session so it measures what the live turn actually transmits instead of re-analyzing with an empty
+    /// discovered set.
+    /// </summary>
+    public Func<ToolSearchCoordinator?>? ToolSearchCoordinatorProvider { get; set; }
 
     /// <summary>
     /// The live MCP client manager, so <c>/mcp</c> can report connection status and tools.

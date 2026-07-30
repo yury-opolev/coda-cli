@@ -1,3 +1,4 @@
+using Coda.Agent.ToolSearch;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -32,8 +33,22 @@ public sealed class ContextCommand : ISlashCommand
             ["Free space"] = ("#5f574e", '░'),
         };
 
-    private static (string Color, char Glyph) StyleFor(string categoryName) =>
-        Styles.TryGetValue(categoryName, out var style) ? style : ("#f2d6b3", '◆');
+    private static (string Color, char Glyph) StyleFor(string categoryName)
+    {
+        if (Styles.TryGetValue(categoryName, out var style))
+        {
+            return style;
+        }
+
+        // Deferred MCP tools are informational (zero cost) so they get a hollow, dim marker —
+        // distinct from every glyph in the static Styles dictionary and from the plain fallback.
+        if (categoryName.StartsWith("MCP tools (deferred", StringComparison.Ordinal))
+        {
+            return ("#5f574e", '\u25cb'); // ○ U+25CB: hollow — present but costing nothing
+        }
+
+        return ("#f2d6b3", '\u25c6'); // ◆ generic fallback
+    }
 
     /// <summary>
     /// The per-category grid/legend glyphs, exposed so tests can assert every context category maps to a
@@ -77,8 +92,9 @@ public sealed class ContextCommand : ISlashCommand
     internal static async Task<ContextReport> AnalyzeOnceAsync(CommandContext context, CancellationToken cancellationToken)
     {
         var options = BuildSessionOptions(context);
-
-        using var session = new CodaSession(context.Credentials, options, history: context.Session.History);
+        var coordinator = context.ToolSearchCoordinatorProvider?.Invoke();
+        using var session = new CodaSession(context.Credentials, options, history: context.Session.History,
+            toolSearchCoordinatorOverride: coordinator);
         return await session.AnalyzeContextAsync(cancellationToken).ConfigureAwait(false);
     }
 

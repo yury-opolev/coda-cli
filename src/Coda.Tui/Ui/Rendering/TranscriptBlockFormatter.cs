@@ -417,6 +417,7 @@ public static class TranscriptBlockFormatter
         "Messages" => ('\u25a0', TranscriptRole.ContextMessages),                // ■
         "Autocompact buffer" => ('\u2592', TranscriptRole.ContextAutocompactBuffer), // ▒
         "Free space" => ('\u2591', TranscriptRole.ContextFreeSpace),             // ░
+        _ when categoryName.StartsWith("MCP tools (deferred", StringComparison.Ordinal) => ('\u25cb', TranscriptRole.ContextFreeSpace), // ○  dim: present but costs nothing
         _ => ('\u25c6', TranscriptRole.ContextSystemPrompt),
     };
 

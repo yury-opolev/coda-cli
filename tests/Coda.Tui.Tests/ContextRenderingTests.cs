@@ -105,6 +105,18 @@ public sealed class ContextRenderingTests
         }
     }
 
+    [Fact]
+    public void Context_deferred_category_glyph_is_distinct_from_all_six_static_categories()
+    {
+        // The "MCP tools (deferred, N tools)" label is dynamic and cannot live in the static
+        // Styles dictionary; both renderers must assign it a glyph that is distinct from every
+        // static-category glyph so the grid stays shape-legible on low-colour terminals.
+        var (deferredGlyph, _) = TranscriptBlockFormatter.ContextCategoryStyle("MCP tools (deferred, 5 tools)");
+
+        var staticGlyphs = ContextCommand.CategoryGlyphs.Values.ToHashSet();
+        Assert.DoesNotContain(deferredGlyph, staticGlyphs);
+    }
+
     private static CommandContext BuildContext(UiAnsiConsoleAdapter console, IUiEventPublisher events)
     {
         var store = new InMemoryTokenStore();
