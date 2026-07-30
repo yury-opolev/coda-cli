@@ -128,12 +128,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     internal string VisibleTextForTest { get; private set; } = string.Empty;
 
     // ── ISelectableOverlay ────────────────────────────────────────────────────
-
-    bool ISelectableOverlay.HasSelection => this.body.HasSelection;
-
-    string ISelectableOverlay.SelectedText => this.body.SelectedText;
-
-    void ISelectableOverlay.ClearSelection() => this.body.ClearSelection();
+    SelectableTextView ISelectableOverlay.Body => this.body;
 
     internal void Show()
     {

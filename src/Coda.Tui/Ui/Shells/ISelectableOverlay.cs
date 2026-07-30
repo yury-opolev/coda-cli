@@ -1,22 +1,18 @@
 namespace Coda.Tui.Ui.Shells;
 
 /// <summary>
-/// Implemented by modal overlay views that host a <see cref="SelectableTextView"/> body so the shell
-/// can route overlay text-selection copies through its single clipboard path.
+/// Implemented by modal overlay views that host a <see cref="SelectableTextView"/> body, so the shell can
+/// treat overlay text selection uniformly rather than wiring each overlay by hand.
 /// </summary>
 /// <remarks>
-/// The shell calls <see cref="HasSelection"/> and <see cref="SelectedText"/> to decide whether a
-/// Ctrl+C should copy rather than arm the exit chord, and passes <see cref="ClearSelection"/> as the
-/// clear-on-success callback to <c>CopyToClipboard</c> so the selection survives a clipboard failure.
+/// Terminal.Gui dispatches a key to the focused subview before the SuperView, and most overlays swallow
+/// every key they do not map — so an overlay cannot rely on the shell seeing its Ctrl+C. Each overlay
+/// therefore calls <see cref="SelectableTextView.TryCopySelection"/> on its own body first, and the shell
+/// uses this interface only for the overlays whose keys do reach it. Both routes end at the same
+/// clipboard path, because <see cref="Body"/> is the single thing they share.
 /// </remarks>
 internal interface ISelectableOverlay
 {
-    /// <summary>Whether the overlay body currently has at least one cell selected.</summary>
-    bool HasSelection { get; }
-
-    /// <summary>The plain text of the current body selection, or an empty string when nothing is selected.</summary>
-    string SelectedText { get; }
-
-    /// <summary>Clears any active body selection.</summary>
-    void ClearSelection();
+    /// <summary>The overlay's selectable body.</summary>
+    SelectableTextView Body { get; }
 }

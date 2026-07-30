@@ -102,12 +102,7 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
     internal IReadOnlyList<string> VisibleOutputLines => this.visibleOutput;
 
     // ── ISelectableOverlay ────────────────────────────────────────────────────
-
-    bool ISelectableOverlay.HasSelection => this.body.HasSelection;
-
-    string ISelectableOverlay.SelectedText => this.body.SelectedText;
-
-    void ISelectableOverlay.ClearSelection() => this.body.ClearSelection();
+    SelectableTextView ISelectableOverlay.Body => this.body;
 
     /// <summary>Opens the controller, subscribes to changes, starts a fresh pump, focuses, and renders.</summary>
     public void Show()

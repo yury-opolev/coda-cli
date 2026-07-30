@@ -24,11 +24,10 @@ internal static class CodaThemes
             Palette = new TuiPalette
             {
                 Success = new(new TgColor(70, 195, 85), TgName.BrightGreen),
-                Caution = new(new TgColor(200, 150, 40), TgName.Yellow),
-                Danger  = new(new TgColor(200, 70, 70), TgName.Red),
-                Info    = new(new TgColor(160, 170, 185), TgName.Gray),
+                Warn = new(new TgColor(200, 150, 40), TgName.Yellow),
+                Error   = new(new TgColor(200, 70, 70), TgName.Red),
+                Dim     = new(new TgColor(160, 170, 185), TgName.Gray),
             },
-            Question = new(new TgColor(220, 170, 60), TgName.BrightYellow),
             ContextSystemPrompt = new(new TgColor(140, 190, 255), TgName.BrightBlue),
             ContextSystemTools = new(new TgColor(120, 170, 230), TgName.BrightBlue),
             ContextMcpTools = new(new TgColor(140, 220, 200), TgName.BrightCyan),
@@ -87,11 +86,10 @@ internal static class CodaThemes
             Palette = new TuiPalette
             {
                 Success = new(new TgColor(55, 205, 100), TgName.BrightGreen),
-                Caution = new(new TgColor(200, 140, 30), TgName.Yellow),
-                Danger  = new(new TgColor(210, 70, 70), TgName.Red),
-                Info    = new(new TgColor(150, 170, 190), TgName.Gray),
+                Warn = new(new TgColor(200, 140, 30), TgName.Yellow),
+                Error   = new(new TgColor(210, 70, 70), TgName.Red),
+                Dim     = new(new TgColor(150, 170, 190), TgName.Gray),
             },
-            Question = new(new TgColor(220, 160, 40), TgName.BrightYellow),
             ContextSystemPrompt = new(new TgColor(80, 210, 220), TgName.BrightCyan),
             ContextSystemTools = new(new TgColor(60, 180, 200), TgName.Cyan),
             ContextMcpTools = new(new TgColor(100, 190, 180), TgName.BrightCyan),

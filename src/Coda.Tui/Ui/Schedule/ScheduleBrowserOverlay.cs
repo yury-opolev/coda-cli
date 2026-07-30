@@ -89,12 +89,7 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
     internal string FooterText => this.footer.Text ?? string.Empty;
 
     // ── ISelectableOverlay ────────────────────────────────────────────────────
-
-    bool ISelectableOverlay.HasSelection => this.body.HasSelection;
-
-    string ISelectableOverlay.SelectedText => this.body.SelectedText;
-
-    void ISelectableOverlay.ClearSelection() => this.body.ClearSelection();
+    SelectableTextView ISelectableOverlay.Body => this.body;
 
     // ── Show / Hide / Teardown ────────────────────────────────────────────────
 

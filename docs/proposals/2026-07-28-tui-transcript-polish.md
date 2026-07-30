@@ -161,10 +161,13 @@ Four phases plus two additions, each landed as its own reviewed commit on
 - **The pin is memoised and survives re-renders.** A submitted prompt is unbounded in size and the
   pin redraws every frame, so composition is cached against the block instance and width.
 - **Outcome colours resolve through a named palette.** Rather than each theme restating six roles,
-  `TuiPalette` (`Success`, `Caution`, `Danger`, `Info`) is the base a theme supplies once — the TUI
-  counterpart of `ConsolePalette`. `Caution` deliberately covers a partial failure, an approval and
-  a cancelled batch alike: all three mean "noteworthy, but nothing failed outright". The redundant
-  `PermissionApproval` role was removed, since a rejected permission is exactly `Danger`.
+  `TuiPalette` (`Success`, `Warn`, `Error`, `Dim`) is the base a theme supplies once — the TUI
+  counterpart of `ConsolePalette`, sharing its vocabulary. `Warn` deliberately covers a partial
+  failure, an approval, a cancelled batch and an open question alike: all mean "noteworthy, but
+  nothing failed outright". The redundant `PermissionApproval` role was removed, since a rejected
+  permission is exactly `Error`.
+- **The gutter is chrome, so it is never copied.** The prefix lives in the row's text so it draws and
+  highlights with the row, but each row records its gutter width and a copied selection skips it.
 - **Views never clear their own selection after a copy.** The host clears it, because it keeps the
   selection when a clipboard write fails so the user can retry.
 - **Selection is a reusable surface.** `SelectableTextView` backs the session id and the modal

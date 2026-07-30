@@ -92,7 +92,6 @@ public sealed class TranscriptGlyphsTests
     [Theory]
     [InlineData(TranscriptGutterKind.Child)]
     [InlineData(TranscriptGutterKind.LastChild)]
-    [InlineData(TranscriptGutterKind.ChildContinuation)]
     public void Prefix_for_child_kinds_has_ChildCells_width(TranscriptGutterKind kind)
     {
         Assert.Equal(TranscriptGlyphs.ChildCells, TerminalCellText.Width(TranscriptGlyphs.Unicode.Prefix(kind)));

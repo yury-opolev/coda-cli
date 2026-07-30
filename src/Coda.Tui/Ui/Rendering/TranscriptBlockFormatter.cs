@@ -32,6 +32,10 @@ public enum TranscriptRole
     Code,
     Tool,
     Diff,
+
+    /// <summary>A permission that was REJECTED. Red is reserved for a failure or a rejection, and this is
+    /// the rejection half of that rule; an approved one uses <see cref="PermissionApproved"/> and a
+    /// still-undecided one <see cref="Question"/>.</summary>
     Permission,
     Question,
     Warning,
@@ -117,6 +121,13 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     /// projected and consumed by the final shaping pass, which turns it into the row's literal prefix.</summary>
     public TranscriptGutterKind Gutter { get; init; }
 
+    /// <summary>
+    /// Cells occupied by the gutter prefix once the shaping pass has applied it. The prefix lives in
+    /// <see cref="Text"/> so it draws and highlights with the row, but it is chrome rather than content, so
+    /// copying a selection skips it.
+    /// </summary>
+    public int GutterCells { get; init; }
+
     /// <summary>Wraps a plain string as an assistant-role line.</summary>
     public static implicit operator TranscriptRenderLine(string text) => new(text, TranscriptRole.Assistant);
 
@@ -132,6 +143,7 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
         this.PrefixCells == other.PrefixCells &&
         this.PrefixRole == other.PrefixRole &&
         this.Gutter == other.Gutter &&
+        this.GutterCells == other.GutterCells &&
         LinksContentEqual(this.Links, other.Links);
 
     private static bool LinksContentEqual(IReadOnlyList<LinkSpan>? a, IReadOnlyList<LinkSpan>? b)
@@ -149,6 +161,8 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
 
     public override int GetHashCode()
     {
+        // GutterCells is intentionally absent: it is a pure function of Gutter (every marker and connector
+        // is one cell wide), so equal rows always agree on it and the hash stays consistent with Equals.
         var hash = HashCode.Combine(
             this.Text, (int)this.Role, this.FillWidth, this.RightText,
             this.RightTextTrailingCells, this.PrefixCells, (int)this.PrefixRole, (int)this.Gutter);
@@ -194,7 +208,7 @@ public static class TranscriptBlockFormatter
 
         var effectiveGlyphs = glyphs ?? TranscriptGlyphs.Unicode;
         var safeWidth = width > 0 ? width : 1;
-        var reserved = GutterReservedCells(block, toolDisplayMode);
+        var reserved = GutterReservedCells(block);
         var contentWidth = Math.Max(1, safeWidth - reserved);
         var lines = new List<TranscriptRenderLine>();
 
@@ -278,7 +292,7 @@ public static class TranscriptBlockFormatter
 
     /// <summary>Cells the gutter reserves for <paramref name="block"/>, so content is wrapped narrow enough
     /// that the prefix always fits inside the viewport width.</summary>
-    internal static int GutterReservedCells(TranscriptBlock block, ToolDisplayMode toolDisplayMode) => block switch
+    internal static int GutterReservedCells(TranscriptBlock block) => block switch
     {
         UserTranscriptBlock => TranscriptGlyphs.MarkerCells,
         PendingUserTranscriptBlock => TranscriptGlyphs.MarkerCells,
@@ -319,6 +333,7 @@ public static class TranscriptBlockFormatter
             {
                 Text = prefix + line.Text,
                 PrefixCells = newPrefixCells,
+                GutterCells = shift,
                 Links = ShiftLinkSpans(line.Links, shift),
             };
         }
@@ -849,7 +864,9 @@ public static class TranscriptBlockFormatter
         if (toolDisplayMode == ToolDisplayMode.Full && tool.Result is { Length: > 0 } result)
         {
             var resultStart = lines.Count;
-            foreach (var line in SplitLines(result))
+            // Tool output is untrusted: strip escapes, controls and bidi overrides before it reaches the
+            // terminal, matching how the correlated-activity path already treats a result.
+            foreach (var line in SplitLines(TerminalTextSanitizer.Sanitize(result)))
             {
                 foreach (var wrapped in WrapPreformatted(line, width))
                 {
@@ -1807,6 +1824,12 @@ public static class TranscriptBlockFormatter
         }
     }
 
+    /// <summary>
+    /// Renders a permission row: the tool, its input preview, and the decision. Both model-controlled
+    /// fields are flattened to a single safe line first — a permission entry is the only place the UI shows
+    /// <em>what</em> the agent asked to run, so an embedded newline could forge an extra row (a fake
+    /// "→ allowed") and a bidi override could reorder a dangerous command to read as a benign one.
+    /// </summary>
     private static string FormatPermission(PermissionTranscriptBlock permission)
     {
         var decision = permission.Allowed switch
@@ -1816,7 +1839,9 @@ public static class TranscriptBlockFormatter
             null => string.Empty,
         };
 
-        return $"{permission.ToolName} {permission.InputPreview}{decision}";
+        var toolName = TerminalTextSanitizer.SanitizeSingleLine(permission.ToolName);
+        var preview = TerminalTextSanitizer.SanitizeSingleLine(permission.InputPreview);
+        return $"{toolName} {preview}{decision}";
     }
 
     private static string FormatQuestion(UserQuestionTranscriptBlock question) =>

@@ -295,4 +295,72 @@ public sealed class TranscriptGutterTests
             lines,
             line => line.Text.Length > 0 && line.Text.Trim().Length == 0);
     }
-}
+
+    // ---------------------------------------------------------------------------
+    // Hostile input never reaches the terminal
+    // ---------------------------------------------------------------------------
+
+    [Fact]
+    public void Permission_row_cannot_forge_extra_rows_or_reorder_its_command()
+    {
+        // A permission entry is the only place the UI shows WHAT the agent asked to run, so a newline
+        // could forge a second "allowed" row and a bidi override could make a dangerous command read as
+        // a benign one.
+        var block = new PermissionTranscriptBlock(
+            Guid.NewGuid(),
+            "run_command",
+            "rm -rf /\n\u001b[31mwrite_file safe.txt \u2192 allowed\u202e",
+            Allowed: false);
+
+        var lines = TranscriptBlockFormatter.Format(block, 200);
+
+        var row = Assert.Single(lines);
+        Assert.DoesNotContain('\u001b', row.Text);
+        Assert.DoesNotContain('\u202e', row.Text);
+        Assert.EndsWith("\u2192 denied", row.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Full_mode_tool_result_is_stripped_of_escapes()
+    {
+        var block = new ToolTranscriptBlock(
+            Guid.NewGuid(), "run", "{}", 5, "ok\u001b[2J\u202edone", IsError: false, Complete: true);
+
+        var lines = TranscriptBlockFormatter.Format(block, 80, ToolDisplayMode.Full);
+
+        Assert.DoesNotContain(lines, line => line.Text.Contains('\u001b'));
+        Assert.DoesNotContain(lines, line => line.Text.Contains('\u202e'));
+    }
+
+    // ---------------------------------------------------------------------------
+    // The gutter is chrome: it draws with the row but is never copied
+    // ---------------------------------------------------------------------------
+
+    [Fact]
+    public void Gutter_cells_are_recorded_so_copy_can_skip_them()
+    {
+        var user = TranscriptBlockFormatter.Format(
+            new UserTranscriptBlock(Guid.NewGuid(), "hello"), 40);
+        Assert.Equal(TranscriptGlyphs.MarkerCells, user[0].GutterCells);
+
+        var activity = TranscriptBlockFormatter.Format(
+            new ToolActivityTranscriptBlock(
+                Guid.NewGuid(), "root", "act",
+                ImmutableArray.Create(
+                    new ToolActivityCall("c0", "root", "read_file", """{"path":"a"}""", "p",
+                        ToolCallStatus.Running, 10, null, null)),
+                ToolActivityCompletionState.Active),
+            120, ToolDisplayMode.Summary);
+
+        Assert.Equal(TranscriptGlyphs.MarkerCells, activity[0].GutterCells);
+        Assert.Equal(TranscriptGlyphs.ChildCells, activity[1].GutterCells);
+    }
+
+    [Fact]
+    public void Rows_without_a_gutter_record_no_gutter_cells()
+    {
+        var lines = TranscriptBlockFormatter.Format(
+            new CommandOutputTranscriptBlock(Guid.NewGuid(), "plain output"), 40);
+
+        Assert.All(lines, line => Assert.Equal(0, line.GutterCells));
+    }}

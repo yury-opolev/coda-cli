@@ -88,11 +88,11 @@ public sealed class SelectableTextViewTests : IClassFixture<TerminalGuiApplicati
     }
 
     [Fact]
-    public void Text_property_returns_first_line()
+    public void AllText_returns_every_line()
     {
         var view = CreateView();
         view.SetText("first\nsecond");
-        Assert.Equal("first", view.Text);
+        Assert.Equal("first\nsecond", view.AllText);
     }
 
     [Fact]
@@ -448,7 +448,7 @@ public sealed class SelectableTextViewTests : IClassFixture<TerminalGuiApplicati
             UiSessionSnapshot.Empty with { SessionId = "ses-abc", Model = "gpt-5" },
             CancellationToken.None);
 
-        Assert.Contains("ses-abc", fixture.Shell.Header.Text, StringComparison.Ordinal);
+        Assert.Contains("ses-abc", fixture.Shell.Header.AllText, StringComparison.Ordinal);
     }
 
     [Fact]

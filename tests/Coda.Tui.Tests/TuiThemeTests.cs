@@ -32,13 +32,13 @@ public sealed class TuiThemeTests
         Assert.Equal(TgName.White, theme.TranscriptAssistant.Fallback);
         Assert.Equal(TgName.BrightYellow, theme.TranscriptUser.Fallback);
         Assert.Equal(TgName.BrightYellow, theme.TranscriptTool.Fallback);
-        Assert.Equal(TgName.BrightYellow, theme.Question.Fallback);
+        Assert.Equal(TgName.Yellow, theme.Question.Fallback);
         Assert.Equal(TgName.Red, theme.Error.Fallback);
         Assert.NotEqual(TgName.Blue, theme.TranscriptTool.Fallback);
 
-        // Error is unchanged and is the Danger palette entry — the only red in the theme.
-        // A rejected permission row resolves to Danger, the same red as Error.
-        Assert.Equal(theme.Error, theme.Palette.Danger);
+        // Error is unchanged and is the Error palette entry — the only red in the theme.
+        // A rejected permission row resolves to the Error palette entry, the same red as Error.
+        Assert.Equal(theme.Error, theme.Palette.Error);
     }
 
     [Fact]

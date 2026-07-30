@@ -1,14 +1,14 @@
 namespace Coda.Tui.Ui.Mode;
 
 /// <summary>Observed capabilities of the attached terminal.</summary>
+/// <param name="UnicodeOutput">Whether the terminal can render box-drawing and geometric characters;
+/// used to choose between the Unicode and ASCII glyph sets for the transcript gutter.</param>
 public sealed record TerminalCapabilities(
     bool InputRedirected,
     bool OutputRedirected,
     int Width,
     int Height,
     bool Interactive,
-    /// <summary>Whether the terminal can render box-drawing and geometric characters; used to choose
-    /// between Unicode and ASCII glyph sets for the transcript gutter.</summary>
     bool UnicodeOutput = true);
 
 public interface ITerminalCapabilitiesProvider

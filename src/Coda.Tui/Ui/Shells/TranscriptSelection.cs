@@ -76,6 +76,12 @@ internal sealed class TranscriptSelection
         return (0, width);
     }
 
+    /// <summary>
+    /// The selected text of <paramref name="rows"/>, one entry per row, joined by newlines. Each row's
+    /// gutter — its role marker, continuation indent or tree connector — is skipped: it is chrome that
+    /// draws and highlights with the row, but pasting ` ● ` or `   │ ` back into an editor is never what
+    /// the user meant to copy.
+    /// </summary>
     internal string CopyText(IReadOnlyList<TranscriptRow> rows)
     {
         var selected = new List<string>();
@@ -92,10 +98,16 @@ internal sealed class TranscriptSelection
                 continue;
             }
 
-            selected.Add(TerminalCellText.SliceByCells(
-                row.Text,
-                range.StartCell,
-                range.EndCellExclusive));
+            var start = Math.Max(range.StartCell, row.GutterCells);
+            if (start >= range.EndCellExclusive)
+            {
+                // The selection covers only gutter chrome on this row, so it contributes an empty line
+                // rather than being dropped — a blank row inside a multi-row selection is still a row.
+                selected.Add(string.Empty);
+                continue;
+            }
+
+            selected.Add(TerminalCellText.SliceByCells(row.Text, start, range.EndCellExclusive));
         }
 
         return string.Join('\n', selected);

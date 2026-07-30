@@ -26,7 +26,7 @@ namespace Coda.Tui.Ui.Shells;
 /// not focusable and does not participate in the Tab order; selection is entirely mouse-driven.
 /// </para>
 /// </remarks>
-internal class SelectableTextView : View
+internal sealed class SelectableTextView : View
 {
     private readonly IApplication? app;
     private readonly TranscriptSelection selection = new();
@@ -59,13 +59,7 @@ internal class SelectableTextView : View
     /// <summary>The current lines of content, each already sanitized.</summary>
     internal IReadOnlyList<string> Lines => this.lines;
 
-    /// <summary>
-    /// The first line of content, for compatibility with consumers that treat this as a single-line label.
-    /// Returns an empty string when no lines have been set.
-    /// </summary>
-    internal new string Text => this.lines.Count > 0 ? this.lines[0] : string.Empty;
-
-    /// <summary>All lines of content joined by <c>\n</c>, for consumers that need the full multi-line body text.</summary>
+    /// <summary>All lines of content joined by <c>\n</c>, for consumers that need the full body text.</summary>
     internal string AllText => string.Join('\n', this.lines);
 
     /// <summary>Whether at least one cell is currently selected.</summary>
@@ -330,14 +324,9 @@ internal class SelectableTextView : View
 
     /// <summary>
     /// True when <paramref name="flags"/> represent any of the three physical right-click completions
-    /// (single, double, or triple) without a position report. Mirrors the triple-bit handling used by
-    /// the composer's right-click path so semantics are consistent across all copy surfaces.
+    /// (single, double, or triple) without a position report.
     /// </summary>
-    private static bool IsRightClick(MouseFlags flags) =>
-        !flags.HasFlag(MouseFlags.PositionReport) &&
-        (flags.HasFlag(MouseFlags.RightButtonClicked) ||
-         flags.HasFlag(MouseFlags.RightButtonDoubleClicked) ||
-         flags.HasFlag(MouseFlags.RightButtonTripleClicked));
+    private static bool IsRightClick(MouseFlags flags) => SelectionGesture.IsRightClick(flags);
 
     /// <summary>
     /// Maps a mouse event to a cell position, clamped to the rows actually on screen.

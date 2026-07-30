@@ -699,21 +699,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private bool TryCopyOverlaySelection()
     {
         ISelectableOverlay? overlay =
-            this.PromptOverlay.Visible ? (ISelectableOverlay)this.PromptOverlay :
-            this.taskOverlay?.Visible == true ? (ISelectableOverlay)this.taskOverlay :
-            this.mcpOverlay?.Visible == true ? (ISelectableOverlay)this.mcpOverlay :
-            this.scheduleOverlay?.Visible == true ? (ISelectableOverlay)this.scheduleOverlay :
-            this.skillsOverlay?.Visible == true ? (ISelectableOverlay)this.skillsOverlay :
-            this.pluginOverlay?.Visible == true ? (ISelectableOverlay)this.pluginOverlay :
+            this.PromptOverlay.Visible ? this.PromptOverlay :
+            this.taskOverlay?.Visible == true ? this.taskOverlay :
+            this.mcpOverlay?.Visible == true ? this.mcpOverlay :
+            this.scheduleOverlay?.Visible == true ? this.scheduleOverlay :
+            this.skillsOverlay?.Visible == true ? this.skillsOverlay :
+            this.pluginOverlay?.Visible == true ? this.pluginOverlay :
             null;
 
-        if (overlay is null || !overlay.HasSelection)
-        {
-            return false;
-        }
-
-        this.CopyToClipboard(overlay.SelectedText, overlay.ClearSelection);
-        return true;
+        return overlay?.Body.TryCopySelection() == true;
     }
 
     private bool TryHandleTranscriptNavigationKey(Key key)

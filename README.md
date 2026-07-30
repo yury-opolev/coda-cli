@@ -186,11 +186,13 @@ one accepted mid-sentence stays literal text and is sent to the model together w
 it, so `Enter` there accepts the suggestion and leaves the prompt for you to finish.
 
 **Mouse:** in the **transcript**, **left-drag** selects text; `Ctrl+C` **or a right-click** copies the
-selection and clears it. In the **composer**, **left-drag** selects text; when a selection exists,
-`Ctrl+C` **or a right-click** copies it and clears the selection; a **right-click** with no selection
-pastes at the clicked caret; `Ctrl+V` remains a direct paste; and a **middle-click** opens the editor
-context menu. The **session id** in the header can be selected with a **left-drag** and copied the same
-way (right-click or `Ctrl+C`). **`Shift`-drag** hands native selection and copy to the terminal where
+selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
+the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a
+selection exists, `Ctrl+C` **or a right-click** copies it and clears the selection; a **right-click**
+with no selection pastes at the clicked caret; `Ctrl+V` remains a direct paste; and a **middle-click**
+opens the editor context menu. The **session id** in the header, and the body of the modal browsers
+(`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
+and copied the same way. **`Shift`-drag** hands native selection and copy to the terminal where
 supported. `--no-mouse` leaves selection and copy native to the terminal, and every action stays
 reachable from the keyboard. Full-screen has **no permanent sidebar**
 and uses a **virtualized transcript** (context, pickers, permissions, help, and diffs all use

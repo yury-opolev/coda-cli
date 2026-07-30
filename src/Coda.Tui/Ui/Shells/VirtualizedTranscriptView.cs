@@ -75,7 +75,8 @@ internal sealed class VirtualizedTranscriptView : View
         this.glyphs = glyphs ?? TranscriptGlyphs.Unicode;
         this.index = new TranscriptLayoutIndex(
             formatter ?? TranscriptBlockFormatter.Format,
-            enableIncrementalAssistant: formatter is null);
+            enableIncrementalAssistant: formatter is null,
+            glyphs: this.glyphs);
         this.CanFocus = true;
         this.MousePositionTracking = true;
     }
@@ -165,9 +166,6 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>The pin text drawn at screen row 0 during the last <see cref="OnDrawingContent"/> call, or
     /// null when no pin was drawn. Exposed for tests.</summary>
     internal string? PinnedPromptForTest { get; private set; }
-
-    /// <summary>Total number of times the prompt pin was drawn. Exposed for tests.</summary>
-    internal int PinnedPromptDrawCount { get; private set; }
 
     internal void ScrollToRowForTest(int row) =>
         this.viewport.ScrollToRow(row, this.index.AnchorAt(row));
@@ -473,7 +471,6 @@ internal sealed class VirtualizedTranscriptView : View
         this.AddStr(text);
 
         this.pinVisible = true;
-        this.PinnedPromptDrawCount++;
     }
 
     /// <summary>
@@ -804,10 +801,7 @@ internal sealed class VirtualizedTranscriptView : View
         // Right-click: when a selection is active, copy it and consume the event regardless of whether the
         // pointer is over a link — selection takes priority over the link context menu. With no selection,
         // right-click over a link opens the context menu as before.
-        if ((mouse.Flags.HasFlag(MouseFlags.RightButtonClicked) ||
-             mouse.Flags.HasFlag(MouseFlags.RightButtonDoubleClicked) ||
-             mouse.Flags.HasFlag(MouseFlags.RightButtonTripleClicked)) &&
-            !mouse.Flags.HasFlag(MouseFlags.PositionReport))
+        if (SelectionGesture.IsRightClick(mouse.Flags))
         {
             if (this.selection.HasSelection)
             {

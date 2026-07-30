@@ -237,10 +237,10 @@ public sealed class ToolOutcomeColourTests
         // The mapping a theme author relies on: adjust one palette entry and every role routed through it
         // moves with it. Asserted per built-in theme so a theme cannot quietly opt out by restating a role.
         Assert.Equal(palette.Success, theme.Tui.ToolSuccess);
-        Assert.Equal(palette.Caution, theme.Tui.ToolPartialFailure);
-        Assert.Equal(palette.Caution, theme.Tui.PermissionApproved);
-        Assert.Equal(palette.Caution, theme.Tui.Warning);
-        Assert.Equal(palette.Danger, theme.Tui.Error);
-        Assert.Equal(palette.Info, theme.Tui.Notification);
+        Assert.Equal(palette.Warn, theme.Tui.ToolPartialFailure);
+        Assert.Equal(palette.Warn, theme.Tui.PermissionApproved);
+        Assert.Equal(palette.Warn, theme.Tui.Warning);
+        Assert.Equal(palette.Error, theme.Tui.Error);
+        Assert.Equal(palette.Dim, theme.Tui.Notification);
     }
 }

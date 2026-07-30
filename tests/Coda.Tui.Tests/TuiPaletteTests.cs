@@ -16,15 +16,15 @@ public sealed class TuiPaletteTests
     // -----------------------------------------------------------------------
 
     [Fact]
-    public void Retinting_caution_makes_Warning_ToolPartialFailure_and_PermissionApproved_report_that_colour()
+    public void Retinting_warn_makes_Warning_ToolPartialFailure_and_PermissionApproved_report_that_colour()
     {
         var distinctive = new TuiThemeColor(new TgColor(99, 42, 17), TgName.BrightMagenta);
         var theme = new TuiTheme
         {
-            Palette = new TuiPalette { Caution = distinctive },
+            Palette = new TuiPalette { Warn = distinctive },
         };
 
-        // All three roles that resolve through Caution must report the new colour.
+        // All three roles that resolve through Warn must report the new colour.
         Assert.Equal(distinctive, theme.Warning);
         Assert.Equal(distinctive, theme.ToolPartialFailure);
         Assert.Equal(distinctive, theme.PermissionApproved);
@@ -51,12 +51,12 @@ public sealed class TuiPaletteTests
     }
 
     [Fact]
-    public void Retinting_danger_only_changes_Error()
+    public void Retinting_error_only_changes_Error()
     {
         var distinctive = new TuiThemeColor(new TgColor(200, 10, 10), TgName.Red);
         var theme = new TuiTheme
         {
-            Palette = new TuiPalette { Danger = distinctive },
+            Palette = new TuiPalette { Error = distinctive },
         };
 
         Assert.Equal(distinctive, theme.Error);
@@ -71,7 +71,7 @@ public sealed class TuiPaletteTests
         var distinctive = new TuiThemeColor(new TgColor(100, 100, 200), TgName.Gray);
         var theme = new TuiTheme
         {
-            Palette = new TuiPalette { Info = distinctive },
+            Palette = new TuiPalette { Dim = distinctive },
         };
 
         Assert.Equal(distinctive, theme.Notification);
@@ -90,9 +90,9 @@ public sealed class TuiPaletteTests
         var theme = new TuiTheme();
 
         Assert.Equal(TuiPalette.WarmEmber.Success, theme.Palette.Success);
-        Assert.Equal(TuiPalette.WarmEmber.Caution, theme.Palette.Caution);
-        Assert.Equal(TuiPalette.WarmEmber.Danger, theme.Palette.Danger);
-        Assert.Equal(TuiPalette.WarmEmber.Info, theme.Palette.Info);
+        Assert.Equal(TuiPalette.WarmEmber.Warn, theme.Palette.Warn);
+        Assert.Equal(TuiPalette.WarmEmber.Error, theme.Palette.Error);
+        Assert.Equal(TuiPalette.WarmEmber.Dim, theme.Palette.Dim);
     }
 
     [Fact]
@@ -114,7 +114,7 @@ public sealed class TuiPaletteTests
         Assert.True(CodaThemes.TryGet(themeName, out var theme));
         var palette = theme.Tui.Palette;
 
-        var entries = new[] { palette.Success, palette.Caution, palette.Danger, palette.Info };
+        var entries = new[] { palette.Success, palette.Warn, palette.Error, palette.Dim };
 
         // All four true-color values must be distinct.
         Assert.Equal(4, entries.Select(e => e.TrueColor).Distinct().Count());
@@ -149,23 +149,23 @@ public sealed class TuiPaletteTests
     }
 
     [Fact]
-    public void TuiPalette_WarmEmber_has_expected_caution_colour()
+    public void TuiPalette_WarmEmber_has_expected_warn_colour()
     {
-        Assert.Equal(new TgColor(240, 199, 94), TuiPalette.WarmEmber.Caution.TrueColor);
-        Assert.Equal(TgName.Yellow, TuiPalette.WarmEmber.Caution.Fallback);
+        Assert.Equal(new TgColor(240, 199, 94), TuiPalette.WarmEmber.Warn.TrueColor);
+        Assert.Equal(TgName.Yellow, TuiPalette.WarmEmber.Warn.Fallback);
     }
 
     [Fact]
-    public void TuiPalette_WarmEmber_has_expected_danger_colour()
+    public void TuiPalette_WarmEmber_has_expected_error_colour()
     {
-        Assert.Equal(new TgColor(217, 104, 93), TuiPalette.WarmEmber.Danger.TrueColor);
-        Assert.Equal(TgName.Red, TuiPalette.WarmEmber.Danger.Fallback);
+        Assert.Equal(new TgColor(217, 104, 93), TuiPalette.WarmEmber.Error.TrueColor);
+        Assert.Equal(TgName.Red, TuiPalette.WarmEmber.Error.Fallback);
     }
 
     [Fact]
     public void TuiPalette_WarmEmber_has_expected_info_colour()
     {
-        Assert.Equal(new TgColor(191, 174, 156), TuiPalette.WarmEmber.Info.TrueColor);
-        Assert.Equal(TgName.Gray, TuiPalette.WarmEmber.Info.Fallback);
+        Assert.Equal(new TgColor(191, 174, 156), TuiPalette.WarmEmber.Dim.TrueColor);
+        Assert.Equal(TgName.Gray, TuiPalette.WarmEmber.Dim.Fallback);
     }
 }

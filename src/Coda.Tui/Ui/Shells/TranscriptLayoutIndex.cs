@@ -31,6 +31,14 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
     public TranscriptRole PrefixRole { get; init; }
 
     /// <summary>
+    /// Cells occupied by the row's gutter prefix — its role marker, continuation indent, or tree connector.
+    /// The gutter is part of <see cref="Text"/> so it draws and highlights with the row, but it is chrome
+    /// rather than content, so copying a selection skips it. Distinct from <see cref="PrefixCells"/>, which
+    /// is a colouring range and also covers the callout bar.
+    /// </summary>
+    public int GutterCells { get; init; }
+
+    /// <summary>
     /// Zero or more hyperlink spans on this render line, mirrored from the corresponding
     /// <see cref="TranscriptRenderLine.Links"/>. Null when the row has no links.
     /// </summary>
@@ -81,12 +89,17 @@ internal sealed class TranscriptLayoutIndex
     /// default <see cref="TranscriptBlockFormatter.Format"/>, since the incremental formatter is guaranteed
     /// output-identical to that formatter and would otherwise bypass an injected one.
     /// </param>
+    /// <param name="glyphs">
+    /// The gutter glyph set the incremental formatter shapes with, so a streaming assistant block draws the
+    /// same marker as the settled render on an ASCII terminal. Ignored when the incremental path is off.
+    /// </param>
     public TranscriptLayoutIndex(
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>> formatter,
-        bool enableIncrementalAssistant = false)
+        bool enableIncrementalAssistant = false,
+        TranscriptGlyphs? glyphs = null)
     {
         this.formatter = formatter ?? throw new ArgumentNullException(nameof(formatter));
-        this.streamingFormatter = enableIncrementalAssistant ? new IncrementalMarkdownFormatter() : null;
+        this.streamingFormatter = enableIncrementalAssistant ? new IncrementalMarkdownFormatter(glyphs) : null;
     }
 
     /// <summary>Total wrapped rows across every block.</summary>
@@ -318,6 +331,7 @@ internal sealed class TranscriptLayoutIndex
                     RightText = line.RightText,
                     RightTextTrailingCells = line.RightTextTrailingCells,
                     PrefixCells = line.PrefixCells,
+                    GutterCells = line.GutterCells,
                     PrefixRole = line.PrefixRole,
                     Links = line.Links,
                 });

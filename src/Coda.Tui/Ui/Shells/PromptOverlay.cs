@@ -137,10 +137,7 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
             _ => this.HandleChoiceKey(this.request, key, multiSelect: false),
         };
     }
-
-    bool ISelectableOverlay.HasSelection => this.bodyLabel.HasSelection;
-    string ISelectableOverlay.SelectedText => this.bodyLabel.SelectedText;
-    void ISelectableOverlay.ClearSelection() => this.bodyLabel.ClearSelection();
+    SelectableTextView ISelectableOverlay.Body => this.bodyLabel;
 
     protected override void Dispose(bool disposing)
     {
