@@ -171,7 +171,9 @@ interactive, headless, and slash-command flows. Export/import carries it as the 
 
 **Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
-`Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda ·
+`Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda; pressing `Esc`
+three times within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
+it and `Esc` keeps it going ·
 `Ctrl+C` copies the current transcript selection and, with nothing selected,
 exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `F2`
 switches between full-screen and inline · `Ctrl+B` sends the selected (or latest) running **foreground

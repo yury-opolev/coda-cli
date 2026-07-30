@@ -284,8 +284,8 @@ internal sealed class SpikeHarness
         Console.CancelKeyPress += OnCancel;
         try
         {
-            ui.AppendTranscript("Cancel sample: a double Esc interrupts the active turn; an intercepted Ctrl+C keeps the app alive so it can copy a selection or, pressed twice, exit.");
-            ui.SetStatus("Esc Esc interrupts; Ctrl+C copies the selection or exits on a second press; /exit also quits.");
+            ui.AppendTranscript("Cancel sample: three Esc presses ask to stop the active turn; an intercepted Ctrl+C keeps the app alive so it can copy a selection or, pressed twice, exit.");
+            ui.SetStatus("Esc x3 asks to stop; Ctrl+C copies the selection or exits on a second press; /exit also quits.");
             app.LayoutAndDraw();
 
             // Simulate the intercepted Ctrl+C signal deterministically (headless cannot self-deliver SIGINT).
@@ -294,7 +294,7 @@ internal sealed class SpikeHarness
 
             Console.WriteLine(
                 $"[cancel] signal-handled={interrupted} app-alive={app.Initialized} " +
-                "note=an intercepted Ctrl+C never corrupts the terminal; double Esc interrupts and an explicit exit is still required result=OK");
+                "note=an intercepted Ctrl+C never corrupts the terminal; three Esc presses ask to stop and an explicit exit is still required result=OK");
         }
         finally
         {
@@ -564,7 +564,7 @@ internal sealed class SpikeHarness
         SpikeScenario.Unicode => "Unicode: wide CJK, emoji, and combining marks are rendered. Esc exits.",
         SpikeScenario.Paste => "Paste: paste multiline text — it inserts verbatim without submitting. Esc exits.",
         SpikeScenario.Resize => "Resize: resize the terminal (try 60x12, 59x12, 60x11). Esc exits.",
-        SpikeScenario.Cancel => "Cancel: a double Esc interrupts; Ctrl+C copies a selection or exits on a second press; /exit quits.",
+        SpikeScenario.Cancel => "Cancel: three Esc presses ask to stop; Ctrl+C copies a selection or exits on a second press; /exit quits.",
         SpikeScenario.MouseOff => "Mouse-off: the mouse is disabled; the keyboard still works. Esc exits.",
         _ => "Esc exits.",
     };

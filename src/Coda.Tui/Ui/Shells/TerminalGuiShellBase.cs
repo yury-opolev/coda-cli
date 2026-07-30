@@ -601,19 +601,38 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                 return true;
             }
 
-            // Cancel any armed chord (e.g. a pending Ctrl+C exit) so no stale "Press … again" hint or chord
-            // state survives an Esc — even the Esc that just dismissed an overlay.
+            // Advance an already-armed stop sequence, or decline an armed confirmation. This must come
+            // before the general "cancel any armed chord" branch, or the second Esc would cancel the very
+            // chord it is meant to advance.
+            if (this.chords.ArmedAction is ShellChordAction.Interrupt or ShellChordAction.ConfirmStop)
+            {
+                this.ApplyChord(this.chords.HandleEscape(this.HasInterruptibleWork()));
+                return true;
+            }
+
+            // Cancel any other armed chord (e.g. a pending Ctrl+C exit) so no stale hint survives.
             if (this.chords.ArmedAction != ShellChordAction.None)
             {
                 this.ResetChordOverride();
                 return true;
             }
 
-            // Escape is a local dismiss/cancel key only. With nothing left to dismiss it is still fully
-            // consumed (returns true) so it can never fall through to Terminal.Gui's default Esc quit
-            // binding and close the application, and it never arms or fires a global interrupt chord —
-            // interrupting/terminating the session stays on the explicit Ctrl+C chord.
+            // Arm the stop sequence on the first Esc while work is interruptible.
+            if (this.HasInterruptibleWork())
+            {
+                return this.ApplyChord(this.chords.HandleEscape(true));
+            }
+
+            // Escape is a local dismiss/cancel key. Still fully consumed so it can never fall through
+            // to Terminal.Gui's default Esc quit binding and close the application.
             return true;
+        }
+
+        // Enter confirms an armed stop. Checked before the composer sees it so a confirmation can never
+        // be mistaken for a prompt submission; with nothing armed the key falls straight through.
+        if (key == Key.Enter && this.chords.ArmedAction == ShellChordAction.ConfirmStop)
+        {
+            return this.ApplyChord(this.chords.HandleConfirmStop());
         }
 
         if (key == Key.C.WithCtrl)
@@ -1267,11 +1286,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (result.Hint is { } hint)
         {
             this.Operational.SetStatus(hint);
-            var window = this.chords.ArmedAction == ShellChordAction.Interrupt
-                ? ShellCommandChordState.InterruptWindow
-                : ShellCommandChordState.ExitWindow;
+
+            // Schedule against the chord's REMAINING window, not the full one: a mid-sequence press does
+            // not restart the clock, so a full-window timeout would leave the hint (and the status-row
+            // override it implies) alive after the chord itself had already lapsed.
             this.chordTimeout = this.addTimeout(
-                window + TimeSpan.FromMilliseconds(1),
+                this.chords.RemainingWindow + TimeSpan.FromMilliseconds(1),
                 () =>
                 {
                     this.chordTimeout = null;

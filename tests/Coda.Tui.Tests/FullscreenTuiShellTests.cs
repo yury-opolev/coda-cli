@@ -1529,20 +1529,93 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Escape_never_arms_or_fires_an_interrupt_even_with_active_work()
+    public void Three_escapes_with_active_work_arm_the_stop_confirmation()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
 
-        Assert.True(fixture.Shell.Composer.NewKeyDownEvent(Key.Esc));
-        Assert.DoesNotContain("Press Esc again", fixture.Shell.Operational.Status.Text);
+        PressEscape(fixture, clock, 3);
 
-        clock.Advance(TimeSpan.FromMilliseconds(100));
-        Assert.True(fixture.Shell.Composer.NewKeyDownEvent(Key.Esc));
-
-        // Escape is never a global interrupt chord: even a rapid second Esc while work is active fires no
-        // UiAction. Interrupting/terminating stays on the explicit Ctrl+C chord.
+        // The third press asks rather than stops: nothing is interrupted until the user confirms.
         Assert.Empty(fixture.Actions);
+        Assert.Contains("Stop the current turn?", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Two_escapes_with_active_work_arm_but_do_not_stop()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        PressEscape(fixture, clock, 1);
+        Assert.Contains("Press Esc twice more to stop", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
+
+        PressEscape(fixture, clock, 1);
+        Assert.Contains("Press Esc again to stop", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Enter_after_three_escapes_raises_UiAction_Interrupt()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        PressEscape(fixture, clock, 3);
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
+
+        Assert.Equal([UiAction.Interrupt], fixture.Actions);
+    }
+
+    [Fact]
+    public void Escape_after_three_escapes_declines_and_raises_no_action()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        PressEscape(fixture, clock, 3);
+        Assert.Contains("Stop the current turn?", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
+
+        // A fourth press is what a user hammering Esc actually does; it must decline cleanly rather
+        // than leaving a stale confirmation on screen.
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+
+        Assert.Empty(fixture.Actions);
+        Assert.DoesNotContain("Stop the current turn?", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Enter_without_an_armed_confirmation_raises_no_interrupt()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
+
+        // With nothing armed, Enter keeps its ordinary meaning and never stops the turn.
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
+
+        Assert.DoesNotContain(UiAction.Interrupt, fixture.Actions);
+    }
+
+    [Fact]
+    public void Three_escapes_without_interruptible_work_do_nothing()
+    {
+        var clock = new ManualTimeProvider();
+        using var fixture = RetainedShellFixture.Create(activeWork: false, timeProvider: clock);
+
+        PressEscape(fixture, clock, 3);
+
+        Assert.Empty(fixture.Actions);
+        Assert.DoesNotContain("to stop", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
+    }
+
+    /// <summary>Presses Esc <paramref name="count"/> times, well inside the chord window.</summary>
+    private static void PressEscape(RetainedShellFixture fixture, ManualTimeProvider clock, int count)
+    {
+        for (var i = 0; i < count; i++)
+        {
+            clock.Advance(TimeSpan.FromMilliseconds(100));
+            fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
+        }
     }
 
     [Fact]
