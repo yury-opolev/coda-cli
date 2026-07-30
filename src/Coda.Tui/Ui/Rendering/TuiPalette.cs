@@ -23,6 +23,12 @@ internal sealed record TuiPalette
     /// <summary>Low-emphasis informational chrome.</summary>
     public TuiThemeColor Dim { get; init; } = new(new TgColor(191, 174, 156), TgName.Gray);
 
+    /// <summary>
+    /// A neutral hue that carries no success/failure meaning — used where something must simply read
+    /// as distinct, such as a keyword against a type in highlighted code.
+    /// </summary>
+    public TuiThemeColor Accent { get; init; } = new(new TgColor(150, 170, 220), TgName.BrightBlue);
+
     /// <summary>The Warm Ember base palette, and the defaults every omitted entry inherits.</summary>
     public static TuiPalette WarmEmber { get; } = new();
 }

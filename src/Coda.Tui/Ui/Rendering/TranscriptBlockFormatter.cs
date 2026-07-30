@@ -130,6 +130,13 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
     /// </summary>
     public IReadOnlyList<LinkSpan>? Links { get; init; }
 
+    /// <summary>
+    /// Zero or more syntax-highlight spans on this render line, in row-local cell columns. Null when
+    /// the row is not highlighted — which is most rows — so the common path stays allocation-free.
+    /// A token whose text wraps contributes one span per render line, exactly like <see cref="Links"/>.
+    /// </summary>
+    public IReadOnlyList<SyntaxSpan>? Syntax { get; init; }
+
     /// <summary>Where this row sits in the transcript's gutter/tree shape. Set while the block is being
     /// projected and consumed by the final shaping pass, which turns it into the row's literal prefix.</summary>
     public TranscriptGutterKind Gutter { get; init; }
@@ -157,7 +164,21 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
         this.PrefixRole == other.PrefixRole &&
         this.Gutter == other.Gutter &&
         this.GutterCells == other.GutterCells &&
-        LinksContentEqual(this.Links, other.Links);
+        LinksContentEqual(this.Links, other.Links) &&
+        SyntaxContentEqual(this.Syntax, other.Syntax);
+
+    private static bool SyntaxContentEqual(IReadOnlyList<SyntaxSpan>? a, IReadOnlyList<SyntaxSpan>? b)
+    {
+        if (ReferenceEquals(a, b)) return true;
+        if (a is null || b is null) return false;
+        if (a.Count != b.Count) return false;
+        for (var i = 0; i < a.Count; i++)
+        {
+            if (a[i] != b[i]) return false;
+        }
+
+        return true;
+    }
 
     private static bool LinksContentEqual(IReadOnlyList<LinkSpan>? a, IReadOnlyList<LinkSpan>? b)
     {
@@ -184,6 +205,14 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
             foreach (var link in this.Links)
             {
                 hash = HashCode.Combine(hash, link);
+            }
+        }
+
+        if (this.Syntax is not null)
+        {
+            foreach (var span in this.Syntax)
+            {
+                hash = HashCode.Combine(hash, span);
             }
         }
 
@@ -348,8 +377,30 @@ public static class TranscriptBlockFormatter
                 PrefixCells = newPrefixCells,
                 GutterCells = shift,
                 Links = ShiftLinkSpans(line.Links, shift),
+                Syntax = ShiftSyntaxSpans(line.Syntax, shift),
             };
         }
+    }
+
+    /// <summary>Re-bases syntax spans past a gutter prefix that was just prepended to the row text.</summary>
+    private static IReadOnlyList<SyntaxSpan>? ShiftSyntaxSpans(IReadOnlyList<SyntaxSpan>? spans, int shift)
+    {
+        if (spans is null || spans.Count == 0 || shift == 0)
+        {
+            return spans;
+        }
+
+        var shifted = new SyntaxSpan[spans.Count];
+        for (var i = 0; i < spans.Count; i++)
+        {
+            shifted[i] = spans[i] with
+            {
+                StartColumn = spans[i].StartColumn + shift,
+                EndColumn = spans[i].EndColumn + shift,
+            };
+        }
+
+        return shifted;
     }
 
     /// <summary>Whether <paramref name="kind"/> opens an entry (and so always draws its marker).</summary>
@@ -530,7 +581,16 @@ public static class TranscriptBlockFormatter
                 break;
 
             case Markdig.Syntax.CodeBlock code:
-                AppendCode(lines, code.Lines.ToString(), width, indent);
+                // Only a fenced block names its language; an indented block has no info string, so it
+                // stays unhighlighted rather than being guessed at.
+                AppendCode(
+                    lines,
+                    code.Lines.ToString(),
+                    width,
+                    indent,
+                    code is Markdig.Syntax.FencedCodeBlock fenced
+                        ? SyntaxLanguageDetector.FromInfoString(fenced.Info)
+                        : SyntaxLanguage.None);
                 break;
 
             case QuoteBlock quote:
@@ -806,15 +866,33 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendCode(List<TranscriptRenderLine> lines, string code, int width, string indent = "")
+    private static void AppendCode(
+        List<TranscriptRenderLine> lines,
+        string code,
+        int width,
+        string indent = "",
+        SyntaxLanguage language = SyntaxLanguage.None)
     {
         var contentWidth = EffectiveWidth(width, indent);
-        foreach (var line in SplitLines(code))
+        var sourceLines = SplitLines(code).ToList();
+
+        // Tokenise the block as one contiguous run so a block comment or triple-quoted string that
+        // opens on one line and closes on another is highlighted across the gap.
+        var spansByLine = SyntaxTokenizer.Tokenize(sourceLines, language);
+        var indentCells = TerminalCellText.Width(indent);
+
+        for (var i = 0; i < sourceLines.Count; i++)
         {
+            var line = sourceLines[i];
+            var charSpans = spansByLine[i];
+
             // Code is preformatted: preserve whitespace, only hard-breaking lines wider than the viewport.
-            foreach (var wrapped in WrapPreformatted(line, contentWidth))
+            foreach (var (wrapped, charStart) in WrapPreformattedWithOffsets(line, contentWidth))
             {
-                lines.Add(new TranscriptRenderLine(indent + wrapped, TranscriptRole.Code));
+                lines.Add(new TranscriptRenderLine(indent + wrapped, TranscriptRole.Code)
+                {
+                    Syntax = SyntaxSpanMapper.MapSegment(wrapped, charStart, charSpans, indentCells),
+                });
             }
         }
     }
@@ -932,8 +1010,13 @@ public static class TranscriptBlockFormatter
         var prefixCells = gutterWidth + MarkerCells;
         var contentWidth = Math.Max(1, width - prefixCells);
 
-        foreach (var diffLine in file.Lines)
+        // Highlight the body against the language the file extension names. Each contiguous run of code
+        // lines is tokenised on its own so an unterminated construct cannot bleed across a hunk boundary.
+        var bodySpans = TokenizeDiffBody(file);
+
+        for (var lineIndex = 0; lineIndex < file.Lines.Length; lineIndex++)
         {
+            var diffLine = file.Lines[lineIndex];
             // Derive the display line number (right-aligned) and marker character.
             var lineNum = diffLine.Kind switch
             {
@@ -964,8 +1047,9 @@ public static class TranscriptBlockFormatter
             };
 
             // Hard-wrap the content portion at contentWidth so no body row exceeds the viewport.
-            var contentSegments = WrapPreformatted(diffLine.Text, contentWidth).ToList();
-            var firstContent = contentSegments.Count > 0 ? contentSegments[0] : string.Empty;
+            var contentSegments = WrapPreformattedWithOffsets(diffLine.Text, contentWidth).ToList();
+            var (firstContent, firstCharStart) = contentSegments.Count > 0 ? contentSegments[0] : (string.Empty, 0);
+            var charSpans = bodySpans[lineIndex];
 
             // First segment carries the line-number gutter prefix.
             lines.Add(new TranscriptRenderLine($"{numStr} {marker} {firstContent}", role)
@@ -973,6 +1057,7 @@ public static class TranscriptBlockFormatter
                 FillWidth = fillWidth,
                 PrefixCells = Math.Min(prefixCells, TerminalCellText.Width($"{numStr} {marker} ")),
                 PrefixRole = TranscriptRole.DiffContext,
+                Syntax = SyntaxSpanMapper.MapSegment(firstContent, firstCharStart, charSpans, prefixCells),
             });
 
             // Continuation segments: blank gutter (same width) so the content stays aligned.
@@ -981,15 +1066,75 @@ public static class TranscriptBlockFormatter
                 var gutterPad = new string(' ', prefixCells);
                 for (var i = 1; i < contentSegments.Count; i++)
                 {
-                    lines.Add(new TranscriptRenderLine($"{gutterPad}{contentSegments[i]}", role)
+                    var (segment, segmentCharStart) = contentSegments[i];
+                    lines.Add(new TranscriptRenderLine($"{gutterPad}{segment}", role)
                     {
                         FillWidth = fillWidth,
                         PrefixCells = prefixCells,
                         PrefixRole = TranscriptRole.DiffContext,
+                        Syntax = SyntaxSpanMapper.MapSegment(segment, segmentCharStart, charSpans, prefixCells),
                     });
                 }
             }
         }
+    }
+
+    /// <summary>
+    /// Tokenises a diff body, returning one span list per entry in <see cref="DiffFile.Lines"/>.
+    /// </summary>
+    /// <remarks>
+    /// Section headings and no-newline markers are chrome rather than source, so they are never
+    /// highlighted and they also terminate the run around them: state carried by a block comment or a
+    /// triple-quoted string must not survive a hunk boundary, because the lines either side of one are
+    /// not adjacent in the real file.
+    /// </remarks>
+    private static IReadOnlyList<IReadOnlyList<SyntaxCharSpan>> TokenizeDiffBody(DiffFile file)
+    {
+        var result = new IReadOnlyList<SyntaxCharSpan>[file.Lines.Length];
+        var language = SyntaxLanguageDetector.FromFilePath(file.Path);
+        if (language == SyntaxLanguage.None)
+        {
+            Array.Fill(result, []);
+            return result;
+        }
+
+        var runTexts = new List<string>();
+        var runIndices = new List<int>();
+
+        void FlushRun()
+        {
+            if (runTexts.Count == 0)
+            {
+                return;
+            }
+
+            var spans = SyntaxTokenizer.Tokenize(runTexts, language);
+            for (var i = 0; i < runIndices.Count; i++)
+            {
+                result[runIndices[i]] = spans[i];
+            }
+
+            runTexts.Clear();
+            runIndices.Clear();
+        }
+
+        for (var i = 0; i < file.Lines.Length; i++)
+        {
+            var line = file.Lines[i];
+            if (line.Kind is DiffLineKind.Added or DiffLineKind.Removed or DiffLineKind.Context)
+            {
+                runTexts.Add(line.Text);
+                runIndices.Add(i);
+            }
+            else
+            {
+                result[i] = [];
+                FlushRun();
+            }
+        }
+
+        FlushRun();
+        return result;
     }
 
     /// <summary>The narrowest line-number gutter, so a one-line file does not produce a single-digit column.</summary>
@@ -2081,22 +2226,34 @@ public static class TranscriptBlockFormatter
     /// <summary>Hard-wraps preformatted text (code, diff, tool/command output) preserving all whitespace.</summary>
     private static IEnumerable<string> WrapPreformatted(string line, int width)
     {
+        foreach (var (chunk, _) in WrapPreformattedWithOffsets(line, width))
+        {
+            yield return chunk;
+        }
+    }
+
+    /// <summary>
+    /// Hard-wraps preformatted text, also reporting where each segment starts in the logical line.
+    /// Syntax highlighting needs those offsets to clip a token's char range onto the segment it landed in.
+    /// </summary>
+    private static IEnumerable<(string Chunk, int CharStart)> WrapPreformattedWithOffsets(string line, int width)
+    {
         var cellWidth = width > 0 ? width : 1;
         if (line.Length == 0)
         {
-            yield return string.Empty;
+            yield return (string.Empty, 0);
             yield break;
         }
 
         if (TerminalCellText.Width(line) <= cellWidth)
         {
-            yield return line;
+            yield return (line, 0);
             yield break;
         }
 
-        foreach (var (chunk, _, _) in BreakWord(line, cellWidth))
+        foreach (var (chunk, charStart, _, _) in BreakWordWithCharPositions(line, 0, cellWidth))
         {
-            yield return chunk;
+            yield return (chunk, charStart);
         }
     }
 

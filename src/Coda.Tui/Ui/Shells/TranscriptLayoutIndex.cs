@@ -43,6 +43,12 @@ public readonly record struct TranscriptRow(Guid BlockId, int LocalRow, int Glob
     /// <see cref="TranscriptRenderLine.Links"/>. Null when the row has no links.
     /// </summary>
     public IReadOnlyList<LinkSpan>? Links { get; init; }
+
+    /// <summary>
+    /// Zero or more syntax-highlight spans on this render line, mirrored from the corresponding
+    /// <see cref="TranscriptRenderLine.Syntax"/>. Null when the row is not highlighted.
+    /// </summary>
+    public IReadOnlyList<SyntaxSpan>? Syntax { get; init; }
 }
 
 /// <summary>
@@ -334,6 +340,7 @@ internal sealed class TranscriptLayoutIndex
                     GutterCells = line.GutterCells,
                     PrefixRole = line.PrefixRole,
                     Links = line.Links,
+                    Syntax = line.Syntax,
                 });
             }
 
