@@ -179,54 +179,6 @@ public sealed class ComposerClipboardShellTests
     }
 
     [Fact]
-    public void Left_click_copy_selection_uses_the_shell_copy_path()
-    {
-        string? copied = null;
-        using var fixture = RetainedShellFixture.Create(
-            activeWork: false,
-            clipboardWriter: text =>
-            {
-                copied = text;
-                return true;
-            });
-        SelectComposerText(fixture, "alpha beta", fromColumn: 0, toColumn: 5);
-
-        // A fresh unshifted left press over the selection raises a semantic CopySelection gesture, which the
-        // shell routes through the same copy path as Ctrl+C.
-        fixture.Shell.Composer.NewMouseEvent(new Mouse
-        {
-            Flags = MouseFlags.LeftButtonPressed,
-            Position = new Point(8, 0),
-        });
-
-        Assert.Equal("alpha", copied);
-        Assert.False(fixture.Shell.Composer.HasComposerSelection);
-        Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
-        Assert.Empty(fixture.Actions);
-    }
-
-    [Fact]
-    public void Left_click_copy_with_unavailable_clipboard_preserves_selection()
-    {
-        using var fixture = RetainedShellFixture.Create(
-            activeWork: false,
-            clipboardWriter: _ => false,
-            addTimeout: (_, _) => new object(),
-            removeTimeout: _ => true);
-        SelectComposerText(fixture, "alpha beta", fromColumn: 0, toColumn: 5);
-
-        fixture.Shell.Composer.NewMouseEvent(new Mouse
-        {
-            Flags = MouseFlags.LeftButtonPressed,
-            Position = new Point(8, 0),
-        });
-
-        Assert.True(fixture.Shell.Composer.HasComposerSelection);
-        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
-        Assert.Empty(fixture.Actions);
-    }
-
-    [Fact]
     public void Right_click_copy_selection_uses_the_shell_copy_path()
     {
         string? copied = null;
@@ -239,16 +191,38 @@ public sealed class ComposerClipboardShellTests
             });
         SelectComposerText(fixture, "alpha beta", fromColumn: 0, toColumn: 5);
 
-        // A right press over a selection copies it (context menu is deferred to a right press without one).
+        // A right press over the selection raises a semantic CopySelection gesture, which the shell routes
+        // through the same copy path as Ctrl+C.
         fixture.Shell.Composer.NewMouseEvent(new Mouse
         {
             Flags = MouseFlags.RightButtonPressed,
-            Position = new Point(2, 0),
+            Position = new Point(8, 0),
         });
 
         Assert.Equal("alpha", copied);
         Assert.False(fixture.Shell.Composer.HasComposerSelection);
         Assert.Equal("5 symbols copied to clipboard", fixture.Shell.Operational.Status.Text);
+        Assert.Empty(fixture.Actions);
+    }
+
+    [Fact]
+    public void Right_click_copy_with_unavailable_clipboard_preserves_selection()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            clipboardWriter: _ => false,
+            addTimeout: (_, _) => new object(),
+            removeTimeout: _ => true);
+        SelectComposerText(fixture, "alpha beta", fromColumn: 0, toColumn: 5);
+
+        fixture.Shell.Composer.NewMouseEvent(new Mouse
+        {
+            Flags = MouseFlags.RightButtonPressed,
+            Position = new Point(8, 0),
+        });
+
+        Assert.True(fixture.Shell.Composer.HasComposerSelection);
+        Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
         Assert.Empty(fixture.Actions);
     }
 
@@ -546,7 +520,7 @@ public sealed class ComposerClipboardShellTests
 
         fixture.Shell.Composer.NewMouseEvent(new Mouse
         {
-            Flags = MouseFlags.LeftButtonPressed,
+            Flags = MouseFlags.RightButtonPressed,
             Position = new Point(8, 0),
         });
 
@@ -577,7 +551,7 @@ public sealed class ComposerClipboardShellTests
 
         fixture.Shell.Composer.NewMouseEvent(new Mouse
         {
-            Flags = MouseFlags.LeftButtonPressed,
+            Flags = MouseFlags.RightButtonPressed,
             Position = new Point(8, 0),
         });
 

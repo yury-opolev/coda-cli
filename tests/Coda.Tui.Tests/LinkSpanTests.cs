@@ -47,13 +47,13 @@ public sealed class LinkSpanTests
     [Fact]
     public void Autolink_span_columns_match_start_and_end_of_url_in_text()
     {
-        // "See https://example.com" — URL starts at col 4 after "See ".
+        // "See https://example.com" rendered as " ● See https://example.com" — URL starts at col 7.
         var lines = Format("See https://example.com", width: 80);
 
         var line = Assert.Single(lines);
         var link = Assert.Single(line.Links ?? []);
-        Assert.Equal(4, link.StartColumn);
-        Assert.Equal(4 + TerminalCellText.Width("https://example.com"), link.EndColumn);
+        Assert.Equal(7, link.StartColumn);
+        Assert.Equal(7 + TerminalCellText.Width("https://example.com"), link.EndColumn);
     }
 
     // ---------------------------------------------------------------------------
@@ -84,14 +84,14 @@ public sealed class LinkSpanTests
     [Fact]
     public void Deceptive_link_span_includes_warning_glyph_in_column_range()
     {
-        // "click here⚠" should be fully covered by the link span.
+        // " ● click here⚠": link starts at col 3 (gutter " ● "), ends at 3+11=14.
         var lines = Format("[click here](https://example.com)");
 
         var line = Assert.Single(lines);
         var link = Assert.Single(line.Links!);
-        Assert.Equal(0, link.StartColumn);
+        Assert.Equal(3, link.StartColumn);
         // "click here⚠": width = 10 + 1 = 11 (⚠ is 1 cell).
-        Assert.Equal(11, link.EndColumn);
+        Assert.Equal(14, link.EndColumn);
     }
 
     // ---------------------------------------------------------------------------

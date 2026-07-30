@@ -26,7 +26,6 @@ internal sealed class ComposerView : TextView
     private bool caretPlaced;
     private System.Drawing.Point lastUnwrappedPosition;
     private bool inputEnabled = true;
-    private bool suppressLeftGesture;
     private bool suppressRightGesture;
     private bool pendingRightPaste;
     private IReadOnlyList<ISlashCommand> lastSuggestions = [];
@@ -157,13 +156,6 @@ internal sealed class ComposerView : TextView
 
     /// <summary>The native <see cref="TextView.SelectedText"/>, or an empty string when nothing is selected.</summary>
     internal string SelectedComposerText => this.SelectedText ?? string.Empty;
-
-    /// <summary>
-    /// Whether a left copy gesture has armed suppression of the remainder of its click sequence. It is set on
-    /// the copy press and cleared by the gesture's terminal click; it must never remain armed after the
-    /// gesture completes. Exposed for tests only so the completion contract can be asserted directly.
-    /// </summary>
-    internal bool LeftGestureSuppressed => this.suppressLeftGesture;
 
     /// <summary>
     /// Clears only the native selection highlight and repaints. It never mutates the draft text or moves the
@@ -397,34 +389,6 @@ internal sealed class ComposerView : TextView
         handled = true;
         var flags = mouse.Flags;
 
-        // A copy was already raised on the left press; swallow the rest of the sequence so the release/click
-        // can't start a fresh native drag after the shell clears the old selection. Terminal.Gui delivers the
-        // gesture as press, release, then a synthesized click, so suppression must survive the release and only
-        // lift on that terminal click — otherwise the trailing click leaks through to the base editor and
-        // repositions the caret. A second or third physical click reports the distinct
-        // LeftButtonDoubleClicked / LeftButtonTripleClicked bit, so all three complete the armed gesture
-        // (via IsLeftGestureCompletion) — otherwise a multi-click would leave suppression armed until the next
-        // press had to recover it, swallowing native events in between.
-        if (this.suppressLeftGesture)
-        {
-            if (IsGestureStartingPress(flags))
-            {
-                // A truncated / off-view / grab-loss sequence can end without the terminal synthesized click
-                // that would otherwise lift suppression, leaving it armed forever; a fresh press begins a new
-                // gesture, so recover and reinterpret it here.
-                this.suppressLeftGesture = false;
-            }
-            else
-            {
-                if (IsLeftGestureCompletion(flags))
-                {
-                    this.suppressLeftGesture = false;
-                }
-
-                return true;
-            }
-        }
-
         // A copy was already raised on the right press; swallow the complete right gesture through its
         // terminal synthesized click so it can never reach the native context menu.
         if (this.suppressRightGesture)
@@ -467,20 +431,6 @@ internal sealed class ComposerView : TextView
 
                 return true;
             }
-        }
-
-        // A fresh, unshifted left press over an existing selection copies it and consumes the click sequence
-        // instead of starting another drag. PositionReport identifies a drag move (not a new press), which
-        // must keep extending the native selection.
-        if (flags.HasFlag(MouseFlags.LeftButtonPressed)
-            && !flags.HasFlag(MouseFlags.PositionReport)
-            && !flags.HasFlag(MouseFlags.Shift)
-            && this.HasComposerSelection)
-        {
-            this.suppressLeftGesture = true;
-            this.RaisePointerAction(
-                ComposerPointerActionKind.CopySelection, this.SelectedComposerText, mouse.ScreenPosition);
-            return true;
         }
 
         // A right press over a selection copies and consumes the gesture; a right press without one positions
@@ -536,18 +486,6 @@ internal sealed class ComposerView : TextView
         || flags.HasFlag(MouseFlags.RightButtonDoubleClicked)
         || flags.HasFlag(MouseFlags.RightButtonTripleClicked);
 
-    /// <summary>
-    /// True when <paramref name="flags"/> carry a terminal completion event for an armed left gesture, the
-    /// mirror of <see cref="IsRightGestureCompletion"/>. Terminal.Gui reports the first physical click as
-    /// <see cref="MouseFlags.LeftButtonClicked"/>, the second as <see cref="MouseFlags.LeftButtonDoubleClicked"/>,
-    /// and the third as <see cref="MouseFlags.LeftButtonTripleClicked"/>; each is a single distinct bit for one
-    /// physical click, so testing all three completes the armed copy gesture on any of them and never leaves
-    /// suppression stuck armed after a multi-click.
-    /// </summary>
-    private static bool IsLeftGestureCompletion(MouseFlags flags) =>
-        flags.HasFlag(MouseFlags.LeftButtonClicked)
-        || flags.HasFlag(MouseFlags.LeftButtonDoubleClicked)
-        || flags.HasFlag(MouseFlags.LeftButtonTripleClicked);
 
     /// <summary>
     /// Positions the native caret from a right press by replaying it as a self-contained left press-and-release

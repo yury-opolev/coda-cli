@@ -7,12 +7,12 @@ using Terminal.Gui.Drivers;
 
 namespace Coda.Tui.Ui.Shells;
 
-internal sealed class PromptOverlay : View
+internal sealed class PromptOverlay : View, ISelectableOverlay
 {
     private readonly IUiEventPublisher publisher;
     private TuiTheme theme;
     private readonly Label titleLabel;
-    private readonly Label bodyLabel;
+    private readonly SelectableTextView bodyLabel;
     private readonly HashSet<int> checkedIndices = [];
     private readonly StringBuilder textBuffer = new();
 
@@ -21,7 +21,7 @@ internal sealed class PromptOverlay : View
     private bool completed;
     private bool freeTextMode;
 
-    public PromptOverlay(IUiEventPublisher publisher, TuiTheme? theme = null)
+    public PromptOverlay(IUiEventPublisher publisher, TuiTheme? theme = null, IApplication? app = null, Action<string, Action>? onCopyRequested = null)
     {
         this.publisher = publisher ?? throw new ArgumentNullException(nameof(publisher));
         this.theme = theme ?? CodaThemes.Current.Tui;
@@ -30,7 +30,12 @@ internal sealed class PromptOverlay : View
         this.BorderStyle = LineStyle.Rounded;
 
         this.titleLabel = new Label { X = 0, Y = 0, Width = Dim.Fill(), CanFocus = false };
-        this.bodyLabel = new Label { X = 0, Y = 2, Width = Dim.Fill(), Height = Dim.Fill(), CanFocus = false };
+        this.bodyLabel = new SelectableTextView(app) { X = 0, Y = 2, Width = Dim.Fill(), Height = Dim.Fill() };
+        if (onCopyRequested is not null)
+        {
+            this.bodyLabel.CopyRequested += text => onCopyRequested(text, this.bodyLabel.ClearSelection);
+        }
+
         this.Add(this.titleLabel);
         this.Add(this.bodyLabel);
     }
@@ -38,12 +43,13 @@ internal sealed class PromptOverlay : View
     internal void ApplyTheme(TuiTheme theme, IDriver? driver)
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.bodyLabel.ApplyTheme(this.theme, driver, this.theme.PromptText, this.theme.Background);
         this.SetScheme(this.theme.PromptScheme(driver));
         this.SetNeedsDraw();
     }
 
     public UiPromptRequest? Request => this.request;
-    internal string BodyText => this.bodyLabel.Text ?? string.Empty;
+    internal string BodyText => this.bodyLabel.AllText;
 
     public void Update(UiPromptRequest? next)
     {
@@ -51,6 +57,12 @@ internal sealed class PromptOverlay : View
         {
             this.request = null;
             this.completed = false;
+
+            // Release any grab BEFORE hiding. Once the overlay is invisible its body stops receiving mouse
+            // events (Terminal.Gui gates delivery on CanBeVisible, which walks the SuperViews), so a grab
+            // taken mid-drag could never see the release that would free it — and a held grab swallows every
+            // mouse event in the application for the rest of the session.
+            this.bodyLabel.ClearSelection();
             this.Visible = false;
             return;
         }
@@ -86,6 +98,13 @@ internal sealed class PromptOverlay : View
             return false;
         }
 
+        // The overlay holds focus while visible and consumes every key, so the shell's own Ctrl+C handler
+        // is unreachable from here — copy an active body selection before anything else claims the key.
+        if (key == Key.C.WithCtrl && this.bodyLabel.TryCopySelection())
+        {
+            return true;
+        }
+
         if (this.request is null || this.completed)
         {
             return base.OnKeyDown(key);
@@ -118,11 +137,13 @@ internal sealed class PromptOverlay : View
             _ => this.HandleChoiceKey(this.request, key, multiSelect: false),
         };
     }
+    SelectableTextView ISelectableOverlay.Body => this.bodyLabel;
 
     protected override void Dispose(bool disposing)
     {
         if (disposing)
         {
+            this.bodyLabel.CancelMouseInteraction();
             this.request = null;
         }
 
@@ -276,12 +297,12 @@ internal sealed class PromptOverlay : View
         if (this.request is not { } req)
         {
             this.titleLabel.Text = string.Empty;
-            this.bodyLabel.Text = string.Empty;
+            this.bodyLabel.SetText(string.Empty);
             return;
         }
 
         this.titleLabel.Text = req.Message is { Length: > 0 } message ? $"{req.Title}\n{message}" : req.Title;
-        this.bodyLabel.Text = this.RenderBody(req);
+        this.bodyLabel.SetText(this.RenderBody(req));
     }
 
     private string RenderBody(UiPromptRequest req)

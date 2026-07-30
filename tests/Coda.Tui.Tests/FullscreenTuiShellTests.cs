@@ -1325,7 +1325,7 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Left_click_with_selection_copies_clears_without_arming_or_new_drag()
+    public void Right_click_with_selection_copies_clears_and_does_not_arm_exit()
     {
         string? copied = null;
         using var fixture = RetainedShellFixture.Create(
@@ -1355,10 +1355,10 @@ public sealed class FullscreenTuiShellTests
         });
         Assert.True(fixture.Shell.Transcript.HasSelection);
 
-        // A fresh unshifted left press copies the current selection instead of starting a new one.
+        // A right-click over the active selection copies it.
         var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
         {
-            Flags = MouseFlags.LeftButtonPressed,
+            Flags = MouseFlags.RightButtonClicked,
             Position = new System.Drawing.Point(2, 1),
         });
 
@@ -1371,7 +1371,48 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Left_click_with_unavailable_clipboard_preserves_selection()
+    public void Left_click_with_selection_starts_new_selection()
+    {
+        using var fixture = RetainedShellFixture.Create(activeWork: false);
+        fixture.Shell.Transcript.ReplaceAll(Lines(3));
+
+        // Drag-select the first row.
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(4, 0),
+        });
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonReleased,
+            Position = new System.Drawing.Point(0, 0),
+        });
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+
+        // A fresh left press clears the old selection and starts a new drag — no copy is raised.
+        var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed,
+            Position = new System.Drawing.Point(2, 1),
+        });
+
+        Assert.True(handled);
+        // After just a press the anchor is set but not yet moved. A drag move proves a new selection is live.
+        fixture.Shell.Transcript.ProcessMouse(new Mouse
+        {
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
+            Position = new System.Drawing.Point(6, 1),
+        });
+        Assert.True(fixture.Shell.Transcript.HasSelection);
+    }
+
+    [Fact]
+    public void Right_click_with_unavailable_clipboard_keeps_selection()
     {
         using var fixture = RetainedShellFixture.Create(
             activeWork: false,
@@ -1398,11 +1439,12 @@ public sealed class FullscreenTuiShellTests
 
         var handled = fixture.Shell.Transcript.ProcessMouse(new Mouse
         {
-            Flags = MouseFlags.LeftButtonPressed,
+            Flags = MouseFlags.RightButtonClicked,
             Position = new System.Drawing.Point(2, 1),
         });
 
         Assert.True(handled);
+        // The write failed, so the selection is kept for a retry rather than silently discarded.
         Assert.True(fixture.Shell.Transcript.HasSelection);
         Assert.Equal("Clipboard unavailable", fixture.Shell.Operational.Status.Text);
         Assert.Empty(fixture.Actions);
@@ -2523,7 +2565,7 @@ public sealed class VirtualizedTranscriptViewTests
     }
 
     [Fact]
-    public void Fresh_left_press_with_active_selection_requests_copy_and_starts_no_new_drag()
+    public void Fresh_left_press_with_active_selection_clears_old_and_starts_new_drag()
     {
         using IApplication app = Application.Create();
         app.AppModel = AppModel.FullScreen;
@@ -2549,12 +2591,11 @@ public sealed class VirtualizedTranscriptViewTests
             Position = new System.Drawing.Point(4, 0),
         });
         Assert.True(view.HasSelection);
-        var selectedBefore = view.GetSelectedText();
 
         var copyRequests = 0;
         view.CopyRequested += () => copyRequests++;
 
-        // A fresh unshifted left press while a selection is active requests a copy and consumes the click.
+        // A fresh unshifted left press while a selection is active clears it and starts a new drag.
         var handled = view.ProcessMouse(new Mouse
         {
             Flags = MouseFlags.LeftButtonPressed,
@@ -2562,19 +2603,15 @@ public sealed class VirtualizedTranscriptViewTests
         });
 
         Assert.True(handled);
-        Assert.Equal(1, copyRequests);
-
-        // No new selection/drag was started: the original selection is untouched and a subsequent release
-        // in a new place neither extends the selection nor toggles expansion.
-        Assert.True(view.HasSelection);
-        Assert.Equal(selectedBefore, view.GetSelectedText());
+        // No copy — left-click no longer copies.
+        Assert.Equal(0, copyRequests);
+        // New drag: extend the selection from the new anchor, then assert it's active.
         view.ProcessMouse(new Mouse
         {
-            Flags = MouseFlags.LeftButtonReleased,
+            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
             Position = new System.Drawing.Point(6, 1),
         });
         Assert.True(view.HasSelection);
-        Assert.Equal(selectedBefore, view.GetSelectedText());
     }
 
     [Fact]

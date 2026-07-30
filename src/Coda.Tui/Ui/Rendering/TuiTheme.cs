@@ -35,6 +35,10 @@ internal sealed class TuiTheme
     {
     }
 
+    /// <summary>The named base colours this theme is built from. The outcome roles below resolve through it,
+    /// so a theme re-tints them by supplying its own palette rather than restating each role.</summary>
+    public TuiPalette Palette { get; init; } = TuiPalette.WarmEmber;
+
     public TuiThemeColor Background { get; init; } = new(new TgColor(23, 19, 16), TgName.Black);
     public TuiThemeColor TranscriptAssistant { get; init; } = new(new TgColor(242, 214, 179), TgName.White);
     public TuiThemeColor TranscriptUser { get; init; } = new(new TgColor(230, 168, 74), TgName.BrightYellow);
@@ -49,11 +53,34 @@ internal sealed class TuiTheme
     public TuiThemeColor Code { get; init; } = new(new TgColor(200, 184, 166), TgName.Gray);
     public TuiThemeColor TranscriptTool { get; init; } = new(new TgColor(240, 190, 84), TgName.BrightYellow);
     public TuiThemeColor Diff { get; init; } = new(new TgColor(201, 138, 82), TgName.Yellow);
-    public TuiThemeColor PermissionApproval { get; init; } = new(new TgColor(233, 130, 107), TgName.BrightRed);
-    public TuiThemeColor Question { get; init; } = new(new TgColor(240, 199, 94), TgName.BrightYellow);
-    public TuiThemeColor Warning { get; init; } = new(new TgColor(240, 199, 94), TgName.Yellow);
-    public TuiThemeColor Notification { get; init; } = new(new TgColor(191, 174, 156), TgName.Gray);
-    public TuiThemeColor Error { get; init; } = new(new TgColor(217, 104, 93), TgName.Red);
+
+    /// <summary>A wholly successful batch of tool calls. The one green in the transcript palette: it means
+    /// "nothing needs your attention", which is why it is never used for a partial outcome.
+    /// Resolves through <see cref="TuiPalette.Success"/>.</summary>
+    public TuiThemeColor ToolSuccess => this.Palette.Success;
+
+    /// <summary>A batch of tool calls where some, but not all, failed. Noteworthy but not a failure.
+    /// Resolves through <see cref="TuiPalette.Warn"/>.</summary>
+    public TuiThemeColor ToolPartialFailure => this.Palette.Warn;
+
+    /// <summary>A tool that ran after its permission was approved. Noteworthy rather than a failure.
+    /// Resolves through <see cref="TuiPalette.Warn"/>.</summary>
+    public TuiThemeColor PermissionApproved => this.Palette.Warn;
+
+    /// <summary>An open question awaiting the user — a permission still to be decided, a prompt to answer.
+    /// Resolves through <see cref="TuiPalette.Warn"/>, so the "waiting for approval" status row and an
+    /// approved transcript row agree on the colour that means "this needs you, nothing has failed".</summary>
+    public TuiThemeColor Question => this.Palette.Warn;
+
+    /// <summary>A cancelled or partially-cancelled outcome. Resolves through <see cref="TuiPalette.Warn"/>.</summary>
+    public TuiThemeColor Warning => this.Palette.Warn;
+
+    /// <summary>Low-emphasis informational chrome. Resolves through <see cref="TuiPalette.Dim"/>.</summary>
+    public TuiThemeColor Notification => this.Palette.Dim;
+
+    /// <summary>A failure or a rejected permission — and nothing else.
+    /// Resolves through <see cref="TuiPalette.Error"/>.</summary>
+    public TuiThemeColor Error => this.Palette.Error;
 
     // Six eye-friendly Warm Ember context-usage colors, one per /context category. Each is a distinct
     // warm hue (gold → amber → terracotta → rose → taupe → dim warm grey) with a distinct, warm-degrading

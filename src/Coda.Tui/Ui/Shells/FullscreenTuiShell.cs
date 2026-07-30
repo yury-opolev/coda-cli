@@ -53,7 +53,8 @@ internal class FullscreenTuiShell(
     IPrivateBrowserResolver? privateBrowserResolver = null,
     IUiPromptService? linkPromptService = null,
     IClipboardImageReader? imageReader = null,
-    Func<ClipboardImage, string?>? imagePaste = null)
+    Func<ClipboardImage, string?>? imagePaste = null,
+    TranscriptGlyphs? transcriptGlyphs = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -94,12 +95,12 @@ internal class FullscreenTuiShell(
 
     private int composerHeight = MinimumComposerHeight;
     private bool applyingComposerLayout;
-    private Label header = null!;
+    private SelectableTextView header = null!;
     private VirtualizedTranscriptView transcript = null!;
     private JumpToBottomHint jumpHint = null!;
 
-    /// <summary>The one-row session header (session/model).</summary>
-    internal Label Header => this.header;
+    /// <summary>The one-row selectable session header (session/model).</summary>
+    internal SelectableTextView Header => this.header;
 
     /// <summary>The virtualized transcript surface filling the space between header and composer.</summary>
     internal VirtualizedTranscriptView Transcript => this.transcript;
@@ -109,10 +110,12 @@ internal class FullscreenTuiShell(
     /// <inheritdoc />
     protected override VirtualizedTranscriptView TranscriptView => this.transcript;
 
-    /// <summary>Releases transcript mouse capture before a shell exit or mode transition stops the application.</summary>
+    /// <summary>Releases transcript and header mouse capture before a shell exit or mode transition stops
+    /// the application, so no grab is left pointing at a view that is about to be torn down.</summary>
     public override void RequestStop(TuiShellExit outcome)
     {
         this.transcript.CancelMouseInteraction();
+        this.header?.CancelMouseInteraction();
         base.RequestStop(outcome);
     }
 
@@ -134,13 +137,15 @@ internal class FullscreenTuiShell(
         // overlay set their own schemes below and keep them.
         this.SetScheme(this.Theme.SurfaceScheme(this.HostApp.Driver));
 
-        this.header = new Label { CanFocus = false };
+        this.header = new SelectableTextView(this.HostApp) { CanFocus = false };
         this.header.X = 0;
         this.header.Y = 0;
         this.header.Width = Dim.Fill();
         this.header.Height = 1;
+        this.header.ApplyTheme(this.Theme, this.HostApp.Driver);
+        this.header.CopyRequested += this.OnHeaderCopyRequested;
 
-        this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter);
+        this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter, glyphs: transcriptGlyphs);
         this.transcript.TranscriptScrolled += this.RefreshHeaderForViewport;
         this.BindTranscriptInput(this.transcript);
         this.transcript.X = 0;
@@ -297,6 +302,7 @@ internal class FullscreenTuiShell(
         this.SetScheme(this.Theme.SurfaceScheme(this.HostApp.Driver));
         this.Composer.SetScheme(this.Chrome.CreateInputScheme(this.HostApp.Driver));
         this.jumpHint?.ApplyTheme(this.Theme, this.HostApp.Driver);
+        this.header?.ApplyTheme(this.Theme, this.HostApp.Driver);
     }
 
     protected override void PlaceCompletion(int height, bool visible)
@@ -458,7 +464,7 @@ internal class FullscreenTuiShell(
         var session = string.IsNullOrEmpty(snapshot.SessionId) ? "no session" : snapshot.SessionId;
         var left = string.IsNullOrEmpty(snapshot.Model) ? session : $"{session} · {snapshot.Model}";
 
-        this.header.Text = left;
+        this.header.SetText(left);
     }
 
     /// <summary>
@@ -472,8 +478,26 @@ internal class FullscreenTuiShell(
 
     private void OnJumpHint() => this.TranscriptView.JumpToNewest();
 
+    /// <inheritdoc />
+    protected override bool TryCopyHeaderSelection()
+    {
+        if (!this.header.HasSelection)
+        {
+            return false;
+        }
+
+        this.CopyToClipboard(this.header.SelectedText, this.header.ClearSelection);
+        return true;
+    }
+
     protected override void Dispose(bool disposing)
     {
+        if (disposing && this.header is not null)
+        {
+            this.header.CancelMouseInteraction();
+            this.header.CopyRequested -= this.OnHeaderCopyRequested;
+        }
+
         if (disposing && this.transcript is not null)
         {
             this.transcript.CancelMouseInteraction();
@@ -488,4 +512,6 @@ internal class FullscreenTuiShell(
 
         base.Dispose(disposing);
     }
+
+    private void OnHeaderCopyRequested(string text) => this.CopyToClipboard(text, this.header.ClearSelection);
 }

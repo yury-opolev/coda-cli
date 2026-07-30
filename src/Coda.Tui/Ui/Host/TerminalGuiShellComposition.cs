@@ -39,7 +39,8 @@ internal static class TerminalGuiShellComposition
         IPrivateBrowserResolver? privateBrowserResolver = null,
         IUiPromptService? linkPromptService = null,
         IClipboardImageReader? imageReader = null,
-        Func<ClipboardImage, string?>? imagePaste = null)
+        Func<ClipboardImage, string?>? imagePaste = null,
+        TranscriptGlyphs? transcriptGlyphs = null)
     {
         ArgumentNullException.ThrowIfNull(application);
         ArgumentNullException.ThrowIfNull(composer);
@@ -68,7 +69,8 @@ internal static class TerminalGuiShellComposition
                 privateBrowserResolver: privateBrowserResolver,
                 linkPromptService: linkPromptService,
                 imageReader: imageReader,
-                imagePaste: imagePaste)
+                imagePaste: imagePaste,
+                transcriptGlyphs: transcriptGlyphs)
             : new InlineTuiShell(
                 application,
                 composer,
@@ -86,6 +88,7 @@ internal static class TerminalGuiShellComposition
                 privateBrowserResolver: privateBrowserResolver,
                 linkPromptService: linkPromptService,
                 imageReader: imageReader,
-                imagePaste: imagePaste);
+                imagePaste: imagePaste,
+                transcriptGlyphs: transcriptGlyphs);
     }
 }

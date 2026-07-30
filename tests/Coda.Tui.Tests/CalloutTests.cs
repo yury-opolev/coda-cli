@@ -43,7 +43,7 @@ public sealed class CalloutTests
 
         var title = Assert.Single(lines);
         Assert.Equal(expectedRole, title.Role);
-        Assert.Equal($"{expectedGlyph} {expectedLabel}", title.Text);
+        Assert.Equal($" \u25cf {expectedGlyph} {expectedLabel}", title.Text);
     }
 
     [Theory]
@@ -169,12 +169,12 @@ public sealed class CalloutTests
         Assert.True(lines.Count >= 2, "callout with body must have at least title + body rows");
         // Title row.
         Assert.Equal(TranscriptRole.CalloutNote, lines[0].Role);
-        Assert.StartsWith("ℹ ", lines[0].Text);
+        Assert.StartsWith(" \u25cf \u2139 ", lines[0].Text);
         // Body rows: │ prefix + Assistant role.
         for (var i = 1; i < lines.Count; i++)
         {
             Assert.Equal(TranscriptRole.Assistant, lines[i].Role);
-            Assert.StartsWith("│ ", lines[i].Text);
+            Assert.StartsWith("   \u2502 ", lines[i].Text);
         }
     }
 
@@ -184,10 +184,10 @@ public sealed class CalloutTests
         var lines = Format("> [!TIP]\n> remember this", 80);
 
         Assert.True(lines.Count >= 2);
-        // The body line is "│ remember this"
+        // The body line is "   │ remember this"
         var bodyLine = lines[1];
         Assert.Equal(TranscriptRole.Assistant, bodyLine.Role);
-        Assert.Equal("│ remember this", bodyLine.Text);
+        Assert.Equal("   \u2502 remember this", bodyLine.Text);
     }
 
     [Fact]
@@ -201,7 +201,7 @@ public sealed class CalloutTests
         // All body rows have the bar prefix.
         foreach (var line in lines.Skip(1))
         {
-            Assert.StartsWith("│ ", line.Text);
+            Assert.StartsWith("   \u2502 ", line.Text);
             Assert.Equal(TranscriptRole.Assistant, line.Role);
         }
     }
@@ -216,7 +216,7 @@ public sealed class CalloutTests
         // Every non-title row must have the bar prefix.
         foreach (var bodyLine in lines.Skip(1).Where(l => !string.IsNullOrEmpty(l.Text)))
         {
-            Assert.StartsWith("│ ", bodyLine.Text);
+            Assert.StartsWith("   \u2502 ", bodyLine.Text);
         }
     }
 
@@ -227,7 +227,7 @@ public sealed class CalloutTests
 
         var title = Assert.Single(lines);
         Assert.Equal(TranscriptRole.CalloutWarning, title.Role);
-        Assert.Equal("⚠ WARNING", title.Text);
+        Assert.Equal(" \u25cf \u26a0 WARNING", title.Text);
     }
 
     [Fact]
@@ -237,7 +237,7 @@ public sealed class CalloutTests
 
         var title = Assert.Single(lines);
         Assert.Equal(TranscriptRole.CalloutCaution, title.Role);
-        Assert.Equal("⊗ CAUTION", title.Text);
+        Assert.Equal(" \u25cf \u2297 CAUTION", title.Text);
     }
 
     // ---------------------------------------------------------------------------
@@ -403,9 +403,9 @@ public sealed class CalloutTests
         foreach (var bodyLine in lines.Skip(1))
         {
             Assert.Equal(TranscriptRole.Assistant, bodyLine.Role);
-            Assert.StartsWith("│ ", bodyLine.Text);
-            // PrefixCells must equal the width of "│ " (= 2 cells) for a top-level callout.
-            Assert.Equal(TerminalCellText.Width("│ "), bodyLine.PrefixCells);
+            Assert.StartsWith("   \u2502 ", bodyLine.Text);
+            // PrefixCells covers gutter (3 cells "   ") + the callout bar "│ " (2 cells).
+            Assert.Equal(TerminalCellText.Width("   \u2502 "), bodyLine.PrefixCells);
             // PrefixRole must be the callout role so the bar is drawn in the callout color.
             Assert.Equal(calloutRole, bodyLine.PrefixRole);
         }
@@ -451,11 +451,12 @@ public sealed class CalloutTests
         var link = Assert.Single(bodyRow.Links!);
         Assert.Equal("https://example.com", link.Url);
         Assert.True(link.TextMatchesUrl);
-        // The bar prefix "│ " is 2 display cells wide; "See " is 4 cells — URL starts at col 6.
-        var barWidth = TerminalCellText.Width("│ ");
+        // The body row text is "   │ See https://..." — gutter "   " (3 cells) + bar "│ " (2 cells) + "See " (4 cells).
+        var gutterWidth = TranscriptGlyphs.MarkerCells;
+        var barWidth = TerminalCellText.Width("\u2502 ");
         var prefixWidth = TerminalCellText.Width("See ");
-        Assert.Equal(barWidth + prefixWidth, link.StartColumn);
-        Assert.Equal(barWidth + prefixWidth + TerminalCellText.Width("https://example.com"), link.EndColumn);
+        Assert.Equal(gutterWidth + barWidth + prefixWidth, link.StartColumn);
+        Assert.Equal(gutterWidth + barWidth + prefixWidth + TerminalCellText.Width("https://example.com"), link.EndColumn);
     }
 
     [Fact]

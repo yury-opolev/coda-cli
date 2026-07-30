@@ -1,5 +1,6 @@
 using Coda.Agent.Scheduling;
 using Coda.Tui.Ui.Rendering;
+using Coda.Tui.Ui.Shells;
 
 namespace Coda.Tui.Ui.Schedule;
 
@@ -17,7 +18,7 @@ namespace Coda.Tui.Ui.Schedule;
 /// never double-subscribes or double-pumps; a repeated Hide never re-notifies. <see cref="Dispose"/>
 /// mirrors <see cref="Hide"/>'s teardown.</para>
 /// </summary>
-internal sealed class ScheduleBrowserOverlay : View
+internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
 {
     private const int PageStep = 10;
 
@@ -27,7 +28,7 @@ internal sealed class ScheduleBrowserOverlay : View
     private readonly Action? onChanged;
 
     private readonly Label header;
-    private readonly Label body;
+    private readonly SelectableTextView body;
     private readonly Label footer;
 
     private CancellationTokenSource? pumpCts;
@@ -38,7 +39,8 @@ internal sealed class ScheduleBrowserOverlay : View
         IApplication app,
         ScheduleBrowserController controller,
         TuiTheme? theme = null,
-        Action? onChanged = null)
+        Action? onChanged = null,
+        Action<string, Action>? onCopyRequested = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -52,8 +54,13 @@ internal sealed class ScheduleBrowserOverlay : View
         this.BorderStyle = LineStyle.Rounded;
 
         this.header = new Label { X = 0, Y = 0, Width = Dim.Fill(), Height = 1, CanFocus = false };
-        this.body = new Label { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1), CanFocus = false };
+        this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1) };
         this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+        if (onCopyRequested is not null)
+        {
+            this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
+        }
+
         this.Add(this.header);
         this.Add(this.body);
         this.Add(this.footer);
@@ -63,6 +70,7 @@ internal sealed class ScheduleBrowserOverlay : View
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
         {
             this.Render();
@@ -77,8 +85,11 @@ internal sealed class ScheduleBrowserOverlay : View
     internal bool IsPumping => this.pumpCts is not null;
 
     internal string HeaderText => this.header.Text ?? string.Empty;
-    internal string BodyText => this.body.Text ?? string.Empty;
+    internal string BodyText => this.body.AllText;
     internal string FooterText => this.footer.Text ?? string.Empty;
+
+    // ── ISelectableOverlay ────────────────────────────────────────────────────
+    SelectableTextView ISelectableOverlay.Body => this.body;
 
     // ── Show / Hide / Teardown ────────────────────────────────────────────────
 
@@ -86,6 +97,7 @@ internal sealed class ScheduleBrowserOverlay : View
     public void Show()
     {
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
+        this.body.ApplyTheme(this.theme, this.app.Driver);
 
         // Idempotent: a second Show while already active must never double-subscribe or double-pump.
         if (this.active)
@@ -113,6 +125,7 @@ internal sealed class ScheduleBrowserOverlay : View
     {
         if (!this.active) return;
 
+        this.body.CancelMouseInteraction();
         this.Teardown();
         this.Visible = false;
         this.onChanged?.Invoke();
@@ -215,7 +228,7 @@ internal sealed class ScheduleBrowserOverlay : View
     {
         if (state.Rows.Count == 0)
         {
-            this.body.Text = "  (no scheduled tasks — press N to create one)";
+            this.body.SetText("  (no scheduled tasks — press N to create one)");
             return;
         }
 
@@ -240,7 +253,7 @@ internal sealed class ScheduleBrowserOverlay : View
                 $"{prefix}{id}{name}  {rule}  {tz}  next {nextUtc} UTC  {statusStr}{outcome}");
         }
 
-        this.body.Text = lines.ToString();
+        this.body.SetText(lines.ToString());
     }
 
     private void RenderFooter(ScheduleBrowserState state)
@@ -262,6 +275,7 @@ internal sealed class ScheduleBrowserOverlay : View
         if (!this.disposed && disposing)
         {
             this.disposed = true;
+            this.body.CancelMouseInteraction();
             if (this.active)
             {
                 this.Teardown();

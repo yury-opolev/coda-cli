@@ -30,6 +30,7 @@ internal sealed class VirtualizedTranscriptView : View
     private readonly TranscriptLayoutIndex index;
     private readonly TranscriptViewportState viewport = new();
     private readonly HashSet<Guid> expanded = new();
+    private readonly TranscriptGlyphs glyphs;
 
     private int currentWidth = DefaultWidth;
     private Guid? selectedBlockId;
@@ -53,16 +54,29 @@ internal sealed class VirtualizedTranscriptView : View
     private TgAttribute? linkAttributeCache;
     private TgAttribute? linkDeceptiveAttributeCache;
 
+    // Pin state tracked between draw and mouse handling.
+    private bool pinVisible;
+
+    // Composed-pin memo. The pin is drawn on every frame while a turn streams, and the source prompt can be
+    // an arbitrarily large paste, so the composition is cached against the (immutable) block instance and the
+    // width it was composed for. A replaced block is a new instance, which invalidates the memo by reference.
+    private UserTranscriptBlock? pinMemoBlock;
+    private int pinMemoWidth = -1;
+    private string? pinMemoText;
+
     public VirtualizedTranscriptView(
         IApplication app,
         Func<TranscriptBlock, int, IReadOnlyList<TranscriptRenderLine>>? formatter = null,
-        TuiTheme? theme = null)
+        TuiTheme? theme = null,
+        TranscriptGlyphs? glyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.theme = theme ?? CodaThemes.Current.Tui;
+        this.glyphs = glyphs ?? TranscriptGlyphs.Unicode;
         this.index = new TranscriptLayoutIndex(
             formatter ?? TranscriptBlockFormatter.Format,
-            enableIncrementalAssistant: formatter is null);
+            enableIncrementalAssistant: formatter is null,
+            glyphs: this.glyphs);
         this.CanFocus = true;
         this.MousePositionTracking = true;
     }
@@ -97,9 +111,8 @@ internal sealed class VirtualizedTranscriptView : View
     internal event Func<Key, bool>? UnhandledKeyDown;
 
     /// <summary>
-    /// Raised when a fresh unshifted left-button press lands while a selection is active. The host copies
-    /// the current selection to the clipboard in response; the press is consumed here and never begins a
-    /// new selection or toggles tool/diff expansion.
+    /// Raised when a right-click lands while a selection is active. The host copies the current selection
+    /// to the clipboard in response; the right-click is consumed and the selection cleared.
     /// </summary>
     internal event Action? CopyRequested;
 
@@ -146,6 +159,13 @@ internal sealed class VirtualizedTranscriptView : View
     internal bool ScrollbarDraggingForTest => this.scrollbarDragging;
 
     internal bool MouseCaptureActiveForTest => this.dragging || this.scrollbarDragging;
+
+    /// <summary>The active work callback; null is treated as false (no active work).</summary>
+    internal Func<bool>? HasActiveWork { get; set; }
+
+    /// <summary>The pin text drawn at screen row 0 during the last <see cref="OnDrawingContent"/> call, or
+    /// null when no pin was drawn. Exposed for tests.</summary>
+    internal string? PinnedPromptForTest { get; private set; }
 
     internal void ScrollToRowForTest(int row) =>
         this.viewport.ScrollToRow(row, this.index.AnchorAt(row));
@@ -393,8 +413,81 @@ internal sealed class VirtualizedTranscriptView : View
             this.DrawRow(row, screenRow);
         }
 
+        // Draw the prompt pin (screen row 0) when active work is running and the pinned prompt has
+        // scrolled entirely above the viewport. Must happen after the normal row loop so it paints on
+        // top, and before DrawScrollbar so the scrollbar still sits in the rightmost column.
+        this.DrawPin();
+
         this.DrawScrollbar();
         return true;
+    }
+
+    /// <summary>
+    /// Paints the one-line prompt pin at screen row 0 when the conditions defined by
+    /// <see cref="TranscriptPin.ShouldShow"/> are met.
+    /// </summary>
+    private void DrawPin()
+    {
+        var contentWidth = this.ContentWidth;
+        if (this.Viewport.Height <= 0 || contentWidth <= 0)
+        {
+            this.pinVisible = false;
+            this.PinnedPromptForTest = null;
+            return;
+        }
+
+        var pinned = this.index.LastUserBlock();
+        var show = TranscriptPin.ShouldShow(
+            this.HasActiveWork?.Invoke() == true,
+            pinned?.FirstRow,
+            pinned?.EndRowExclusive ?? 0,
+            this.viewport.TopRow,
+            this.Viewport.Height);
+
+        if (!show)
+        {
+            this.pinVisible = false;
+            this.PinnedPromptForTest = null;
+            return;
+        }
+
+        var text = this.ComposePin(pinned!.Value.Block, contentWidth);
+        this.PinnedPromptForTest = text;
+
+        if (text is null)
+        {
+            this.pinVisible = false;
+            return;
+        }
+
+        // Fill the full width with the user-block attribute so it reads as its own surface.
+        var attr = this.AttributeFor(TranscriptRole.User);
+        this.SetAttribute(attr);
+        this.Move(0, 0);
+        this.AddStr(new string(' ', contentWidth));
+
+        // Paint the pin text over the background.
+        this.Move(0, 0);
+        this.AddStr(text);
+
+        this.pinVisible = true;
+    }
+
+    /// <summary>
+    /// The composed pin text for <paramref name="block"/> at <paramref name="contentWidth"/>, reusing the
+    /// previous composition when neither has changed. Composition scans and sanitizes the submitted prompt,
+    /// which is unbounded in size, so it must not run once per frame while a turn streams.
+    /// </summary>
+    private string? ComposePin(UserTranscriptBlock block, int contentWidth)
+    {
+        if (!ReferenceEquals(block, this.pinMemoBlock) || contentWidth != this.pinMemoWidth)
+        {
+            this.pinMemoText = TranscriptPin.Compose(block.Text, contentWidth, this.glyphs);
+            this.pinMemoBlock = block;
+            this.pinMemoWidth = contentWidth;
+        }
+
+        return this.pinMemoText;
     }
 
     /// <summary>
@@ -661,6 +754,19 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
+        // The pin row (screen row 0) is inert chrome when visible: a fresh left press on it must not start
+        // a drag selection or toggle expansion on the hidden content row underneath. Now that left-click no
+        // longer copies a selection, the !selection.HasSelection guard is no longer needed — any fresh left
+        // press on the pin row is unconditionally consumed regardless of selection state.
+        if (this.pinVisible &&
+            local.Y == 0 &&
+            !this.dragging &&
+            mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
+            !mouse.Flags.HasFlag(MouseFlags.PositionReport))
+        {
+            return true;
+        }
+
         // Terminal.Gui signals a fresh press as a bare LeftButtonPressed. While the
         // button is held and the pointer moves, it re-reports the same button flag
         // combined with PositionReport (LeftButtonPressed | PositionReport) once per
@@ -670,14 +776,9 @@ internal sealed class VirtualizedTranscriptView : View
             mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
             !mouse.Flags.HasFlag(MouseFlags.PositionReport))
         {
-            // A fresh press while a selection is active copies that selection instead of starting a new
-            // one: request the copy and consume the click without anchoring a drag or toggling expansion.
-            if (this.selection.HasSelection)
-            {
-                this.CopyRequested?.Invoke();
-                return true;
-            }
-
+            // A fresh left press clears any existing selection and starts a new drag. Copying is now
+            // exclusively a right-click gesture so left-click never interrupts the selection workflow.
+            this.ClearSelection();
             var position = this.ToTranscriptPosition(mouse);
             this.BeginSelection(position);
             mouseService.GrabMouse(this);
@@ -697,10 +798,19 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        // Right-click on a link span opens the context menu anchored at the pointer.
-        if (mouse.Flags.HasFlag(MouseFlags.RightButtonClicked) &&
-            !mouse.Flags.HasFlag(MouseFlags.PositionReport))
+        // Right-click: when a selection is active, copy it and consume the event regardless of whether the
+        // pointer is over a link — selection takes priority over the link context menu. With no selection,
+        // right-click over a link opens the context menu as before.
+        if (SelectionGesture.IsRightClick(mouse.Flags))
         {
+            if (this.selection.HasSelection)
+            {
+                // The host owns clearing: it preserves the selection when the clipboard write fails, so
+                // clearing here would silently lose a selection the user still needs.
+                this.CopyRequested?.Invoke();
+                return true;
+            }
+
             var position = this.ToTranscriptPosition(mouse);
             if (this.TryGetLinkAt(position.GlobalRow, position.CellColumn, out var link))
             {
@@ -973,7 +1083,7 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.Code => this.theme.Code,
             TranscriptRole.Tool => this.theme.TranscriptTool,
             TranscriptRole.Diff => this.theme.Diff,
-            TranscriptRole.Permission => this.theme.PermissionApproval,
+            TranscriptRole.Permission => this.theme.Error,
             TranscriptRole.Question => this.theme.Question,
             TranscriptRole.Warning => this.theme.Warning,
             TranscriptRole.Notification => this.theme.Notification,
@@ -989,6 +1099,9 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.CalloutImportant => this.theme.CalloutImportant,
             TranscriptRole.CalloutWarning => this.theme.CalloutWarning,
             TranscriptRole.CalloutCaution => this.theme.CalloutCaution,
+            TranscriptRole.ToolSuccess => this.theme.ToolSuccess,
+            TranscriptRole.ToolPartialFailure => this.theme.ToolPartialFailure,
+            TranscriptRole.PermissionApproved => this.theme.PermissionApproved,
             _ => this.theme.TranscriptAssistant,
         };
 

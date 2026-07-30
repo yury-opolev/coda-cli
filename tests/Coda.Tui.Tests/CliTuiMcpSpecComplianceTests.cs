@@ -232,7 +232,7 @@ public sealed class CliTuiMcpSpecComplianceTests
 
         var activeLines = TranscriptBlockFormatter.Format(active, 120, ToolDisplayMode.Summary);
         Assert.Equal(6, activeLines.Count);
-        Assert.Equal("`- ...and 2 more", activeLines[^1].Text);
+        Assert.Equal("   \u2514 ...and 2 more", activeLines[^1].Text);
         Assert.Equal(
             "Ran 4 tools - 1 failed, cancelled",
             ToolActivityPreview.CompletedText(new ToolActivitySummary("root", "activity", 4, 1, 1, 1, null)));

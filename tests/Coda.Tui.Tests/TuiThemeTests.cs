@@ -23,7 +23,6 @@ public sealed class TuiThemeTests
         Assert.Equal(new TgColor(242, 214, 179), theme.TranscriptAssistant.TrueColor);
         Assert.Equal(new TgColor(230, 168, 74), theme.TranscriptUser.TrueColor);
         Assert.Equal(new TgColor(240, 190, 84), theme.TranscriptTool.TrueColor);
-        Assert.Equal(new TgColor(233, 130, 107), theme.PermissionApproval.TrueColor);
         Assert.Equal(new TgColor(240, 199, 94), theme.Question.TrueColor);
         Assert.Equal(new TgColor(217, 104, 93), theme.Error.TrueColor);
 
@@ -33,11 +32,13 @@ public sealed class TuiThemeTests
         Assert.Equal(TgName.White, theme.TranscriptAssistant.Fallback);
         Assert.Equal(TgName.BrightYellow, theme.TranscriptUser.Fallback);
         Assert.Equal(TgName.BrightYellow, theme.TranscriptTool.Fallback);
-        Assert.Equal(TgName.BrightRed, theme.PermissionApproval.Fallback);
-        Assert.Equal(TgName.BrightYellow, theme.Question.Fallback);
+        Assert.Equal(TgName.Yellow, theme.Question.Fallback);
         Assert.Equal(TgName.Red, theme.Error.Fallback);
         Assert.NotEqual(TgName.Blue, theme.TranscriptTool.Fallback);
-        Assert.NotEqual(TgName.Magenta, theme.PermissionApproval.Fallback);
+
+        // Error is unchanged and is the Error palette entry — the only red in the theme.
+        // A rejected permission row resolves to the Error palette entry, the same red as Error.
+        Assert.Equal(theme.Error, theme.Palette.Error);
     }
 
     [Fact]
@@ -53,7 +54,7 @@ public sealed class TuiThemeTests
     [InlineData(TranscriptRole.Assistant, 242, 214, 179)]
     [InlineData(TranscriptRole.User, 230, 168, 74)]
     [InlineData(TranscriptRole.Tool, 240, 190, 84)]
-    [InlineData(TranscriptRole.Permission, 233, 130, 107)]
+    [InlineData(TranscriptRole.Permission, 217, 104, 93)]
     [InlineData(TranscriptRole.Question, 240, 199, 94)]
     [InlineData(TranscriptRole.Warning, 240, 199, 94)]
     [InlineData(TranscriptRole.Error, 217, 104, 93)]
@@ -83,7 +84,7 @@ public sealed class TuiThemeTests
             new TgColor(TgName.BrightYellow),
             view.AttributeFor(TranscriptRole.Tool).Foreground);
         Assert.Equal(
-            new TgColor(TgName.BrightRed),
+            new TgColor(TgName.Red),
             view.AttributeFor(TranscriptRole.Permission).Foreground);
     }
 

@@ -45,4 +45,60 @@ public sealed class TranscriptSelectionTests
 
         Assert.Equal("lpha\n界beta\nom", selection.CopyText(rows));
     }
+
+    [Fact]
+    public void CopyText_skips_the_gutter_so_markers_and_connectors_are_never_copied()
+    {
+        var selection = new TranscriptSelection();
+        selection.Begin(new TranscriptCellPosition(0, 0));
+        selection.Update(new TranscriptCellPosition(1, 20));
+        var rows = new[]
+        {
+            new TranscriptRow(Guid.NewGuid(), 0, 0, " ● here is the answer", TranscriptRole.Assistant)
+            {
+                GutterCells = 3,
+            },
+            new TranscriptRow(Guid.NewGuid(), 0, 1, "   └ npm install", TranscriptRole.Tool)
+            {
+                GutterCells = 5,
+            },
+        };
+
+        // Dragging across the whole block copies the content, not the chrome that shapes it.
+        Assert.Equal("here is the answer\nnpm install", selection.CopyText(rows));
+    }
+
+    [Fact]
+    public void CopyText_starting_inside_the_text_is_unaffected_by_the_gutter()
+    {
+        var selection = new TranscriptSelection();
+        selection.Begin(new TranscriptCellPosition(0, 8));
+        selection.Update(new TranscriptCellPosition(0, 11));
+        var rows = new[]
+        {
+            new TranscriptRow(Guid.NewGuid(), 0, 0, " ● here is the answer", TranscriptRole.Assistant)
+            {
+                GutterCells = 3,
+            },
+        };
+
+        Assert.Equal("is t", selection.CopyText(rows));
+    }
+
+    [Fact]
+    public void CopyText_of_a_gutter_only_selection_yields_an_empty_row()
+    {
+        var selection = new TranscriptSelection();
+        selection.Begin(new TranscriptCellPosition(0, 0));
+        selection.Update(new TranscriptCellPosition(0, 1));
+        var rows = new[]
+        {
+            new TranscriptRow(Guid.NewGuid(), 0, 0, " ● answer", TranscriptRole.Assistant)
+            {
+                GutterCells = 3,
+            },
+        };
+
+        Assert.Equal(string.Empty, selection.CopyText(rows));
+    }
 }
