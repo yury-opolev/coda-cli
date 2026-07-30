@@ -110,9 +110,8 @@ internal sealed class VirtualizedTranscriptView : View
     internal event Func<Key, bool>? UnhandledKeyDown;
 
     /// <summary>
-    /// Raised when a fresh unshifted left-button press lands while a selection is active. The host copies
-    /// the current selection to the clipboard in response; the press is consumed here and never begins a
-    /// new selection or toggles tool/diff expansion.
+    /// Raised when a right-click lands while a selection is active. The host copies the current selection
+    /// to the clipboard in response; the right-click is consumed and the selection cleared.
     /// </summary>
     internal event Action? CopyRequested;
 
@@ -758,14 +757,13 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        // The pin row (screen row 0) is inert chrome when visible: consume fresh presses so neither
-        // selection nor expansion begins on the hidden content underneath. An active selection still wins,
-        // so copy-on-click keeps working uniformly on every row. Wheel events (handled above) are
-        // deliberately not blocked so scrolling still works while the pointer is over the pin.
+        // The pin row (screen row 0) is inert chrome when visible: a fresh left press on it must not start
+        // a drag selection or toggle expansion on the hidden content row underneath. Now that left-click no
+        // longer copies a selection, the !selection.HasSelection guard is no longer needed — any fresh left
+        // press on the pin row is unconditionally consumed regardless of selection state.
         if (this.pinVisible &&
             local.Y == 0 &&
             !this.dragging &&
-            !this.selection.HasSelection &&
             mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
             !mouse.Flags.HasFlag(MouseFlags.PositionReport))
         {
@@ -781,14 +779,9 @@ internal sealed class VirtualizedTranscriptView : View
             mouse.Flags.HasFlag(MouseFlags.LeftButtonPressed) &&
             !mouse.Flags.HasFlag(MouseFlags.PositionReport))
         {
-            // A fresh press while a selection is active copies that selection instead of starting a new
-            // one: request the copy and consume the click without anchoring a drag or toggling expansion.
-            if (this.selection.HasSelection)
-            {
-                this.CopyRequested?.Invoke();
-                return true;
-            }
-
+            // A fresh left press clears any existing selection and starts a new drag. Copying is now
+            // exclusively a right-click gesture so left-click never interrupts the selection workflow.
+            this.ClearSelection();
             var position = this.ToTranscriptPosition(mouse);
             this.BeginSelection(position);
             mouseService.GrabMouse(this);
@@ -808,10 +801,22 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        // Right-click on a link span opens the context menu anchored at the pointer.
-        if (mouse.Flags.HasFlag(MouseFlags.RightButtonClicked) &&
+        // Right-click: when a selection is active, copy it and consume the event regardless of whether the
+        // pointer is over a link — selection takes priority over the link context menu. With no selection,
+        // right-click over a link opens the context menu as before.
+        if ((mouse.Flags.HasFlag(MouseFlags.RightButtonClicked) ||
+             mouse.Flags.HasFlag(MouseFlags.RightButtonDoubleClicked) ||
+             mouse.Flags.HasFlag(MouseFlags.RightButtonTripleClicked)) &&
             !mouse.Flags.HasFlag(MouseFlags.PositionReport))
         {
+            if (this.selection.HasSelection)
+            {
+                // The host owns clearing: it preserves the selection when the clipboard write fails, so
+                // clearing here would silently lose a selection the user still needs.
+                this.CopyRequested?.Invoke();
+                return true;
+            }
+
             var position = this.ToTranscriptPosition(mouse);
             if (this.TryGetLinkAt(position.GlobalRow, position.CellColumn, out var link))
             {

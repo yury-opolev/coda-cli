@@ -64,7 +64,7 @@ public sealed class ComposerPointerActionTests
     }
 
     [Fact]
-    public void Fresh_left_press_over_selection_copies_and_does_not_start_a_new_drag()
+    public void Fresh_left_press_over_selection_starts_new_selection_instead_of_copying()
     {
         var controller = CreateController();
         using var view = CreateLaidOutView(controller, width: 20, height: 4);
@@ -74,23 +74,11 @@ public sealed class ComposerPointerActionTests
 
         var actions = Capture(view);
 
+        // A fresh left press over an existing selection now clears it and starts a new drag.
         view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(10, 0) });
 
-        Assert.Single(actions);
-        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
-        Assert.Equal("alpha", actions[0].SelectedText);
-
-        // The rest of the click sequence is consumed, so no fresh native drag can start over the old
-        // selection: the selection is left untouched and no second action is raised.
-        view.NewMouseEvent(new Mouse
-        {
-            Flags = MouseFlags.LeftButtonPressed | MouseFlags.PositionReport,
-            Position = new Point(14, 0),
-        });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(14, 0) });
-
-        Assert.Single(actions);
-        Assert.Equal("alpha", view.SelectedComposerText);
+        // No copy action — left-click no longer copies.
+        Assert.Empty(actions);
     }
 
     [Fact]
@@ -150,57 +138,6 @@ public sealed class ComposerPointerActionTests
     }
 
     [Fact]
-    public void Left_copy_consumes_the_complete_press_release_click_gesture()
-    {
-        var controller = CreateController();
-        using var view = CreateLaidOutView(controller, width: 20, height: 4);
-        view.SetDraft("alpha beta gamma", 0);
-        DragSelect(view, fromColumn: 0, toColumn: 5);
-        Assert.Equal("alpha", view.SelectedComposerText);
-
-        var actions = Capture(view);
-
-        // Once a copy has been claimed, the rest of the gesture must never re-enter the native editor: any
-        // native caret positioning raises UnwrappedCursorPositionChanged, so seeing it after the copy proves
-        // the trailing click leaked through to the base TextView (repositioning the caret / dropping the
-        // selection).
-        var copyRaised = false;
-        var nativeActivityAfterCopy = false;
-        view.PointerActionRequested += (_, e) =>
-        {
-            if (e.Kind == ComposerPointerActionKind.CopySelection)
-            {
-                copyRaised = true;
-            }
-        };
-        view.UnwrappedCursorPositionChanged += (_, _) =>
-        {
-            if (copyRaised)
-            {
-                nativeActivityAfterCopy = true;
-            }
-        };
-
-        var caretBeforeGesture = view.InsertionPoint;
-
-        // The real interpreter delivers a button gesture as press, release, then a synthesized click.
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonClicked, Position = new Point(2, 0) });
-
-        Assert.Single(actions);
-        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
-        Assert.Equal("alpha", actions[0].SelectedText);
-
-        // The trailing release/click never repositions the caret or starts a new drag: the selection this test
-        // deliberately leaves intact survives and the caret is unchanged.
-        Assert.False(nativeActivityAfterCopy, "the completing release/click must not re-enter the native editor");
-        Assert.True(view.HasComposerSelection);
-        Assert.Equal("alpha", view.SelectedComposerText);
-        Assert.Equal(caretBeforeGesture, view.InsertionPoint);
-    }
-
-    [Fact]
     public void Right_copy_consumes_the_complete_gesture_and_never_opens_the_context_menu()
     {
         var controller = CreateController();
@@ -240,32 +177,6 @@ public sealed class ComposerPointerActionTests
         // otherwise raise its own context menu.
         Assert.False(nativeActivityAfterCopy, "the completing right click must not re-enter the native editor");
         Assert.True(view.ContextMenu is null || !view.ContextMenu.Visible, "no native context menu may open after a copy");
-    }
-
-    [Fact]
-    public void Left_copy_recovers_when_the_gesture_never_delivers_a_synthesized_click()
-    {
-        var controller = CreateController();
-        using var view = CreateLaidOutView(controller, width: 20, height: 4);
-        view.SetDraft("alpha beta gamma", 0);
-        DragSelect(view, fromColumn: 0, toColumn: 5);
-
-        var actions = Capture(view);
-
-        // The first left press over the selection claims a copy and arms suppression.
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
-        Assert.Single(actions);
-
-        // A truncated gesture ends with a release but no synthesized click (a drag emits none), so suppression
-        // is never cleared by a terminal click.
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
-
-        // A fresh press starts a new gesture and must not be swallowed by the stale suppression: it recovers
-        // and copies again over the still-present selection.
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(3, 0) });
-
-        Assert.Equal(2, actions.Count);
-        Assert.All(actions, a => Assert.Equal(ComposerPointerActionKind.CopySelection, a.Kind));
     }
 
     [Fact]
@@ -483,58 +394,4 @@ public sealed class ComposerPointerActionTests
         }
     }
 
-    [Fact]
-    public void Left_double_click_terminal_completes_the_copy_and_clears_suppression()
-    {
-        var controller = CreateController();
-        using var view = CreateLaidOutView(controller, width: 20, height: 4);
-        view.SetDraft("alpha beta gamma", 0);
-        DragSelect(view, fromColumn: 0, toColumn: 5);
-        Assert.Equal("alpha", view.SelectedComposerText);
-
-        var actions = Capture(view);
-
-        // A left press over the selection copies it and arms suppression. Terminal.Gui then delivers the
-        // release and a synthesized terminal click; a second physical click reports the distinct
-        // LeftButtonDoubleClicked bit, which must complete the armed gesture just like LeftButtonClicked.
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonDoubleClicked, Position = new Point(2, 0) });
-
-        // Exactly one copy for the whole gesture: the terminal double-click never raises a duplicate.
-        Assert.Single(actions);
-        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
-
-        // The terminal double-click must complete the gesture and clear suppression, symmetric with a plain
-        // terminal click. Left over armed, a following non-press native mouse action would be silently
-        // swallowed until the next press recovered it; the completion must leave no such stale state behind.
-        Assert.False(
-            view.LeftGestureSuppressed,
-            "a terminal double-click must clear left-gesture suppression, not leave it armed");
-    }
-
-    [Fact]
-    public void Left_triple_click_terminal_completes_the_copy_and_clears_suppression()
-    {
-        var controller = CreateController();
-        using var view = CreateLaidOutView(controller, width: 20, height: 4);
-        view.SetDraft("alpha beta gamma", 0);
-        DragSelect(view, fromColumn: 0, toColumn: 5);
-        Assert.Equal("alpha", view.SelectedComposerText);
-
-        var actions = Capture(view);
-
-        // A third physical click terminates with the distinct LeftButtonTripleClicked bit; it must complete the
-        // armed left gesture with the same semantics as LeftButtonClicked/DoubleClicked.
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonPressed, Position = new Point(2, 0) });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonReleased, Position = new Point(2, 0) });
-        view.NewMouseEvent(new Mouse { Flags = MouseFlags.LeftButtonTripleClicked, Position = new Point(2, 0) });
-
-        Assert.Single(actions);
-        Assert.Equal(ComposerPointerActionKind.CopySelection, actions[0].Kind);
-
-        Assert.False(
-            view.LeftGestureSuppressed,
-            "a terminal triple-click must clear left-gesture suppression, not leave it armed");
-    }
 }

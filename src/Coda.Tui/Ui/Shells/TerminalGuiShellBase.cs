@@ -618,6 +618,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         if (key == Key.C.WithCtrl)
         {
+            if (this.TryCopyHeaderSelection())
+            {
+                return true;
+            }
+
             if (this.TryCopyComposerSelection())
             {
                 return true;
@@ -730,6 +735,14 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.CopyTranscriptSelection();
         return true;
     }
+
+    /// <summary>
+    /// Copies an active header selection to the clipboard when Ctrl+C arrives. The base implementation
+    /// always returns <see langword="false"/>; <see cref="FullscreenTuiShell"/> overrides this to check its
+    /// <see cref="SelectableTextView"/> header. The header is checked before the composer and transcript so
+    /// a deliberate selection in the header is not accidentally overridden by an existing composer selection.
+    /// </summary>
+    protected virtual bool TryCopyHeaderSelection() => false;
 
     /// <summary>
     /// Copies an active composer selection to the clipboard when Ctrl+C arrives, taking precedence over any
@@ -869,18 +882,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
-    /// Copies the active composer selection to the clipboard. When the selection contains zero copyable symbols
-    /// the selection is cleared with a deterministic "0 symbols copied to clipboard" confirmation without
-    /// touching the clipboard writer. Otherwise, on a successful write the selection highlight is cleared and a
-    /// transient "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds; when the clipboard is
-    /// unavailable the selection is preserved and a transient "Clipboard unavailable" Warning is pinned instead.
-    /// The draft text and caret are never mutated.
+    /// Copies <paramref name="text"/> to the clipboard through the standard path, then invokes
+    /// <paramref name="clearSelection"/> and shows the appropriate transient status. The selection is
+    /// always cleared on a zero-symbol selection; on a successful write the selection is cleared and a
+    /// "{N} symbol(s) copied to clipboard" status is shown; on clipboard unavailability the selection is
+    /// <em>not</em> cleared and a warning is shown instead. This mirrors the existing per-surface semantics
+    /// while sharing a single implementation across all copy surfaces (transcript, composer, header).
     /// </summary>
-    private void CopyComposerSelection(string text)
+    protected void CopyToClipboard(string text, Action clearSelection)
     {
         if (ClipboardStatusText.CountSymbols(text) == 0)
         {
-            this.Composer.ClearComposerSelection();
+            clearSelection();
             this.ShowTransientOperationalStatus(
                 new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
                 TimeSpan.FromSeconds(1.5));
@@ -889,7 +902,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
 
         if (this.clipboardWriter(text))
         {
-            this.Composer.ClearComposerSelection();
+            clearSelection();
             this.ShowTransientOperationalStatus(
                 new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
                 TimeSpan.FromSeconds(1.5));
@@ -902,7 +915,18 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
-    /// Handles a transcript copy request (a fresh left click on an active selection) by routing through the
+    /// Copies the active composer selection to the clipboard. When the selection contains zero copyable symbols
+    /// the selection is cleared with a deterministic "0 symbols copied to clipboard" confirmation without
+    /// touching the clipboard writer. Otherwise, on a successful write the selection highlight is cleared and a
+    /// transient "{N} symbol(s) copied to clipboard" status is pinned for 1.5 seconds; when the clipboard is
+    /// unavailable the selection is preserved and a transient "Clipboard unavailable" Warning is pinned instead.
+    /// The draft text and caret are never mutated.
+    /// </summary>
+    private void CopyComposerSelection(string text) =>
+        this.CopyToClipboard(text, this.Composer.ClearComposerSelection);
+
+    /// <summary>
+    /// Handles a transcript copy request (a right-click on an active selection) by routing through the
     /// same copy path as Ctrl+C.
     /// </summary>
     private void HandleTranscriptCopyRequested() => this.CopyTranscriptSelection();
@@ -1145,31 +1169,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
 
         var text = this.TranscriptView.GetSelectedText();
-
-        // An empty or newline-only selection has no symbols to copy. Clear it and report a deterministic
-        // "0 symbols copied to clipboard" confirmation instead of routing through the clipboard writer, whose
-        // skipped/failed write would otherwise surface a misleading "Clipboard unavailable" warning.
-        if (ClipboardStatusText.CountSymbols(text) == 0)
-        {
-            this.TranscriptView.ClearSelection();
-            this.ShowTransientOperationalStatus(
-                new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
-                TimeSpan.FromSeconds(1.5));
-            return;
-        }
-
-        if (this.clipboardWriter(text))
-        {
-            this.TranscriptView.ClearSelection();
-            this.ShowTransientOperationalStatus(
-                new OperationalStatus(ClipboardStatusText.Copied(text), OperationalTone.Ready, false),
-                TimeSpan.FromSeconds(1.5));
-            return;
-        }
-
-        this.ShowTransientOperationalStatus(
-            new OperationalStatus("Clipboard unavailable", OperationalTone.Warning, false),
-            TimeSpan.FromSeconds(1.5));
+        this.CopyToClipboard(text, this.TranscriptView.ClearSelection);
     }
 
     /// <summary>
