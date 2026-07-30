@@ -462,6 +462,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // an empty list and the browser opens empty; afterwards they observe the running session's registry.
         context.TaskManagerProvider = () => agentRunner.Tasks;
         context.ScheduleControlProvider = () => agentRunner.ScheduleControl;
+        context.ToolSearchCoordinatorProvider = () => agentRunner.ToolSearchCoordinator;
 
         Func<TaskBrowserProvider?> taskBrowserProvider = () =>
             agentRunner.Tasks is { } tasks && agentRunner.ExecutionGate is { } gate

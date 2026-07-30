@@ -154,7 +154,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         IReadOnlyList<UserHook>? hookList = null,
         Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null,
         Func<string, string, CancellationToken, Task<(int, string)>>? sessionExecOverride = null,
-        Coda.Agent.Hooks.IHookHandler? sessionPromptHandlerOverride = null)
+        Coda.Agent.Hooks.IHookHandler? sessionPromptHandlerOverride = null,
+        ToolSearchCoordinator? toolSearchCoordinatorOverride = null)
     {
         this.credentials = credentials ?? throw new ArgumentNullException(nameof(credentials));
         this.options = options ?? throw new ArgumentNullException(nameof(options));
@@ -246,6 +247,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             var autoPercent = ToolSearchModeResolver.ResolveAutoPercentage(toolSearchEnv);
             this.toolSearchCoordinator = new ToolSearchCoordinator(toolSearchMode, autoPercent, contextWindowTokens: ContextWindow.DefaultTokens);
+        }
+
+        // Test seam: a caller-supplied coordinator wins over the env-var-derived one so unit tests
+        // can exercise deferral behaviour without mutating process-wide environment variables.
+        if (toolSearchCoordinatorOverride is not null)
+        {
+            this.toolSearchCoordinator = toolSearchCoordinatorOverride;
         }
 
         // Built last so that if any wiring above throws, no telemetry file handle is
@@ -923,6 +931,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     public const int ContextWindowTokens = ContextWindow.DefaultTokens;
 
     /// <summary>
+    /// The active tool-search coordinator, or <see langword="null"/> when tool search is not active
+    /// (standard mode or before the first turn). Exposed so <c>/context</c> can measure what the
+    /// live turn actually transmits rather than re-analyzing with an empty discovered set.
+    /// </summary>
+    public ToolSearchCoordinator? ToolSearchCoordinator => this.toolSearchCoordinator;
+
+    /// <summary>
     /// Analyze how the context window is currently used, broken down by category
     /// (system prompt, tools, messages, reserved buffer, free space). Mirrors the
     /// reference client's <c>/context</c>. Uses the provider's count-tokens endpoint
@@ -936,10 +951,16 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
 
         var systemPrompt = EffectiveSystemPrompt.Resolve(options);
 
-        var allDefs = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]).Definitions;
+        var registry = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]);
+        var allDefs = this.toolSearchCoordinator?.BuildWireDefinitions(registry) ?? registry.Definitions;
         // MCP tools are namespaced "mcp__<server>__<tool>"; everything else is built-in.
         var mcpDefs = allDefs.Where(d => d.Name.StartsWith("mcp__", StringComparison.Ordinal)).ToList();
         var builtinDefs = allDefs.Where(d => !d.Name.StartsWith("mcp__", StringComparison.Ordinal)).ToList();
+
+        // Total MCP tools in the registry (wire + deferred), used only to compute deferredCount.
+        var mcpAllCount = registry.Definitions.Count(d => d.Name.StartsWith("mcp__", StringComparison.Ordinal));
+        // Number of MCP tools withheld from the wire (for the informational deferred category).
+        var deferredCount = mcpAllCount - mcpDefs.Count;
 
         int systemTokens;
         int toolTokens;
@@ -963,7 +984,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             var mcpCount = mcpDefs.Count > 0
                 ? await client.CountTokensAsync(
                     new ChatRequest { Model = options.Model, Messages = [], Tools = mcpDefs }, cancellationToken).ConfigureAwait(false)
-                : 0;
+                : (int?)0;
             var messageCount = this.history.Count > 0
                 ? await client.CountTokensAsync(
                     new ChatRequest { Model = options.Model, Messages = this.history }, cancellationToken).ConfigureAwait(false)
@@ -1032,6 +1053,13 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         if (mcpToolTokens > 0)
         {
             categories.Add(new ContextCategory("MCP tools", mcpToolTokens));
+        }
+
+        // Informational zero-token entry when tools are loaded but withheld from the wire.
+        // Listed so users can see the servers are active without counting against UsedTokens.
+        if (deferredCount > 0)
+        {
+            categories.Add(new ContextCategory($"MCP tools (deferred, {deferredCount} tools)", 0));
         }
 
         if (messageTokens > 0)

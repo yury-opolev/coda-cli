@@ -1,6 +1,7 @@
 using Coda.Agent;
 using Coda.Agent.Scheduling;
 using Coda.Agent.Tasks;
+using Coda.Agent.ToolSearch;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
@@ -93,6 +94,14 @@ public sealed class AgentRunner : IDisposable
 
     /// <summary>The session's cooperative pause gate (null before the first turn runs).</summary>
     public AgentExecutionGate? ExecutionGate => this.session?.ExecutionGate;
+
+    /// <summary>
+    /// The live tool-search coordinator once the session exists, or null when tool search is
+    /// inactive (standard mode) or the session has not been created yet. Exposed so <c>/context</c>
+    /// can measure what the live turn actually transmits rather than re-analyzing with an empty
+    /// discovered set.
+    /// </summary>
+    public ToolSearchCoordinator? ToolSearchCoordinator => this.session?.ToolSearchCoordinator;
 
     /// <summary>For tests: whether <see cref="Dispose"/> has already run.</summary>
     internal bool IsDisposed

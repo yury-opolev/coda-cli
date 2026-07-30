@@ -159,4 +159,32 @@ public sealed class ContextUsageTests
         var barGlyphs = categoryLine.Text.Count(ch => ch == '\u2591');
         Assert.InRange(barGlyphs, 1, 11);
     }
+
+    [Theory]
+    [InlineData("MCP tools (deferred, 42 tools)")]
+    [InlineData("MCP tools (deferred, 0 tools)")]
+    [InlineData("MCP tools (deferred, 300 tools)")]
+    public void ContextCategoryStyle_deferred_name_returns_distinct_glyph_and_dim_role(string name)
+    {
+        var (glyph, role) = TranscriptBlockFormatter.ContextCategoryStyle(name);
+
+        // Distinct glyph: ○ (U+25CB) — visually present but hollow, signalling "no cost".
+        Assert.Equal('\u25cb', glyph);
+        // Dim role (reuses ContextFreeSpace) so the line reads as "present but costing nothing".
+        Assert.Equal(TranscriptRole.ContextFreeSpace, role);
+        // Must not fall back to the active-MCP glyph (●) or the generic fallback (◆).
+        Assert.NotEqual('\u25cf', glyph);
+        Assert.NotEqual('\u25c6', glyph);
+    }
+
+    [Fact]
+    public void ContextCategoryStyle_deferred_name_does_not_match_exact_mcp_tools_case()
+    {
+        // "MCP tools" (exact) keeps its own dedicated glyph and role.
+        var (mcpGlyph, mcpRole) = TranscriptBlockFormatter.ContextCategoryStyle("MCP tools");
+        var (deferredGlyph, deferredRole) = TranscriptBlockFormatter.ContextCategoryStyle("MCP tools (deferred, 5 tools)");
+
+        Assert.NotEqual(mcpGlyph, deferredGlyph);
+        Assert.NotEqual(mcpRole, deferredRole);
+    }
 }
