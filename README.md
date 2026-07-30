@@ -192,7 +192,7 @@ it, so `Enter` there accepts the suggestion and leaves the prompt for you to fin
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
 the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a
 selection exists, `Ctrl+C` **or a right-click** copies it and clears the selection; a **right-click**
-with no selection pastes at the clicked caret; `Ctrl+V` remains a direct paste; and a **middle-click**
+with no selection pastes at the clicked caret; `Ctrl+V` pastes at the caret, attaching a copied **image** when the clipboard holds one and falling back to text otherwise; and a **middle-click**
 opens the editor context menu. The **session id** in the header, and the body of the modal browsers
 (`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
 and copied the same way. **`Shift`-drag** hands native selection and copy to the terminal where
