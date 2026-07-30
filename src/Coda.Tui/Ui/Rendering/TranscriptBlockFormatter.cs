@@ -898,11 +898,14 @@ public static class TranscriptBlockFormatter
             width - TranscriptGlyphs.ChildCells,
             TranscriptRole.DiffContext);
 
-        // The summary is always the last tree-connected child of the header — body rows that follow
-        // carry no gutter and are not part of the gutter tree.
+        // The summary is always the last tree-connected child of the header. Only its FIRST row carries
+        // the terminating connector — a wrapped summary would otherwise repeat "└ " on every row.
         for (var i = summaryStart; i < lines.Count; i++)
         {
-            lines[i] = lines[i] with { Gutter = TranscriptGutterKind.LastChild };
+            lines[i] = lines[i] with
+            {
+                Gutter = i == summaryStart ? TranscriptGutterKind.LastChild : TranscriptGutterKind.ChildContinuation,
+            };
         }
 
         if (file.Lines.IsEmpty)
@@ -913,12 +916,20 @@ public static class TranscriptBlockFormatter
         // ── Body rows ─────────────────────────────────────────────────────
         // Compute the right-aligned line-number gutter width: the minimum number of digits needed
         // to display the largest line number in this file, clamped to a sensible floor of 3.
-        var gutterWidth = ComputeDiffGutterWidth(file.Lines);
 
         // The prefix for every body row: "{lineNum} {marker} " occupies gutterWidth + 3 cells.
         // PrefixCells covers that range so the line-number gutter is painted in DiffContext (dim)
         // while the remaining cells are painted in the row's own role (Added / Removed / Context).
-        var prefixCells = gutterWidth + 3; // num + SP + marker + SP
+        // A viewport too narrow to hold the gutter and still show useful content drops the gutter
+        // entirely rather than overflowing: an over-wide row would make the terminal wrap and strand
+        // characters on the following line.
+        var desiredGutter = ComputeDiffGutterWidth(file.Lines);
+        var gutterFits = width >= desiredGutter + MarkerCells + MinimumDiffContentWidth;
+        var gutterWidth = gutterFits ? desiredGutter : 0;
+
+        // The marker column is never dropped — it is what distinguishes an addition from a removal —
+        // so it is reserved even when the line numbers are not.
+        var prefixCells = gutterWidth + MarkerCells;
         var contentWidth = Math.Max(1, width - prefixCells);
 
         foreach (var diffLine in file.Lines)
@@ -932,7 +943,8 @@ public static class TranscriptBlockFormatter
                 _ => null,                                  // SectionHeading / NoNewline: no number
             };
 
-            var numStr = lineNum.HasValue
+            // PadLeft never truncates, so a zero-width gutter must be short-circuited explicitly.
+            var numStr = lineNum.HasValue && gutterWidth > 0
                 ? lineNum.Value.ToString(CultureInfo.InvariantCulture).PadLeft(gutterWidth)
                 : new string(' ', gutterWidth);
 
@@ -980,9 +992,18 @@ public static class TranscriptBlockFormatter
         }
     }
 
+    /// <summary>The narrowest line-number gutter, so a one-line file does not produce a single-digit column.</summary>
+    private const int MinimumDiffGutterWidth = 3;
+
+    /// <summary>Content cells a body row must retain for the line-number gutter to be worth showing.</summary>
+    private const int MinimumDiffContentWidth = 4;
+
+    /// <summary>Cells the marker column costs: a leading space, the +/-/space marker, and a trailing space.</summary>
+    private const int MarkerCells = 3;
+
     /// <summary>
     /// Returns the minimum column width that can display every line number in <paramref name="lines"/>,
-    /// clamped to a sensible floor of 3 so a one-line file does not produce a single-digit gutter.
+    /// clamped to <see cref="MinimumDiffGutterWidth"/>.
     /// </summary>
     private static int ComputeDiffGutterWidth(ImmutableArray<DiffLine> lines)
     {
@@ -1000,7 +1021,7 @@ public static class TranscriptBlockFormatter
             }
         }
 
-        return Math.Max(3, maxLine.ToString(CultureInfo.InvariantCulture).Length);
+        return Math.Max(MinimumDiffGutterWidth, maxLine.ToString(CultureInfo.InvariantCulture).Length);
     }
 
     private static void AppendTool(

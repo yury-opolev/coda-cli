@@ -287,4 +287,70 @@ public sealed class DiffFormatterTests
         Assert.NotEmpty(lines);
         Assert.All(lines, l => Assert.Equal(TranscriptRole.Diff, l.Role));
     }
-}
+
+    // ── Regressions found in review ───────────────────────────────────────────
+
+    [Fact]
+    public void A_wrapped_summary_row_does_not_repeat_the_connector()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/a.txt b/a.txt",
+            "--- a/a.txt",
+            "+++ b/a.txt",
+            "@@ -1,1 +1,1 @@",
+            "-old",
+            "+new");
+
+        var lines = TranscriptBlockFormatter.Format(new DiffTranscriptBlock(Guid.NewGuid(), patch), 20);
+
+        // Only the first row of a wrapped summary carries the terminating connector.
+        var connectorRows = lines.Count(l => l.Text.Contains('\u2514'));
+        Assert.Equal(1, connectorRows);
+    }
+
+    [Theory]
+    [InlineData(6)]
+    [InlineData(8)]
+    [InlineData(10)]
+    [InlineData(12)]
+    public void Body_rows_fit_even_when_the_viewport_is_narrower_than_the_gutter(int width)
+    {
+        var patch = string.Join('\n',
+            "diff --git a/a.txt b/a.txt",
+            "--- a/a.txt",
+            "+++ b/a.txt",
+            "@@ -10000,2 +10000,2 @@",
+            " context line here",
+            "-removed line here",
+            "+added line here");
+
+        var lines = TranscriptBlockFormatter.Format(new DiffTranscriptBlock(Guid.NewGuid(), patch), width);
+
+        foreach (var line in lines)
+        {
+            Assert.True(
+                TerminalCellText.Width(line.Text) <= width,
+                $"Row \"{line.Text}\" exceeds the {width}-cell viewport.");
+        }
+    }
+
+    [Fact]
+    public void A_changed_row_bands_the_full_width_including_its_gutter()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/a.txt b/a.txt",
+            "--- a/a.txt",
+            "+++ b/a.txt",
+            "@@ -1,1 +1,1 @@",
+            "-old",
+            "+new");
+
+        var lines = TranscriptBlockFormatter.Format(new DiffTranscriptBlock(Guid.NewGuid(), patch), 60);
+
+        // FillWidth carries the added/removed band; the gutter recolours the foreground only, so the
+        // band must still start at column 0 rather than after the line number.
+        var addedRow = Assert.Single(lines, l => l.Role == TranscriptRole.DiffAdded);
+        Assert.True(addedRow.FillWidth);
+        Assert.True(addedRow.PrefixCells > 0);
+        Assert.Equal(TranscriptRole.DiffContext, addedRow.PrefixRole);
+    }}

@@ -407,4 +407,122 @@ public sealed class UnifiedDiffParserTests
         Assert.Equal(1, file.Added);
         Assert.Equal(1, file.Removed);
     }
-}
+
+    // ── Regressions found in review ───────────────────────────────────────────
+
+    [Theory]
+    [InlineData("-", "--- get user by id")]   // an SQL/Lua/Haskell comment on a removed line
+    [InlineData("+", "+++ i;")]               // a C++ increment on an added line
+    public void A_body_line_whose_content_starts_with_a_marker_does_not_end_the_hunk(string marker, string bodyLine)
+    {
+        // "--- x" and "+++ x" inside a hunk are body lines, not file headers. Treating them as headers
+        // dropped every remaining line of the hunk and clobbered the file's path.
+        var patch = string.Join('\n',
+            "diff --git a/q.sql b/q.sql",
+            "--- a/q.sql",
+            "+++ b/q.sql",
+            "@@ -1,5 +1,5 @@",
+            " SELECT 1;",
+            bodyLine,
+            " SELECT 2;",
+            " SELECT 3;",
+            " SELECT 4;");
+
+        var file = Assert.Single(UnifiedDiffParser.Parse(patch));
+
+        Assert.Equal("q.sql", file.Path);
+        Assert.Equal(5, file.Lines.Length);
+        Assert.Equal(marker == "+" ? 1 : 0, file.Added);
+        Assert.Equal(marker == "-" ? 1 : 0, file.Removed);
+        Assert.Equal("SELECT 4;", file.Lines[^1].Text);
+    }
+
+    [Fact]
+    public void A_trailing_newline_does_not_invent_a_context_line()
+    {
+        // Real `git diff` output always ends with a newline; yielding the final empty segment made it a
+        // context line one past the end of the file.
+        var patch = "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,1 +1,1 @@\n-old\n+new\n";
+
+        var file = Assert.Single(UnifiedDiffParser.Parse(patch));
+
+        Assert.Equal(2, file.Lines.Length);
+        Assert.DoesNotContain(file.Lines, l => l.Kind == DiffLineKind.Context);
+    }
+
+    [Fact]
+    public void A_binary_stanza_still_reports_its_file()
+    {
+        // A binary stanza carries no ---/+++ headers, so without a diff --git fallback the file
+        // vanished entirely from a mixed diff.
+        var patch = string.Join('\n',
+            "diff --git a/img.png b/img.png",
+            "index 1234567..89abcde 100644",
+            "Binary files a/img.png and b/img.png differ");
+
+        var file = Assert.Single(UnifiedDiffParser.Parse(patch));
+
+        Assert.Equal("img.png", file.Path);
+        Assert.Contains(file.Lines, l => l.Text.Contains("Binary", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_mode_only_stanza_still_reports_its_file()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/run.sh b/run.sh",
+            "old mode 100644",
+            "new mode 100755");
+
+        var file = Assert.Single(UnifiedDiffParser.Parse(patch));
+
+        Assert.Equal("run.sh", file.Path);
+        Assert.Equal(2, file.Lines.Length);
+    }
+
+    [Fact]
+    public void A_combined_merge_diff_is_surfaced_rather_than_rendered_empty()
+    {
+        // A combined diff has one marker column per parent, so the single-marker grammar cannot number
+        // it. Showing the raw hunk beats showing a file with no rows at all.
+        var patch = string.Join('\n',
+            "diff --cc f.txt",
+            "index 1111111,2222222..0000000",
+            "--- a/f.txt",
+            "+++ b/f.txt",
+            "@@@ -1,1 -1,1 +1,3 @@@",
+            "++<<<<<<< HEAD",
+            " +ours",
+            "++=======");
+
+        var file = Assert.Single(UnifiedDiffParser.Parse(patch));
+
+        Assert.NotEmpty(file.Lines);
+        Assert.Contains(file.Lines, l => l.Text.Contains("<<<<<<<", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void Line_numbers_stay_correct_across_a_second_hunk()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/a.txt b/a.txt",
+            "--- a/a.txt",
+            "+++ b/a.txt",
+            "@@ -1,2 +1,2 @@",
+            " one",
+            "-two",
+            "+TWO",
+            "@@ -50,2 +50,2 @@",
+            " fifty",
+            "-fiftyone",
+            "+FIFTYONE");
+
+        var file = Assert.Single(UnifiedDiffParser.Parse(patch));
+
+        var second = file.Lines[3];
+        Assert.Equal(DiffLineKind.Context, second.Kind);
+        Assert.Equal(50, second.OldLine);
+        Assert.Equal(50, second.NewLine);
+        Assert.Equal(51, file.Lines[4].OldLine);
+        Assert.Equal(51, file.Lines[5].NewLine);
+    }}

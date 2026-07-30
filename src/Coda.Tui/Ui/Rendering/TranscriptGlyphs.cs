@@ -10,6 +10,7 @@ public enum TranscriptGutterKind
     Continuation,       // wrapped/continuation row under a marker row
     Child,              // dependent child row, continuing connector
     LastChild,          // final dependent child row, terminating connector
+    ChildContinuation,  // wrapped continuation of a child row: child indent, no connector
 }
 
 /// <summary>The marker and connector glyphs that shape the transcript, with an ASCII fallback for
@@ -46,6 +47,7 @@ public sealed record TranscriptGlyphs(
         TranscriptGutterKind.Continuation => "   ",
         TranscriptGutterKind.Child => "   " + this.ChildConnector + " ",
         TranscriptGutterKind.LastChild => "   " + this.LastChildConnector + " ",
+        TranscriptGutterKind.ChildContinuation => "     ",
         _ => string.Empty,
     };
 }

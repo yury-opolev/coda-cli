@@ -119,8 +119,11 @@ public static class UnifiedDiffParser
         int removed = 0;
         bool inFile = false;
         bool inHunk = false;
+        bool combined = false;
         int oldLine = 0;
         int newLine = 0;
+        string? gitOldPath = null;
+        string? gitNewPath = null;
 
         // Flush the accumulated file state into result and reset for the next file.
         void FlushFile()
@@ -131,10 +134,19 @@ public static class UnifiedDiffParser
             }
 
             // Determine the resolved path: new side for non-deletions, old side for deletions.
-            // Strip the a/ or b/ git prefix if present.
+            // Strip the a/ or b/ git prefix if present. A binary or mode-only stanza carries no
+            // ---/+++ headers at all, so fall back to the paths on the "diff --git" line — without
+            // that fallback such a file vanished silently from a mixed diff.
             var resolvedPath = kind == DiffChangeKind.Deletion
                 ? StripGitPrefix(oldPath ?? string.Empty, "a/")
                 : StripGitPrefix(newPath ?? string.Empty, "b/");
+
+            if (string.IsNullOrEmpty(resolvedPath))
+            {
+                resolvedPath = kind == DiffChangeKind.Deletion
+                    ? StripGitPrefix(gitOldPath ?? string.Empty, "a/")
+                    : StripGitPrefix(gitNewPath ?? string.Empty, "b/");
+            }
 
             if (!string.IsNullOrEmpty(resolvedPath) || bodyLines.Count > 0)
             {
@@ -143,8 +155,11 @@ public static class UnifiedDiffParser
 
             oldPath = null;
             newPath = null;
+            gitOldPath = null;
+            gitNewPath = null;
             kind = DiffChangeKind.Modification;
             isRename = false;
+            combined = false;
             bodyLines.Clear();
             added = 0;
             removed = 0;
@@ -157,12 +172,58 @@ public static class UnifiedDiffParser
         foreach (var raw in SplitLines(patch))
         {
             // ----------------------------------------------------------------
+            // Hunk bodies are dispatched purely on the marker character, BEFORE any header pattern is
+            // considered. Inside a hunk, "--- x" is a removed line whose content is "-- x" (an SQL, Lua or
+            // Haskell comment) and "+++ x" is an added one — treating those as file headers dropped the
+            // rest of the hunk and clobbered the file's path.
+            // ----------------------------------------------------------------
+            if (inHunk && !raw.StartsWith("@@", StringComparison.Ordinal))
+            {
+                if (raw.StartsWith("\\ ", StringComparison.Ordinal))
+                {
+                    // "\ No newline at end of file" — a meta annotation, no line numbers.
+                    bodyLines.Add(new DiffLine(DiffLineKind.NoNewline, null, null, raw[2..]));
+                    continue;
+                }
+
+                if (raw.Length == 0 || raw[0] == ' ')
+                {
+                    var text = raw.Length > 0 ? raw[1..] : string.Empty;
+                    bodyLines.Add(new DiffLine(DiffLineKind.Context, oldLine, newLine, text));
+                    oldLine++;
+                    newLine++;
+                    continue;
+                }
+
+                if (raw[0] == '-')
+                {
+                    bodyLines.Add(new DiffLine(DiffLineKind.Removed, oldLine, null, raw[1..]));
+                    oldLine++;
+                    removed++;
+                    continue;
+                }
+
+                if (raw[0] == '+')
+                {
+                    bodyLines.Add(new DiffLine(DiffLineKind.Added, null, newLine, raw[1..]));
+                    newLine++;
+                    added++;
+                    continue;
+                }
+
+                // Anything else ends the hunk (e.g. the next "diff --git"); fall through to the
+                // header handling below so the new file section is opened correctly.
+                inHunk = false;
+            }
+
+            // ----------------------------------------------------------------
             // File boundary — start a new file section.
             // ----------------------------------------------------------------
             if (raw.StartsWith("diff --git ", StringComparison.Ordinal))
             {
                 FlushFile();
                 inFile = true;
+                (gitOldPath, gitNewPath) = ParseGitHeaderPaths(raw);
                 continue;
             }
 
@@ -170,13 +231,25 @@ public static class UnifiedDiffParser
             // Lines consumed without contributing body content.
             // ----------------------------------------------------------------
             if (raw.StartsWith("index ", StringComparison.Ordinal) ||
-                raw.StartsWith("old mode ", StringComparison.Ordinal) ||
-                raw.StartsWith("new mode ", StringComparison.Ordinal) ||
                 raw.StartsWith("new file mode ", StringComparison.Ordinal) ||
                 raw.StartsWith("deleted file mode ", StringComparison.Ordinal) ||
-                raw.StartsWith("similarity index ", StringComparison.Ordinal) ||
-                raw.StartsWith("Binary files ", StringComparison.Ordinal))
+                raw.StartsWith("similarity index ", StringComparison.Ordinal))
             {
+                continue;
+            }
+
+            // A stanza with no hunks still describes a real change; surface it as a single body row so
+            // the file is not silently missing from the render.
+            if (raw.StartsWith("Binary files ", StringComparison.Ordinal))
+            {
+                bodyLines.Add(new DiffLine(DiffLineKind.SectionHeading, null, null, "Binary file — content not shown"));
+                continue;
+            }
+
+            if (raw.StartsWith("old mode ", StringComparison.Ordinal) ||
+                raw.StartsWith("new mode ", StringComparison.Ordinal))
+            {
+                bodyLines.Add(new DiffLine(DiffLineKind.SectionHeading, null, null, raw.Trim()));
                 continue;
             }
 
@@ -237,6 +310,23 @@ public static class UnifiedDiffParser
             // ----------------------------------------------------------------
             // Hunk header — reset line-number counters.
             // ----------------------------------------------------------------
+            if (raw.StartsWith("@@@", StringComparison.Ordinal))
+            {
+                // A combined (merge) diff carries one marker column per parent, so the single-marker
+                // body grammar below does not apply. Rendering it as structured rows would mis-number
+                // every line; surface the raw hunk instead so a conflict is never shown as an empty file.
+                combined = true;
+                inHunk = false;
+                bodyLines.Add(new DiffLine(DiffLineKind.SectionHeading, null, null, raw));
+                continue;
+            }
+
+            if (combined)
+            {
+                bodyLines.Add(new DiffLine(DiffLineKind.SectionHeading, null, null, raw));
+                continue;
+            }
+
             if (raw.StartsWith("@@ ", StringComparison.Ordinal))
             {
                 var match = HunkHeaderRegex.Match(raw);
@@ -308,13 +398,56 @@ public static class UnifiedDiffParser
     }
 
     /// <summary>
+    /// Extracts the old and new paths from a <c>diff --git a/x b/y</c> line, or (null, null) when the
+    /// form is not recognised. Used only as a fallback for stanzas that carry no <c>---</c>/<c>+++</c>
+    /// headers at all — binary files and mode-only changes — so those still resolve a display path.
+    /// </summary>
+    /// <remarks>
+    /// Paths containing spaces are quoted by git, which is what makes the unquoted case ambiguous: the
+    /// split is anchored on the <c>" b/"</c> separator, and an unquoted path that itself contains that
+    /// sequence cannot be disambiguated without the index. Such a path is left unresolved rather than
+    /// guessed at, because a wrong path is worse than none.
+    /// </remarks>
+    private static (string? Old, string? New) ParseGitHeaderPaths(string line)
+    {
+        var rest = line["diff --git ".Length..];
+        if (rest.StartsWith('"'))
+        {
+            // Quoted form: "a/first path" "b/second path".
+            var closing = rest.IndexOf("\" \"", StringComparison.Ordinal);
+            if (closing > 0 && rest.EndsWith('"'))
+            {
+                return (rest[1..closing], rest[(closing + 3)..^1]);
+            }
+
+            return (null, null);
+        }
+
+        var separator = rest.IndexOf(" b/", StringComparison.Ordinal);
+        if (separator <= 0 || rest.IndexOf(" b/", separator + 1, StringComparison.Ordinal) >= 0)
+        {
+            return (null, null);
+        }
+
+        return (rest[..separator], rest[(separator + 1)..]);
+    }
+
+    /// <summary>
     /// Strips the leading <paramref name="prefix"/> from <paramref name="path"/> when present,
     /// leaving the suffix unchanged. Used to remove the <c>a/</c> and <c>b/</c> git diff prefixes.
     /// </summary>
     private static string StripGitPrefix(string path, string prefix) =>
         path.StartsWith(prefix, StringComparison.Ordinal) ? path[prefix.Length..] : path;
 
-    /// <summary>Splits <paramref name="text"/> on <c>\n</c> and <c>\r\n</c> boundaries.</summary>
+    /// <summary>
+    /// Splits <paramref name="text"/> on <c>\n</c> and <c>\r\n</c> boundaries, without yielding a final
+    /// empty segment for text that ends in a terminator.
+    /// </summary>
+    /// <remarks>
+    /// Real <c>git diff</c> output always ends with a newline. Yielding the trailing empty segment made
+    /// it a context line inside the last hunk, inventing a blank row with a line number one past the end
+    /// of the file — and occasionally widening the whole gutter by a digit.
+    /// </remarks>
     private static IEnumerable<string> SplitLines(string text)
     {
         var start = 0;
@@ -328,6 +461,9 @@ public static class UnifiedDiffParser
             }
         }
 
-        yield return text[start..];
+        if (start < text.Length)
+        {
+            yield return text[start..];
+        }
     }
 }

@@ -542,13 +542,21 @@ internal sealed class VirtualizedTranscriptView : View
                     row.Text, range.Value.StartCell, range.Value.EndCellExclusive);
             }
 
-            // Prefix boundary (callout bar color covers [0, prefixEnd)).
+            // Prefix boundary (callout bar / diff line-number gutter covers [0, prefixEnd)).
             var prefixEnd = 0;
             var prefixAttribute = default(TgAttribute);
             if (hasPrefix)
             {
                 (_, prefixEnd) = TerminalCellText.SnapRangeToGraphemes(row.Text, 0, row.PrefixCells);
-                prefixAttribute = this.AttributeFor(row.PrefixRole);
+
+                // The prefix changes the FOREGROUND only. Taking its background too would punch a hole in
+                // a FillWidth row's band — a diff's added/removed colour would start after the gutter
+                // instead of at column 0.
+                prefixAttribute = row.FillWidth
+                    ? new TgAttribute(
+                        this.AttributeFor(row.PrefixRole).Foreground,
+                        rowAttribute.Background)
+                    : this.AttributeFor(row.PrefixRole);
             }
 
             // Collect all boundary points and sort them; duplicates collapse to zero-width segments (skipped below).
