@@ -583,6 +583,15 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return false;
         }
 
+        // Ctrl+L repaints the screen. Handled at the shell rather than through the composer's action map
+        // so it works whatever holds focus — a corrupted screen is exactly the state in which the user may
+        // have just clicked into the transcript.
+        if (key == Key.L.WithCtrl)
+        {
+            this.ForceFullRepaint();
+            return true;
+        }
+
         if (key == Key.Esc)
         {
             if (this.Completion.Visible)
@@ -1892,8 +1901,37 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.ResetChordOverride();
         }
 
+        // Ctrl+L is the terminal's conventional "repaint" gesture and the recovery route when something
+        // outside Terminal.Gui has written to the screen — a tool that printed directly, or a resize the
+        // host mishandled — leaving characters the frame differ believes are already correct and therefore
+        // never repaints. Handled here rather than forwarded, because only the shell owns the application.
+        if (action == UiAction.ForceRedraw)
+        {
+            this.ForceFullRepaint();
+            return;
+        }
+
         this.ActionRequested?.Invoke(this, action);
     }
+
+    /// <summary>
+    /// Discards everything the terminal is believed to be showing and repaints from scratch, so stale
+    /// cells left by a writer outside Terminal.Gui cannot survive.
+    /// </summary>
+    private void ForceFullRepaint()
+    {
+        // ClearContents() blanks the grid CLEAN in inline mode, which would teach the frame differ that
+        // cells are blank the terminal was never told to blank — cementing the divergence this is meant
+        // to cure. Setting the flag and marking the tree dirty is enough on both paths: the application
+        // physically erases the screen on the next iteration, and every view redraws into a grid the
+        // differ has no usable baseline for.
+        this.app.ClearScreenNextIteration = true;
+        this.SetNeedsDraw();
+        this.ForceRedrawCount++;
+    }
+
+    /// <summary>Number of full repaints forced by <c>Ctrl+L</c>. Exposed for tests.</summary>
+    internal int ForceRedrawCount { get; private set; }
 
     private void OnCompletionChanged(object? sender, EventArgs e) => this.SyncCompletion();
 

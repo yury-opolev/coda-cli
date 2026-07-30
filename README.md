@@ -175,7 +175,8 @@ cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step th
 three times within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
 it and `Esc` keeps it going ·
 `Ctrl+C` copies the current transcript selection and, with nothing selected,
-exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `F2`
+exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `Ctrl+L` repaints the screen (use it if a tool that wrote to the terminal directly has left stray
+characters behind) · `F2`
 switches between full-screen and inline · `Ctrl+B` sends the selected (or latest) running **foreground
 shell** to the background — and, inside the `/tasks` browser, releases an output attachment — without ever
 opening the browser · `Ctrl+End` jumps to the newest transcript output (the scrollbar shows position).
