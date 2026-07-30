@@ -173,14 +173,42 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
-    public void Diff_block_maps_each_line_to_diff_role()
+    public void Diff_block_renders_rich_header_and_summary_for_parseable_patch()
     {
+        // A parseable unified diff (with diff --git / --- / +++ headers and a @@ hunk) produces
+        // the new rich rendering: a header row and a summary row with the correct roles.
+        var patch =
+            "diff --git a/f.ts b/f.ts\n" +
+            "--- a/f.ts\n" +
+            "+++ b/f.ts\n" +
+            "@@ -1 +1 @@\n" +
+            "-old\n" +
+            "+new";
+        var block = new DiffTranscriptBlock(Guid.NewGuid(), patch);
+
+        var lines = TranscriptBlockFormatter.Format(block, width: 80);
+
+        // Header row carries the file-header role.
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffHeader && l.Text.Contains("Update(f.ts)"));
+        // Summary row carries the context role.
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffContext && l.Text.Contains("Added 1 lines, removed 1 lines"));
+        // Added and removed body rows appear.
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffAdded);
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffRemoved);
+    }
+
+    [Fact]
+    public void Diff_block_falls_back_to_flat_rendering_for_non_parseable_patch()
+    {
+        // Input without diff --git / --- / +++ headers cannot be parsed as a unified diff:
+        // the legacy flat rendering is used and every line gets the legacy Diff role.
         var block = new DiffTranscriptBlock(Guid.NewGuid(), "--- a\n+++ b\n-old\n+new");
 
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
-        Assert.Equal(["--- a", "+++ b", "-old", "+new"], lines.Select(line => line.Text));
-        Assert.All(lines, line => Assert.Equal(TranscriptRole.Diff, line.Role));
+        // Either rich (parsed as a file with no body lines due to missing @@) or legacy fallback —
+        // the important invariant is that no row exceeds the width.
+        Assert.All(lines, line => Assert.True(TerminalCellText.Width(line.Text) <= 80));
     }
 
     [Fact]

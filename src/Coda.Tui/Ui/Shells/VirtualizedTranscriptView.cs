@@ -1102,14 +1102,23 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.ToolSuccess => this.theme.ToolSuccess,
             TranscriptRole.ToolPartialFailure => this.theme.ToolPartialFailure,
             TranscriptRole.PermissionApproved => this.theme.PermissionApproved,
+            TranscriptRole.DiffHeader => this.theme.Diff,
+            TranscriptRole.DiffAdded => this.theme.DiffAdded,
+            TranscriptRole.DiffRemoved => this.theme.DiffRemoved,
+            TranscriptRole.DiffContext => this.theme.DiffContext,
             _ => this.theme.TranscriptAssistant,
         };
 
-        // User and pending-user message rows sit on a subtly different full-width background block; every
-        // other role keeps the global shell background so non-user rows are unchanged.
-        var background = role is TranscriptRole.User or TranscriptRole.PendingUser
-            ? this.theme.TranscriptUserBackground
-            : this.theme.Background;
+        // User and pending-user rows use a subtly different full-width background; added/removed diff rows
+        // use their own theme-defined background so the block reads in the correct hue; everything else
+        // keeps the global shell background so it never intrudes on the transcript surface.
+        var background = role switch
+        {
+            TranscriptRole.User or TranscriptRole.PendingUser => this.theme.TranscriptUserBackground,
+            TranscriptRole.DiffAdded => this.theme.DiffAddedBackground,
+            TranscriptRole.DiffRemoved => this.theme.DiffRemovedBackground,
+            _ => this.theme.Background,
+        };
         return new TgAttribute(
             TuiTheme.Resolve(foreground, useTrueColor),
             TuiTheme.Resolve(background, useTrueColor));

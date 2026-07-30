@@ -1,4 +1,5 @@
 using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Globalization;
 using System.Text;
 using Coda.Agent;
@@ -71,6 +72,18 @@ public enum TranscriptRole
 
     /// <summary>A tool call whose permission was approved and executed.</summary>
     PermissionApproved,
+
+    /// <summary>The file-level header row of a rich diff block, e.g. <c>Update(path/to/file.ts)</c>.</summary>
+    DiffHeader,
+
+    /// <summary>An added line in a rich diff (full-width green background, <c>+</c> marker).</summary>
+    DiffAdded,
+
+    /// <summary>A removed line in a rich diff (full-width red background, <c>-</c> marker).</summary>
+    DiffRemoved,
+
+    /// <summary>A context line, line-number gutter, or summary row in a rich diff (dim foreground).</summary>
+    DiffContext,
 }
 
 /// <summary>A single rendered transcript line: display text plus the role that colors it.</summary>
@@ -808,13 +821,186 @@ public static class TranscriptBlockFormatter
 
     private static void AppendDiff(List<TranscriptRenderLine> lines, string patch, int width)
     {
-        foreach (var line in SplitLines(patch))
+        var files = UnifiedDiffParser.Parse(patch);
+
+        if (files.Count == 0)
         {
-            foreach (var wrapped in WrapPreformatted(line, width))
+            // No recognisable unified diff structure — fall back to the legacy flat rendering so
+            // content like raw "-old\n+new" (no diff --git headers) still reaches the transcript.
+            foreach (var line in SplitLines(patch))
             {
-                lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.Diff));
+                foreach (var wrapped in WrapPreformatted(line, width))
+                {
+                    lines.Add(new TranscriptRenderLine(wrapped, TranscriptRole.Diff));
+                }
+            }
+
+            return;
+        }
+
+        foreach (var file in files)
+        {
+            AppendDiffFile(lines, file, width);
+        }
+    }
+
+    /// <summary>
+    /// Renders one <see cref="DiffFile"/> from the parsed unified diff model onto attributed,
+    /// width-wrapped <see cref="TranscriptRenderLine"/>s:
+    /// <list type="bullet">
+    /// <item><description>A <em>file header</em> row (<c>Update(path)</c>) with an
+    /// <see cref="TranscriptGutterKind.AgentComplete"/> gutter so it aligns with other agent output.</description></item>
+    /// <item><description>A <em>summary</em> row (<c>Added N lines, removed M lines</c>) with a
+    /// <see cref="TranscriptGutterKind.LastChild"/> gutter (the <c>└</c> connector).</description></item>
+    /// <item><description>Body rows for every <see cref="DiffLine"/>, each carrying a right-aligned
+    /// line-number gutter (dim via <see cref="TranscriptRenderLine.PrefixCells"/> /
+    /// <see cref="TranscriptRenderLine.PrefixRole"/>), a one-character marker (<c>+</c> / <c>-</c> /
+    /// space), and the content text; added and removed rows additionally set
+    /// <see cref="TranscriptRenderLine.FillWidth"/> so the full viewport width is painted in the
+    /// diff background colour.</description></item>
+    /// </list>
+    /// </summary>
+    private static void AppendDiffFile(List<TranscriptRenderLine> lines, DiffFile file, int width)
+    {
+        // ── File header row ────────────────────────────────────────────────
+        // "Update(path)", "Create(path)", or "Delete(path)" depending on the change kind.
+        var kindLabel = file.Kind switch
+        {
+            DiffChangeKind.Addition => "Create",
+            DiffChangeKind.Deletion => "Delete",
+            DiffChangeKind.Rename => "Rename",
+            _ => "Update",
+        };
+
+        var headerStart = lines.Count;
+        // Wrap at (width − MarkerCells) so that after ApplyGutters prepends " ● " the row still fits.
+        AppendWrapped(
+            lines,
+            $"{kindLabel}({file.Path})",
+            width - TranscriptGlyphs.MarkerCells,
+            TranscriptRole.DiffHeader);
+
+        // Tag header rows: first = AgentComplete, wraps = Continuation.
+        for (var i = headerStart; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with
+            {
+                Gutter = i == headerStart ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.Continuation,
+            };
+        }
+
+        // ── Summary row ────────────────────────────────────────────────────
+        var summaryStart = lines.Count;
+        // Wrap at (width − ChildCells) so that after ApplyGutters prepends "   └ " the row still fits.
+        AppendWrapped(
+            lines,
+            $"Added {file.Added} lines, removed {file.Removed} lines",
+            width - TranscriptGlyphs.ChildCells,
+            TranscriptRole.DiffContext);
+
+        // The summary is always the last tree-connected child of the header — body rows that follow
+        // carry no gutter and are not part of the gutter tree.
+        for (var i = summaryStart; i < lines.Count; i++)
+        {
+            lines[i] = lines[i] with { Gutter = TranscriptGutterKind.LastChild };
+        }
+
+        if (file.Lines.IsEmpty)
+        {
+            return;
+        }
+
+        // ── Body rows ─────────────────────────────────────────────────────
+        // Compute the right-aligned line-number gutter width: the minimum number of digits needed
+        // to display the largest line number in this file, clamped to a sensible floor of 3.
+        var gutterWidth = ComputeDiffGutterWidth(file.Lines);
+
+        // The prefix for every body row: "{lineNum} {marker} " occupies gutterWidth + 3 cells.
+        // PrefixCells covers that range so the line-number gutter is painted in DiffContext (dim)
+        // while the remaining cells are painted in the row's own role (Added / Removed / Context).
+        var prefixCells = gutterWidth + 3; // num + SP + marker + SP
+        var contentWidth = Math.Max(1, width - prefixCells);
+
+        foreach (var diffLine in file.Lines)
+        {
+            // Derive the display line number (right-aligned) and marker character.
+            var lineNum = diffLine.Kind switch
+            {
+                DiffLineKind.Added => diffLine.NewLine,
+                DiffLineKind.Removed => diffLine.OldLine,
+                DiffLineKind.Context => diffLine.NewLine,  // spec: "NEW-side line number"
+                _ => null,                                  // SectionHeading / NoNewline: no number
+            };
+
+            var numStr = lineNum.HasValue
+                ? lineNum.Value.ToString(CultureInfo.InvariantCulture).PadLeft(gutterWidth)
+                : new string(' ', gutterWidth);
+
+            var marker = diffLine.Kind switch
+            {
+                DiffLineKind.Added => '+',
+                DiffLineKind.Removed => '-',
+                DiffLineKind.NoNewline => '\\',
+                _ => ' ',
+            };
+
+            var (role, fillWidth) = diffLine.Kind switch
+            {
+                DiffLineKind.Added => (TranscriptRole.DiffAdded, true),
+                DiffLineKind.Removed => (TranscriptRole.DiffRemoved, true),
+                _ => (TranscriptRole.DiffContext, false),
+            };
+
+            // Hard-wrap the content portion at contentWidth so no body row exceeds the viewport.
+            var contentSegments = WrapPreformatted(diffLine.Text, contentWidth).ToList();
+            var firstContent = contentSegments.Count > 0 ? contentSegments[0] : string.Empty;
+
+            // First segment carries the line-number gutter prefix.
+            lines.Add(new TranscriptRenderLine($"{numStr} {marker} {firstContent}", role)
+            {
+                FillWidth = fillWidth,
+                PrefixCells = Math.Min(prefixCells, TerminalCellText.Width($"{numStr} {marker} ")),
+                PrefixRole = TranscriptRole.DiffContext,
+            });
+
+            // Continuation segments: blank gutter (same width) so the content stays aligned.
+            if (contentSegments.Count > 1)
+            {
+                var gutterPad = new string(' ', prefixCells);
+                for (var i = 1; i < contentSegments.Count; i++)
+                {
+                    lines.Add(new TranscriptRenderLine($"{gutterPad}{contentSegments[i]}", role)
+                    {
+                        FillWidth = fillWidth,
+                        PrefixCells = prefixCells,
+                        PrefixRole = TranscriptRole.DiffContext,
+                    });
+                }
             }
         }
+    }
+
+    /// <summary>
+    /// Returns the minimum column width that can display every line number in <paramref name="lines"/>,
+    /// clamped to a sensible floor of 3 so a one-line file does not produce a single-digit gutter.
+    /// </summary>
+    private static int ComputeDiffGutterWidth(ImmutableArray<DiffLine> lines)
+    {
+        var maxLine = 0;
+        foreach (var line in lines)
+        {
+            if (line.OldLine.HasValue)
+            {
+                maxLine = Math.Max(maxLine, line.OldLine.Value);
+            }
+
+            if (line.NewLine.HasValue)
+            {
+                maxLine = Math.Max(maxLine, line.NewLine.Value);
+            }
+        }
+
+        return Math.Max(3, maxLine.ToString(CultureInfo.InvariantCulture).Length);
     }
 
     private static void AppendTool(
