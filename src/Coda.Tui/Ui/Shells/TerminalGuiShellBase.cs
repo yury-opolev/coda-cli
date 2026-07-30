@@ -592,6 +592,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return true;
         }
 
+        // Ctrl+V pastes at the caret, preferring an image on the clipboard over text — the same path a
+        // right-click takes. Handled here rather than left to the editor's native paste, which only ever
+        // sees text and so silently dropped a copied image. Focus follows the paste so the draft is
+        // immediately usable when the key arrived from the transcript.
+        if (key == Key.V.WithCtrl && !this.composerDisabled && this.Composer.InputEnabled)
+        {
+            this.Composer.SetFocus();
+            this.PasteComposerClipboard();
+            return true;
+        }
+
         if (key == Key.Esc)
         {
             if (this.Completion.Visible)
@@ -862,6 +873,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // Prefer an image on the clipboard over text: read it through the injected reader, stage+validate it
         // via the imagePaste callback, and insert its [Image N] token at the caret. A missing image falls
         // through to the text-paste path; a present-but-rejected image pins a warning without pasting text.
+        //
+        // NOTE: the per-OS readers shell out to a helper process (PowerShell on Windows, wl-paste/xclip on
+        // Linux), so this probe costs on the order of a second and runs on the UI thread. That is the
+        // long-standing behaviour of the right-click paste, and Ctrl+V now shares it. Moving the probe off
+        // the UI thread needs an injectable dispatcher so the paste stays deterministic under test —
+        // tracked separately rather than bolted on here.
         if (this.imageReader is not null && this.imagePaste is not null)
         {
             var image = this.imageReader.TryRead();
