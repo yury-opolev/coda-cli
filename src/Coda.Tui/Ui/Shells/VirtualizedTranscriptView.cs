@@ -542,13 +542,21 @@ internal sealed class VirtualizedTranscriptView : View
                     row.Text, range.Value.StartCell, range.Value.EndCellExclusive);
             }
 
-            // Prefix boundary (callout bar color covers [0, prefixEnd)).
+            // Prefix boundary (callout bar / diff line-number gutter covers [0, prefixEnd)).
             var prefixEnd = 0;
             var prefixAttribute = default(TgAttribute);
             if (hasPrefix)
             {
                 (_, prefixEnd) = TerminalCellText.SnapRangeToGraphemes(row.Text, 0, row.PrefixCells);
-                prefixAttribute = this.AttributeFor(row.PrefixRole);
+
+                // The prefix changes the FOREGROUND only. Taking its background too would punch a hole in
+                // a FillWidth row's band — a diff's added/removed colour would start after the gutter
+                // instead of at column 0.
+                prefixAttribute = row.FillWidth
+                    ? new TgAttribute(
+                        this.AttributeFor(row.PrefixRole).Foreground,
+                        rowAttribute.Background)
+                    : this.AttributeFor(row.PrefixRole);
             }
 
             // Collect all boundary points and sort them; duplicates collapse to zero-width segments (skipped below).
@@ -1102,14 +1110,23 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.ToolSuccess => this.theme.ToolSuccess,
             TranscriptRole.ToolPartialFailure => this.theme.ToolPartialFailure,
             TranscriptRole.PermissionApproved => this.theme.PermissionApproved,
+            TranscriptRole.DiffHeader => this.theme.Diff,
+            TranscriptRole.DiffAdded => this.theme.DiffAdded,
+            TranscriptRole.DiffRemoved => this.theme.DiffRemoved,
+            TranscriptRole.DiffContext => this.theme.DiffContext,
             _ => this.theme.TranscriptAssistant,
         };
 
-        // User and pending-user message rows sit on a subtly different full-width background block; every
-        // other role keeps the global shell background so non-user rows are unchanged.
-        var background = role is TranscriptRole.User or TranscriptRole.PendingUser
-            ? this.theme.TranscriptUserBackground
-            : this.theme.Background;
+        // User and pending-user rows use a subtly different full-width background; added/removed diff rows
+        // use their own theme-defined background so the block reads in the correct hue; everything else
+        // keeps the global shell background so it never intrudes on the transcript surface.
+        var background = role switch
+        {
+            TranscriptRole.User or TranscriptRole.PendingUser => this.theme.TranscriptUserBackground,
+            TranscriptRole.DiffAdded => this.theme.DiffAddedBackground,
+            TranscriptRole.DiffRemoved => this.theme.DiffRemovedBackground,
+            _ => this.theme.Background,
+        };
         return new TgAttribute(
             TuiTheme.Resolve(foreground, useTrueColor),
             TuiTheme.Resolve(background, useTrueColor));

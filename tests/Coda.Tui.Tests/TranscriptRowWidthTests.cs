@@ -90,6 +90,27 @@ public sealed class TranscriptRowWidthTests
         AssertFits(TranscriptBlockFormatter.Format(block, width), width);
     }
 
+    [Theory]
+    [InlineData(20)]
+    [InlineData(40)]
+    [InlineData(80)]
+    public void Diff_rows_never_exceed_the_requested_width(int width)
+    {
+        // A realistic multi-hunk patch with long content lines to exercise wrapping at narrow widths.
+        var patch =
+            "diff --git a/src/some/very/long/path/to/component.tsx b/src/some/very/long/path/to/component.tsx\n" +
+            "--- a/src/some/very/long/path/to/component.tsx\n" +
+            "+++ b/src/some/very/long/path/to/component.tsx\n" +
+            "@@ -1,3 +1,3 @@\n" +
+            " export const Component = () => { return <div className=\"some-very-long-classname\">hello</div>; };\n" +
+            "-const old = 'value that is removed from this line';\n" +
+            "+const new_ = 'value that is added to replace the removed one on this line';";
+
+        var block = new DiffTranscriptBlock(Guid.NewGuid(), patch);
+
+        AssertFits(TranscriptBlockFormatter.Format(block, width), width);
+    }
+
     private static void AssertFits(IReadOnlyList<TranscriptRenderLine> lines, int width)
     {
         foreach (var line in lines)

@@ -105,6 +105,31 @@ internal sealed class TuiTheme
     /// the theme's user color so the whole pending block reads as unconfirmed until delivered.</summary>
     public TuiThemeColor PendingUser { get; init; } = new(new TgColor(150, 128, 104), TgName.Gray);
 
+    // -----------------------------------------------------------------------
+    // Rich diff coloring (added 2026-07 for richer git-diff rendering)
+    // -----------------------------------------------------------------------
+
+    /// <summary>Foreground for added lines in a rich diff block — resolves through <see cref="TuiPalette.Success"/>
+    /// so a diff's green matches the tool-success green, keeping the palette consistent.</summary>
+    public TuiThemeColor DiffAdded => this.Palette.Success;
+
+    /// <summary>Foreground for removed lines in a rich diff block — resolves through <see cref="TuiPalette.Error"/>
+    /// so the diff red aligns with errors and rejections throughout the transcript.</summary>
+    public TuiThemeColor DiffRemoved => this.Palette.Error;
+
+    /// <summary>Foreground for context lines, line-number gutters, and the summary row — resolves through
+    /// <see cref="TuiPalette.Dim"/> to de-emphasise unchanged lines relative to the coloured add/remove rows.</summary>
+    public TuiThemeColor DiffContext => this.Palette.Dim;
+
+    /// <summary>Full-width background painted behind added lines so the entire viewport row reads as green
+    /// rather than just the content characters. Per-theme init property so each theme can choose a dark
+    /// shade that complements its overall background without looking like the tool-success foreground.</summary>
+    public TuiThemeColor DiffAddedBackground { get; init; } = new(new TgColor(22, 52, 22), TgName.DarkGray);
+
+    /// <summary>Full-width background painted behind removed lines. Per-theme init property matching the
+    /// <see cref="DiffAddedBackground"/> discipline so themes remain internally consistent.</summary>
+    public TuiThemeColor DiffRemovedBackground { get; init; } = new(new TgColor(52, 20, 20), TgName.DarkGray);
+
     /// <summary>Foreground color applied to honest link spans (display text identifies the destination).</summary>
     public TuiThemeColor Link { get; init; } = new(new TgColor(110, 165, 215), TgName.BrightBlue);
     /// <summary>Foreground color applied to deceptive link spans (display text hides the destination),
