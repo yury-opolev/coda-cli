@@ -874,11 +874,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // via the imagePaste callback, and insert its [Image N] token at the caret. A missing image falls
         // through to the text-paste path; a present-but-rejected image pins a warning without pasting text.
         //
-        // NOTE: the per-OS readers shell out to a helper process (PowerShell on Windows, wl-paste/xclip on
-        // Linux), so this probe costs on the order of a second and runs on the UI thread. That is the
-        // long-standing behaviour of the right-click paste, and Ctrl+V now shares it. Moving the probe off
-        // the UI thread needs an injectable dispatcher so the paste stays deterministic under test —
-        // tracked separately rather than bolted on here.
+        // The readers answer "no image" from a cheap native/format check before starting any helper process,
+        // so the common text paste never pays for the probe and the UI thread is not blocked.
         if (this.imageReader is not null && this.imagePaste is not null)
         {
             var image = this.imageReader.TryRead();

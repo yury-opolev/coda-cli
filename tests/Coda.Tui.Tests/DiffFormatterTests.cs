@@ -354,3 +354,78 @@ public sealed class DiffFormatterTests
         Assert.True(addedRow.PrefixCells > 0);
         Assert.Equal(TranscriptRole.DiffContext, addedRow.PrefixRole);
     }}
+
+/// <summary>
+/// A diff is untrusted: its content comes from files in whatever repository the user happens to have
+/// checked out. Escape sequences embedded in a tracked file must never reach the terminal, where they
+/// could rewrite the screen, retitle the window, or on OSC 52 capable terminals write to the clipboard.
+/// </summary>
+public sealed class DiffSanitizationTests
+{
+    private static TranscriptRenderLine[] FormatDiff(string patch, int width = 80) =>
+        TranscriptBlockFormatter.Format(
+            new DiffTranscriptBlock(Guid.NewGuid(), patch), width).ToArray();
+
+    [Fact]
+    public void Escape_sequences_in_a_diff_body_never_reach_a_render_line()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/evil.txt b/evil.txt",
+            "--- a/evil.txt",
+            "+++ b/evil.txt",
+            "@@ -1,1 +1,1 @@",
+            "-old",
+            "+payload\u001b]52;c;Y2FsYw==\u0007and\u001b[2Jmore");
+
+        foreach (var line in FormatDiff(patch))
+        {
+            Assert.DoesNotContain('\u001b', line.Text);
+            Assert.DoesNotContain('\u0007', line.Text);
+        }
+    }
+
+    [Fact]
+    public void Escape_sequences_in_a_diff_file_path_never_reach_a_render_line()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/ev\u001b[2Jil.txt b/ev\u001b[2Jil.txt",
+            "--- a/ev\u001b[2Jil.txt",
+            "+++ b/ev\u001b[2Jil.txt",
+            "@@ -1,1 +1,1 @@",
+            "-old",
+            "+new");
+
+        foreach (var line in FormatDiff(patch))
+        {
+            Assert.DoesNotContain('\u001b', line.Text);
+        }
+    }
+
+    [Fact]
+    public void Escape_sequences_in_an_unstructured_patch_never_reach_a_render_line()
+    {
+        // The fallback path for text with no recognisable diff structure must guard just as tightly.
+        foreach (var line in FormatDiff("-old\u001b[2J\n+new\u001b]52;c;Y2FsYw==\u0007"))
+        {
+            Assert.DoesNotContain('\u001b', line.Text);
+            Assert.DoesNotContain('\u0007', line.Text);
+        }
+    }
+
+    [Fact]
+    public void Sanitizing_leaves_ordinary_diff_content_intact()
+    {
+        var patch = string.Join('\n',
+            "diff --git a/Foo.cs b/Foo.cs",
+            "--- a/Foo.cs",
+            "+++ b/Foo.cs",
+            "@@ -1,1 +1,1 @@",
+            "-int old;",
+            "+int fresh;");
+
+        var lines = FormatDiff(patch);
+
+        Assert.Contains(lines, l => l.Text.Contains("int fresh;", StringComparison.Ordinal));
+        Assert.Contains(lines, l => l.Text.Contains("Foo.cs", StringComparison.Ordinal));
+    }
+}
