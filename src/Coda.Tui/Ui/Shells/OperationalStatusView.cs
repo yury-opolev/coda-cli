@@ -145,7 +145,7 @@ internal sealed class OperationalStatusView : View
             OperationalTone.Thinking => this.theme.OperationalThinking,
             OperationalTone.Waiting => this.theme.OperationalWaiting,
             // "Waiting for approval" is an open question, not a failure or a rejection, so it must not
-            // draw in the red PermissionApproval role — red is reserved for those two outcomes alone.
+            // draw in the Error role — red (Palette.Danger) is reserved for those two outcomes alone.
             OperationalTone.Approval => this.theme.Question,
             OperationalTone.Warning => this.theme.Warning,
             OperationalTone.Error => this.theme.Error,

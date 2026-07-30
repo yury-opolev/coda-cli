@@ -222,36 +222,25 @@ public sealed class ToolOutcomeColourTests
             Error: null);
 
     // -------------------------------------------------------------------------
-    // Red is reserved for failure and rejection
+    // Palette routing: semantic roles resolve through the per-theme palette
     // -------------------------------------------------------------------------
 
     public static TheoryData<string> BuiltInThemeNames() => new() { "default", "warm-ember", "cool-dark" };
 
     [Theory]
     [MemberData(nameof(BuiltInThemeNames))]
-    public void PermissionApproved_is_never_the_theme_success_green(string themeName)
+    public void Outcome_roles_resolve_through_the_theme_palette(string themeName)
     {
         Assert.True(CodaThemes.TryGet(themeName, out var theme));
+        var palette = theme.Tui.Palette;
 
-        // An approved tool is noteworthy, not "all clear": it must not borrow the success green, or the
-        // transcript would read an approval as a completed batch.
-        Assert.NotEqual(theme.Tui.ToolSuccess, theme.Tui.PermissionApproved);
+        // The mapping a theme author relies on: adjust one palette entry and every role routed through it
+        // moves with it. Asserted per built-in theme so a theme cannot quietly opt out by restating a role.
+        Assert.Equal(palette.Success, theme.Tui.ToolSuccess);
+        Assert.Equal(palette.Caution, theme.Tui.ToolPartialFailure);
+        Assert.Equal(palette.Caution, theme.Tui.PermissionApproved);
+        Assert.Equal(palette.Caution, theme.Tui.Warning);
+        Assert.Equal(palette.Danger, theme.Tui.Error);
+        Assert.Equal(palette.Info, theme.Tui.Notification);
     }
-
-    [Theory]
-    [MemberData(nameof(BuiltInThemeNames))]
-    public void PermissionApproved_and_partial_failure_are_warm_not_cool(string themeName)
-    {
-        Assert.True(CodaThemes.TryGet(themeName, out var theme));
-
-        // Orange/yellow means red > green and red > blue. This is what §3 asks for, and it is what keeps
-        // the role legible as "noteworthy" in every palette rather than drifting to the theme's accent hue.
-        AssertWarm(theme.Tui.PermissionApproved);
-        AssertWarm(theme.Tui.ToolPartialFailure);
-
-        static void AssertWarm(TuiThemeColor role)
-        {
-            Assert.True(role.TrueColor.R > role.TrueColor.G, "expected red channel above green");
-            Assert.True(role.TrueColor.G > role.TrueColor.B, "expected green channel above blue");
-        }
-    }}
+}

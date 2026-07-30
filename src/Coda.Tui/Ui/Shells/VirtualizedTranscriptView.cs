@@ -1084,7 +1084,7 @@ internal sealed class VirtualizedTranscriptView : View
             TranscriptRole.Code => this.theme.Code,
             TranscriptRole.Tool => this.theme.TranscriptTool,
             TranscriptRole.Diff => this.theme.Diff,
-            TranscriptRole.Permission => this.theme.PermissionApproval,
+            TranscriptRole.Permission => this.theme.Error,
             TranscriptRole.Question => this.theme.Question,
             TranscriptRole.Warning => this.theme.Warning,
             TranscriptRole.Notification => this.theme.Notification,

@@ -1180,8 +1180,10 @@ public static class TranscriptBlockFormatter
     };
 
     /// <summary>The semantic role colouring a finished tool-activity summary line. Green only when every
-    /// call succeeded, red only when every call failed, orange for a mixed outcome; a cancelled batch with
-    /// no failures stays a warning.</summary>
+    /// call succeeded, red only when every call failed, and the theme's caution colour for anything in
+    /// between — a mixed outcome or a cancelled-but-unfailed batch. Those last two deliberately share a
+    /// colour: both mean "noteworthy, but nothing failed outright", and the wording of the line already
+    /// distinguishes them.</summary>
     internal static TranscriptRole SummaryRole(ToolActivitySummary summary)
     {
         if (summary.FailedCalls <= 0 && summary.Cancelled)
