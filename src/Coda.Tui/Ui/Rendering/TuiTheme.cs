@@ -121,6 +121,27 @@ internal sealed class TuiTheme
     /// <see cref="TuiPalette.Dim"/> to de-emphasise unchanged lines relative to the coloured add/remove rows.</summary>
     public TuiThemeColor DiffContext => this.Palette.Dim;
 
+    // Syntax highlighting. Each token kind takes a different palette hue so highlighted code reads the
+    // same way in every theme without any theme restating these, and so RoleParityTests is satisfied
+    // by construction: the palettes already differ, therefore so do the derived roles.
+
+    /// <summary>Language keywords. Resolves through <see cref="TuiPalette.Accent"/> — the one hue that
+    /// carries no success/failure meaning, which is what a keyword needs.</summary>
+    public TuiThemeColor SyntaxKeyword => this.Palette.Accent;
+
+    /// <summary>Type names and built-in types. Resolves through <see cref="TuiPalette.Warn"/>.</summary>
+    public TuiThemeColor SyntaxType => this.Palette.Warn;
+
+    /// <summary>String and character literals. Resolves through <see cref="TuiPalette.Success"/>.</summary>
+    public TuiThemeColor SyntaxString => this.Palette.Success;
+
+    /// <summary>Numeric literals. Resolves through <see cref="TuiPalette.Error"/> — chosen for being the
+    /// remaining distinct hue, not to suggest anything is wrong.</summary>
+    public TuiThemeColor SyntaxNumber => this.Palette.Error;
+
+    /// <summary>Comments. Resolves through <see cref="TuiPalette.Dim"/> so prose recedes behind code.</summary>
+    public TuiThemeColor SyntaxComment => this.Palette.Dim;
+
     /// <summary>Full-width background painted behind added lines so the entire viewport row reads as green
     /// rather than just the content characters. Per-theme init property so each theme can choose a dark
     /// shade that complements its overall background without looking like the tool-success foreground.</summary>

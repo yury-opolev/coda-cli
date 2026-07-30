@@ -3,6 +3,7 @@ using System.Collections.Immutable;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
 using TgAttribute = Terminal.Gui.Drawing.Attribute;
+using TgColor = Terminal.Gui.Drawing.Color;
 
 namespace Coda.Tui.Ui.Shells;
 
@@ -178,6 +179,9 @@ internal sealed class VirtualizedTranscriptView : View
     /// <summary>Counts segments drawn with a Link or LinkDeceptive attribute during <see cref="DrawRow"/>.
     /// Used by tests to verify link coloring fires at draw time.</summary>
     internal int LinkDrawCount { get; private set; }
+
+    /// <summary>Segments drawn in a syntax-highlight attribute. A test seam for the highlighting path.</summary>
+    internal int SyntaxDrawCount { get; private set; }
 
     /// <summary>Number of times the transcript was fully rebuilt (initial/reseed/resize).</summary>
     internal int ReplaceAllCount { get; private set; }
@@ -516,9 +520,10 @@ internal sealed class VirtualizedTranscriptView : View
         var rowWidth = TerminalCellText.Width(row.Text);
         var range = row.IsSeparator ? null : this.selection.RangeForRow(row.GlobalRow, rowWidth);
         var hasLinks = row.Links is { Count: > 0 };
+        var hasSyntax = row.Syntax is { Count: > 0 };
         var hasPrefix = row.PrefixCells > 0;
 
-        if (range is null && !hasLinks && !hasPrefix)
+        if (range is null && !hasLinks && !hasPrefix && !hasSyntax)
         {
             // Fast path: no segmentation needed — single attribute covers the whole row.
             this.SetAttribute(rowAttribute);
@@ -560,7 +565,7 @@ internal sealed class VirtualizedTranscriptView : View
             }
 
             // Collect all boundary points and sort them; duplicates collapse to zero-width segments (skipped below).
-            var bps = new List<int>(8 + (hasLinks ? row.Links!.Count * 2 : 0)) { 0, rowWidth };
+            var bps = new List<int>(8 + (hasLinks ? row.Links!.Count * 2 : 0) + (hasSyntax ? row.Syntax!.Count * 2 : 0)) { 0, rowWidth };
             if (range is not null) { bps.Add(selectStart); bps.Add(selectEnd); }
             if (hasPrefix) { bps.Add(prefixEnd); }
             if (hasLinks)
@@ -569,6 +574,15 @@ internal sealed class VirtualizedTranscriptView : View
                 {
                     bps.Add(link.StartColumn);
                     bps.Add(link.EndColumn);
+                }
+            }
+
+            if (hasSyntax)
+            {
+                foreach (var span in row.Syntax!)
+                {
+                    bps.Add(span.StartColumn);
+                    bps.Add(span.EndColumn);
                 }
             }
 
@@ -609,9 +623,16 @@ internal sealed class VirtualizedTranscriptView : View
                     // Priority 3: callout prefix bar.
                     segAttr = prefixAttribute;
                 }
+                else if (hasSyntax && TryGetSyntaxKind(row.Syntax!, segStart, segEnd, out var tokenKind))
+                {
+                    // Priority 4: syntax highlight. Only the foreground changes — taking the background
+                    // too would punch a hole in a diff's added/removed band.
+                    segAttr = this.SyntaxAttributeFor(tokenKind, rowAttribute.Background, useTrueColor);
+                    this.SyntaxDrawCount++;
+                }
                 else
                 {
-                    // Priority 4: normal row role color.
+                    // Priority 5: normal row role color.
                     segAttr = rowAttribute;
                 }
 
@@ -664,6 +685,49 @@ internal sealed class VirtualizedTranscriptView : View
 
         attr = default;
         return false;
+    }
+
+    /// <summary>
+    /// Searches <paramref name="spans"/> for one that fully contains the segment
+    /// [<paramref name="segStart"/>, <paramref name="segEnd"/>).
+    /// </summary>
+    private static bool TryGetSyntaxKind(
+        IReadOnlyList<SyntaxSpan> spans,
+        int segStart,
+        int segEnd,
+        out SyntaxTokenKind kind)
+    {
+        foreach (var span in spans)
+        {
+            if (segStart >= span.StartColumn && segEnd <= span.EndColumn)
+            {
+                kind = span.Kind;
+                return true;
+            }
+        }
+
+        kind = SyntaxTokenKind.Plain;
+        return false;
+    }
+
+    /// <summary>
+    /// The attribute for a syntax token: the kind's foreground over the row's own background, so a
+    /// highlighted token inside a diff's coloured band keeps that band rather than cutting through it.
+    /// </summary>
+    internal TgAttribute SyntaxAttributeFor(SyntaxTokenKind kind, TgColor background, bool? trueColor = null)
+    {
+        var useTrueColor = trueColor ?? TuiTheme.SupportsTrueColor(this.app.Driver);
+        var role = kind switch
+        {
+            SyntaxTokenKind.Keyword => this.theme.SyntaxKeyword,
+            SyntaxTokenKind.Type => this.theme.SyntaxType,
+            SyntaxTokenKind.String => this.theme.SyntaxString,
+            SyntaxTokenKind.Number => this.theme.SyntaxNumber,
+            SyntaxTokenKind.Comment => this.theme.SyntaxComment,
+            _ => this.theme.Code,
+        };
+
+        return new TgAttribute(TuiTheme.Resolve(role, useTrueColor), background);
     }
 
     /// <inheritdoc />
