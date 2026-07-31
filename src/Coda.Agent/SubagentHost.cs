@@ -3,6 +3,8 @@ using Coda.Agent.Hooks;
 using Coda.Agent.Subagents;
 using Coda.Agent.Tasks;
 using LlmClient;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Coda.Agent;
 
@@ -12,7 +14,7 @@ namespace Coda.Agent;
 /// the same model, permission prompt and working directory. The subagent's output
 /// streams to the parent sink; its accumulated assistant text is returned.
 /// </summary>
-public sealed class SubagentHost : ISubagentHost
+public sealed partial class SubagentHost : ISubagentHost
 {
     private readonly ILlmClient client;
     private readonly ToolRegistry subagentTools;
@@ -24,6 +26,7 @@ public sealed class SubagentHost : ISubagentHost
     private readonly TimeSpan? toolProgressInterval;
     private readonly SubagentRegistry? subagentRegistry;
     private readonly Coda.Agent.Settings.SubagentSettings subagentSettings;
+    private readonly ILogger logger;
 
     public SubagentHost(
         ILlmClient client,
@@ -35,7 +38,8 @@ public sealed class SubagentHost : ISubagentHost
         UserHookRunner? userHooks = null,
         TimeSpan? toolProgressInterval = null,
         SubagentRegistry? subagentRegistry = null,
-        Coda.Agent.Settings.SubagentSettings? subagentSettings = null)
+        Coda.Agent.Settings.SubagentSettings? subagentSettings = null,
+        ILogger? logger = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -50,6 +54,7 @@ public sealed class SubagentHost : ISubagentHost
         this.toolProgressInterval = toolProgressInterval;
         this.subagentRegistry = subagentRegistry;
         this.subagentSettings = subagentSettings ?? Coda.Agent.Settings.SubagentSettings.Default;
+        this.logger = logger ?? NullLogger.Instance;
     }
 
     /// <summary>The session's subagent limits and system-prompt policy in force for this host.</summary>
@@ -151,13 +156,24 @@ public sealed class SubagentHost : ISubagentHost
         var definition = this.subagentRegistry?.Resolve(subagentType) ?? BuiltInAgents.Resolve(subagentType);
         var prefix = this.includeAnthropicSystemPrefix ? AnthropicModels.AnthropicSystemPrefix + "\n\n" : string.Empty;
 
-        // SECURITY: the definition body is laid down first and everything the caller supplies comes
-        // after it, so caller text can add to the subagent's instructions but never pre-empt the
-        // guardrails the definition establishes.
+        // SECURITY: whatever ends up as the body is laid down first and everything the caller
+        // supplies comes after it, so caller text can add to the subagent's instructions but never
+        // pre-empt the guardrails they establish. Only an explicit setting lets the caller supply
+        // the body itself — see ResolveSystemPromptBody.
+        var (body, demotedReplacement) = this.ResolveSystemPromptBody(definition, request.SystemPrompt, subagentType);
+
         var systemPrompt = prefix
-            + definition.SystemPromptBody
+            + body
             + "\n\n# Environment\nWorking directory: "
             + this.baseOptions.WorkingDirectory;
+
+        // A replacement the session refused still reaches the subagent, just behind the definition
+        // rather than instead of it. It goes ahead of the explicit append because that is the order
+        // the caller asked for: the broader instruction first, the addition after it.
+        if (demotedReplacement is not null)
+        {
+            systemPrompt += "\n\n" + demotedReplacement;
+        }
 
         if (request.SystemPrompt?.Append is { } callerAppend && !string.IsNullOrWhiteSpace(callerAppend))
         {
@@ -335,6 +351,45 @@ public sealed class SubagentHost : ISubagentHost
 
         return result;
     }
+
+    /// <summary>
+    /// Decides what the subagent's system-prompt body is: the definition's own text, or the
+    /// caller's when the session explicitly allows replacement.
+    /// </summary>
+    /// <returns>
+    /// The body to use, and — when a replacement was asked for but refused — the caller's text to
+    /// append behind the definition instead.
+    /// </returns>
+    /// <remarks>
+    /// Refusing by demotion rather than by dropping is deliberate. Dropping loses information the
+    /// caller thought it had passed on, and failing the launch turns a permission question into an
+    /// error the model cannot fix; appending keeps the caller's intent while leaving the definition
+    /// in charge.
+    /// </remarks>
+    private (string Body, string? DemotedReplacement) ResolveSystemPromptBody(
+        SubagentDefinition definition,
+        SubagentSystemPrompt? requested,
+        string subagentType)
+    {
+        if (requested?.Replacement is not { } replacement || string.IsNullOrWhiteSpace(replacement))
+        {
+            return (definition.SystemPromptBody, null);
+        }
+
+        if (this.subagentSettings.AllowSystemPromptReplacement)
+        {
+            return (replacement, null);
+        }
+
+        this.LogSystemPromptReplacementRefused(subagentType);
+        return (definition.SystemPromptBody, replacement);
+    }
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "subagent '{subagentType}' asked to replace its system prompt, which this session does not " +
+                  "allow; appending the text instead. Set subagents.allowSystemPromptReplacement to enable it.")]
+    private partial void LogSystemPromptReplacementRefused(string subagentType);
 
     /// <summary>
     /// Computes a child's advertised tool set. A read-only definition (e.g. Explore) or a

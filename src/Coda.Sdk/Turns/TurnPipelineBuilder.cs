@@ -178,7 +178,7 @@ public sealed class TurnPipelineBuilder
                 trustGuard: this.trustGuard, runLog: this.runLog)
             : null;
 
-        var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks, this.subagentRegistry, this.subagentSettings);
+        var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks, this.subagentRegistry, this.subagentSettings, this.loggerFactory.CreateLogger("Coda.Subagents"));
 
         var parentTools = this.BuildParentTools(options);
 
@@ -333,7 +333,7 @@ public sealed class TurnPipelineBuilder
         // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
         // stripped so a depth-2 child cannot reintroduce them.
         var subagentTools = StripSkillTool(StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools]).All);
-        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: this.subagentRegistry, subagentSettings: this.subagentSettings);
+        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: this.subagentRegistry, subagentSettings: this.subagentSettings, logger: this.loggerFactory.CreateLogger("Coda.Subagents"));
 
         var tools = this.BuildScheduledTools(options);
 
@@ -507,10 +507,11 @@ public sealed class TurnPipelineBuilder
         UserHookRunner? userHooks,
         TaskManager tasks,
         Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null,
-        Coda.Agent.Settings.SubagentSettings? subagentSettings = null)
+        Coda.Agent.Settings.SubagentSettings? subagentSettings = null,
+        ILogger? logger = null)
     {
         var subagentTools = StripSkillTool([.. BuiltInTools.All(), .. options.ExtraTools]);
-        return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: subagentRegistry, subagentSettings: subagentSettings);
+        return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: subagentRegistry, subagentSettings: subagentSettings, logger: logger);
     }
 
     /// <summary>
@@ -550,7 +551,7 @@ public sealed class TurnPipelineBuilder
         // hook-spawned subagents.
         var hookFreeHost = BuildSubagentHost(
             options, client, agentOptions, permissions, includeAnthropicSystemPrefix,
-            userHooks: null, this.tasks, this.subagentRegistry, this.subagentSettings);
+            userHooks: null, this.tasks, this.subagentRegistry, this.subagentSettings, this.loggerFactory.CreateLogger("Coda.Subagents"));
         var agentHandler = new AgentHookHandler(
             hookFreeHost,
             this.loggerFactory.CreateLogger("Coda.Hooks.Agent"),

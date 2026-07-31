@@ -16,8 +16,10 @@ internal static class SubagentPromptInput
     public static SubagentSystemPrompt? Read(JsonElement input)
     {
         var append = ToolInput.GetString(input, "system_prompt_append");
+        var replacement = ToolInput.GetString(input, "system_prompt");
         var requested = new SubagentSystemPrompt(
-            Append: string.IsNullOrWhiteSpace(append) ? null : append);
+            Append: string.IsNullOrWhiteSpace(append) ? null : append,
+            Replacement: string.IsNullOrWhiteSpace(replacement) ? null : replacement);
 
         return requested.IsEmpty ? null : requested;
     }

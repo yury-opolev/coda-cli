@@ -7,18 +7,22 @@ namespace Coda.Agent;
 /// <para>
 /// <see cref="Append"/> is the additive form and is always safe: the subagent definition's own body
 /// stays in front of it, so a caller can add context but cannot talk the subagent out of its own
-/// guardrails.
+/// guardrails. <see cref="Replacement"/> discards that body, which is why it is honoured only when
+/// <see cref="Settings.SubagentSettings.AllowSystemPromptReplacement"/> is enabled; otherwise it is
+/// demoted to an append rather than dropped, so the caller's intent still reaches the subagent
+/// without the guardrails going with it.
 /// </para>
 /// <para>
-/// This carries model-supplied text. It is appended to the prompt and nothing else — never
+/// Both fields carry model-supplied text. They are appended to the prompt and nothing else — never
 /// interpolated into tool policy, tool selection, or the depth and fan-out limits, which come from
 /// the registry and settings alone.
 /// </para>
 /// </remarks>
-public sealed record SubagentSystemPrompt(string? Append = null)
+public sealed record SubagentSystemPrompt(string? Append = null, string? Replacement = null)
 {
     /// <summary>True when the caller asked for nothing, so the prompt is built exactly as before.</summary>
-    public bool IsEmpty => string.IsNullOrWhiteSpace(this.Append);
+    public bool IsEmpty =>
+        string.IsNullOrWhiteSpace(this.Append) && string.IsNullOrWhiteSpace(this.Replacement);
 }
 
 /// <summary>
