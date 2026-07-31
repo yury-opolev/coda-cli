@@ -31,6 +31,10 @@ public sealed partial class TaskManager
     /// <summary>
     /// Registers and runs a foreground subagent while preserving its parent tool-activity identity.
     /// </summary>
+    /// <param name="systemPrompt">
+    /// The caller's requested influence over the child's system prompt, or null for none. Passed
+    /// through untouched; the host decides what it is allowed to do with it.
+    /// </param>
     public async Task<string> RunSubagentForegroundAsync(
         ISubagentHost host,
         string subagentType,
@@ -40,6 +44,7 @@ public sealed partial class TaskManager
         string? parentTaskId,
         ToolActivityContext? parentActivity,
         TurnShape? parentRestriction = null,
+        SubagentSystemPrompt? systemPrompt = null,
         CancellationToken cancellationToken = default)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Foreground);
@@ -50,8 +55,14 @@ public sealed partial class TaskManager
         using var linked = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, task.Token);
         try
         {
+            var request = new SubagentRequest(subagentType, prompt, task.Id, task.Depth)
+            {
+                ParentActivity = parentActivity,
+                ParentToolRestriction = parentRestriction,
+                SystemPrompt = systemPrompt,
+            };
             var result = await host
-                .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity, parentRestriction, linked.Token)
+                .RunSubagentAsync(request, sink, steering, linked.Token)
                 .ConfigureAwait(false);
             Complete(task.Id, result);
             return result;
@@ -95,6 +106,9 @@ public sealed partial class TaskManager
     /// run. The background run then returns it when the subagent finishes, because the caller is
     /// long gone by then and cannot release it itself.
     /// </param>
+    /// <param name="systemPrompt">
+    /// The caller's requested influence over the child's system prompt, or null for none.
+    /// </param>
     public string StartSubagentBackground(
         ISubagentHost host,
         string subagentType,
@@ -102,19 +116,25 @@ public sealed partial class TaskManager
         string description,
         string? parentTaskId,
         TurnShape? parentRestriction = null,
-        bool holdsSubagentSlot = false)
+        bool holdsSubagentSlot = false,
+        SubagentSystemPrompt? systemPrompt = null)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Background);
         var steering = new SteeringInbox();
         task.AttachSteering(steering);
         var sink = new TaskOutputSink(this, task.Id, NullAgentSink.Instance);
+        var request = new SubagentRequest(subagentType, prompt, task.Id, task.Depth)
+        {
+            ParentToolRestriction = parentRestriction,
+            SystemPrompt = systemPrompt,
+        };
 
         _ = Task.Run(async () =>
         {
             try
             {
                 var result = await host
-                    .RunSubagentAsync(subagentType, prompt, sink, steering, task.Id, task.Depth, parentActivity: null, parentRestriction, task.Token)
+                    .RunSubagentAsync(request, sink, steering, task.Token)
                     .ConfigureAwait(false);
                 Complete(task.Id, result);
             }

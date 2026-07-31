@@ -113,7 +113,7 @@ public sealed class SubagentHost : ISubagentHost
             cancellationToken: cancellationToken);
 
     /// <inheritdoc/>
-    public async Task<string> RunSubagentAsync(
+    public Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,
         IAgentSink sink,
@@ -122,18 +122,51 @@ public sealed class SubagentHost : ISubagentHost
         int depth,
         ToolActivityContext? parentActivity,
         TurnShape? parentToolRestriction,
+        CancellationToken cancellationToken = default) =>
+        this.RunSubagentAsync(
+            new SubagentRequest(subagentType, prompt, taskId, depth)
+            {
+                ParentActivity = parentActivity,
+                ParentToolRestriction = parentToolRestriction,
+            },
+            sink,
+            steering,
+            cancellationToken);
+
+    /// <inheritdoc/>
+    public async Task<string> RunSubagentAsync(
+        SubagentRequest request,
+        IAgentSink sink,
+        SteeringInbox steering,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var subagentType = request.SubagentType;
+        var taskId = request.TaskId;
+        var depth = request.Depth;
+        var parentActivity = request.ParentActivity;
+        var parentToolRestriction = request.ParentToolRestriction;
+
         var definition = this.subagentRegistry?.Resolve(subagentType) ?? BuiltInAgents.Resolve(subagentType);
         var prefix = this.includeAnthropicSystemPrefix ? AnthropicModels.AnthropicSystemPrefix + "\n\n" : string.Empty;
+
+        // SECURITY: the definition body is laid down first and everything the caller supplies comes
+        // after it, so caller text can add to the subagent's instructions but never pre-empt the
+        // guardrails the definition establishes.
         var systemPrompt = prefix
             + definition.SystemPromptBody
             + "\n\n# Environment\nWorking directory: "
             + this.baseOptions.WorkingDirectory;
 
+        if (request.SystemPrompt?.Append is { } callerAppend && !string.IsNullOrWhiteSpace(callerAppend))
+        {
+            systemPrompt += "\n\n" + callerAppend;
+        }
+
         // SubagentStart hook: fires before the first model call. Fail-closed: a broken hook
         // blocks the subagent from running so it can never run unshaped.
-        var effectivePrompt = prompt;
+        var effectivePrompt = request.Prompt;
         var effectiveParentRestriction = parentToolRestriction;
         string? appendSystemPromptFromHook = null;
 
@@ -194,6 +227,8 @@ public sealed class SubagentHost : ISubagentHost
 
         if (appendSystemPromptFromHook is not null)
         {
+            // Last, always: an operator's hook must be able to constrain both the definition and
+            // whatever the calling agent asked for.
             systemPrompt += "\n\n" + appendSystemPromptFromHook;
         }
 

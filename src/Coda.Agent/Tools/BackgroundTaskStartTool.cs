@@ -16,7 +16,7 @@ public sealed class BackgroundTaskStartTool : ITool
         "Use task_output to read incremental progress and task_stop to cancel it.";
 
     public string InputSchemaJson => """
-        {"type":"object","properties":{"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."}},"required":["prompt"]}
+        {"type":"object","properties":{"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."},"system_prompt_append":{"type":"string","description":"Extra standing instructions for the subagent, appended to its system prompt. The subagent type's own instructions always come first and are never replaced."}},"required":["prompt"]}
         """;
 
     // Matches TaskTool.IsReadOnly — launching a subagent is not itself mutating;
@@ -69,7 +69,8 @@ public sealed class BackgroundTaskStartTool : ITool
                 subagentType,
                 context.CurrentTaskId,
                 context.ParentToolRestriction,
-                holdsSubagentSlot: true);
+                holdsSubagentSlot: true,
+                systemPrompt: SubagentPromptInput.Read(input));
         }
         catch
         {

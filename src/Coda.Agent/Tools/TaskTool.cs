@@ -20,7 +20,7 @@ public sealed class TaskTool : ITool
         "Use subagent_type=\"explore\" for read-only research tasks.";
 
     public string InputSchemaJson => """
-        {"type":"object","properties":{"description":{"type":"string","description":"3-5 word task summary"},"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default, full tools) or \"explore\" (read-only research — read_file/list_dir/glob/grep/web_fetch/web_search only; makes no changes, reports findings)."}},"required":["description","prompt"]}
+        {"type":"object","properties":{"description":{"type":"string","description":"3-5 word task summary"},"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default, full tools) or \"explore\" (read-only research — read_file/list_dir/glob/grep/web_fetch/web_search only; makes no changes, reports findings)."},"system_prompt_append":{"type":"string","description":"Extra standing instructions for the subagent, appended to its system prompt. The subagent type's own instructions always come first and are never replaced."}},"required":["description","prompt"]}
         """;
 
     // Launching is not itself a mutating action; the subagent's own mutating tools
@@ -50,6 +50,7 @@ public sealed class TaskTool : ITool
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
         var description = ToolInput.GetString(input, "description") ?? subagentType;
         var parentSink = context.Sink ?? NullAgentSink.Instance;
+        var systemPrompt = SubagentPromptInput.Read(input);
 
         // Fan-out is bounded per session. Taken here rather than inside the task manager so the
         // refusal reaches the model as a plain tool error it can act on, before any task is
@@ -76,6 +77,7 @@ public sealed class TaskTool : ITool
                     context.CurrentTaskId,
                     parentActivity: context.ToolActivity,
                     parentRestriction: context.ParentToolRestriction,
+                    systemPrompt: systemPrompt,
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
         }
