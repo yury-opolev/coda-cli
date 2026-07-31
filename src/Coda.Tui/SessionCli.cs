@@ -70,26 +70,46 @@ public static class SessionCli
     /// `--resume`/`resume` with an id → that id, or without one → newest; `-f`/`--fork`/`fork` with an id →
     /// fork that id, or without one → fork the newest, each into a new session id. Anything else → no intent.
     /// </summary>
+    /// <remarks>
+    /// Every argument is examined, not just the first. Reading argv[0] alone meant any flag in front of
+    /// the intent — <c>--yolo</c>, say — silently defeated resume, continue and fork: the session started
+    /// empty and nothing said why. Flag order must not decide whether a session is restored.
+    /// </remarks>
     public static StartupIntent ParseStartupIntent(IReadOnlyList<string> args)
     {
-        if (args.Count == 0)
+        for (var i = 0; i < args.Count; i++)
         {
-            return new StartupIntent(false, null);
+            switch (args[i])
+            {
+                case "-c" or "--continue" or "continue":
+                    return new StartupIntent(true, null);
+
+                case "-r" or "--resume" or "resume":
+                    return TakesId(args, i, out var resumeId)
+                        ? new StartupIntent(false, resumeId)
+                        : new StartupIntent(true, null);
+
+                case "-f" or "--fork" or "fork":
+                    return TakesId(args, i, out var forkId)
+                        ? new StartupIntent(false, forkId, Fork: true)
+                        : new StartupIntent(true, null, Fork: true);
+            }
         }
 
-        switch (args[0])
+        return new StartupIntent(false, null);
+    }
+
+    /// <summary>Whether the argument after <paramref name="index"/> is an id rather than another flag.</summary>
+    private static bool TakesId(IReadOnlyList<string> args, int index, out string id)
+    {
+        if (index + 1 < args.Count && !args[index + 1].StartsWith('-'))
         {
-            case "-c" or "--continue" or "continue":
-                return new StartupIntent(true, null);
-            case "-r" or "--resume" or "resume":
-                var hasId = args.Count > 1 && !args[1].StartsWith('-');
-                return hasId ? new StartupIntent(false, args[1]) : new StartupIntent(true, null);
-            case "-f" or "--fork" or "fork":
-                var forkHasId = args.Count > 1 && !args[1].StartsWith('-');
-                return forkHasId ? new StartupIntent(false, args[1], Fork: true) : new StartupIntent(true, null, Fork: true);
-            default:
-                return new StartupIntent(false, null);
+            id = args[index + 1];
+            return true;
         }
+
+        id = string.Empty;
+        return false;
     }
 }
 

@@ -33,6 +33,12 @@ public sealed class SessionState
     /// <summary>The CLI override supplied when this process started; authoritative over resumed metadata.</summary>
     public string? StartupSystemPromptOverride { get; init; }
 
+    /// <summary>
+    /// Set by <c>--yolo-safe</c>: in bypass mode every mutating action is first classified, so risky
+    /// ones are escalated rather than blindly allowed.
+    /// </summary>
+    public bool EnableBypassClassifier { get; init; }
+
     /// <summary>The exact override currently applied to root turns; null uses normal construction.</summary>
     public string? SystemPromptOverride { get; set; }
 

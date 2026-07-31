@@ -100,3 +100,142 @@ public sealed class TuiLaunchOptionsTests
         Assert.Equal("--exact-value", Assert.IsType<Coda.Tui.SystemPromptSource.Inline>(parsed.SystemPromptSource).Text);
     }
 }
+
+/// <summary>
+/// The interactive launcher never parsed --yolo at all: only `coda run` and `coda serve` understood it,
+/// so starting the TUI with it left the session in Default mode and asked for permission as usual, with
+/// nothing to say the flag had been ignored.
+/// </summary>
+public sealed class TuiLaunchPermissionOptionsTests
+{
+    [Fact]
+    public void Yolo_selects_bypass_mode()
+    {
+        var options = TuiLaunchOptions.Parse(["--yolo"]);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, options.PermissionMode);
+        Assert.False(options.EnableBypassClassifier);
+        Assert.Null(options.Error);
+    }
+
+    [Fact]
+    public void Yolo_safe_selects_bypass_mode_with_the_classifier()
+    {
+        var options = TuiLaunchOptions.Parse(["--yolo-safe"]);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, options.PermissionMode);
+        Assert.True(options.EnableBypassClassifier);
+    }
+
+    [Theory]
+    [InlineData("default", Coda.Agent.PermissionMode.Default)]
+    [InlineData("acceptEdits", Coda.Agent.PermissionMode.AcceptEdits)]
+    [InlineData("plan", Coda.Agent.PermissionMode.Plan)]
+    [InlineData("bypass", Coda.Agent.PermissionMode.BypassPermissions)]
+    [InlineData("yolo", Coda.Agent.PermissionMode.BypassPermissions)]
+    public void Permission_mode_accepts_each_mode(string value, Coda.Agent.PermissionMode expected)
+    {
+        Assert.Equal(expected, TuiLaunchOptions.Parse(["--permission-mode", value]).PermissionMode);
+    }
+
+    [Fact]
+    public void Permission_mode_also_accepts_the_equals_form()
+    {
+        Assert.Equal(
+            Coda.Agent.PermissionMode.Plan,
+            TuiLaunchOptions.Parse(["--permission-mode=plan"]).PermissionMode);
+    }
+
+    [Fact]
+    public void An_unknown_permission_mode_is_an_error_rather_than_a_silent_default()
+    {
+        var options = TuiLaunchOptions.Parse(["--permission-mode", "nonsense"]);
+
+        Assert.NotNull(options.Error);
+    }
+
+    [Fact]
+    public void A_permission_mode_with_no_value_is_an_error()
+    {
+        Assert.NotNull(TuiLaunchOptions.Parse(["--permission-mode"]).Error);
+    }
+
+    [Fact]
+    public void No_permission_flag_leaves_the_mode_unset()
+    {
+        Assert.Null(TuiLaunchOptions.Parse([]).PermissionMode);
+    }
+
+    [Fact]
+    public void The_permission_flags_are_consumed_rather_than_left_for_the_session_parser()
+    {
+        // A leftover --yolo at argv[0] is exactly what used to defeat the resume intent.
+        var options = TuiLaunchOptions.Parse(["--yolo", "--resume", "abc123"]);
+
+        Assert.Equal(["--resume", "abc123"], options.RemainingArgs);
+    }
+
+    [Fact]
+    public void The_permission_mode_value_is_consumed_with_its_flag()
+    {
+        var options = TuiLaunchOptions.Parse(["--permission-mode", "plan", "--resume", "abc123"]);
+
+        Assert.Equal(["--resume", "abc123"], options.RemainingArgs);
+    }
+}
+
+/// <summary>
+/// Parsing the flag is only half the job: the mode has to reach the session, or --yolo would still ask
+/// for permission on every tool while claiming to have been understood.
+/// </summary>
+public sealed class LaunchPermissionModeWiringTests
+{
+    [Fact]
+    public void Yolo_puts_the_session_in_bypass_mode()
+    {
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", TuiLaunchOptions.Parse(["--yolo"]));
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.False(session.EnableBypassClassifier);
+    }
+
+    [Fact]
+    public void Yolo_safe_puts_the_session_in_bypass_mode_with_the_classifier()
+    {
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", TuiLaunchOptions.Parse(["--yolo-safe"]));
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.True(session.EnableBypassClassifier);
+    }
+
+    [Fact]
+    public void Permission_mode_plan_reaches_the_session()
+    {
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState(
+            "anthropic", TuiLaunchOptions.Parse(["--permission-mode", "plan"]));
+
+        Assert.Equal(Coda.Agent.PermissionMode.Plan, session.PermissionMode);
+    }
+
+    [Fact]
+    public void Without_a_flag_the_session_keeps_the_default_mode()
+    {
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", TuiLaunchOptions.Parse([]));
+
+        Assert.Equal(Coda.Agent.PermissionMode.Default, session.PermissionMode);
+        Assert.False(session.EnableBypassClassifier);
+    }
+
+    [Fact]
+    public void Yolo_and_resume_together_keep_both_the_mode_and_the_intent()
+    {
+        // The reported bug: --yolo defeated the resume AND was itself ignored.
+        var options = TuiLaunchOptions.Parse(["--yolo", "--resume", "abc123"]);
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", options);
+        var intent = SessionCli.ParseStartupIntent(options.RemainingArgs);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.Equal("abc123", intent.ResumeId);
+        Assert.True(intent.HasIntent);
+    }
+}

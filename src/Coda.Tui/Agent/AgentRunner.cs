@@ -510,6 +510,8 @@ public sealed class AgentRunner : IDisposable
         Model = context.Session.Model,
         WorkingDirectory = context.Session.WorkingDirectory,
         PermissionMode = context.Session.PermissionMode,
+        // --yolo-safe: classify each mutating action in bypass mode instead of allowing it blindly.
+        EnableBypassClassifier = context.Session.EnableBypassClassifier,
         // Pass the session's stable, shared state so a mid-turn /yolo or /permissions change is
         // observed by the running loop and its subagents' next permission decision.
         PermissionModeState = context.Session.PermissionModes,

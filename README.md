@@ -136,6 +136,12 @@ dotnet run --project src/Coda.Tui -- --tui=inline       # optional: same retaine
 dotnet run --project src/Coda.Tui -- --tui=auto         # default: full-screen on a supported terminal, else plain
 dotnet run --project src/Coda.Tui -- --plain            # plain output (screen readers, CI, redirection)
 dotnet run --project src/Coda.Tui -- --no-mouse         # keyboard-only; leave the mouse to the terminal
+
+# Start in a permission mode, the same modes /permissions offers. These compose with
+# --continue / --resume <id> / --fork [id] in any order.
+dotnet run --project src/Coda.Tui -- --yolo             # bypass: every tool runs without asking
+dotnet run --project src/Coda.Tui -- --yolo-safe        # bypass + classifier: risky actions still escalate
+dotnet run --project src/Coda.Tui -- --permission-mode plan
 ```
 
 ### Exact startup system prompts
