@@ -966,6 +966,9 @@ public sealed partial class AgentLoop : IAgentLoop
             Tasks = this.tasks,
             CurrentTaskId = this.currentTaskId,
             CurrentDepth = this.currentDepth,
+            // From the session's manager, never from a constant: a session may be configured to
+            // nest deeper or shallower, and the tools have to refuse against the real limit.
+            MaxSubagentDepth = this.tasks?.MaxSubagentDepth ?? TaskManager.DefaultMaxSubagentDepth,
             Lsp = this.lsp,
             AllTools = this.tools.All,
             OnToolsDiscovered = names => this.toolSearch?.AddDiscovered(names),

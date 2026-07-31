@@ -110,6 +110,14 @@ public sealed record SessionOptions
         new Dictionary<string, Coda.Agent.Lsp.LspServerConfig>(StringComparer.Ordinal);
 
     /// <summary>
+    /// Limits on subagent nesting and fan-out, and whether the main agent may replace a subagent's
+    /// system prompt. Null (the default) resolves the <c>subagents</c> block from the session's own
+    /// settings files, so a host does not have to remember to pass it; set it only to override the
+    /// settings for this session.
+    /// </summary>
+    public Coda.Agent.Settings.SubagentSettings? SubagentSettings { get; init; }
+
+    /// <summary>
     /// Complete exact root system prompt. Null uses normal Coda construction; empty and whitespace are exact values.
     /// </summary>
     public string? SystemPromptOverride { get; init; }

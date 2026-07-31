@@ -23,6 +23,7 @@ public sealed class SubagentHost : ISubagentHost
     private readonly TaskManager tasks;
     private readonly TimeSpan? toolProgressInterval;
     private readonly SubagentRegistry? subagentRegistry;
+    private readonly Coda.Agent.Settings.SubagentSettings subagentSettings;
 
     public SubagentHost(
         ILlmClient client,
@@ -33,7 +34,8 @@ public sealed class SubagentHost : ISubagentHost
         bool includeAnthropicSystemPrefix = true,
         UserHookRunner? userHooks = null,
         TimeSpan? toolProgressInterval = null,
-        SubagentRegistry? subagentRegistry = null)
+        SubagentRegistry? subagentRegistry = null,
+        Coda.Agent.Settings.SubagentSettings? subagentSettings = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -47,7 +49,11 @@ public sealed class SubagentHost : ISubagentHost
         // production → the child loop uses AgentLoop's own default interval.
         this.toolProgressInterval = toolProgressInterval;
         this.subagentRegistry = subagentRegistry;
+        this.subagentSettings = subagentSettings ?? Coda.Agent.Settings.SubagentSettings.Default;
     }
+
+    /// <summary>The session's subagent limits and system-prompt policy in force for this host.</summary>
+    internal Coda.Agent.Settings.SubagentSettings SubagentSettings => this.subagentSettings;
 
     /// <summary>Test seam: exposes the registry so integration tests can verify it was wired.</summary>
     internal SubagentRegistry? SubagentRegistryForTest => this.subagentRegistry;

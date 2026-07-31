@@ -37,10 +37,15 @@ public sealed partial class AgentHookHandler : IHookHandler
     /// Using a host with hooks would cause infinite recursion on hook-triggering events.
     /// </param>
     /// <param name="logger">Logger for warnings and informational messages.</param>
-    public AgentHookHandler(ISubagentHost subagentHost, ILogger? logger = null, int maxSubagentDepth = TaskManager.DefaultMaxSubagentDepth)
+    /// <param name="tasks">
+    /// The session's task manager, the single source of the subagent limits this handler must
+    /// respect. Null falls back to <see cref="TaskManager.DefaultMaxSubagentDepth"/>, which keeps
+    /// standalone construction (tests, embedders) working unchanged.
+    /// </param>
+    public AgentHookHandler(ISubagentHost subagentHost, ILogger? logger = null, TaskManager? tasks = null)
     {
         this.subagentHost = subagentHost ?? throw new ArgumentNullException(nameof(subagentHost));
-        this.maxSubagentDepth = maxSubagentDepth;
+        this.maxSubagentDepth = tasks?.MaxSubagentDepth ?? TaskManager.DefaultMaxSubagentDepth;
         this.logger = logger ?? NullLogger.Instance;
     }
 
