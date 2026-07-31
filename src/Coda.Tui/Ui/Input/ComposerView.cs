@@ -636,7 +636,15 @@ internal sealed class ComposerView : TextView
     {
         var draft = this.controller.State.Draft;
         var index = Math.Clamp(this.controller.State.CursorIndex, 0, draft.Length);
-        var (row, column) = LogicalCaret(draft, index);
+
+        // An [Image N] token is the draft's reference to a staged image, and the agent attaches that image
+        // only while the whole token survives. A delete that would break one apart therefore removes all of
+        // it: the alternative leaves wreckage on screen and drops the attachment with nothing to explain why.
+        var token = ImageTokenSpans.DeleteSpanAt(draft, index, forward);
+        var deleteFrom = token?.Start ?? index;
+        var deleteCount = token is { } span ? span.End - span.Start : 1;
+
+        var (row, column) = LogicalCaret(draft, deleteFrom);
         var previousWrap = this.WordWrap;
 
         // Reposition the base caret via logical coordinates without mirroring the (unchanged) draft/caret,
@@ -655,7 +663,16 @@ internal sealed class ComposerView : TextView
 
         try
         {
-            if (forward)
+            if (token is not null)
+            {
+                // The caret sits at the token's start, so the whole span comes off to the right regardless
+                // of which key asked for the delete.
+                for (var i = 0; i < deleteCount; i++)
+                {
+                    this.DeleteCharRight();
+                }
+            }
+            else if (forward)
             {
                 this.DeleteCharRight();
             }
