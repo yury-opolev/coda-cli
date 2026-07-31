@@ -16,7 +16,7 @@ public sealed class BackgroundTaskStartTool : ITool
         "Use task_output to read incremental progress and task_stop to cancel it.";
 
     public string InputSchemaJson => """
-        {"type":"object","properties":{"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."}},"required":["prompt"]}
+        {"type":"object","properties":{"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."},"system_prompt_append":{"type":"string","description":"Extra standing instructions for the subagent, appended to its system prompt. The subagent type's own instructions always come first and are never replaced."},"system_prompt":{"type":"string","description":"Replaces the subagent type's own instructions entirely. Only honoured when subagents.allowSystemPromptReplacement is enabled in settings; otherwise it is appended like system_prompt_append. Prefer system_prompt_append."}},"required":["prompt"]}
         """;
 
     // Matches TaskTool.IsReadOnly — launching a subagent is not itself mutating;
@@ -32,7 +32,7 @@ public sealed class BackgroundTaskStartTool : ITool
                 IsError: false));
         }
 
-        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        if (context.CurrentDepth >= context.MaxSubagentDepth)
         {
             return Task.FromResult(new ToolResult(
                 "Cannot start a background subagent from here: the maximum subagent nesting depth has been reached.",
@@ -46,7 +46,38 @@ public sealed class BackgroundTaskStartTool : ITool
         }
 
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
-        var id = context.Tasks.StartSubagentBackground(context.Subagents, subagentType, prompt, subagentType, context.CurrentTaskId, context.ParentToolRestriction);
+
+        // Same session-wide fan-out budget as the foreground task tool. The slot is handed to the
+        // background run, which returns it when the subagent finishes — this tool returns long
+        // before that, so it cannot release the slot itself.
+        if (!context.Tasks.TryAcquireSubagentSlot())
+        {
+            return Task.FromResult(new ToolResult(
+                $"Cannot start a background subagent: all {context.Tasks.MaxConcurrentSubagents} concurrent " +
+                "subagent slots are in use (subagents.maxConcurrent). Wait for a running subagent to finish, " +
+                "or raise the limit in settings.",
+                IsError: true));
+        }
+
+        string id;
+        try
+        {
+            id = context.Tasks.StartSubagentBackground(
+                context.Subagents,
+                subagentType,
+                prompt,
+                subagentType,
+                context.CurrentTaskId,
+                context.ParentToolRestriction,
+                holdsSubagentSlot: true,
+                systemPrompt: SubagentPromptInput.Read(input));
+        }
+        catch
+        {
+            // The run never started, so nothing will ever release the slot for us.
+            context.Tasks.ReleaseSubagentSlot();
+            throw;
+        }
 
         return Task.FromResult(new ToolResult(
             $"Started background task {id}. Use task_output to read its progress."));

@@ -3,6 +3,8 @@ using Coda.Agent.Hooks;
 using Coda.Agent.Subagents;
 using Coda.Agent.Tasks;
 using LlmClient;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 
 namespace Coda.Agent;
 
@@ -12,7 +14,7 @@ namespace Coda.Agent;
 /// the same model, permission prompt and working directory. The subagent's output
 /// streams to the parent sink; its accumulated assistant text is returned.
 /// </summary>
-public sealed class SubagentHost : ISubagentHost
+public sealed partial class SubagentHost : ISubagentHost
 {
     private readonly ILlmClient client;
     private readonly ToolRegistry subagentTools;
@@ -23,6 +25,7 @@ public sealed class SubagentHost : ISubagentHost
     private readonly TaskManager tasks;
     private readonly TimeSpan? toolProgressInterval;
     private readonly SubagentRegistry? subagentRegistry;
+    private readonly ILogger logger;
 
     public SubagentHost(
         ILlmClient client,
@@ -33,7 +36,8 @@ public sealed class SubagentHost : ISubagentHost
         bool includeAnthropicSystemPrefix = true,
         UserHookRunner? userHooks = null,
         TimeSpan? toolProgressInterval = null,
-        SubagentRegistry? subagentRegistry = null)
+        SubagentRegistry? subagentRegistry = null,
+        ILogger? logger = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -47,7 +51,14 @@ public sealed class SubagentHost : ISubagentHost
         // production → the child loop uses AgentLoop's own default interval.
         this.toolProgressInterval = toolProgressInterval;
         this.subagentRegistry = subagentRegistry;
+        this.logger = logger ?? NullLogger.Instance;
     }
+
+    /// <summary>
+    /// The session's subagent settings, read from the task manager so the depth this host gates on
+    /// and the prompt policy it enforces can never come from two different configurations.
+    /// </summary>
+    private Coda.Agent.Settings.SubagentSettings SubagentSettings => this.tasks.SubagentSettings;
 
     /// <summary>Test seam: exposes the registry so integration tests can verify it was wired.</summary>
     internal SubagentRegistry? SubagentRegistryForTest => this.subagentRegistry;
@@ -107,7 +118,7 @@ public sealed class SubagentHost : ISubagentHost
             cancellationToken: cancellationToken);
 
     /// <inheritdoc/>
-    public async Task<string> RunSubagentAsync(
+    public Task<string> RunSubagentAsync(
         string subagentType,
         string prompt,
         IAgentSink sink,
@@ -116,25 +127,69 @@ public sealed class SubagentHost : ISubagentHost
         int depth,
         ToolActivityContext? parentActivity,
         TurnShape? parentToolRestriction,
+        CancellationToken cancellationToken = default) =>
+        this.RunSubagentAsync(
+            new SubagentRequest(subagentType, prompt, taskId, depth)
+            {
+                ParentActivity = parentActivity,
+                ParentToolRestriction = parentToolRestriction,
+            },
+            sink,
+            steering,
+            cancellationToken);
+
+    /// <inheritdoc/>
+    public async Task<string> RunSubagentAsync(
+        SubagentRequest request,
+        IAgentSink sink,
+        SteeringInbox steering,
         CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(request);
+
+        var subagentType = request.SubagentType;
+        var taskId = request.TaskId;
+        var depth = request.Depth;
+        var parentActivity = request.ParentActivity;
+        var parentToolRestriction = request.ParentToolRestriction;
+
         var definition = this.subagentRegistry?.Resolve(subagentType) ?? BuiltInAgents.Resolve(subagentType);
         var prefix = this.includeAnthropicSystemPrefix ? AnthropicModels.AnthropicSystemPrefix + "\n\n" : string.Empty;
+
+        // SECURITY: whatever ends up as the body is laid down first and everything the caller
+        // supplies comes after it, so caller text can add to the subagent's instructions but never
+        // pre-empt the guardrails they establish. Only an explicit setting lets the caller supply
+        // the body itself — see ResolveSystemPromptBody.
+        var (body, demotedReplacement) = this.ResolveSystemPromptBody(definition, request.SystemPrompt, subagentType);
+
         var systemPrompt = prefix
-            + definition.SystemPromptBody
+            + body
             + "\n\n# Environment\nWorking directory: "
             + this.baseOptions.WorkingDirectory;
 
+        // A replacement the session refused still reaches the subagent, just behind the definition
+        // rather than instead of it. It goes ahead of the explicit append because that is the order
+        // the caller asked for: the broader instruction first, the addition after it.
+        if (demotedReplacement is not null)
+        {
+            systemPrompt += "\n\n" + demotedReplacement;
+        }
+
+        if (request.SystemPrompt?.Append is { } callerAppend && !string.IsNullOrWhiteSpace(callerAppend))
+        {
+            systemPrompt += "\n\n" + callerAppend;
+        }
+
         // SubagentStart hook: fires before the first model call. Fail-closed: a broken hook
         // blocks the subagent from running so it can never run unshaped.
-        var effectivePrompt = prompt;
+        var effectivePrompt = request.Prompt;
         var effectiveParentRestriction = parentToolRestriction;
         string? appendSystemPromptFromHook = null;
 
         if (this.userHooks is { HasSubagentStart: true })
         {
             var parentTaskId = this.tasks.Find(taskId)?.ParentId;
-            var childTools = ResolveChildTools(this.subagentTools, definition.ReadOnlyToolsOnly, depth);
+            var childTools = ResolveChildTools(this.subagentTools, definition.ReadOnlyToolsOnly, depth, this.tasks.MaxSubagentDepth);
             var toolNames = childTools.All.Select(static t => t.Name).ToList();
 
             SubagentStartResult startResult;
@@ -188,6 +243,8 @@ public sealed class SubagentHost : ISubagentHost
 
         if (appendSystemPromptFromHook is not null)
         {
+            // Last, always: an operator's hook must be able to constrain both the definition and
+            // whatever the calling agent asked for.
             systemPrompt += "\n\n" + appendSystemPromptFromHook;
         }
 
@@ -209,9 +266,9 @@ public sealed class SubagentHost : ISubagentHost
             ? ToolActivityContext.CreateRoot()
             : parentActivity.ForSubagent(taskId);
         var readOnlyDefinition = definition.ReadOnlyToolsOnly;
-        var tools = ResolveChildTools(this.subagentTools, readOnlyDefinition, depth);
+        var tools = ResolveChildTools(this.subagentTools, readOnlyDefinition, depth, this.tasks.MaxSubagentDepth);
 
-        var atMaxDepth = depth >= TaskManager.MaxSubagentDepth;
+        var atMaxDepth = depth >= this.tasks.MaxSubagentDepth;
 
         // A depth-1 child may create depth-2 grandchildren (so it gets this host); a depth-2
         // grandchild — and any read-only child — receives no host and no task-creation tools, so
@@ -296,6 +353,45 @@ public sealed class SubagentHost : ISubagentHost
     }
 
     /// <summary>
+    /// Decides what the subagent's system-prompt body is: the definition's own text, or the
+    /// caller's when the session explicitly allows replacement.
+    /// </summary>
+    /// <returns>
+    /// The body to use, and — when a replacement was asked for but refused — the caller's text to
+    /// append behind the definition instead.
+    /// </returns>
+    /// <remarks>
+    /// Refusing by demotion rather than by dropping is deliberate. Dropping loses information the
+    /// caller thought it had passed on, and failing the launch turns a permission question into an
+    /// error the model cannot fix; appending keeps the caller's intent while leaving the definition
+    /// in charge.
+    /// </remarks>
+    private (string Body, string? DemotedReplacement) ResolveSystemPromptBody(
+        SubagentDefinition definition,
+        SubagentSystemPrompt? requested,
+        string subagentType)
+    {
+        if (requested?.Replacement is not { } replacement || string.IsNullOrWhiteSpace(replacement))
+        {
+            return (definition.SystemPromptBody, null);
+        }
+
+        if (this.SubagentSettings.AllowSystemPromptReplacement)
+        {
+            return (replacement, null);
+        }
+
+        this.LogSystemPromptReplacementRefused(subagentType);
+        return (definition.SystemPromptBody, replacement);
+    }
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "subagent '{subagentType}' asked to replace its system prompt, which this session does not " +
+                  "allow; appending the text instead. Set subagents.allowSystemPromptReplacement to enable it.")]
+    private partial void LogSystemPromptReplacementRefused(string subagentType);
+
+    /// <summary>
     /// Computes a child's advertised tool set. A read-only definition (e.g. Explore) or a
     /// grandchild at <see cref="TaskManager.MaxSubagentDepth"/> receives NO runtime
     /// task-management tools at all — neither the creation tools (<c>task</c>/<c>task_start</c>)
@@ -303,10 +399,10 @@ public sealed class SubagentHost : ISubagentHost
     /// <c>task_*</c> runtime tool) — so it can neither spawn children nor read or stop any task
     /// in the session. A depth-1 general-purpose child keeps them to manage its own descendants.
     /// </summary>
-    internal static ToolRegistry ResolveChildTools(ToolRegistry subagentTools, bool readOnlyDefinition, int depth)
+    internal static ToolRegistry ResolveChildTools(ToolRegistry subagentTools, bool readOnlyDefinition, int depth, int maxDepth = TaskManager.DefaultMaxSubagentDepth)
     {
         var baseTools = readOnlyDefinition ? subagentTools.ReadOnly() : subagentTools;
-        var denyTaskManagement = readOnlyDefinition || depth >= TaskManager.MaxSubagentDepth;
+        var denyTaskManagement = readOnlyDefinition || depth >= maxDepth;
         return denyTaskManagement ? StripTaskManagementTools(baseTools) : baseTools;
     }
 
@@ -315,8 +411,8 @@ public sealed class SubagentHost : ISubagentHost
     /// <see cref="TaskManager.MaxSubagentDepth"/>) lose all task-management tools; shallower
     /// children keep them. Read-only definitions are handled by <see cref="ResolveChildTools"/>.
     /// </summary>
-    internal static ToolRegistry SelectChildTools(ToolRegistry tools, int depth) =>
-        depth >= TaskManager.MaxSubagentDepth
+    internal static ToolRegistry SelectChildTools(ToolRegistry tools, int depth, int maxDepth = TaskManager.DefaultMaxSubagentDepth) =>
+        depth >= maxDepth
             ? StripTaskManagementTools(tools)
             : tools;
 

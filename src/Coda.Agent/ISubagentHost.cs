@@ -51,4 +51,31 @@ public interface ISubagentHost
         TurnShape? parentToolRestriction,
         CancellationToken cancellationToken = default) =>
         RunSubagentAsync(subagentType, prompt, sink, steering, taskId, depth, parentActivity, cancellationToken);
+
+    /// <summary>
+    /// Runs a nested subagent from a single request object. This is the overload the task manager
+    /// calls, and the only one that carries the caller's system-prompt influence
+    /// (<see cref="SubagentRequest.SystemPrompt"/>).
+    /// </summary>
+    /// <remarks>
+    /// The default implementation forwards to the positional overload and therefore drops the
+    /// system-prompt influence. That is deliberate: a third-party host that predates this overload
+    /// never supported caller-supplied prompt text, and silently ignoring it is safer than having
+    /// the interface pretend it was applied.
+    /// </remarks>
+    Task<string> RunSubagentAsync(
+        SubagentRequest request,
+        IAgentSink sink,
+        SteeringInbox steering,
+        CancellationToken cancellationToken = default) =>
+        RunSubagentAsync(
+            request.SubagentType,
+            request.Prompt,
+            sink,
+            steering,
+            request.TaskId,
+            request.Depth,
+            request.ParentActivity,
+            request.ParentToolRestriction,
+            cancellationToken);
 }

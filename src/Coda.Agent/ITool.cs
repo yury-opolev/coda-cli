@@ -56,6 +56,12 @@ public sealed record ToolContext(string WorkingDirectory)
     /// <summary>Nesting depth: 0 at the main agent, 1 for a child subagent, 2 for a grandchild.</summary>
     public int CurrentDepth { get; init; }
 
+    /// <summary>
+    /// The deepest nesting this session allows. Read from here rather than from a constant so a session
+    /// can be configured to go deeper (or shallower) than the default.
+    /// </summary>
+    public int MaxSubagentDepth { get; init; } = Coda.Agent.Tasks.TaskManager.DefaultMaxSubagentDepth;
+
     /// <summary>LSP server manager for code-intelligence operations; null when no LSP servers are configured.</summary>
     public LspServerManager? Lsp { get; init; }
 

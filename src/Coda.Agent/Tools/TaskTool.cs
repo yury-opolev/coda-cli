@@ -20,7 +20,7 @@ public sealed class TaskTool : ITool
         "Use subagent_type=\"explore\" for read-only research tasks.";
 
     public string InputSchemaJson => """
-        {"type":"object","properties":{"description":{"type":"string","description":"3-5 word task summary"},"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default, full tools) or \"explore\" (read-only research — read_file/list_dir/glob/grep/web_fetch/web_search only; makes no changes, reports findings)."}},"required":["description","prompt"]}
+        {"type":"object","properties":{"description":{"type":"string","description":"3-5 word task summary"},"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default, full tools) or \"explore\" (read-only research — read_file/list_dir/glob/grep/web_fetch/web_search only; makes no changes, reports findings)."},"system_prompt_append":{"type":"string","description":"Extra standing instructions for the subagent, appended to its system prompt. The subagent type's own instructions always come first and are never replaced."},"system_prompt":{"type":"string","description":"Replaces the subagent type's own instructions entirely. Only honoured when subagents.allowSystemPromptReplacement is enabled in settings; otherwise it is appended like system_prompt_append. Prefer system_prompt_append."}},"required":["description","prompt"]}
         """;
 
     // Launching is not itself a mutating action; the subagent's own mutating tools
@@ -34,7 +34,7 @@ public sealed class TaskTool : ITool
             return new ToolResult("Subagents are not available in this context.", IsError: true);
         }
 
-        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        if (context.CurrentDepth >= context.MaxSubagentDepth)
         {
             return new ToolResult(
                 "Cannot launch a subagent from here: the maximum subagent nesting depth has been reached.",
@@ -50,6 +50,19 @@ public sealed class TaskTool : ITool
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
         var description = ToolInput.GetString(input, "description") ?? subagentType;
         var parentSink = context.Sink ?? NullAgentSink.Instance;
+        var systemPrompt = SubagentPromptInput.Read(input);
+
+        // Fan-out is bounded per session. Taken here rather than inside the task manager so the
+        // refusal reaches the model as a plain tool error it can act on, before any task is
+        // registered — a refused launch leaves no trace in the task list.
+        if (!context.Tasks.TryAcquireSubagentSlot())
+        {
+            return new ToolResult(
+                $"Cannot launch a subagent: all {context.Tasks.MaxConcurrentSubagents} concurrent subagent " +
+                "slots are in use (subagents.maxConcurrent). Wait for a running subagent to finish, or raise " +
+                "the limit in settings.",
+                IsError: true);
+        }
 
         string report;
         try
@@ -64,6 +77,7 @@ public sealed class TaskTool : ITool
                     context.CurrentTaskId,
                     parentActivity: context.ToolActivity,
                     parentRestriction: context.ParentToolRestriction,
+                    systemPrompt: systemPrompt,
                     cancellationToken: cancellationToken)
                 .ConfigureAwait(false);
         }
@@ -72,6 +86,10 @@ public sealed class TaskTool : ITool
             // A SubagentStart hook (fail-closed) blocked this subagent. Return the reason as an
             // error result so the parent agent sees an explicit rejection rather than a crash.
             return new ToolResult(ex.Message, IsError: true);
+        }
+        finally
+        {
+            context.Tasks.ReleaseSubagentSlot();
         }
 
         return new ToolResult(report);

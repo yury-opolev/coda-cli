@@ -26,6 +26,8 @@ namespace Coda.Agent.Hooks;
 public sealed partial class AgentHookHandler : IHookHandler
 {
     private readonly ISubagentHost subagentHost;
+    private readonly TaskManager? tasks;
+    private readonly int maxSubagentDepth;
     private readonly ILogger logger;
 
     /// <summary>
@@ -36,9 +38,17 @@ public sealed partial class AgentHookHandler : IHookHandler
     /// Using a host with hooks would cause infinite recursion on hook-triggering events.
     /// </param>
     /// <param name="logger">Logger for warnings and informational messages.</param>
-    public AgentHookHandler(ISubagentHost subagentHost, ILogger? logger = null)
+    /// <param name="tasks">
+    /// The session's task manager, the single source of the subagent limits this handler must
+    /// respect — nesting depth and the shared fan-out budget. Null falls back to
+    /// <see cref="TaskManager.DefaultMaxSubagentDepth"/> and an unbounded fan-out, which keeps
+    /// standalone construction (tests, embedders) working unchanged.
+    /// </param>
+    public AgentHookHandler(ISubagentHost subagentHost, ILogger? logger = null, TaskManager? tasks = null)
     {
         this.subagentHost = subagentHost ?? throw new ArgumentNullException(nameof(subagentHost));
+        this.tasks = tasks;
+        this.maxSubagentDepth = tasks?.MaxSubagentDepth ?? TaskManager.DefaultMaxSubagentDepth;
         this.logger = logger ?? NullLogger.Instance;
     }
 
@@ -53,9 +63,9 @@ public sealed partial class AgentHookHandler : IHookHandler
 
         var currentDepth = ExtractDepthFromPayload(payload);
 
-        if (currentDepth >= TaskManager.MaxSubagentDepth)
+        if (currentDepth >= this.maxSubagentDepth)
         {
-            this.LogDepthLimitExceeded(hook.AgentType ?? "agent", currentDepth, TaskManager.MaxSubagentDepth);
+            this.LogDepthLimitExceeded(hook.AgentType ?? "agent", currentDepth, this.maxSubagentDepth);
             return HookOutput.NoOp;
         }
 
@@ -64,16 +74,33 @@ public sealed partial class AgentHookHandler : IHookHandler
         var taskId = Guid.NewGuid().ToString("N");
         var subagentDepth = currentDepth + 1;
 
-        var result = await this.subagentHost.RunSubagentAsync(
-            agentType,
-            subagentPrompt,
-            NullSink.Instance,
-            new SteeringInbox(),
-            taskId,
-            subagentDepth,
-            ct).ConfigureAwait(false);
+        // Hook subagents draw on the same session-wide fan-out budget as the task tools, so a
+        // chatty hook cannot crowd out the work the user actually asked for. Fail-open: a hook
+        // that cannot run right now is a no-op, matching how a broken agent hook already behaves,
+        // rather than failing the event it was inspecting.
+        if (this.tasks is { } manager && !manager.TryAcquireSubagentSlot())
+        {
+            this.LogConcurrencyLimitExceeded(agentType, manager.MaxConcurrentSubagents);
+            return HookOutput.NoOp;
+        }
 
-        return ParseAgentResult(result);
+        try
+        {
+            var result = await this.subagentHost.RunSubagentAsync(
+                agentType,
+                subagentPrompt,
+                NullSink.Instance,
+                new SteeringInbox(),
+                taskId,
+                subagentDepth,
+                ct).ConfigureAwait(false);
+
+            return ParseAgentResult(result);
+        }
+        finally
+        {
+            this.tasks?.ReleaseSubagentSlot();
+        }
     }
 
     /// <summary>
@@ -126,6 +153,11 @@ public sealed partial class AgentHookHandler : IHookHandler
         Message = "agent hook '{agentType}' skipped at depth {currentDepth}: " +
                   "would exceed max subagent depth {maxDepth}")]
     private partial void LogDepthLimitExceeded(string agentType, int currentDepth, int maxDepth);
+
+    [LoggerMessage(
+        Level = LogLevel.Warning,
+        Message = "agent hook '{agentType}' skipped: all {maxConcurrent} concurrent subagent slots are in use")]
+    private partial void LogConcurrencyLimitExceeded(string agentType, int maxConcurrent);
 
     /// <summary>Exposed for testing: the subagent host used for agent hook evaluation.</summary>
     internal ISubagentHost SubagentHostForTest => this.subagentHost;

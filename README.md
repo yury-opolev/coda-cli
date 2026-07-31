@@ -82,9 +82,11 @@ Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
   **process-local** — they do **not** survive across processes, and the manager
   stops every task when Coda exits.
 - **Subagents** — delegate a self-contained subtask with `task`, which runs a nested
-  agent loop in its own context with a scoped toolset. Nesting is bounded (main
-  agent at depth 0, subagents at depth 1 and 2); the main agent can inspect and
-  steer every task, while a subagent can only see and act on its own descendants.
+  agent loop in its own context with a scoped toolset. Nesting and fan-out are
+  bounded (by default the main agent at depth 0 with subagents at depth 1 and 2, and
+  8 subagents running at once), both configurable via the
+  [`subagents` settings block](#subagent-limits--prompts). The main agent can inspect
+  and steer every task, while a subagent can only see and act on its own descendants.
 - **Code intelligence (LSP)** — when language servers are configured, an `lsp` tool
   provides definitions/references/hover/symbols/diagnostics.
 - **MCP** — drop a `.mcp.json` in the working dir and Coda connects the servers,
@@ -381,7 +383,9 @@ Once connected, just type a message. Coda streams the assistant reply and runs a
 - read-only (automatic): `read_file`, `list_dir`, `glob`, `grep`
 - permission-gated: `edit_file`, `write_file`, `run_command`
 - `task` — delegate a self-contained subtask to a **subagent** (a nested agent loop
-  with the file/command tools but not `task`; it streams its work and reports back)
+  with the file/command tools but not `task`; it streams its work and reports back).
+  `system_prompt_append` adds standing instructions for it — see
+  [Subagent limits & prompts](#subagent-limits--prompts)
 - any tools from configured **MCP servers** (below), as `mcp__<server>__<tool>`
 
 All file tools are sandboxed to the working directory (symlink-aware). `/model`
@@ -833,7 +837,7 @@ project files if they exist (it never writes to them).
 
 | What | Location | Notes |
 |---|---|---|
-| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers |
+| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers, subagent limits |
 | Project settings | `<project>/.coda/settings.json` | overrides user settings |
 | Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
 | Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |
@@ -843,6 +847,55 @@ project files if they exist (it never writes to them).
 | MCP servers | `~/.coda/.mcp.json`, `<project>/.mcp.json` | stdio + HTTP; project overrides user |
 | Session memory | `<project>/.coda/SESSION_MEMORY.md` | when enabled |
 | Telemetry logs | `~/.coda/logs/coda-<timestamp>-<pid>.log` | JSON-lines; opt-in; secrets redacted |
+
+### Subagent limits & prompts
+
+How deep and how wide a session may fan out into subagents is configurable in
+`~/.coda/settings.json` (project file overrides user, field by field):
+
+```json
+{
+  "subagents": {
+    "maxDepth": 2,
+    "maxConcurrent": 8,
+    "allowSystemPromptReplacement": false
+  }
+}
+```
+
+| Field | Default | Effect |
+|---|---|---|
+| `maxDepth` | `2` | Deepest subagent nesting. The main agent is depth 0, so `2` permits a subagent and a grandchild. A subagent at the limit gets no task-management tools at all, so it cannot spawn or inspect anything. Clamped to `1`–`10`. |
+| `maxConcurrent` | `8` | How many subagents may run at once across the session, foreground and background together. The budget is session-wide and counts ancestors, so a running parent still holds a slot while its child asks for one. A launch that cannot get a slot is **refused, never queued** — the tool returns an error naming the limit so the model can wait, work inline, or explain why it cannot. Clamped to `1`–`64`. |
+| `allowSystemPromptReplacement` | `false` | Whether the `system_prompt` tool parameter (below) may replace a subagent's own instructions outright. **User file only** — a project file cannot set it in either direction, because `<project>/.coda/settings.json` belongs to whoever wrote the repo you cloned, and this is the one field that would hand a prompt-injected model the subagent's own instructions. |
+
+Both limits are **clamped on load**: a settings file can raise one within reason but
+never remove it. None of the three is reachable from tool input — the model cannot
+widen its own budget or ungate its own prompt.
+
+#### Influencing a subagent's system prompt
+
+`task` and `task_start` accept two optional parameters that let the delegating agent
+pass on standing instructions the subagent definition cannot know about:
+
+| Parameter | Effect |
+|---|---|
+| `system_prompt_append` | Appended behind whatever the system prompt body is. It never replaces anything itself, so on its own the subagent type's own instructions stay in front. Always available. |
+| `system_prompt` | Replaces the subagent type's own instructions entirely. Honoured **only** when `allowSystemPromptReplacement` is enabled; otherwise it is appended like `system_prompt_append` and a warning is logged. |
+
+The assembly order is fixed: **subagent definition → caller text → `SubagentStart`
+hook text**. That ordering is a security boundary, not formatting. Both parameters
+carry model-written text, and the subagent definition is what stands between that
+text and the subagent's tools — so caller text can only ever *add to* the
+definition's instructions, never get in front of them, and an operator's
+`SubagentStart` hook always has the final word.
+
+Replacement is off by default for the same reason: it hands that leading position to
+the caller. When it is enabled, the working-directory block still survives (factual
+context, not a guardrail). Either way this only ever changes **text** — the child's
+tool set, read-only status, depth and slot budget come from the subagent definition
+and settings, never from the prompt, so an `explore` subagent whose prompt has been
+replaced is still read-only.
 
 ### Tool display mode
 

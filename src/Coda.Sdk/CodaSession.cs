@@ -52,6 +52,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly TodoStore todos = new();
     private readonly ScheduledTaskStore schedules;
     private readonly TaskManager tasks;
+    private readonly Coda.Agent.Settings.SubagentSettings subagentSettings;
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
@@ -179,10 +180,17 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             this.sessionHooks.Source = src;
         }
+        // Loaded before the task manager because the manager's subagent limits come from it.
+        // Resolved once here rather than in each host (TUI/headless/serve): every host reaches the
+        // session through this constructor, so a host that forgets to pass the block still gets the
+        // configured limits instead of silently falling back to the defaults.
+        var settings = SettingsLoader.Load(options.WorkingDirectory);
+        this.subagentSettings = options.SubagentSettings ?? settings.Subagents;
+
         // The manager groups persistent task logs under the session id captured HERE. If the id
         // is later adopted (AdoptSessionId/Resume), the manager keeps this original grouping so
         // active task logs are never moved out from under open writers — see AdoptSessionId.
-        this.tasks = new TaskManager(this.SessionId);
+        this.tasks = new TaskManager(this.SessionId, subagentSettings: this.subagentSettings);
         if (httpClient is null)
         {
             // No HttpClient.Timeout: it would cap the TOTAL stream duration and kill a
@@ -199,10 +207,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         var schedulesPath = Path.Combine(options.WorkingDirectory, ".coda", "scheduled_tasks.json");
         this.schedules = new ScheduledTaskStore(schedulesPath);
 
-        // Load LSP servers from settings and merge with any plugin-contributed servers.
-        // Plugin keys are namespaced (plugin:<name>:<server>) so clashes with settings keys are rare;
-        // settings always win on exact-key clashes.
-        var settings = SettingsLoader.Load(options.WorkingDirectory);
+        // Load LSP servers from settings (loaded above) and merge with any plugin-contributed
+        // servers. Plugin keys are namespaced (plugin:<name>:<server>) so clashes with settings keys
+        // are rare; settings always win on exact-key clashes.
         // Use caller-provided hook list when available (supports /hooks enable/disable and
         // the shared run log). Preserve the mutable-list contract: when the caller already
         // gave us a List<UserHook>, reuse it so HookManagementService.SetEnabled mutations

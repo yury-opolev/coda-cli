@@ -5,7 +5,7 @@ namespace Coda.Sdk.Serve.Messages;
 /// <summary>
 /// Wire representation of a single scheduled task definition returned by
 /// <c>session/scheduleList</c> and <c>session/scheduleCreate</c>. A positional record with
-/// explicit camelCase <see cref="JsonPropertyName"/> attributes keeps the JSON shape stable —
+/// explicit camelCase <c>[JsonPropertyName]</c> attributes keeps the JSON shape stable —
 /// never a ValueTuple <c>Item1</c>/<c>Item2</c> projection. Optional fields are omitted from
 /// the wire when null.
 /// </summary>

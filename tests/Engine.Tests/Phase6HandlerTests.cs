@@ -737,7 +737,7 @@ public sealed class Phase6HandlerTests : IDisposable
         var hook = new UserHook("PreToolUse", null, HandlerType: "agent",
             HookPrompt: "Review this");
         // Depth is at the limit — subagent must NOT run.
-        var payload = $$$"""{"depth": {{{TaskManager.MaxSubagentDepth}}}}""";
+        var payload = $$$"""{"depth": {{{TaskManager.DefaultMaxSubagentDepth}}}}""";
         var output = await handler.HandleAsync(hook, payload, CancellationToken.None);
 
         Assert.Equal(0, subagentHost.CallCount);
@@ -752,7 +752,7 @@ public sealed class Phase6HandlerTests : IDisposable
 
         var hook = new UserHook("PreToolUse", null, HandlerType: "agent",
             HookPrompt: "Review this");
-        var payload = $$$"""{"depth": {{{TaskManager.MaxSubagentDepth + 1}}}}""";
+        var payload = $$$"""{"depth": {{{TaskManager.DefaultMaxSubagentDepth + 1}}}}""";
         var output = await handler.HandleAsync(hook, payload, CancellationToken.None);
 
         Assert.Equal(0, subagentHost.CallCount);

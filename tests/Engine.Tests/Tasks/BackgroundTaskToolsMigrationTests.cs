@@ -133,7 +133,7 @@ public sealed class BackgroundTaskToolsMigrationTests
     {
         using var mgr = NewManager();
         var tool = new BackgroundTaskStartTool();
-        var context = Context(tasks: mgr, host: new FakeHost("out"), currentDepth: TaskManager.MaxSubagentDepth);
+        var context = Context(tasks: mgr, host: new FakeHost("out"), currentDepth: TaskManager.DefaultMaxSubagentDepth);
 
         var result = await tool.ExecuteAsync(Json("""{"prompt":"go"}"""), context);
 

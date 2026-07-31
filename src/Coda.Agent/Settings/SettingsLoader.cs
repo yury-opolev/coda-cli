@@ -77,6 +77,8 @@ public static class SettingsLoader
 
         // Merge goal block per field: project overrides user, field by field.
         var goalMerged = MergeGoalSettings(userSettings.Goal, projectSettings.Goal);
+        var subagentsMerged = SubagentOverrides.Merge(
+            userSettings.SubagentOverrides, projectSettings.SubagentOverrides);
 
         // Telemetry: project block overrides user block wholesale (it is a single value object).
         var telemetry = projectSettings.Telemetry ?? userSettings.Telemetry;
@@ -97,6 +99,7 @@ public static class SettingsLoader
             && modelByProvider.Count == 0
             && githubEnterpriseDomain is null
             && goalMerged is null
+            && subagentsMerged is null
             && telemetry is null
             && userSettings.Theme is null
             && userSettings.ToolDisplayMode is null
@@ -152,6 +155,8 @@ public static class SettingsLoader
             ModelByProvider = modelByProvider,
             GitHubEnterpriseDomain = githubEnterpriseDomain,
             Goal = goalMerged,
+            SubagentOverrides = subagentsMerged,
+            Subagents = subagentsMerged?.ToSettings() ?? SubagentSettings.Default,
             Telemetry = telemetry,
             Theme = userSettings.Theme,
             ToolDisplayMode = userSettings.ToolDisplayMode,
@@ -181,6 +186,10 @@ public static class SettingsLoader
             // Parse lspServers from the raw JSON node to handle JsonNode? fields correctly.
             var lspServers = ParseLspServers(json);
 
+            // Parsed once: the raw overrides drive the per-field merge, the materialised settings
+            // are what a caller reads. Two calls could drift.
+            var subagentOverrides = ParseSubagentOverrides(doc?.Subagents);
+
             return new CodaSettings(allow, deny, hooks)
             {
                 LspServers = lspServers,
@@ -188,6 +197,8 @@ public static class SettingsLoader
                 ModelByProvider = ParseModelByProvider(doc?.ModelByProvider),
                 GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
+                SubagentOverrides = subagentOverrides,
+                Subagents = subagentOverrides?.ToSettings() ?? SubagentSettings.Default,
                 Telemetry = ParseTelemetry(doc?.Telemetry),
                 Theme = NullIfBlank(doc?.Theme),
                 ToolDisplayMode = MigrateDisplayMode(doc?.ToolDisplayMode),
@@ -368,6 +379,12 @@ public static class SettingsLoader
 
         return [];
     }
+
+    /// <summary>Reads the <c>subagents</c> block, keeping absent fields null so the merge stays per field.</summary>
+    private static SubagentOverrides? ParseSubagentOverrides(SubagentSection? section) =>
+        section is null
+            ? null
+            : new SubagentOverrides(section.MaxDepth, section.MaxConcurrent, section.AllowSystemPromptReplacement);
 
     private static GoalSettings? ParseGoalSettings(GoalSection? section)
     {
@@ -603,6 +620,9 @@ public static class SettingsLoader
         public Dictionary<string, string>? ModelByProvider { get; set; }
         public string? GithubEnterpriseDomain { get; set; }
         public GoalSection? Goal { get; set; }
+
+        [JsonPropertyName("subagents")]
+        public SubagentSection? Subagents { get; set; }
         public TelemetrySection? Telemetry { get; set; }
         [JsonPropertyName("theme")]
         public string? Theme { get; set; }
@@ -625,6 +645,18 @@ public static class SettingsLoader
         public int? MaxContinuations { get; set; }
         public bool? AutoCompact { get; set; }
         public double? ExtensionFraction { get; set; }
+    }
+
+    private sealed class SubagentSection
+    {
+        [JsonPropertyName("maxDepth")]
+        public int? MaxDepth { get; set; }
+
+        [JsonPropertyName("maxConcurrent")]
+        public int? MaxConcurrent { get; set; }
+
+        [JsonPropertyName("allowSystemPromptReplacement")]
+        public bool? AllowSystemPromptReplacement { get; set; }
     }
 
     private sealed class TelemetrySection

@@ -52,7 +52,7 @@ public sealed record SessionExitSnapshot
 
     /// <summary>
     /// Projects an immutable snapshot from live session state. <paramref name="context"/> is the
-    /// most recent cached report (<see cref="ContextSnapshotCache.Current"/>) or null; no new
+    /// most recent cached report (<c>ContextSnapshotCache.Current</c>) or null; no new
     /// analysis is performed. <paramref name="catalog"/> defaults to <see cref="ModelCatalog.Default"/>.
     /// </summary>
     public static SessionExitSnapshot Create(
