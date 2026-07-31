@@ -51,6 +51,18 @@ public sealed class TaskTool : ITool
         var description = ToolInput.GetString(input, "description") ?? subagentType;
         var parentSink = context.Sink ?? NullAgentSink.Instance;
 
+        // Fan-out is bounded per session. Taken here rather than inside the task manager so the
+        // refusal reaches the model as a plain tool error it can act on, before any task is
+        // registered — a refused launch leaves no trace in the task list.
+        if (!context.Tasks.TryAcquireSubagentSlot())
+        {
+            return new ToolResult(
+                $"Cannot launch a subagent: all {context.Tasks.MaxConcurrentSubagents} concurrent subagent " +
+                "slots are in use (subagents.maxConcurrent). Wait for a running subagent to finish, or raise " +
+                "the limit in settings.",
+                IsError: true);
+        }
+
         string report;
         try
         {
@@ -72,6 +84,10 @@ public sealed class TaskTool : ITool
             // A SubagentStart hook (fail-closed) blocked this subagent. Return the reason as an
             // error result so the parent agent sees an explicit rejection rather than a crash.
             return new ToolResult(ex.Message, IsError: true);
+        }
+        finally
+        {
+            context.Tasks.ReleaseSubagentSlot();
         }
 
         return new ToolResult(report);

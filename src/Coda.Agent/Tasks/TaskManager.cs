@@ -36,8 +36,12 @@ public sealed partial class TaskManager : IDisposable
     private readonly List<TaskSubscription> _subs = new();
     private readonly long _outputRingBytes;
     private readonly int _maxRetainedTerminalTasks;
-    private readonly SemaphoreSlim _subagentSlots;
-    private int _nextId;
+
+    // Never disposed, deliberately. A background subagent returns its slot after the manager has
+    // shut down, and disposing the semaphore would turn that release into an ObjectDisposedException
+    // on a pool thread. SemaphoreSlim holds no unmanaged resource unless AvailableWaitHandle is
+    // touched, which nothing here does.
+    private readonly SemaphoreSlim _subagentSlots;    private int _nextId;
     private bool _idleLeaseHeld;
 
     /// <summary>

@@ -90,13 +90,19 @@ public sealed partial class TaskManager
     /// Registers a background subagent task, starts it on the thread pool, and returns its id
     /// immediately. Progress is polled via <c>task_output</c> and cancelled via <c>task_stop</c>.
     /// </summary>
+    /// <param name="holdsSubagentSlot">
+    /// True when the caller already took a slot from <see cref="TryAcquireSubagentSlot"/> for this
+    /// run. The background run then returns it when the subagent finishes, because the caller is
+    /// long gone by then and cannot release it itself.
+    /// </param>
     public string StartSubagentBackground(
         ISubagentHost host,
         string subagentType,
         string prompt,
         string description,
         string? parentTaskId,
-        TurnShape? parentRestriction = null)
+        TurnShape? parentRestriction = null,
+        bool holdsSubagentSlot = false)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Background);
         var steering = new SteeringInbox();
@@ -119,6 +125,13 @@ public sealed partial class TaskManager
             catch (Exception ex)
             {
                 Fail(task.Id, ex.Message);
+            }
+            finally
+            {
+                if (holdsSubagentSlot)
+                {
+                    ReleaseSubagentSlot();
+                }
             }
         });
 

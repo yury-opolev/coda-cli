@@ -46,7 +46,37 @@ public sealed class BackgroundTaskStartTool : ITool
         }
 
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
-        var id = context.Tasks.StartSubagentBackground(context.Subagents, subagentType, prompt, subagentType, context.CurrentTaskId, context.ParentToolRestriction);
+
+        // Same session-wide fan-out budget as the foreground task tool. The slot is handed to the
+        // background run, which returns it when the subagent finishes — this tool returns long
+        // before that, so it cannot release the slot itself.
+        if (!context.Tasks.TryAcquireSubagentSlot())
+        {
+            return Task.FromResult(new ToolResult(
+                $"Cannot start a background subagent: all {context.Tasks.MaxConcurrentSubagents} concurrent " +
+                "subagent slots are in use (subagents.maxConcurrent). Wait for a running subagent to finish, " +
+                "or raise the limit in settings.",
+                IsError: true));
+        }
+
+        string id;
+        try
+        {
+            id = context.Tasks.StartSubagentBackground(
+                context.Subagents,
+                subagentType,
+                prompt,
+                subagentType,
+                context.CurrentTaskId,
+                context.ParentToolRestriction,
+                holdsSubagentSlot: true);
+        }
+        catch
+        {
+            // The run never started, so nothing will ever release the slot for us.
+            context.Tasks.ReleaseSubagentSlot();
+            throw;
+        }
 
         return Task.FromResult(new ToolResult(
             $"Started background task {id}. Use task_output to read its progress."));
