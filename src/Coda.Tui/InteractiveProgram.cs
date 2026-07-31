@@ -742,12 +742,24 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             onExhausted: () => agentRunner.SetSessionEndReason("error")).ConfigureAwait(false);
     }
 
-    internal static SessionState CreateSessionState(string providerId, TuiLaunchOptions options) =>
-        new(providerId)
+    internal static SessionState CreateSessionState(string providerId, TuiLaunchOptions options)
+    {
+        var session = new SessionState(providerId)
         {
             StartupSystemPromptOverride = options.SystemPromptOverride,
             SystemPromptOverride = options.SystemPromptOverride,
+            EnableBypassClassifier = options.EnableBypassClassifier,
         };
+
+        // A launch-time --yolo / --permission-mode sets the session's mode exactly as /yolo or
+        // /permissions would, so the flag and the command cannot disagree.
+        if (options.PermissionMode is { } mode)
+        {
+            session.PermissionMode = mode;
+        }
+
+        return session;
+    }
 
     /// <summary>
     /// Seeds <paramref name="session"/>.<see cref="SessionState.EffortByModel"/> from
