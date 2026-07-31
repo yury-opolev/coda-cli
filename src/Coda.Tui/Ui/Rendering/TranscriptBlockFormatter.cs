@@ -468,6 +468,10 @@ public static class TranscriptBlockFormatter
     private static bool IsTerminalStatus(ToolCallStatus status) =>
         status is ToolCallStatus.Succeeded or ToolCallStatus.Failed or ToolCallStatus.Cancelled or ToolCallStatus.Skipped;
 
+    /// <summary>Returns true when <paramref name="status"/> means the call did not succeed.</summary>
+    private static bool IsErrorStatus(ToolCallStatus status) =>
+        status is ToolCallStatus.Failed or ToolCallStatus.Cancelled;
+
     /// <summary>
     /// The canonical semantic style for each <c>/context</c> category: a distinct, shape-legible glyph and
     /// the semantic role that colors its line. Exposed so tests can assert every category maps to a distinct
@@ -897,7 +901,7 @@ public static class TranscriptBlockFormatter
         }
     }
 
-    private static void AppendDiff(List<TranscriptRenderLine> lines, string patch, int width)
+    private static void AppendDiff(List<TranscriptRenderLine> lines, string patch, int width, bool embedded = false)
     {
         // A patch is untrusted: its content is whatever the files in the user's repository contain, and
         // its paths are whatever they are named. Strip escapes, controls and bidi overrides before any of
@@ -924,7 +928,7 @@ public static class TranscriptBlockFormatter
 
         foreach (var file in files)
         {
-            AppendDiffFile(lines, file, width);
+            AppendDiffFile(lines, file, width, embedded);
         }
     }
 
@@ -944,7 +948,7 @@ public static class TranscriptBlockFormatter
     /// diff background colour.</description></item>
     /// </list>
     /// </summary>
-    private static void AppendDiffFile(List<TranscriptRenderLine> lines, DiffFile file, int width)
+    private static void AppendDiffFile(List<TranscriptRenderLine> lines, DiffFile file, int width, bool embedded = false)
     {
         // ── File header row ────────────────────────────────────────────────
         // "Update(path)", "Create(path)", or "Delete(path)" depending on the change kind.
@@ -956,21 +960,28 @@ public static class TranscriptBlockFormatter
             _ => "Update",
         };
 
+        // Embedded in a tool result the diff is already a child of something: the caller owns the gutter,
+        // so no marker or connector is claimed here and the rows are left for its own tagging pass.
+        var headerReserve = embedded ? 0 : TranscriptGlyphs.MarkerCells;
+
         var headerStart = lines.Count;
         // Wrap at (width − MarkerCells) so that after ApplyGutters prepends " ● " the row still fits.
         AppendWrapped(
             lines,
             $"{kindLabel}({file.Path})",
-            width - TranscriptGlyphs.MarkerCells,
+            width - headerReserve,
             TranscriptRole.DiffHeader);
 
         // Tag header rows: first = AgentComplete, wraps = Continuation.
-        for (var i = headerStart; i < lines.Count; i++)
+        if (!embedded)
         {
-            lines[i] = lines[i] with
+            for (var i = headerStart; i < lines.Count; i++)
             {
-                Gutter = i == headerStart ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.Continuation,
-            };
+                lines[i] = lines[i] with
+                {
+                    Gutter = i == headerStart ? TranscriptGutterKind.AgentComplete : TranscriptGutterKind.Continuation,
+                };
+            }
         }
 
         // ── Summary row ────────────────────────────────────────────────────
@@ -979,17 +990,20 @@ public static class TranscriptBlockFormatter
         AppendWrapped(
             lines,
             $"Added {file.Added} lines, removed {file.Removed} lines",
-            width - TranscriptGlyphs.ChildCells,
+            width - (embedded ? 0 : TranscriptGlyphs.ChildCells),
             TranscriptRole.DiffContext);
 
         // The summary is always the last tree-connected child of the header. Only its FIRST row carries
         // the terminating connector — a wrapped summary would otherwise repeat "└ " on every row.
-        for (var i = summaryStart; i < lines.Count; i++)
+        if (!embedded)
         {
-            lines[i] = lines[i] with
+            for (var i = summaryStart; i < lines.Count; i++)
             {
-                Gutter = i == summaryStart ? TranscriptGutterKind.LastChild : TranscriptGutterKind.ChildContinuation,
-            };
+                lines[i] = lines[i] with
+                {
+                    Gutter = i == summaryStart ? TranscriptGutterKind.LastChild : TranscriptGutterKind.ChildContinuation,
+                };
+            }
         }
 
         if (file.Lines.IsEmpty)
@@ -1260,17 +1274,42 @@ public static class TranscriptBlockFormatter
         if (toolDisplayMode == ToolDisplayMode.Full && tool.Result is { Length: > 0 } result)
         {
             var resultStart = lines.Count;
-            // Tool output is untrusted: strip escapes, controls and bidi overrides before it reaches the
-            // terminal, matching how the correlated-activity path already treats a result.
-            foreach (var line in SplitLines(TerminalTextSanitizer.Sanitize(result)))
-            {
-                foreach (var wrapped in WrapPreformatted(line, width))
-                {
-                    lines.Add(new TranscriptRenderLine(wrapped, role));
-                }
-            }
-
+            AppendToolResultBody(lines, result, width, role, tool.IsError);
             TagChildRows(lines, resultStart);
+        }
+    }
+
+    /// <summary>
+    /// Renders a tool's result, giving a real unified diff the same rich treatment <c>/diff</c> gets.
+    /// </summary>
+    /// <remarks>
+    /// A patch reaches the transcript by more than one route: the agent runs <c>git diff</c> through a
+    /// shell tool, or a tool returns a patch of its own. Recognising it here means the rendering follows
+    /// the content rather than the command that happened to produce it. An error result is always left
+    /// as text — a failure message is the thing worth reading, and re-interpreting it would bury it.
+    /// </remarks>
+    private static void AppendToolResultBody(
+        List<TranscriptRenderLine> lines,
+        string result,
+        int width,
+        TranscriptRole role,
+        bool isError)
+    {
+        if (!isError && UnifiedDiffParser.LooksLikeDiff(result))
+        {
+            // AppendDiff sanitises the patch itself, and embedded mode leaves the gutter to the caller.
+            AppendDiff(lines, result, width, embedded: true);
+            return;
+        }
+
+        // Tool output is untrusted: strip escapes, controls and bidi overrides before it reaches the
+        // terminal, matching how the correlated-activity path already treats a result.
+        foreach (var line in SplitLines(TerminalTextSanitizer.Sanitize(result)))
+        {
+            foreach (var wrapped in WrapPreformatted(line, width))
+            {
+                lines.Add(new TranscriptRenderLine(wrapped, role));
+            }
         }
     }
 
@@ -1523,7 +1562,7 @@ public static class TranscriptBlockFormatter
             var childStart = lines.Count;
             if (!string.IsNullOrEmpty(call.Result))
             {
-                AppendPreformatted(lines, TerminalTextSanitizer.Sanitize(call.Result), width, role);
+                AppendToolResultBody(lines, call.Result, width, role, IsErrorStatus(call.Status));
             }
 
             if (!string.IsNullOrEmpty(call.Error))
