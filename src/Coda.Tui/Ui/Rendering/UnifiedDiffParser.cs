@@ -103,6 +103,46 @@ public static class UnifiedDiffParser
         RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline);
 
     /// <summary>
+    /// The char index at which the diff proper begins — the first <c>diff --git</c>, <c>--- </c> or
+    /// <c>@@ </c> line — so a caller can keep whatever came before it.
+    /// </summary>
+    /// <remarks>
+    /// A patch is rarely alone: <c>git show</c> and <c>git log -p</c> put a commit header, author, date
+    /// and message in front of it. Rendering the diff must not cost that text, so the preamble is
+    /// identified rather than discarded. Returns 0 when the text begins with the diff, and -1 when there
+    /// is no diff in it at all.
+    /// </remarks>
+    public static int FindDiffStart(string? text)
+    {
+        if (string.IsNullOrEmpty(text))
+        {
+            return -1;
+        }
+
+        var lineStart = 0;
+        while (lineStart <= text.Length)
+        {
+            var lineEnd = text.IndexOf('\n', lineStart);
+            var length = (lineEnd < 0 ? text.Length : lineEnd) - lineStart;
+            var line = text.AsSpan(lineStart, length).TrimEnd('\r');
+
+            if (line.StartsWith("diff --git ") || line.StartsWith("--- ") || line.StartsWith("@@ "))
+            {
+                return lineStart;
+            }
+
+            if (lineEnd < 0)
+            {
+                return -1;
+            }
+
+            lineStart = lineEnd + 1;
+        }
+
+        return -1;
+    }
+
+    /// <summary>
     /// Whether <paramref name="text"/> is a unified diff, as opposed to text that merely resembles one.
     /// </summary>
     /// <remarks>
