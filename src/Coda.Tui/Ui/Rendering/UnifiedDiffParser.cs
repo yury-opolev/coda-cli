@@ -96,6 +96,40 @@ public static class UnifiedDiffParser
         @"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$",
         RegexOptions.Compiled | RegexOptions.CultureInvariant);
 
+    // The same shape as HunkHeaderRegex but matched against a whole document, to answer "is this a diff
+    // at all?" without splitting the text first.
+    private static readonly Regex AnyHunkHeaderRegex = new(
+        @"^@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@",
+        RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.Multiline);
+
+    /// <summary>
+    /// Whether <paramref name="text"/> is a unified diff, as opposed to text that merely resembles one.
+    /// </summary>
+    /// <remarks>
+    /// Used to decide whether output that arrived by some other route — a <c>git diff</c> the agent ran
+    /// through a shell tool, say — deserves the rich diff rendering. The test is deliberately strict:
+    /// prose, logs and code are full of lines beginning <c>-</c>, <c>+</c> or <c>---</c>, so a well-formed
+    /// hunk header is required as well as at least one file the parser could actually make sense of.
+    /// Mis-detecting here would mangle ordinary output, which is far worse than missing a diff.
+    /// </remarks>
+    public static bool LooksLikeDiff(string? text)
+    {
+        if (string.IsNullOrEmpty(text) || !AnyHunkHeaderRegex.IsMatch(text))
+        {
+            return false;
+        }
+
+        foreach (var file in Parse(text))
+        {
+            if (!file.Lines.IsDefaultOrEmpty)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     /// <summary>
     /// Parses <paramref name="patch"/> into an ordered list of <see cref="DiffFile"/> entries.
     /// Returns an empty list for null, empty, or non-diff input without throwing.
