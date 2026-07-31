@@ -53,7 +53,7 @@ internal sealed class ShellCommandChordState
     internal static readonly TimeSpan ConfirmStopWindow = TimeSpan.FromSeconds(10);
 
     /// <summary>Esc presses required to reach the stop confirmation.</summary>
-    private const int EscapePressesToStop = 3;
+    private const int EscapePressesToStop = 2;
 
     private readonly TimeProvider clock;
     private long armedAt;
@@ -94,7 +94,7 @@ internal sealed class ShellCommandChordState
     }
 
     /// <summary>
-    /// Handles an Esc press. Three presses within <see cref="InterruptWindow"/> of the first arm the stop
+    /// Handles an Esc press. Two presses within <see cref="InterruptWindow"/> of the first arm the stop
     /// confirmation; a press while that confirmation is armed declines it. A press after the window lapses
     /// re-arms from the first. Returns <c>Consumed: false</c> when <paramref name="hasActiveWork"/> is
     /// false, resetting any in-progress sequence so Esc keeps its ordinary dismiss meaning when idle.
@@ -125,13 +125,13 @@ internal sealed class ShellCommandChordState
             this.ArmedAction = ShellChordAction.Interrupt;
             this.armedAt = now;
             this.escapePresses = 1;
-            return this.Arm(Hint("Press Esc twice more to stop"));
+            return this.Arm(Hint(RemainingPressesHint(1)));
         }
 
         this.escapePresses++;
         if (this.escapePresses < EscapePressesToStop)
         {
-            return this.Arm(Hint("Press Esc again to stop"));
+            return this.Arm(Hint(RemainingPressesHint(this.escapePresses)));
         }
 
         // The gesture is complete: hand over to an explicit confirmation rather than stopping outright.
@@ -140,6 +140,15 @@ internal sealed class ShellCommandChordState
         this.escapePresses = 0;
         return this.Arm(Hint("Stop the current turn? Enter to stop · Esc to keep going"));
     }
+
+    /// <summary>
+    /// The prompt shown after <paramref name="pressesSoFar"/> presses, phrased for however many remain.
+    /// Derived from <see cref="EscapePressesToStop"/> so the wording can never drift from the chord.
+    /// </summary>
+    private static string RemainingPressesHint(int pressesSoFar) =>
+        EscapePressesToStop - pressesSoFar == 1
+            ? "Press Esc again to stop"
+            : $"Press Esc {EscapePressesToStop - pressesSoFar} more times to stop";
 
     /// <summary>
     /// Confirms an armed stop, firing <see cref="ShellChordAction.Interrupt"/>. Returns

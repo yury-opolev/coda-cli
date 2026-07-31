@@ -47,7 +47,7 @@ automated smoke against an isolated ANSI screen buffer.
 - **Selection/copy:** **left-drag** selects transcript text and `Ctrl+C` copies it; **`Shift`-drag**
   (and `--no-mouse`) hands native selection and copy to the terminal where supported. There is no
   in-app Shift+arrow/`Home`/`End` selection and no composer-text copy binding.
-- **Chords:** pressing `Esc` three times within 1.5 s asks to stop the active turn (`Enter` stops it, `Esc` keeps it going; fewer presses only dismiss the menu or clear a selection); `Ctrl+C` copies a selection and, with nothing selected, exits on the second press; `/exit` or `/quit` exits — there is **no `Ctrl+D`** binding.
+- **Chords:** pressing `Esc` twice within 1.5 s asks to stop the active turn (`Enter` stops it, `Esc` keeps it going; fewer presses only dismiss the menu or clear a selection); `Ctrl+C` copies a selection and, with nothing selected, exits on the second press; `/exit` or `/quit` exits — there is **no `Ctrl+D`** binding.
 
 ## Checklist items (columns)
 
@@ -66,7 +66,7 @@ the terminal supports full-screen:
 10. **Picker** — keyboard-only picker/completion works.
 11. **Mouse off** — with the mouse disabled, the keyboard remains fully usable.
 12. **Plain fallback** — low-color / `TERM=dumb` falls back to plain output.
-13. **Exit/interrupt chords** — pressing `Esc` three times within 1.5 s asks to stop the active turn (`Enter` stops it, `Esc` keeps it going); `/exit` or a second `Ctrl+C` (with no selection) then leaves cleanly, while `Ctrl+C` over a selection copies instead of exiting.
+13. **Exit/interrupt chords** — pressing `Esc` twice within 1.5 s asks to stop the active turn (`Enter` stops it, `Esc` keeps it going); `/exit` or a second `Ctrl+C` (with no selection) then leaves cleanly, while `Ctrl+C` over a selection copies instead of exiting.
 14. **Crash restore** — a managed renderer crash restores the terminal and exits non-zero.
 15. **Bounded 10k** — full-screen visible-row formatting stays bounded with 10,000 blocks.
 16. **Redirected** — redirected input and redirected output both use plain behavior.

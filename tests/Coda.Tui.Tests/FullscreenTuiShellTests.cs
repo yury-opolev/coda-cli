@@ -1529,54 +1529,53 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Three_escapes_with_active_work_arm_the_stop_confirmation()
+    public void Two_escapes_with_active_work_arm_the_stop_confirmation()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
 
-        PressEscape(fixture, clock, 3);
+        PressEscape(fixture, clock, 2);
 
-        // The third press asks rather than stops: nothing is interrupted until the user confirms.
+        // The second press asks rather than stops: nothing is interrupted until the user confirms.
         Assert.Empty(fixture.Actions);
         Assert.Contains("Stop the current turn?", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Two_escapes_with_active_work_arm_but_do_not_stop()
+    public void One_escape_with_active_work_arms_but_does_not_stop()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
 
         PressEscape(fixture, clock, 1);
-        Assert.Contains("Press Esc twice more to stop", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
 
-        PressEscape(fixture, clock, 1);
         Assert.Contains("Press Esc again to stop", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
         Assert.Empty(fixture.Actions);
+        Assert.DoesNotContain("Stop the current turn?", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
     }
 
     [Fact]
-    public void Enter_after_three_escapes_raises_UiAction_Interrupt()
+    public void Enter_after_two_escapes_raises_UiAction_Interrupt()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
 
-        PressEscape(fixture, clock, 3);
+        PressEscape(fixture, clock, 2);
         fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
 
         Assert.Equal([UiAction.Interrupt], fixture.Actions);
     }
 
     [Fact]
-    public void Escape_after_three_escapes_declines_and_raises_no_action()
+    public void Escape_after_two_escapes_declines_and_raises_no_action()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: true, timeProvider: clock);
 
-        PressEscape(fixture, clock, 3);
+        PressEscape(fixture, clock, 2);
         Assert.Contains("Stop the current turn?", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);
 
-        // A fourth press is what a user hammering Esc actually does; it must decline cleanly rather
+        // A third press is what a user hammering Esc actually does; it must decline cleanly rather
         // than leaving a stale confirmation on screen.
         fixture.Shell.Composer.NewKeyDownEvent(Key.Esc);
 
@@ -1597,12 +1596,12 @@ public sealed class FullscreenTuiShellTests
     }
 
     [Fact]
-    public void Three_escapes_without_interruptible_work_do_nothing()
+    public void Two_escapes_without_interruptible_work_do_nothing()
     {
         var clock = new ManualTimeProvider();
         using var fixture = RetainedShellFixture.Create(activeWork: false, timeProvider: clock);
 
-        PressEscape(fixture, clock, 3);
+        PressEscape(fixture, clock, 2);
 
         Assert.Empty(fixture.Actions);
         Assert.DoesNotContain("to stop", fixture.Shell.Operational.Status.Text, StringComparison.Ordinal);

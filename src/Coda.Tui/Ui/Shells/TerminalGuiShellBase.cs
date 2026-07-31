@@ -592,11 +592,17 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             return true;
         }
 
-        // Ctrl+V pastes at the caret, preferring an image on the clipboard over text — the same path a
-        // right-click takes. Handled here rather than left to the editor's native paste, which only ever
-        // sees text and so silently dropped a copied image. Focus follows the paste so the draft is
-        // immediately usable when the key arrived from the transcript.
-        if (key == Key.V.WithCtrl && !this.composerDisabled && this.Composer.InputEnabled)
+        // Alt+V and Ctrl+V both paste at the caret, preferring an image on the clipboard over text — the
+        // same path a right-click takes. Handled here rather than left to the editor's native paste, which
+        // only ever sees text and so silently dropped a copied image. Focus follows the paste so the draft
+        // is immediately usable when the key arrived from the transcript.
+        //
+        // Alt+V exists because terminal emulators claim the obvious key: Windows Terminal binds BOTH
+        // ctrl+v and ctrl+shift+v to its own paste action, which reads text only, so an image-only
+        // clipboard produces no input at all and the application never sees the keypress. Alt+V is left
+        // alone, so it is the binding that can actually attach an image. Ctrl+V is kept for terminals
+        // that do pass it through.
+        if ((key == Key.V.WithCtrl || key == Key.V.WithAlt) && !this.composerDisabled && this.Composer.InputEnabled)
         {
             this.Composer.SetFocus();
             this.PasteComposerClipboard();
