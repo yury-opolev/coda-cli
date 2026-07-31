@@ -26,6 +26,7 @@ namespace Coda.Agent.Hooks;
 public sealed partial class AgentHookHandler : IHookHandler
 {
     private readonly ISubagentHost subagentHost;
+    private readonly int maxSubagentDepth;
     private readonly ILogger logger;
 
     /// <summary>
@@ -36,9 +37,10 @@ public sealed partial class AgentHookHandler : IHookHandler
     /// Using a host with hooks would cause infinite recursion on hook-triggering events.
     /// </param>
     /// <param name="logger">Logger for warnings and informational messages.</param>
-    public AgentHookHandler(ISubagentHost subagentHost, ILogger? logger = null)
+    public AgentHookHandler(ISubagentHost subagentHost, ILogger? logger = null, int maxSubagentDepth = TaskManager.DefaultMaxSubagentDepth)
     {
         this.subagentHost = subagentHost ?? throw new ArgumentNullException(nameof(subagentHost));
+        this.maxSubagentDepth = maxSubagentDepth;
         this.logger = logger ?? NullLogger.Instance;
     }
 
@@ -53,9 +55,9 @@ public sealed partial class AgentHookHandler : IHookHandler
 
         var currentDepth = ExtractDepthFromPayload(payload);
 
-        if (currentDepth >= TaskManager.MaxSubagentDepth)
+        if (currentDepth >= this.maxSubagentDepth)
         {
-            this.LogDepthLimitExceeded(hook.AgentType ?? "agent", currentDepth, TaskManager.MaxSubagentDepth);
+            this.LogDepthLimitExceeded(hook.AgentType ?? "agent", currentDepth, this.maxSubagentDepth);
             return HookOutput.NoOp;
         }
 

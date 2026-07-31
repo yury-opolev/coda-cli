@@ -34,7 +34,7 @@ public sealed class TaskTool : ITool
             return new ToolResult("Subagents are not available in this context.", IsError: true);
         }
 
-        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        if (context.CurrentDepth >= context.MaxSubagentDepth)
         {
             return new ToolResult(
                 "Cannot launch a subagent from here: the maximum subagent nesting depth has been reached.",

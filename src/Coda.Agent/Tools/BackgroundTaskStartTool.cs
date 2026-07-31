@@ -32,7 +32,7 @@ public sealed class BackgroundTaskStartTool : ITool
                 IsError: false));
         }
 
-        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        if (context.CurrentDepth >= context.MaxSubagentDepth)
         {
             return Task.FromResult(new ToolResult(
                 "Cannot start a background subagent from here: the maximum subagent nesting depth has been reached.",

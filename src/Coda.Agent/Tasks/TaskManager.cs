@@ -9,8 +9,18 @@ namespace Coda.Agent.Tasks;
 /// </summary>
 public sealed partial class TaskManager : IDisposable
 {
-    /// <summary>Maximum subagent nesting depth. Main agent is depth 0; deepest subagent is depth 2.</summary>
-    public const int MaxSubagentDepth = 2;
+    /// <summary>
+    /// The nesting depth in force when nothing configures one. Main agent is depth 0, so 2 permits a
+    /// subagent and a grandchild. Kept as the default rather than the law: <see cref="MaxSubagentDepth"/>
+    /// is what callers should read, since a session may raise it.
+    /// </summary>
+    public const int DefaultMaxSubagentDepth = 2;
+
+    /// <summary>Maximum subagent nesting depth for this session.</summary>
+    public int MaxSubagentDepth { get; }
+
+    /// <summary>How many subagent tasks may run at once in this session.</summary>
+    public int MaxConcurrentSubagents { get; }
 
     /// <summary>
     /// Default upper bound on retained <em>terminal</em> tasks. Once more terminal tasks than this
@@ -26,6 +36,7 @@ public sealed partial class TaskManager : IDisposable
     private readonly List<TaskSubscription> _subs = new();
     private readonly long _outputRingBytes;
     private readonly int _maxRetainedTerminalTasks;
+    private readonly SemaphoreSlim _subagentSlots;
     private int _nextId;
     private bool _idleLeaseHeld;
 
@@ -47,13 +58,19 @@ public sealed partial class TaskManager : IDisposable
         string sessionId,
         string? logRoot = null,
         long outputRingBytes = OutputRing.DefaultMaxBytes,
-        int maxRetainedTerminalTasks = DefaultMaxRetainedTerminalTasks)
+        int maxRetainedTerminalTasks = DefaultMaxRetainedTerminalTasks,
+        Coda.Agent.Settings.SubagentSettings? subagentSettings = null)
     {
         if (outputRingBytes <= 0) throw new ArgumentOutOfRangeException(nameof(outputRingBytes));
         if (maxRetainedTerminalTasks < 0)
         {
             throw new ArgumentOutOfRangeException(nameof(maxRetainedTerminalTasks));
         }
+
+        var limits = subagentSettings ?? Coda.Agent.Settings.SubagentSettings.Default;
+        MaxSubagentDepth = limits.MaxDepth;
+        MaxConcurrentSubagents = limits.MaxConcurrent;
+        _subagentSlots = new SemaphoreSlim(limits.MaxConcurrent, limits.MaxConcurrent);
 
         SessionId = sessionId;
         LogRoot = logRoot ?? DefaultLogRoot;
@@ -106,6 +123,33 @@ public sealed partial class TaskManager : IDisposable
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
             ".coda", "task-logs");
 
+    /// <summary>Subagent slots currently free; for diagnostics and tests.</summary>
+    public int AvailableSubagentSlots => this._subagentSlots.CurrentCount;
+
+    /// <summary>
+    /// Takes one of the session's concurrent-subagent slots, or reports that none is free.
+    /// </summary>
+    /// <remarks>
+    /// Non-blocking on purpose. Waiting here would hold the parent's turn open with nothing on screen
+    /// to explain the stall, and the model could neither retry nor choose differently; refusing lets it
+    /// see the limit and decide instead. The semaphore is never taken while <c>_gate</c> is held, so it
+    /// cannot deadlock with registration or shutdown.
+    /// </remarks>
+    public bool TryAcquireSubagentSlot() => this._subagentSlots.Wait(0);
+
+    /// <summary>Returns a slot taken by <see cref="TryAcquireSubagentSlot"/>. Safe to over-release.</summary>
+    public void ReleaseSubagentSlot()
+    {
+        try
+        {
+            this._subagentSlots.Release();
+        }
+        catch (SemaphoreFullException)
+        {
+            // A double release is a caller bug, not a reason to fail a turn.
+        }
+    }
+
     /// <summary>
     /// Registers a new task and returns it in the Running state. Derives depth
     /// from the parent (null parent => depth 1). Throws when the parent id is
@@ -144,10 +188,10 @@ public sealed partial class TaskManager : IDisposable
             throw new InvalidOperationException($"Unknown parent task '{parentTaskId}'.");
         }
 
-        if (kind == TaskKind.Subagent && depth > MaxSubagentDepth)
+        if (kind == TaskKind.Subagent && depth > this.MaxSubagentDepth)
         {
             throw new InvalidOperationException(
-                $"Subagent nesting depth {depth} exceeds maximum {MaxSubagentDepth}.");
+                $"Subagent nesting depth {depth} exceeds maximum {this.MaxSubagentDepth}.");
         }
 
         // Test seam: deterministically interleave a concurrent shutdown here, after the pre-lock

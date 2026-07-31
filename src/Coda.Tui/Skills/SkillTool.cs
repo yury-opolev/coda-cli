@@ -211,9 +211,9 @@ public sealed partial class SkillTool : ITool, ISkillShapeDeltaSource
         CancellationToken cancellationToken)
     {
         // Degrade to inline when at max depth (spec: must degrade, not fail).
-        if (context.CurrentDepth >= TaskManager.MaxSubagentDepth)
+        if (context.CurrentDepth >= context.MaxSubagentDepth)
         {
-            this.LogForkDegraded(skill.Name, TaskManager.MaxSubagentDepth);
+            this.LogForkDegraded(skill.Name, context.MaxSubagentDepth);
             var inlineNote = $"[Note: Skill '{skill.Name}' could not fork (max subagent depth reached); running inline.]\n\n";
             var (_, content) = this._state.TryLoad(skill.Name, body);
             var inlineDelta = SkillTurnShapeComposer.BuildSkillDelta(skill);

@@ -220,7 +220,7 @@ public sealed class TaskIsolationTests
         var general = BuiltInAgents.Resolve("general-purpose");
 
         var tools = SubagentHost.ResolveChildTools(
-            FullTaskRegistry(), general.ReadOnlyToolsOnly, depth: TaskManager.MaxSubagentDepth);
+            FullTaskRegistry(), general.ReadOnlyToolsOnly, depth: TaskManager.DefaultMaxSubagentDepth);
         var names = tools.All.Select(t => t.Name).ToList();
 
         Assert.DoesNotContain("task", names);

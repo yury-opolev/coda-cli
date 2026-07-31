@@ -42,6 +42,20 @@ public sealed record CodaSettings(
     /// <summary>Optional goal-loop defaults loaded from the "goal" block in settings.json. Null = no goal block present.</summary>
     public GoalSettings? Goal { get; init; }
 
+    /// <summary>
+    /// Limits on subagent nesting and fan-out, and whether the main agent may replace a subagent's
+    /// system prompt. Never null: an absent block means the defaults.
+    /// </summary>
+    public SubagentSettings Subagents { get; init; } = SubagentSettings.Default;
+
+    /// <summary>
+    /// The subagent values this settings file actually specified, with null meaning "not set".
+    /// Kept alongside the materialised <see cref="Subagents"/> purely so the user/project merge can
+    /// work per field: once clamped into <see cref="SubagentSettings"/> a default is indistinguishable
+    /// from a deliberate value.
+    /// </summary>
+    internal SubagentOverrides? SubagentOverrides { get; init; }
+
     /// <summary>Optional telemetry/logging config from the "telemetry" block. Null = off.</summary>
     public TelemetrySettings? Telemetry { get; init; }
 
@@ -88,3 +102,28 @@ public sealed record CodaSettings(
     public bool CacheUse1hTtl { get; init; }
 }
 
+
+/// <summary>
+/// The subagent fields a single settings file specified; null means the file did not mention it.
+/// Exists only so the user/project merge can operate per field before clamping.
+/// </summary>
+internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool? AllowSystemPromptReplacement)
+{
+    /// <summary>Project values win field by field; anything neither file set falls to the default.</summary>
+    public static SubagentOverrides? Merge(SubagentOverrides? user, SubagentOverrides? project) =>
+        user is null && project is null
+            ? null
+            : new SubagentOverrides(
+                project?.MaxDepth ?? user?.MaxDepth,
+                project?.MaxConcurrent ?? user?.MaxConcurrent,
+                project?.AllowSystemPromptReplacement ?? user?.AllowSystemPromptReplacement);
+
+    /// <summary>Applies these overrides onto the defaults, clamping as SubagentSettings requires.</summary>
+    public SubagentSettings ToSettings() => new()
+    {
+        MaxDepth = this.MaxDepth ?? SubagentSettings.Default.MaxDepth,
+        MaxConcurrent = this.MaxConcurrent ?? SubagentSettings.Default.MaxConcurrent,
+        AllowSystemPromptReplacement =
+            this.AllowSystemPromptReplacement ?? SubagentSettings.Default.AllowSystemPromptReplacement,
+    };
+}

@@ -119,7 +119,7 @@ public class TaskToolsCompatibilityTests
         {
             Tasks = mgr,
             Subagents = new FakeHost(),
-            CurrentDepth = TaskManager.MaxSubagentDepth,
+            CurrentDepth = TaskManager.DefaultMaxSubagentDepth,
         };
 
         var result = await new TaskTool().ExecuteAsync(

@@ -552,7 +552,7 @@ public sealed class SkillContextForkTests
             Subagents = subagent,
             Tasks = mgr,
             Sink = new NullAgentSink(),
-            CurrentDepth = TaskManager.MaxSubagentDepth, // at the limit
+            CurrentDepth = TaskManager.DefaultMaxSubagentDepth, // at the limit
         };
 
         var result = await tool.ExecuteAsync(

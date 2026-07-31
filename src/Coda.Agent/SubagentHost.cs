@@ -134,7 +134,7 @@ public sealed class SubagentHost : ISubagentHost
         if (this.userHooks is { HasSubagentStart: true })
         {
             var parentTaskId = this.tasks.Find(taskId)?.ParentId;
-            var childTools = ResolveChildTools(this.subagentTools, definition.ReadOnlyToolsOnly, depth);
+            var childTools = ResolveChildTools(this.subagentTools, definition.ReadOnlyToolsOnly, depth, this.tasks.MaxSubagentDepth);
             var toolNames = childTools.All.Select(static t => t.Name).ToList();
 
             SubagentStartResult startResult;
@@ -209,9 +209,9 @@ public sealed class SubagentHost : ISubagentHost
             ? ToolActivityContext.CreateRoot()
             : parentActivity.ForSubagent(taskId);
         var readOnlyDefinition = definition.ReadOnlyToolsOnly;
-        var tools = ResolveChildTools(this.subagentTools, readOnlyDefinition, depth);
+        var tools = ResolveChildTools(this.subagentTools, readOnlyDefinition, depth, this.tasks.MaxSubagentDepth);
 
-        var atMaxDepth = depth >= TaskManager.MaxSubagentDepth;
+        var atMaxDepth = depth >= this.tasks.MaxSubagentDepth;
 
         // A depth-1 child may create depth-2 grandchildren (so it gets this host); a depth-2
         // grandchild — and any read-only child — receives no host and no task-creation tools, so
@@ -303,10 +303,10 @@ public sealed class SubagentHost : ISubagentHost
     /// <c>task_*</c> runtime tool) — so it can neither spawn children nor read or stop any task
     /// in the session. A depth-1 general-purpose child keeps them to manage its own descendants.
     /// </summary>
-    internal static ToolRegistry ResolveChildTools(ToolRegistry subagentTools, bool readOnlyDefinition, int depth)
+    internal static ToolRegistry ResolveChildTools(ToolRegistry subagentTools, bool readOnlyDefinition, int depth, int maxDepth = TaskManager.DefaultMaxSubagentDepth)
     {
         var baseTools = readOnlyDefinition ? subagentTools.ReadOnly() : subagentTools;
-        var denyTaskManagement = readOnlyDefinition || depth >= TaskManager.MaxSubagentDepth;
+        var denyTaskManagement = readOnlyDefinition || depth >= maxDepth;
         return denyTaskManagement ? StripTaskManagementTools(baseTools) : baseTools;
     }
 
@@ -315,8 +315,8 @@ public sealed class SubagentHost : ISubagentHost
     /// <see cref="TaskManager.MaxSubagentDepth"/>) lose all task-management tools; shallower
     /// children keep them. Read-only definitions are handled by <see cref="ResolveChildTools"/>.
     /// </summary>
-    internal static ToolRegistry SelectChildTools(ToolRegistry tools, int depth) =>
-        depth >= TaskManager.MaxSubagentDepth
+    internal static ToolRegistry SelectChildTools(ToolRegistry tools, int depth, int maxDepth = TaskManager.DefaultMaxSubagentDepth) =>
+        depth >= maxDepth
             ? StripTaskManagementTools(tools)
             : tools;
 
