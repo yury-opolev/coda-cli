@@ -11,6 +11,41 @@ namespace Coda.Agent.Lsp;
 public static partial class PluginLspServerLoader
 {
     /// <summary>
+    /// Loads LSP servers from an explicit list of plugin directories.
+    /// </summary>
+    /// <remarks>
+    /// This is the form the composition root uses. <see cref="Load"/> discovers plugins by scanning,
+    /// which means it cannot know which of them the user enabled or approved — and an LSP server runs
+    /// a process, so that decision has to be made before this point rather than here. Callers pass the
+    /// directories of plugins that already cleared those gates.
+    /// </remarks>
+    public static IReadOnlyDictionary<string, LspServerConfig> LoadForPluginDirectories(
+        IReadOnlyList<string> pluginDirectories)
+    {
+        var result = new Dictionary<string, LspServerConfig>();
+
+        foreach (var pluginDir in pluginDirectories)
+        {
+            var pluginJsonPath = Path.Combine(pluginDir, "plugin.json");
+            if (!File.Exists(pluginJsonPath))
+            {
+                continue;
+            }
+
+            try
+            {
+                LoadPlugin(pluginDir, pluginJsonPath, result);
+            }
+            catch
+            {
+                // tolerant: skip this plugin, continue with others
+            }
+        }
+
+        return result;
+    }
+
+    /// <summary>
     /// Loads and scopes all LSP servers discovered across the given plugin base directories.
     /// Each server key is of the form <c>plugin:&lt;pluginName&gt;:&lt;serverName&gt;</c>.
     /// Malformed or missing files are silently skipped.

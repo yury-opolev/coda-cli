@@ -93,6 +93,37 @@ public static class PluginContentHash
             }
         }
 
+        // LSP servers — hashed as the loader resolves them, so an inline declaration, a referenced
+        // file and a .lsp.json all move the hash. These start processes, so a changed command must
+        // force the approval prompt again.
+        try
+        {
+            var lspServers = Coda.Agent.Lsp.PluginLspServerLoader
+                .LoadForPluginDirectories([plugin.Directory])
+                .OrderBy(kvp => kvp.Key, StringComparer.Ordinal);
+
+            foreach (var (name, config) in lspServers)
+            {
+                sb.Append("lsp:").Append(name).Append('=')
+                  .Append(config.Command).Append(' ')
+                  .Append(string.Join(' ', config.Args ?? []));
+
+                if (config.Env is { Count: > 0 } env)
+                {
+                    foreach (var (key, value) in env.OrderBy(e => e.Key, StringComparer.Ordinal))
+                    {
+                        sb.Append(' ').Append(key).Append('=').Append(value);
+                    }
+                }
+
+                sb.AppendLine();
+            }
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            // Skip unreadable LSP declarations — fail-safe.
+        }
+
         // Skill file names — adding or removing skills changes the hash.
         var skillDirs = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
         {

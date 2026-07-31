@@ -167,14 +167,13 @@ public sealed record PluginManifest
     /// </summary>
     /// <remarks>
     /// Nothing reads this property. Plugin LSP servers do work, but by a separate route:
-    /// <see cref="Coda.Agent.Lsp.PluginLspServerLoader"/> enumerates the plugin directories and
-    /// re-parses each <c>plugin.json</c> itself, so it accepts an inline object as well as a path and
-    /// never consults this manifest model. Changing the field here therefore has no effect on what
-    /// actually loads.
+    /// <see cref="Coda.Agent.Lsp.PluginLspServerLoader"/> re-parses each <c>plugin.json</c> itself, so
+    /// it accepts an inline object as well as a path and never consults this manifest model. Changing
+    /// the field here therefore has no effect on what actually loads.
     /// <para>
-    /// That route also bypasses the composer, and so has neither the per-class approval gate the hook
-    /// and MCP paths use nor an enabled check — a disabled plugin's LSP server still starts. Worth
-    /// closing before this field is given a real consumer.
+    /// That route is now driven by <see cref="PluginComponentComposer"/>, which hands it only the
+    /// directories of plugins that are enabled and whose <see cref="PluginComponentClass.Lsp"/> class
+    /// the user approved — an LSP server starts a process, so it is gated like hooks and MCP servers.
     /// </para>
     /// </remarks>
     public IReadOnlyList<string> LspServers { get; init; } = [];

@@ -36,6 +36,8 @@ public sealed class PluginTrustStore
     private readonly string trustFile;
     private static readonly object FileLock = new();
 
+    // Every class needs a wire name: SetApprovedClasses drops any class missing one, so an omission
+    // silently means "can never be approved" for a plugin that has an approval record.
     private static readonly IReadOnlyDictionary<PluginComponentClass, string> ClassNames =
         new Dictionary<PluginComponentClass, string>
         {
@@ -43,6 +45,8 @@ public sealed class PluginTrustStore
             [PluginComponentClass.Hook] = "hook",
             [PluginComponentClass.McpServer] = "mcpServer",
             [PluginComponentClass.Subagent] = "subagent",
+            [PluginComponentClass.SlashCommand] = "slashCommand",
+            [PluginComponentClass.Lsp] = "lsp",
         };
 
     private static readonly IReadOnlyDictionary<string, PluginComponentClass> ClassByName =

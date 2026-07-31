@@ -17,4 +17,7 @@ public enum PluginComponentClass
 
     /// <summary>Custom slash commands backed by Markdown prompt bodies.</summary>
     SlashCommand,
+
+    /// <summary>Language Server Protocol server processes.</summary>
+    Lsp,
 }

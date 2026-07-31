@@ -97,6 +97,19 @@ public sealed record SessionOptions
     public IReadOnlyList<OutputStyle> PluginOutputStyles { get; init; } = [];
 
     /// <summary>
+    /// Plugin-contributed LSP servers, keyed by the loader's scoped name. Merged beneath the settings
+    /// servers, which win on a key clash.
+    /// </summary>
+    /// <remarks>
+    /// Supplied by the caller rather than discovered here, because starting an LSP server runs a
+    /// process and only the plugin layer knows which plugins the user enabled and approved for it
+    /// (<see cref="Coda.Tui.Plugins.PluginComposition.LspServers"/>). Empty by default, so a host that
+    /// does not compose plugins contributes none rather than silently scanning for them.
+    /// </remarks>
+    public IReadOnlyDictionary<string, Coda.Agent.Lsp.LspServerConfig> PluginLspServers { get; init; } =
+        new Dictionary<string, Coda.Agent.Lsp.LspServerConfig>(StringComparer.Ordinal);
+
+    /// <summary>
     /// Complete exact root system prompt. Null uses normal Coda construction; empty and whitespace are exact values.
     /// </summary>
     public string? SystemPromptOverride { get; init; }

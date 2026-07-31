@@ -210,14 +210,11 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         this.configuredHooks = (hookList as List<UserHook>)
             ?? (hookList is not null ? new List<UserHook>(hookList) : new List<UserHook>(settings.Hooks));
 
-        var userCodaPluginsDir = Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".coda",
-            "plugins");
-        var projectCodaPluginsDir = Path.Combine(options.WorkingDirectory, ".coda", "plugins");
+        // Plugin LSP servers arrive already filtered to the plugins the user enabled and approved for
+        // the Lsp class; scanning for them here would bypass that gate, and starting one runs a process.
         var lspServers = LspServerMapBuilder.Build(
             settings.LspServers,
-            [userCodaPluginsDir, projectCodaPluginsDir]);
+            options.PluginLspServers);
 
         if (lspServers.Count > 0)
         {

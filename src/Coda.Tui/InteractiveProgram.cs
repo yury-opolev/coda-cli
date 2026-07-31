@@ -433,6 +433,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var capturedTrustGuard = hookTrustGuard;
         var capturedRegistry = pluginRegistry;
         var capturedPluginOutputStyles = pluginComposition.OutputStyles;
+        var capturedPluginLspServers = pluginComposition.LspServers;
         Func<int, string>? skillReattach = skillTool is not null
             ? threshold => skillState.GetReattachContent(Coda.Tui.Skills.SkillSessionState.DeriveReattachBudget(threshold))
             : null;
@@ -444,7 +445,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             sessionFactory: (ctx, opts, currentOpts) =>
                 new CodaSession(
                     ctx.Credentials,
-                    opts with { PluginOutputStyles = capturedPluginOutputStyles },
+                    opts with
+                    {
+                        PluginOutputStyles = capturedPluginOutputStyles,
+                        PluginLspServers = capturedPluginLspServers,
+                    },
                     history: ctx.Session.History,
                     sessionId: ctx.Session.SessionId,
                     currentOptionsProvider: currentOpts,
