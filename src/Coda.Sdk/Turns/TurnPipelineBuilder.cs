@@ -333,7 +333,7 @@ public sealed class TurnPipelineBuilder
         // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
         // stripped so a depth-2 child cannot reintroduce them.
         var subagentTools = StripSkillTool(StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools]).All);
-        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: this.subagentRegistry, subagentSettings: this.subagentSettings, logger: this.loggerFactory.CreateLogger("Coda.Subagents"));
+        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: this.subagentRegistry, logger: this.loggerFactory.CreateLogger("Coda.Subagents"));
 
         var tools = this.BuildScheduledTools(options);
 
@@ -511,7 +511,7 @@ public sealed class TurnPipelineBuilder
         ILogger? logger = null)
     {
         var subagentTools = StripSkillTool([.. BuiltInTools.All(), .. options.ExtraTools]);
-        return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: subagentRegistry, subagentSettings: subagentSettings, logger: logger);
+        return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: subagentRegistry, logger: logger);
     }
 
     /// <summary>

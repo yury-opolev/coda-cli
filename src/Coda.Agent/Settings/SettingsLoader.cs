@@ -186,6 +186,10 @@ public static class SettingsLoader
             // Parse lspServers from the raw JSON node to handle JsonNode? fields correctly.
             var lspServers = ParseLspServers(json);
 
+            // Parsed once: the raw overrides drive the per-field merge, the materialised settings
+            // are what a caller reads. Two calls could drift.
+            var subagentOverrides = ParseSubagentOverrides(doc?.Subagents);
+
             return new CodaSettings(allow, deny, hooks)
             {
                 LspServers = lspServers,
@@ -193,8 +197,8 @@ public static class SettingsLoader
                 ModelByProvider = ParseModelByProvider(doc?.ModelByProvider),
                 GitHubEnterpriseDomain = NullIfBlank(doc?.GithubEnterpriseDomain),
                 Goal = ParseGoalSettings(doc?.Goal),
-                SubagentOverrides = ParseSubagentOverrides(doc?.Subagents),
-                Subagents = ParseSubagentOverrides(doc?.Subagents)?.ToSettings() ?? SubagentSettings.Default,
+                SubagentOverrides = subagentOverrides,
+                Subagents = subagentOverrides?.ToSettings() ?? SubagentSettings.Default,
                 Telemetry = ParseTelemetry(doc?.Telemetry),
                 Theme = NullIfBlank(doc?.Theme),
                 ToolDisplayMode = MigrateDisplayMode(doc?.ToolDisplayMode),

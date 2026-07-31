@@ -25,7 +25,6 @@ public sealed partial class SubagentHost : ISubagentHost
     private readonly TaskManager tasks;
     private readonly TimeSpan? toolProgressInterval;
     private readonly SubagentRegistry? subagentRegistry;
-    private readonly Coda.Agent.Settings.SubagentSettings subagentSettings;
     private readonly ILogger logger;
 
     public SubagentHost(
@@ -38,7 +37,6 @@ public sealed partial class SubagentHost : ISubagentHost
         UserHookRunner? userHooks = null,
         TimeSpan? toolProgressInterval = null,
         SubagentRegistry? subagentRegistry = null,
-        Coda.Agent.Settings.SubagentSettings? subagentSettings = null,
         ILogger? logger = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
@@ -53,12 +51,14 @@ public sealed partial class SubagentHost : ISubagentHost
         // production → the child loop uses AgentLoop's own default interval.
         this.toolProgressInterval = toolProgressInterval;
         this.subagentRegistry = subagentRegistry;
-        this.subagentSettings = subagentSettings ?? Coda.Agent.Settings.SubagentSettings.Default;
         this.logger = logger ?? NullLogger.Instance;
     }
 
-    /// <summary>The session's subagent limits and system-prompt policy in force for this host.</summary>
-    internal Coda.Agent.Settings.SubagentSettings SubagentSettings => this.subagentSettings;
+    /// <summary>
+    /// The session's subagent settings, read from the task manager so the depth this host gates on
+    /// and the prompt policy it enforces can never come from two different configurations.
+    /// </summary>
+    private Coda.Agent.Settings.SubagentSettings SubagentSettings => this.tasks.SubagentSettings;
 
     /// <summary>Test seam: exposes the registry so integration tests can verify it was wired.</summary>
     internal SubagentRegistry? SubagentRegistryForTest => this.subagentRegistry;
@@ -376,7 +376,7 @@ public sealed partial class SubagentHost : ISubagentHost
             return (definition.SystemPromptBody, null);
         }
 
-        if (this.subagentSettings.AllowSystemPromptReplacement)
+        if (this.SubagentSettings.AllowSystemPromptReplacement)
         {
             return (replacement, null);
         }

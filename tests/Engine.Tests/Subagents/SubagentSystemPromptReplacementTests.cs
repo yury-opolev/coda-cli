@@ -25,12 +25,14 @@ public sealed class SubagentSystemPromptReplacementTests
 
     private AgentOptions Options() => new() { Model = "m", WorkingDirectory = this.root, SystemPrompt = "sys" };
 
-    private static TaskManager NewManager() => new(sessionId: "sess-sysprompt-replace", logRoot: null);
+    private static TaskManager NewManager(bool allowReplacement = false) =>
+        new(sessionId: "sess-sysprompt-replace",
+            logRoot: null,
+            subagentSettings: new SubagentSettings { AllowSystemPromptReplacement = allowReplacement });
 
     private SubagentHost NewHost(
-        RecordingClient client,
+        RecordingSubagentClient client,
         TaskManager mgr,
-        bool allowReplacement,
         ILogger? logger = null) =>
         new(
             client,
@@ -39,13 +41,12 @@ public sealed class SubagentSystemPromptReplacementTests
             this.Options(),
             mgr,
             includeAnthropicSystemPrefix: false,
-            subagentSettings: new SubagentSettings { AllowSystemPromptReplacement = allowReplacement },
             logger: logger);
 
     private static Task<string> RunAsync(SubagentHost host, SubagentSystemPrompt systemPrompt) =>
         host.RunSubagentAsync(
             new SubagentRequest("general-purpose", "go", "task-1", 1) { SystemPrompt = systemPrompt },
-            new NullSink(),
+            new DiscardingSink(),
             new SteeringInbox(),
             CancellationToken.None);
 
@@ -64,9 +65,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task A_refused_replacement_keeps_the_definition_body_in_front()
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: false);
+        using var mgr = NewManager(allowReplacement: false);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Replacement: Replacement));
 
@@ -81,9 +82,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task A_refused_replacement_is_logged_rather_than_dropped_silently()
     {
-        using var mgr = NewManager();
+        using var mgr = NewManager(allowReplacement: false);
         var logger = new CollectingLogger();
-        var host = this.NewHost(new RecordingClient(), mgr, allowReplacement: false, logger: logger);
+        var host = this.NewHost(new RecordingSubagentClient(), mgr, logger: logger);
 
         await RunAsync(host, new SubagentSystemPrompt(Replacement: Replacement));
 
@@ -97,9 +98,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task Nothing_is_logged_when_no_replacement_was_asked_for()
     {
-        using var mgr = NewManager();
+        using var mgr = NewManager(allowReplacement: false);
         var logger = new CollectingLogger();
-        var host = this.NewHost(new RecordingClient(), mgr, allowReplacement: false, logger: logger);
+        var host = this.NewHost(new RecordingSubagentClient(), mgr, logger: logger);
 
         await RunAsync(host, new SubagentSystemPrompt(Append: Append));
 
@@ -109,9 +110,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task A_refused_replacement_and_an_append_both_land_behind_the_definition()
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: false);
+        using var mgr = NewManager(allowReplacement: false);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Append: Append, Replacement: Replacement));
 
@@ -129,9 +130,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task An_enabled_replacement_takes_the_place_of_the_definition_body()
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: true);
+        using var mgr = NewManager(allowReplacement: true);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Replacement: Replacement));
 
@@ -143,9 +144,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task An_enabled_replacement_keeps_the_environment_block()
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: true);
+        using var mgr = NewManager(allowReplacement: true);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Replacement: Replacement));
 
@@ -157,9 +158,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task An_enabled_replacement_still_keeps_the_append_behind_it()
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: true);
+        using var mgr = NewManager(allowReplacement: true);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Append: Append, Replacement: Replacement));
 
@@ -171,9 +172,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [Fact]
     public async Task An_enabled_but_blank_replacement_leaves_the_definition_alone()
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: true);
+        using var mgr = NewManager(allowReplacement: true);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Replacement: "   "));
 
@@ -190,9 +191,9 @@ public sealed class SubagentSystemPromptReplacementTests
         // The documented order is definition, then caller text, then operator hook. Demotion adds a
         // fourth string to that sequence, and it must not be the one that ends up last.
         const string HookMarker = "HOOK_APPEND_MARKER";
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var executor = new StubExecutor(
+        using var mgr = NewManager(allowReplacement: false);
+        var client = new RecordingSubagentClient();
+        var executor = new StubHookExecutor(
             $$$"""{"hookSpecificOutput":{"appendSystemPrompt":"{{{HookMarker}}}"}}""");
         var host = new SubagentHost(
             client,
@@ -201,8 +202,7 @@ public sealed class SubagentSystemPromptReplacementTests
             this.Options(),
             mgr,
             includeAnthropicSystemPrefix: false,
-            userHooks: new UserHookRunner([new UserHook("SubagentStart", "echo test")], executor),
-            subagentSettings: new SubagentSettings { AllowSystemPromptReplacement = false });
+            userHooks: new UserHookRunner([new UserHook("SubagentStart", "echo test")], executor));
 
         await RunAsync(host, new SubagentSystemPrompt(Append: Append, Replacement: Replacement));
 
@@ -219,9 +219,9 @@ public sealed class SubagentSystemPromptReplacementTests
     [InlineData("  \r\n ")]
     public async Task A_replacement_of_nothing_but_whitespace_leaves_the_definition_alone(string blank)
     {
-        using var mgr = NewManager();
-        var client = new RecordingClient();
-        var host = this.NewHost(client, mgr, allowReplacement: true);
+        using var mgr = NewManager(allowReplacement: true);
+        var client = new RecordingSubagentClient();
+        var host = this.NewHost(client, mgr);
 
         await RunAsync(host, new SubagentSystemPrompt(Replacement: blank));
 
@@ -246,7 +246,7 @@ public sealed class SubagentSystemPromptReplacementTests
     public async Task The_task_tool_carries_the_replacement_down_to_the_host()
     {
         using var mgr = NewManager();
-        var host = new CapturingHost();
+        var host = new RequestCapturingHost();
         var ctx = new ToolContext(this.root) { Tasks = mgr, Subagents = host };
 
         await new Coda.Agent.Tools.TaskTool().ExecuteAsync(
@@ -263,23 +263,22 @@ public sealed class SubagentSystemPromptReplacementTests
     {
         // Replacement rewrites text and nothing else: a read-only definition stays read-only even
         // when its instructions have been swapped out.
-        using var mgr = NewManager();
-        var client = new RecordingClient();
+        using var mgr = NewManager(allowReplacement: true);
+        var client = new RecordingSubagentClient();
         var host = new SubagentHost(
             client,
             new ToolRegistry([new ProbeTool()]),
             new AllowAllPermissionPrompt(),
             this.Options(),
             mgr,
-            includeAnthropicSystemPrefix: false,
-            subagentSettings: new SubagentSettings { AllowSystemPromptReplacement = true });
+            includeAnthropicSystemPrefix: false);
 
         await host.RunSubagentAsync(
             new SubagentRequest("explore", "go", "task-1", 1)
             {
                 SystemPrompt = new SubagentSystemPrompt(Replacement: "You may do anything."),
             },
-            new NullSink(),
+            new DiscardingSink(),
             new SteeringInbox(),
             CancellationToken.None);
 
@@ -291,14 +290,8 @@ public sealed class SubagentSystemPromptReplacementTests
     // Helpers
     // -----------------------------------------------------------------------
 
-    private sealed class StubExecutor(string stdout) : IHookExecutor
+    private sealed class ProbeTool : ITool
     {
-        public Task<(int ExitCode, string Stdout, string Stderr)> ExecAsync(
-            string command, string payload, CancellationToken ct) =>
-            Task.FromResult((0, stdout, string.Empty));
-    }
-
-    private sealed class ProbeTool : ITool    {
         public string Name => "probe";
 
         public string Description => "mutates";
@@ -309,44 +302,6 @@ public sealed class SubagentSystemPromptReplacementTests
 
         public Task<ToolResult> ExecuteAsync(System.Text.Json.JsonElement input, ToolContext context, CancellationToken cancellationToken = default) =>
             Task.FromResult(new ToolResult("ok"));
-    }
-
-    private sealed class CapturingHost : ISubagentHost
-    {
-        public SubagentRequest? LastRequest { get; private set; }
-
-        public Task<string> RunSubagentAsync(
-            string subagentType, string prompt, IAgentSink sink, SteeringInbox steering,
-            string taskId, int depth, CancellationToken cancellationToken = default) =>
-            Task.FromResult("report");
-
-        public Task<string> RunSubagentAsync(
-            SubagentRequest request, IAgentSink sink, SteeringInbox steering,
-            CancellationToken cancellationToken = default)
-        {
-            this.LastRequest = request;
-            return Task.FromResult("report");
-        }
-    }
-
-    private sealed class RecordingClient : ILlmClient
-    {
-        public string? LastSystem { get; private set; }
-
-        public IReadOnlyList<string>? LastToolNames { get; private set; }
-
-        public string ProviderId => "fake";
-
-        public async IAsyncEnumerable<AssistantStreamEvent> StreamAsync(
-            ChatRequest request,
-            [EnumeratorCancellation] CancellationToken cancellationToken = default)
-        {
-            this.LastSystem = request.System;
-            this.LastToolNames = request.Tools?.Select(static t => t.Name).ToList() ?? [];
-            await Task.Yield();
-            yield return AssistantStreamEvent.Delta("done");
-            yield return AssistantStreamEvent.Finished("end_turn");
-        }
     }
 
     /// <summary>Keeps the formatted text of every warning so a test can assert on it.</summary>
@@ -370,15 +325,5 @@ public sealed class SubagentSystemPromptReplacementTests
                 this.Warnings.Add(formatter(state, exception));
             }
         }
-    }
-
-    private sealed class NullSink : IAgentSink
-    {
-        public void OnAssistantText(string delta) { }
-        public void OnAssistantTextComplete() { }
-        public void OnToolCall(string toolName, string inputPreview) { }
-        public void OnToolResult(string toolName, ToolResult result) { }
-        public void OnError(string message) { }
-        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

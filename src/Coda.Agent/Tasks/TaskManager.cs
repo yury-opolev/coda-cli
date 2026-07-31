@@ -16,6 +16,14 @@ public sealed partial class TaskManager : IDisposable
     /// </summary>
     public const int DefaultMaxSubagentDepth = 2;
 
+    /// <summary>The subagent limits and system-prompt policy this session is running under.</summary>
+    /// <remarks>
+    /// Exposed so collaborators that already hold the manager — the subagent host, the agent hook
+    /// handler — read the session's settings from one place instead of being handed a second copy
+    /// that could disagree with the depth and fan-out this manager is actually enforcing.
+    /// </remarks>
+    public Coda.Agent.Settings.SubagentSettings SubagentSettings { get; }
+
     /// <summary>Maximum subagent nesting depth for this session.</summary>
     public int MaxSubagentDepth { get; }
 
@@ -72,6 +80,7 @@ public sealed partial class TaskManager : IDisposable
         }
 
         var limits = subagentSettings ?? Coda.Agent.Settings.SubagentSettings.Default;
+        SubagentSettings = limits;
         MaxSubagentDepth = limits.MaxDepth;
         MaxConcurrentSubagents = limits.MaxConcurrent;
         _subagentSlots = new SemaphoreSlim(limits.MaxConcurrent, limits.MaxConcurrent);

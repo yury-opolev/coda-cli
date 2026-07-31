@@ -127,7 +127,7 @@ public sealed class SubagentLimitsWiringTests : IDisposable
             new AgentOptions { Model = "m", WorkingDirectory = this.root, SystemPrompt = "sys" },
             tasks: tasks);
 
-        await loop.RunAsync([ChatMessage.UserText("go")], new NullSink(), CancellationToken.None);
+        await loop.RunAsync([ChatMessage.UserText("go")], new DiscardingSink(), CancellationToken.None);
 
         Assert.Equal(5, probe.SeenMaxDepth);
     }
@@ -142,7 +142,7 @@ public sealed class SubagentLimitsWiringTests : IDisposable
             new AllowAllPermissionPrompt(),
             new AgentOptions { Model = "m", WorkingDirectory = this.root, SystemPrompt = "sys" });
 
-        await loop.RunAsync([ChatMessage.UserText("go")], new NullSink(), CancellationToken.None);
+        await loop.RunAsync([ChatMessage.UserText("go")], new DiscardingSink(), CancellationToken.None);
 
         Assert.Equal(TaskManager.DefaultMaxSubagentDepth, probe.SeenMaxDepth);
     }
@@ -189,15 +189,5 @@ public sealed class SubagentLimitsWiringTests : IDisposable
                 yield return AssistantStreamEvent.Finished("end_turn");
             }
         }
-    }
-
-    private sealed class NullSink : IAgentSink
-    {
-        public void OnAssistantText(string delta) { }
-        public void OnAssistantTextComplete() { }
-        public void OnToolCall(string toolName, string inputPreview) { }
-        public void OnToolResult(string toolName, ToolResult result) { }
-        public void OnError(string message) { }
-        public void OnResponseRewritten(string hookCommand, string originalResponse, string displayContent, string? modifiedResponse) { }
     }
 }

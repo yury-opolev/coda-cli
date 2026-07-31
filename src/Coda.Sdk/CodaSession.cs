@@ -294,8 +294,7 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
             sessionHookList: this.configuredHooks,
             runLog: this.hookRunLog,
             trustGuard: this.trustGuard,
-            subagentRegistry: subagentRegistry,
-            subagentSettings: this.subagentSettings);
+            subagentRegistry: subagentRegistry);
 
         this.logger.LogInformation(
             "Session {sessionId} started: provider {provider}, model {model}",
