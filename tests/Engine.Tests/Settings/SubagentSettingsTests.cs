@@ -133,4 +133,58 @@ public sealed class SubagentSettingsTests : IDisposable
         // The field the project did not set still comes from the user file.
         Assert.Equal(8, settings.Subagents.MaxConcurrent);
     }
+
+    // -----------------------------------------------------------------------
+    // Prompt replacement is user-only: a project file is attacker-controlled the
+    // moment someone clones a hostile repo
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public void A_project_file_cannot_enable_system_prompt_replacement()
+    {
+        var settings = this.Load(projectJson: """{"subagents":{"allowSystemPromptReplacement":true}}""");
+
+        Assert.False(settings.Subagents.AllowSystemPromptReplacement);
+    }
+
+    [Fact]
+    public void A_project_file_cannot_enable_replacement_over_a_user_file_that_left_it_off()
+    {
+        var settings = this.Load(
+            userJson: """{"subagents":{"allowSystemPromptReplacement":false}}""",
+            projectJson: """{"subagents":{"allowSystemPromptReplacement":true}}""");
+
+        Assert.False(settings.Subagents.AllowSystemPromptReplacement);
+    }
+
+    [Fact]
+    public void The_user_file_is_what_enables_system_prompt_replacement()
+    {
+        var settings = this.Load(userJson: """{"subagents":{"allowSystemPromptReplacement":true}}""");
+
+        Assert.True(settings.Subagents.AllowSystemPromptReplacement);
+    }
+
+    [Fact]
+    public void A_project_file_cannot_disable_replacement_the_user_enabled()
+    {
+        // Symmetry matters as much as the block: the project file is simply not consulted for this
+        // field, so a hostile repo cannot flip it in either direction.
+        var settings = this.Load(
+            userJson: """{"subagents":{"allowSystemPromptReplacement":true}}""",
+            projectJson: """{"subagents":{"allowSystemPromptReplacement":false}}""");
+
+        Assert.True(settings.Subagents.AllowSystemPromptReplacement);
+    }
+
+    [Fact]
+    public void A_project_file_may_still_raise_the_clamped_resource_limits()
+    {
+        // Depth and fan-out stay project-settable: they are clamped bounds on resource use, not a
+        // hand-off of the subagent's own instructions.
+        var settings = this.Load(projectJson: """{"subagents":{"maxDepth":5,"maxConcurrent":16}}""");
+
+        Assert.Equal(5, settings.Subagents.MaxDepth);
+        Assert.Equal(16, settings.Subagents.MaxConcurrent);
+    }
 }

@@ -109,14 +109,23 @@ public sealed record CodaSettings(
 /// </summary>
 internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool? AllowSystemPromptReplacement)
 {
-    /// <summary>Project values win field by field; anything neither file set falls to the default.</summary>
+    /// <summary>
+    /// Project values win field by field; anything neither file set falls to the default.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: <see cref="AllowSystemPromptReplacement"/> is the exception — it is read from the
+    /// user file only, like <c>toolDisplayMode</c>. A project settings file is attacker-controlled
+    /// the moment someone clones a hostile repo, and this is the one field that hands a
+    /// prompt-injected model the subagent's own instructions; the depth and fan-out limits are
+    /// clamped resource bounds, so raising those from a project is merely noisy.
+    /// </remarks>
     public static SubagentOverrides? Merge(SubagentOverrides? user, SubagentOverrides? project) =>
         user is null && project is null
             ? null
             : new SubagentOverrides(
                 project?.MaxDepth ?? user?.MaxDepth,
                 project?.MaxConcurrent ?? user?.MaxConcurrent,
-                project?.AllowSystemPromptReplacement ?? user?.AllowSystemPromptReplacement);
+                user?.AllowSystemPromptReplacement);
 
     /// <summary>Applies these overrides onto the defaults, clamping as SubagentSettings requires.</summary>
     public SubagentSettings ToSettings() => new()

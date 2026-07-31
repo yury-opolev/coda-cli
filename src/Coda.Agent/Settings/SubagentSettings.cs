@@ -49,5 +49,10 @@ public sealed record SubagentSettings
     /// to it. Off by default: appending leaves the subagent's own identity and guardrails in front of
     /// whatever the caller adds, and replacing removes them.
     /// </summary>
+    /// <remarks>
+    /// Settable from the user settings file only. A project file is attacker-controlled as soon as
+    /// someone clones a hostile repo, and unlike the clamped depth and fan-out limits this one
+    /// decides whether a prompt-injected model can hand a subagent its instructions.
+    /// </remarks>
     public bool AllowSystemPromptReplacement { get; init; }
 }

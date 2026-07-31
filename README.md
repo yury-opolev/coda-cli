@@ -867,11 +867,11 @@ How deep and how wide a session may fan out into subagents is configurable in
 |---|---|---|
 | `maxDepth` | `2` | Deepest subagent nesting. The main agent is depth 0, so `2` permits a subagent and a grandchild. A subagent at the limit gets no task-management tools at all, so it cannot spawn or inspect anything. Clamped to `1`–`10`. |
 | `maxConcurrent` | `8` | How many subagents may run at once across the session, foreground and background together. The budget is session-wide and counts ancestors, so a running parent still holds a slot while its child asks for one. A launch that cannot get a slot is **refused, never queued** — the tool returns an error naming the limit so the model can wait, work inline, or explain why it cannot. Clamped to `1`–`64`. |
-| `allowSystemPromptReplacement` | `false` | Whether the `system_prompt` tool parameter (below) may replace a subagent's own instructions outright. |
+| `allowSystemPromptReplacement` | `false` | Whether the `system_prompt` tool parameter (below) may replace a subagent's own instructions outright. **User file only** — a project file cannot set it in either direction, because `<project>/.coda/settings.json` belongs to whoever wrote the repo you cloned, and this is the one field that would hand a prompt-injected model the subagent's own instructions. |
 
-Both values are **clamped on load**: a settings file can raise a limit within reason
-but never remove one. Neither is reachable from tool input — the model cannot widen
-its own budget.
+Both limits are **clamped on load**: a settings file can raise one within reason but
+never remove it. None of the three is reachable from tool input — the model cannot
+widen its own budget or ungate its own prompt.
 
 #### Influencing a subagent's system prompt
 
