@@ -138,22 +138,38 @@ public sealed record PluginManifest
     public string? Themes { get; init; }
 
     // -------------------------------------------------------------------------
-    // Runtime configuration (Phase 4 — parsed but not yet wired)
+    // Runtime configuration
     // -------------------------------------------------------------------------
 
     /// <summary>
-    /// Inline or path-based hook configurations. Parsed and exposed; consumed in Phase 4.
+    /// Paths to hook configuration files, relative to the plugin directory.
     /// </summary>
+    /// <remarks>
+    /// Loaded by <see cref="PluginHookLoader"/> and merged by <see cref="PluginComponentComposer"/>,
+    /// but only for plugins whose <see cref="PluginComponentClass.Hook"/> class the user approved.
+    /// </remarks>
     public IReadOnlyList<string> Hooks { get; init; } = [];
 
     /// <summary>
-    /// MCP server configurations. Parsed and exposed; consumed in Phase 4.
+    /// Paths to MCP server configuration files, relative to the plugin directory. Each file has the
+    /// same shape as <c>.mcp.json</c>.
     /// </summary>
+    /// <remarks>
+    /// Loaded by <see cref="PluginMcpLoader"/>, gated on the user having approved this plugin's
+    /// <see cref="PluginComponentClass.McpServer"/> class, then merged by
+    /// <see cref="Coda.Mcp.McpConfig.LoadEntriesWithPlugins"/> beneath the user and project layers —
+    /// so a server of the same name in <c>.mcp.json</c> shadows the plugin's.
+    /// </remarks>
     public IReadOnlyList<string> McpServers { get; init; } = [];
 
     /// <summary>
-    /// LSP server configurations. Parsed and exposed; wiring via the existing LSP loader.
+    /// Paths to LSP server configuration files, relative to the plugin directory.
     /// </summary>
+    /// <remarks>
+    /// Parsed only: nothing reads this yet. LSP servers currently come from settings
+    /// (<see cref="Coda.Agent.Settings.CodaSettings.LspServers"/>), so declaring one here has no
+    /// effect. Wiring it would need the same per-class approval gate the hook and MCP paths use.
+    /// </remarks>
     public IReadOnlyList<string> LspServers { get; init; } = [];
 
     // -------------------------------------------------------------------------
