@@ -585,17 +585,24 @@ public static class TranscriptBlockFormatter
                 break;
 
             case Markdig.Syntax.CodeBlock code:
+            {
+                var body = code.Lines.ToString();
+                var info = code is Markdig.Syntax.FencedCodeBlock fenced ? fenced.Info : null;
+
+                // A block the model labelled "diff" is asking to be read as one, so give it the same
+                // rendering /diff produces — but only when it really holds a patch, since a mislabelled
+                // fence should still show its contents rather than vanish.
+                if (IsDiffInfoString(info) && UnifiedDiffParser.LooksLikeDiff(body))
+                {
+                    AppendDiffWithPreamble(lines, body, width, TranscriptRole.Code);
+                    break;
+                }
+
                 // Only a fenced block names its language; an indented block has no info string, so it
                 // stays unhighlighted rather than being guessed at.
-                AppendCode(
-                    lines,
-                    code.Lines.ToString(),
-                    width,
-                    indent,
-                    code is Markdig.Syntax.FencedCodeBlock fenced
-                        ? SyntaxLanguageDetector.FromInfoString(fenced.Info)
-                        : SyntaxLanguage.None);
+                AppendCode(lines, body, width, indent, SyntaxLanguageDetector.FromInfoString(info));
                 break;
+            }
 
             case QuoteBlock quote:
                 var callout = DetectCallout(quote);
@@ -868,6 +875,25 @@ public static class TranscriptBlockFormatter
                 lines[itemStart] = firstLine with { Text = indent + marker + suffix };
             }
         }
+    }
+
+    /// <summary>Whether a fenced block's info string declares its contents to be a patch.</summary>
+    private static bool IsDiffInfoString(string? info)
+    {
+        if (string.IsNullOrWhiteSpace(info))
+        {
+            return false;
+        }
+
+        var first = info.AsSpan().Trim();
+        var space = first.IndexOf(' ');
+        if (space >= 0)
+        {
+            first = first[..space];
+        }
+
+        return first.Equals("diff", StringComparison.OrdinalIgnoreCase)
+            || first.Equals("patch", StringComparison.OrdinalIgnoreCase);
     }
 
     private static void AppendCode(
@@ -1297,14 +1323,47 @@ public static class TranscriptBlockFormatter
     {
         if (!isError && UnifiedDiffParser.LooksLikeDiff(result))
         {
-            // AppendDiff sanitises the patch itself, and embedded mode leaves the gutter to the caller.
-            AppendDiff(lines, result, width, embedded: true);
+            AppendDiffWithPreamble(lines, result, width, role);
             return;
         }
 
+        AppendSanitizedPreformatted(lines, result, width, role);
+    }
+
+    /// <summary>
+    /// Renders a patch, keeping whatever text preceded it.
+    /// </summary>
+    /// <remarks>
+    /// A patch is rarely alone: <c>git show</c> and <c>git log -p</c> put a commit header, author, date
+    /// and message in front of one. Rendering only the parsed files would drop all of that silently, which
+    /// is worse than not colouring the diff at all.
+    /// </remarks>
+    private static void AppendDiffWithPreamble(
+        List<TranscriptRenderLine> lines,
+        string text,
+        int width,
+        TranscriptRole role)
+    {
+        var start = UnifiedDiffParser.FindDiffStart(text);
+        if (start > 0)
+        {
+            AppendSanitizedPreformatted(lines, text[..start].TrimEnd('\n', '\r'), width, role);
+        }
+
+        // AppendDiff sanitises the patch itself, and embedded mode leaves the gutter to the caller.
+        AppendDiff(lines, start > 0 ? text[start..] : text, width, embedded: true);
+    }
+
+    /// <summary>Emits preformatted rows, stripping escapes and controls first.</summary>
+    private static void AppendSanitizedPreformatted(
+        List<TranscriptRenderLine> lines,
+        string text,
+        int width,
+        TranscriptRole role)
+    {
         // Tool output is untrusted: strip escapes, controls and bidi overrides before it reaches the
         // terminal, matching how the correlated-activity path already treats a result.
-        foreach (var line in SplitLines(TerminalTextSanitizer.Sanitize(result)))
+        foreach (var line in SplitLines(TerminalTextSanitizer.Sanitize(text)))
         {
             foreach (var wrapped in WrapPreformatted(line, width))
             {

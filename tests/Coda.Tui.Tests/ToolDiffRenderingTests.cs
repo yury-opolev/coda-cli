@@ -101,3 +101,113 @@ public sealed class ToolDiffRenderingTests
         }
     }
 }
+
+/// <summary>
+/// A patch rarely arrives alone. <c>git show</c> puts a commit header in front of it, and a model
+/// writes prose around a fenced one. Rendering the diff must never cost the text around it, and a
+/// block the model explicitly labelled <c>diff</c> should be rendered as one.
+/// </summary>
+public sealed class DiffInContextTests
+{
+    private const string GitShow = """
+        commit 98e5e45
+        Author: yury <yury@example.com>
+        Date:   Fri Jul 31 07:23:13 2026 +0200
+
+            chore: bump version to 0.1.94
+
+        diff --git a/version.json b/version.json
+        index a10bbe1..518a052 100644
+        --- a/version.json
+        +++ b/version.json
+        @@ -1,3 +1,3 @@
+         {
+        -  "build": 93
+        +  "build": 94
+         }
+        """;
+
+    private static TranscriptRenderLine[] FormatTool(string result) =>
+        TranscriptBlockFormatter.Format(
+            new ToolTranscriptBlock(Guid.NewGuid(), "shell", "{}", 1, result, false, true), 100).ToArray();
+
+    private static TranscriptRenderLine[] FormatMarkdown(string markdown) =>
+        TranscriptBlockFormatter.Format(
+            new AssistantTranscriptBlock(Guid.NewGuid(), markdown, true), 100).ToArray();
+
+    // -----------------------------------------------------------------------
+    // The text around a diff must survive
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public void A_commit_header_in_front_of_a_diff_is_preserved()
+    {
+        var lines = FormatTool(GitShow);
+
+        Assert.Contains(lines, l => l.Text.Contains("commit 98e5e45", StringComparison.Ordinal));
+        Assert.Contains(lines, l => l.Text.Contains("Author: yury", StringComparison.Ordinal));
+        Assert.Contains(lines, l => l.Text.Contains("chore: bump version to 0.1.94", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void The_diff_after_a_commit_header_is_still_rendered_richly()
+    {
+        var lines = FormatTool(GitShow);
+
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffAdded);
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffRemoved);
+    }
+
+    [Fact]
+    public void The_preamble_is_not_mistaken_for_diff_content()
+    {
+        var lines = FormatTool(GitShow);
+
+        var author = Assert.Single(lines, l => l.Text.Contains("Author: yury", StringComparison.Ordinal));
+        Assert.NotEqual(TranscriptRole.DiffAdded, author.Role);
+        Assert.NotEqual(TranscriptRole.DiffRemoved, author.Role);
+    }
+
+    // -----------------------------------------------------------------------
+    // A fenced block the model labelled "diff"
+    // -----------------------------------------------------------------------
+
+    [Theory]
+    [InlineData("diff")]
+    [InlineData("patch")]
+    public void A_fenced_block_labelled_as_a_diff_is_rendered_as_one(string info)
+    {
+        var lines = FormatMarkdown($"Here:\n\n```{info}\n{GitShow}\n```\n");
+
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffAdded);
+        Assert.Contains(lines, l => l.Role == TranscriptRole.DiffRemoved);
+    }
+
+    [Fact]
+    public void The_prose_around_a_fenced_diff_survives()
+    {
+        var lines = FormatMarkdown($"Here:\n\n```diff\n{GitShow}\n```\n\nThat is the bump.\n");
+
+        Assert.Contains(lines, l => l.Text.Contains("Here:", StringComparison.Ordinal));
+        Assert.Contains(lines, l => l.Text.Contains("That is the bump.", StringComparison.Ordinal));
+        Assert.Contains(lines, l => l.Text.Contains("commit 98e5e45", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_diff_fence_holding_no_real_diff_stays_ordinary_code()
+    {
+        var lines = FormatMarkdown("```diff\njust some text\nnot a patch\n```\n");
+
+        Assert.DoesNotContain(lines, l => l.Role is TranscriptRole.DiffAdded or TranscriptRole.DiffRemoved);
+        Assert.Contains(lines, l => l.Text.Contains("just some text", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void A_csharp_fence_is_still_highlighted_rather_than_diffed()
+    {
+        var lines = FormatMarkdown("```csharp\npublic int X = 1;\n```\n");
+
+        Assert.DoesNotContain(lines, l => l.Role is TranscriptRole.DiffAdded or TranscriptRole.DiffRemoved);
+        Assert.Contains(lines, l => l.Syntax is { Count: > 0 });
+    }
+}
