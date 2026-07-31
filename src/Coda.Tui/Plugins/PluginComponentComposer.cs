@@ -30,6 +30,18 @@ public sealed class PluginComposition
         new Dictionary<string, (McpServerConfig, string)>(StringComparer.Ordinal);
 
     /// <summary>
+    /// LSP servers contributed by enabled plugins whose <see cref="PluginComponentClass.Lsp"/> class
+    /// the user approved, keyed by the loader's scoped name (<c>plugin:&lt;plugin&gt;:&lt;server&gt;</c>).
+    /// </summary>
+    /// <remarks>
+    /// Composed here rather than discovered further down because starting an LSP server runs a process,
+    /// and only this layer knows which plugins are enabled and approved. The session receives the
+    /// finished set and never scans for itself.
+    /// </remarks>
+    public IReadOnlyDictionary<string, Coda.Agent.Lsp.LspServerConfig> LspServers { get; init; } =
+        new Dictionary<string, Coda.Agent.Lsp.LspServerConfig>(StringComparer.Ordinal);
+
+    /// <summary>
     /// Output styles contributed by enabled plugins, for session-scoped resolution.
     /// These are also registered into the static <see cref="BuiltInOutputStyles"/> registry
     /// as a side-effect of <see cref="PluginComponentComposer.Compose"/>, but the list here
@@ -211,6 +223,29 @@ public static class PluginComponentComposer
             mcpServers = new Dictionary<string, (McpServerConfig, string)>(StringComparer.Ordinal);
         }
 
+        // LSP servers — same gate as MCP: these start a process, so only enabled, approved plugins
+        // contribute. The loader is handed explicit directories rather than left to scan.
+        var eligibleForLsp = trustStore is null
+            ? plugins.Where(p => p.IsEnabled).ToList()
+            : plugins.Where(p =>
+            {
+                if (!p.IsEnabled) return false;
+                var filter = BuildTrustFilter(p, workingDirectory, trustStore, logger);
+                return !filter.BlocksAll && filter.IsClassAllowed(PluginComponentClass.Lsp);
+            }).ToList();
+
+        IReadOnlyDictionary<string, Coda.Agent.Lsp.LspServerConfig> lspServers;
+        try
+        {
+            lspServers = Coda.Agent.Lsp.PluginLspServerLoader.LoadForPluginDirectories(
+                eligibleForLsp.Select(p => p.Directory).ToList());
+        }
+        catch (Exception ex)
+        {
+            logger?.LogError("Unexpected error loading plugin LSP servers: {Message}", ex.Message);
+            lspServers = new Dictionary<string, Coda.Agent.Lsp.LspServerConfig>(StringComparer.Ordinal);
+        }
+
         // Output styles and themes: apply workspace-trust filtering so project plugins in an
         // untrusted workspace cannot inject content into the session even for non-executable
         // components. LoadOutputStyles/LoadThemes are called outside the per-plugin loop (they
@@ -252,6 +287,7 @@ public static class PluginComponentComposer
             Agents = agents,
             Hooks = hooks,
             McpServers = mcpServers,
+            LspServers = lspServers,
             OutputStyles = outputStyles,
             Themes = themes,
             Commands = commands,

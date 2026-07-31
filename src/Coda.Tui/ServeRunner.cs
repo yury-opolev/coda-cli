@@ -500,7 +500,8 @@ public static class ServeRunner
                     : null;
 
                 var sessionOptions = BuildSessionOptions(options, settings.Telemetry, allExtraTools, settings.EffortByModel, skillReattach, grantedDirs,
-                    pluginOutputStyles: pluginComposition.OutputStyles);
+                    pluginOutputStyles: pluginComposition.OutputStyles,
+                    pluginLspServers: pluginComposition.LspServers);
 
                 var streams = await transport.AcceptAsync(cts.Token).ConfigureAwait(false);
                 await using var host = BuildHost(streams.Input, streams.Output, credentials, sessionOptions, options.ApiKey,
@@ -537,7 +538,8 @@ public static class ServeRunner
         IReadOnlyDictionary<string, string>? effortByModel = null,
         Func<int, string>? skillReattachProvider = null,
         Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null,
-        IReadOnlyList<Coda.Agent.OutputStyles.OutputStyle>? pluginOutputStyles = null) =>
+        IReadOnlyList<Coda.Agent.OutputStyles.OutputStyle>? pluginOutputStyles = null,
+        IReadOnlyDictionary<string, Coda.Agent.Lsp.LspServerConfig>? pluginLspServers = null) =>
         new()
         {
             ProviderId = options.ProviderId!,
@@ -568,6 +570,8 @@ public static class ServeRunner
             // stale or unsupported stored levels are clamped/dropped, never sent verbatim.
             Effort = ResolveInitialEffort(options.ProviderId!, options.Model!, effortByModel),
             PluginOutputStyles = pluginOutputStyles ?? [],
+            PluginLspServers = pluginLspServers
+                ?? new Dictionary<string, Coda.Agent.Lsp.LspServerConfig>(StringComparer.Ordinal),
         };
 
     /// <summary>

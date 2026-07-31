@@ -63,7 +63,7 @@ public sealed class LspServerMapBuilderTests : IDisposable
             ["ts"] = MakeConfig("typescript-language-server"),
         };
 
-        var result = LspServerMapBuilder.Build(settingsServers, [this.baseDir]);
+        var result = LspServerMapBuilder.Build(settingsServers, PluginLspServerLoader.Load([this.baseDir]));
 
         Assert.True(result.ContainsKey("ts"), "Expected 'ts' from settings.");
         Assert.True(result.ContainsKey("plugin:myplugin:py"), "Expected 'plugin:myplugin:py' from plugin.");
@@ -86,7 +86,7 @@ public sealed class LspServerMapBuilderTests : IDisposable
             ["plugin:myplugin:py"] = settingsConfig,
         };
 
-        var result = LspServerMapBuilder.Build(settingsServers, [this.baseDir]);
+        var result = LspServerMapBuilder.Build(settingsServers, PluginLspServerLoader.Load([this.baseDir]));
 
         // The settings config must win on the clashing key.
         Assert.Equal("pylsp-from-settings", result["plugin:myplugin:py"].Command);
@@ -102,7 +102,7 @@ public sealed class LspServerMapBuilderTests : IDisposable
 
         // Pass a non-existent dir — no plugins
         var nonExistent = Path.Combine(this.baseDir, "no-such-dir");
-        var result = LspServerMapBuilder.Build(settingsServers, [nonExistent]);
+        var result = LspServerMapBuilder.Build(settingsServers, PluginLspServerLoader.Load([nonExistent]));
 
         Assert.Single(result);
         Assert.True(result.ContainsKey("ts"));
@@ -115,7 +115,7 @@ public sealed class LspServerMapBuilderTests : IDisposable
 
         var result = LspServerMapBuilder.Build(
             new Dictionary<string, LspServerConfig>(),
-            [this.baseDir]);
+            PluginLspServerLoader.Load([this.baseDir]));
 
         Assert.Single(result);
         Assert.True(result.ContainsKey("plugin:myplugin:py"));

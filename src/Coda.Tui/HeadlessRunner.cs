@@ -188,6 +188,7 @@ public static class HeadlessRunner
             MaxStopContinuations = options.MaxStopContinuations,
             SystemPromptOverride = ResolveInitialSystemPromptOverride(options, resolvedTarget),
             PluginOutputStyles = pluginComposition.OutputStyles,
+            PluginLspServers = pluginComposition.LspServers,
         };
 
         // Merge plugin hooks before settings hooks so they are subject to the same trust guard.

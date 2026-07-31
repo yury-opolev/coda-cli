@@ -14,6 +14,12 @@ public sealed record PluginInventory
     /// <summary>Number of MCP server entries declared in the plugin manifest.</summary>
     public int McpServerCount { get; init; }
 
+    /// <summary>
+    /// Number of LSP servers the plugin declares, counted by resolving them exactly as the loader
+    /// does — so an inline <c>lspServers</c> object, a path to a file, and a <c>.lsp.json</c> all count.
+    /// </summary>
+    public int LspServerCount { get; init; }
+
     /// <summary>Number of subagent definition files found in the plugin's agents directory.</summary>
     public int SubagentCount { get; init; }
 
@@ -23,7 +29,7 @@ public sealed record PluginInventory
     /// <summary><see langword="true"/> when the plugin provides no components at all.</summary>
     public bool IsEmpty =>
         this.SkillCount == 0 && this.HookCount == 0 && this.McpServerCount == 0 &&
-        this.SubagentCount == 0 && this.CommandCount == 0;
+        this.SubagentCount == 0 && this.CommandCount == 0 && this.LspServerCount == 0;
 
     /// <summary>
     /// The set of <see cref="PluginComponentClass"/> values present in this inventory
@@ -39,6 +45,7 @@ public sealed record PluginInventory
             if (this.McpServerCount > 0) set.Add(PluginComponentClass.McpServer);
             if (this.SubagentCount > 0) set.Add(PluginComponentClass.Subagent);
             if (this.CommandCount > 0) set.Add(PluginComponentClass.SlashCommand);
+            if (this.LspServerCount > 0) set.Add(PluginComponentClass.Lsp);
             return set;
         }
     }
@@ -55,6 +62,7 @@ public sealed record PluginInventory
         if (this.HookCount > 0) parts.Add($"{this.HookCount} hook{(this.HookCount == 1 ? string.Empty : "s")}");
         if (this.McpServerCount > 0) parts.Add($"{this.McpServerCount} MCP server{(this.McpServerCount == 1 ? string.Empty : "s")}");
         if (this.SubagentCount > 0) parts.Add($"{this.SubagentCount} subagent{(this.SubagentCount == 1 ? string.Empty : "s")}");
+        if (this.LspServerCount > 0) parts.Add($"{this.LspServerCount} LSP server{(this.LspServerCount == 1 ? string.Empty : "s")}");
         return parts.Count == 0 ? "(no components)" : string.Join(", ", parts);
     }
 
@@ -76,7 +84,25 @@ public sealed record PluginInventory
             McpServerCount = manifest.McpServers.Count,
             SubagentCount = CountSubagents(manifest, pluginDirectory),
             CommandCount = CountCommands(manifest, pluginDirectory),
+            LspServerCount = CountLspServers(pluginDirectory),
         };
+    }
+
+    /// <summary>
+    /// Counts LSP servers by resolving them through the loader that actually starts them, so the
+    /// inventory cannot disagree with what would run. The manifest model only captures the path form;
+    /// a plugin may equally declare them inline or in a <c>.lsp.json</c>.
+    /// </summary>
+    private static int CountLspServers(string pluginDirectory)
+    {
+        try
+        {
+            return Coda.Agent.Lsp.PluginLspServerLoader.LoadForPluginDirectories([pluginDirectory]).Count;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            return 0;
+        }
     }
 
     private static int CountSkills(PluginManifest manifest, string pluginDirectory)
