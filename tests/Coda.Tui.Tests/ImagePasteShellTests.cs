@@ -14,7 +14,7 @@ namespace Coda.Tui.Tests;
 [Collection("TerminalGuiInit")]
 public sealed class ImagePasteShellTests
 {
-    private sealed class FakeImageReader(ClipboardImage? image) : IClipboardImageReader
+    internal sealed class FakeImageReader(ClipboardImage? image) : IClipboardImageReader
     {
         public ClipboardImage? TryRead() => image;
     }
@@ -297,5 +297,143 @@ public sealed class ImagePasteShellTests
 
         Assert.False(readerInvoked);
         Assert.Empty(fixture.Shell.Composer.GetDraft());
+    }
+}
+
+/// <summary>
+/// A terminal that claims Ctrl+V for its own paste can only ever hand the application text. When that
+/// text is a path to an image file, treating it as an attachment is what makes the obvious gesture work
+/// without the user rebinding anything.
+/// </summary>
+public sealed class ImagePathPasteShellTests : IDisposable
+{
+    private readonly string directory =
+        Directory.CreateDirectory(Path.Combine(Path.GetTempPath(), "coda-paste-" + Guid.NewGuid().ToString("N"))).FullName;
+
+    public void Dispose()
+    {
+        try { Directory.Delete(this.directory, recursive: true); } catch (IOException) { }
+    }
+
+    private static readonly byte[] Png = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+
+    private string WritePng(string name = "shot.png")
+    {
+        var path = Path.Combine(this.directory, name);
+        File.WriteAllBytes(path, Png);
+        return path;
+    }
+
+    [Fact]
+    public void Pasting_a_path_to_an_image_attaches_it_instead_of_inserting_the_path()
+    {
+        var path = this.WritePng();
+        string? staged = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: img => { staged = img.Base64Data; return "[Image 1]"; });
+
+        fixture.Shell.Composer.NewPasteEvent(path);
+
+        Assert.Equal(Convert.ToBase64String(Png), staged);
+        Assert.Contains("[Image 1]", fixture.Shell.Composer.GetDraft(), StringComparison.Ordinal);
+        Assert.DoesNotContain(path, fixture.Shell.Composer.GetDraft(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_quoted_path_from_copy_as_path_is_attached()
+    {
+        var path = this.WritePng();
+        string? staged = null;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: img => { staged = img.Base64Data; return "[Image 1]"; });
+
+        // Explorer's Shift+right-click → "Copy as path" quotes the path.
+        fixture.Shell.Composer.NewPasteEvent($"\"{path}\"");
+
+        Assert.Equal(Convert.ToBase64String(Png), staged);
+    }
+
+    [Fact]
+    public void Pasting_ordinary_text_is_still_inserted_as_text()
+    {
+        var attached = false;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: _ => { attached = true; return "[Image 1]"; });
+
+        fixture.Shell.Composer.NewPasteEvent("just some prose");
+
+        Assert.False(attached);
+        Assert.Contains("just some prose", fixture.Shell.Composer.GetDraft(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_path_to_a_non_image_file_is_still_inserted_as_text()
+    {
+        var path = Path.Combine(this.directory, "notes.txt");
+        File.WriteAllText(path, "hello");
+        var attached = false;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: _ => { attached = true; return "[Image 1]"; });
+
+        fixture.Shell.Composer.NewPasteEvent(path);
+
+        Assert.False(attached);
+        Assert.Contains("notes.txt", fixture.Shell.Composer.GetDraft(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void A_path_that_names_an_image_but_is_not_there_warns_and_pastes_nothing()
+    {
+        var missing = Path.Combine(this.directory, "absent.png");
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: _ => "[Image 1]");
+
+        fixture.Shell.Composer.NewPasteEvent(missing);
+
+        Assert.Equal(OperationalTone.Warning, fixture.Shell.Operational.Status.Tone);
+        Assert.Empty(fixture.Shell.Composer.GetDraft());
+    }
+
+    [Fact]
+    public void The_inserted_token_is_not_itself_examined_as_a_paste()
+    {
+        // The shell inserts "[Image 1] " through the same paste machinery; re-entering the handler with
+        // its own token would be a loop waiting to happen.
+        var path = this.WritePng();
+        var calls = 0;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: _ => { calls++; return "[Image 1]"; });
+
+        fixture.Shell.Composer.NewPasteEvent(path);
+
+        Assert.Equal(1, calls);
+    }
+
+    [Fact]
+    public void A_multi_line_paste_mentioning_an_image_stays_text()
+    {
+        var path = this.WritePng();
+        var attached = false;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new ImagePasteShellTests.FakeImageReader(null),
+            imagePaste: _ => { attached = true; return "[Image 1]"; });
+
+        fixture.Shell.Composer.NewPasteEvent($"see this:\n{path}");
+
+        Assert.False(attached);
+        Assert.Contains("see this:", fixture.Shell.Composer.GetDraft(), StringComparison.Ordinal);
     }
 }
