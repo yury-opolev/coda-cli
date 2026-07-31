@@ -232,7 +232,7 @@ public readonly record struct TranscriptRenderLine(string Text, TranscriptRole R
 public static class TranscriptBlockFormatter
 {
     private static readonly MarkdownPipeline Pipeline =
-        new MarkdownPipelineBuilder().UseAutoLinks().Build();
+        new MarkdownPipelineBuilder().UseAutoLinks().UsePipeTables().Build();
 
     /// <summary>Projects <paramref name="block"/> onto wrapped, attributed lines for the given cell width.</summary>
     public static IReadOnlyList<TranscriptRenderLine> Format(TranscriptBlock block, int width) =>
@@ -584,6 +584,10 @@ public static class TranscriptBlockFormatter
                 AppendWrappedInline(lines, paragraph.Inline, width, TranscriptRole.Assistant, indent);
                 break;
 
+            case Markdig.Extensions.Tables.Table table:
+                AppendTable(lines, table, EffectiveWidth(width, indent), indent);
+                break;
+
             case Markdig.Syntax.CodeBlock code:
             {
                 var body = code.Lines.ToString();
@@ -874,6 +878,90 @@ public static class TranscriptBlockFormatter
                 var suffix = text.Length >= prefixLength ? text[prefixLength..] : string.Empty;
                 lines[itemStart] = firstLine with { Text = indent + marker + suffix };
             }
+        }
+    }
+
+    /// <summary>
+    /// Renders a markdown table as real columns, fitted to the viewport.
+    /// </summary>
+    /// <remarks>
+    /// Cell content is flattened to its text: a table cell is a small space, and carrying inline styling
+    /// and link spans through column allocation and wrapping would buy little for the complexity. The
+    /// layout arithmetic lives in <see cref="MarkdownTableLayout"/>; this method only turns Markdig's
+    /// model into cell strings and the result back into attributed rows.
+    /// </remarks>
+    private static void AppendTable(
+        List<TranscriptRenderLine> lines,
+        Markdig.Extensions.Tables.Table table,
+        int width,
+        string indent)
+    {
+        var rows = new List<IReadOnlyList<string>>();
+        var hasHeader = false;
+
+        foreach (var block in table)
+        {
+            if (block is not Markdig.Extensions.Tables.TableRow row)
+            {
+                continue;
+            }
+
+            var cells = new List<string>();
+            foreach (var cellBlock in row)
+            {
+                if (cellBlock is not Markdig.Extensions.Tables.TableCell cell)
+                {
+                    continue;
+                }
+
+                // A cell holds blocks; in practice one paragraph. Flatten whatever inline content it has.
+                var text = new StringBuilder();
+                foreach (var inner in cell)
+                {
+                    if (inner is LeafBlock { Inline: not null } leaf)
+                    {
+                        text.Append(RenderInline(leaf.Inline));
+                    }
+                }
+
+                cells.Add(text.ToString().Trim());
+            }
+
+            if (rows.Count == 0 && row.IsHeader)
+            {
+                hasHeader = true;
+            }
+
+            rows.Add(cells);
+        }
+
+        if (rows.Count == 0)
+        {
+            return;
+        }
+
+        var alignments = table.ColumnDefinitions
+            .Select(definition => MarkdownTableLayout.From(definition.Alignment))
+            .ToList();
+
+        var built = MarkdownTableLayout.Build(
+            rows,
+            alignments,
+            hasHeader,
+            width,
+            static (text, cellWidth) => WrapLine(text, cellWidth));
+
+        foreach (var built_row in built)
+        {
+            var role = built_row switch
+            {
+                { IsRule: true } => TranscriptRole.DiffContext,
+                { IsHeader: true } => TranscriptRole.Heading,
+                _ => TranscriptRole.Assistant,
+            };
+
+            // Trailing padding on the last column serves no purpose and would end up in copied text.
+            lines.Add(new TranscriptRenderLine(indent + built_row.Text.TrimEnd(), role));
         }
     }
 
