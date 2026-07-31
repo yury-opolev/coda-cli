@@ -9,8 +9,8 @@ namespace Coda.Agent;
 /// the instance, including already-running foreground and background subagents.
 /// </summary>
 /// <remarks>
-/// The mode is stored as an <see cref="int"/> and accessed with <see cref="Volatile.Read(ref int)"/>
-/// / <see cref="Volatile.Write(ref int, int)"/> so a writer on one thread and readers on others see
+/// The mode is stored as an <see cref="int"/> and accessed with <c>Volatile.Read</c>
+/// / <c>Volatile.Write</c> so a writer on one thread and readers on others see
 /// a consistent, torn-free value without locking.
 /// </remarks>
 public sealed class PermissionModeState

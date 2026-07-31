@@ -33,7 +33,7 @@ public sealed record SessionOptions
     /// <see cref="AutoCompactTokenThreshold"/> for this turn; the lambda computes the character
     /// budget via <c>SkillSessionState.DeriveReattachBudget</c> and calls
     /// <c>SkillSessionState.GetReattachContent</c>. Returns the content to inject, or null/empty
-    /// when nothing needs re-injecting. Wires the <see cref="Coda.Tui.Skills.SkillSessionState"/>
+    /// when nothing needs re-injecting. Wires the <c>Coda.Tui.Skills.SkillSessionState</c>
     /// into the compaction path without creating a dependency on <c>Coda.Tui</c> in this assembly.
     /// </summary>
     public Func<int, string>? SkillReattachContentProvider { get; init; }
@@ -92,7 +92,7 @@ public sealed record SessionOptions
     /// Session-scoped plugin output styles for this session. Checked before the static process-global
     /// registry so serve sessions with different working directories resolve only their own plugin styles.
     /// Empty by default (no plugin styles); the TUI/headless paths may populate this from
-    /// <see cref="Coda.Tui.Plugins.PluginComposition.OutputStyles"/> at session construction.
+    /// <c>Coda.Tui.Plugins.PluginComposition.OutputStyles</c> at session construction.
     /// </summary>
     public IReadOnlyList<OutputStyle> PluginOutputStyles { get; init; } = [];
 
@@ -103,7 +103,7 @@ public sealed record SessionOptions
     /// <remarks>
     /// Supplied by the caller rather than discovered here, because starting an LSP server runs a
     /// process and only the plugin layer knows which plugins the user enabled and approved for it
-    /// (<see cref="Coda.Tui.Plugins.PluginComposition.LspServers"/>). Empty by default, so a host that
+    /// (<c>Coda.Tui.Plugins.PluginComposition.LspServers</c>). Empty by default, so a host that
     /// does not compose plugins contributes none rather than silently scanning for them.
     /// </remarks>
     public IReadOnlyDictionary<string, Coda.Agent.Lsp.LspServerConfig> PluginLspServers { get; init; } =

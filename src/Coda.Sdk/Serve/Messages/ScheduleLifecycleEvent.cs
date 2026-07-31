@@ -11,9 +11,9 @@ namespace Coda.Sdk.Serve.Messages;
 /// Optional fields are omitted from the wire when null.
 /// </summary>
 /// <remarks>
-/// This is a distinct wire type from the shared <see cref="Coda.Sdk.Scheduling.ScheduleLifecycleEvent"/>
+/// This is a distinct wire type from the shared <c>Coda.Sdk.Scheduling.ScheduleLifecycleEvent</c>
 /// (which carries a typed enum, not a wire string). A positional record with explicit
-/// <see cref="JsonPropertyName"/> attributes keeps the JSON shape stable and camelCase — never a
+/// <c>[JsonPropertyName]</c> attributes keeps the JSON shape stable and camelCase — never a
 /// ValueTuple <c>Item1</c>/<c>Item2</c> projection.
 /// </remarks>
 /// <param name="DefinitionId">The scheduled definition's persisted id.</param>

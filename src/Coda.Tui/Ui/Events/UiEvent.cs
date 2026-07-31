@@ -47,7 +47,7 @@ public sealed record ThinkingDeltaEvent(string Delta, DateTimeOffset BurstStarte
 
 /// <summary>
 /// The current reasoning burst completed. <see cref="ElapsedMs"/> is the wall-clock duration of the
-/// burst, computed by the <see cref="TuiAgentSink"/> from its injectable <see cref="TimeProvider"/>.
+/// burst, computed by the <c>TuiAgentSink</c> from its injectable <see cref="TimeProvider"/>.
 /// <see cref="ThinkingTokens"/> is the provider-reported token count for the burst, or
 /// <see langword="null"/> when the provider does not report per-burst counts.
 /// </summary>

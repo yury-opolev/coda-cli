@@ -57,8 +57,8 @@ internal sealed class IncrementalMarkdownFormatter
     /// <summary>
     /// Projects the assistant block <paramref name="id"/>'s accumulated <paramref name="text"/> at the given
     /// cell width, reusing the formatting of already-completed leading blocks. The result is identical to
-    /// <see cref="TranscriptBlockFormatter.Format(TranscriptBlock,int)"/> for an
-    /// <see cref="AssistantTranscriptBlock"/> carrying the same text.
+    /// <c>TranscriptBlockFormatter.Format</c> for an
+    /// <c>AssistantTranscriptBlock</c> carrying the same text.
     /// </summary>
     public IReadOnlyList<TranscriptRenderLine> Update(Guid id, string? text, int width)
     {

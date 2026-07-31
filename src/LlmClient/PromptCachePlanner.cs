@@ -26,7 +26,7 @@ namespace LlmClient;
 /// </para>
 /// <para>
 /// <b>Item 3 finding — system prompt requires no split.</b>
-/// <see cref="Coda.Agent.AgentSystemPrompt.Build"/> composes fixed instruction text, an
+/// <c>Coda.Agent.AgentSystemPrompt.Build</c> composes fixed instruction text, an
 /// <c># Environment</c> section with the working directory, and optional <c># Project context</c>
 /// / <c># Output style</c> sections. All components are fixed for the lifetime of a session: the
 /// prompt is built once in <c>TurnPipelineBuilder.BuildSpec</c> and stored in

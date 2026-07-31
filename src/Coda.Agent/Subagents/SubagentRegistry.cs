@@ -20,7 +20,7 @@ public sealed class SubagentRegistry
     /// Resolves a subagent type name. Built-in types are checked first (case-insensitive)
     /// so a plugin agent with the same type as a built-in cannot shadow it — plugin
     /// definitions whose type collides with a built-in are rejected at compose time by
-    /// <see cref="PluginComponentComposer"/>, but this order provides defence-in-depth.
+    /// <c>PluginComponentComposer</c>, but this order provides defence-in-depth.
     /// Unknown types fall back to <see cref="BuiltInAgents.Resolve"/>.
     /// </summary>
     public SubagentDefinition Resolve(string? type)

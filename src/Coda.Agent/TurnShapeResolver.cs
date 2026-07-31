@@ -68,7 +68,7 @@ internal sealed record TurnShapeResolution
     /// Only the tool restriction crosses the parent–child boundary. System prompt, model, and
     /// effort overrides are per-parent-turn decisions specific to that turn's context (the
     /// parent's own role prompt, model budget, etc.) and must not bleed into a subagent that
-    /// has its own system prompt (<see cref="Subagents.AgentSystemPrompt"/>) and context.
+    /// has its own system prompt (<c>AgentSystemPrompt</c>) and context.
     /// </para>
     /// <para>
     /// Monotonicity is maintained in two ways:
