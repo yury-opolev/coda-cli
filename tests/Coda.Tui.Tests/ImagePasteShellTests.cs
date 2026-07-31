@@ -217,4 +217,85 @@ public sealed class ImagePasteShellTests
 
         Assert.False(readerInvoked);
         Assert.Empty(fixture.Shell.Composer.GetDraft());
-    }}
+    }
+
+    // -----------------------------------------------------------------------
+    // Alt+V — the binding that actually survives a terminal emulator
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public void Alt_v_attaches_an_image_from_the_clipboard()
+    {
+        var image = new ClipboardImage("image/png", "AAA", 3);
+        string? stagedBase64 = null;
+
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new FakeImageReader(image),
+            imagePaste: img =>
+            {
+                stagedBase64 = img.Base64Data;
+                return "[Image 1]";
+            });
+
+        // Windows Terminal binds both ctrl+v and ctrl+shift+v to its own paste action, so neither key
+        // ever reaches the application. Alt+V is left alone by the emulator, which makes it the binding
+        // that can actually attach an image.
+        fixture.Shell.Composer.NewKeyDownEvent(Key.V.WithAlt);
+
+        Assert.Equal(image.Base64Data, stagedBase64);
+        Assert.Contains("[Image 1]", fixture.Shell.Composer.GetDraft(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Alt_v_falls_back_to_text_when_no_image_is_on_the_clipboard()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new FakeImageReader(null),
+            imagePaste: _ => "[Image 1]",
+            clipboardReader: () => new ClipboardReadResult(true, "hello"));
+
+        fixture.Shell.Composer.NewKeyDownEvent(Key.V.WithAlt);
+
+        Assert.Equal("hello", fixture.Shell.Composer.GetDraft());
+    }
+
+    [Fact]
+    public void Alt_v_from_the_transcript_pastes_into_the_composer_and_takes_focus()
+    {
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new FakeImageReader(null),
+            imagePaste: _ => "[Image 1]",
+            clipboardReader: () => new ClipboardReadResult(true, "hello"));
+
+        fixture.Shell.Transcript.SetFocus();
+        fixture.Shell.Transcript.NewKeyDownEvent(Key.V.WithAlt);
+
+        Assert.Equal("hello", fixture.Shell.Composer.GetDraft());
+        Assert.True(fixture.Shell.Composer.HasFocus);
+    }
+
+    [Fact]
+    public void Alt_v_from_the_transcript_does_nothing_while_the_composer_is_disabled()
+    {
+        var readerInvoked = false;
+        using var fixture = RetainedShellFixture.Create(
+            activeWork: false,
+            imageReader: new FakeImageReader(null),
+            imagePaste: _ => "[Image 1]",
+            clipboardReader: () =>
+            {
+                readerInvoked = true;
+                return new ClipboardReadResult(true, "hello");
+            });
+        fixture.Shell.Composer.InputEnabled = false;
+        fixture.Shell.Transcript.SetFocus();
+
+        fixture.Shell.Transcript.NewKeyDownEvent(Key.V.WithAlt);
+
+        Assert.False(readerInvoked);
+        Assert.Empty(fixture.Shell.Composer.GetDraft());
+    }
+}

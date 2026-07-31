@@ -172,7 +172,7 @@ interactive, headless, and slash-command flows. Export/import carries it as the 
 **Keys (Warm Ember):** `Enter` submits · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda; pressing `Esc`
-three times within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
+twice within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
 it and `Esc` keeps it going ·
 `Ctrl+C` copies the current transcript selection and, with nothing selected,
 exits on a **second** press · `/exit` (or `/quit`) exits — there is **no `Ctrl+D`** binding · `Ctrl+L` repaints the screen (use it if a tool that wrote to the terminal directly has left stray
@@ -192,7 +192,7 @@ it, so `Enter` there accepts the suggestion and leaves the prompt for you to fin
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
 the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a
 selection exists, `Ctrl+C` **or a right-click** copies it and clears the selection; a **right-click**
-with no selection pastes at the clicked caret; `Ctrl+V` pastes at the caret, attaching a copied **image** when the clipboard holds one and falling back to text otherwise; and a **middle-click**
+with no selection pastes at the clicked caret; `Alt+V` (or `Ctrl+V`) pastes at the caret, attaching a copied **image** when the clipboard holds one and falling back to text otherwise — use `Alt+V` if your terminal claims `Ctrl+V` for its own paste, as Windows Terminal does, since its paste reads text only and an image-only clipboard then produces nothing; and a **middle-click**
 opens the editor context menu. The **session id** in the header, and the body of the modal browsers
 (`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
 and copied the same way. **`Shift`-drag** hands native selection and copy to the terminal where
