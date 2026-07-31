@@ -769,9 +769,49 @@ internal sealed class ComposerView : TextView
             return true;
         }
 
-        var handled = this.HandlePaste(text);
+        var payload = text ?? string.Empty;
+
+        // The shell gets first refusal on the payload, because a paste is not always text: a path to an
+        // image is an attachment, and only the shell knows how to stage one. NewPasteEvent routes here
+        // too, so the token the shell inserts must not be offered back to it.
+        if (!this.suppressShellPaste && this.ShellPasteHandler?.Invoke(payload) == true)
+        {
+            this.RaiseCompletionIfChanged();
+            return true;
+        }
+
+        var handled = this.HandlePaste(payload);
         this.RaiseCompletionIfChanged();
         return handled;
+    }
+
+    /// <summary>
+    /// Offered every paste payload before it is inserted; returning true means the shell consumed it.
+    /// </summary>
+    /// <remarks>
+    /// The composer deliberately knows nothing about attachments. It only knows that something other
+    /// than itself may have a better use for a payload, which keeps file I/O and image staging out of
+    /// the editor.
+    /// </remarks>
+    internal Func<string, bool>? ShellPasteHandler { get; set; }
+
+    private bool suppressShellPaste;
+
+    /// <summary>
+    /// Inserts <paramref name="text"/> as a paste without offering it to <see cref="ShellPasteHandler"/>.
+    /// Used for text the shell itself produced — an <c>[Image N]</c> token it must not re-examine.
+    /// </summary>
+    public bool InsertPasteDirect(string text)
+    {
+        this.suppressShellPaste = true;
+        try
+        {
+            return this.NewPasteEvent(text);
+        }
+        finally
+        {
+            this.suppressShellPaste = false;
+        }
     }
 
     private bool HandlePaste(string text)

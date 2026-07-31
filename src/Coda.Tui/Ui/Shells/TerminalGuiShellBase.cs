@@ -187,6 +187,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
         // composer's own printable/action mapping regardless of which view currently holds focus.
         this.Composer.ShellKeyHandler = this.TryHandleShellKey;
+        this.Composer.ShellPasteHandler = this.TryHandleShellPaste;
 
         this.Composer.SubmissionSubmitted += this.OnComposerSubmitted;
         this.Composer.ActionRequested += this.OnComposerActionRequested;
@@ -496,6 +497,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.ClearTransientOperationalOverride();
             this.CancelScheduledComposerLayoutRecalc();
             this.Composer.ShellKeyHandler = null;
+            this.Composer.ShellPasteHandler = null;
             this.Composer.SubmissionSubmitted -= this.OnComposerSubmitted;
             this.Composer.ActionRequested -= this.OnComposerActionRequested;
             this.Composer.PointerActionRequested -= this.OnComposerPointerActionRequested;
@@ -867,6 +869,72 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <summary>
+    /// Stages <paramref name="image"/> and writes its <c>[Image N]</c> token into the draft, confirming
+    /// in the operational row. Returns false when staging refused it.
+    /// </summary>
+    private bool TryAttachImage(ClipboardImage image)
+    {
+        var token = this.imagePaste?.Invoke(image);
+        if (token is null)
+        {
+            return false;
+        }
+
+        // Direct insert: the token is text this shell just produced, so offering it back to the paste
+        // handler would be asking whether our own token is an image path.
+        this.Composer.InsertPasteDirect(token + " ");
+
+        var kb = image.ByteLength / 1024.0;
+        var mime = image.MediaType.Split('/').LastOrDefault()?.ToUpperInvariant() ?? image.MediaType;
+        this.ShowTransientOperationalStatus(
+            new OperationalStatus($"🖼 image attached · {mime} {kb:F0} KB", OperationalTone.Ready, false),
+            TimeSpan.FromSeconds(1.5));
+        return true;
+    }
+
+    /// <summary>
+    /// Offered every paste payload: a path naming an image file becomes an attachment instead of text.
+    /// </summary>
+    /// <remarks>
+    /// This is what lets a terminal's own Ctrl+V attach an image. Windows Terminal claims that key and
+    /// its paste carries text only, so a copied bitmap never reaches the application at all — but a path
+    /// does, when the file was copied with "Copy as path". Recognising it here means the obvious gesture
+    /// works without the user having to rebind anything.
+    /// <para>
+    /// A payload that is not an image path is returned to the composer untouched, and a path whose file
+    /// cannot be attached says why rather than silently pasting the path instead.
+    /// </para>
+    /// </remarks>
+    private bool TryHandleShellPaste(string text)
+    {
+        if (this.imagePaste is null ||
+            this.composerDisabled ||
+            !this.Composer.InputEnabled ||
+            !ImagePathPaste.TryGetImagePath(text, out var path, out var mediaType))
+        {
+            return false;
+        }
+
+        if (!ImageFileLoader.TryLoad(path, mediaType, out var image, out var error))
+        {
+            this.ShowTransientOperationalStatus(
+                new OperationalStatus(error ?? "Image not attached", OperationalTone.Warning, false),
+                TimeSpan.FromSeconds(1.5));
+            return true;
+        }
+
+        if (this.TryAttachImage(image!))
+        {
+            return true;
+        }
+
+        this.ShowTransientOperationalStatus(
+            new OperationalStatus("Image not attached: unsupported type or too large", OperationalTone.Warning, false),
+            TimeSpan.FromSeconds(1.5));
+        return true;
+    }
+
+    /// <summary>
     /// Pastes the clipboard into the composer at the caret the pointer gesture already positioned. The
     /// clipboard is read exactly once through the <c>clipboardReader</c> seam: an unavailable read leaves the
     /// draft and caret untouched and pins a transient "Clipboard unavailable" Warning; an available but empty
@@ -887,15 +955,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             var image = this.imageReader.TryRead();
             if (image is not null)
             {
-                var token = this.imagePaste(image);
-                if (token is not null)
+                if (this.TryAttachImage(image))
                 {
-                    this.Composer.NewPasteEvent(token + " ");
-                    var kb = image.ByteLength / 1024.0;
-                    var mime = image.MediaType.Split('/').LastOrDefault()?.ToUpperInvariant() ?? image.MediaType;
-                    this.ShowTransientOperationalStatus(
-                        new OperationalStatus($"🖼 image attached · {mime} {kb:F0} KB", OperationalTone.Ready, false),
-                        TimeSpan.FromSeconds(1.5));
                     return;
                 }
 
