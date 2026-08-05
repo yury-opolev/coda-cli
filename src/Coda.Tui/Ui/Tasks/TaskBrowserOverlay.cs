@@ -88,6 +88,7 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         this.listTable.Style.ColumnStyles[2] = new ColumnStyle { MinWidth = 4, MaxWidth = 10 };
         this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 0, MaxWidth = 50, TruncationIndicator = "…" };
         this.listTable.Style.RowColorGetter = this.GetRowScheme;
+        this.listTable.FullRowSelect = true;
 
         this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(2), Visible = false };
         if (onCopyRequested is not null)
@@ -637,6 +638,11 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 
     private Scheme? GetRowScheme(RowColorGetterArgs args)
     {
+        if (this.IsSelectedRow(args.RowIndex))
+        {
+            return this.EnsureSchemes().Selection;
+        }
+
         if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
         {
             return null;
@@ -648,6 +654,11 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 
     private Scheme? GetStatusCellScheme(CellColorGetterArgs args)
     {
+        if (this.IsSelectedRow(args.RowIndex))
+        {
+            return this.EnsureSchemes().Selection;
+        }
+
         if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
         {
             return null;
@@ -656,6 +667,15 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         var row = this.ListTableSource.RowAt(args.RowIndex);
         return this.EnsureSchemes().For(TaskTableSource.GetState(row.Task));
     }
+
+    /// <summary>
+    /// Whether <paramref name="rowIndex"/> is the row the table cursor is on, which the colour
+    /// getters paint with the inverted selection scheme. Read from the table rather than from
+    /// controller state so a filtered list, whose row indices no longer match the unfiltered
+    /// state, still highlights the row the user is actually on.
+    /// </summary>
+    private bool IsSelectedRow(int rowIndex) =>
+        this.listTable.Value is { } selection && selection.SelectedCell.Y == rowIndex;
 
     private BrowserSchemes EnsureSchemes() =>
         this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);

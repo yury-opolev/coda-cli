@@ -51,6 +51,38 @@ public sealed class SkillBrowserOverlayTests : IDisposable
         new(() => new SkillBrowserProvider(_tempDir, StateStore: null));
 
     [Fact]
+    public void Selected_row_is_painted_with_the_selection_attribute()
+    {
+        WriteSkill("alpha", "first skill");
+        WriteSkill("beta", "second skill");
+
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new SkillBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, "alpha", "beta");
+
+            overlay.NewKeyDownEvent(Key.CursorDown);
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, "beta", "alpha");
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Fact]
     public void Overlay_ListsSkills()
     {
         WriteSkill("alpha", "first skill");

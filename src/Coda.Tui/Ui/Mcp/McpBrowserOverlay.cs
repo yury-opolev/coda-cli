@@ -26,6 +26,12 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private BrowserSchemes? browserSchemes;
 
+    /// <summary>
+    /// The body pane currently on screen. Tracked so a transition can be detected and the
+    /// abandoned pane torn down exactly once.
+    /// </summary>
+    private View? visiblePane;
+
     private CancellationTokenSource? lifetime;
     private bool active;
     private bool subscribed;
@@ -117,6 +123,10 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.listTable.Style.ColumnStyles[4] = new ColumnStyle { MinWidth = 0, MaxWidth = 4 };
         this.listTable.Style.ColumnStyles[5] = new ColumnStyle { MinWidth = 0, MaxWidth = 30, TruncationIndicator = "…" };
         this.listTable.Style.RowColorGetter = this.GetRowScheme;
+
+        // Without this the highlight would cover only the cursor cell, and the cursor cell is the
+        // one-character status column — an all-but-invisible mark for "this is the selected row".
+        this.listTable.FullRowSelect = true;
 
         this.status = new Label
         {
@@ -426,10 +436,57 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.SetNeedsDraw();
     }
 
+    /// <summary>
+    /// Makes exactly one of the three body panes visible, tearing the abandoned pane down when the
+    /// pane actually changes.
+    /// </summary>
+    /// <remarks>
+    /// Leaving the editor used to strand it on screen: only the list and detail panes toggled each
+    /// other's <see cref="View.Visible"/> flag, so the form and every widget in it kept painting
+    /// over the list the user had returned to. Clearing the viewport on the transition matters too
+    /// — Terminal.Gui repaints only what a view claims, and the list's rows are shorter than the
+    /// editor's, so the tail of each editor row would survive as a fragment.
+    /// </remarks>
+    private void ShowOnly(View pane)
+    {
+        var changed = !ReferenceEquals(this.visiblePane, pane);
+
+        // Show the incoming pane before hiding the outgoing one: Terminal.Gui throws when the
+        // focused view is hidden and no visible focusable sibling is left to take over, which is
+        // the same ordering rule McpEditorForm.ApplyState follows for its own two-pass layout.
+        pane.Visible = true;
+
+        foreach (var other in this.BodyPanes())
+        {
+            if (!ReferenceEquals(other, pane))
+            {
+                other.Visible = false;
+            }
+        }
+
+        if (!changed)
+        {
+            return;
+        }
+
+        this.visiblePane = pane;
+
+        // Hide the editor's fields explicitly rather than relying on the hidden parent, so that
+        // neither a later layout pass nor VisibleTextForTest can resurrect rows the user has left.
+        if (!ReferenceEquals(pane, this.editorForm))
+        {
+            this.editorForm.HideAllFields();
+        }
+
+        this.ClearViewport();
+        this.SetNeedsDraw();
+    }
+
+    private View[] BodyPanes() => [this.body, this.listTable, this.editorForm];
+
     private string RenderList(McpBrowserState state)
     {
-        this.listTable.Visible = true;
-        this.body.Visible = false;
+        this.ShowOnly(this.listTable);
 
         // Apply case-insensitive name filter when in filter mode.
         var servers = this.filterBuffer.Length > 0
@@ -508,8 +565,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private void RenderDetail(McpBrowserState state)
     {
-        this.listTable.Visible = false;
-        this.body.Visible = true;
+        this.ShowOnly(this.body);
         var lines = new List<string>();
         var detail = state.Detail;
         if (detail is null)
@@ -569,9 +625,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private void RenderEditor(McpBrowserState state)
     {
-        this.listTable.Visible = false;
-        this.body.Visible = false;
-        this.editorForm.Visible = true;
+        this.ShowOnly(this.editorForm);
 
         this.header.Text = SafeSingle($"MCP editor — {state.Editor?.Mode.ToString() ?? "unavailable"}");
         this.status.Text = SafeSingle(state.StatusMessage);
@@ -752,9 +806,22 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private BrowserSchemes EnsureSchemes() =>
         this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);
 
+    /// <summary>
+    /// Whether <paramref name="rowIndex"/> is the row the cursor is on. The colour getters consult
+    /// the table's own cursor rather than the controller's selected key so the highlight stays put
+    /// while the list is filtered, where row indices no longer match the unfiltered state.
+    /// </summary>
+    private bool IsSelectedRow(int rowIndex) =>
+        this.listTable.Value is { } selection && selection.SelectedCell.Y == rowIndex;
+
     private Scheme GetRowScheme(RowColorGetterArgs args)
     {
         var schemes = this.EnsureSchemes();
+        if (this.IsSelectedRow(args.RowIndex))
+        {
+            return schemes.Selection;
+        }
+
         if (args.Table is not McpServerTableSource source || args.RowIndex < 0 || args.RowIndex >= source.Rows)
         {
             return schemes.Normal;
@@ -766,6 +833,11 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private Scheme GetStatusCellScheme(CellColorGetterArgs args)
     {
         var schemes = this.EnsureSchemes();
+        if (this.IsSelectedRow(args.RowIndex))
+        {
+            return schemes.Selection;
+        }
+
         if (args.Table is not McpServerTableSource source || args.RowIndex < 0 || args.RowIndex >= source.Rows)
         {
             return schemes.Normal;
@@ -774,7 +846,8 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         return schemes.For(McpServerTableSource.GetState(source.SummaryAt(args.RowIndex)));
     }
 
-    private Scheme GetTransportCellScheme(CellColorGetterArgs args) => this.EnsureSchemes().Accent;
+    private Scheme GetTransportCellScheme(CellColorGetterArgs args) =>
+        this.IsSelectedRow(args.RowIndex) ? this.EnsureSchemes().Selection : this.EnsureSchemes().Accent;
 
     private void Observe(Task task) =>
         task.ContinueWith(

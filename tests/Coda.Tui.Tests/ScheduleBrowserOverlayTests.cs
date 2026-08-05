@@ -39,6 +39,37 @@ public sealed class ScheduleBrowserOverlayTests : IDisposable
     // ── Basic show/hide ───────────────────────────────────────────────────────
 
     [Fact]
+    public void Selected_row_is_painted_with_the_selection_attribute()
+    {
+        var controller = NewController([MakeModel("s1", "Alpha schedule"), MakeModel("s2", "Beta schedule")]);
+
+        var host = new Window();
+        var overlay = new ScheduleBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            controller.Open();
+            overlay.Show();
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, "Alpha schedule", "Beta schedule");
+
+            overlay.NewKeyDownEvent(Key.CursorDown);
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, "Beta schedule", "Alpha schedule");
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Fact]
     public void Overlay_ShowsAndDrawsRows_WithoutThrowing()
     {
         var controller = NewController([MakeModel("s1", "My schedule"), MakeModel("s2")]);

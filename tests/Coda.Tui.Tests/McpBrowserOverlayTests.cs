@@ -314,6 +314,119 @@ public sealed class McpBrowserOverlayTests : IDisposable
         Assert.DoesNotContain("raw-stdio-value", this.overlay.VisibleTextForTest, StringComparison.Ordinal);
     }
 
+    // ── Rendered-output regression coverage ───────────────────────────────────
+    // These assert on the driver cell buffer. The widget-state equivalents passed for months while
+    // the screen showed no selection highlight and kept editor artifacts after cancelling.
+
+    [Fact]
+    public void Selected_list_row_is_painted_with_the_selection_attribute()
+    {
+        this.overlay.Show();
+        this.controller.SetStateForTest(ListStateWithServers(selectedIndex: 2));
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        RenderedOutput.AssertSelectionHighlightVisible(this.application, "server-3", "server-1");
+    }
+
+    [Fact]
+    public void Moving_the_cursor_moves_the_painted_selection_highlight()
+    {
+        this.overlay.Show();
+        this.controller.SetStateForTest(ListStateWithServers(selectedIndex: 0));
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        var firstBefore = RenderedOutput.AttributeOf(this.application, "server-1");
+        var secondBefore = RenderedOutput.AttributeOf(this.application, "server-2");
+        Assert.NotEqual(secondBefore, firstBefore);
+
+        this.controller.SetStateForTest(ListStateWithServers(selectedIndex: 1));
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        Assert.Equal(secondBefore, RenderedOutput.AttributeOf(this.application, "server-1"));
+        Assert.Equal(firstBefore, RenderedOutput.AttributeOf(this.application, "server-2"));
+    }
+
+    [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public void Leaving_the_editor_repaints_a_clean_list_with_no_editor_field_labels(bool save)
+    {
+        this.overlay.Show();
+        this.controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = McpEditorFormTests.MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name),
+        });
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        // Sanity: the labels really are on screen before we leave, so the negative assertion below
+        // cannot pass vacuously.
+        Assert.Contains("Scope:", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+        Assert.Contains("Transport:", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+        Assert.Contains("Command:", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+
+        this.controller.SetStateForTest(ListStateWithServers(selectedIndex: 0) with
+        {
+            StatusMessage = save ? "Stored." : "Discarded.",
+        });
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        var screen = RenderedOutput.Text(this.application);
+        Assert.DoesNotContain("Scope:", screen, StringComparison.Ordinal);
+        Assert.DoesNotContain("Transport:", screen, StringComparison.Ordinal);
+        Assert.DoesNotContain("Command:", screen, StringComparison.Ordinal);
+        Assert.DoesNotContain("Arguments:", screen, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u27e6 Save \u27e7", screen, StringComparison.Ordinal);
+        Assert.DoesNotContain("\u27e6 Cancel \u27e7", screen, StringComparison.Ordinal);
+        Assert.Contains("server-1", screen, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Leaving_the_detail_view_repaints_a_clean_list()
+    {
+        var listState = ListStateWithServers(selectedIndex: 0);
+        this.overlay.Show();
+        this.controller.SetStateForTest(listState with
+        {
+            View = McpBrowserView.Detail,
+            StatusMessage = "detail",
+        });
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+        Assert.Contains("(no server selected)", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+
+        this.controller.SetStateForTest(listState);
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        Assert.DoesNotContain("(no server selected)", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+    }
+
+    private static McpBrowserState ListStateWithServers(int selectedIndex)
+    {
+        var servers = Enumerable.Range(1, 5)
+            .Select(i => new McpServerSummary(
+                new McpServerKey(McpConfigScope.Project, $"server-{i}"),
+                "/project/.mcp.json",
+                Enabled: true,
+                IsEffective: true,
+                McpTransportKind.Stdio,
+                McpConnectionState.Connected,
+                LastError: null))
+            .ToImmutableArray();
+        return McpBrowserState.Empty with
+        {
+            Servers = servers,
+            SelectedKey = servers[selectedIndex].Key,
+            StatusMessage = "ready",
+        };
+    }
+
     public void Dispose()
     {
         this.overlay.Dispose();

@@ -32,7 +32,21 @@ internal sealed class BrowserSchemes
         this.Overridden = this.Build(theme.Palette.Dim);
         this.Accent = this.Build(theme.Palette.Accent);
         this.Dim = this.Build(theme.Palette.Dim);
+
+        var selection = theme.Attribute(theme.SelectionText, theme.SelectionBackground, driver);
+        this.Selection = Solid(selection, selection);
     }
+
+    /// <summary>The row under the cursor.</summary>
+    /// <remarks>
+    /// Every visual role carries the same inverted attribute on purpose. The browser tables are
+    /// created with <c>CanFocus = false</c> (the overlay owns the keyboard and translates keys into
+    /// controller commands), and Terminal.Gui picks <c>Scheme.Active</c> rather than
+    /// <c>Scheme.Focus</c> for the selected row of a table that does not have focus. A scheme that
+    /// only defined <c>Focus</c> would therefore leave the selection invisible, which is precisely
+    /// the defect this exists to prevent.
+    /// </remarks>
+    public TgScheme Selection { get; }
 
     /// <summary>Default row content — a name, a description.</summary>
     public TgScheme Normal { get; }

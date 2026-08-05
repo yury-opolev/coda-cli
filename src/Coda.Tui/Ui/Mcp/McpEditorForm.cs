@@ -78,9 +78,6 @@ internal sealed class McpEditorForm : View
     private readonly Label EnvironmentPrefixLabel;
     private readonly Label BearerTokenPrefixLabel;
 
-    // focusedLabelScheme is reserved for future accent-colouring of the focused prefix label
-    // and is intentionally omitted until the TUI 2.x API for per-view scheme overrides is pinned.
-
     /// <summary>Fired when the Save button is activated. The overlay wires this to the save flow.</summary>
     internal event Action? SaveRequested;
 
@@ -103,6 +100,17 @@ internal sealed class McpEditorForm : View
     /// <summary>Cached label schemes; invalidated when the theme changes.</summary>
     private Terminal.Gui.Drawing.Scheme? normalLabelScheme;
     private Terminal.Gui.Drawing.Scheme? focusedLabelScheme;
+
+    /// <summary>Fully inverted scheme, applied wholesale to the focused Save/Cancel button.</summary>
+    private Terminal.Gui.Drawing.Scheme? selectionScheme;
+
+    /// <summary>
+    /// Scheme for the option selectors: normal text for the options at rest, the inverted
+    /// selection attribute for the option under the cursor. Keeping the two roles apart is what
+    /// makes the SELECTED option (marked <c>◉</c>) readable as a different thing from the FOCUSED
+    /// option (inverted) inside the same widget.
+    /// </summary>
+    private Terminal.Gui.Drawing.Scheme? optionScheme;
 
     /// <summary>The field whose label currently carries the accent colour.</summary>
     private McpEditorField focusedField;
@@ -243,8 +251,11 @@ internal sealed class McpEditorForm : View
         // ── buttons ───────────────────────────────────────────────────────────
         // ShadowStyle.None: the default drop shadow renders a stray half-block glyph after the
         // button ("⟦ Save ⟧▖") which reads as corruption in a dense form rather than as depth.
+        // X = GutterWidth aligns them with the label column so the ❯ marker sits directly beside
+        // them; at X = 0 they painted over the marker and the active action row was unmarked.
         this.SaveButton = new Button
         {
+            X = GutterWidth,
             Text = "Save",
             TabStop = TabBehavior.TabStop,
             ShadowStyle = ShadowStyles.None,
@@ -253,6 +264,7 @@ internal sealed class McpEditorForm : View
 
         this.CancelButton = new Button
         {
+            X = GutterWidth,
             Text = "Cancel",
             TabStop = TabBehavior.TabStop,
             ShadowStyle = ShadowStyles.None,
@@ -310,22 +322,32 @@ internal sealed class McpEditorForm : View
         this.driver = driver;
         this.normalLabelScheme = null;
         this.focusedLabelScheme = null;
-        this.RefreshLabelAccents();
+        this.selectionScheme = null;
+        this.optionScheme = null;
+        this.RefreshFocusAffordances();
     }
 
     /// <summary>
-    /// Repaints every prefix label so exactly the focused field's label carries the accent scheme.
-    /// Cheap enough to run on every focus change: the label count is fixed and small.
+    /// Repaints every focus affordance so exactly the focused field is marked: its prefix label
+    /// carries the accent scheme, the Save/Cancel button (if that is the focused field) is
+    /// inverted, and the selectors get a scheme whose cursor role is unmistakably different from
+    /// its resting role. Cheap enough to run on every focus change: the widget count is fixed and
+    /// small.
     /// </summary>
-    private void RefreshLabelAccents()
+    private void RefreshFocusAffordances()
     {
         if (this.theme is not { } t)
         {
             return;
         }
 
-        this.normalLabelScheme ??= SolidScheme(t.Attribute(t.TranscriptAssistant, t.Background, this.driver));
+        var normal = t.Attribute(t.TranscriptAssistant, t.Background, this.driver);
+        var selection = t.Attribute(t.SelectionText, t.SelectionBackground, this.driver);
+
+        this.normalLabelScheme ??= SolidScheme(normal);
         this.focusedLabelScheme ??= SolidScheme(t.Attribute(t.Palette.Accent, t.Background, this.driver));
+        this.selectionScheme ??= SolidScheme(selection);
+        this.optionScheme ??= CursorScheme(normal, selection);
 
         var focusedLabel = this.PrefixLabelForField(this.focusedField);
         foreach (var label in this.AllPrefixLabels())
@@ -336,7 +358,42 @@ internal sealed class McpEditorForm : View
         }
 
         this.GutterIndicator.SetScheme(this.focusedLabelScheme);
+
+        // A focused button is inverted wholesale. Terminal.Gui expresses Button focus only through
+        // the scheme, and the surface scheme's focus role is too close to its normal role to answer
+        // "is Save or Cancel about to fire?" at a glance.
+        this.SaveButton.SetScheme(this.focusedField == McpEditorField.Save
+            ? this.selectionScheme
+            : this.normalLabelScheme);
+        this.CancelButton.SetScheme(this.focusedField == McpEditorField.Cancel
+            ? this.selectionScheme
+            : this.normalLabelScheme);
+
+        this.ScopeSelector.SetScheme(this.optionScheme);
+        this.TransportSelector.SetScheme(this.optionScheme);
+        this.AuthModeSelector.SetScheme(this.optionScheme);
     }
+
+    /// <summary>
+    /// A scheme that reads as "resting" at <paramref name="normal"/> and as "the cursor is here" at
+    /// <paramref name="cursor"/>. Both the focus and the active roles carry the cursor attribute so
+    /// the mark survives whether or not the widget's container currently owns the keyboard.
+    /// </summary>
+    private static Terminal.Gui.Drawing.Scheme CursorScheme(
+        Terminal.Gui.Drawing.Attribute normal,
+        Terminal.Gui.Drawing.Attribute cursor) => new()
+    {
+        Normal = normal,
+        HotNormal = normal,
+        Focus = cursor,
+        HotFocus = cursor,
+        Active = cursor,
+        HotActive = cursor,
+        Highlight = cursor,
+        Editable = normal,
+        ReadOnly = normal,
+        Disabled = normal,
+    };
 
     private static Terminal.Gui.Drawing.Scheme SolidScheme(Terminal.Gui.Drawing.Attribute attribute) => new()
     {
@@ -473,6 +530,12 @@ internal sealed class McpEditorForm : View
                     view.Visible = false;
                 }
             }
+
+            // Pass 3: give the focused field real widget focus. Focus previously only ever flowed
+            // widget → controller, so opening the editor left everything unfocused: no option in a
+            // selector was marked as the one under the cursor and neither button looked active
+            // until the user pressed Tab.
+            this.FocusField(editor.FocusedField);
         }
         finally
         {
@@ -487,6 +550,37 @@ internal sealed class McpEditorForm : View
         if (height <= 0) height = this.Frame.Height;
         if (height <= 0) height = this.SuperView?.Frame.Height ?? 0;
         return Math.Max(1, height);
+    }
+
+    /// <summary>
+    /// Hides every widget in the form. The overlay calls this when it leaves the editor, so a row
+    /// the user has walked away from cannot paint over the list or detail view it returned to.
+    /// </summary>
+    internal void HideAllFields()
+    {
+        foreach (var view in this.SubViews)
+        {
+            view.Visible = false;
+        }
+    }
+
+    /// <summary>
+    /// Gives real widget focus to the field the controller considers focused, when that field has
+    /// a focusable widget currently on screen. Runs under <see cref="suppressSync"/> so the
+    /// resulting <c>HasFocusChanged</c> events do not write the focus straight back into the
+    /// controller and re-enter this method.
+    /// </summary>
+    private void FocusField(McpEditorField field)
+    {
+        if (this.ViewForField(field) is not { Visible: true, CanFocus: true, Enabled: true } view)
+        {
+            return;
+        }
+
+        if (!view.HasFocus)
+        {
+            view.SetFocus();
+        }
     }
 
     /// <summary>
@@ -636,7 +730,7 @@ internal sealed class McpEditorForm : View
         // Keep the accent in step with the gutter: both mark the same row, and a stale colour on a
         // row the marker has left is worse than no colour at all.
         this.focusedField = editor.FocusedField;
-        this.RefreshLabelAccents();
+        this.RefreshFocusAffordances();
 
         for (var i = 0; i < rows.Count; i++)
         {
