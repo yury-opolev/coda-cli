@@ -63,10 +63,15 @@ public sealed class McpBrowserKeyMapTests
         // Item management chords remain.
         Assert.Equal(McpBrowserCommand.EditorAddItem, McpBrowserKeyMap.Map(Key.N.WithCtrl, McpBrowserView.Editor));
         Assert.Equal(McpBrowserCommand.EditorRemoveItem, McpBrowserKeyMap.Map(Key.R.WithCtrl, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorPreviousItem, McpBrowserKeyMap.Map(Key.CursorUp.WithCtrl, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorNextItem, McpBrowserKeyMap.Map(Key.CursorDown.WithCtrl, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorPreviousItemPart, McpBrowserKeyMap.Map(Key.CursorLeft.WithCtrl, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorNextItemPart, McpBrowserKeyMap.Map(Key.CursorRight.WithCtrl, McpBrowserView.Editor));
+        // Reordering is Alt+Up / Alt+Down (Task 8).
+        Assert.Equal(McpBrowserCommand.EditorReorderUp, McpBrowserKeyMap.Map(Key.CursorUp.WithAlt, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorReorderDown, McpBrowserKeyMap.Map(Key.CursorDown.WithAlt, McpBrowserView.Editor));
+        // The old Ctrl+arrow item-navigation chords are retired: with per-item widgets, plain
+        // Tab/Shift+Tab and Up/Down navigate fields and items, so these are no longer mapped.
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorUp.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorDown.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorLeft.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorRight.WithCtrl, McpBrowserView.Editor));
     }
 
     [Fact]

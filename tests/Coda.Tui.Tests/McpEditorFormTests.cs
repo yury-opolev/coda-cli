@@ -48,6 +48,55 @@ public sealed class McpEditorFormTests : IDisposable
         }
     }
 
+    /// <summary>
+    /// Task 8 invariant: environment/header VALUES are per-item rows too, but their value is a
+    /// read-only label — never a <see cref="TextField"/>. A secret env value must therefore never
+    /// reach a TextField, and must render as the masked placeholder.
+    /// </summary>
+    [Fact]
+    public void Map_entry_value_is_never_a_text_field()
+    {
+        const string secret = "env-header-secret-value";
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment:
+            [
+                new McpNamedSecretDraft(
+                    "TOKEN",
+                    McpSecretSource.None,
+                    new McpSecretChange(
+                        "env/TOKEN",
+                        McpSecretChangeKind.Replace,
+                        new McpSecretReplacement(secret))),
+            ],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        var editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+        {
+            SelectedItem = 0,
+        };
+
+        this.form.ApplyState(editor);
+        this.application.LayoutAndDraw();
+
+        foreach (var field in AllTextFields(this.form))
+        {
+            Assert.DoesNotContain(secret, field.Text ?? string.Empty, StringComparison.Ordinal);
+        }
+
+        // The value must still be shown, but only as the masked placeholder on a Label.
+        Assert.Contains(AllLabels(this.form), label => (label.Text ?? string.Empty).Contains("*****", StringComparison.Ordinal));
+    }
+
     // ── text field behaviour ──────────────────────────────────────────────────
 
     /// <summary>
@@ -382,6 +431,15 @@ public sealed class McpEditorFormTests : IDisposable
         {
             if (child is TextField tf) yield return tf;
             foreach (var nested in AllTextFields(child)) yield return nested;
+        }
+    }
+
+    private static IEnumerable<Label> AllLabels(View parent)
+    {
+        foreach (var child in parent.SubViews)
+        {
+            if (child is Label lbl) yield return lbl;
+            foreach (var nested in AllLabels(child)) yield return nested;
         }
     }
 

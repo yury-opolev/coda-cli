@@ -61,6 +61,8 @@ internal enum McpBrowserCommand
     EditorCancel,
     EditorAddItem,
     EditorRemoveItem,
+    EditorReorderUp,
+    EditorReorderDown,
     EditorPreviousItem,
     EditorNextItem,
     EditorPreviousItemPart,

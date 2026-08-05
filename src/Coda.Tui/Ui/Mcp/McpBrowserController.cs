@@ -324,6 +324,39 @@ internal sealed class McpBrowserController
         this.RaiseChanged();
     }
 
+    /// <summary>
+    /// Updates the focused field AND the selected item cursor when a per-item widget (an argument,
+    /// scope, environment or header row) gains focus. Keeps
+    /// <see cref="McpEditorState.SelectedItem"/> and <see cref="McpEditorState.SelectedItemPart"/>
+    /// aligned with the widget the user is actually editing so that add/remove/reorder and the
+    /// Enter-driven secret prompt all act on that row.
+    /// </summary>
+    internal void UpdateEditorFocusItem(McpEditorField field, int itemIndex, McpEditorItemPart part)
+    {
+        lock (this.sync)
+        {
+            if (this.state.Editor is not { } editor) return;
+            if (editor.FocusedField == field
+                && editor.SelectedItem == itemIndex
+                && editor.SelectedItemPart == part)
+            {
+                return;
+            }
+
+            this.state = this.state with
+            {
+                Editor = editor with
+                {
+                    FocusedField = field,
+                    SelectedItem = itemIndex,
+                    SelectedItemPart = part,
+                },
+            };
+        }
+
+        this.RaiseChanged();
+    }
+
     private async Task ExecuteCoreAsync(
         McpBrowserProvider current,
         long openEpoch,
@@ -409,6 +442,12 @@ internal sealed class McpBrowserController
                 return;
             case McpBrowserCommand.EditorNextItemPart:
                 this.MoveEditorItemPart(current, openEpoch, 1);
+                return;
+            case McpBrowserCommand.EditorReorderUp:
+                this.ReorderEditorItem(current, openEpoch, -1);
+                return;
+            case McpBrowserCommand.EditorReorderDown:
+                this.ReorderEditorItem(current, openEpoch, 1);
                 return;
         }
     }
@@ -591,25 +630,117 @@ internal sealed class McpBrowserController
         }
     }
 
+    /// <summary>
+    /// Saves the editor draft in three phases so the idle-gate lease is NEVER held while the user
+    /// is answering a warning confirmation.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Phase 1 acquires the lease, prepares the mutation (which validates the draft and computes any
+    /// warnings against the current on-disk revision), then RELEASES the lease. Holding the lease
+    /// across an interactive prompt would block a queued turn — or any other MCP action — for as long
+    /// as the confirmation stays open.
+    /// </para>
+    /// <para>
+    /// Phase 2, if the preview carries warnings, asks the user to confirm with no lease held.
+    /// </para>
+    /// <para>
+    /// Phase 3 re-acquires the lease and commits. The commit re-validates: the service checks the
+    /// preview's captured revision under its own mutation gate and returns a <c>Rejected</c> result
+    /// if the configuration changed between prepare and commit, so a concurrent edit fails cleanly
+    /// instead of clobbering the newer file.
+    /// </para>
+    /// </remarks>
     private async Task SaveEditorAsync(
         McpBrowserProvider current,
         long openEpoch,
         McpEditorState editor,
-        CancellationToken ct) =>
-        await this.MutateWithLeaseAsync(current, openEpoch, async token =>
+        CancellationToken ct)
+    {
+        var preview = await this.PrepareSaveAsync(current, openEpoch, editor, ct).ConfigureAwait(false);
+        if (preview is null)
+        {
+            return;
+        }
+
+        if (!preview.Warnings.IsDefaultOrEmpty && !await this.ConfirmWarningsAsync(current, openEpoch, preview, ct).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        var lease = this.TryAcquireLease(current, openEpoch);
+        if (lease is null)
+        {
+            return;
+        }
+
+        try
         {
             var result = editor.Mode == McpEditorMode.Add
-                ? await current.Management.CommitAddAsync(
-                    await current.Management.PrepareAddAsync(editor.Draft, token).ConfigureAwait(false),
-                    token).ConfigureAwait(false)
-                : await current.Management.CommitEditAsync(
-                    await current.Management.PrepareEditAsync(
-                        this.State.SelectedKey ?? new McpServerKey(editor.Draft.Scope, editor.Draft.Name),
-                        editor.Draft,
-                        token).ConfigureAwait(false),
-                    token).ConfigureAwait(false);
+                ? await current.Management.CommitAddAsync(preview, ct).ConfigureAwait(false)
+                : await current.Management.CommitEditAsync(preview, ct).ConfigureAwait(false);
             this.ApplyMutation(current, openEpoch, result);
-        }, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Phase 1 of the save flow: prepares the mutation under a lease and releases the lease before
+    /// returning. Returns <c>null</c> when the lease is unavailable (status already applied).
+    /// </summary>
+    private async Task<McpEditPreview?> PrepareSaveAsync(
+        McpBrowserProvider current,
+        long openEpoch,
+        McpEditorState editor,
+        CancellationToken ct)
+    {
+        var lease = this.TryAcquireLease(current, openEpoch);
+        if (lease is null)
+        {
+            return null;
+        }
+
+        try
+        {
+            return editor.Mode == McpEditorMode.Add
+                ? await current.Management.PrepareAddAsync(editor.Draft, ct).ConfigureAwait(false)
+                : await current.Management.PrepareEditAsync(
+                    this.State.SelectedKey ?? new McpServerKey(editor.Draft.Scope, editor.Draft.Name),
+                    editor.Draft,
+                    ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            lease.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Phase 2 of the save flow: confirms any warnings with NO lease held. Returns <c>true</c> when
+    /// the user accepts and the commit should proceed.
+    /// </summary>
+    private async Task<bool> ConfirmWarningsAsync(
+        McpBrowserProvider current,
+        long openEpoch,
+        McpEditPreview preview,
+        CancellationToken ct)
+    {
+        var message = string.Join(
+            " ",
+            preview.Warnings.Select(SafeText).Append("Continue?"));
+        var confirmation = await current.Prompts.RequestAsync(
+            UiPromptRequest.Confirm(SafeText(message), defaultValue: false), ct).ConfigureAwait(false);
+        if (confirmation.Cancelled || !confirmation.SelectedIds.Contains("yes", StringComparer.Ordinal))
+        {
+            this.ApplyStatus(current, openEpoch, "Cancelled.");
+            return false;
+        }
+
+        return true;
+    }
 
     private async Task PromptBearerReplacementAsync(McpBrowserProvider current, long openEpoch, CancellationToken ct)
     {
@@ -796,26 +927,94 @@ internal sealed class McpBrowserController
             }
             : state);
 
+    /// <summary>
+    /// Reorders the focused list item by one position in <paramref name="direction"/>.
+    /// </summary>
+    /// <remarks>
+    /// The parallel <c>Args</c>/<c>ArgumentItems</c> and <c>Scopes</c>/<c>ScopeItems</c> arrays are
+    /// swapped in lock-step so that each <see cref="McpDraftListItem"/> (and its stable
+    /// <see cref="McpDraftListItem.Id"/>) travels WITH its display value. This is a hard correctness
+    /// requirement: the commit path in <c>McpManagementService.MergeIdentifiedDraftListValues</c>
+    /// recovers the true (possibly redacted) raw value of each item by its Guid. Swapping only the
+    /// display strings while leaving the identity items in place would silently write a redaction
+    /// sentinel (e.g. <c>[redacted URL]</c>) back into the config in place of the real secret.
+    /// </remarks>
+    private void ReorderEditorItem(McpBrowserProvider current, long openEpoch, int direction) =>
+        this.Mutate(current, openEpoch, state =>
+        {
+            if (state.Editor is not { } editor)
+            {
+                return state;
+            }
+
+            var index = editor.SelectedItem;
+            var target = index + direction;
+            var draft = editor.Draft;
+            switch (editor.FocusedField)
+            {
+                case McpEditorField.Arguments
+                    when InRange(index, draft.Args.Length) && InRange(target, draft.Args.Length):
+                    draft = draft with
+                    {
+                        Args = Swap(draft.Args, index, target),
+                        ArgumentItems = SwapItems(draft.ArgumentItems, draft.Args.Length, index, target),
+                    };
+                    break;
+                case McpEditorField.Scopes
+                    when InRange(index, draft.Scopes.Length) && InRange(target, draft.Scopes.Length):
+                    draft = draft with
+                    {
+                        Scopes = Swap(draft.Scopes, index, target),
+                        ScopeItems = SwapItems(draft.ScopeItems, draft.Scopes.Length, index, target),
+                    };
+                    break;
+                case McpEditorField.Environment
+                    when InRange(index, draft.Environment.Length) && InRange(target, draft.Environment.Length):
+                    draft = draft with { Environment = Swap(draft.Environment, index, target) };
+                    break;
+                case McpEditorField.Headers
+                    when InRange(index, draft.Headers.Length) && InRange(target, draft.Headers.Length):
+                    draft = draft with { Headers = Swap(draft.Headers, index, target) };
+                    break;
+                default:
+                    return state;
+            }
+
+            return state with { Editor = editor with { Draft = draft, SelectedItem = target } };
+        });
+
+    private static bool InRange(int index, int length) => index >= 0 && index < length;
+
+    private static ImmutableArray<T> Swap<T>(ImmutableArray<T> values, int first, int second)
+    {
+        var builder = values.ToBuilder();
+        (builder[first], builder[second]) = (builder[second], builder[first]);
+        return builder.ToImmutable();
+    }
+
+    /// <summary>
+    /// Swaps two identity items in lock-step with their display array, but only when the identity
+    /// array is materialized and aligned with the display array; otherwise the identity array is
+    /// left untouched so the commit path falls back to display-based matching.
+    /// </summary>
+    private static ImmutableArray<McpDraftListItem> SwapItems(
+        ImmutableArray<McpDraftListItem> items,
+        int expectedLength,
+        int first,
+        int second) =>
+        items.IsDefault || items.Length != expectedLength
+            ? items
+            : Swap(items, first, second);
+
     private async Task MutateWithLeaseAsync(
         McpBrowserProvider current,
         long openEpoch,
         Func<CancellationToken, Task> mutation,
         CancellationToken ct)
     {
-        IDisposable? lease;
-        try
-        {
-            lease = current.IdleGate.TryAcquire();
-        }
-        catch
-        {
-            this.ApplyStatus(current, openEpoch, "MCP changes are unavailable while a turn is running.");
-            return;
-        }
-
+        var lease = this.TryAcquireLease(current, openEpoch);
         if (lease is null)
         {
-            this.ApplyStatus(current, openEpoch, "MCP changes are unavailable while a turn is running.");
             return;
         }
 
@@ -827,6 +1026,34 @@ internal sealed class McpBrowserController
         {
             lease.Dispose();
         }
+    }
+
+    /// <summary>
+    /// Tries to acquire the exclusive idle-gate lease that guards MCP mutations. Returns the lease
+    /// on success, or <c>null</c> after applying the standard "unavailable while a turn is running"
+    /// status. Callers own disposing the returned lease. Split out from
+    /// <see cref="MutateWithLeaseAsync"/> so the save flow can acquire and release the lease across
+    /// several phases (prepare, confirm, commit) rather than holding it for the whole operation.
+    /// </summary>
+    private IDisposable? TryAcquireLease(McpBrowserProvider current, long openEpoch)
+    {
+        IDisposable? lease;
+        try
+        {
+            lease = current.IdleGate.TryAcquire();
+        }
+        catch
+        {
+            this.ApplyStatus(current, openEpoch, "MCP changes are unavailable while a turn is running.");
+            return null;
+        }
+
+        if (lease is null)
+        {
+            this.ApplyStatus(current, openEpoch, "MCP changes are unavailable while a turn is running.");
+        }
+
+        return lease;
     }
 
     private void ChangeScope(McpBrowserProvider current, long openEpoch) =>

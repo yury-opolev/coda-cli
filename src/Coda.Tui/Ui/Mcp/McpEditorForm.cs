@@ -63,6 +63,23 @@ internal sealed class McpEditorForm : View
     /// </summary>
     private int scrollOffset;
 
+    // ── per-item widget pools (Task 8) ───────────────────────────────────────
+    // List/map fields expand into one editable row per item. The pools grow on demand and are
+    // reused across renders; pool index N always represents item index N of its field. Argument and
+    // scope values are TextFields; environment and header VALUES are never TextFields (they stay on
+    // the modal secret-prompt path), only their names are editable.
+    private readonly List<TextField> argItemFields = [];
+    private readonly List<TextField> scopeItemFields = [];
+    private readonly List<MapItemRow> envItemRows = [];
+    private readonly List<MapItemRow> headerItemRows = [];
+
+    /// <summary>
+    /// A single laid-out row in the editor. <see cref="ItemIndex"/> is <c>-1</c> for a scalar field
+    /// (or the placeholder row of an empty list); otherwise it is the zero-based index of an item
+    /// within a list/map field.
+    /// </summary>
+    private readonly record struct EditorRow(McpEditorField Field, int ItemIndex);
+
 
     internal McpEditorForm(McpBrowserController controller)
     {
@@ -232,6 +249,11 @@ internal sealed class McpEditorForm : View
     internal void ApplyState(McpEditorState editor)
     {
         var fields = McpEditorFieldSet.For(editor.Draft);
+        var draft = editor.Draft;
+
+        // Expand list/map fields into one row per item so long lists take part in the same
+        // scroll-offset logic as scalar fields (spec: "a long argument list stays reachable").
+        var rows = BuildRows(fields, draft);
 
         // Walk up the view tree to find a reliable non-zero height. Individual view frames can
         // transiently read as 1 (or stale) during re-layout triggered by Visible/Y mutations on
@@ -245,29 +267,37 @@ internal sealed class McpEditorForm : View
 
         height = Math.Max(1, height);
 
-        // Compute which field is focused so we can keep it within the scroll window.
+        // Compute which row is focused so we can keep it within the scroll window. For a list field
+        // the focused row is the one whose item index matches the editor's SelectedItem.
         var focusedIndex = 0;
-        for (var fi = 0; fi < fields.Count; fi++)
+        for (var ri = 0; ri < rows.Count; ri++)
         {
-            if (fields[fi] == editor.FocusedField) { focusedIndex = fi; break; }
+            if (rows[ri].Field != editor.FocusedField)
+            {
+                continue;
+            }
+
+            focusedIndex = ri;
+            if (rows[ri].ItemIndex < 0 || rows[ri].ItemIndex == editor.SelectedItem)
+            {
+                break;
+            }
         }
 
-        // Compute scroll offset: always derive it from the focused field index and height so
-        // that back-to-back renders with different heights (from FrameChanged callbacks during
-        // layout passes) produce consistent results. This avoids the accumulated-state trap where
-        // a render with a stale height sets scrollOffset to a value that hides the focused field
-        // in subsequent renders.
-        var maxOffset = Math.Max(0, fields.Count - height);
+        // Compute scroll offset: always derive it from the focused row index and height so that
+        // back-to-back renders with different heights (from FrameChanged callbacks during layout
+        // passes) produce consistent results.
+        var maxOffset = Math.Max(0, rows.Count - height);
         this.scrollOffset = focusedIndex >= height
             ? Math.Clamp(focusedIndex - height + 1, 0, maxOffset)
             : 0;
 
         // Build a lookup of which subviews should be visible after layout.
         var visibleViews = new HashSet<View>(ReferenceEqualityComparer.Instance);
-        for (var i = 0; i < fields.Count; i++)
+        for (var i = 0; i < rows.Count; i++)
         {
             if (i < this.scrollOffset || i >= this.scrollOffset + height) continue;
-            var v = this.ViewForField(fields[i]);
+            var v = this.ViewForRow(rows[i]);
             if (v is not null) visibleViews.Add(v);
         }
 
@@ -278,7 +308,7 @@ internal sealed class McpEditorForm : View
             // Pass 1: position and show every view that belongs in the viewport. This ensures the
             // focused view is visible before we hide anything, so Terminal.Gui never loses its
             // focus target.
-            this.LayoutFields(fields, editor, this.scrollOffset, height);
+            this.LayoutRows(rows, editor, this.scrollOffset, height);
 
             // Pass 2: hide every subview that is NOT in the visible set.
             foreach (var view in this.SubViews)
@@ -368,21 +398,165 @@ internal sealed class McpEditorForm : View
     /// window [<paramref name="offset"/>, <paramref name="offset"/> + <paramref name="height"/>).
     /// Pass 2 (hiding out-of-window views) is the caller's responsibility.
     /// </summary>
-    private void LayoutFields(
-        IReadOnlyList<McpEditorField> fields,
+    private void LayoutRows(
+        IReadOnlyList<EditorRow> rows,
         McpEditorState editor,
         int offset,
         int height)
     {
         var draft = editor.Draft;
 
-        for (var i = 0; i < fields.Count; i++)
+        for (var i = 0; i < rows.Count; i++)
         {
             if (i < offset || i >= offset + height) continue;
 
             var row = i - offset;
-            var field = fields[i];
+            var descriptor = rows[i];
+            if (descriptor.ItemIndex < 0)
+            {
+                this.LayoutScalarField(descriptor.Field, editor, row);
+            }
+            else
+            {
+                this.LayoutItemRow(descriptor, draft, row);
+            }
+        }
+    }
 
+    /// <summary>
+    /// Expands the ordered scalar field set into concrete rows, splitting each non-empty list/map
+    /// field into one row per item. An empty list keeps a single placeholder row (the summary
+    /// label) so the user still has somewhere to press Ctrl+N to add the first item.
+    /// </summary>
+    private static IReadOnlyList<EditorRow> BuildRows(
+        IReadOnlyList<McpEditorField> fields,
+        McpServerDraft draft)
+    {
+        var rows = new List<EditorRow>(fields.Count);
+        foreach (var field in fields)
+        {
+            var count = ItemCount(field, draft);
+            if (IsListField(field) && count > 0)
+            {
+                for (var i = 0; i < count; i++)
+                {
+                    rows.Add(new EditorRow(field, i));
+                }
+            }
+            else
+            {
+                rows.Add(new EditorRow(field, -1));
+            }
+        }
+
+        return rows;
+    }
+
+    private static bool IsListField(McpEditorField field) => field is
+        McpEditorField.Arguments or
+        McpEditorField.Scopes or
+        McpEditorField.Environment or
+        McpEditorField.Headers;
+
+    private static int ItemCount(McpEditorField field, McpServerDraft draft) => field switch
+    {
+        McpEditorField.Arguments => draft.Args.IsDefault ? 0 : draft.Args.Length,
+        McpEditorField.Scopes => draft.Scopes.IsDefault ? 0 : draft.Scopes.Length,
+        McpEditorField.Environment => draft.Environment.IsDefault ? 0 : draft.Environment.Length,
+        McpEditorField.Headers => draft.Headers.IsDefault ? 0 : draft.Headers.Length,
+        _ => 0,
+    };
+
+    /// <summary>Returns the subview for a row, creating pooled per-item widgets on demand.</summary>
+    private View? ViewForRow(EditorRow row) => row.ItemIndex < 0
+        ? this.ViewForField(row.Field)
+        : row.Field switch
+        {
+            McpEditorField.Arguments => this.EnsureListField(this.argItemFields, row.ItemIndex, McpEditorField.Arguments),
+            McpEditorField.Scopes => this.EnsureListField(this.scopeItemFields, row.ItemIndex, McpEditorField.Scopes),
+            McpEditorField.Environment => this.EnsureMapRow(this.envItemRows, row.ItemIndex, McpEditorField.Environment),
+            McpEditorField.Headers => this.EnsureMapRow(this.headerItemRows, row.ItemIndex, McpEditorField.Headers),
+            _ => this.ViewForField(row.Field),
+        };
+
+    private void LayoutItemRow(EditorRow descriptor, McpServerDraft draft, int row)
+    {
+        switch (descriptor.Field)
+        {
+            case McpEditorField.Arguments:
+                LayoutListField(
+                    this.EnsureListField(this.argItemFields, descriptor.ItemIndex, McpEditorField.Arguments),
+                    draft.Args,
+                    descriptor.ItemIndex,
+                    row);
+                break;
+
+            case McpEditorField.Scopes:
+                LayoutListField(
+                    this.EnsureListField(this.scopeItemFields, descriptor.ItemIndex, McpEditorField.Scopes),
+                    draft.Scopes,
+                    descriptor.ItemIndex,
+                    row);
+                break;
+
+            case McpEditorField.Environment:
+                LayoutMapRow(
+                    this.EnsureMapRow(this.envItemRows, descriptor.ItemIndex, McpEditorField.Environment),
+                    draft.Environment,
+                    descriptor.ItemIndex,
+                    row);
+                break;
+
+            case McpEditorField.Headers:
+                LayoutMapRow(
+                    this.EnsureMapRow(this.headerItemRows, descriptor.ItemIndex, McpEditorField.Headers),
+                    draft.Headers,
+                    descriptor.ItemIndex,
+                    row);
+                break;
+        }
+    }
+
+    private static void LayoutListField(
+        TextField field,
+        System.Collections.Immutable.ImmutableArray<string> values,
+        int index,
+        int row)
+    {
+        field.Y = row;
+        field.Value = !values.IsDefault && index < values.Length ? values[index] : string.Empty;
+        field.InsertionPoint = field.Text?.Length ?? 0;
+        field.Visible = true;
+    }
+
+    private static void LayoutMapRow(
+        MapItemRow mapRow,
+        System.Collections.Immutable.ImmutableArray<McpNamedSecretDraft> values,
+        int index,
+        int row)
+    {
+        mapRow.Y = row;
+        var named = !values.IsDefault && index < values.Length ? values[index] : null;
+        mapRow.Name.Value = named?.Name ?? string.Empty;
+        mapRow.Name.InsertionPoint = mapRow.Name.Text?.Length ?? 0;
+
+        // Invariant: the map VALUE is never an editable field. It is a read-only label showing the
+        // secret placeholder; the real value flows through the modal secret-prompt path.
+        mapRow.Value.Text = named is null ? "(unchanged)" : FormatSecret(named.Change);
+        mapRow.Visible = true;
+    }
+
+    /// <summary>
+    /// Lays out one scalar field (or the placeholder row of an empty list) at <paramref name="row"/>.
+    /// </summary>
+    private void LayoutScalarField(
+        McpEditorField field,
+        McpEditorState editor,
+        int row)
+    {
+        var draft = editor.Draft;
+
+        {
             switch (field)
             {
                 case McpEditorField.Scope:
@@ -481,6 +655,121 @@ internal sealed class McpEditorForm : View
             }
         }
     }
+
+    /// <summary>
+    /// Returns the pooled argument/scope <see cref="TextField"/> for <paramref name="index"/>,
+    /// creating and wiring pooled widgets on demand. Pool index N always maps to item index N, so
+    /// closures can safely capture the index.
+    /// </summary>
+    private TextField EnsureListField(List<TextField> pool, int index, McpEditorField field)
+    {
+        while (pool.Count <= index)
+        {
+            var itemIndex = pool.Count;
+            var textField = new TextField
+            {
+                Id = $"{field}Item{itemIndex}",
+                Width = Dim.Fill(),
+                Height = 1,
+                TabStop = TabBehavior.TabStop,
+                Used = true,
+                Visible = false,
+            };
+            this.Add(textField);
+            pool.Add(textField);
+
+            textField.ValueChanged += (_, _) =>
+            {
+                if (this.suppressSync) return;
+                var value = textField.Text ?? string.Empty;
+                this.controller.UpdateEditorDraft(d => SetListValue(d, field, itemIndex, value));
+            };
+            textField.HasFocusChanged += (sender, _) =>
+            {
+                if (!this.suppressSync && sender is View v && v.HasFocus)
+                {
+                    this.controller.UpdateEditorFocusItem(field, itemIndex, McpEditorItemPart.Value);
+                }
+            };
+        }
+
+        return pool[index];
+    }
+
+    /// <summary>
+    /// Returns the pooled environment/header row for <paramref name="index"/>, creating and wiring
+    /// pooled widgets on demand. The name is an editable field; the value is a read-only label
+    /// (never a TextField — see <see cref="MapItemRow"/>).
+    /// </summary>
+    private MapItemRow EnsureMapRow(List<MapItemRow> pool, int index, McpEditorField field)
+    {
+        while (pool.Count <= index)
+        {
+            var itemIndex = pool.Count;
+            var mapRow = new MapItemRow($"{field}Item{itemIndex}");
+            this.Add(mapRow);
+            pool.Add(mapRow);
+
+            mapRow.Name.ValueChanged += (_, _) =>
+            {
+                if (this.suppressSync) return;
+                var value = mapRow.Name.Text ?? string.Empty;
+                this.controller.UpdateEditorDraft(d => SetNamedName(d, field, itemIndex, value));
+            };
+            mapRow.Name.HasFocusChanged += (sender, _) =>
+            {
+                if (!this.suppressSync && sender is View v && v.HasFocus)
+                {
+                    this.controller.UpdateEditorFocusItem(field, itemIndex, McpEditorItemPart.Name);
+                }
+            };
+            mapRow.Value.HasFocusChanged += (sender, _) =>
+            {
+                if (!this.suppressSync && sender is View v && v.HasFocus)
+                {
+                    this.controller.UpdateEditorFocusItem(field, itemIndex, McpEditorItemPart.Value);
+                }
+            };
+        }
+
+        return pool[index];
+    }
+
+    /// <summary>
+    /// Writes an argument or scope display value back into the draft, keeping the parallel identity
+    /// array (<c>ArgumentItems</c>/<c>ScopeItems</c>) aligned so the commit path can still recover
+    /// redacted raw values by Guid.
+    /// </summary>
+    private static McpServerDraft SetListValue(McpServerDraft draft, McpEditorField field, int index, string value)
+    {
+        if (field == McpEditorField.Arguments)
+        {
+            if (draft.Args.IsDefault || index >= draft.Args.Length) return draft;
+            var items = draft.ArgumentItems.IsDefault || index >= draft.ArgumentItems.Length
+                ? draft.ArgumentItems
+                : draft.ArgumentItems.SetItem(index, draft.ArgumentItems[index] with { Value = value });
+            return draft with { Args = draft.Args.SetItem(index, value), ArgumentItems = items };
+        }
+
+        if (draft.Scopes.IsDefault || index >= draft.Scopes.Length) return draft;
+        var scopeItems = draft.ScopeItems.IsDefault || index >= draft.ScopeItems.Length
+            ? draft.ScopeItems
+            : draft.ScopeItems.SetItem(index, draft.ScopeItems[index] with { Value = value });
+        return draft with { Scopes = draft.Scopes.SetItem(index, value), ScopeItems = scopeItems };
+    }
+
+    private static McpServerDraft SetNamedName(McpServerDraft draft, McpEditorField field, int index, string value)
+    {
+        if (field == McpEditorField.Environment)
+        {
+            if (draft.Environment.IsDefault || index >= draft.Environment.Length) return draft;
+            return draft with { Environment = draft.Environment.SetItem(index, draft.Environment[index] with { Name = value }) };
+        }
+
+        if (draft.Headers.IsDefault || index >= draft.Headers.Length) return draft;
+        return draft with { Headers = draft.Headers.SetItem(index, draft.Headers[index] with { Name = value }) };
+    }
+
     private void WireValueChanged()
     {
         this.NameField.ValueChanged += (_, _) =>
@@ -569,4 +858,46 @@ internal sealed class McpEditorForm : View
             McpSecretChangeKind.Remove => "(removed)",
             _ => "(unchanged)",
         };
+
+    /// <summary>
+    /// A single environment/header row: an editable name <see cref="TextField"/> next to a
+    /// read-only value <see cref="Label"/>. The value is DELIBERATELY a label and never a
+    /// <see cref="TextField"/> — this is the hard secret-safety invariant (spec §7.3): map values
+    /// only ever render as <c>"*****"</c>/<c>"(removed)"</c>/<c>"(unchanged)"</c> and their real
+    /// replacement flows through the modal secret-prompt path.
+    /// </summary>
+    private sealed class MapItemRow : View
+    {
+        internal readonly TextField Name;
+        internal readonly Label Value;
+
+        internal MapItemRow(string id)
+        {
+            this.Id = id;
+            this.Width = Dim.Fill();
+            this.Height = 1;
+            this.Visible = false;
+
+            this.Name = new TextField
+            {
+                Id = id + "Name",
+                Width = Dim.Percent(55),
+                Height = 1,
+                TabStop = TabBehavior.TabStop,
+                Used = true,
+            };
+
+            this.Value = new Label
+            {
+                Id = id + "Value",
+                X = Pos.Right(this.Name) + 1,
+                Width = Dim.Fill(),
+                Height = 1,
+                CanFocus = true,
+                TabStop = TabBehavior.TabStop,
+            };
+
+            this.Add(this.Name, this.Value);
+        }
+    }
 }

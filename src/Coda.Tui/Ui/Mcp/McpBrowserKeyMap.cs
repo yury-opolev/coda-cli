@@ -51,10 +51,12 @@ internal static class McpBrowserKeyMap
         if (key == Key.Enter) return McpBrowserCommand.EditorApply;
         if (key == Key.N.WithCtrl) return McpBrowserCommand.EditorAddItem;
         if (key == Key.R.WithCtrl) return McpBrowserCommand.EditorRemoveItem;
-        if (key == Key.CursorUp.WithCtrl) return McpBrowserCommand.EditorPreviousItem;
-        if (key == Key.CursorDown.WithCtrl) return McpBrowserCommand.EditorNextItem;
-        if (key == Key.CursorLeft.WithCtrl) return McpBrowserCommand.EditorPreviousItemPart;
-        if (key == Key.CursorRight.WithCtrl) return McpBrowserCommand.EditorNextItemPart;
+
+        // Item reordering is Alt+Up / Alt+Down. Ctrl+arrows are intentionally NOT mapped anymore:
+        // with per-item widgets (Task 8) plain Tab/Shift+Tab and Up/Down navigate between fields and
+        // items, so the old Ctrl-based item navigation would only shadow those widget defaults.
+        if (key == Key.CursorUp.WithAlt) return McpBrowserCommand.EditorReorderUp;
+        if (key == Key.CursorDown.WithAlt) return McpBrowserCommand.EditorReorderDown;
         return McpBrowserCommand.None;
     }
 }

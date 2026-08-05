@@ -563,12 +563,14 @@ internal sealed partial class McpManagementService : IMcpManagementService
         }
 
         normalized = normalized with { BaseRevision = prepared.Revision };
+        var warnings = CreateScopeWarnings(entries, original, normalized)
+            .AddRange(CreateTransportChangeWarnings(current.Config, normalized));
         return new McpEditPreview(
             Guid.NewGuid(),
             original,
             normalized,
             prepared.Revision,
-            CreateScopeWarnings(entries, original, normalized));
+            warnings);
     }
 
     internal McpDeletePreview PrepareDelete(McpServerKey key, CancellationToken ct)
@@ -1103,6 +1105,46 @@ internal sealed partial class McpManagementService : IMcpManagementService
 
         return warnings.ToImmutable();
     }
+
+    /// <summary>
+    /// Produces a warning when an EDIT-mode draft changes the transport away from the original.
+    /// </summary>
+    /// <remarks>
+    /// <c>NormalizeStdioDraft</c> and <c>NormalizeHttpDraft</c> unconditionally erase the opposite
+    /// transport's fields at prepare time, so switching transport silently discards configuration
+    /// the user may still expect to be there. Naming the dropped fields lets the caller surface a
+    /// confirmation before those values are lost. For Add there is no original, so no transport
+    /// change is possible and this returns no warnings.
+    /// </remarks>
+    private static ImmutableArray<string> CreateTransportChangeWarnings(
+        McpServerConfig? original,
+        McpServerDraft draft)
+    {
+        var originalTransport = original switch
+        {
+            McpStdioServerConfig => McpTransportKind.Stdio,
+            McpHttpServerConfig => McpTransportKind.Http,
+            _ => (McpTransportKind?)null,
+        };
+
+        if (originalTransport is null || originalTransport == draft.Transport)
+        {
+            return ImmutableArray<string>.Empty;
+        }
+
+        var droppedFields = originalTransport == McpTransportKind.Stdio
+            ? "command, arguments, and environment variables"
+            : "URL, headers, authentication mode, client ID, scopes, and bearer token";
+
+        return
+        [
+            $"Changing the transport from {DescribeTransport(originalTransport.Value)} to "
+            + $"{DescribeTransport(draft.Transport)} will drop the existing {droppedFields}.",
+        ];
+    }
+
+    private static string DescribeTransport(McpTransportKind transport) =>
+        transport == McpTransportKind.Stdio ? "stdio" : "http";
 
     private async Task<McpMutationResult> CommitAsync(
         McpEditPreview preview,
