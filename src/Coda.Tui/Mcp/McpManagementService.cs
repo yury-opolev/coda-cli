@@ -3043,7 +3043,12 @@ internal sealed partial class McpManagementService : IMcpManagementService
             entry.IsEffective,
             TransportFor(entry.Config),
             connection,
-            lastError is null ? null : SanitizeError(lastError));
+            lastError is null ? null : SanitizeError(lastError))
+        {
+            ToolCount = connected && this.runtime is not null
+                ? this.runtime.ServerTools(entry.Key.Name).Count
+                : null,
+        };
     }
 
     private McpServerDetail CreateDetail(McpPhysicalServerEntry entry)

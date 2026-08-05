@@ -196,18 +196,28 @@ public sealed class McpBrowserOverlayTests : IDisposable
             StatusMessage = "selected status",
         });
         this.controller.NotifyChangedForTest();
+        // At full size the table scrolls to and shows server-12.
+        this.application.LayoutAndDraw();
+        var rendered = RenderedDriverText(this.application);
+        Assert.True(rendered.Contains("server-12", StringComparison.Ordinal), rendered);
+        Assert.Contains("selected status", rendered, StringComparison.Ordinal);
+        Assert.Equal(selected, this.controller.State.SelectedKey);
+
+        // At narrow sizes the selected row must still be reachable and rendered — that is the whole
+        // point of the test. Headers are disabled precisely so the limited height goes to data.
         this.application.Driver!.SetScreenSize(28, 8);
         this.application.LayoutAndDraw();
-
-        var rendered = RenderedDriverText(this.application);
-        Assert.True(rendered.Contains("❯ server-12", StringComparison.Ordinal), rendered);
+        rendered = RenderedDriverText(this.application);
+        Assert.True(rendered.Contains("server-12", StringComparison.Ordinal), rendered);
         Assert.Contains("selected status", rendered, StringComparison.Ordinal);
+        Assert.Equal(selected, this.controller.State.SelectedKey);
 
         this.application.Driver.SetScreenSize(24, 8);
         this.application.LayoutAndDraw();
         rendered = RenderedDriverText(this.application);
-        Assert.True(rendered.Contains("❯ server-12", StringComparison.Ordinal), rendered);
+        Assert.True(rendered.Contains("server-12", StringComparison.Ordinal), rendered);
         Assert.Contains("selected status", rendered, StringComparison.Ordinal);
+        Assert.Equal(selected, this.controller.State.SelectedKey);
     }
 
     [Fact]

@@ -123,16 +123,17 @@ guarded. Keep Tasks 2 and 3 in the same commit.
 ### Task 3: Shared chrome and the glyph/scheme vocabulary
 
 **Files:** Create `BrowserChrome.cs`, `StatusGlyphs.cs`, `BrowserSchemes.cs`
-**Test:** Create `tests/Coda.Tui.Tests/BrowserChromeTests.cs`
+**Test:** Create `tests/Coda.Tui.Tests/BrowserVocabularyTests.cs`
 
-- [ ] **Step 1: Write failing tests** — `StatusGlyphs.For(unicode: false)` returns the ASCII set and
+- [x] **Step 1: Write failing tests** — `StatusGlyphs.For(unicode: false)` returns the ASCII set and
   every glyph is one cell wide in both sets (mirror `TranscriptGlyphsTests`); each state maps to the
-  §6 palette role; `BrowserSchemes` resolves in both true-colour and 16-colour modes; `BrowserChrome`
-  composes header/body/footer, applies the theme, and runs an injected teardown hook exactly once.
-- [ ] **Step 2: Implement** by **composition, not inheritance** — the five overlays differ in status
-  area size, detail pane, teardown extras and editor mode (spec §5). `BrowserChrome` is a helper the
-  overlay owns, not a base class it derives from.
-- [ ] **Step 3: Verify** — `--filter "FullyQualifiedName~BrowserChrome|FullyQualifiedName~StatusGlyph"`
+  §6 palette role; `BrowserSchemes` resolves in both true-colour and 16-colour modes.
+- [x] **Step 2: Implement** `StatusGlyphs` + `BrowserSchemes`.
+- [ ] **Step 3: `BrowserChrome` — DEFERRED to Task 10.** It exists to remove duplication across the
+  five overlays, and its only consumer is the Phase 4 migration. Building it now, against a single
+  overlay that is itself mid-rewrite, would mean designing the shared shape from one example and
+  reworking it later. Task 10 builds it with four real consumers in hand.
+- [x] **Step 4: Verify** — `--filter "FullyQualifiedName~BrowserVocabulary"` (10 tests)
 
 ---
 

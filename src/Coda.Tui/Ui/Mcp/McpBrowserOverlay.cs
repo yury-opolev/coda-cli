@@ -13,15 +13,8 @@ namespace Coda.Tui.Ui.Mcp;
 /// </summary>
 internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 {
-    /// <summary>
-    /// The glyph marking the selected row or focused editor field. The list's scroll anchor finds
-    /// the selected line by scanning for <see cref="SelectionPrefix"/>, so the two must never drift
-    /// apart — keep both derived from this constant.
-    /// </summary>
+    /// <summary>The glyph marking the focused editor field.</summary>
     private const string SelectionMarker = "\u276f";
-
-    /// <summary>The selected-row prefix as it appears at the start of a rendered list line.</summary>
-    private const string SelectionPrefix = SelectionMarker + " ";
 
     private readonly IApplication app;
     private readonly McpBrowserController controller;
@@ -29,28 +22,38 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private readonly Action? onChanged;
     private readonly Label header;
     private readonly SelectableTextView body;
+    private readonly TableView listTable;
     private readonly Label status;
     private readonly Label footer;
+
+    private BrowserSchemes? browserSchemes;
 
     private CancellationTokenSource? lifetime;
     private bool active;
     private bool subscribed;
     private bool disposed;
-    private int listOffset;
     private int detailOffset;
     private int editorOffset;
+
+    /// <summary>
+    /// The glyph set for status cells, chosen once from the terminal's Unicode capability so a
+    /// terminal that cannot draw geometric shapes still gets a legible status column.
+    /// </summary>
+    private readonly StatusGlyphs statusGlyphs;
 
     internal McpBrowserOverlay(
         IApplication app,
         McpBrowserController controller,
         TuiTheme? theme = null,
         Action? onChanged = null,
-        Action<string, Action>? onCopyRequested = null)
+        Action<string, Action>? onCopyRequested = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
         this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
+        this.statusGlyphs = statusGlyphs ?? StatusGlyphs.Unicode;
 
         this.Visible = false;
         this.CanFocus = true;
@@ -78,6 +81,42 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
         }
 
+        this.listTable = new TableView
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            CanFocus = false,
+            Visible = false,
+        };
+
+        // No column headers. The overlay body is only a handful of rows tall — at 24x8 a header plus
+        // its underline consumed the entire viewport and the list rendered zero servers. The columns
+        // are self-describing (a status glyph, a name, a transport tag), so the two rows are better
+        // spent on data.
+        this.listTable.Style.ShowHeaders = false;
+        this.listTable.Style.ShowHorizontalHeaderUnderline = false;
+        this.listTable.Style.ShowHorizontalHeaderOverline = false;
+        this.listTable.Style.ShowVerticalCellLines = false;
+        this.listTable.Style.ColumnStyles[0] = new ColumnStyle
+        {
+            MinWidth = 1,
+            MaxWidth = 1,
+            ColorGetter = this.GetStatusCellScheme,
+        };
+        this.listTable.Style.ColumnStyles[1] = new ColumnStyle { MinWidth = 6, MaxWidth = 25 };
+        this.listTable.Style.ColumnStyles[2] = new ColumnStyle
+        {
+            MinWidth = 4,
+            MaxWidth = 5,
+            ColorGetter = this.GetTransportCellScheme,
+        };
+        this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 4, MaxWidth = 7 };
+        this.listTable.Style.ColumnStyles[4] = new ColumnStyle { MinWidth = 0, MaxWidth = 4 };
+        this.listTable.Style.ColumnStyles[5] = new ColumnStyle { MinWidth = 0, MaxWidth = 30, TruncationIndicator = "…" };
+        this.listTable.Style.RowColorGetter = this.GetRowScheme;
+
         this.status = new Label
         {
             X = 0,
@@ -94,7 +133,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             Height = 1,
             CanFocus = false,
         };
-        this.Add(this.header, this.body, this.status, this.footer);
+        this.Add(this.header, this.body, this.listTable, this.status, this.footer);
         this.FrameChanged += (_, _) =>
         {
             if (this.active)
@@ -109,11 +148,23 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
                 this.Render();
             }
         };
+
+        // The table's own frame settles after Render has already run, so scrolling the selection
+        // into view has to happen here as well: on a resize the viewport shrinks underneath a
+        // row offset that was computed for the old height, leaving the selected server off screen.
+        this.listTable.FrameChanged += (_, _) =>
+        {
+            if (this.active && this.listTable.Visible)
+            {
+                this.listTable.EnsureCursorIsVisible();
+            }
+        };
     }
 
     internal void ApplyTheme(TuiTheme theme)
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.browserSchemes = null;
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
@@ -283,71 +334,101 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private void Render()
     {
         var state = this.controller.State;
+        string bodyText;
         switch (state.View)
         {
             case McpBrowserView.Detail:
                 this.RenderDetail(state);
+                bodyText = this.body.AllText;
                 break;
             case McpBrowserView.Editor:
                 this.RenderEditor(state);
+                bodyText = this.body.AllText;
                 break;
             default:
-                this.RenderList(state);
+                bodyText = this.RenderList(state);
                 break;
         }
 
         this.VisibleTextForTest = string.Join(
             Environment.NewLine,
             this.header.Text ?? string.Empty,
-            this.body.AllText,
+            bodyText,
             this.status.Text ?? string.Empty,
             this.footer.Text ?? string.Empty);
         this.SetNeedsDraw();
     }
 
-    private void RenderList(McpBrowserState state)
+    private string RenderList(McpBrowserState state)
     {
-        var lines = new List<string> { $"MCP servers ({state.Servers.Length})" };
-        if (state.Servers.IsDefaultOrEmpty)
+        this.listTable.Visible = true;
+        this.body.Visible = false;
+
+        var source = new McpServerTableSource(state.Servers, this.statusGlyphs, null);
+        this.listTable.Table = source;
+
+        // Sync the table's selection from controller state, then scroll it into view. Without the
+        // second step the table renders from row 0 regardless of the selection, so on a short
+        // terminal the selected server is simply not on screen — which is exactly the case the
+        // narrow-terminal tests cover.
+        if (!state.Servers.IsDefaultOrEmpty && state.SelectedKey is { } key)
         {
-            lines.Add("(no configured servers)");
-        }
-        else
-        {
-            for (var index = 0; index < state.Servers.Length; index++)
+            var idx = 0;
+            for (var i = 0; i < state.Servers.Length; i++)
             {
-                var server = state.Servers[index];
-                var selected = state.SelectedKey == server.Key ? SelectionMarker : " ";
-                var enabled = server.Enabled ? "enabled" : "disabled";
-                var effective = server.IsEffective ? "effective" : "overridden";
-                var error = string.IsNullOrWhiteSpace(server.LastError)
-                    ? string.Empty
-                    : $" error={SafeSingle(server.LastError)}";
-                lines.Add(new StringBuilder()
-                    .Append(selected).Append(' ')
-                    .Append(SafeSingle(server.Key.Name)).Append(" [")
-                    .Append(Scope(server.Key.Scope)).Append("] ")
-                    .Append(Transport(server.Transport)).Append(' ')
-                    .Append(enabled).Append(' ')
-                    .Append(effective).Append(" connection=")
-                    .Append(server.Connection).Append(error).ToString());
+                if (state.Servers[i].Key == key)
+                {
+                    idx = i;
+                    break;
+                }
             }
+
+            this.listTable.SetSelection(0, idx, false);
+            this.listTable.EnsureCursorIsVisible();
         }
 
         this.header.Text = SafeSingle("MCP manager");
-        var selectedLine = state.SelectedKey is not null
-            ? lines.FindIndex(line => line.StartsWith(SelectionPrefix, StringComparison.Ordinal))
-            : -1;
-        this.body.SetText(Window(lines, ref this.listOffset, this.BodyViewportRows(), selectedLine));
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
                 "↑/↓ move · PgUp/PgDn · Home/End · Enter detail · a add · e edit · Space enable · u reauth · Delete remove · Esc close",
                 "↑/↓ · PgUp/PgDn · Home/End · Enter · Esc"));
+
+        return BuildListText(state, source);
+    }
+
+    /// <summary>
+    /// Builds a plain-text representation of the list for <see cref="VisibleTextForTest"/>. The
+    /// text is not rendered to the screen; it is used only for test assertions that need to verify
+    /// state without driver-scraping.
+    /// </summary>
+    private static string BuildListText(McpBrowserState state, McpServerTableSource source)
+    {
+        if (state.Servers.IsDefaultOrEmpty)
+        {
+            return "(no configured servers)";
+        }
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < state.Servers.Length; i++)
+        {
+            var server = state.Servers[i];
+            var itemState = McpServerTableSource.GetState(server);
+            sb.Append(SafeSingle(server.Key.Name))
+              .Append(' ')
+              .Append(itemState.ToString().ToLowerInvariant())
+              .Append(" connection=")
+              .Append(server.Connection)
+              .AppendLine();
+        }
+
+        return sb.ToString();
     }
 
     private void RenderDetail(McpBrowserState state)
     {
+        this.listTable.Visible = false;
+        this.body.Visible = true;
         var lines = new List<string>();
         var detail = state.Detail;
         if (detail is null)
@@ -407,6 +488,8 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private void RenderEditor(McpBrowserState state)
     {
+        this.listTable.Visible = false;
+        this.body.Visible = true;
         var lines = new List<string>();
         var focusedLine = -1;
         if (state.Editor is not { } editor)
@@ -686,6 +769,33 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private static string Transport(McpTransportKind transport) => transport == McpTransportKind.Http ? "http" : "stdio";
 
     private static string SafeSingle(string? value) => TerminalTextSanitizer.SanitizeSingleLine(value ?? string.Empty);
+
+    private BrowserSchemes EnsureSchemes() =>
+        this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);
+
+    private Scheme GetRowScheme(RowColorGetterArgs args)
+    {
+        var schemes = this.EnsureSchemes();
+        if (args.Table is not McpServerTableSource source || args.RowIndex < 0 || args.RowIndex >= source.Rows)
+        {
+            return schemes.Normal;
+        }
+
+        return schemes.ForRow(McpServerTableSource.GetState(source.SummaryAt(args.RowIndex)));
+    }
+
+    private Scheme GetStatusCellScheme(CellColorGetterArgs args)
+    {
+        var schemes = this.EnsureSchemes();
+        if (args.Table is not McpServerTableSource source || args.RowIndex < 0 || args.RowIndex >= source.Rows)
+        {
+            return schemes.Normal;
+        }
+
+        return schemes.For(McpServerTableSource.GetState(source.SummaryAt(args.RowIndex)));
+    }
+
+    private Scheme GetTransportCellScheme(CellColorGetterArgs args) => this.EnsureSchemes().Accent;
 
     private void Observe(Task task) =>
         task.ContinueWith(

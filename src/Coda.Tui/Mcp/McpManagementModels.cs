@@ -95,7 +95,11 @@ public sealed record McpServerSummary(
     bool IsEffective,
     McpTransportKind Transport,
     McpConnectionState Connection,
-    string? LastError);
+    string? LastError)
+{
+    /// <summary>Number of tools exposed by this server, or null when the runtime has not yet connected.</summary>
+    public int? ToolCount { get; init; }
+}
 
 public sealed record McpManagementSnapshot(
     bool ProjectScopeAvailable,

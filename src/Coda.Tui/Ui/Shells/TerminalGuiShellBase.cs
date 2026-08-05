@@ -106,7 +106,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         IPrivateBrowserResolver? privateBrowserResolver = null,
         IUiPromptService? linkPromptService = null,
         IClipboardImageReader? imageReader = null,
-        Func<ClipboardImage, string?>? imagePaste = null)
+        Func<ClipboardImage, string?>? imagePaste = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -158,7 +159,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (mcpBrowserProvider is not null)
         {
             this.mcpController = new McpBrowserController(mcpBrowserProvider);
-            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged, onCopyRequested: this.CopyToClipboard);
+            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged, onCopyRequested: this.CopyToClipboard, statusGlyphs: statusGlyphs);
         }
 
         if (scheduleBrowserProvider is not null)

@@ -40,7 +40,8 @@ internal static class TerminalGuiShellComposition
         IUiPromptService? linkPromptService = null,
         IClipboardImageReader? imageReader = null,
         Func<ClipboardImage, string?>? imagePaste = null,
-        TranscriptGlyphs? transcriptGlyphs = null)
+        TranscriptGlyphs? transcriptGlyphs = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         ArgumentNullException.ThrowIfNull(application);
         ArgumentNullException.ThrowIfNull(composer);
@@ -70,7 +71,8 @@ internal static class TerminalGuiShellComposition
                 linkPromptService: linkPromptService,
                 imageReader: imageReader,
                 imagePaste: imagePaste,
-                transcriptGlyphs: transcriptGlyphs)
+                transcriptGlyphs: transcriptGlyphs,
+                statusGlyphs: statusGlyphs)
             : new InlineTuiShell(
                 application,
                 composer,
@@ -89,6 +91,7 @@ internal static class TerminalGuiShellComposition
                 linkPromptService: linkPromptService,
                 imageReader: imageReader,
                 imagePaste: imagePaste,
-                transcriptGlyphs: transcriptGlyphs);
+                transcriptGlyphs: transcriptGlyphs,
+                statusGlyphs: statusGlyphs);
     }
 }

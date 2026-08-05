@@ -637,6 +637,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // Resolve the glyph set once from the terminal capabilities — Unicode for UTF-8 terminals, ASCII
         // fallback otherwise — so the transcript gutter uses the right characters for this session.
         var transcriptGlyphs = TranscriptGlyphs.For(this.capabilities.UnicodeOutput);
+        var statusGlyphs = StatusGlyphs.For(this.capabilities.UnicodeOutput);
 
         // The Terminal.Gui shell factory: wire the composer to the controller, point the actor's frame
         // sink at the shell, and (once the loop is pumping) run startup and enable submission.
@@ -667,7 +668,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 linkPromptService: actorPrompts,
                 imageReader: clipboardImageReader,
                 imagePaste: imagePaste,
-                transcriptGlyphs: transcriptGlyphs);
+                transcriptGlyphs: transcriptGlyphs,
+                statusGlyphs: statusGlyphs);
 
             // Route /image (and any command staging an image) into this shell's live composer draft. Dispatch
             // is serialized by the controller, so a mode switch never leaves this pointing at a dead shell.
