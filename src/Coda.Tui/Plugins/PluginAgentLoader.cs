@@ -126,9 +126,12 @@ public static class PluginAgentLoader
         // model key: accepted for user-scoped plugins; ignored with a warning for project-scoped
         // plugins because the project directory is attacker-controlled after a hostile clone, and
         // model choice is a cost lever.
+        //
+        // NOTE: `model` is a first-class field on the shared frontmatter parser
+        // (SkillFrontmatter.Model), not an unknown key — reading it from UnknownFields silently
+        // yields null for every agent file.
         string? model = null;
-        if (frontmatter.UnknownFields.TryGetValue("model", out var modelValue)
-            && !string.IsNullOrWhiteSpace(modelValue))
+        if (!string.IsNullOrWhiteSpace(frontmatter.Model))
         {
             if (isProjectPlugin)
             {
@@ -139,7 +142,7 @@ public static class PluginAgentLoader
             }
             else
             {
-                model = modelValue.Trim();
+                model = frontmatter.Model.Trim();
             }
         }
 
