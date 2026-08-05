@@ -113,7 +113,7 @@ public sealed class CommandCompletionShellTests
         Assert.True(shell.Completion.Visible);
         var rows = shell.Completion.RenderVisibleRows(80);
         Assert.Contains(rows, row => row.Contains("help") && row.Contains("Show help"));
-        Assert.Contains(rows, row => row.Contains(">"));
+        Assert.Contains(rows, row => row.Contains("\u276f"));
 
         // The menu bottom aligns with the operational row (overlaying the transcript), and neither the
         // composer, operational row, nor the status moved to make room for it.

@@ -101,7 +101,7 @@ public sealed class PromptOverlayFreeTextTests : IDisposable
         var body = this.overlay.BodyText;
         var markerIndex = body.IndexOf(FreeTextRowMarker, StringComparison.Ordinal);
         Assert.True(markerIndex >= 1, "The ✎ row should be present in body text");
-        Assert.Equal('>', body[markerIndex - 2]); // cursor is '>' two chars before the ✎ ("> ✎")
+        Assert.Equal('\u276f', body[markerIndex - 2]); // cursor is '❯' two chars before the ✎ ("❯ ✎")
     }
 
     // ---------------------------------------------------------------------------

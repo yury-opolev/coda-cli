@@ -265,7 +265,7 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
             foreach (var plugin in state.Plugins)
             {
                 var selected = plugin.Name == state.SelectedName;
-                var prefix = selected ? "▶ " : "  ";
+                var prefix = selected ? "\u276f " : "  ";
                 var name = TerminalTextSanitizer.SanitizeSingleLine(plugin.Name);
                 var version = TerminalTextSanitizer.SanitizeSingleLine(plugin.Version);
                 var enabled = plugin.IsEnabled ? "enabled" : "disabled";

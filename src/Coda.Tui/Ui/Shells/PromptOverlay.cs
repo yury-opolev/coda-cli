@@ -325,7 +325,7 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
                 for (var i = 0; i < req.Options.Length; i++)
                 {
                     var option = req.Options[i];
-                    var cursor = i == this.selectedIndex ? ">" : " ";
+                    var cursor = i == this.selectedIndex ? "\u276f" : " ";
                     var mark = req.Kind == UiPromptKind.SelectMany
                         ? (this.checkedIndices.Contains(i) ? "[x] " : "[ ] ")
                         : string.Empty;
@@ -335,7 +335,7 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
 
                 if (req.AllowFreeText)
                 {
-                    var freeTextCursor = this.selectedIndex == req.Options.Length ? ">" : " ";
+                    var freeTextCursor = this.selectedIndex == req.Options.Length ? "\u276f" : " ";
                     builder.Append(freeTextCursor).Append(" \u270e Type your own answer\u2026");
                 }
                 else if (builder.Length > 0)

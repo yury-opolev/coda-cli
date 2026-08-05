@@ -266,7 +266,7 @@ internal sealed class SkillBrowserOverlay : View, ISelectableOverlay
             foreach (var skill in state.Skills)
             {
                 var selected = skill.Name == state.SelectedName;
-                var prefix = selected ? "▶ " : "  ";
+                var prefix = selected ? "\u276f " : "  ";
                 var name = TerminalTextSanitizer.SanitizeSingleLine(skill.Name);
                 var origin = skill.Origin.ToString().ToLowerInvariant();
                 var enabled = skill.DisableModelInvocation ? "model-off" : "enabled";

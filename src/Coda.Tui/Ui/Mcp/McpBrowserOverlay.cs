@@ -13,6 +13,16 @@ namespace Coda.Tui.Ui.Mcp;
 /// </summary>
 internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 {
+    /// <summary>
+    /// The glyph marking the selected row or focused editor field. The list's scroll anchor finds
+    /// the selected line by scanning for <see cref="SelectionPrefix"/>, so the two must never drift
+    /// apart — keep both derived from this constant.
+    /// </summary>
+    private const string SelectionMarker = "\u276f";
+
+    /// <summary>The selected-row prefix as it appears at the start of a rendered list line.</summary>
+    private const string SelectionPrefix = SelectionMarker + " ";
+
     private readonly IApplication app;
     private readonly McpBrowserController controller;
     private TuiTheme theme;
@@ -301,7 +311,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             for (var index = 0; index < state.Servers.Length; index++)
             {
                 var server = state.Servers[index];
-                var selected = state.SelectedKey == server.Key ? ">" : " ";
+                var selected = state.SelectedKey == server.Key ? SelectionMarker : " ";
                 var enabled = server.Enabled ? "enabled" : "disabled";
                 var effective = server.IsEffective ? "effective" : "overridden";
                 var error = string.IsNullOrWhiteSpace(server.LastError)
@@ -320,7 +330,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
         this.header.Text = SafeSingle("MCP manager");
         var selectedLine = state.SelectedKey is not null
-            ? lines.FindIndex(line => line.StartsWith("> ", StringComparison.Ordinal))
+            ? lines.FindIndex(line => line.StartsWith(SelectionPrefix, StringComparison.Ordinal))
             : -1;
         this.body.SetText(Window(lines, ref this.listOffset, this.BodyViewportRows(), selectedLine));
         this.status.Text = SafeSingle(state.StatusMessage);
@@ -434,7 +444,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         int focusedLine)
     {
         var line = lines.Count;
-        var marker = editor.FocusedField == field ? ">" : " ";
+        var marker = editor.FocusedField == field ? SelectionMarker : " ";
         lines.Add(marker + " " + field + ": " + SafeSingle(value));
         return focusedLine >= 0 || editor.FocusedField != field ? focusedLine : line;
     }
@@ -454,7 +464,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             focusedLine);
         for (var index = 0; index < values.Count; index++)
         {
-            var marker = editor.FocusedField == field && editor.SelectedItem == index ? ">" : " ";
+            var marker = editor.FocusedField == field && editor.SelectedItem == index ? SelectionMarker : " ";
             lines.Add($"  {marker} {index + 1}: {SafeSingle(values[index])}");
         }
 
@@ -477,7 +487,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         for (var index = 0; index < values.Count; index++)
         {
             var item = values[index];
-            var marker = editor.FocusedField == field && editor.SelectedItem == index ? ">" : " ";
+            var marker = editor.FocusedField == field && editor.SelectedItem == index ? SelectionMarker : " ";
             var part = editor.FocusedField == field && editor.SelectedItem == index
                 ? editor.SelectedItemPart
                 : McpEditorItemPart.Value;

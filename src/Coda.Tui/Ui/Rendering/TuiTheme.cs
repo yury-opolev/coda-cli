@@ -164,9 +164,11 @@ internal sealed class TuiTheme
     /// region reads as its own panel rather than blending into the transcript surface.</summary>
     public TuiThemeColor ComposerPanelBackground { get; init; } = new(new TgColor(34, 28, 23), TgName.Black);
 
-    /// <summary>The half-block edge shading drawn along the composer panel's top and bottom rows: a warm
-    /// tone a touch lighter than the panel so the seam between shell and panel is soft, not a hard border.</summary>
-    public TuiThemeColor ComposerPanelEdge { get; init; } = new(new TgColor(58, 47, 38), TgName.Black);
+    /// <summary>The half-block edge shading drawn along the composer panel's top and bottom rows.
+    /// It matches <see cref="ComposerPanelBackground"/> so the edges read as the panel bleeding half
+    /// a row above and below the input, rather than as a lighter rim around it. Kept as its own role
+    /// so a theme may tint the seam if it wants to.</summary>
+    public TuiThemeColor ComposerPanelEdge { get; init; } = new(new TgColor(34, 28, 23), TgName.Black);
 
     public TuiThemeColor OperationalReady { get; init; } = new(new TgColor(143, 136, 128), TgName.Gray);
     public TuiThemeColor OperationalInitializing { get; init; } = new(new TgColor(179, 138, 80), TgName.Yellow);

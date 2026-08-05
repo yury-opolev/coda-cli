@@ -40,7 +40,7 @@ public sealed class TranscriptPinViewTests
         fixture.HostApplication.LayoutAndDraw();
 
         Assert.NotNull(view.PinnedPromptForTest);
-        Assert.Contains(">", view.PinnedPromptForTest, StringComparison.Ordinal);
+        Assert.Contains("\u276f", view.PinnedPromptForTest, StringComparison.Ordinal);
     }
 
     // -------------------------------------------------------------------------

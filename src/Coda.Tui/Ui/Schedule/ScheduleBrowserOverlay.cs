@@ -236,7 +236,7 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
         foreach (var row in state.Rows)
         {
             var selected = row.Id == state.SelectedId;
-            var prefix = selected ? "▶ " : "  ";
+            var prefix = selected ? "\u276f " : "  ";
             var id = TerminalTextSanitizer.SanitizeSingleLine(row.Id);
             var name = row.Name is { Length: > 0 } n
                 ? $" \"{TerminalTextSanitizer.SanitizeSingleLine(n)}\""

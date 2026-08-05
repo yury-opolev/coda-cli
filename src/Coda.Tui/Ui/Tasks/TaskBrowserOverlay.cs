@@ -326,7 +326,7 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 
     private static void AppendListRow(StringBuilder sb, TaskListRow row, string? selectedId)
     {
-        var cursor = row.Task.Id == selectedId ? '>' : ' ';
+        var cursor = row.Task.Id == selectedId ? '\u276f' : ' ';
         var indent = new string(' ', row.IndentDepth * 2);
         var glyph = row.IndentDepth == 0 ? "●" : "└";
         sb.Append(cursor).Append(' ').Append(indent).Append(glyph).Append(' ')

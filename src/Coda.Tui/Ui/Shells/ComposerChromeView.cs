@@ -6,9 +6,20 @@ namespace Coda.Tui.Ui.Shells;
 
 internal sealed class ComposerChromeView : View
 {
-    internal const string PromptGlyph = ">";
-    internal const char TopEdgeGlyph = '▀';
-    internal const char BottomEdgeGlyph = '▄';
+    internal const string PromptGlyph = "\u276f";
+
+    /// <summary>
+    /// The top edge is a <em>lower</em> half block: the cell's upper half keeps the shell background
+    /// and its lower half carries the panel colour, so the panel appears to begin half a row above
+    /// the first content row instead of starting abruptly at a cell boundary.
+    /// </summary>
+    internal const char TopEdgeGlyph = '▄';
+
+    /// <summary>
+    /// The bottom edge mirrors <see cref="TopEdgeGlyph"/> with an <em>upper</em> half block, so the
+    /// panel appears to end half a row below the last content row.
+    /// </summary>
+    internal const char BottomEdgeGlyph = '▀';
 
     private const int PromptColumn = 0;
     private const int PromptRow = 1;
@@ -105,7 +116,10 @@ internal sealed class ComposerChromeView : View
 
         if (this.ready)
         {
-            var edge = this.theme.Attribute(this.theme.ComposerPanelEdge, this.theme.ComposerPanelBackground, driver);
+            // The edge rows are painted against the SHELL background, not the panel background: the
+            // half-block glyph then reads as the panel bleeding half a row outward, rather than as a
+            // lighter rim floating inside the panel.
+            var edge = this.theme.Attribute(this.theme.ComposerPanelEdge, this.theme.Background, driver);
             this.SetAttribute(edge);
             this.Move(0, 0);
             this.AddStr(new string(TopEdgeGlyph, width));

@@ -188,13 +188,13 @@ public sealed class McpBrowserOverlayTests : IDisposable
         this.application.LayoutAndDraw();
 
         var rendered = RenderedDriverText(this.application);
-        Assert.True(rendered.Contains("> server-12", StringComparison.Ordinal), rendered);
+        Assert.True(rendered.Contains("❯ server-12", StringComparison.Ordinal), rendered);
         Assert.Contains("selected status", rendered, StringComparison.Ordinal);
 
         this.application.Driver.SetScreenSize(24, 8);
         this.application.LayoutAndDraw();
         rendered = RenderedDriverText(this.application);
-        Assert.True(rendered.Contains("> server-12", StringComparison.Ordinal), rendered);
+        Assert.True(rendered.Contains("❯ server-12", StringComparison.Ordinal), rendered);
         Assert.Contains("selected status", rendered, StringComparison.Ordinal);
     }
 
@@ -241,7 +241,7 @@ public sealed class McpBrowserOverlayTests : IDisposable
         this.controller.NotifyChangedForTest();
         this.application.LayoutAndDraw();
         rendered = RenderedDriverText(this.application);
-        Assert.Contains("> Cancel", rendered, StringComparison.Ordinal);
+        Assert.Contains("❯ Cancel", rendered, StringComparison.Ordinal);
         Assert.Contains("editor status", rendered, StringComparison.Ordinal);
     }
 

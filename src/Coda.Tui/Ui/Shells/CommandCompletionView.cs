@@ -154,7 +154,7 @@ internal sealed class CommandCompletionView : View
     private string RowText(int index)
     {
         var command = this.suggestions[index];
-        var marker = index == this.selectedIndex ? "> " : "  ";
+        var marker = index == this.selectedIndex ? "\u276f " : "  ";
         // Prepend the skill glyph for skill-derived entries so they are visually
         // distinguishable from built-ins in the live menu (M3: marker at render time only).
         var summaryPrefix = command is SkillSlashCommand ? SkillSlashCommand.SkillMarker : string.Empty;

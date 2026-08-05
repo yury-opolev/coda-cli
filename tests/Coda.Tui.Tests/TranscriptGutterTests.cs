@@ -22,7 +22,7 @@ public sealed class TranscriptGutterTests
         var lines = TranscriptBlockFormatter.Format(
             new UserTranscriptBlock(Guid.NewGuid(), "hello", null), 40);
 
-        Assert.Equal(" > hello", lines[0].Text);
+        Assert.Equal(" \u276f hello", lines[0].Text);
     }
 
     [Fact]
@@ -33,7 +33,7 @@ public sealed class TranscriptGutterTests
             new UserTranscriptBlock(Guid.NewGuid(), "hello world", null), 10);
 
         Assert.True(lines.Count >= 2, "message should wrap at width 10");
-        Assert.StartsWith(" > ", lines[0].Text);
+        Assert.StartsWith(" \u276f ", lines[0].Text);
         Assert.StartsWith("   ", lines[1].Text);
     }
 
@@ -49,7 +49,7 @@ public sealed class TranscriptGutterTests
             80);
 
         var line = Assert.Single(lines);
-        Assert.StartsWith(" > [pending] ", line.Text);
+        Assert.StartsWith(" \u276f [pending] ", line.Text);
         Assert.Contains("queued", line.Text, StringComparison.Ordinal);
     }
 

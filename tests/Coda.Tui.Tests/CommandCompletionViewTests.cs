@@ -39,8 +39,8 @@ public sealed class CommandCompletionViewTests
         Assert.Contains("Show help", rows[0]);
         Assert.Contains("model", rows[1]);
         Assert.Contains("Pick model", rows[1]);
-        Assert.DoesNotContain(">", rows[0]);
-        Assert.Contains(">", rows[1]);
+        Assert.DoesNotContain("\u276f", rows[0]);
+        Assert.Contains("\u276f", rows[1]);
         Assert.Equal(2, view.DesiredHeight);
     }
 
