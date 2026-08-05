@@ -508,6 +508,12 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         lines.Add($"Status:   {task.Status}");
         lines.Add($"Duration: {FormatDuration(task)}");
         lines.Add($"Log:      {task.LogPath}");
+        // Render the model resolved for this subagent so the browser exposes which LLM tier each task uses.
+        if (task.ResolvedModel is { Length: > 0 } model)
+        {
+            lines.Add($"Model:    {model}");
+        }
+
         if (task.Result is { Length: > 0 } result)
         {
             lines.Add($"Result:   {TerminalTextSanitizer.Sanitize(result)}");

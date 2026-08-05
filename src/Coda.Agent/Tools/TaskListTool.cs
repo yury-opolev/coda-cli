@@ -40,6 +40,7 @@ public sealed class TaskListTool : ITool
             sb.Append(t.Id)
               .Append("  ").Append(t.Kind.ToString().ToLowerInvariant())
               .Append("  ").Append(t.Status.ToString().ToLowerInvariant())
+              .Append("  ").Append(t.ResolvedModel ?? "—")
               .Append("  ").Append(t.Description)
               .Append('\n');
         }

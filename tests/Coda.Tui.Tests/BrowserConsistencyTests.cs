@@ -1,4 +1,5 @@
 using Coda.Tui.Ui.Mcp;
+using Coda.Tui.Ui.Models;
 using Coda.Tui.Ui.Plugins;
 using Coda.Tui.Ui.Schedule;
 using Coda.Tui.Ui.Skills;
@@ -8,7 +9,7 @@ using Xunit;
 namespace Coda.Tui.Tests;
 
 /// <summary>
-/// Table-driven consistency tests asserting that all five browsers share the mandatory key-binding
+/// Table-driven consistency tests asserting that all six browsers share the mandatory key-binding
 /// contract defined in Task 11:
 /// <list type="bullet">
 ///   <item>List view: Esc and q close; Up/Down and k/j navigate; PgUp/PgDn and Home/End jump; r reloads; / enters filter.</item>
@@ -225,5 +226,29 @@ public sealed class BrowserConsistencyTests
             var cmd = TaskBrowserKeyMap.Map(new Key(ch), TaskBrowserView.Steering);
             Assert.True(cmd == TaskBrowserCommand.None, $"'{ch}' must be None in steering view but was {cmd}");
         }
+    }
+
+    // ── Model ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Regression insurance: ModelBrowserKeyMap must satisfy the same mandatory binding contract as
+    /// every other browser so a future refactor that drops a binding fails here before reaching users.
+    /// </summary>
+    [Fact]
+    public void Model_List_HasMandatoryBindings()
+    {
+        Assert.Equal(ModelBrowserCommand.Close, ModelBrowserKeyMap.Map(Key.Esc));
+        Assert.Equal(ModelBrowserCommand.Close, ModelBrowserKeyMap.Map(new Key('q')));
+        Assert.Equal(ModelBrowserCommand.MoveUp, ModelBrowserKeyMap.Map(Key.CursorUp));
+        Assert.Equal(ModelBrowserCommand.MoveUp, ModelBrowserKeyMap.Map(new Key('k')));
+        Assert.Equal(ModelBrowserCommand.MoveDown, ModelBrowserKeyMap.Map(Key.CursorDown));
+        Assert.Equal(ModelBrowserCommand.MoveDown, ModelBrowserKeyMap.Map(new Key('j')));
+        Assert.Equal(ModelBrowserCommand.PageUp, ModelBrowserKeyMap.Map(Key.PageUp));
+        Assert.Equal(ModelBrowserCommand.PageDown, ModelBrowserKeyMap.Map(Key.PageDown));
+        Assert.Equal(ModelBrowserCommand.MoveToStart, ModelBrowserKeyMap.Map(Key.Home));
+        Assert.Equal(ModelBrowserCommand.MoveToEnd, ModelBrowserKeyMap.Map(Key.End));
+        Assert.Equal(ModelBrowserCommand.Reload, ModelBrowserKeyMap.Map(new Key('r')));
+        Assert.Equal(ModelBrowserCommand.Filter, ModelBrowserKeyMap.Map(new Key('/')));
+        Assert.Equal(ModelBrowserCommand.Select, ModelBrowserKeyMap.Map(Key.Enter));
     }
 }

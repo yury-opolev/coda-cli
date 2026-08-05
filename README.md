@@ -203,7 +203,7 @@ selection exists, `Ctrl+C` **or a right-click** copies it and clears the selecti
 with no selection pastes at the clicked caret; `Alt+V` (or `Ctrl+V`) pastes at the caret, attaching a copied **image** when the clipboard holds one and falling back to text otherwise — use `Alt+V` if your terminal claims `Ctrl+V` for its own paste, as Windows Terminal does, since its paste reads text only and an image-only clipboard then produces nothing. Pasting a **path to an image file** attaches that image instead of inserting the path, so Explorer's `Shift`+right-click → **Copy as path** followed by an ordinary paste works even through a terminal's own `Ctrl+V`; and a **middle-click**
 opens the editor context menu. The **session id** in the header, and the body of the modal browsers
 (`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
-and copied the same way. **`Shift`-drag** hands native selection and copy to the terminal where
+and copied the same way. In each browser the **list pane** uses a TableView widget that highlights the selected row; drag-select with `Ctrl+C` is available in the **detail pane** where a full `SelectableTextView` is rendered. **`Shift`-drag** hands native selection and copy to the terminal where
 supported. `--no-mouse` leaves selection and copy native to the terminal, and every action stays
 reachable from the keyboard. Full-screen has **no permanent sidebar**
 and uses a **virtualized transcript** (context, pickers, permissions, help, and diffs all use

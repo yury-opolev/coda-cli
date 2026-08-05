@@ -647,4 +647,70 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             host.Dispose();
         }
     }
+
+    /// <summary>
+    /// Regression guard: the task detail pane must show the resolved model so users can tell which
+    /// LLM tier each subagent is running — the headline capability promised by the subagent spec.
+    /// </summary>
+    [Fact]
+    public void Detail_ShowsResolvedModel_WhenSet()
+    {
+        var t = _mgr.Register(TaskKind.Subagent, "model-task", parentTaskId: null);
+        _mgr.SetTaskResolvedModel(t.Id, "claude-opus-4-8");
+
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+            overlay.NewKeyDownEvent(Key.Enter); // open detail
+
+            var body = overlay.BodyText;
+            Assert.Contains("Model:", body, StringComparison.Ordinal);
+            Assert.Contains("claude-opus-4-8", body, StringComparison.Ordinal);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Regression guard: the task detail pane must NOT render a blank "Model:" row when the resolved
+    /// model is absent — an empty metadata row would be misleading and visually ragged.
+    /// </summary>
+    [Fact]
+    public void Detail_DoesNotShowModelRow_WhenNotSet()
+    {
+        _mgr.Register(TaskKind.Shell, "no-model-task", parentTaskId: null);
+
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+            overlay.NewKeyDownEvent(Key.Enter); // open detail
+
+            // When no model was resolved (e.g. shell tasks) no Model: row should appear.
+            Assert.DoesNotContain("Model:", overlay.BodyText, StringComparison.Ordinal);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
 }

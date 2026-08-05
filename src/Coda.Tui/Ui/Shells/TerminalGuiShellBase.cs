@@ -328,11 +328,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                 }
 
                 // Mutual exclusion: hide any currently visible browser before opening the model one.
-                this.taskOverlay?.Hide();
-                this.mcpOverlay?.Hide();
-                this.scheduleOverlay?.Hide();
-                this.skillsOverlay?.Hide();
-                this.pluginOverlay?.Hide();
+                this.HideAllBrowsersExcept(this.modelBrowserOverlay);
 
                 this.modelBrowserOverlay.Show(result, currentModelId, id => tcs.TrySetResult(id));
             });
@@ -1767,55 +1763,54 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
+    /// <summary>
+    /// Hides every browser overlay except <paramref name="keep"/> so all entry points enforce mutual
+    /// exclusion without the set drifting as new browsers are added.
+    /// </summary>
+    private void HideAllBrowsersExcept(View? keep)
+    {
+        if (!ReferenceEquals(keep, this.taskOverlay)) this.taskOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.mcpOverlay)) this.mcpOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.scheduleOverlay)) this.scheduleOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.skillsOverlay)) this.skillsOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.pluginOverlay)) this.pluginOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.modelBrowserOverlay)) this.modelBrowserOverlay.Hide();
+    }
+
     private void OpenTaskBrowser()
     {
         // Show() owns controller.Open() + a fresh pump and is idempotent while already active, so a repeated
         // /tasks never re-Opens (which would rebind the subscription and dispose the live pump under it).
         // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
         // was built once; before the first turn the provider returns null and the browser opens empty.
-        this.mcpOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.skillsOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.taskOverlay);
         this.taskOverlay?.Show();
     }
 
     private void OpenMcpBrowser()
     {
-        this.taskOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.skillsOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.mcpOverlay);
         this.mcpOverlay?.Show();
     }
 
     private void OpenScheduleBrowser()
     {
         // Show() is idempotent: a repeated /schedule never double-Opens or double-pumps.
-        this.taskOverlay?.Hide();
-        this.mcpOverlay?.Hide();
-        this.skillsOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.scheduleOverlay);
         this.scheduleOverlay?.Show();
     }
 
     private void OpenSkillsBrowser()
     {
         // Show() is idempotent: a repeated /skills never double-Opens or double-pumps.
-        this.taskOverlay?.Hide();
-        this.mcpOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.skillsOverlay);
         this.skillsOverlay?.Show();
     }
 
     private void OpenPluginBrowser()
     {
         // Show() is idempotent: a repeated /plugin never double-Opens or double-pumps.
-        this.taskOverlay?.Hide();
-        this.mcpOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.skillsOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.pluginOverlay);
         this.pluginOverlay?.Show();
     }
 
