@@ -85,6 +85,16 @@ internal sealed class ManagedTask : IDisposable
     public TaskRunStatus Status { get { lock (_gate) { return _status; } } }
     public TaskExecutionMode Mode { get { lock (_gate) { return _mode; } } }
 
+    /// <summary>
+    /// The model id resolved by <see cref="SubagentHost"/> for this subagent task, or null when
+    /// not yet set (pre-run) or not applicable (shell tasks). Set once just before the agent loop
+    /// starts.
+    /// </summary>
+    public string? ResolvedModel { get; private set; }
+
+    /// <summary>Records the resolved model id. Called once by SubagentHost before the loop starts.</summary>
+    internal void SetResolvedModel(string? model) => this.ResolvedModel = model;
+
     /// <summary>Requests cancellation of the underlying work without changing status.</summary>
     internal void Cancel()
     {
@@ -222,7 +232,8 @@ internal sealed class ManagedTask : IDisposable
         {
             return new TaskSnapshot(
                 Id, ParentId, Depth, Kind, Description,
-                _status, _mode, _version, StartedAt, _endedAt, LogPath, _result, _error);
+                _status, _mode, _version, StartedAt, _endedAt, LogPath, _result, _error,
+                ResolvedModel);
         }
     }
 

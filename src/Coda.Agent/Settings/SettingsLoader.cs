@@ -77,6 +77,28 @@ public static class SettingsLoader
 
         // Merge goal block per field: project overrides user, field by field.
         var goalMerged = MergeGoalSettings(userSettings.Goal, projectSettings.Goal);
+
+        // Warn when a project settings file sets model/modelByType — those are user-only for
+        // security reasons (cost lever; project is attacker-controlled after a hostile clone).
+        if (projectSettings.SubagentOverrides is { } projSubagents)
+        {
+            if (!string.IsNullOrWhiteSpace(projSubagents.Model))
+            {
+                logger?.LogWarning(
+                    "'{File}': 'subagents.model' is ignored in project settings files (user settings only). " +
+                    "Set it in your user settings file (~/.coda/settings.json) instead.",
+                    projectFile);
+            }
+
+            if (projSubagents.ModelByType is { Count: > 0 })
+            {
+                logger?.LogWarning(
+                    "'{File}': 'subagents.modelByType' is ignored in project settings files (user settings only). " +
+                    "Set it in your user settings file (~/.coda/settings.json) instead.",
+                    projectFile);
+            }
+        }
+
         var subagentsMerged = SubagentOverrides.Merge(
             userSettings.SubagentOverrides, projectSettings.SubagentOverrides);
 
@@ -384,7 +406,14 @@ public static class SettingsLoader
     private static SubagentOverrides? ParseSubagentOverrides(SubagentSection? section) =>
         section is null
             ? null
-            : new SubagentOverrides(section.MaxDepth, section.MaxConcurrent, section.AllowSystemPromptReplacement);
+            : new SubagentOverrides(
+                section.MaxDepth,
+                section.MaxConcurrent,
+                section.AllowSystemPromptReplacement,
+                section.Model,
+                section.ModelByType is { Count: > 0 }
+                    ? new Dictionary<string, string>(section.ModelByType, StringComparer.OrdinalIgnoreCase)
+                    : null);
 
     private static GoalSettings? ParseGoalSettings(GoalSection? section)
     {
@@ -657,6 +686,12 @@ public static class SettingsLoader
 
         [JsonPropertyName("allowSystemPromptReplacement")]
         public bool? AllowSystemPromptReplacement { get; set; }
+
+        [JsonPropertyName("model")]
+        public string? Model { get; set; }
+
+        [JsonPropertyName("modelByType")]
+        public Dictionary<string, string>? ModelByType { get; set; }
     }
 
     private sealed class TelemetrySection

@@ -47,6 +47,7 @@ public sealed class TaskGetTool : ITool
             + $"\ndepth: {s.Depth}\nstarted: {s.StartedAt:o}"
             + (s.EndedAt is { } ended ? $"\nended: {ended:o}" : string.Empty)
             + $"\nlog: {s.LogPath}"
+            + (s.ResolvedModel is { } m ? $"\nmodel: {m}" : string.Empty)
             + detail;
 
         return Task.FromResult(new ToolResult(body));

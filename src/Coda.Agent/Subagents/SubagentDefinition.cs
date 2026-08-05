@@ -8,4 +8,5 @@ public sealed record SubagentDefinition(
     string Type,
     string Description,
     string SystemPromptBody,
-    bool ReadOnlyToolsOnly);
+    bool ReadOnlyToolsOnly,
+    string? Model = null);

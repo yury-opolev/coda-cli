@@ -47,4 +47,10 @@ public sealed record SubagentRequest(string SubagentType, string Prompt, string 
 
     /// <summary>The caller's requested system-prompt influence, or null for none.</summary>
     public SubagentSystemPrompt? SystemPrompt { get; init; }
+
+    /// <summary>
+    /// Explicit model id for this subagent run, or null to inherit from settings or the session.
+    /// Same-provider only by design; an unknown id surfaces as the provider's own error.
+    /// </summary>
+    public string? Model { get; init; }
 }

@@ -107,17 +107,24 @@ public sealed record CodaSettings(
 /// The subagent fields a single settings file specified; null means the file did not mention it.
 /// Exists only so the user/project merge can operate per field before clamping.
 /// </summary>
-internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool? AllowSystemPromptReplacement)
+internal sealed record SubagentOverrides(
+    int? MaxDepth,
+    int? MaxConcurrent,
+    bool? AllowSystemPromptReplacement,
+    string? Model = null,
+    IReadOnlyDictionary<string, string>? ModelByType = null)
 {
     /// <summary>
     /// Project values win field by field; anything neither file set falls to the default.
     /// </summary>
     /// <remarks>
-    /// SECURITY: <see cref="AllowSystemPromptReplacement"/> is the exception — it is read from the
-    /// user file only, like <c>toolDisplayMode</c>. A project settings file is attacker-controlled
-    /// the moment someone clones a hostile repo, and this is the one field that hands a
-    /// prompt-injected model the subagent's own instructions; the depth and fan-out limits are
-    /// clamped resource bounds, so raising those from a project is merely noisy.
+    /// SECURITY: <see cref="AllowSystemPromptReplacement"/>, <see cref="Model"/>, and
+    /// <see cref="ModelByType"/> are read from the user file only, like <c>toolDisplayMode</c>.
+    /// A project settings file is attacker-controlled the moment someone clones a hostile repo.
+    /// Prompt-replacement hands a prompt-injected model the subagent's own instructions; model
+    /// choice is a cost lever — a hostile project could pin every subagent to the most expensive
+    /// model. The depth and fan-out limits are clamped resource bounds, so raising those from a
+    /// project is merely noisy.
     /// </remarks>
     public static SubagentOverrides? Merge(SubagentOverrides? user, SubagentOverrides? project) =>
         user is null && project is null
@@ -125,7 +132,9 @@ internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool
             : new SubagentOverrides(
                 project?.MaxDepth ?? user?.MaxDepth,
                 project?.MaxConcurrent ?? user?.MaxConcurrent,
-                user?.AllowSystemPromptReplacement);
+                user?.AllowSystemPromptReplacement,
+                user?.Model,
+                user?.ModelByType);
 
     /// <summary>Applies these overrides onto the defaults, clamping as SubagentSettings requires.</summary>
     public SubagentSettings ToSettings() => new()
@@ -134,5 +143,8 @@ internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool
         MaxConcurrent = this.MaxConcurrent ?? SubagentSettings.Default.MaxConcurrent,
         AllowSystemPromptReplacement =
             this.AllowSystemPromptReplacement ?? SubagentSettings.Default.AllowSystemPromptReplacement,
+        Model = this.Model,
+        ModelByType = this.ModelByType
+            ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
     };
 }

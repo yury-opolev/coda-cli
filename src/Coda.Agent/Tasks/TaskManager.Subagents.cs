@@ -35,6 +35,9 @@ public sealed partial class TaskManager
     /// The caller's requested influence over the child's system prompt, or null for none. Passed
     /// through untouched; the host decides what it is allowed to do with it.
     /// </param>
+    /// <param name="model">
+    /// Explicit model id for this subagent run, or null to inherit from settings or the session.
+    /// </param>
     public async Task<string> RunSubagentForegroundAsync(
         ISubagentHost host,
         string subagentType,
@@ -45,6 +48,7 @@ public sealed partial class TaskManager
         ToolActivityContext? parentActivity,
         TurnShape? parentRestriction = null,
         SubagentSystemPrompt? systemPrompt = null,
+        string? model = null,
         CancellationToken cancellationToken = default)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Foreground);
@@ -60,6 +64,7 @@ public sealed partial class TaskManager
                 ParentActivity = parentActivity,
                 ParentToolRestriction = parentRestriction,
                 SystemPrompt = systemPrompt,
+                Model = model,
             };
             var result = await host
                 .RunSubagentAsync(request, sink, steering, linked.Token)
@@ -109,6 +114,9 @@ public sealed partial class TaskManager
     /// <param name="systemPrompt">
     /// The caller's requested influence over the child's system prompt, or null for none.
     /// </param>
+    /// <param name="model">
+    /// Explicit model id for this subagent run, or null to inherit from settings or the session.
+    /// </param>
     public string StartSubagentBackground(
         ISubagentHost host,
         string subagentType,
@@ -117,7 +125,8 @@ public sealed partial class TaskManager
         string? parentTaskId,
         TurnShape? parentRestriction = null,
         bool holdsSubagentSlot = false,
-        SubagentSystemPrompt? systemPrompt = null)
+        SubagentSystemPrompt? systemPrompt = null,
+        string? model = null)
     {
         var task = Register(TaskKind.Subagent, description, parentTaskId, TaskExecutionMode.Background);
         var steering = new SteeringInbox();
@@ -127,6 +136,7 @@ public sealed partial class TaskManager
         {
             ParentToolRestriction = parentRestriction,
             SystemPrompt = systemPrompt,
+            Model = model,
         };
 
         _ = Task.Run(async () =>
@@ -156,6 +166,19 @@ public sealed partial class TaskManager
         });
 
         return task.Id;
+    }
+
+    /// <summary>
+    /// Records the resolved model id on the task so <c>task_list</c>/<c>task_get</c> can report
+    /// which model each subagent is running. Called by <see cref="SubagentHost"/> just before the
+    /// agent loop starts; silently ignored for unknown task ids.
+    /// </summary>
+    public void SetTaskResolvedModel(string taskId, string? model)
+    {
+        if (Find(taskId) is { } task)
+        {
+            task.SetResolvedModel(model);
+        }
     }
 
     /// <summary>
