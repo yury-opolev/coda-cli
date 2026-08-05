@@ -43,6 +43,9 @@ internal sealed class ModelBrowserOverlay : View
     // Completion callback set on each Show call; null when no session is active.
     private Action<string?>? onCompleted;
 
+    // Reload factory set on each Show call; null when the caller cannot supply fresh data.
+    private Func<CancellationToken, Task<ModelListResult>>? reloadFactory;
+
     /// <summary>Creates the overlay bound to <paramref name="controller"/>.</summary>
     public ModelBrowserOverlay(
         IApplication app,
@@ -126,17 +129,28 @@ internal sealed class ModelBrowserOverlay : View
     // ── Show / Hide / Teardown ────────────────────────────────────────────────
 
     /// <summary>
+    /// <summary>
     /// Opens the controller with the given <paramref name="result"/>, subscribes to changes, focuses,
     /// renders, and wires <paramref name="onCompleted"/> to be called with the chosen model id
     /// (or <c>null</c> when the user dismisses) exactly once.
     /// </summary>
-    public void Show(ModelListResult result, string? currentModelId, Action<string?> onCompleted)
+    /// <param name="onReload">
+    /// Optional factory that re-fetches the model list (e.g. by clearing the provider cache and
+    /// calling the live endpoint). When non-null the overlay fires a real re-resolve when the user
+    /// presses <c>r</c>. When null, <c>r</c> is ignored.
+    /// </param>
+    public void Show(
+        ModelListResult result,
+        string? currentModelId,
+        Action<string?> onCompleted,
+        Func<CancellationToken, Task<ModelListResult>>? onReload = null)
     {
         ArgumentNullException.ThrowIfNull(result);
         ArgumentNullException.ThrowIfNull(onCompleted);
 
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.onCompleted = onCompleted;
+        this.reloadFactory = onReload;
         this.filterMode = false;
         this.filterBuffer = string.Empty;
 
@@ -173,6 +187,7 @@ internal sealed class ModelBrowserOverlay : View
 
         var cb = this.onCompleted;
         this.onCompleted = null;
+        this.reloadFactory = null;
 
         // Invoke the callback outside the overlay's own lock (none here, but outside the view mutation path)
         // so callers can safely set another Show from within the callback.
@@ -283,10 +298,7 @@ internal sealed class ModelBrowserOverlay : View
             }
 
             case ModelBrowserCommand.Reload:
-                // Reload is handled by the caller (via the onChanged callback it can trigger a fresh
-                // fetch and call Show again); for now report it in the status.
-                this.status.Text = " reloading…";
-                this.SetNeedsDraw();
+                this.StartReload();
                 return true;
 
             case ModelBrowserCommand.Filter:
@@ -300,6 +312,51 @@ internal sealed class ModelBrowserOverlay : View
     }
 
     // ── Render ────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Fires an async re-resolve of the model list when <see cref="reloadFactory"/> is available.
+    /// Updates the status to "reloading…" immediately, then calls
+    /// <see cref="ModelBrowserController.UpdateResult"/> on completion so the table re-renders with
+    /// the fresh list.
+    /// </summary>
+    private void StartReload()
+    {
+        if (this.reloadFactory is null)
+        {
+            // No reload factory was provided; silently ignore (no footer entry to mislead the user
+            // because the footer is only rendered when the factory is set — see RenderList).
+            return;
+        }
+
+        this.status.Text = " reloading…";
+        this.SetNeedsDraw();
+
+        var factory = this.reloadFactory;
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                var fresh = await factory(CancellationToken.None).ConfigureAwait(false);
+                // UpdateResult is thread-safe (uses lock) and fires Changed, which marshals the
+                // render through app.Invoke via OnControllerChanged — no extra Invoke needed here.
+                if (this.active && !this.disposed)
+                {
+                    this.controller.UpdateResult(fresh);
+                }
+            }
+            catch
+            {
+                this.app.Invoke(() =>
+                {
+                    if (this.active && !this.disposed)
+                    {
+                        this.status.Text = " reload failed";
+                        this.SetNeedsDraw();
+                    }
+                });
+            }
+        });
+    }
 
     private void OnControllerChanged()
     {

@@ -330,7 +330,9 @@ public sealed class McpBrowserControllerTests
         {
             Environment = d.Environment.SetItem(0, d.Environment[0] with { Name = "E" }),
         });
-        await controller.ExecuteAsync(McpBrowserCommand.EditorNextItemPart, null, CancellationToken.None);
+        // Move focus to the Value part (the modal-prompt target). With widget-based navigation
+        // the user would Tab to the MapItemRow.Value label; here we drive the controller directly.
+        controller.UpdateEditorFocusItem(McpEditorField.Environment, 0, McpEditorItemPart.Value);
         await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
         var environment = Assert.Single(controller.State.Editor!.Draft.Environment);
         Assert.Equal("E", environment.Name);
@@ -344,7 +346,8 @@ public sealed class McpBrowserControllerTests
         {
             Headers = d.Headers.SetItem(0, d.Headers[0] with { Name = "H" }),
         });
-        await controller.ExecuteAsync(McpBrowserCommand.EditorNextItemPart, null, CancellationToken.None);
+        // Move focus to the Value part (the modal-prompt target).
+        controller.UpdateEditorFocusItem(McpEditorField.Headers, 0, McpEditorItemPart.Value);
         await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
         var header = Assert.Single(controller.State.Editor!.Draft.Headers);
         Assert.Equal("H", header.Name);

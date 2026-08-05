@@ -161,14 +161,17 @@ internal sealed class McpEditorForm : View
             Visible = false,
         };
 
-        // ── summary labels (full list editing is Task 8) ──────────────────────
-        this.ArgumentsSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false };
-        this.HeadersSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false };
-        this.ScopesSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false };
-        this.EnvironmentSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false };
+        // ── summary labels (placeholder rows for empty lists, and bearer token) ─────────────────
+        // These must be focusable so Tab traversal reaches them and Ctrl+N / Ctrl+R / Alt+Up/Down
+        // can operate on the right field when the focus is on a placeholder. The bearer-token row
+        // also needs focus so Enter triggers the modal secret-replacement prompt.
+        this.ArgumentsSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.HeadersSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.ScopesSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.EnvironmentSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
 
         // BearerToken is always a read-only label — never bound to a TextField.
-        this.BearerTokenLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false };
+        this.BearerTokenLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
 
         // ── buttons ───────────────────────────────────────────────────────────
         this.SaveButton = new Button
@@ -847,6 +850,12 @@ internal sealed class McpEditorForm : View
         this.BearerTokenLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.BearerToken); };
         this.SaveButton.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Save); };
         this.CancelButton.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Cancel); };
+        // Placeholder summary rows for empty lists: must update FocusedField so Ctrl+N, Ctrl+R,
+        // and Alt+Up/Down can operate on the right collection when focus is on the placeholder.
+        this.ArgumentsSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Arguments); };
+        this.EnvironmentSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Environment); };
+        this.HeadersSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Headers); };
+        this.ScopesSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Scopes); };
     }
     private static string FormatCount(string label, int count) =>
         count == 0 ? $"{label}: (none)" : $"{label}: {count} item(s)";

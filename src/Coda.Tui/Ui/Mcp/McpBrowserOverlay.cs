@@ -280,7 +280,9 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             return true;
         }
 
-        // Filter mode: keys go to the filter buffer; Esc exits filter (does not close browser).
+        // Filter mode: printable text goes to the filter buffer; Esc exits filter (does not close
+        // browser); Enter opens the selected row; arrows move the selection, all exactly as if
+        // filter mode were not active.
         if (this.filterMode)
         {
             if (key == Key.Esc)
@@ -298,14 +300,25 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
                 return true;
             }
 
-            if (key.AsRune.Value > 0x1F && !char.IsControl((char)key.AsRune.Value))
+            // Enter and arrow keys fall through to the normal command dispatch below so the user
+            // can open/navigate the filtered list without leaving filter mode first.
+            if (key == Key.Enter ||
+                key == Key.CursorUp || key == Key.CursorDown ||
+                key == Key.PageUp || key == Key.PageDown ||
+                key == Key.Home || key == Key.End)
+            {
+                // Handled by the standard command dispatch path below — do not return here.
+            }
+            else if (key.AsRune.Value > 0x1F && !char.IsControl((char)key.AsRune.Value))
             {
                 this.filterBuffer += key.AsRune.ToString();
                 this.Render();
                 return true;
             }
-
-            return true; // swallow all other keys in filter mode
+            else
+            {
+                return true; // swallow unrecognised modifier chords that are not navigation
+            }
         }
 
         var command = McpBrowserKeyMap.Map(key, this.controller.State.View);
@@ -563,7 +576,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "Tab/↑/↓ field · Enter save · Ctrl+N add · Ctrl+R remove · Ctrl+↑/↓ item · Ctrl+←/→ part · Esc cancel",
+                "Tab/↑/↓ field · Enter save · Ctrl+N add · Ctrl+R remove · Alt+↑/↓ reorder · Esc cancel",
                 "Tab field · Enter save · Esc cancel"));
 
         if (state.Editor is { } editor)
@@ -680,13 +693,13 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private bool TryScrollDetail(Key key)
     {
-        if (key == Key.CursorUp)
+        if (key == Key.CursorUp || key == new Key('k'))
         {
             this.detailOffset = Math.Max(0, this.detailOffset - 1);
             return true;
         }
 
-        if (key == Key.CursorDown)
+        if (key == Key.CursorDown || key == new Key('j'))
         {
             this.detailOffset = (int)Math.Min(int.MaxValue, (long)this.detailOffset + 1);
             return true;

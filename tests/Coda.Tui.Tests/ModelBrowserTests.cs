@@ -1,3 +1,4 @@
+using System.Threading;
 using Coda.Sdk;
 using Coda.Tui.Commands;
 using Coda.Tui.Repl;
@@ -315,6 +316,49 @@ public sealed class ModelBrowserTests : IDisposable
         this.ShowWith(MakeResult(ModelSource.Catalog, count: 3));
         var text = this._overlay.SynthesizeListText();
         Assert.DoesNotContain('\u001b', text);
+    }
+
+    // ── Test 9: r reloads the model list via the factory ─────────────────────
+
+    /// <summary>
+    /// Pressing <c>r</c> when a reload factory is wired must re-resolve the list.
+    /// The controller's result changes to the factory's return value, proving the reload
+    /// goes through a real re-fetch rather than being a no-op.
+    /// </summary>
+    [Fact]
+    public void R_triggers_reload_factory_and_updates_the_model_list()
+    {
+        var fetchCount = 0;
+        var original = MakeResult(count: 3);
+        var refreshed = MakeResult(count: 5); // different entry count so we can detect the swap
+
+        var result = MakeResult(count: 3);
+        string? chosen = null;
+        this._overlay.Show(result, null, id => chosen = id, onReload: async ct =>
+        {
+            fetchCount++;
+            await Task.Yield(); // genuine async hop
+            return refreshed;
+        });
+        this._app.LayoutAndDraw();
+
+        // Press r; the reload fires asynchronously on a background Task.
+        this._overlay.NewKeyDownEvent(new Key('r'));
+
+        // Spin until the controller's Models list updates (up to 5 s).
+        // controller.UpdateResult is called directly on the Task thread (thread-safe via lock),
+        // so no app.Invoke draining is needed — we just wait for the state to change.
+        var deadline = DateTime.UtcNow.AddSeconds(5);
+        while (this._controller.State.Models.Count != 5 && DateTime.UtcNow < deadline)
+        {
+            Thread.Sleep(20);
+        }
+
+        // The factory must have been called exactly once.
+        Assert.Equal(1, fetchCount);
+
+        // After the reload the controller must hold the fresh result (5 entries, not 3).
+        Assert.Equal(5, this._controller.State.Models.Count);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

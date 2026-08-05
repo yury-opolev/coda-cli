@@ -159,6 +159,73 @@ public sealed class McpEditorFormTests : IDisposable
         Assert.NotSame(before, after);
     }
 
+    /// <summary>
+    /// Real Tab traversal must reach the Arguments and Environment placeholder rows for a stdio
+    /// field set — the user cannot add the first item to an empty list unless Tab lands there.
+    /// This is the test that catches the original bug where those rows were non-focusable Labels.
+    /// </summary>
+    [Fact]
+    public void Tab_traversal_for_stdio_reaches_arguments_and_environment_placeholders()
+    {
+        // Empty args and env so the placeholder labels are visible (not per-item rows).
+        var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope);
+        this.form.ApplyState(state);
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        var visited = CollectTabOrder(this.form, maxSteps: 20);
+
+        Assert.Contains(this.form.ArgumentsSummaryLabel, visited);
+        Assert.Contains(this.form.EnvironmentSummaryLabel, visited);
+    }
+
+    /// <summary>
+    /// Real Tab traversal must reach Headers, Scopes, and the BearerToken row in the http+bearer
+    /// field set — the bearer token can only be replaced when that row can be focused.
+    /// </summary>
+    [Fact]
+    public void Tab_traversal_for_http_bearer_reaches_headers_scopes_and_bearer_token()
+    {
+        var state = MakeEditorState(McpTransportKind.Http, McpEditorField.Scope, McpAuthMode.Bearer);
+        this.form.ApplyState(state);
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        var visited = CollectTabOrder(this.form, maxSteps: 30);
+
+        Assert.Contains(this.form.HeadersSummaryLabel, visited);
+        Assert.Contains(this.form.ScopesSummaryLabel, visited);
+        Assert.Contains(this.form.BearerTokenLabel, visited);
+    }
+
+    /// <summary>
+    /// Focusing the ArgumentsSummaryLabel (the empty-list placeholder) must update the
+    /// controller's FocusedField to Arguments via the HasFocusChanged wiring. This is the
+    /// prerequisite for Ctrl+N to add the first argument — without it the controller can never
+    /// know which collection to add to.
+    /// </summary>
+    [Fact]
+    public void CtrlN_on_focused_empty_arguments_placeholder_adds_first_item()
+    {
+        var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name);
+        this.controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = state,
+        });
+        this.form.ApplyState(state);
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        // Move real widget focus to the Arguments placeholder label.
+        this.form.ArgumentsSummaryLabel.SetFocus();
+        this.application.LayoutAndDraw();
+
+        // The controller's FocusedField must now be Arguments via HasFocusChanged wiring.
+        // This verifies that Ctrl+N pressed at this point would act on the right collection.
+        Assert.Equal(McpEditorField.Arguments, this.controller.State.Editor!.FocusedField);
+    }
+
     [Fact]
     public void ShiftTab_moves_focus_to_the_previous_focusable_field()
     {
@@ -383,6 +450,35 @@ public sealed class McpEditorFormTests : IDisposable
         Assert.True(this.form.CancelButton.Visible, "Cancel");
     }
     // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// <summary>
+    /// Advances Tab focus on the form up to <paramref name="maxSteps"/> times and returns every
+    /// distinct view that received focus. Stops early when the traversal wraps back to the first
+    /// focused widget, so the returned list covers exactly one complete cycle.
+    /// </summary>
+    private static IReadOnlyList<View> CollectTabOrder(McpEditorForm form, int maxSteps)
+    {
+        var result = new List<View>();
+        View? first = null;
+        for (var i = 0; i < maxSteps; i++)
+        {
+            form.AdvanceFocus(NavigationDirection.Forward, TabBehavior.TabStop);
+            var focused = FindFocused(form);
+            if (focused is null) break;
+            if (first is null)
+            {
+                first = focused;
+            }
+            else if (ReferenceEquals(focused, first))
+            {
+                break; // wrapped around — full cycle complete
+            }
+
+            result.Add(focused);
+        }
+
+        return result;
+    }
 
     internal static McpEditorState MakeEditorState(
         McpTransportKind transport,

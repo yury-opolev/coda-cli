@@ -44,10 +44,12 @@ public sealed class BrowserConsistencyTests
     {
         Assert.Equal(McpBrowserCommand.ReturnToList, McpBrowserKeyMap.Map(Key.Esc, McpBrowserView.Detail));
         Assert.Equal(McpBrowserCommand.ReturnToList, McpBrowserKeyMap.Map(new Key('q'), McpBrowserView.Detail));
-        Assert.Equal(McpBrowserCommand.MoveUp, McpBrowserKeyMap.Map(Key.CursorUp, McpBrowserView.Detail));
-        Assert.Equal(McpBrowserCommand.MoveUp, McpBrowserKeyMap.Map(new Key('k'), McpBrowserView.Detail));
-        Assert.Equal(McpBrowserCommand.MoveDown, McpBrowserKeyMap.Map(Key.CursorDown, McpBrowserView.Detail));
-        Assert.Equal(McpBrowserCommand.MoveDown, McpBrowserKeyMap.Map(new Key('j'), McpBrowserView.Detail));
+        // Up/Down and k/j scroll the detail pane content (handled by TryScrollDetail in the overlay,
+        // not by the controller command dispatch), so the keymap correctly returns None for them.
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorUp, McpBrowserView.Detail));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(new Key('k'), McpBrowserView.Detail));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorDown, McpBrowserView.Detail));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(new Key('j'), McpBrowserView.Detail));
     }
 
     [Fact]
@@ -59,6 +61,37 @@ public sealed class BrowserConsistencyTests
             var cmd = McpBrowserKeyMap.Map(new Key(ch), McpBrowserView.Editor);
             Assert.True(cmd == McpBrowserCommand.None, $"'{ch}' must be None in editor view but was {cmd}");
         }
+    }
+
+    /// <summary>
+    /// The editor footer advertises Tab/↑/↓ field, Enter save, Ctrl+N add, Ctrl+R remove,
+    /// Alt+↑/↓ reorder, Esc cancel. Each advertised key must actually map to the documented action
+    /// so the footer can never drift from the keymap again.
+    /// </summary>
+    [Fact]
+    public void Mcp_Editor_FooterKeysMustMatchKeymap()
+    {
+        // Esc → cancel
+        Assert.Equal(McpBrowserCommand.EditorCancel, McpBrowserKeyMap.Map(Key.Esc, McpBrowserView.Editor));
+        // Enter → apply (focused field decides save vs. prompt vs. no-op)
+        Assert.Equal(McpBrowserCommand.EditorApply, McpBrowserKeyMap.Map(Key.Enter, McpBrowserView.Editor));
+        // Ctrl+N → add item
+        Assert.Equal(McpBrowserCommand.EditorAddItem, McpBrowserKeyMap.Map(Key.N.WithCtrl, McpBrowserView.Editor));
+        // Ctrl+R → remove item
+        Assert.Equal(McpBrowserCommand.EditorRemoveItem, McpBrowserKeyMap.Map(Key.R.WithCtrl, McpBrowserView.Editor));
+        // Alt+↑/↓ → reorder
+        Assert.Equal(McpBrowserCommand.EditorReorderUp, McpBrowserKeyMap.Map(Key.CursorUp.WithAlt, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.EditorReorderDown, McpBrowserKeyMap.Map(Key.CursorDown.WithAlt, McpBrowserView.Editor));
+        // Tab / Shift+Tab and plain Up/Down handled by McpEditorForm.AdvanceFocus → None from keymap
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Tab, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Tab.WithShift, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorUp, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorDown, McpBrowserView.Editor));
+        // Ctrl+↑/↓/←/→ are retired and must NOT be bound (footer no longer advertises them)
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorUp.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorDown.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorLeft.WithCtrl, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorRight.WithCtrl, McpBrowserView.Editor));
     }
 
     // ── Skills ───────────────────────────────────────────────────────────────

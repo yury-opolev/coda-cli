@@ -40,8 +40,9 @@ internal static class McpBrowserKeyMap
     private static McpBrowserCommand MapDetail(Key key)
     {
         if (key == Key.Esc || key == Key.Q) return McpBrowserCommand.ReturnToList;
-        if (key == Key.CursorUp || key == Key.K) return McpBrowserCommand.MoveUp;
-        if (key == Key.CursorDown || key == Key.J) return McpBrowserCommand.MoveDown;
+        // Up/Down and k/j scroll the detail pane (handled by TryScrollDetail in the overlay)
+        // rather than changing the underlying list selection. Returning None lets the overlay's
+        // TryScrollDetail path claim those keys before falling through to no-op.
         if (key == new Key('e')) return McpBrowserCommand.BeginEdit;
         if (key == Key.Space) return McpBrowserCommand.ToggleEnabled;
         if (key == new Key('u')) return McpBrowserCommand.Reauthenticate;

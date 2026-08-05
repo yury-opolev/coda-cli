@@ -32,6 +32,12 @@ public sealed class McpBrowserKeyMapTests
         Assert.Equal(McpBrowserCommand.DeleteServer, McpBrowserKeyMap.Map(Key.Delete, McpBrowserView.Detail));
         Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Enter, McpBrowserView.Detail));
         Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Home, McpBrowserView.Detail));
+        // Up/Down and k/j scroll the detail pane content via TryScrollDetail rather than changing
+        // the underlying list selection — so the keymap returns None for them.
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorUp, McpBrowserView.Detail));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.CursorDown, McpBrowserView.Detail));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(new Key('k'), McpBrowserView.Detail));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(new Key('j'), McpBrowserView.Detail));
     }
 
     [Theory]

@@ -63,10 +63,6 @@ internal enum McpBrowserCommand
     EditorRemoveItem,
     EditorReorderUp,
     EditorReorderDown,
-    EditorPreviousItem,
-    EditorNextItem,
-    EditorPreviousItemPart,
-    EditorNextItemPart,
 
     /// <summary>Reload / refresh the server list (list view only).</summary>
     Reload,

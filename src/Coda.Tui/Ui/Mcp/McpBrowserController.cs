@@ -431,18 +431,6 @@ internal sealed class McpBrowserController
             case McpBrowserCommand.EditorRemoveItem:
                 this.RemoveEditorItem(current, openEpoch);
                 return;
-            case McpBrowserCommand.EditorPreviousItem:
-                this.MoveEditorItem(current, openEpoch, -1);
-                return;
-            case McpBrowserCommand.EditorNextItem:
-                this.MoveEditorItem(current, openEpoch, 1);
-                return;
-            case McpBrowserCommand.EditorPreviousItemPart:
-                this.MoveEditorItemPart(current, openEpoch, -1);
-                return;
-            case McpBrowserCommand.EditorNextItemPart:
-                this.MoveEditorItemPart(current, openEpoch, 1);
-                return;
             case McpBrowserCommand.EditorReorderUp:
                 this.ReorderEditorItem(current, openEpoch, -1);
                 return;
@@ -893,33 +881,6 @@ internal sealed class McpBrowserController
             };
         });
 
-    private void MoveEditorItem(McpBrowserProvider current, long openEpoch, int direction) =>
-        this.Mutate(current, openEpoch, state =>
-        {
-            if (state.Editor is not { } editor)
-            {
-                return state;
-            }
-
-            var count = editor.FocusedField switch
-            {
-                McpEditorField.Arguments => editor.Draft.Args.Length,
-                McpEditorField.Scopes => editor.Draft.Scopes.Length,
-                McpEditorField.Environment => editor.Draft.Environment.Length,
-                McpEditorField.Headers => editor.Draft.Headers.Length,
-                _ => 0,
-            };
-            return count == 0
-                ? state
-                : state with
-                {
-                    Editor = editor with
-                    {
-                        SelectedItem = Math.Clamp(editor.SelectedItem + direction, 0, count - 1),
-                    },
-                };
-        });
-
     private void MoveEditorItemPart(McpBrowserProvider current, long openEpoch, int direction) =>
         this.Mutate(current, openEpoch, state => state.Editor is { } editor &&
                 editor.FocusedField is McpEditorField.Environment or McpEditorField.Headers
@@ -1000,18 +961,32 @@ internal sealed class McpBrowserController
     }
 
     /// <summary>
-    /// Swaps two identity items in lock-step with their display array, but only when the identity
-    /// array is materialized and aligned with the display array; otherwise the identity array is
-    /// left untouched so the commit path falls back to display-based matching.
+    /// Swaps two identity items in lock-step with their display array. Throws
+    /// <see cref="InvalidOperationException"/> when the identity array is materialized but has a
+    /// different length from the display array — that mismatch is a real corruption bug and must
+    /// not be silently swallowed. When the identity array is default/empty, the display swap
+    /// proceeds without identity tracking and the commit path falls back to display-based matching.
     /// </summary>
     private static ImmutableArray<McpDraftListItem> SwapItems(
         ImmutableArray<McpDraftListItem> items,
         int expectedLength,
         int first,
-        int second) =>
-        items.IsDefault || items.Length != expectedLength
-            ? items
-            : Swap(items, first, second);
+        int second)
+    {
+        if (items.IsDefault || items.Length == 0)
+        {
+            return items;
+        }
+
+        if (items.Length != expectedLength)
+        {
+            throw new InvalidOperationException(
+                $"Identity array length {items.Length} does not match display array length {expectedLength}; " +
+                "the draft is corrupted and the swap was aborted.");
+        }
+
+        return Swap(items, first, second);
+    }
 
     private async Task MutateWithLeaseAsync(
         McpBrowserProvider current,
