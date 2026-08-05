@@ -117,7 +117,13 @@ public sealed class OverlaySelectionTests : IDisposable
             overlay.Show();
             this.app.LayoutAndDraw();
 
+            // The list view now uses a TableView (Task 10). Navigate to the detail pane (Enter),
+            // where the SelectableTextView is visible and supports drag-select / copy.
+            overlay.NewKeyDownEvent(Key.Enter);
+            this.app.LayoutAndDraw();
+
             var body = BodyOf(overlay);
+            Assert.True(body.Visible, "detail body must be visible after Enter");
             Drag(body, 0, 0, 4, 0);
             Assert.True(body.HasSelection);
 

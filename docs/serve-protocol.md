@@ -240,6 +240,27 @@ at session startup, so schedule events may arrive immediately; in **API-key** mo
 does not start — and therefore emits nothing — until a valid key completes an
 authenticated `initialize`.
 
+### `event/taskCompleted`
+
+Emitted whenever a background task reaches a terminal state (completed, failed, or
+stopped). Like `event/scheduleLifecycle`, this is **not** tied to a turn — a background
+subagent can finish at any time while the session is open.
+
+```jsonc
+event/taskCompleted {
+  "taskId":      "task-0003",    // stable task identifier
+  "status":      "completed",    // "completed" | "failed" | "stopped"
+  "description": "explore docs", // human-readable task label
+  "report":      "Found 42 …"   // truncated result or error text; null when not applicable
+}
+```
+
+`report` is truncated to 4 000 characters (the same cap applied by the TUI injection
+seam). Use `task_output` to retrieve the full log. The event is emitted for every
+background completion regardless of whether `task_wait` was called; if an agent is
+waiting on the task with `task_wait`, the wait call consumes the outbox entry so the
+event and the `task_wait` result are not double-delivered.
+
 ## Coda → Orchestrator (server-initiated requests — you MUST answer; the agent blocks)
 | Method | Params | Reply |
 |---|---|---|

@@ -131,7 +131,7 @@ public static class PluginComponentComposer
             {
                 try
                 {
-                    foreach (var definition in PluginAgentLoader.Load(plugin, logger))
+                    foreach (var definition in PluginAgentLoader.Load(plugin, workingDirectory, logger))
                     {
                         if (BuiltInAgents.IsBuiltInType(definition.Type))
                         {

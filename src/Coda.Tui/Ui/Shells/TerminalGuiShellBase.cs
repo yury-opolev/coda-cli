@@ -1,10 +1,12 @@
 using System.Text;
+using Coda.Sdk;
 using Coda.Tui.Clipboard;
 using Coda.Tui.Ui.Events;
 using Coda.Tui.Ui.Host;
 using Coda.Tui.Ui.Input;
 using Coda.Agent;
 using Coda.Tui.Ui.Mcp;
+using Coda.Tui.Ui.Models;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Rendering;
 using Coda.Tui.Ui.State;
@@ -24,7 +26,7 @@ namespace Coda.Tui.Ui.Shells;
 /// private to the shell layer and never enters <see cref="UiSessionSnapshot"/>, so no Terminal.Gui
 /// type leaks into the host-neutral state model.
 /// </remarks>
-internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHandle
+internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHandle, IModelBrowserService
 {
     private const int DefaultStatusWidth = 80;
 
@@ -66,6 +68,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     private readonly Coda.Tui.Ui.Skills.SkillBrowserOverlay? skillsOverlay;
     private readonly Coda.Tui.Ui.Plugins.PluginBrowserController? pluginController;
     private readonly Coda.Tui.Ui.Plugins.PluginBrowserOverlay? pluginOverlay;
+    private readonly ModelBrowserController modelBrowserController;
+    private readonly ModelBrowserOverlay modelBrowserOverlay;
     private readonly bool followsRegistryTheme;
     private bool disposed;
 
@@ -106,7 +110,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         IPrivateBrowserResolver? privateBrowserResolver = null,
         IUiPromptService? linkPromptService = null,
         IClipboardImageReader? imageReader = null,
-        Func<ClipboardImage, string?>? imagePaste = null)
+        Func<ClipboardImage, string?>? imagePaste = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
@@ -158,7 +163,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         if (mcpBrowserProvider is not null)
         {
             this.mcpController = new McpBrowserController(mcpBrowserProvider);
-            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged, onCopyRequested: this.CopyToClipboard);
+            this.mcpOverlay = new McpBrowserOverlay(this.app, this.mcpController, this.Theme, this.OnMcpBrowserChanged, onCopyRequested: this.CopyToClipboard, statusGlyphs: statusGlyphs);
         }
 
         if (scheduleBrowserProvider is not null)
@@ -183,6 +188,12 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.pluginOverlay = new Coda.Tui.Ui.Plugins.PluginBrowserOverlay(
                 this.app, this.pluginController, this.Theme, this.OnPluginBrowserChanged, onCopyRequested: this.CopyToClipboard);
         }
+
+        // The model browser is always present: it receives its data at Show time (no background provider),
+        // so it can be constructed eagerly. The shell exposes SelectModelAsync so ModelCommand can await it.
+        this.modelBrowserController = new ModelBrowserController();
+        this.modelBrowserOverlay = new ModelBrowserOverlay(
+            this.app, this.modelBrowserController, this.Theme, this.OnModelBrowserChanged, statusGlyphs: statusGlyphs);
 
         // The composer routes every key through the shell first so the interrupt/exit chords win over the
         // composer's own printable/action mapping regardless of which view currently holds focus.
@@ -283,6 +294,57 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// <summary>The plugin browser controller (test/diagnostic seam), or null when no provider was wired.</summary>
     internal Coda.Tui.Ui.Plugins.PluginBrowserController? PluginController => this.pluginController;
 
+    /// <summary>The hosted model browser overlay (always present in Terminal.Gui mode).</summary>
+    internal ModelBrowserOverlay ModelBrowserOverlay => this.modelBrowserOverlay;
+
+    /// <summary>The model browser controller (test/diagnostic seam).</summary>
+    internal ModelBrowserController ModelBrowserController => this.modelBrowserController;
+
+    /// <summary>
+    /// Opens the model browser, returns the selected model id, or <c>null</c> when the user dismisses.
+    /// Marshals to the UI thread, so the caller may be on any thread.
+    /// </summary>
+    internal Task<string?> SelectModelAsync(ModelListResult result, string? currentModelId, CancellationToken cancellationToken)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+
+        var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var reg = cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
+
+        tcs.Task.ContinueWith(
+            static (_, state) => ((CancellationTokenRegistration)state!).Dispose(),
+            reg,
+            CancellationToken.None,
+            TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+
+        try
+        {
+            this.app.Invoke(() =>
+            {
+                if (tcs.Task.IsCompleted)
+                {
+                    return;
+                }
+
+                // Mutual exclusion: hide any currently visible browser before opening the model one.
+                this.HideAllBrowsersExcept(this.modelBrowserOverlay);
+
+                this.modelBrowserOverlay.Show(result, currentModelId, id => tcs.TrySetResult(id));
+            });
+        }
+        catch (Exception ex)
+        {
+            tcs.TrySetException(ex);
+        }
+
+        return tcs.Task;
+    }
+
+    /// <inheritdoc/>
+    Task<string?> IModelBrowserService.SelectModelAsync(ModelListResult result, string? currentModelId, CancellationToken cancellationToken)
+        => this.SelectModelAsync(result, currentModelId, cancellationToken);
+
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells
     /// position it (via <see cref="PlaceCompletion"/>) and add it to their view tree; it stays hidden with
@@ -332,6 +394,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.scheduleOverlay?.Hide();
         this.skillsOverlay?.Hide();
         this.pluginOverlay?.Hide();
+        this.modelBrowserOverlay.Hide();
         this.RequestedExit = outcome;
         this.app.RequestStop();
     }
@@ -480,6 +543,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.scheduleOverlay?.ApplyTheme(this.Theme);
         this.skillsOverlay?.ApplyTheme(this.Theme);
         this.pluginOverlay?.ApplyTheme(this.Theme);
+        this.modelBrowserOverlay.ApplyTheme(this.Theme);
     }
 
     protected override void Dispose(bool disposing)
@@ -521,6 +585,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             this.scheduleOverlay?.Hide();
             this.skillsOverlay?.Hide();
             this.pluginOverlay?.Hide();
+            this.modelBrowserOverlay.Hide();
         }
 
         base.Dispose(disposing);
@@ -728,7 +793,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         this.mcpOverlay?.Visible == true ||
         this.scheduleOverlay?.Visible == true ||
         this.skillsOverlay?.Visible == true ||
-        this.pluginOverlay?.Visible == true;
+        this.pluginOverlay?.Visible == true ||
+        this.modelBrowserOverlay.Visible;
 
     private View? VisibleBrowserOverlay() =>
         this.scheduleOverlay?.Visible == true
@@ -741,7 +807,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                         ? this.mcpOverlay
                         : this.taskOverlay?.Visible == true
                             ? this.taskOverlay
-                            : null;
+                            : this.modelBrowserOverlay.Visible
+                                ? this.modelBrowserOverlay
+                                : null;
 
     private bool TryCopyOverlaySelection()
     {
@@ -1695,55 +1763,54 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
     }
 
+    /// <summary>
+    /// Hides every browser overlay except <paramref name="keep"/> so all entry points enforce mutual
+    /// exclusion without the set drifting as new browsers are added.
+    /// </summary>
+    private void HideAllBrowsersExcept(View? keep)
+    {
+        if (!ReferenceEquals(keep, this.taskOverlay)) this.taskOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.mcpOverlay)) this.mcpOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.scheduleOverlay)) this.scheduleOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.skillsOverlay)) this.skillsOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.pluginOverlay)) this.pluginOverlay?.Hide();
+        if (!ReferenceEquals(keep, this.modelBrowserOverlay)) this.modelBrowserOverlay.Hide();
+    }
+
     private void OpenTaskBrowser()
     {
         // Show() owns controller.Open() + a fresh pump and is idempotent while already active, so a repeated
         // /tasks never re-Opens (which would rebind the subscription and dispose the live pump under it).
         // Re-invoking the provider inside the first Show picks up the live TaskManager even though the overlay
         // was built once; before the first turn the provider returns null and the browser opens empty.
-        this.mcpOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.skillsOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.taskOverlay);
         this.taskOverlay?.Show();
     }
 
     private void OpenMcpBrowser()
     {
-        this.taskOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.skillsOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.mcpOverlay);
         this.mcpOverlay?.Show();
     }
 
     private void OpenScheduleBrowser()
     {
         // Show() is idempotent: a repeated /schedule never double-Opens or double-pumps.
-        this.taskOverlay?.Hide();
-        this.mcpOverlay?.Hide();
-        this.skillsOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.scheduleOverlay);
         this.scheduleOverlay?.Show();
     }
 
     private void OpenSkillsBrowser()
     {
         // Show() is idempotent: a repeated /skills never double-Opens or double-pumps.
-        this.taskOverlay?.Hide();
-        this.mcpOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.pluginOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.skillsOverlay);
         this.skillsOverlay?.Show();
     }
 
     private void OpenPluginBrowser()
     {
         // Show() is idempotent: a repeated /plugin never double-Opens or double-pumps.
-        this.taskOverlay?.Hide();
-        this.mcpOverlay?.Hide();
-        this.scheduleOverlay?.Hide();
-        this.skillsOverlay?.Hide();
+        this.HideAllBrowsersExcept(this.pluginOverlay);
         this.pluginOverlay?.Show();
     }
 
@@ -1817,6 +1884,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
         else if (this.VisibleBrowserOverlay() is { } browser)
         {
+            // Safe to call unconditionally: Terminal.Gui restores focus to the overlay's
+            // most-recently-focused descendant, so this does not disturb a focused table row or
+            // editor field. CliTuiMcpTuiIntegrationTests locks that behaviour.
             browser.SetFocus();
         }
         else if (!this.composerDisabled && !this.composerLockedByAttachment)
@@ -1911,6 +1981,41 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
             else
             {
                 this.pluginOverlay.SetFocus();
+            }
+
+            return;
+        }
+
+        if (this.PromptOverlay.Visible)
+        {
+            this.PromptOverlay.SetFocus();
+        }
+        else if (this.VisibleBrowserOverlay() is { } browser)
+        {
+            browser.SetFocus();
+        }
+        else if (!this.composerDisabled && !this.composerLockedByAttachment)
+        {
+            this.Composer.SetFocus();
+        }
+    }
+
+    private void OnModelBrowserChanged()
+    {
+        if (this.disposed)
+        {
+            return;
+        }
+
+        if (this.modelBrowserOverlay.Visible)
+        {
+            if (this.PromptOverlay.Visible)
+            {
+                this.PromptOverlay.SetFocus();
+            }
+            else
+            {
+                this.modelBrowserOverlay.SetFocus();
             }
 
             return;

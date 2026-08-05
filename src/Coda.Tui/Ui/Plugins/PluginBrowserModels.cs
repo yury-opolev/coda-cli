@@ -50,6 +50,12 @@ internal enum PluginBrowserCommand
 
     /// <summary>Update the selected plugin from its source.</summary>
     Update,
+
+    /// <summary>Reload the plugin set from disk.</summary>
+    Reload,
+
+    /// <summary>Enter type-to-filter mode.</summary>
+    Filter,
 }
 
 /// <summary>

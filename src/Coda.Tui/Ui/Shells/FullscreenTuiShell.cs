@@ -54,7 +54,8 @@ internal class FullscreenTuiShell(
     IUiPromptService? linkPromptService = null,
     IClipboardImageReader? imageReader = null,
     Func<ClipboardImage, string?>? imagePaste = null,
-    TranscriptGlyphs? transcriptGlyphs = null)
+    TranscriptGlyphs? transcriptGlyphs = null,
+    StatusGlyphs? statusGlyphs = null)
     : TerminalGuiShellBase(
         app,
         controller,
@@ -78,7 +79,8 @@ internal class FullscreenTuiShell(
         privateBrowserResolver: privateBrowserResolver,
         linkPromptService: linkPromptService,
         imageReader: imageReader,
-        imagePaste: imagePaste)
+        imagePaste: imagePaste,
+        statusGlyphs: statusGlyphs)
 {
     /// <summary>The minimum number of composer input rows: a single content row when the draft fits on one
     /// visual line (the chrome adds the two half-block edge rows around it).</summary>
@@ -252,6 +254,13 @@ internal class FullscreenTuiShell(
             pluginOverlay.Height = Dim.Fill();
             this.Add(pluginOverlay);
         }
+
+        // The model browser overlay is always present; position it the same way as the other browsers.
+        this.ModelBrowserOverlay.X = 0;
+        this.ModelBrowserOverlay.Y = 0;
+        this.ModelBrowserOverlay.Width = Dim.Fill();
+        this.ModelBrowserOverlay.Height = Dim.Fill();
+        this.Add(this.ModelBrowserOverlay);
 
         this.Add(this.PromptOverlay);
     }

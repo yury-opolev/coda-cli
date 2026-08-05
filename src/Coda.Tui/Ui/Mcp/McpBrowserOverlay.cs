@@ -19,28 +19,42 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private readonly Action? onChanged;
     private readonly Label header;
     private readonly SelectableTextView body;
+    private readonly TableView listTable;
+    private readonly McpEditorForm editorForm;
     private readonly Label status;
     private readonly Label footer;
+
+    private BrowserSchemes? browserSchemes;
 
     private CancellationTokenSource? lifetime;
     private bool active;
     private bool subscribed;
     private bool disposed;
-    private int listOffset;
     private int detailOffset;
-    private int editorOffset;
+
+    /// <summary>
+    /// The glyph set for status cells, chosen once from the terminal's Unicode capability so a
+    /// terminal that cannot draw geometric shapes still gets a legible status column.
+    /// </summary>
+    private readonly StatusGlyphs statusGlyphs;
+
+    // Filter-mode state: / enters filter mode; keys go to the buffer; Esc exits filter first.
+    private bool filterMode;
+    private string filterBuffer = string.Empty;
 
     internal McpBrowserOverlay(
         IApplication app,
         McpBrowserController controller,
         TuiTheme? theme = null,
         Action? onChanged = null,
-        Action<string, Action>? onCopyRequested = null)
+        Action<string, Action>? onCopyRequested = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
         this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
+        this.statusGlyphs = statusGlyphs ?? StatusGlyphs.Unicode;
 
         this.Visible = false;
         this.CanFocus = true;
@@ -68,6 +82,42 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
         }
 
+        this.listTable = new TableView
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            CanFocus = false,
+            Visible = false,
+        };
+
+        // No column headers. The overlay body is only a handful of rows tall — at 24x8 a header plus
+        // its underline consumed the entire viewport and the list rendered zero servers. The columns
+        // are self-describing (a status glyph, a name, a transport tag), so the two rows are better
+        // spent on data.
+        this.listTable.Style.ShowHeaders = false;
+        this.listTable.Style.ShowHorizontalHeaderUnderline = false;
+        this.listTable.Style.ShowHorizontalHeaderOverline = false;
+        this.listTable.Style.ShowVerticalCellLines = false;
+        this.listTable.Style.ColumnStyles[0] = new ColumnStyle
+        {
+            MinWidth = 1,
+            MaxWidth = 1,
+            ColorGetter = this.GetStatusCellScheme,
+        };
+        this.listTable.Style.ColumnStyles[1] = new ColumnStyle { MinWidth = 6, MaxWidth = 25 };
+        this.listTable.Style.ColumnStyles[2] = new ColumnStyle
+        {
+            MinWidth = 4,
+            MaxWidth = 5,
+            ColorGetter = this.GetTransportCellScheme,
+        };
+        this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 4, MaxWidth = 7 };
+        this.listTable.Style.ColumnStyles[4] = new ColumnStyle { MinWidth = 0, MaxWidth = 4 };
+        this.listTable.Style.ColumnStyles[5] = new ColumnStyle { MinWidth = 0, MaxWidth = 30, TruncationIndicator = "…" };
+        this.listTable.Style.RowColorGetter = this.GetRowScheme;
+
         this.status = new Label
         {
             X = 0,
@@ -84,7 +134,22 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             Height = 1,
             CanFocus = false,
         };
-        this.Add(this.header, this.body, this.status, this.footer);
+        this.editorForm = new McpEditorForm(controller)
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            Visible = false,
+        };
+        this.editorForm.SaveRequested += () =>
+            this.Observe(this.controller.ExecuteAsync(
+                McpBrowserCommand.EditorApply, null, this.lifetime?.Token ?? CancellationToken.None));
+        this.editorForm.CancelRequested += () =>
+            this.Observe(this.controller.ExecuteAsync(
+                McpBrowserCommand.EditorCancel, null, this.lifetime?.Token ?? CancellationToken.None));
+
+        this.Add(this.header, this.body, this.listTable, this.editorForm, this.status, this.footer);
         this.FrameChanged += (_, _) =>
         {
             if (this.active)
@@ -99,11 +164,23 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
                 this.Render();
             }
         };
+
+        // The table's own frame settles after Render has already run, so scrolling the selection
+        // into view has to happen here as well: on a resize the viewport shrinks underneath a
+        // row offset that was computed for the old height, leaving the selected server off screen.
+        this.listTable.FrameChanged += (_, _) =>
+        {
+            if (this.active && this.listTable.Visible)
+            {
+                this.listTable.EnsureCursorIsVisible();
+            }
+        };
     }
 
     internal void ApplyTheme(TuiTheme theme)
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.browserSchemes = null;
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
@@ -197,20 +274,76 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             return false;
         }
 
-        // The overlay holds focus and consumes every key while visible, so the shell's own Ctrl+C handler
-        // is unreachable from here — copy an active body selection before the key is swallowed.
+        // Copy an active body selection before anything else claims the chord.
         if (key == Key.C.WithCtrl && this.body.TryCopySelection())
         {
             return true;
         }
 
-        var command = McpBrowserKeyMap.Map(key, this.controller.State.View);
-        if (command == McpBrowserCommand.None &&
-            this.controller.State.View == McpBrowserView.Detail &&
-            this.TryScrollDetail(key))
+        // Filter mode: printable text goes to the filter buffer; Esc exits filter (does not close
+        // browser); Enter opens the selected row; arrows move the selection, all exactly as if
+        // filter mode were not active.
+        if (this.filterMode)
         {
+            if (key == Key.Esc)
+            {
+                this.filterMode = false;
+                this.filterBuffer = string.Empty;
+                this.Render();
+                return true;
+            }
+
+            if (key == Key.Backspace && this.filterBuffer.Length > 0)
+            {
+                this.filterBuffer = this.filterBuffer[..^1];
+                this.Render();
+                return true;
+            }
+
+            // Enter and arrow keys fall through to the normal command dispatch below so the user
+            // can open/navigate the filtered list without leaving filter mode first.
+            if (key == Key.Enter ||
+                key == Key.CursorUp || key == Key.CursorDown ||
+                key == Key.PageUp || key == Key.PageDown ||
+                key == Key.Home || key == Key.End)
+            {
+                // Handled by the standard command dispatch path below — do not return here.
+            }
+            else if (key.AsRune.Value > 0x1F && !char.IsControl((char)key.AsRune.Value))
+            {
+                this.filterBuffer += key.AsRune.ToString();
+                this.Render();
+                return true;
+            }
+            else
+            {
+                return true; // swallow unrecognised modifier chords that are not navigation
+            }
+        }
+
+        var command = McpBrowserKeyMap.Map(key, this.controller.State.View);
+
+        // Filter command is overlay-level state; do not route to the controller.
+        if (command == McpBrowserCommand.Filter)
+        {
+            this.filterMode = true;
             this.Render();
             return true;
+        }
+
+        if (command == McpBrowserCommand.None)
+        {
+            if (this.controller.State.View == McpBrowserView.Detail && this.TryScrollDetail(key))
+            {
+                this.Render();
+                return true;
+            }
+
+            // Not one of ours: leave it unhandled so a focused child view can act on it. Returning
+            // true unconditionally here would make every child widget deaf. The shell already
+            // declines keys while a browser overlay is visible, so an unclaimed key is simply
+            // dropped rather than leaking to the composer.
+            return false;
         }
 
         var token = this.lifetime?.Token ?? CancellationToken.None;
@@ -226,11 +359,11 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     /// <inheritdoc/>
     /// <remarks>
     /// Terminal.Gui hit-tests and delivers the event straight to the child under the pointer, so the
-    /// <see cref="SelectableTextView"/> body already gets its drag selections and right-click copies. This
-    /// override exists only to swallow whatever the body did not take, so mouse input cannot reach the
-    /// views behind a visible overlay.
+    /// <see cref="SelectableTextView"/> body gets its drag selections and right-click copies, and the
+    /// table and editor widgets get their clicks. Anything no child claimed is left unhandled — the
+    /// overlay covers the shell, so there is nothing behind it to protect.
     /// </remarks>
-    protected override bool OnMouseEvent(Mouse mouse) => this.Visible;
+    protected override bool OnMouseEvent(Mouse mouse) => false;
 
     private void OnControllerChanged()
     {
@@ -267,71 +400,115 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private void Render()
     {
         var state = this.controller.State;
+        string bodyText;
         switch (state.View)
         {
             case McpBrowserView.Detail:
                 this.RenderDetail(state);
+                bodyText = this.body.AllText;
                 break;
             case McpBrowserView.Editor:
                 this.RenderEditor(state);
+                bodyText = this.editorForm.VisibleTextForTest;
                 break;
             default:
-                this.RenderList(state);
+                bodyText = this.RenderList(state);
                 break;
         }
 
         this.VisibleTextForTest = string.Join(
             Environment.NewLine,
             this.header.Text ?? string.Empty,
-            this.body.AllText,
+            bodyText,
             this.status.Text ?? string.Empty,
             this.footer.Text ?? string.Empty);
         this.SetNeedsDraw();
     }
 
-    private void RenderList(McpBrowserState state)
+    private string RenderList(McpBrowserState state)
     {
-        var lines = new List<string> { $"MCP servers ({state.Servers.Length})" };
-        if (state.Servers.IsDefaultOrEmpty)
+        this.listTable.Visible = true;
+        this.body.Visible = false;
+
+        // Apply case-insensitive name filter when in filter mode.
+        var servers = this.filterBuffer.Length > 0
+            ? state.Servers.Where(s => s.Key.Name.Contains(this.filterBuffer, StringComparison.OrdinalIgnoreCase)).ToImmutableArray()
+            : state.Servers;
+
+        var source = new McpServerTableSource(servers, this.statusGlyphs, null);
+        this.listTable.Table = source;
+
+        // Sync the table's selection from controller state, then scroll it into view. Without the
+        // second step the table renders from row 0 regardless of the selection, so on a short
+        // terminal the selected server is simply not on screen — which is exactly the case the
+        // narrow-terminal tests cover.
+        if (!servers.IsDefaultOrEmpty && state.SelectedKey is { } key)
         {
-            lines.Add("(no configured servers)");
-        }
-        else
-        {
-            for (var index = 0; index < state.Servers.Length; index++)
+            var idx = 0;
+            for (var i = 0; i < servers.Length; i++)
             {
-                var server = state.Servers[index];
-                var selected = state.SelectedKey == server.Key ? ">" : " ";
-                var enabled = server.Enabled ? "enabled" : "disabled";
-                var effective = server.IsEffective ? "effective" : "overridden";
-                var error = string.IsNullOrWhiteSpace(server.LastError)
-                    ? string.Empty
-                    : $" error={SafeSingle(server.LastError)}";
-                lines.Add(new StringBuilder()
-                    .Append(selected).Append(' ')
-                    .Append(SafeSingle(server.Key.Name)).Append(" [")
-                    .Append(Scope(server.Key.Scope)).Append("] ")
-                    .Append(Transport(server.Transport)).Append(' ')
-                    .Append(enabled).Append(' ')
-                    .Append(effective).Append(" connection=")
-                    .Append(server.Connection).Append(error).ToString());
+                if (servers[i].Key == key)
+                {
+                    idx = i;
+                    break;
+                }
             }
+
+            this.listTable.SetSelection(0, idx, false);
+            this.listTable.EnsureCursorIsVisible();
         }
 
         this.header.Text = SafeSingle("MCP manager");
-        var selectedLine = state.SelectedKey is not null
-            ? lines.FindIndex(line => line.StartsWith("> ", StringComparison.Ordinal))
-            : -1;
-        this.body.SetText(Window(lines, ref this.listOffset, this.BodyViewportRows(), selectedLine));
-        this.status.Text = SafeSingle(state.StatusMessage);
+
+        if (this.filterMode)
+        {
+            this.status.Text = SafeSingle($" filter: {this.filterBuffer}▏");
+        }
+        else
+        {
+            this.status.Text = SafeSingle(state.StatusMessage);
+        }
+
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "↑/↓ move · PgUp/PgDn · Home/End · Enter detail · a add · e edit · Space enable · u reauth · Delete remove · Esc close",
-                "↑/↓ · PgUp/PgDn · Home/End · Enter · Esc"));
+                "↑/↓ k/j move · PgUp/PgDn · Home/End · Enter detail · a add · e edit · Space enable · u reauth · Delete remove · r reload · / filter · Esc q close",
+                "↑/↓ k/j · PgUp/PgDn · r reload · / filter · Esc q"));
+
+        return BuildListText(state, source);
+    }
+
+    /// <summary>
+    /// Builds a plain-text representation of the list for <see cref="VisibleTextForTest"/>. The
+    /// text is not rendered to the screen; it is used only for test assertions that need to verify
+    /// state without driver-scraping.
+    /// </summary>
+    private static string BuildListText(McpBrowserState state, McpServerTableSource source)
+    {
+        if (state.Servers.IsDefaultOrEmpty)
+        {
+            return "(no configured servers)";
+        }
+
+        var sb = new StringBuilder();
+        for (var i = 0; i < state.Servers.Length; i++)
+        {
+            var server = state.Servers[i];
+            var itemState = McpServerTableSource.GetState(server);
+            sb.Append(SafeSingle(server.Key.Name))
+              .Append(' ')
+              .Append(itemState.ToString().ToLowerInvariant())
+              .Append(" connection=")
+              .Append(server.Connection)
+              .AppendLine();
+        }
+
+        return sb.ToString();
     }
 
     private void RenderDetail(McpBrowserState state)
     {
+        this.listTable.Visible = false;
+        this.body.Visible = true;
         var lines = new List<string>();
         var detail = state.Detail;
         if (detail is null)
@@ -385,109 +562,27 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "↑/↓ scroll · PgUp/PgDn · Home/End · e edit · Space enable · u reauth · Delete remove · Esc back",
-                "↑/↓ · PgUp/PgDn · Home/End · Esc back"));
+                "↑/↓ k/j scroll · PgUp/PgDn · Home/End · e edit · Space enable · u reauth · Delete remove · Esc q back",
+                "↑/↓ k/j · PgUp/PgDn · Home/End · Esc q back"));
     }
 
     private void RenderEditor(McpBrowserState state)
     {
-        var lines = new List<string>();
-        var focusedLine = -1;
-        if (state.Editor is not { } editor)
-        {
-            lines.Add("(editor unavailable)");
-        }
-        else
-        {
-            var draft = editor.Draft;
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Scope, Scope(draft.Scope), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Name, draft.Name, focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Transport, Transport(draft.Transport), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Command, draft.Command, focusedLine);
-            focusedLine = AppendEditorCollection(lines, editor, McpEditorField.Arguments, DraftArgs(draft), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Url, draft.Url, focusedLine);
-            focusedLine = AppendEditorNamedSecrets(lines, editor, McpEditorField.Environment, draft.Environment, focusedLine);
-            focusedLine = AppendEditorNamedSecrets(lines, editor, McpEditorField.Headers, draft.Headers, focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.AuthMode, draft.AuthMode.ToString(), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.ClientId, draft.ClientId, focusedLine);
-            focusedLine = AppendEditorCollection(lines, editor, McpEditorField.Scopes, DraftScopes(draft), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.BearerToken, DraftSecret(draft.BearerToken), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Save, "apply", focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Cancel, "cancel", focusedLine);
-        }
+        this.listTable.Visible = false;
+        this.body.Visible = false;
+        this.editorForm.Visible = true;
 
-        lines.Add($"Busy: turn={(state.TurnBusy ? "yes" : "no")} action={(state.ActionBusy ? "yes" : "no")}");
         this.header.Text = SafeSingle($"MCP editor — {state.Editor?.Mode.ToString() ?? "unavailable"}");
-        this.body.SetText(Window(lines, ref this.editorOffset, this.BodyViewportRows(), focusedLine));
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "Tab/Shift+Tab field · Enter apply/next · Ctrl+N add · Ctrl+R remove · Ctrl+↑/↓ item · Ctrl+←/→ part · Esc cancel",
-                "Enter Save · Esc Cancel"));
-    }
+                "Tab/↑/↓ field · Enter save · Ctrl+N add · Ctrl+R remove · Alt+↑/↓ reorder · Esc cancel",
+                "Tab field · Enter save · Esc cancel"));
 
-    private static int AppendEditorField(
-        List<string> lines,
-        McpEditorState editor,
-        McpEditorField field,
-        string? value,
-        int focusedLine)
-    {
-        var line = lines.Count;
-        var marker = editor.FocusedField == field ? ">" : " ";
-        lines.Add(marker + " " + field + ": " + SafeSingle(value));
-        return focusedLine >= 0 || editor.FocusedField != field ? focusedLine : line;
-    }
-
-    private static int AppendEditorCollection(
-        List<string> lines,
-        McpEditorState editor,
-        McpEditorField field,
-        IReadOnlyList<string> values,
-        int focusedLine)
-    {
-        focusedLine = AppendEditorField(
-            lines,
-            editor,
-            field,
-            values.Count == 0 ? "(none)" : $"{values.Count} item(s)",
-            focusedLine);
-        for (var index = 0; index < values.Count; index++)
+        if (state.Editor is { } editor)
         {
-            var marker = editor.FocusedField == field && editor.SelectedItem == index ? ">" : " ";
-            lines.Add($"  {marker} {index + 1}: {SafeSingle(values[index])}");
+            this.editorForm.ApplyState(editor);
         }
-
-        return focusedLine;
-    }
-
-    private static int AppendEditorNamedSecrets(
-        List<string> lines,
-        McpEditorState editor,
-        McpEditorField field,
-        IReadOnlyList<McpNamedSecretDraft> values,
-        int focusedLine)
-    {
-        focusedLine = AppendEditorField(
-            lines,
-            editor,
-            field,
-            values.Count == 0 ? "(none)" : $"{values.Count} item(s)",
-            focusedLine);
-        for (var index = 0; index < values.Count; index++)
-        {
-            var item = values[index];
-            var marker = editor.FocusedField == field && editor.SelectedItem == index ? ">" : " ";
-            var part = editor.FocusedField == field && editor.SelectedItem == index
-                ? editor.SelectedItemPart
-                : McpEditorItemPart.Value;
-            var value = part == McpEditorItemPart.Name
-                ? SafeSingle(item.Name)
-                : DraftSecret(item.Change);
-            lines.Add($"  {marker} {index + 1}: {value} ({item.ExistingSource})");
-        }
-
-        return focusedLine;
     }
 
     private static void AppendValues(List<string> lines, string label, IReadOnlyList<string> values)
@@ -598,13 +693,13 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private bool TryScrollDetail(Key key)
     {
-        if (key == Key.CursorUp)
+        if (key == Key.CursorUp || key == new Key('k'))
         {
             this.detailOffset = Math.Max(0, this.detailOffset - 1);
             return true;
         }
 
-        if (key == Key.CursorDown)
+        if (key == Key.CursorDown || key == new Key('j'))
         {
             this.detailOffset = (int)Math.Min(int.MaxValue, (long)this.detailOffset + 1);
             return true;
@@ -645,24 +740,6 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private static IReadOnlyList<string> EffectiveArgs(ImmutableArray<string> args) =>
         args.IsDefault ? [] : args.ToArray();
 
-    private static IReadOnlyList<string> DraftArgs(McpServerDraft draft) =>
-        draft.ArgumentItems.IsDefault
-            ? draft.Args
-            : draft.ArgumentItems.Select(item => item.Value).ToArray();
-
-    private static IReadOnlyList<string> DraftScopes(McpServerDraft draft) =>
-        draft.ScopeItems.IsDefault
-            ? draft.Scopes
-            : draft.ScopeItems.Select(item => item.Value).ToArray();
-
-    private static string DraftSecret(McpSecretChange change) =>
-        change.Kind switch
-        {
-            McpSecretChangeKind.Replace => "*****",
-            McpSecretChangeKind.Remove => "(removed)",
-            _ => "(unchanged)",
-        };
-
     private static string MaskedSecret(string? value) => "*****";
 
     private static string Scope(McpConfigScope scope) => scope == McpConfigScope.User ? "user" : "project";
@@ -670,6 +747,33 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private static string Transport(McpTransportKind transport) => transport == McpTransportKind.Http ? "http" : "stdio";
 
     private static string SafeSingle(string? value) => TerminalTextSanitizer.SanitizeSingleLine(value ?? string.Empty);
+
+    private BrowserSchemes EnsureSchemes() =>
+        this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);
+
+    private Scheme GetRowScheme(RowColorGetterArgs args)
+    {
+        var schemes = this.EnsureSchemes();
+        if (args.Table is not McpServerTableSource source || args.RowIndex < 0 || args.RowIndex >= source.Rows)
+        {
+            return schemes.Normal;
+        }
+
+        return schemes.ForRow(McpServerTableSource.GetState(source.SummaryAt(args.RowIndex)));
+    }
+
+    private Scheme GetStatusCellScheme(CellColorGetterArgs args)
+    {
+        var schemes = this.EnsureSchemes();
+        if (args.Table is not McpServerTableSource source || args.RowIndex < 0 || args.RowIndex >= source.Rows)
+        {
+            return schemes.Normal;
+        }
+
+        return schemes.For(McpServerTableSource.GetState(source.SummaryAt(args.RowIndex)));
+    }
+
+    private Scheme GetTransportCellScheme(CellColorGetterArgs args) => this.EnsureSchemes().Accent;
 
     private void Observe(Task task) =>
         task.ContinueWith(

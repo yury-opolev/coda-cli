@@ -38,14 +38,16 @@ public sealed class TaskBrowserKeyMapTests
         Assert.Equal(TaskBrowserCommand.MoveToEnd, TaskBrowserKeyMap.Map(Key.End, TaskBrowserView.List));
         Assert.Equal(TaskBrowserCommand.OpenDetail, TaskBrowserKeyMap.Map(Key.Enter, TaskBrowserView.List));
         Assert.Equal(TaskBrowserCommand.Stop, TaskBrowserKeyMap.Map(new Key('x'), TaskBrowserView.List));
-        Assert.Equal(TaskBrowserCommand.Dismiss, TaskBrowserKeyMap.Map(new Key('r'), TaskBrowserView.List));
+        // D8: 'r' is reload everywhere; 'd' is dismiss for Tasks.
+        Assert.Equal(TaskBrowserCommand.Reload, TaskBrowserKeyMap.Map(new Key('r'), TaskBrowserView.List));
+        Assert.Equal(TaskBrowserCommand.Dismiss, TaskBrowserKeyMap.Map(new Key('d'), TaskBrowserView.List));
     }
 
     [Theory]
     [InlineData('a')] // Attach is detail-only
     [InlineData('s')] // Steer is detail-only
     [InlineData('l')] // Toggle-source is detail-only
-    [InlineData('q')]
+    // 'q' is now Close in list, so it is NOT unmapped
     [InlineData('z')]
     [InlineData('1')]
     [InlineData(' ')]
@@ -74,13 +76,17 @@ public sealed class TaskBrowserKeyMapTests
         Assert.Equal(TaskBrowserCommand.ScrollUp, TaskBrowserKeyMap.Map(Key.PageUp, TaskBrowserView.Detail));
         Assert.Equal(TaskBrowserCommand.ScrollDown, TaskBrowserKeyMap.Map(Key.PageDown, TaskBrowserView.Detail));
         Assert.Equal(TaskBrowserCommand.Stop, TaskBrowserKeyMap.Map(new Key('x'), TaskBrowserView.Detail));
-        Assert.Equal(TaskBrowserCommand.Dismiss, TaskBrowserKeyMap.Map(new Key('r'), TaskBrowserView.Detail));
+        // D8: 'd' is dismiss, 'r' is reload.
+        Assert.Equal(TaskBrowserCommand.Dismiss, TaskBrowserKeyMap.Map(new Key('d'), TaskBrowserView.Detail));
+        Assert.Equal(TaskBrowserCommand.Reload, TaskBrowserKeyMap.Map(new Key('r'), TaskBrowserView.Detail));
         Assert.Equal(TaskBrowserCommand.ReturnToList, TaskBrowserKeyMap.Map(Key.B.WithCtrl, TaskBrowserView.Detail));
+        // 'q' closes/returns from detail just like Esc (parity with other browsers).
+        Assert.Equal(TaskBrowserCommand.ReturnToList, TaskBrowserKeyMap.Map(new Key('q'), TaskBrowserView.Detail));
     }
 
     [Theory]
     [InlineData('b')]
-    [InlineData('q')]
+    // 'q' is now ReturnToList in detail, so it is NOT unmapped
     [InlineData('z')]
     [InlineData('9')]
     [InlineData(' ')]

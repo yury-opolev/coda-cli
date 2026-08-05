@@ -39,13 +39,20 @@ public sealed class TaskWaitTool : ITool
     }
 
     /// <summary>
-    /// Renders the terminal-completion message. A null <paramref name="status"/> (the task was concurrently
-    /// pruned after reaching a terminal state) omits the status clause rather than reporting "status finished".
+    /// Renders the terminal-completion message and includes the task report when present so callers can
+    /// still see the WHY of the completion after task_wait consumes the outbox entry to preserve exactly-once delivery.
+    /// A null <paramref name="status"/> (the task was concurrently pruned after reaching a terminal state)
+    /// omits the status clause rather than reporting "status finished".
     /// </summary>
-    internal static string FormatFinished(string taskId, string? status) =>
-        status is null
+    internal static string FormatFinished(string taskId, string? status, string? report)
+    {
+        var headline = status is null
             ? $"Task '{taskId}' finished."
             : $"Task '{taskId}' finished with status {status}.";
+        return string.IsNullOrEmpty(report)
+            ? headline
+            : $"{headline}\n{report}";
+    }
 
     public async Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
     {
@@ -77,8 +84,16 @@ public sealed class TaskWaitTool : ITool
                 return new ToolResult($"Task '{taskId}' not found.");
             }
 
+            // Consume the outbox entry so the owning agent does not receive the same completion
+            // twice: once via task_wait's return value and once via the injection seam.
+            // A timeout (OperationCanceledException below) must NOT consume — the task is still
+            // running and the outbox entry should be delivered at the next iteration boundary.
+            var consumed = context.Tasks.ConsumeCompletion(taskId, context.CurrentTaskId);
+            var truncatedReport = consumed?.Report is { Length: > AgentLoop.CompletionReportTruncateAt } r
+                ? AgentLoop.TruncateAtRuneBoundary(r, AgentLoop.CompletionReportTruncateAt)
+                : consumed?.Report;
             var status = context.Tasks.Get(taskId, context.CurrentTaskId)?.Status.ToString().ToLowerInvariant();
-            return new ToolResult(FormatFinished(taskId, status));
+            return new ToolResult(FormatFinished(taskId, status, truncatedReport));
         }
         catch (OperationCanceledException) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
         {

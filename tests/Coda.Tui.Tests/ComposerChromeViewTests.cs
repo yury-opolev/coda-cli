@@ -38,7 +38,7 @@ public sealed class ComposerChromeViewTests
         // A full-width upper-half-block top edge, the warm prompt at column 0 of the first content row (so
         // the composer's own rows overdraw everything but the gutter), an interior content row, and a
         // full-width lower-half-block bottom edge — no vertical accent bar or box border.
-        Assert.Equal(["▀▀▀▀▀▀▀▀▀▀▀▀", ">           ", "            ", "▄▄▄▄▄▄▄▄▄▄▄▄"], rows);
+        Assert.Equal(["▄▄▄▄▄▄▄▄▄▄▄▄", "\u276f           ", "            ", "▀▀▀▀▀▀▀▀▀▀▀▀"], rows);
         Assert.DoesNotContain(rows, row => row.Contains('▌'));
         Assert.DoesNotContain(rows, row => row.Contains('│'));
         Assert.DoesNotContain(rows, row => row.Contains("Initializing", StringComparison.Ordinal));
@@ -52,7 +52,7 @@ public sealed class ComposerChromeViewTests
         // A single-line draft yields a 1 content-row composer, so the chrome is exactly three rows: the
         // upper-half-block top edge, the one content row carrying the prompt gutter, and the lower-half-block
         // bottom edge.
-        Assert.Equal(["▀▀▀▀▀▀", ">     ", "▄▄▄▄▄▄"], chrome.RenderRows(width: 6, height: 3));
+        Assert.Equal(["▄▄▄▄▄▄", "\u276f     ", "▀▀▀▀▀▀"], chrome.RenderRows(width: 6, height: 3));
     }
 
     [Fact]

@@ -213,7 +213,7 @@ public sealed class SubagentPluginTests : IDisposable
             IsEnabled = false,
         };
 
-        var agents = PluginAgentLoader.Load(plugin);
+        var agents = PluginAgentLoader.Load(plugin, workingDirectory: null); // user-scoped: no working directory needed
         Assert.Empty(agents);
     }
 
@@ -231,7 +231,7 @@ public sealed class SubagentPluginTests : IDisposable
             Manifest = manifest,
         };
 
-        var agents = PluginAgentLoader.Load(plugin);
+        var agents = PluginAgentLoader.Load(plugin, workingDirectory: null); // user-scoped: no working directory needed
         Assert.Single(agents);
         Assert.Equal("custom-agent", agents[0].Type);
     }
@@ -253,5 +253,57 @@ public sealed class SubagentPluginTests : IDisposable
         var composition = PluginComponentComposer.Compose([plugin], this.temp.Path);
 
         Assert.Contains(composition.Agents, a => a.Type == "composer-type");
+    }
+
+    // =========================================================================
+    // Plugin model: user-scoped vs project-scoped (Task 3)
+    // =========================================================================
+
+    [Fact]
+    public void PluginAgentLoader_reads_model_key_from_user_scoped_plugin()
+    {
+        var agentsDir = Directory.CreateDirectory(Path.Combine(this.temp.Path, "agents")).FullName;
+        File.WriteAllText(Path.Combine(agentsDir, "model-agent.md"),
+            "---\ntype: model-agent\nmodel: fast-cheap-model\n---\nBody.");
+
+        var agents = PluginAgentLoader.LoadFromDirectory(
+            agentsDir, "test-plugin", isProjectPlugin: false);
+
+        Assert.Single(agents);
+        Assert.Equal("fast-cheap-model", agents[0].Model);
+    }
+
+    [Fact]
+    public void PluginAgentLoader_ignores_model_key_from_project_scoped_plugin_with_warning()
+    {
+        var agentsDir = Directory.CreateDirectory(Path.Combine(this.temp.Path, "agents")).FullName;
+        File.WriteAllText(Path.Combine(agentsDir, "proj-model-agent.md"),
+            "---\ntype: proj-model-agent\nmodel: expensive-model\n---\nBody.");
+
+        var logger = new CapturingLogger();
+        var agents = PluginAgentLoader.LoadFromDirectory(
+            agentsDir, "test-plugin", isProjectPlugin: true, logger: logger);
+
+        // Agent still loads, but model must be null.
+        Assert.Single(agents);
+        Assert.Null(agents[0].Model);
+
+        // A warning must have been logged.
+        Assert.Contains(logger.Entries, e =>
+            e.Level == LogLevel.Warning &&
+            e.Message.Contains("model", StringComparison.OrdinalIgnoreCase));
+    }
+
+    [Fact]
+    public void PluginAgentLoader_no_model_key_leaves_definition_model_null()
+    {
+        var agentsDir = Directory.CreateDirectory(Path.Combine(this.temp.Path, "agents")).FullName;
+        File.WriteAllText(Path.Combine(agentsDir, "no-model.md"),
+            "---\ntype: no-model-agent\n---\nBody.");
+
+        var agents = PluginAgentLoader.LoadFromDirectory(agentsDir, "test-plugin");
+
+        Assert.Single(agents);
+        Assert.Null(agents[0].Model);
     }
 }

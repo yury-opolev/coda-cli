@@ -22,8 +22,8 @@ public sealed record TranscriptGlyphs(
     string ChildConnector,
     string LastChildConnector)
 {
-    /// <summary>Unicode glyph set: &gt; ○ ● │ └</summary>
-    public static TranscriptGlyphs Unicode { get; } = new(">", "\u25cb", "\u25cf", "\u2502", "\u2514"); // > ○ ● │ └
+    /// <summary>Unicode glyph set: ❯ ○ ● │ └</summary>
+    public static TranscriptGlyphs Unicode { get; } = new("\u276f", "\u25cb", "\u25cf", "\u2502", "\u2514"); // ❯ ○ ● │ └
 
     /// <summary>ASCII glyph set: &gt; o * | `</summary>
     public static TranscriptGlyphs Ascii { get; }   = new(">", "o", "*", "|", "`");

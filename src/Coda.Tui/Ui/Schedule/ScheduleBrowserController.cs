@@ -156,6 +156,15 @@ internal sealed class ScheduleBrowserController : IDisposable
         this.RaiseChanged();
     }
 
+    /// <summary>Moves the selection to the first row.</summary>
+    public void MoveToStart() => this.MoveSelection(int.MinValue / 2);
+
+    /// <summary>Moves the selection to the last row.</summary>
+    public void MoveToEnd() => this.MoveSelection(int.MaxValue / 2);
+
+    /// <summary>Triggers a reload of the schedule list via the pump signal.</summary>
+    public void Reload() => this.NotifyScheduleChanged();
+
     // ── Delete ────────────────────────────────────────────────────────────────
 
     /// <summary>

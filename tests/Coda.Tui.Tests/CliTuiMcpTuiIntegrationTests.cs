@@ -105,6 +105,46 @@ public sealed class CliTuiMcpTuiIntegrationTests
     }
 
     [Fact]
+    public void Controller_change_does_not_steal_focus_from_a_focused_child_of_the_browser()
+    {
+        using var fixture = RetainedShellFixture.CreateIntegrated(
+            TuiRunMode.Fullscreen,
+            ToolDisplayMode.Summary);
+
+        fixture.Shell.Composer.SetDraft("/mcp", 4);
+        fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Enter);
+
+        var overlay = Assert.IsType<McpBrowserOverlay>(fixture.Shell.McpOverlay);
+        Assert.True(overlay.HasFocus);
+
+        // Stand in for the table and editor fields that Tasks 5 and 7 add. In the editor every
+        // keystroke mutates the draft and so raises Changed, which drives the shell's focus
+        // restoration — if that moved focus, typing would be impossible after the first character.
+        //
+        // It does not: Terminal.Gui restores focus to the most-recently-focused descendant, so the
+        // shell's unconditional SetFocus is safe. This test exists to lock that behaviour, because
+        // the whole widget-based editor depends on it and nothing else would catch it changing.
+        var child = new TextField { Width = 10, Y = 0, TabStop = TabBehavior.TabStop };
+        var second = new TextField { Width = 10, Y = 1, TabStop = TabBehavior.TabStop };
+        overlay.Add(child);
+        overlay.Add(second);
+        second.SetFocus();
+        Assert.True(second.HasFocus);
+
+        fixture.Shell.McpController!.NotifyChangedForTest();
+        fixture.HostApplication.LayoutAndDraw();
+
+        Assert.True(second.HasFocus);
+        Assert.False(child.HasFocus);
+        Assert.True(overlay.HasFocus);
+
+        overlay.Remove(child);
+        overlay.Remove(second);
+        child.Dispose();
+        second.Dispose();
+    }
+
+    [Fact]
     public void Mode_switch_releases_both_browser_lifecycles_and_transcript_mouse_capture()
     {
         using var fixture = RetainedShellFixture.CreateIntegrated(

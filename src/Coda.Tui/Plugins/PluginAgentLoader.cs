@@ -28,12 +28,25 @@ public static class PluginAgentLoader
     /// Returns an empty list if the plugin is disabled, has no manifest, or the directory
     /// does not exist.
     /// </summary>
-    public static IReadOnlyList<SubagentDefinition> Load(PluginInfo plugin, ILogger? logger = null)
+    /// <param name="plugin">The plugin to load agents from.</param>
+    /// <param name="workingDirectory">
+    /// The session working directory used to determine whether the plugin is project-scoped.
+    /// This parameter is required so each caller states the trust boundary explicitly instead of
+    /// silently defaulting to user-scoped behavior when it forgot to pass the current workspace.
+    /// When null, the plugin is treated as user-scoped (model key is accepted).
+    /// </param>
+    /// <param name="logger">Optional logger for warnings and errors.</param>
+    public static IReadOnlyList<SubagentDefinition> Load(
+        PluginInfo plugin,
+        string? workingDirectory,
+        ILogger? logger = null)
     {
         if (!plugin.IsEnabled) return [];
 
+        var isProjectPlugin = workingDirectory is not null
+            && PluginComponentComposer.IsProjectPlugin(plugin, workingDirectory);
         var agentsDir = PluginResourceLoader.ResolvePath(plugin, plugin.Manifest?.Agents ?? "agents");
-        return LoadFromDirectory(agentsDir, plugin.Name, logger);
+        return LoadFromDirectory(agentsDir, plugin.Name, isProjectPlugin: isProjectPlugin, logger: logger);
     }
 
     /// <summary>
@@ -43,11 +56,17 @@ public static class PluginAgentLoader
     public static IReadOnlyList<SubagentDefinition> LoadFromDirectory(
         string agentsDir,
         string pluginName,
-        ILogger? logger = null) =>
+        ILogger? logger = null,
+        bool isProjectPlugin = false) =>
         PluginResourceLoader.LoadDirectory<SubagentDefinition>(
-            agentsDir, "*.md", pluginName, "agent", file => TryLoadFile(file, pluginName, logger), logger);
+            agentsDir, "*.md", pluginName, "agent",
+            file => TryLoadFile(file, pluginName, isProjectPlugin, logger), logger);
 
-    private static SubagentDefinition? TryLoadFile(string file, string pluginName, ILogger? logger)
+    private static SubagentDefinition? TryLoadFile(
+        string file,
+        string pluginName,
+        bool isProjectPlugin,
+        ILogger? logger)
     {
         if (PluginResourceLoader.TryReadText(file, pluginName, "agent", logger) is not { } content)
         {
@@ -63,11 +82,14 @@ public static class PluginAgentLoader
             return null;
         }
 
-        // Reject forbidden keys but keep loading the rest of the definition.
-        // Real security guarantee: SubagentDefinition has only Type, Description,
-        // SystemPromptBody, ReadOnlyToolsOnly — unrecognised keys land in UnknownFields
-        // and are never read. The check below is a diagnostic aid so plugin authors
-        // are notified early; it is not a security boundary.
+        // SECURITY INVARIANT: SubagentDefinition carries Type, Description, SystemPromptBody,
+        // ReadOnlyToolsOnly, and Model (user-scoped plugins only). Every other frontmatter key
+        // lands in UnknownFields and is never read. The forbidden-key check below is a diagnostic
+        // aid so plugin authors are notified early; the real restriction is that only recognised
+        // fields are mapped into the definition.
+        // Model is additionally gated on plugin scope: a project-scoped plugin's `model:` key is
+        // ignored (with a warning) because the project directory is attacker-controlled and model
+        // choice is a cost lever.
         foreach (var (key, _) in frontmatter.UnknownFields)
         {
             var stripped = key
@@ -103,10 +125,34 @@ public static class PluginAgentLoader
             readOnlyToolsOnly = string.Equals(readOnlyValue, "true", StringComparison.OrdinalIgnoreCase);
         }
 
+        // model key: accepted for user-scoped plugins; ignored with a warning for project-scoped
+        // plugins because the project directory is attacker-controlled after a hostile clone, and
+        // model choice is a cost lever.
+        //
+        // NOTE: `model` is a first-class field on the shared frontmatter parser
+        // (SkillFrontmatter.Model), not an unknown key — reading it from UnknownFields silently
+        // yields null for every agent file.
+        string? model = null;
+        if (!string.IsNullOrWhiteSpace(frontmatter.Model))
+        {
+            if (isProjectPlugin)
+            {
+                logger?.LogWarning(
+                    "Plugin '{Plugin}' agent '{File}': 'model' key is ignored in project-scoped plugin " +
+                    "agent definitions. Declare model overrides in your user settings file instead.",
+                    pluginName, Path.GetFileName(file));
+            }
+            else
+            {
+                model = frontmatter.Model.Trim();
+            }
+        }
+
         return new SubagentDefinition(
             Type: agentType.Trim(),
             Description: description,
             SystemPromptBody: frontmatter.Body,
-            ReadOnlyToolsOnly: readOnlyToolsOnly);
+            ReadOnlyToolsOnly: readOnlyToolsOnly,
+            Model: model);
     }
 }

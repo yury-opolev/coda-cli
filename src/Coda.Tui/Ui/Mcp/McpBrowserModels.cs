@@ -57,19 +57,18 @@ internal enum McpBrowserCommand
     Reauthenticate,
     DeleteServer,
     ReturnToList,
-    EditorNext,
-    EditorPrevious,
     EditorApply,
     EditorCancel,
-    EditorBackspace,
-    EditorDelete,
-    EditorInsert,
     EditorAddItem,
     EditorRemoveItem,
-    EditorPreviousItem,
-    EditorNextItem,
-    EditorPreviousItemPart,
-    EditorNextItemPart,
+    EditorReorderUp,
+    EditorReorderDown,
+
+    /// <summary>Reload / refresh the server list (list view only).</summary>
+    Reload,
+
+    /// <summary>Enter type-to-filter mode (list view only).</summary>
+    Filter,
 }
 
 internal sealed record McpEditorState(

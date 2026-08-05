@@ -154,6 +154,20 @@ public sealed partial class SubagentHost : ISubagentHost
         var parentToolRestriction = request.ParentToolRestriction;
 
         var definition = this.subagentRegistry?.Resolve(subagentType) ?? BuiltInAgents.Resolve(subagentType);
+
+        // Resolve model: first non-empty wins across request → settings-by-type → settings-global
+        // → definition → session model. Operator settings outrank a plugin-declared model at every
+        // level so a hostile project plugin cannot force an expensive model. Terminal control
+        // characters are stripped to prevent log injection.
+        var resolvedModel = ResolveModel(
+            request.Model,
+            this.SubagentSettings,
+            subagentType,
+            definition.Model,
+            this.baseOptions.Model);
+
+        // Record the resolved model on the task so task_list/task_get can surface it.
+        this.tasks.SetTaskResolvedModel(taskId, resolvedModel);
         var prefix = this.includeAnthropicSystemPrefix ? AnthropicModels.AnthropicSystemPrefix + "\n\n" : string.Empty;
 
         // SECURITY: whatever ends up as the body is laid down first and everything the caller
@@ -251,6 +265,7 @@ public sealed partial class SubagentHost : ISubagentHost
         var options = this.baseOptions with
         {
             SystemPrompt = systemPrompt,
+            Model = resolvedModel,
             // Cap a delegated subagent task's iteration backstop (recoverable soft stop if hit).
             MaxIterations = Math.Min(this.baseOptions.MaxIterations, 500),
         };
@@ -366,6 +381,50 @@ public sealed partial class SubagentHost : ISubagentHost
     /// error the model cannot fix; appending keeps the caller's intent while leaving the definition
     /// in charge.
     /// </remarks>
+    /// <summary>
+    /// Resolves the effective model id for a subagent run, using the first non-empty source in
+    /// precedence order:
+    /// <list type="number">
+    ///   <item><term>request.Model</term><description>explicit <c>model</c> arg on the tool call</description></item>
+    ///   <item><term>settings.ModelByType[subagentType]</term><description>operator, per type</description></item>
+    ///   <item><term>settings.Model</term><description>operator, global</description></item>
+    ///   <item><term>definition.Model</term><description>plugin-declared</description></item>
+    ///   <item><term>sessionModel</term><description>session model — today's behaviour</description></item>
+    /// </list>
+    /// Operator settings outrank a plugin-declared model at every level, so a hostile project
+    /// plugin cannot force an expensive model. Values are trimmed; whitespace-only is treated as
+    /// absent. Terminal control characters are stripped.
+    /// </summary>
+    internal static string ResolveModel(
+        string? requestModel,
+        Coda.Agent.Settings.SubagentSettings settings,
+        string subagentType,
+        string? definitionModel,
+        string sessionModel)
+    {
+        foreach (var candidate in new[]
+        {
+            requestModel,
+            settings.ModelByType.TryGetValue(subagentType, out var byType) ? byType : null,
+            settings.Model,
+            definitionModel,
+        })
+        {
+            if (!string.IsNullOrWhiteSpace(candidate))
+            {
+                return StripControlChars(candidate.Trim());
+            }
+        }
+
+        return sessionModel;
+    }
+
+    /// <summary>Removes terminal control characters (ESC, carriage return, etc.) from a model id.</summary>
+    private static string StripControlChars(string value) =>
+        string.IsNullOrEmpty(value)
+            ? value
+            : new string(value.Where(static c => !char.IsControl(c)).ToArray());
+
     private (string Body, string? DemotedReplacement) ResolveSystemPromptBody(
         SubagentDefinition definition,
         SubagentSystemPrompt? requested,

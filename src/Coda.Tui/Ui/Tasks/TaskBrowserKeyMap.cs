@@ -18,6 +18,8 @@ internal enum TaskBrowserCommand
     OpenDetail,
     Stop,
     Dismiss,
+    Reload,
+    Filter,
 
     // Detail view
     BeginSteering,
@@ -62,33 +64,36 @@ internal static class TaskBrowserKeyMap
 
     private static TaskBrowserCommand MapList(Key key)
     {
-        if (key == Key.Esc) return TaskBrowserCommand.Close;
-        if (key == Key.CursorUp) return TaskBrowserCommand.MoveUp;
-        if (key == Key.CursorDown) return TaskBrowserCommand.MoveDown;
+        if (key == Key.Esc || key == Key.Q) return TaskBrowserCommand.Close;
+        if (key == Key.CursorUp || key == Key.K) return TaskBrowserCommand.MoveUp;
+        if (key == Key.CursorDown || key == Key.J) return TaskBrowserCommand.MoveDown;
         if (key == Key.PageUp) return TaskBrowserCommand.PageUp;
         if (key == Key.PageDown) return TaskBrowserCommand.PageDown;
         if (key == Key.Home) return TaskBrowserCommand.MoveToStart;
         if (key == Key.End) return TaskBrowserCommand.MoveToEnd;
         if (key == Key.Enter) return TaskBrowserCommand.OpenDetail;
         if (key == new Key('x')) return TaskBrowserCommand.Stop;
-        if (key == new Key('r')) return TaskBrowserCommand.Dismiss;
+        if (key == new Key('d')) return TaskBrowserCommand.Dismiss;
+        if (key == new Key('r')) return TaskBrowserCommand.Reload;
+        if (key == new Key('/')) return TaskBrowserCommand.Filter;
         return TaskBrowserCommand.None;
     }
 
     private static TaskBrowserCommand MapDetail(Key key)
     {
-        if (key == Key.Esc) return TaskBrowserCommand.ReturnToList;
+        if (key == Key.Esc || key == Key.Q) return TaskBrowserCommand.ReturnToList;
         if (key == Key.B.WithCtrl) return TaskBrowserCommand.ReturnToList;
+        if (key == Key.CursorUp || key == Key.K) return TaskBrowserCommand.ScrollUp;
+        if (key == Key.CursorDown || key == Key.J) return TaskBrowserCommand.ScrollDown;
+        if (key == Key.PageUp) return TaskBrowserCommand.ScrollUp;
+        if (key == Key.PageDown) return TaskBrowserCommand.ScrollDown;
         if (key == new Key('s')) return TaskBrowserCommand.BeginSteering;
         if (key == new Key('a')) return TaskBrowserCommand.Attach;
         if (key == new Key('l')) return TaskBrowserCommand.ToggleOutputSource;
         if (key == new Key('x')) return TaskBrowserCommand.Stop;
-        if (key == new Key('r')) return TaskBrowserCommand.Dismiss;
+        if (key == new Key('d')) return TaskBrowserCommand.Dismiss;
+        if (key == new Key('r')) return TaskBrowserCommand.Reload;
         if (key == Key.End) return TaskBrowserCommand.JumpToNewest;
-        if (key == Key.CursorUp) return TaskBrowserCommand.ScrollUp;
-        if (key == Key.CursorDown) return TaskBrowserCommand.ScrollDown;
-        if (key == Key.PageUp) return TaskBrowserCommand.ScrollUp;
-        if (key == Key.PageDown) return TaskBrowserCommand.ScrollDown;
         return TaskBrowserCommand.None;
     }
 

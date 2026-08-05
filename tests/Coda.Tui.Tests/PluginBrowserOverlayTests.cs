@@ -71,7 +71,18 @@ public sealed class PluginBrowserOverlayTests : IDisposable
             Assert.True(overlay.Visible);
             Assert.Contains("alpha", overlay.BodyText, StringComparison.Ordinal);
             Assert.Contains("beta", overlay.BodyText, StringComparison.Ordinal);
-            Assert.Contains("enabled", overlay.BodyText, StringComparison.Ordinal);
+            // The list now renders via TableView (Task 10); "enabled" is no longer a text column.
+            // Enabled state is represented by the status glyph — for an enabled+untrusted plugin
+            // the glyph is the Attention glyph, not the Disabled glyph.
+            var source = overlay.ListTableSource;
+            Assert.NotNull(source);
+            for (var i = 0; i < source!.Rows; i++)
+            {
+                var glyph = source[i, 0].ToString()!;
+                Assert.NotEqual(StatusGlyphs.Unicode.Disabled, glyph);
+                Assert.NotEqual(StatusGlyphs.Ascii.Disabled, glyph);
+            }
+
             Assert.Contains("untrusted", overlay.BodyText, StringComparison.Ordinal);
         }
         finally

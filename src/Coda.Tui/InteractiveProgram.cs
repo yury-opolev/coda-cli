@@ -566,6 +566,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             var plainConsole = new UiAnsiConsoleAdapter(mailbox, this.OffscreenWidth(), this.OffscreenHeight());
             context.SetModeEnvironment(plainConsole, PlainUiPromptService.Instance, mailbox, semanticUiEnabled: true);
             context.DraftInsertCallback = null;
+            context.ModelBrowserService = null;
             frameSink.Set(null, null);
             observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
@@ -597,6 +598,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             // write straight to the real console rather than through the adapter.
             context.SetModeEnvironment(realConsole, new SpectreUiPromptService(realConsole), mailbox, semanticUiEnabled: false);
             context.DraftInsertCallback = null;
+            context.ModelBrowserService = null;
             frameSink.Set(null, null);
             observer.Set(new PlainOutputRenderer(this.output, toolDisplayMode));
 
@@ -637,6 +639,7 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // Resolve the glyph set once from the terminal capabilities — Unicode for UTF-8 terminals, ASCII
         // fallback otherwise — so the transcript gutter uses the right characters for this session.
         var transcriptGlyphs = TranscriptGlyphs.For(this.capabilities.UnicodeOutput);
+        var statusGlyphs = StatusGlyphs.For(this.capabilities.UnicodeOutput);
 
         // The Terminal.Gui shell factory: wire the composer to the controller, point the actor's frame
         // sink at the shell, and (once the loop is pumping) run startup and enable submission.
@@ -667,11 +670,16 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                 linkPromptService: actorPrompts,
                 imageReader: clipboardImageReader,
                 imagePaste: imagePaste,
-                transcriptGlyphs: transcriptGlyphs);
+                transcriptGlyphs: transcriptGlyphs,
+                statusGlyphs: statusGlyphs);
 
             // Route /image (and any command staging an image) into this shell's live composer draft. Dispatch
             // is serialized by the controller, so a mode switch never leaves this pointing at a dead shell.
             context.DraftInsertCallback = token => tgApp.Invoke(() => shell.Composer.NewPasteEvent(token + " "));
+
+            // Route /model (no arg, interactive) into the dedicated browser overlay this shell hosts.
+            // A mode switch or shell teardown nulls it out in RunPlainSessionAsync/RunSpectreSessionAsync.
+            context.ModelBrowserService = shell;
 
             shell.PromptSubmitted += (_, text) => controller.OnSubmitted(text);
             shell.ActionRequested += (_, action) => _ = controller.HandleActionAsync(action);

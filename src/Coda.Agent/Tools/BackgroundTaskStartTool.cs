@@ -16,7 +16,7 @@ public sealed class BackgroundTaskStartTool : ITool
         "Use task_output to read incremental progress and task_stop to cancel it.";
 
     public string InputSchemaJson => """
-        {"type":"object","properties":{"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."},"system_prompt_append":{"type":"string","description":"Extra standing instructions for the subagent, appended to its system prompt. The subagent type's own instructions always come first and are never replaced."},"system_prompt":{"type":"string","description":"Replaces the subagent type's own instructions entirely. Only honoured when subagents.allowSystemPromptReplacement is enabled in settings; otherwise it is appended like system_prompt_append. Prefer system_prompt_append."}},"required":["prompt"]}
+        {"type":"object","properties":{"prompt":{"type":"string","description":"The detailed task for the subagent"},"subagent_type":{"type":"string","description":"Subagent type: \"general-purpose\" (default) or \"explore\" (read-only research)."},"model":{"type":"string","description":"Model id for this subagent, from the session's provider. Omit to inherit the session model."},"system_prompt_append":{"type":"string","description":"Extra standing instructions for the subagent, appended to its system prompt. The subagent type's own instructions always come first and are never replaced."},"system_prompt":{"type":"string","description":"Replaces the subagent type's own instructions entirely. Only honoured when subagents.allowSystemPromptReplacement is enabled in settings; otherwise it is appended like system_prompt_append. Prefer system_prompt_append."}},"required":["prompt"]}
         """;
 
     // Matches TaskTool.IsReadOnly — launching a subagent is not itself mutating;
@@ -46,6 +46,7 @@ public sealed class BackgroundTaskStartTool : ITool
         }
 
         var subagentType = ToolInput.GetString(input, "subagent_type") ?? "general-purpose";
+        var model = ToolInput.GetString(input, "model");
 
         // Same session-wide fan-out budget as the foreground task tool. The slot is handed to the
         // background run, which returns it when the subagent finishes — this tool returns long
@@ -70,7 +71,8 @@ public sealed class BackgroundTaskStartTool : ITool
                 context.CurrentTaskId,
                 context.ParentToolRestriction,
                 holdsSubagentSlot: true,
-                systemPrompt: SubagentPromptInput.Read(input));
+                systemPrompt: SubagentPromptInput.Read(input),
+                model: model);
         }
         catch
         {

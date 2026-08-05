@@ -38,19 +38,29 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 
     private readonly Label header;
     private readonly SelectableTextView body;
+    private readonly TableView listTable;
+    private readonly Label status;
     private readonly Label footer;
+
+    private BrowserSchemes? browserSchemes;
+    private readonly StatusGlyphs statusGlyphs;
 
     private CancellationTokenSource? pumpCts;
     private bool active;
     private bool disposed;
     private List<string> visibleOutput = [];
 
-    public TaskBrowserOverlay(IApplication app, TaskBrowserController controller, TuiTheme? theme = null, Action? onChanged = null, Action<string, Action>? onCopyRequested = null)
+    // Filter-mode state: / enters filter mode; keys go to the buffer; Esc exits filter first.
+    private bool filterMode;
+    private string filterBuffer = string.Empty;
+
+    public TaskBrowserOverlay(IApplication app, TaskBrowserController controller, TuiTheme? theme = null, Action? onChanged = null, Action<string, Action>? onCopyRequested = null, StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
         this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
+        this.statusGlyphs = statusGlyphs ?? StatusGlyphs.Unicode;
 
         this.Visible = false;
         this.CanFocus = true;
@@ -59,16 +69,44 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         this.BorderStyle = LineStyle.Rounded;
 
         this.header = new Label { X = 0, Y = 0, Width = Dim.Fill(), Height = 1, CanFocus = false };
-        this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1) };
-        this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+
+        this.listTable = new TableView
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            CanFocus = false,
+            Visible = false,
+        };
+        this.listTable.Style.ShowHeaders = false;
+        this.listTable.Style.ShowHorizontalHeaderUnderline = false;
+        this.listTable.Style.ShowHorizontalHeaderOverline = false;
+        this.listTable.Style.ShowVerticalCellLines = false;
+        this.listTable.Style.ColumnStyles[0] = new ColumnStyle { MinWidth = 1, MaxWidth = 1, ColorGetter = this.GetStatusCellScheme };
+        this.listTable.Style.ColumnStyles[1] = new ColumnStyle { MinWidth = 4, MaxWidth = 7 };
+        this.listTable.Style.ColumnStyles[2] = new ColumnStyle { MinWidth = 4, MaxWidth = 10 };
+        this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 0, MaxWidth = 50, TruncationIndicator = "…" };
+        this.listTable.Style.RowColorGetter = this.GetRowScheme;
+
+        this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(2), Visible = false };
         if (onCopyRequested is not null)
         {
             this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
         }
 
-        this.Add(this.header);
-        this.Add(this.body);
-        this.Add(this.footer);
+        this.status = new Label { X = 0, Y = Pos.AnchorEnd(2), Width = Dim.Fill(), Height = 1, CanFocus = false };
+        this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+
+        this.Add(this.header, this.listTable, this.body, this.status, this.footer);
+
+        this.listTable.FrameChanged += (_, _) =>
+        {
+            if (this.active && this.listTable.Visible)
+            {
+                this.listTable.EnsureCursorIsVisible();
+            }
+        };
     }
 
     internal void ApplyTheme(TuiTheme theme)
@@ -94,9 +132,13 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 
     internal string HeaderText => this.header.Text ?? string.Empty;
 
-    internal string BodyText => this.body.AllText;
+    /// <summary>Returns body text (detail/steering) or synthesized table text (list pane).</summary>
+    internal string BodyText => this.body.Visible ? this.body.AllText : this.SynthesizeListText();
 
     internal string FooterText => this.footer.Text ?? string.Empty;
+
+    /// <summary>The current task table source. Test seam.</summary>
+    internal TaskTableSource? ListTableSource { get; private set; }
 
     /// <summary>The exact windowed, clamped output lines drawn on the last detail render (for tests/diagnostics).</summary>
     internal IReadOnlyList<string> VisibleOutputLines => this.visibleOutput;
@@ -188,6 +230,35 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         }
 
         var view = this.controller.State.View;
+
+        // Filter mode (list only): keys go to the buffer; Esc exits filter first.
+        if (this.filterMode && view == TaskBrowserView.List)
+        {
+            if (key == Key.Esc)
+            {
+                this.filterMode = false;
+                this.filterBuffer = string.Empty;
+                this.Render();
+                return true;
+            }
+
+            if (key == Key.Backspace && this.filterBuffer.Length > 0)
+            {
+                this.filterBuffer = this.filterBuffer[..^1];
+                this.Render();
+                return true;
+            }
+
+            if (TryGetPrintable(key, out var ch))
+            {
+                this.filterBuffer += ch;
+                this.Render();
+                return true;
+            }
+
+            return true;
+        }
+
         var command = TaskBrowserKeyMap.Map(key, view);
         switch (command)
         {
@@ -204,6 +275,14 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
             case TaskBrowserCommand.ReturnToList: this.controller.ReturnToList(); break;
             case TaskBrowserCommand.Stop: this.controller.RequestStop(); break;
             case TaskBrowserCommand.Dismiss: this.controller.DismissSelected(); break;
+            case TaskBrowserCommand.Reload:
+                this.Observe(this.controller.SyncAsync(this.pumpCts?.Token ?? CancellationToken.None));
+                break;
+            case TaskBrowserCommand.Filter:
+                this.filterMode = true;
+                this.filterBuffer = string.Empty;
+                this.Render();
+                return true;
             case TaskBrowserCommand.BeginSteering: this.controller.BeginSteering(); break;
             case TaskBrowserCommand.Attach: this.Observe(this.controller.AttachAsync(CancellationToken.None)); break;
             case TaskBrowserCommand.ToggleOutputSource: this.controller.ToggleOutputSource(); break;
@@ -295,45 +374,45 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         var projection = state.Projection;
         this.header.Text = $"Tasks — {projection.Active.Count} active, {projection.Recent.Count} recent";
 
-        var sb = new StringBuilder();
-        sb.AppendLine("Active");
-        if (projection.Active.Count == 0)
+        // Build table source with optional filter applied.
+        var filteredProjection = this.ApplyFilterToProjection(projection, this.filterBuffer);
+        var source = new TaskTableSource(filteredProjection, this.statusGlyphs);
+        this.ListTableSource = source;
+        this.listTable.Table = source;
+
+        // Sync table selection to controller state.
+        var allRows = source.Rows;
+        if (allRows > 0)
         {
-            sb.AppendLine("  (no running tasks)");
+            var allFiltered = filteredProjection.AllRows;
+            var selIdx = allFiltered.ToList().FindIndex(r => r.Task.Id == state.SelectedTaskId);
+            if (selIdx >= 0)
+            {
+                this.listTable.SetSelection(0, selIdx, false);
+                this.listTable.EnsureCursorIsVisible();
+            }
+        }
+
+        this.listTable.Visible = true;
+        this.body.Visible = false;
+
+        if (this.filterMode)
+        {
+            this.status.Text = $" filter: {this.filterBuffer}▏";
+        }
+        else if (state.StatusMessage is { Length: > 0 } msg)
+        {
+            this.status.Text = $" {TerminalTextSanitizer.Sanitize(msg)}";
         }
         else
         {
-            foreach (var row in projection.Active)
-            {
-                AppendListRow(sb, row, state.SelectedTaskId);
-            }
+            this.status.Text = string.Empty;
         }
 
-        if (projection.Recent.Count > 0)
-        {
-            sb.AppendLine();
-            sb.AppendLine("Recent");
-            foreach (var row in projection.Recent)
-            {
-                AppendListRow(sb, row, state.SelectedTaskId);
-            }
-        }
-
-        AppendStatus(sb, state);
-        this.body.SetText(sb.ToString());
-        this.footer.Text = "↑/↓ move · PgUp/PgDn · Home/End · Enter open · x×2 stop · r dismiss · Esc close";
+        this.footer.Text = "↑/↓ k/j move · PgUp/PgDn · Home/End · Enter open · x×2 stop · d dismiss · r reload · / filter · Esc q close";
     }
 
-    private static void AppendListRow(StringBuilder sb, TaskListRow row, string? selectedId)
-    {
-        var cursor = row.Task.Id == selectedId ? '>' : ' ';
-        var indent = new string(' ', row.IndentDepth * 2);
-        var glyph = row.IndentDepth == 0 ? "●" : "└";
-        sb.Append(cursor).Append(' ').Append(indent).Append(glyph).Append(' ')
-            .Append(TerminalTextSanitizer.SanitizeSingleLine(row.Task.Description))
-            .Append("  [").Append(row.Task.Status).Append(']')
-            .AppendLine();
-    }
+    // AppendListRow removed: the list is now rendered by the TableView over TaskTableSource.
 
     private void RenderDetail(TaskBrowserState state)
     {
@@ -343,7 +422,10 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
             this.visibleOutput = [];
             this.header.Text = "Task detail";
             this.body.SetText("(no task selected)");
-            this.footer.Text = "Esc back";
+            this.body.Visible = true;
+            this.listTable.Visible = false;
+            this.status.Text = string.Empty;
+            this.footer.Text = "Esc q back";
             return;
         }
 
@@ -380,8 +462,12 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         }
 
         this.body.SetText(sb.ToString());
+        this.body.Visible = true;
+        this.listTable.Visible = false;
+
+        this.status.Text = string.Empty;
         this.footer.Text =
-            "s steer · a attach · l source · ↑/↓ scroll · End newest · Ctrl+B/Esc back · x×2 stop · r dismiss";
+            "s steer · a attach · l source · ↑/↓ k/j scroll · End newest · Ctrl+B/q/Esc back · x×2 stop · d dismiss";
     }
 
     private void RenderSteering(TaskBrowserState state)
@@ -400,12 +486,15 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
 
         sb.AppendLine();
         sb.AppendLine("Message:");
-        // The draft is shown verbatim with a visible caret so the modal editor reads like a text field.
         sb.Append(TerminalTextSanitizer.Sanitize(state.SteeringDraft)).Append('▏');
         sb.AppendLine();
 
         AppendStatus(sb, state);
         this.body.SetText(sb.ToString());
+        this.body.Visible = true;
+        this.listTable.Visible = false;
+
+        this.status.Text = string.Empty;
         this.footer.Text = "Enter send · Shift+Enter/Ctrl+Enter newline · Backspace delete · Esc cancel";
     }
 
@@ -419,6 +508,12 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         lines.Add($"Status:   {task.Status}");
         lines.Add($"Duration: {FormatDuration(task)}");
         lines.Add($"Log:      {task.LogPath}");
+        // Render the model resolved for this subagent so the browser exposes which LLM tier each task uses.
+        if (task.ResolvedModel is { Length: > 0 } model)
+        {
+            lines.Add($"Model:    {model}");
+        }
+
         if (task.Result is { Length: > 0 } result)
         {
             lines.Add($"Result:   {TerminalTextSanitizer.Sanitize(result)}");
@@ -536,6 +631,75 @@ internal sealed class TaskBrowserOverlay : View, ISelectableOverlay
         return span.TotalMinutes >= 1
             ? string.Create(CultureInfo.InvariantCulture, $"{(int)span.TotalMinutes}m {span.Seconds:00}s{suffix}")
             : string.Create(CultureInfo.InvariantCulture, $"{span.TotalSeconds:0.0}s{suffix}");
+    }
+
+    // ── Colour getters for the list table ────────────────────────────────────
+
+    private Scheme? GetRowScheme(RowColorGetterArgs args)
+    {
+        if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
+        {
+            return null;
+        }
+
+        var row = this.ListTableSource.RowAt(args.RowIndex);
+        return this.EnsureSchemes().ForRow(TaskTableSource.GetState(row.Task));
+    }
+
+    private Scheme? GetStatusCellScheme(CellColorGetterArgs args)
+    {
+        if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
+        {
+            return null;
+        }
+
+        var row = this.ListTableSource.RowAt(args.RowIndex);
+        return this.EnsureSchemes().For(TaskTableSource.GetState(row.Task));
+    }
+
+    private BrowserSchemes EnsureSchemes() =>
+        this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);
+
+    private string SynthesizeListText()
+    {
+        if (this.ListTableSource is null)
+        {
+            return string.Empty;
+        }
+
+        var sb = new StringBuilder();
+        for (var r = 0; r < this.ListTableSource.Rows; r++)
+        {
+            for (var c = 0; c < this.ListTableSource.Columns; c++)
+            {
+                if (c > 0)
+                {
+                    sb.Append(' ');
+                }
+
+                sb.Append(this.ListTableSource[r, c]);
+            }
+
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    private TaskListProjection ApplyFilterToProjection(TaskListProjection projection, string filter)
+    {
+        if (string.IsNullOrEmpty(filter))
+        {
+            return projection;
+        }
+
+        bool Matches(TaskListRow r) =>
+            r.Task.Description.Contains(filter, StringComparison.OrdinalIgnoreCase) ||
+            r.Task.Id.Contains(filter, StringComparison.OrdinalIgnoreCase);
+
+        return new TaskListProjection(
+            projection.Active.Where(Matches).ToList(),
+            projection.Recent.Where(Matches).ToList());
     }
 
     private void Observe(Task task) =>

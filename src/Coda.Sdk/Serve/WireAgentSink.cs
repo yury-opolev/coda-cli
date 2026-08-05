@@ -217,6 +217,12 @@ public sealed class WireAgentSink : IAgentSink
         _ = this.SendAsync(ServeMethods.EventSubagentBlocked, node);
     }
 
+    public void OnTaskCompleted(string taskId, string status, string description, string? report)
+    {
+        var node = ServeJson.ToNode(new Messages.TaskCompletedEvent(taskId, status, description, report));
+        _ = this.SendAsync(ServeMethods.EventTaskCompleted, node);
+    }
+
     public void OnSubagentResultModified(string hookCommand, string taskId, string originalResult, string modifiedResult)
     {
         var node = ServeJson.ToNode(new Messages.SubagentResultModifiedEvent(hookCommand, taskId, originalResult, modifiedResult));

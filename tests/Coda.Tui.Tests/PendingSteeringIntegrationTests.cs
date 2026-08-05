@@ -58,7 +58,7 @@ public sealed class PendingSteeringIntegrationTests
         var line = Assert.Single(lines);
         Assert.Equal(TranscriptRole.PendingUser, line.Role);
         Assert.True(line.FillWidth);
-        Assert.StartsWith(" > [pending] ", line.Text, StringComparison.Ordinal);
+        Assert.StartsWith(" \u276f [pending] ", line.Text, StringComparison.Ordinal);
         Assert.Contains("queued", line.Text, StringComparison.Ordinal);
         Assert.Null(line.RightText);
     }

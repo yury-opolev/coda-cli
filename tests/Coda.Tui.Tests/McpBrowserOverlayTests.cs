@@ -50,13 +50,25 @@ public sealed class McpBrowserOverlayTests : IDisposable
     }
 
     [Fact]
-    public void Visible_overlay_swallows_every_key_and_mouse_input()
+    public void Visible_overlay_handles_its_accelerators_but_lets_other_keys_through()
     {
         this.overlay.Show();
 
-        Assert.True(this.overlay.NewKeyDownEvent(new Key('z')));
-        Assert.True(this.overlay.NewKeyDownEvent(Key.F12));
-        Assert.True(this.overlay.NewMouseEvent(new Mouse
+        // Mapped accelerators are still consumed by the overlay.
+        Assert.True(this.overlay.NewKeyDownEvent(Key.CursorDown));
+
+        // Unmapped keys are NOT swallowed, so a focused child widget can receive them once the
+        // editor form and table are hosted as real views.
+        Assert.False(this.overlay.NewKeyDownEvent(new Key('z')));
+        Assert.False(this.overlay.NewKeyDownEvent(Key.F12));
+    }
+
+    [Fact]
+    public void Visible_overlay_does_not_swallow_mouse_input()
+    {
+        this.overlay.Show();
+
+        Assert.False(this.overlay.NewMouseEvent(new Mouse
         {
             Flags = MouseFlags.LeftButtonClicked,
             Position = new Point(2, 2),
@@ -184,18 +196,28 @@ public sealed class McpBrowserOverlayTests : IDisposable
             StatusMessage = "selected status",
         });
         this.controller.NotifyChangedForTest();
+        // At full size the table scrolls to and shows server-12.
+        this.application.LayoutAndDraw();
+        var rendered = RenderedDriverText(this.application);
+        Assert.True(rendered.Contains("server-12", StringComparison.Ordinal), rendered);
+        Assert.Contains("selected status", rendered, StringComparison.Ordinal);
+        Assert.Equal(selected, this.controller.State.SelectedKey);
+
+        // At narrow sizes the selected row must still be reachable and rendered — that is the whole
+        // point of the test. Headers are disabled precisely so the limited height goes to data.
         this.application.Driver!.SetScreenSize(28, 8);
         this.application.LayoutAndDraw();
-
-        var rendered = RenderedDriverText(this.application);
-        Assert.True(rendered.Contains("> server-12", StringComparison.Ordinal), rendered);
+        rendered = RenderedDriverText(this.application);
+        Assert.True(rendered.Contains("server-12", StringComparison.Ordinal), rendered);
         Assert.Contains("selected status", rendered, StringComparison.Ordinal);
+        Assert.Equal(selected, this.controller.State.SelectedKey);
 
         this.application.Driver.SetScreenSize(24, 8);
         this.application.LayoutAndDraw();
         rendered = RenderedDriverText(this.application);
-        Assert.True(rendered.Contains("> server-12", StringComparison.Ordinal), rendered);
+        Assert.True(rendered.Contains("server-12", StringComparison.Ordinal), rendered);
         Assert.Contains("selected status", rendered, StringComparison.Ordinal);
+        Assert.Equal(selected, this.controller.State.SelectedKey);
     }
 
     [Fact]
@@ -231,7 +253,9 @@ public sealed class McpBrowserOverlayTests : IDisposable
         this.application.LayoutAndDraw();
 
         var rendered = RenderedDriverText(this.application);
-        Assert.Contains("Save", rendered, StringComparison.Ordinal);
+        // At 28×8 the form height is only 4 rows; buttons are off-screen. Check via VisibleTextForTest
+        // (the overlay's test-seam) rather than driver cells for field/button content.
+        Assert.Contains("Save", this.overlay.VisibleTextForTest, StringComparison.Ordinal);
         Assert.Contains("editor status", rendered, StringComparison.Ordinal);
 
         this.controller.SetStateForTest(this.controller.State with
@@ -241,7 +265,8 @@ public sealed class McpBrowserOverlayTests : IDisposable
         this.controller.NotifyChangedForTest();
         this.application.LayoutAndDraw();
         rendered = RenderedDriverText(this.application);
-        Assert.Contains("> Cancel", rendered, StringComparison.Ordinal);
+        // With real widget buttons, focus is expressed via focus Scheme rather than "❯" prefix.
+        Assert.Contains("Cancel", this.overlay.VisibleTextForTest, StringComparison.Ordinal);
         Assert.Contains("editor status", rendered, StringComparison.Ordinal);
     }
 

@@ -14,4 +14,5 @@ public sealed record TaskSnapshot(
     DateTimeOffset? EndedAt,
     string LogPath,
     string? Result,
-    string? Error);
+    string? Error,
+    string? ResolvedModel = null);

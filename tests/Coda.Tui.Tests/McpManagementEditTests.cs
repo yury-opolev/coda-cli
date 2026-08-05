@@ -2052,6 +2052,98 @@ public sealed class McpManagementEditTests
         Assert.True(harness.HasNoConfigLockFiles());
     }
 
+    [Fact]
+    public async Task Transport_change_warning_present_when_transport_differs_from_original()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","args":["server.js"]}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var switched = draft with
+        {
+            Transport = McpTransportKind.Http,
+            Url = "https://example.test/mcp",
+            AuthMode = McpAuthMode.None,
+        };
+        var preview = await harness.Service.PrepareEditAsync(original, switched, CancellationToken.None);
+
+        Assert.Contains(
+            preview.Warnings,
+            warning => warning.Contains("Changing the transport", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Transport_change_warning_absent_when_transport_unchanged()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","args":["server.js"]}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with { Command = "deno" },
+            CancellationToken.None);
+
+        Assert.DoesNotContain(
+            preview.Warnings,
+            warning => warning.Contains("Changing the transport", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task Transport_change_warning_names_dropped_fields_for_stdio_to_http()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","args":["server.js"],"env":{"TOKEN":"x"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var switched = draft with
+        {
+            Transport = McpTransportKind.Http,
+            Url = "https://example.test/mcp",
+            AuthMode = McpAuthMode.None,
+            Environment = ImmutableArray<McpNamedSecretDraft>.Empty,
+        };
+        var preview = await harness.Service.PrepareEditAsync(original, switched, CancellationToken.None);
+        var warning = Assert.Single(
+            preview.Warnings,
+            w => w.Contains("Changing the transport", StringComparison.Ordinal));
+
+        Assert.Contains("command", warning, StringComparison.Ordinal);
+        Assert.Contains("arguments", warning, StringComparison.Ordinal);
+        Assert.Contains("environment", warning, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task Transport_change_warning_names_dropped_fields_for_http_to_stdio()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp"}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var switched = draft with { Transport = McpTransportKind.Stdio, Command = "node" };
+        var preview = await harness.Service.PrepareEditAsync(original, switched, CancellationToken.None);
+        var warning = Assert.Single(
+            preview.Warnings,
+            w => w.Contains("Changing the transport", StringComparison.Ordinal));
+
+        Assert.Contains("URL", warning, StringComparison.Ordinal);
+        Assert.Contains("headers", warning, StringComparison.Ordinal);
+        Assert.Contains("authentication mode", warning, StringComparison.Ordinal);
+        Assert.Contains("bearer token", warning, StringComparison.Ordinal);
+    }
+
     private static McpServerDraft StdioDraft(
         string name = "server",
         ImmutableArray<McpNamedSecretDraft> environment = default) =>

@@ -314,4 +314,109 @@ public sealed class SubagentConcurrencyTests
 
         Assert.Equal(expected, mgr.AvailableSubagentSlots);
     }
+
+    // -----------------------------------------------------------------------
+    // SubagentStartBlockedException — slot must be returned (Task 5)
+    // -----------------------------------------------------------------------
+
+    /// <summary>Throws SubagentStartBlockedException, simulating a fail-closed SubagentStart hook.</summary>
+    private sealed class SubagentStartBlockedHost : ISubagentHost
+    {
+        public Task<string> RunSubagentAsync(
+            string subagentType, string prompt, IAgentSink sink, SteeringInbox steering,
+            string taskId, int depth, CancellationToken cancellationToken = default) =>
+            throw new SubagentStartBlockedException("hook blocked this subagent");
+    }
+
+    [Fact]
+    public async Task Task_returns_its_slot_when_SubagentStart_blocks_the_subagent()
+    {
+        using var mgr = NewManager(maxConcurrent: 2);
+        var ctx = new ToolContext(Directory.GetCurrentDirectory())
+        {
+            Tasks = mgr,
+            Subagents = new SubagentStartBlockedHost(),
+        };
+
+        var result = await new TaskTool().ExecuteAsync(
+            Input("""{"description":"x","prompt":"y"}"""), ctx, CancellationToken.None);
+
+        // TaskTool surfaces the block reason as an error result, not an exception.
+        Assert.True(result.IsError);
+        Assert.Equal(2, mgr.AvailableSubagentSlots);
+    }
+
+    [Fact]
+    public async Task Task_start_returns_its_slot_when_SubagentStart_blocks_the_background_subagent()
+    {
+        using var mgr = NewManager(maxConcurrent: 2);
+        var ctx = new ToolContext(Directory.GetCurrentDirectory())
+        {
+            Tasks = mgr,
+            Subagents = new SubagentStartBlockedHost(),
+        };
+
+        await new BackgroundTaskStartTool().ExecuteAsync(
+            Input("""{"prompt":"y"}"""), ctx, CancellationToken.None);
+
+        // Background release happens on a pool thread; wait for it.
+        await WaitForSlotsAsync(mgr, expected: 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default fan-out 20: 20 sequential task_starts yield 20 concurrent tasks (Task 6)
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public async Task Twenty_sequential_task_starts_yield_twenty_concurrent_running_tasks()
+    {
+        // task_start returns immediately (fire-and-forget), so 20 sequential calls must
+        // all succeed and hold 20 slots simultaneously. This is the user-facing goal of
+        // raising the default fan-out from 8 to 20.
+        using var mgr = new TaskManager(
+            sessionId: "sess-fanout",
+            logRoot: null,
+            subagentSettings: SubagentSettings.Default);
+
+        Assert.Equal(20, mgr.MaxConcurrentSubagents);
+
+        var blockers = new BlockingHost[20];
+        for (var i = 0; i < 20; i++)
+        {
+            blockers[i] = new BlockingHost();
+            var ctx = new ToolContext(Directory.GetCurrentDirectory())
+            {
+                Tasks = mgr,
+                Subagents = blockers[i],
+            };
+
+            var result = await new BackgroundTaskStartTool().ExecuteAsync(
+                Input("""{"prompt":"y"}"""), ctx, CancellationToken.None);
+
+            Assert.False(result.IsError, $"task_start {i + 1} failed: {result.Content}");
+        }
+
+        // Wait for all 20 to actually start before asserting concurrency.
+        foreach (var b in blockers)
+        {
+            await b.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+        }
+
+        Assert.Equal(0, mgr.AvailableSubagentSlots);
+
+        // A 21st start must be refused.
+        var overflowCtx = new ToolContext(Directory.GetCurrentDirectory())
+        {
+            Tasks = mgr,
+            Subagents = new FakeHost(),
+        };
+        var overflowResult = await new BackgroundTaskStartTool().ExecuteAsync(
+            Input("""{"prompt":"overflow"}"""), overflowCtx, CancellationToken.None);
+        Assert.True(overflowResult.IsError);
+        Assert.Contains("20", overflowResult.Content);
+
+        // Release all.
+        foreach (var b in blockers) b.Release();
+        await WaitForSlotsAsync(mgr, expected: 20);
+    }
 }

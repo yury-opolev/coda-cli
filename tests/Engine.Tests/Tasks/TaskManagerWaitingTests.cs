@@ -105,4 +105,5 @@ public class TaskManagerWaitingTests : IDisposable
 
         Assert.Equal(TaskActionResult.Denied, mgr.TryDetach(shell.Id, callerTaskId: a.Id));
     }
+
 }

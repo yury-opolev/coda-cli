@@ -125,13 +125,13 @@ public sealed class SubagentSettingsTests : IDisposable
     public void A_project_setting_overrides_the_user_setting()
     {
         var settings = this.Load(
-            userJson: """{"subagents":{"maxDepth":2,"maxConcurrent":8}}""",
+            userJson: """{"subagents":{"maxDepth":2,"maxConcurrent":20}}""",
             projectJson: """{"subagents":{"maxDepth":4}}""");
 
         Assert.Equal(4, settings.Subagents.MaxDepth);
 
         // The field the project did not set still comes from the user file.
-        Assert.Equal(8, settings.Subagents.MaxConcurrent);
+        Assert.Equal(20, settings.Subagents.MaxConcurrent);
     }
 
     // -----------------------------------------------------------------------
@@ -186,5 +186,89 @@ public sealed class SubagentSettingsTests : IDisposable
 
         Assert.Equal(5, settings.Subagents.MaxDepth);
         Assert.Equal(16, settings.Subagents.MaxConcurrent);
+    }
+
+    // -----------------------------------------------------------------------
+    // Default fan-out 20 (Task 6)
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public void The_default_maxConcurrent_is_20()
+    {
+        Assert.Equal(20, SubagentSettings.Default.MaxConcurrent);
+    }
+
+    // -----------------------------------------------------------------------
+    // Model / ModelByType — user-only fields (Tasks 1 and 2)
+    // -----------------------------------------------------------------------
+
+    [Fact]
+    public void Default_model_is_null()
+    {
+        Assert.Null(SubagentSettings.Default.Model);
+    }
+
+    [Fact]
+    public void Default_ModelByType_is_empty()
+    {
+        Assert.Empty(SubagentSettings.Default.ModelByType);
+    }
+
+    [Fact]
+    public void Blank_or_whitespace_model_normalises_to_null()
+    {
+        Assert.Null(new SubagentSettings { Model = "" }.Model);
+        Assert.Null(new SubagentSettings { Model = "   " }.Model);
+    }
+
+    [Fact]
+    public void User_file_model_is_read()
+    {
+        var settings = this.Load(userJson: """{"subagents":{"model":"claude-sonnet-4-6"}}""");
+        Assert.Equal("claude-sonnet-4-6", settings.Subagents.Model);
+    }
+
+    [Fact]
+    public void User_file_modelByType_is_read()
+    {
+        var settings = this.Load(userJson: """{"subagents":{"modelByType":{"explore":"fast-model"}}}""");
+        Assert.Equal("fast-model", settings.Subagents.ModelByType["explore"]);
+    }
+
+    [Fact]
+    public void ModelByType_lookup_is_ordinal_ignore_case()
+    {
+        var settings = this.Load(userJson: """{"subagents":{"modelByType":{"Explore":"fast-model"}}}""");
+        Assert.Equal("fast-model", settings.Subagents.ModelByType["EXPLORE"]);
+    }
+
+    [Fact]
+    public void A_project_file_cannot_set_model()
+    {
+        // Model is a cost lever; a hostile project must not be able to force the session to an
+        // expensive model.
+        var settings = this.Load(
+            projectJson: """{"subagents":{"model":"gpt-expensive"}}""");
+
+        Assert.Null(settings.Subagents.Model);
+    }
+
+    [Fact]
+    public void A_project_file_cannot_override_the_user_model()
+    {
+        var settings = this.Load(
+            userJson: """{"subagents":{"model":"user-model"}}""",
+            projectJson: """{"subagents":{"model":"project-model"}}""");
+
+        Assert.Equal("user-model", settings.Subagents.Model);
+    }
+
+    [Fact]
+    public void A_project_file_cannot_set_modelByType()
+    {
+        var settings = this.Load(
+            projectJson: """{"subagents":{"modelByType":{"general-purpose":"gpt-expensive"}}}""");
+
+        Assert.Empty(settings.Subagents.ModelByType);
     }
 }

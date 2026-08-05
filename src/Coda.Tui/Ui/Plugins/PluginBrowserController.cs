@@ -215,6 +215,20 @@ internal sealed class PluginBrowserController : IDisposable
 
     // ── Actions ───────────────────────────────────────────────────────────────
 
+    /// <summary>Requests a reload of the plugin set from disk (processed by the pump).</summary>
+    public void Reload()
+    {
+        lock (this.sync)
+        {
+            if (!this.open)
+            {
+                return;
+            }
+        }
+
+        this.signal.Release();
+    }
+
     /// <summary>Toggles the selected plugin's enabled state via the state store, then refreshes.</summary>
     public void ToggleSelectedEnabled()
     {

@@ -138,14 +138,24 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             Assert.Contains("child-task", body, StringComparison.Ordinal);
             Assert.Contains("finished-task", body, StringComparison.Ordinal);
 
-            // The child (running, under a running parent) is indented deeper than its parent row.
-            var parentLine = LineContaining(body, "parent-task");
-            var childLine = LineContaining(body, "child-task");
-            Assert.True(LeadingSpaces(childLine) > LeadingSpaces(parentLine));
+            // The list now renders via a TableView (Task 10); indentation is in the Description column
+            // rather than as line-leading spaces. Check the table source directly so the assertion does
+            // not depend on screen-width truncation of the synthesized text.
+            var source = overlay.ListTableSource;
+            Assert.NotNull(source);
+            var parentRow = Enumerable.Range(0, source!.Rows)
+                .First(i => source[i, 3].ToString()!.Contains("parent-task", StringComparison.Ordinal));
+            var childRow = Enumerable.Range(0, source.Rows)
+                .First(i => source[i, 3].ToString()!.Contains("child-task", StringComparison.Ordinal));
+            var parentDesc = source[parentRow, 3].ToString()!;
+            var childDesc = source[childRow, 3].ToString()!;
+            Assert.True(LeadingSpaces(childDesc) > LeadingSpaces(parentDesc),
+                $"Expected child indented deeper than parent. parent='{parentDesc}' child='{childDesc}'");
 
-            // Active + recent groups are labelled.
-            Assert.Contains("Active", body, StringComparison.OrdinalIgnoreCase);
-            Assert.Contains("Recent", body, StringComparison.OrdinalIgnoreCase);
+            // Active/recent grouping is preserved in the Group column (column index 1).
+            var groups = Enumerable.Range(0, source.Rows).Select(i => source[i, 1].ToString()!).ToList();
+            Assert.Contains(groups, g => g.Equals("active", StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(groups, g => g.Equals("recent", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -629,6 +639,72 @@ public sealed class TaskBrowserOverlayTests : IDisposable
             Assert.Equal(TaskBrowserView.Steering, controller.State.View);
             Assert.Equal("h", controller.State.SteeringDraft);
             Assert.Equal(TaskRunStatus.Running, _mgr.Get(t.Id)!.Status);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Regression guard: the task detail pane must show the resolved model so users can tell which
+    /// LLM tier each subagent is running — the headline capability promised by the subagent spec.
+    /// </summary>
+    [Fact]
+    public void Detail_ShowsResolvedModel_WhenSet()
+    {
+        var t = _mgr.Register(TaskKind.Subagent, "model-task", parentTaskId: null);
+        _mgr.SetTaskResolvedModel(t.Id, "claude-opus-4-8");
+
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+            overlay.NewKeyDownEvent(Key.Enter); // open detail
+
+            var body = overlay.BodyText;
+            Assert.Contains("Model:", body, StringComparison.Ordinal);
+            Assert.Contains("claude-opus-4-8", body, StringComparison.Ordinal);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Regression guard: the task detail pane must NOT render a blank "Model:" row when the resolved
+    /// model is absent — an empty metadata row would be misleading and visually ragged.
+    /// </summary>
+    [Fact]
+    public void Detail_DoesNotShowModelRow_WhenNotSet()
+    {
+        _mgr.Register(TaskKind.Shell, "no-model-task", parentTaskId: null);
+
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+            overlay.NewKeyDownEvent(Key.Enter); // open detail
+
+            // When no model was resolved (e.g. shell tasks) no Model: row should appear.
+            Assert.DoesNotContain("Model:", overlay.BodyText, StringComparison.Ordinal);
         }
         finally
         {

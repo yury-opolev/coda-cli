@@ -74,7 +74,7 @@ public class ParityToolsTests : IDisposable
     [InlineData(null, "Task 't-1' finished.")] // concurrently pruned after Terminal — no bogus "status finished"
     [InlineData("completed", "Task 't-1' finished with status completed.")]
     public void FormatFinished_OmitsStatusClauseWhenMissing(string? status, string expected) =>
-        Assert.Equal(expected, TaskWaitTool.FormatFinished("t-1", status));
+        Assert.Equal(expected, TaskWaitTool.FormatFinished("t-1", status, report: null));
 
     [Fact]
     public async Task TaskWait_UnauthorizedTask_IsIndistinguishableFromNotFound()

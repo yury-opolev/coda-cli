@@ -1,8 +1,10 @@
 using Coda.Agent;
 using Coda.Agent.Tasks;
+using Coda.Sdk;
 using Coda.Tui.Agent;
 using Coda.Tui.Repl;
 using Coda.Tui.Ui.Input;
+using Coda.Tui.Ui.Models;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.Shells;
 using Coda.Tui.Ui.State;
@@ -738,5 +740,66 @@ public sealed class TasksInterceptTests
     private static void TryDelete(string dir)
     {
         try { Directory.Delete(dir, recursive: true); } catch { }
+    }
+
+    private static ModelListResult MakeModelResult() =>
+        new("provider", ModelSource.Live, [new ModelListEntry("claude-sonnet")]);
+
+    // ---- Mutual exclusion: model browser must hide when any other browser opens -----------------
+
+    /// <summary>
+    /// Regression guard: the five Open*Browser entry points each hid only the other four before this
+    /// fix; they never hid the model overlay, so both could be visible at once. This test is the
+    /// canonical regression insurance for HideAllBrowsersExcept.
+    /// </summary>
+    [Fact]
+    public void OpenTaskBrowser_HidesModelBrowser()
+    {
+        using var mgr = NewManager(out var dir);
+        try
+        {
+            using var host = ProviderShellHost.Begin(() => new TaskBrowserProvider(mgr, new AgentExecutionGate()));
+            host.Shell.ModelBrowserOverlay.Show(MakeModelResult(), null, _ => { });
+            host.App.LayoutAndDraw();
+
+            Assert.True(host.Shell.ModelBrowserOverlay.Visible, "model browser must be visible before the browser switch");
+
+            Submit(host.Shell, "/tasks");
+
+            Assert.False(host.Shell.ModelBrowserOverlay.Visible, "model browser must be hidden after /tasks opens the task browser");
+            Assert.True(host.Shell.TaskOverlay!.Visible);
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
+    }
+
+    [Fact]
+    public void OpenTaskBrowser_WhenModelBrowserIsVisible_HidesPreviousAndOpensNew()
+    {
+        // Symmetric check: confirm that the model browser visibility is correctly reset before the task
+        // browser receives focus, preventing two focusable modal overlays from coexisting.
+        using var mgr = NewManager(out var dir);
+        try
+        {
+            using var host = ProviderShellHost.Begin(() => new TaskBrowserProvider(mgr, new AgentExecutionGate()));
+            host.Shell.ModelBrowserOverlay.Show(MakeModelResult(), null, _ => { });
+            host.App.LayoutAndDraw();
+
+            Submit(host.Shell, "/tasks");
+
+            // Both at once is the bug; after the fix, the model browser must be gone.
+            var visible = host.Shell.SubViews
+                .Where(v => v is { Visible: true } && (v == host.Shell.ModelBrowserOverlay || v == host.Shell.TaskOverlay))
+                .ToList();
+
+            Assert.Single(visible);
+            Assert.Same(host.Shell.TaskOverlay, visible[0]);
+        }
+        finally
+        {
+            TryDelete(dir);
+        }
     }
 }

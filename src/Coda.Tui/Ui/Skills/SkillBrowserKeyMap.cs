@@ -26,12 +26,19 @@ internal static class SkillBrowserKeyMap
         if (key == Key.Enter) return SkillBrowserCommand.OpenDetail;
         if (key == Key.Space) return SkillBrowserCommand.ToggleEnabled;
         if (key == new Key('r')) return SkillBrowserCommand.Reload;
+        if (key == new Key('/')) return SkillBrowserCommand.Filter;
         return SkillBrowserCommand.None;
     }
 
     private static SkillBrowserCommand MapDetail(Key key)
     {
-        if (key == Key.Esc) return SkillBrowserCommand.ReturnToList;
+        if (key == Key.Esc || key == Key.Q) return SkillBrowserCommand.ReturnToList;
+        if (key == Key.CursorUp || key == Key.K) return SkillBrowserCommand.MoveUp;
+        if (key == Key.CursorDown || key == Key.J) return SkillBrowserCommand.MoveDown;
+        if (key == Key.PageUp) return SkillBrowserCommand.PageUp;
+        if (key == Key.PageDown) return SkillBrowserCommand.PageDown;
+        if (key == Key.Home) return SkillBrowserCommand.MoveToStart;
+        if (key == Key.End) return SkillBrowserCommand.MoveToEnd;
         if (key == Key.Space) return SkillBrowserCommand.ToggleEnabled;
         if (key == new Key('r')) return SkillBrowserCommand.Reload;
         return SkillBrowserCommand.None;

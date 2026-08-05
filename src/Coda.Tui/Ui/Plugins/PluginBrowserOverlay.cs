@@ -23,14 +23,23 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
     private readonly PluginBrowserController controller;
     private TuiTheme theme;
     private readonly Action? onChanged;
+    private readonly StatusGlyphs statusGlyphs;
 
     private readonly Label header;
     private readonly SelectableTextView body;
+    private readonly TableView listTable;
+    private readonly Label status;
     private readonly Label footer;
+
+    private BrowserSchemes? browserSchemes;
 
     private CancellationTokenSource? pumpCts;
     private bool active;
     private bool disposed;
+
+    // Filter-mode state: / enters filter mode; keys go to the buffer; Esc exits filter first.
+    private bool filterMode;
+    private string filterBuffer = string.Empty;
 
     /// <summary>Creates the overlay bound to <paramref name="controller"/>.</summary>
     public PluginBrowserOverlay(
@@ -38,12 +47,14 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
         PluginBrowserController controller,
         TuiTheme? theme = null,
         Action? onChanged = null,
-        Action<string, Action>? onCopyRequested = null)
+        Action<string, Action>? onCopyRequested = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
         this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
+        this.statusGlyphs = statusGlyphs ?? StatusGlyphs.Unicode;
 
         this.Visible = false;
         this.CanFocus = true;
@@ -52,22 +63,59 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
         this.BorderStyle = LineStyle.Rounded;
 
         this.header = new Label { X = 0, Y = 0, Width = Dim.Fill(), Height = 1, CanFocus = false };
-        this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1) };
-        this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+
+        this.listTable = new TableView
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            CanFocus = false,
+            Visible = false,
+        };
+        this.listTable.Style.ShowHeaders = false;
+        this.listTable.Style.ShowHorizontalHeaderUnderline = false;
+        this.listTable.Style.ShowHorizontalHeaderOverline = false;
+        this.listTable.Style.ShowVerticalCellLines = false;
+        this.listTable.Style.ColumnStyles[0] = new ColumnStyle { MinWidth = 1, MaxWidth = 1, ColorGetter = this.GetStatusCellScheme };
+        this.listTable.Style.ColumnStyles[1] = new ColumnStyle { MinWidth = 6, MaxWidth = 24 };
+        this.listTable.Style.ColumnStyles[2] = new ColumnStyle { MinWidth = 3, MaxWidth = 10 };
+        this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 4, MaxWidth = 9 };
+        this.listTable.Style.ColumnStyles[4] = new ColumnStyle { MinWidth = 0, MaxWidth = 4 };
+        this.listTable.Style.RowColorGetter = this.GetRowScheme;
+
+        this.body = new SelectableTextView(app)
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            Visible = false,
+        };
         if (onCopyRequested is not null)
         {
             this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
         }
 
-        this.Add(this.header);
-        this.Add(this.body);
-        this.Add(this.footer);
+        this.status = new Label { X = 0, Y = Pos.AnchorEnd(2), Width = Dim.Fill(), Height = 1, CanFocus = false };
+        this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+
+        this.Add(this.header, this.listTable, this.body, this.status, this.footer);
+
+        this.listTable.FrameChanged += (_, _) =>
+        {
+            if (this.active && this.listTable.Visible)
+            {
+                this.listTable.EnsureCursorIsVisible();
+            }
+        };
     }
 
     /// <summary>Re-applies the surface theme and re-renders (if active).</summary>
     internal void ApplyTheme(TuiTheme theme)
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.browserSchemes = null;
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
@@ -85,16 +133,19 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
 
     internal string HeaderText => this.header.Text ?? string.Empty;
 
-    internal string BodyText => this.body.AllText;
+    /// <summary>Returns body content (detail pane) or synthesized table row text (list pane).</summary>
+    internal string BodyText => this.body.Visible ? this.body.AllText : this.SynthesizeListText();
+
+    internal string StatusText => this.status.Text ?? string.Empty;
 
     internal string FooterText => this.footer.Text ?? string.Empty;
 
-    // ── ISelectableOverlay ────────────────────────────────────────────────────
+    /// <summary>The current table source (null when in detail view). Test seam for direct row inspection.</summary>
+    internal PluginTableSource? ListTableSource { get; private set; }
+
+    // -- ISelectableOverlay ---
     SelectableTextView ISelectableOverlay.Body => this.body;
 
-    // ── Show / Hide / Teardown ────────────────────────────────────────────────
-
-    /// <summary>Opens the controller, subscribes to changes, starts a fresh pump, focuses, and renders.</summary>
     public void Show()
     {
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
@@ -120,7 +171,6 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
         this.Render();
     }
 
-    /// <summary>Cancels the pump, unsubscribes, closes the controller, and hides.</summary>
     public void Hide()
     {
         if (!this.active)
@@ -146,9 +196,6 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
         this.controller.Close();
     }
 
-    // ── Key routing ───────────────────────────────────────────────────────────
-
-    /// <inheritdoc/>
     protected override bool OnKeyDown(Key key)
     {
         if (key is null)
@@ -161,6 +208,33 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
             return base.OnKeyDown(key);
         }
 
+        if (this.filterMode)
+        {
+            if (key == Key.Esc)
+            {
+                this.filterMode = false;
+                this.filterBuffer = string.Empty;
+                this.Render();
+                return true;
+            }
+
+            if (key == Key.Backspace && this.filterBuffer.Length > 0)
+            {
+                this.filterBuffer = this.filterBuffer[..^1];
+                this.Render();
+                return true;
+            }
+
+            if (TryGetPrintable(key, out var ch))
+            {
+                this.filterBuffer += ch;
+                this.Render();
+                return true;
+            }
+
+            return true;
+        }
+
         var command = PluginBrowserKeyMap.Map(key, this.controller.State.View);
         switch (command)
         {
@@ -170,26 +244,32 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
 
             case PluginBrowserCommand.MoveUp:
                 this.controller.MoveSelection(-1);
+                this.Render();
                 return true;
 
             case PluginBrowserCommand.MoveDown:
                 this.controller.MoveSelection(1);
+                this.Render();
                 return true;
 
             case PluginBrowserCommand.PageUp:
                 this.controller.MoveSelection(-PageStep);
+                this.Render();
                 return true;
 
             case PluginBrowserCommand.PageDown:
                 this.controller.MoveSelection(PageStep);
+                this.Render();
                 return true;
 
             case PluginBrowserCommand.MoveToStart:
                 this.controller.MoveToStart();
+                this.Render();
                 return true;
 
             case PluginBrowserCommand.MoveToEnd:
                 this.controller.MoveToEnd();
+                this.Render();
                 return true;
 
             case PluginBrowserCommand.OpenDetail:
@@ -204,15 +284,23 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
                 this.controller.ToggleSelectedEnabled();
                 return true;
 
+            case PluginBrowserCommand.Reload:
+                this.controller.Reload();
+                return true;
+
             case PluginBrowserCommand.Update:
                 this.Observe(this.controller.UpdateSelectedAsync(CancellationToken.None));
+                return true;
+
+            case PluginBrowserCommand.Filter:
+                this.filterMode = true;
+                this.filterBuffer = string.Empty;
+                this.Render();
                 return true;
         }
 
         return base.OnKeyDown(key);
     }
-
-    // ── Render ────────────────────────────────────────────────────────────────
 
     private void OnControllerChanged()
     {
@@ -251,35 +339,42 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
 
     private void RenderList(PluginBrowserState state)
     {
+        var plugins = ApplyFilter(state.Plugins, this.filterBuffer);
         var count = state.Plugins.Count;
         var title = count == 1 ? "1 plugin" : $"{count} plugins";
         this.header.Text = $" Plugins — {title}";
 
-        if (count == 0)
+        var source = new PluginTableSource(plugins, this.statusGlyphs, this.controller.IsTrusted);
+        this.ListTableSource = source;
+        this.listTable.Table = source;
+
+        if (plugins.Count > 0)
         {
-            this.body.SetText("  (no plugins installed)");
+            var selIdx = plugins.ToList().FindIndex(p => p.Name == state.SelectedName);
+            if (selIdx >= 0)
+            {
+                this.listTable.SetSelection(0, selIdx, false);
+                this.listTable.EnsureCursorIsVisible();
+            }
+        }
+
+        this.listTable.Visible = true;
+        this.body.Visible = false;
+
+        if (this.filterMode)
+        {
+            this.status.Text = $" filter: {this.filterBuffer}▏";
+        }
+        else if (state.StatusMessage is { Length: > 0 } msg)
+        {
+            this.status.Text = $" {TerminalTextSanitizer.SanitizeSingleLine(msg)}";
         }
         else
         {
-            var lines = new System.Text.StringBuilder();
-            foreach (var plugin in state.Plugins)
-            {
-                var selected = plugin.Name == state.SelectedName;
-                var prefix = selected ? "▶ " : "  ";
-                var name = TerminalTextSanitizer.SanitizeSingleLine(plugin.Name);
-                var version = TerminalTextSanitizer.SanitizeSingleLine(plugin.Version);
-                var enabled = plugin.IsEnabled ? "enabled" : "disabled";
-                var trusted = this.controller.IsTrusted(plugin) ? "trusted" : "untrusted";
-                var external = plugin.IsExternal ? " [external]" : string.Empty;
-                lines.AppendLine($"{prefix}{name} v{version}  [{enabled}] [{trusted}]{external}");
-            }
-
-            this.body.SetText(lines.ToString());
+            this.status.Text = string.Empty;
         }
 
-        this.footer.Text = state.StatusMessage is { Length: > 0 } msg
-            ? $" {TerminalTextSanitizer.SanitizeSingleLine(msg)}"
-            : " ↑/↓ navigate · Enter detail · Space toggle · u update · Esc close";
+        this.footer.Text = " ↑/↓ k/j move · Enter detail · Space toggle · r reload · u update · / filter · Esc q close";
     }
 
     private void RenderDetail(PluginInfo plugin, PluginBrowserState state)
@@ -296,14 +391,90 @@ internal sealed class PluginBrowserOverlay : View, ISelectableOverlay
         sb.AppendLine($"  directory   {TerminalTextSanitizer.SanitizeSingleLine(plugin.Directory)}");
 
         this.body.SetText(sb.ToString());
-        this.footer.Text = state.StatusMessage is { Length: > 0 } msg
-            ? $" {TerminalTextSanitizer.SanitizeSingleLine(msg)}"
-            : " Esc back · Space toggle · u update";
+
+        this.body.Visible = true;
+        this.listTable.Visible = false;
+
+        this.status.Text = state.StatusMessage is { Length: > 0 } m
+            ? $" {TerminalTextSanitizer.SanitizeSingleLine(m)}"
+            : string.Empty;
+        this.footer.Text = " Esc q back · ↑/↓ k/j · Space toggle · r reload · u update";
     }
 
-    // ── IDisposable ───────────────────────────────────────────────────────────
+    private Scheme? GetRowScheme(RowColorGetterArgs args)
+    {
+        if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
+        {
+            return null;
+        }
 
-    /// <inheritdoc/>
+        var plugin = this.ListTableSource.PluginAt(args.RowIndex);
+        return this.EnsureSchemes().ForRow(PluginTableSource.GetState(plugin, this.controller.IsTrusted(plugin)));
+    }
+
+    private Scheme? GetStatusCellScheme(CellColorGetterArgs args)
+    {
+        if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
+        {
+            return null;
+        }
+
+        var plugin = this.ListTableSource.PluginAt(args.RowIndex);
+        return this.EnsureSchemes().For(PluginTableSource.GetState(plugin, this.controller.IsTrusted(plugin)));
+    }
+
+    private BrowserSchemes EnsureSchemes() =>
+        this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);
+
+    private string SynthesizeListText()
+    {
+        if (this.ListTableSource is null)
+        {
+            return string.Empty;
+        }
+
+        var sb = new System.Text.StringBuilder();
+        for (var r = 0; r < this.ListTableSource.Rows; r++)
+        {
+            for (var c = 0; c < this.ListTableSource.Columns; c++)
+            {
+                if (c > 0)
+                {
+                    sb.Append(' ');
+                }
+
+                sb.Append(this.ListTableSource[r, c]);
+            }
+
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    private static IReadOnlyList<PluginInfo> ApplyFilter(IReadOnlyList<PluginInfo> plugins, string filter)
+    {
+        if (string.IsNullOrEmpty(filter))
+        {
+            return plugins;
+        }
+
+        return plugins.Where(p => p.Name.Contains(filter, StringComparison.OrdinalIgnoreCase)).ToList();
+    }
+
+    private static bool TryGetPrintable(Key key, out string text)
+    {
+        var rune = key.AsRune;
+        if (rune.Value > 0x1F && !char.IsControl((char)rune.Value))
+        {
+            text = rune.ToString();
+            return true;
+        }
+
+        text = string.Empty;
+        return false;
+    }
+
     protected override void Dispose(bool disposing)
     {
         if (!this.disposed && disposing)

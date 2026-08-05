@@ -35,7 +35,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 40);
 
         var line = Assert.Single(lines);
-        Assert.Equal(" > hello world", line.Text);
+        Assert.Equal(" \u276f hello world", line.Text);
         Assert.Equal(TranscriptRole.User, line.Role);
         // A user message renders as a full-width background block.
         Assert.True(line.FillWidth);
@@ -52,7 +52,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 40);
 
         var line = Assert.Single(lines);
-        Assert.Equal(" > hello", line.Text);
+        Assert.Equal(" \u276f hello", line.Text);
         Assert.True(line.FillWidth);
         // The sent time is attached to the block (HH:mm), drawn as a right annotation — never mixed into the
         // copyable text.
@@ -291,7 +291,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 7);
 
-        Assert.Equal([" > \u754c\u754c", "   \u00e9"], lines.Select(line => line.Text));
+        Assert.Equal([" \u276f \u754c\u754c", "   \u00e9"], lines.Select(line => line.Text));
         Assert.All(lines, line => Assert.Equal(TranscriptRole.User, line.Role));
     }
 
@@ -315,7 +315,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var lines = TranscriptBlockFormatter.Format(block, width: 7);
 
-        Assert.Equal([" > \u754c\u754c", "   e\u0301"], lines.Select(line => line.Text));
+        Assert.Equal([" \u276f \u754c\u754c", "   e\u0301"], lines.Select(line => line.Text));
     }
 
     [Fact]
@@ -634,7 +634,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
         var line = Assert.Single(lines);
-        Assert.StartsWith(" > [pending] ", line.Text, StringComparison.Ordinal);
+        Assert.StartsWith(" \u276f [pending] ", line.Text, StringComparison.Ordinal);
         Assert.Contains("queued message", line.Text, StringComparison.Ordinal);
     }
 
@@ -667,7 +667,7 @@ public sealed class TranscriptBlockFormatterTests
         var lines = TranscriptBlockFormatter.Format(block, width: 80);
 
         Assert.True(lines.Count >= 3, "multi-line message must produce at least three lines");
-        Assert.StartsWith(" > [pending] ", lines[0].Text, StringComparison.Ordinal);
+        Assert.StartsWith(" \u276f [pending] ", lines[0].Text, StringComparison.Ordinal);
         Assert.All(lines.Skip(1), line => Assert.False(line.Text.Contains("[pending]", StringComparison.Ordinal)));
     }
 
@@ -680,7 +680,7 @@ public sealed class TranscriptBlockFormatterTests
 
         var line = Assert.Single(lines);
         Assert.Equal(TranscriptRole.User, line.Role);
-        Assert.Equal(" > sent message", line.Text);
+        Assert.Equal(" \u276f sent message", line.Text);
         Assert.True(line.FillWidth);
         Assert.DoesNotContain("[pending]", line.Text, StringComparison.Ordinal);
     }

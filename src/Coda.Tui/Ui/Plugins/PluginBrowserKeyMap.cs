@@ -25,14 +25,23 @@ internal static class PluginBrowserKeyMap
         if (key == Key.End) return PluginBrowserCommand.MoveToEnd;
         if (key == Key.Enter) return PluginBrowserCommand.OpenDetail;
         if (key == Key.Space) return PluginBrowserCommand.ToggleEnabled;
+        if (key == new Key('r')) return PluginBrowserCommand.Reload;
         if (key == new Key('u')) return PluginBrowserCommand.Update;
+        if (key == new Key('/')) return PluginBrowserCommand.Filter;
         return PluginBrowserCommand.None;
     }
 
     private static PluginBrowserCommand MapDetail(Key key)
     {
-        if (key == Key.Esc) return PluginBrowserCommand.ReturnToList;
+        if (key == Key.Esc || key == Key.Q) return PluginBrowserCommand.ReturnToList;
+        if (key == Key.CursorUp || key == Key.K) return PluginBrowserCommand.MoveUp;
+        if (key == Key.CursorDown || key == Key.J) return PluginBrowserCommand.MoveDown;
+        if (key == Key.PageUp) return PluginBrowserCommand.PageUp;
+        if (key == Key.PageDown) return PluginBrowserCommand.PageDown;
+        if (key == Key.Home) return PluginBrowserCommand.MoveToStart;
+        if (key == Key.End) return PluginBrowserCommand.MoveToEnd;
         if (key == Key.Space) return PluginBrowserCommand.ToggleEnabled;
+        if (key == new Key('r')) return PluginBrowserCommand.Reload;
         if (key == new Key('u')) return PluginBrowserCommand.Update;
         return PluginBrowserCommand.None;
     }

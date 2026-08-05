@@ -58,7 +58,7 @@ public sealed class TranscriptPinTests
     public void Compose_short_single_line_fits_without_ellipsis()
     {
         var result = TranscriptPin.Compose("hello", width: 20, Unicode);
-        Assert.Equal(" > hello", result);
+        Assert.Equal(" \u276f hello", result);
         Assert.DoesNotContain("…", result, StringComparison.Ordinal);
     }
 
@@ -82,7 +82,7 @@ public sealed class TranscriptPinTests
         Assert.NotNull(result);
         Assert.True(TerminalCellText.Width(result) <= width, $"Result width {TerminalCellText.Width(result)} exceeds {width}");
         Assert.EndsWith("…", result, StringComparison.Ordinal);
-        Assert.StartsWith(" > ", result, StringComparison.Ordinal);
+        Assert.StartsWith(" \u276f ", result, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -90,7 +90,7 @@ public sealed class TranscriptPinTests
     {
         var result = TranscriptPin.Compose("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA", width: 10, Unicode);
         Assert.NotNull(result);
-        Assert.StartsWith(" > ", result, StringComparison.Ordinal);
+        Assert.StartsWith(" \u276f ", result, StringComparison.Ordinal);
         Assert.EndsWith("…", result, StringComparison.Ordinal);
     }
 
@@ -187,16 +187,16 @@ public sealed class TranscriptPinTests
     }
 
     // -------------------------------------------------------------------------
-    // TranscriptPin.Compose — ASCII glyph set produces the same " > " marker
+    // TranscriptPin.Compose — each glyph set uses its own user marker
     // -------------------------------------------------------------------------
 
     [Fact]
-    public void Compose_ascii_glyph_set_produces_same_marker()
+    public void Compose_uses_the_glyph_sets_own_user_marker()
     {
         var resultUnicode = TranscriptPin.Compose("hello", width: 20, Unicode);
         var resultAscii = TranscriptPin.Compose("hello", width: 20, Ascii);
 
-        Assert.Equal(" > hello", resultUnicode);
+        Assert.Equal(" \u276f hello", resultUnicode);
         Assert.Equal(" > hello", resultAscii);
     }
 
@@ -293,7 +293,7 @@ public sealed class TranscriptPinTests
         var pin = TranscriptPin.Compose("\u001b[2J\nWhat is the meaning of life?", width: 40, Unicode);
 
         Assert.NotNull(pin);
-        Assert.StartsWith(" > What is the meaning of life?", pin);
+        Assert.StartsWith(" \u276f What is the meaning of life?", pin);
     }
 
     [Fact]
@@ -302,7 +302,7 @@ public sealed class TranscriptPinTests
         // "\u001b[0m" sanitizes to nothing, so it is not a continuation and must not add an ellipsis.
         var pin = TranscriptPin.Compose("hello\n\u001b[0m", width: 40, Unicode);
 
-        Assert.Equal(" > hello", pin);
+        Assert.Equal(" \u276f hello", pin);
     }
 
     [Fact]

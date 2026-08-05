@@ -1,5 +1,6 @@
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
+using Coda.Agent.Tools;
 
 namespace Coda.Agent.Settings;
 
@@ -90,6 +91,21 @@ public sealed record CodaSettings(
     /// </summary>
     public IReadOnlyList<string> HookDisabledHashes { get; init; } = [];
 
+    /// <summary>
+    /// The resolved allow/deny filter for the MAIN AGENT's tool registry, derived from the
+    /// <c>agent.tools</c> block. Null means no filter is configured (today's behaviour).
+    /// Subagents, scheduled roots, and hook-spawned agents always keep their full toolsets
+    /// regardless of this value — it is applied only in
+    /// <c>TurnPipelineBuilder.BuildParentTools</c>.
+    /// </summary>
+    public ToolNameFilter? AgentToolFilter { get; init; }
+
+    /// <summary>
+    /// The raw <c>agent.tools</c> overrides from the per-file parse; used only so the
+    /// user/project merge can operate per field before the filter is materialised.
+    /// </summary>
+    internal AgentToolsOverrides? AgentToolsOverrides { get; init; }
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
 
@@ -107,17 +123,24 @@ public sealed record CodaSettings(
 /// The subagent fields a single settings file specified; null means the file did not mention it.
 /// Exists only so the user/project merge can operate per field before clamping.
 /// </summary>
-internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool? AllowSystemPromptReplacement)
+internal sealed record SubagentOverrides(
+    int? MaxDepth,
+    int? MaxConcurrent,
+    bool? AllowSystemPromptReplacement,
+    string? Model = null,
+    IReadOnlyDictionary<string, string>? ModelByType = null)
 {
     /// <summary>
     /// Project values win field by field; anything neither file set falls to the default.
     /// </summary>
     /// <remarks>
-    /// SECURITY: <see cref="AllowSystemPromptReplacement"/> is the exception — it is read from the
-    /// user file only, like <c>toolDisplayMode</c>. A project settings file is attacker-controlled
-    /// the moment someone clones a hostile repo, and this is the one field that hands a
-    /// prompt-injected model the subagent's own instructions; the depth and fan-out limits are
-    /// clamped resource bounds, so raising those from a project is merely noisy.
+    /// SECURITY: <see cref="AllowSystemPromptReplacement"/>, <see cref="Model"/>, and
+    /// <see cref="ModelByType"/> are read from the user file only, like <c>toolDisplayMode</c>.
+    /// A project settings file is attacker-controlled the moment someone clones a hostile repo.
+    /// Prompt-replacement hands a prompt-injected model the subagent's own instructions; model
+    /// choice is a cost lever — a hostile project could pin every subagent to the most expensive
+    /// model. The depth and fan-out limits are clamped resource bounds, so raising those from a
+    /// project is merely noisy.
     /// </remarks>
     public static SubagentOverrides? Merge(SubagentOverrides? user, SubagentOverrides? project) =>
         user is null && project is null
@@ -125,7 +148,9 @@ internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool
             : new SubagentOverrides(
                 project?.MaxDepth ?? user?.MaxDepth,
                 project?.MaxConcurrent ?? user?.MaxConcurrent,
-                user?.AllowSystemPromptReplacement);
+                user?.AllowSystemPromptReplacement,
+                user?.Model,
+                user?.ModelByType);
 
     /// <summary>Applies these overrides onto the defaults, clamping as SubagentSettings requires.</summary>
     public SubagentSettings ToSettings() => new()
@@ -134,5 +159,48 @@ internal sealed record SubagentOverrides(int? MaxDepth, int? MaxConcurrent, bool
         MaxConcurrent = this.MaxConcurrent ?? SubagentSettings.Default.MaxConcurrent,
         AllowSystemPromptReplacement =
             this.AllowSystemPromptReplacement ?? SubagentSettings.Default.AllowSystemPromptReplacement,
+        Model = this.Model,
+        ModelByType = this.ModelByType
+            ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
     };
+}
+
+/// <summary>
+/// The raw <c>agent.tools</c> values parsed from a single settings file.
+/// Null fields mean the file did not mention that property; used for per-field merging before
+/// the final <see cref="ToolNameFilter"/> is materialised.
+/// </summary>
+internal sealed record AgentToolsOverrides(IReadOnlyList<string>? Allow, IReadOnlyList<string> Deny)
+{
+    /// <summary>
+    /// Merges user and project overrides into a single <see cref="ToolNameFilter"/>:
+    /// <c>allow</c> is intersected (project can only restrict further); <c>deny</c> is unioned.
+    /// Returns null when neither file has an <c>agent.tools</c> block.
+    /// </summary>
+    public static AgentToolsOverrides? Merge(AgentToolsOverrides? user, AgentToolsOverrides? project) =>
+        user is null && project is null
+            ? null
+            : new AgentToolsOverrides(
+                MergeAllow(user?.Allow, project?.Allow),
+                MergeDeny(user?.Deny ?? [], project?.Deny ?? []));
+
+    /// <summary>Materialises this record as a <see cref="ToolNameFilter"/>.</summary>
+    public ToolNameFilter ToFilter() => new(this.Allow, this.Deny);
+
+    private static IReadOnlyList<string>? MergeAllow(IReadOnlyList<string>? user, IReadOnlyList<string>? project)
+    {
+        if (user is null && project is null) return null;
+        if (user is null) return project;
+        if (project is null) return user;
+        var projectSet = new HashSet<string>(project, StringComparer.OrdinalIgnoreCase);
+        return [.. user.Where(n => projectSet.Contains(n))];
+    }
+
+    private static IReadOnlyList<string> MergeDeny(IReadOnlyList<string> user, IReadOnlyList<string> project)
+    {
+        if (user.Count == 0 && project.Count == 0) return [];
+        var combined = new HashSet<string>(user, StringComparer.OrdinalIgnoreCase);
+        foreach (var n in project) combined.Add(n);
+        return [.. combined];
+    }
 }

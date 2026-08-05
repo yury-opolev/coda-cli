@@ -281,10 +281,13 @@ public sealed class McpBrowserControllerTests
                 McpEditorField.Arguments),
         });
 
-        await controller.ExecuteAsync(
-            McpBrowserCommand.EditorInsert,
-            new Key('x'),
-            CancellationToken.None);
+        // Scalar item value editing is widget-driven (Task 8). Use UpdateEditorDraft to simulate
+        // the widget writing back "argx" and verify that the authoritative item identity is preserved.
+        controller.UpdateEditorDraft(d => d with
+        {
+            Args = d.Args.SetItem(0, "argx"),
+            ArgumentItems = d.ArgumentItems.SetItem(0, d.ArgumentItems[0] with { Value = "argx" }),
+        });
 
         var changed = controller.State.Editor!.Draft;
         Assert.Equal("argx", Assert.Single(changed.Args));
@@ -306,22 +309,30 @@ public sealed class McpBrowserControllerTests
 
         await SetEditorFieldAsync(controller, McpEditorField.Arguments);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('a'), CancellationToken.None);
+        // Scalar item value editing is now done by widgets (Task 8). Use UpdateEditorDraft to
+        // simulate what the widget does, preserving the add/remove invariant under test.
+        controller.UpdateEditorDraft(d => d with { Args = d.Args.SetItem(0, "a") });
         Assert.Equal("a", Assert.Single(controller.State.Editor!.Draft.Args));
         await controller.ExecuteAsync(McpBrowserCommand.EditorRemoveItem, null, CancellationToken.None);
         Assert.Empty(controller.State.Editor!.Draft.Args);
 
         await SetEditorFieldAsync(controller, McpEditorField.Scopes);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('s'), CancellationToken.None);
+        controller.UpdateEditorDraft(d => d with { Scopes = d.Scopes.SetItem(0, "s") });
         Assert.Equal("s", Assert.Single(controller.State.Editor!.Draft.Scopes));
         await controller.ExecuteAsync(McpBrowserCommand.EditorRemoveItem, null, CancellationToken.None);
         Assert.Empty(controller.State.Editor!.Draft.Scopes);
 
         await SetEditorFieldAsync(controller, McpEditorField.Environment, McpEditorItemPart.Name);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('E'), CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorNextItemPart, null, CancellationToken.None);
+        // Environment variable name editing is widget-driven (Task 8). Set the name directly.
+        controller.UpdateEditorDraft(d => d with
+        {
+            Environment = d.Environment.SetItem(0, d.Environment[0] with { Name = "E" }),
+        });
+        // Move focus to the Value part (the modal-prompt target). With widget-based navigation
+        // the user would Tab to the MapItemRow.Value label; here we drive the controller directly.
+        controller.UpdateEditorFocusItem(McpEditorField.Environment, 0, McpEditorItemPart.Value);
         await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
         var environment = Assert.Single(controller.State.Editor!.Draft.Environment);
         Assert.Equal("E", environment.Name);
@@ -331,8 +342,12 @@ public sealed class McpBrowserControllerTests
 
         await SetEditorFieldAsync(controller, McpEditorField.Headers, McpEditorItemPart.Name);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('H'), CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorNextItemPart, null, CancellationToken.None);
+        controller.UpdateEditorDraft(d => d with
+        {
+            Headers = d.Headers.SetItem(0, d.Headers[0] with { Name = "H" }),
+        });
+        // Move focus to the Value part (the modal-prompt target).
+        controller.UpdateEditorFocusItem(McpEditorField.Headers, 0, McpEditorItemPart.Value);
         await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
         var header = Assert.Single(controller.State.Editor!.Draft.Headers);
         Assert.Equal("H", header.Name);
@@ -547,6 +562,300 @@ public sealed class McpBrowserControllerTests
         Assert.Equal(1, calls);
     }
 
+    // ── Task 8: item reordering ─────────────────────────────────────────────
+
+    [Fact]
+    public async Task Alt_up_reorders_argument_items_upward()
+    {
+        var item0 = new McpDraftListItem(Guid.NewGuid(), "a");
+        var item1 = new McpDraftListItem(Guid.NewGuid(), "b");
+        var draft = TestManagementService.Draft("server") with
+        {
+            Transport = McpTransportKind.Stdio,
+            Command = "node",
+            Args = ["a", "b"],
+            ArgumentItems = [item0, item1],
+        };
+        var controller = NewController(new TestManagementService(), new TestIdleGate());
+        controller.Open();
+        controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Arguments)
+            {
+                SelectedItem = 1,
+            },
+        });
+
+        await controller.ExecuteAsync(McpBrowserCommand.EditorReorderUp, null, CancellationToken.None);
+
+        var reordered = controller.State.Editor!.Draft;
+        Assert.Equal(["b", "a"], reordered.Args.ToArray());
+        Assert.Equal([item1.Id, item0.Id], reordered.ArgumentItems.Select(i => i.Id));
+        Assert.Equal(0, controller.State.Editor!.SelectedItem);
+        controller.Close();
+    }
+
+    [Fact]
+    public async Task Alt_down_reorders_argument_items_downward()
+    {
+        var item0 = new McpDraftListItem(Guid.NewGuid(), "a");
+        var item1 = new McpDraftListItem(Guid.NewGuid(), "b");
+        var draft = TestManagementService.Draft("server") with
+        {
+            Transport = McpTransportKind.Stdio,
+            Command = "node",
+            Args = ["a", "b"],
+            ArgumentItems = [item0, item1],
+        };
+        var controller = NewController(new TestManagementService(), new TestIdleGate());
+        controller.Open();
+        controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Arguments)
+            {
+                SelectedItem = 0,
+            },
+        });
+
+        await controller.ExecuteAsync(McpBrowserCommand.EditorReorderDown, null, CancellationToken.None);
+
+        var reordered = controller.State.Editor!.Draft;
+        Assert.Equal(["b", "a"], reordered.Args.ToArray());
+        Assert.Equal([item1.Id, item0.Id], reordered.ArgumentItems.Select(i => i.Id));
+        Assert.Equal(1, controller.State.Editor!.SelectedItem);
+        controller.Close();
+    }
+
+    [Fact]
+    public async Task Reorder_at_the_boundary_is_a_no_op()
+    {
+        var draft = TestManagementService.Draft("server") with
+        {
+            Transport = McpTransportKind.Stdio,
+            Command = "node",
+            Args = ["a", "b"],
+            ArgumentItems = [new McpDraftListItem(Guid.NewGuid(), "a"), new McpDraftListItem(Guid.NewGuid(), "b")],
+        };
+        var controller = NewController(new TestManagementService(), new TestIdleGate());
+        controller.Open();
+        controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Arguments)
+            {
+                SelectedItem = 0,
+            },
+        });
+
+        await controller.ExecuteAsync(McpBrowserCommand.EditorReorderUp, null, CancellationToken.None);
+
+        Assert.Equal(["a", "b"], controller.State.Editor!.Draft.Args.ToArray());
+        Assert.Equal(0, controller.State.Editor!.SelectedItem);
+        controller.Close();
+    }
+
+    /// <summary>
+    /// The critical invariant (spec Task 8): reordering redacted argument rows must move the
+    /// identity items so each Guid travels with its row, letting the commit path recover the true
+    /// raw value. If reorder only swapped display strings, both rows (which redact to the same
+    /// "[redacted URL]") would be indistinguishable and a redaction sentinel would be written back.
+    /// </summary>
+    [Fact]
+    public async Task Reorder_preserves_redacted_raw_values_through_guid_identity()
+    {
+        const string firstRaw = "https://args.example.test/first?token=first-secret#first";
+        const string secondRaw = "https://args.example.test/second?token=second-secret#second";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """
+            {"mcpServers":{"server":{"command":"node","args":[
+              "https://args.example.test/first?token=first-secret#first",
+              "https://args.example.test/second?token=second-secret#second"
+            ]}}}
+            """);
+        var gate = new TestIdleGate();
+        var controller = new McpBrowserController(() =>
+            new McpBrowserProvider(harness.Service, new RecordingPromptService(), gate));
+
+        controller.Open();
+        await controller.RefreshAsync(CancellationToken.None);
+        await controller.ExecuteAsync(McpBrowserCommand.BeginEdit, null, CancellationToken.None);
+
+        // Both rows redact to the same display value, so ONLY identity travel can keep them apart.
+        var loaded = controller.State.Editor!.Draft;
+        Assert.Equal(2, loaded.ArgumentItems.Length);
+        Assert.All(loaded.Args, value => Assert.Equal("[redacted URL]", value));
+
+        controller.SetStateForTest(controller.State with
+        {
+            Editor = controller.State.Editor! with
+            {
+                FocusedField = McpEditorField.Arguments,
+                SelectedItem = 0,
+            },
+        });
+        await controller.ExecuteAsync(McpBrowserCommand.EditorReorderDown, null, CancellationToken.None);
+
+        controller.SetStateForTest(controller.State with
+        {
+            Editor = controller.State.Editor! with { FocusedField = McpEditorField.Save },
+        });
+        await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        Assert.Equal([secondRaw, firstRaw], config.Args);
+        Assert.DoesNotContain("[redacted URL]", config.Args);
+        controller.Close();
+    }
+
+    // ── Task 9: save gate ───────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Save_with_warnings_requires_confirmation_before_committing()
+    {
+        var management = new TestManagementService
+        {
+            EditDraft = TestManagementService.Draft("server"),
+            EditWarnings = ["Changing the transport will drop the existing command."],
+            CommitEditResult = TestManagementService.Result(TestManagementService.Key("server"), "Saved.", "server"),
+        };
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["yes"], null));
+        var controller = NewController(management, new TestIdleGate(), prompts);
+
+        controller.Open();
+        await controller.RefreshAsync(CancellationToken.None);
+        await controller.ExecuteAsync(McpBrowserCommand.BeginEdit, null, CancellationToken.None);
+        controller.SetStateForTest(controller.State with
+        {
+            Editor = controller.State.Editor! with { FocusedField = McpEditorField.Save },
+        });
+        await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
+
+        var request = Assert.Single(prompts.Requests);
+        Assert.Equal(UiPromptKind.Confirm, request.Kind);
+        Assert.Contains("drop the existing command", request.Title, StringComparison.Ordinal);
+        Assert.Equal(1, management.CommitEditCalls);
+        controller.Close();
+    }
+
+    [Fact]
+    public async Task Cancelling_a_warning_confirmation_keeps_the_draft_and_does_not_commit()
+    {
+        var management = new TestManagementService
+        {
+            EditDraft = TestManagementService.Draft("server"),
+            EditWarnings = ["Changing the transport will drop the existing command."],
+        };
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["no"], null));
+        var controller = NewController(management, new TestIdleGate(), prompts);
+
+        controller.Open();
+        await controller.RefreshAsync(CancellationToken.None);
+        await controller.ExecuteAsync(McpBrowserCommand.BeginEdit, null, CancellationToken.None);
+        var draft = controller.State.Editor!.Draft;
+        controller.SetStateForTest(controller.State with
+        {
+            Editor = controller.State.Editor! with { FocusedField = McpEditorField.Save },
+        });
+        await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
+
+        Assert.Equal(McpBrowserView.Editor, controller.State.View);
+        Assert.Equal(draft, controller.State.Editor!.Draft);
+        Assert.Equal(0, management.CommitEditCalls);
+        Assert.Contains("Cancelled", controller.State.StatusMessage!, StringComparison.Ordinal);
+        controller.Close();
+    }
+
+    [Fact]
+    public async Task The_idle_gate_lease_is_not_held_during_the_warning_confirmation()
+    {
+        var gate = new TestIdleGate();
+        var management = new TestManagementService
+        {
+            EditDraft = TestManagementService.Draft("server"),
+            EditWarnings = ["Changing the transport will drop the existing command."],
+            CommitEditResult = TestManagementService.Result(TestManagementService.Key("server"), "Saved.", "server"),
+        };
+        var prompts = new GateProbingPromptService(gate, new UiPromptResponse(false, ["yes"], null));
+        var controller = new McpBrowserController(() => new McpBrowserProvider(management, prompts, gate));
+
+        controller.Open();
+        await controller.RefreshAsync(CancellationToken.None);
+        await controller.ExecuteAsync(McpBrowserCommand.BeginEdit, null, CancellationToken.None);
+        controller.SetStateForTest(controller.State with
+        {
+            Editor = controller.State.Editor! with { FocusedField = McpEditorField.Save },
+        });
+        await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
+
+        Assert.True(prompts.GateWasAvailableDuringPrompt, "the lease must be released while confirming");
+        Assert.Equal(1, management.CommitEditCalls);
+        controller.Close();
+    }
+
+    [Fact]
+    public async Task A_revision_change_between_prepare_and_commit_fails_cleanly()
+    {
+        var rejected = new McpMutationResult(
+            McpMutationStatus.Rejected,
+            null,
+            "The MCP configuration changed. Reopen the edit and try again.",
+            TestManagementService.Snapshot("server"));
+        var management = new TestManagementService
+        {
+            EditDraft = TestManagementService.Draft("server"),
+            EditWarnings = ["Changing the transport will drop the existing command."],
+            CommitEditResult = rejected,
+        };
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, ["yes"], null));
+        var controller = NewController(management, new TestIdleGate(), prompts);
+
+        controller.Open();
+        await controller.RefreshAsync(CancellationToken.None);
+        await controller.ExecuteAsync(McpBrowserCommand.BeginEdit, null, CancellationToken.None);
+        var draft = controller.State.Editor!.Draft;
+        controller.SetStateForTest(controller.State with
+        {
+            Editor = controller.State.Editor! with { FocusedField = McpEditorField.Save },
+        });
+        await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
+
+        Assert.Equal(1, management.CommitEditCalls);
+        Assert.Equal(McpBrowserView.Editor, controller.State.View);
+        Assert.Equal(draft, controller.State.Editor!.Draft);
+        Assert.Contains("changed", controller.State.StatusMessage!, StringComparison.OrdinalIgnoreCase);
+        controller.Close();
+    }
+
+    private sealed class GateProbingPromptService : IUiPromptService
+    {
+        private readonly IExclusiveIdleGate gate;
+        private readonly UiPromptResponse response;
+
+        public GateProbingPromptService(IExclusiveIdleGate gate, UiPromptResponse response)
+        {
+            this.gate = gate;
+            this.response = response;
+        }
+
+        public bool IsInteractive => true;
+
+        public bool GateWasAvailableDuringPrompt { get; private set; }
+
+        public Task<UiPromptResponse> RequestAsync(UiPromptRequest request, CancellationToken cancellationToken = default)
+        {
+            // If the save flow correctly released the lease before confirming, the gate can be
+            // acquired here; acquire-then-release so we do not perturb the subsequent commit.
+            var probe = this.gate.TryAcquire();
+            this.GateWasAvailableDuringPrompt = probe is not null;
+            probe?.Dispose();
+            return Task.FromResult(this.response);
+        }
+    }
+
     private static McpBrowserController NewController(
         TestManagementService management,
         TestIdleGate gate,
@@ -631,6 +940,8 @@ public sealed class McpBrowserControllerTests
         public int PrepareReauthenticationCalls { get; private set; }
         public int ReauthenticateCalls { get; private set; }
         public int CommitAddCalls { get; private set; }
+        public int CommitEditCalls { get; private set; }
+        public ImmutableArray<string> EditWarnings { get; init; } = [];
         public Func<int, Task<McpManagementSnapshot>>? Refresh { get; init; }
         public Func<bool, McpMutationResult>? SetEnabled { get; init; }
         public Action? OnSetEnabled { get; init; }
@@ -665,7 +976,7 @@ public sealed class McpBrowserControllerTests
             Task.FromResult(new McpEditPreview(Guid.NewGuid(), null, draft, Revision(), []));
 
         public Task<McpEditPreview> PrepareEditAsync(McpServerKey original, McpServerDraft draft, CancellationToken ct) =>
-            Task.FromResult(new McpEditPreview(Guid.NewGuid(), original, draft, Revision(), []));
+            Task.FromResult(new McpEditPreview(Guid.NewGuid(), original, draft, Revision(), this.EditWarnings));
 
         public Task<McpMutationResult> CommitAddAsync(McpEditPreview preview, CancellationToken ct)
         {
@@ -673,8 +984,11 @@ public sealed class McpBrowserControllerTests
             return Task.FromResult(this.CommitAddResult ?? Result(Key(preview.Draft.Name), "Saved.", preview.Draft.Name));
         }
 
-        public Task<McpMutationResult> CommitEditAsync(McpEditPreview preview, CancellationToken ct) =>
-            Task.FromResult(this.CommitEditResult ?? Result(Key(preview.Draft.Name), "Saved.", preview.Draft.Name));
+        public Task<McpMutationResult> CommitEditAsync(McpEditPreview preview, CancellationToken ct)
+        {
+            this.CommitEditCalls++;
+            return Task.FromResult(this.CommitEditResult ?? Result(Key(preview.Draft.Name), "Saved.", preview.Draft.Name));
+        }
 
         public async Task<McpMutationResult> SetEnabledAsync(McpServerKey key, bool enabled, CancellationToken ct)
         {

@@ -114,21 +114,30 @@ public sealed class ModelCommand : ISlashCommand
     }
 
     /// <summary>
-    /// Present the model picker (title <c>Choose a model</c>, option id = model id, with display name
-    /// and context limit as details) over an already-resolved <paramref name="models"/> list through
-    /// the host-neutral prompt surface. Returns the chosen model id, or <c>null</c> when the surface is
-    /// non-interactive or the user dismisses the prompt — the caller mutates nothing until an id returns.
+    /// Present the model picker over an already-resolved <paramref name="models"/> list. When the
+    /// Terminal.Gui shell is active the dedicated <see cref="Coda.Tui.Ui.Models.IModelBrowserService"/>
+    /// is used (full browser with scrolling, filter, and provenance header); otherwise the generic
+    /// prompt overlay handles the selection. Returns the chosen model id, or <c>null</c> when the
+    /// surface is non-interactive or the user dismisses — the caller mutates nothing until an id returns.
     /// </summary>
     internal static async Task<string?> ChooseModelAsync(
         CommandContext context,
         ModelListResult models,
         CancellationToken cancellationToken = default)
     {
+        // Prefer the dedicated browser overlay when the shell wires it (Terminal.Gui modes).
+        if (context.ModelBrowserService is { } browser)
+        {
+            return await browser.SelectModelAsync(models, context.Session.Model, cancellationToken)
+                .ConfigureAwait(false);
+        }
+
         if (!context.Prompts.IsInteractive)
         {
             return null;
         }
 
+        // Fallback: generic prompt overlay (plain/Spectre modes or tests without a browser service).
         // Build every option eagerly and mark the current one case-insensitively, so its canonical id can
         // be used as the request default. PromptOverlay resolves DefaultValue ordinally, so passing the
         // list's exact spelling (not the possibly differently-cased session string) makes the default land.
