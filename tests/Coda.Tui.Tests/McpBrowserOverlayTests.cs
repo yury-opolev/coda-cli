@@ -50,13 +50,25 @@ public sealed class McpBrowserOverlayTests : IDisposable
     }
 
     [Fact]
-    public void Visible_overlay_swallows_every_key_and_mouse_input()
+    public void Visible_overlay_handles_its_accelerators_but_lets_other_keys_through()
     {
         this.overlay.Show();
 
-        Assert.True(this.overlay.NewKeyDownEvent(new Key('z')));
-        Assert.True(this.overlay.NewKeyDownEvent(Key.F12));
-        Assert.True(this.overlay.NewMouseEvent(new Mouse
+        // Mapped accelerators are still consumed by the overlay.
+        Assert.True(this.overlay.NewKeyDownEvent(Key.CursorDown));
+
+        // Unmapped keys are NOT swallowed, so a focused child widget can receive them once the
+        // editor form and table are hosted as real views.
+        Assert.False(this.overlay.NewKeyDownEvent(new Key('z')));
+        Assert.False(this.overlay.NewKeyDownEvent(Key.F12));
+    }
+
+    [Fact]
+    public void Visible_overlay_does_not_swallow_mouse_input()
+    {
+        this.overlay.Show();
+
+        Assert.False(this.overlay.NewMouseEvent(new Mouse
         {
             Flags = MouseFlags.LeftButtonClicked,
             Position = new Point(2, 2),

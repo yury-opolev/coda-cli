@@ -52,7 +52,7 @@ Each has a dedicated test in this plan:
 1. **No secret is ever bound to a `TextField`**, `Secret`-masked or otherwise (Task 7).
 2. **Reordering a list field preserves redacted raw values** — GUID identity must travel with the item (Task 8).
 3. **Changing transport in Edit mode warns before it destroys fields** (Task 9).
-4. **The shell no longer steals focus from a focused child** on controller changes (Task 2).
+4. **A focused child keeps focus across controller changes** — locked by test; the editor depends on it (Task 2).
 5. Secrets never reach the screen, and no `\u001b` ever does (Task 12).
 
 ---
@@ -104,13 +104,17 @@ scaffolding whose only job is to fail fast if an assumption in the spec is wrong
 
 - [ ] **Step 1: Write failing tests** — a focused child receives a printable key while the overlay is
   visible; the overlay still handles its own accelerators (`Esc`); a mouse click reaches a child;
-  **a controller `Changed` event does not move focus away from a focused child** (invariant 4);
+  **a focused child keeps focus across a controller `Changed` event** (invariant 4);
   showing the overlay still focuses it initially.
 - [ ] **Step 2: Implement** — `OnKeyDown` handles accelerators and returns `false` otherwise instead
-  of blanket `true` (`:243`); remove the `OnMouseEvent => this.Visible` swallow (`:253`); in
-  `TerminalGuiShellBase.OnMcpBrowserChanged` (`:1807-1830`) restore focus **only when the overlay
-  does not already contain focus**; narrow the shell's `OnKeyDown` short-circuit (`:707-718`) to
-  global chords.
+  of blanket `true` (`:243`); remove the `OnMouseEvent => this.Visible` swallow (`:253`); narrow the
+  shell's `OnKeyDown` short-circuit (`:707-718`) to global chords.
+
+  **Correction from implementation:** the plan originally claimed the shell's
+  `OnMcpBrowserChanged` focus restoration (`:1807-1830`) would steal focus from a focused child and
+  had to be guarded. It does not — Terminal.Gui restores focus to the most-recently-focused
+  descendant, verified with two focusable fields where the second held focus. The speculative guard
+  was reverted; the test remains as a behaviour lock.
 - [ ] **Step 3: Verify** — `--filter "FullyQualifiedName~McpBrowserOverlay"`
 
 **Note:** this task changes behaviour before the widgets exist, so the browser is briefly *less*

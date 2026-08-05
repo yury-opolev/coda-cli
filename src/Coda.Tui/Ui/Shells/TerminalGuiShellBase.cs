@@ -1817,6 +1817,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         }
         else if (this.VisibleBrowserOverlay() is { } browser)
         {
+            // Safe to call unconditionally: Terminal.Gui restores focus to the overlay's
+            // most-recently-focused descendant, so this does not disturb a focused table row or
+            // editor field. CliTuiMcpTuiIntegrationTests locks that behaviour.
             browser.SetFocus();
         }
         else if (!this.composerDisabled && !this.composerLockedByAttachment)

@@ -207,20 +207,26 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             return false;
         }
 
-        // The overlay holds focus and consumes every key while visible, so the shell's own Ctrl+C handler
-        // is unreachable from here — copy an active body selection before the key is swallowed.
+        // Copy an active body selection before anything else claims the chord.
         if (key == Key.C.WithCtrl && this.body.TryCopySelection())
         {
             return true;
         }
 
         var command = McpBrowserKeyMap.Map(key, this.controller.State.View);
-        if (command == McpBrowserCommand.None &&
-            this.controller.State.View == McpBrowserView.Detail &&
-            this.TryScrollDetail(key))
+        if (command == McpBrowserCommand.None)
         {
-            this.Render();
-            return true;
+            if (this.controller.State.View == McpBrowserView.Detail && this.TryScrollDetail(key))
+            {
+                this.Render();
+                return true;
+            }
+
+            // Not one of ours: leave it unhandled so a focused child view can act on it. Returning
+            // true unconditionally here would make every child widget deaf. The shell already
+            // declines keys while a browser overlay is visible, so an unclaimed key is simply
+            // dropped rather than leaking to the composer.
+            return false;
         }
 
         var token = this.lifetime?.Token ?? CancellationToken.None;
@@ -236,11 +242,11 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     /// <inheritdoc/>
     /// <remarks>
     /// Terminal.Gui hit-tests and delivers the event straight to the child under the pointer, so the
-    /// <see cref="SelectableTextView"/> body already gets its drag selections and right-click copies. This
-    /// override exists only to swallow whatever the body did not take, so mouse input cannot reach the
-    /// views behind a visible overlay.
+    /// <see cref="SelectableTextView"/> body gets its drag selections and right-click copies, and the
+    /// table and editor widgets get their clicks. Anything no child claimed is left unhandled — the
+    /// overlay covers the shell, so there is nothing behind it to protect.
     /// </remarks>
-    protected override bool OnMouseEvent(Mouse mouse) => this.Visible;
+    protected override bool OnMouseEvent(Mouse mouse) => false;
 
     private void OnControllerChanged()
     {
