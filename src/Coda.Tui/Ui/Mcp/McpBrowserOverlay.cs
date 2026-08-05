@@ -235,6 +235,11 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.lifetime = new CancellationTokenSource();
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
+
+        // The editor form needs the theme here too, not only from ApplyTheme: without it the form's
+        // focus affordances (accent label, inverted button, selector cursor) silently do nothing,
+        // because the shell only calls ApplyTheme on a theme CHANGE and a fresh Show is not one.
+        this.editorForm.ApplyTheme(this.theme, this.app.Driver);
         this.active = true;
         this.Visible = true;
         this.controller.Changed += this.OnControllerChanged;

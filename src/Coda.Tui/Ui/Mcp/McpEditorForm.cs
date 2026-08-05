@@ -336,11 +336,10 @@ internal sealed class McpEditorForm : View
     /// </summary>
     private void RefreshFocusAffordances()
     {
-        if (this.theme is not { } t)
-        {
-            return;
-        }
-
+        // Fall back to the current theme rather than returning: an unthemed form used to render NO
+        // focus affordance at all, so a missed ApplyTheme call was invisible instead of merely
+        // mis-coloured. Failing soft here keeps the cursor visible whatever the caller forgot.
+        var t = this.theme ?? CodaThemes.Current.Tui;
         var normal = t.Attribute(t.TranscriptAssistant, t.Background, this.driver);
         var selection = t.Attribute(t.SelectionText, t.SelectionBackground, this.driver);
 
