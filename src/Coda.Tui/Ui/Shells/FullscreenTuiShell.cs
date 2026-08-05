@@ -255,6 +255,13 @@ internal class FullscreenTuiShell(
             this.Add(pluginOverlay);
         }
 
+        // The model browser overlay is always present; position it the same way as the other browsers.
+        this.ModelBrowserOverlay.X = 0;
+        this.ModelBrowserOverlay.Y = 0;
+        this.ModelBrowserOverlay.Width = Dim.Fill();
+        this.ModelBrowserOverlay.Height = Dim.Fill();
+        this.Add(this.ModelBrowserOverlay);
+
         this.Add(this.PromptOverlay);
     }
 

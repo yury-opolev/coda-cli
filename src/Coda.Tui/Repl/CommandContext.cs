@@ -4,6 +4,7 @@ using Coda.Agent.Tasks;
 using Coda.Agent.ToolSearch;
 using Coda.Tui.Commands;
 using Coda.Tui.Ui.Events;
+using Coda.Tui.Ui.Models;
 using Coda.Tui.Ui.Prompts;
 using Coda.Tui.Ui.State;
 using LlmAuth;
@@ -74,6 +75,13 @@ public sealed class CommandContext
     /// staged images are auto-included on the next turn (legacy behaviour).
     /// </summary>
     public Action<string>? DraftInsertCallback { get; set; }
+
+    /// <summary>
+    /// The interactive model picker surface, set by the Terminal.Gui shell when it is running so
+    /// <c>/model</c> (with no argument) opens the dedicated model browser instead of the generic prompt
+    /// overlay. Null in plain, Spectre, and non-interactive modes — callers fall back to the prompt.
+    /// </summary>
+    public IModelBrowserService? ModelBrowserService { get; set; }
 
     /// <summary>
     /// Swap the per-mode presentation environment (console, prompt surface, event publisher, and the
