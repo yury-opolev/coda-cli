@@ -1,4 +1,4 @@
-﻿using System.Text;
+using System.Text;
 using Coda.Mcp;
 using Coda.Tui.Mcp;
 using Coda.Tui.Ui.Rendering;
@@ -26,6 +26,15 @@ internal sealed class McpEditorForm : View
 {
     private const int LabelWidth = 12;
 
+    /// <summary>
+    /// Width of the gutter column (shows <c>❯</c> on the focused row). Kept separate from
+    /// <see cref="LabelWidth"/> so the column boundaries are explicit and testable.
+    /// </summary>
+    private const int GutterWidth = 2;
+
+    /// <summary>X coordinate at which value widgets start (gutter + label).</summary>
+    private const int ValueX = GutterWidth + LabelWidth;
+
     private readonly McpBrowserController controller;
 
     /// <summary>
@@ -51,6 +60,27 @@ internal sealed class McpEditorForm : View
     internal readonly Button SaveButton;
     internal readonly Button CancelButton;
 
+    // ── prefix labels (one per scalar field; always created, shown/hidden by ApplyState) ──────
+    // Each prefix label renders the field name in the label column so the value column is
+    // self-explanatory even without context. The gutter indicator (❯) marks the focused row.
+
+    private readonly Label GutterIndicator;
+    private readonly Label ScopePrefixLabel;
+    private readonly Label NamePrefixLabel;
+    private readonly Label TransportPrefixLabel;
+    private readonly Label CommandPrefixLabel;
+    private readonly Label ArgumentsPrefixLabel;
+    private readonly Label UrlPrefixLabel;
+    private readonly Label HeadersPrefixLabel;
+    private readonly Label AuthModePrefixLabel;
+    private readonly Label ClientIdPrefixLabel;
+    private readonly Label ScopesPrefixLabel;
+    private readonly Label EnvironmentPrefixLabel;
+    private readonly Label BearerTokenPrefixLabel;
+
+    // focusedLabelScheme is reserved for future accent-colouring of the focused prefix label
+    // and is intentionally omitted until the TUI 2.x API for per-view scheme overrides is pinned.
+
     /// <summary>Fired when the Save button is activated. The overlay wires this to the save flow.</summary>
     internal event Action? SaveRequested;
 
@@ -62,6 +92,20 @@ internal sealed class McpEditorForm : View
     /// smoothly as the user tabs through fields. Clamped and updated on every <see cref="ApplyState"/> call.
     /// </summary>
     private int scrollOffset;
+
+    /// <summary>
+    /// The theme and driver last applied, retained so focus changes can recolour labels without the
+    /// caller re-supplying them. Null until <see cref="ApplyTheme"/> runs.
+    /// </summary>
+    private TuiTheme? theme;
+    private Terminal.Gui.Drivers.IDriver? driver;
+
+    /// <summary>Cached label schemes; invalidated when the theme changes.</summary>
+    private Terminal.Gui.Drawing.Scheme? normalLabelScheme;
+    private Terminal.Gui.Drawing.Scheme? focusedLabelScheme;
+
+    /// <summary>The field whose label currently carries the accent colour.</summary>
+    private McpEditorField focusedField;
 
     // ── per-item widget pools (Task 8) ───────────────────────────────────────
     // List/map fields expand into one editable row per item. The pools grow on demand and are
@@ -89,9 +133,26 @@ internal sealed class McpEditorForm : View
         this.Width = Dim.Fill();
         this.Height = Dim.Fill();
 
+        // ── gutter indicator and prefix labels ────────────────────────────────
+        // Created before input widgets so they can be passed to this.Add in the right order.
+        this.GutterIndicator = new Label { X = 0, Width = GutterWidth, Height = 1, Text = "❯ ", Visible = false };
+        this.ScopePrefixLabel       = MakePrefixLabel("Scope:      ");
+        this.NamePrefixLabel        = MakePrefixLabel("Name:       ");
+        this.TransportPrefixLabel   = MakePrefixLabel("Transport:  ");
+        this.CommandPrefixLabel     = MakePrefixLabel("Command:    ");
+        this.ArgumentsPrefixLabel   = MakePrefixLabel("Arguments:  ");
+        this.UrlPrefixLabel         = MakePrefixLabel("URL:        ");
+        this.HeadersPrefixLabel     = MakePrefixLabel("Headers:    ");
+        this.AuthModePrefixLabel    = MakePrefixLabel("Auth:       ");
+        this.ClientIdPrefixLabel    = MakePrefixLabel("Client ID:  ");
+        this.ScopesPrefixLabel      = MakePrefixLabel("Scopes:     ");
+        this.EnvironmentPrefixLabel = MakePrefixLabel("Env:        ");
+        this.BearerTokenPrefixLabel = MakePrefixLabel("Token:      ");
+
         // ── selectors ────────────────────────────────────────────────────────
         this.ScopeSelector = new OptionSelector
         {
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             Labels = ["project", "user"],
@@ -102,6 +163,7 @@ internal sealed class McpEditorForm : View
 
         this.TransportSelector = new OptionSelector
         {
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             Labels = ["stdio", "http"],
@@ -112,6 +174,7 @@ internal sealed class McpEditorForm : View
 
         this.AuthModeSelector = new OptionSelector
         {
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             Labels = ["none", "bearer", "oauth"],
@@ -124,6 +187,7 @@ internal sealed class McpEditorForm : View
         this.NameField = new TextField
         {
             Id = "Name",
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             TabStop = TabBehavior.TabStop,
@@ -134,6 +198,7 @@ internal sealed class McpEditorForm : View
         this.CommandField = new TextField
         {
             Id = "Command",
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             TabStop = TabBehavior.TabStop,
@@ -144,6 +209,7 @@ internal sealed class McpEditorForm : View
         this.UrlField = new TextField
         {
             Id = "Url",
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             TabStop = TabBehavior.TabStop,
@@ -154,6 +220,7 @@ internal sealed class McpEditorForm : View
         this.ClientIdField = new TextField
         {
             Id = "ClientId",
+            X = ValueX,
             Width = Dim.Fill(),
             Height = 1,
             TabStop = TabBehavior.TabStop,
@@ -165,19 +232,22 @@ internal sealed class McpEditorForm : View
         // These must be focusable so Tab traversal reaches them and Ctrl+N / Ctrl+R / Alt+Up/Down
         // can operate on the right field when the focus is on a placeholder. The bearer-token row
         // also needs focus so Enter triggers the modal secret-replacement prompt.
-        this.ArgumentsSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-        this.HeadersSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-        this.ScopesSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-        this.EnvironmentSummaryLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.ArgumentsSummaryLabel  = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.HeadersSummaryLabel    = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.ScopesSummaryLabel     = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.EnvironmentSummaryLabel = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
 
         // BearerToken is always a read-only label — never bound to a TextField.
-        this.BearerTokenLabel = new Label { Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
+        this.BearerTokenLabel = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
 
         // ── buttons ───────────────────────────────────────────────────────────
+        // ShadowStyle.None: the default drop shadow renders a stray half-block glyph after the
+        // button ("⟦ Save ⟧▖") which reads as corruption in a dense form rather than as depth.
         this.SaveButton = new Button
         {
             Text = "Save",
             TabStop = TabBehavior.TabStop,
+            ShadowStyle = ShadowStyles.None,
             Visible = false,
         };
 
@@ -185,6 +255,7 @@ internal sealed class McpEditorForm : View
         {
             Text = "Cancel",
             TabStop = TabBehavior.TabStop,
+            ShadowStyle = ShadowStyles.None,
             Visible = false,
         };
 
@@ -192,6 +263,21 @@ internal sealed class McpEditorForm : View
         // Assigning Text/Value after Add avoids the "first keystroke replaces a character" trap
         // documented in WidgetIntegrationSpikeTests.TextField_inserts_mid_string_at_the_caret.
         this.Add(
+            // Gutter and prefix labels first so they paint under/beside their paired input widget.
+            this.GutterIndicator,
+            this.ScopePrefixLabel,
+            this.NamePrefixLabel,
+            this.TransportPrefixLabel,
+            this.CommandPrefixLabel,
+            this.ArgumentsPrefixLabel,
+            this.UrlPrefixLabel,
+            this.HeadersPrefixLabel,
+            this.AuthModePrefixLabel,
+            this.ClientIdPrefixLabel,
+            this.ScopesPrefixLabel,
+            this.EnvironmentPrefixLabel,
+            this.BearerTokenPrefixLabel,
+            // Input widgets.
             this.ScopeSelector,
             this.NameField,
             this.TransportSelector,
@@ -209,6 +295,62 @@ internal sealed class McpEditorForm : View
 
         this.WireValueChanged();
     }
+
+    /// <summary>
+    /// Applies the theme to the form. The focused field's label is drawn in the accent colour so
+    /// the active row is identifiable by colour as well as by the gutter marker — a marker alone is
+    /// easy to miss on a dense form, and colour is what the rest of the TUI already uses to mean
+    /// "this is the thing you are on".
+    /// </summary>
+    internal void ApplyTheme(TuiTheme theme, Terminal.Gui.Drivers.IDriver? driver)
+    {
+        ArgumentNullException.ThrowIfNull(theme);
+
+        this.theme = theme;
+        this.driver = driver;
+        this.normalLabelScheme = null;
+        this.focusedLabelScheme = null;
+        this.RefreshLabelAccents();
+    }
+
+    /// <summary>
+    /// Repaints every prefix label so exactly the focused field's label carries the accent scheme.
+    /// Cheap enough to run on every focus change: the label count is fixed and small.
+    /// </summary>
+    private void RefreshLabelAccents()
+    {
+        if (this.theme is not { } t)
+        {
+            return;
+        }
+
+        this.normalLabelScheme ??= SolidScheme(t.Attribute(t.TranscriptAssistant, t.Background, this.driver));
+        this.focusedLabelScheme ??= SolidScheme(t.Attribute(t.Palette.Accent, t.Background, this.driver));
+
+        var focusedLabel = this.PrefixLabelForField(this.focusedField);
+        foreach (var label in this.AllPrefixLabels())
+        {
+            label.SetScheme(ReferenceEquals(label, focusedLabel)
+                ? this.focusedLabelScheme
+                : this.normalLabelScheme);
+        }
+
+        this.GutterIndicator.SetScheme(this.focusedLabelScheme);
+    }
+
+    private static Terminal.Gui.Drawing.Scheme SolidScheme(Terminal.Gui.Drawing.Attribute attribute) => new()
+    {
+        Normal = attribute,
+        HotNormal = attribute,
+        Focus = attribute,
+        HotFocus = attribute,
+        Active = attribute,
+        HotActive = attribute,
+        Highlight = attribute,
+        Editable = attribute,
+        ReadOnly = attribute,
+        Disabled = attribute,
+    };
 
     /// <summary>
     /// A plain-text snapshot of all visible labels and field values for test assertions.
@@ -300,9 +442,19 @@ internal sealed class McpEditorForm : View
         for (var i = 0; i < rows.Count; i++)
         {
             if (i < this.scrollOffset || i >= this.scrollOffset + height) continue;
+            if (rows[i].ItemIndex == int.MinValue) continue; // separator — no widget
             var v = this.ViewForRow(rows[i]);
             if (v is not null) visibleViews.Add(v);
+            // Prefix label for scalar rows only (item rows share the field label group).
+            if (rows[i].ItemIndex < 0)
+            {
+                var pl = this.PrefixLabelForField(rows[i].Field);
+                if (pl is not null) visibleViews.Add(pl);
+            }
         }
+
+        // The gutter indicator is always present when any field is visible.
+        visibleViews.Add(this.GutterIndicator);
 
         // Suspend ValueChanged handlers while we push state into widgets.
         this.suppressSync = true;
@@ -311,7 +463,7 @@ internal sealed class McpEditorForm : View
             // Pass 1: position and show every view that belongs in the viewport. This ensures the
             // focused view is visible before we hide anything, so Terminal.Gui never loses its
             // focus target.
-            this.LayoutRows(rows, editor, this.scrollOffset, height);
+            this.LayoutRows(rows, editor, this.scrollOffset, height, focusedIndex);
 
             // Pass 2: hide every subview that is NOT in the visible set.
             foreach (var view in this.SubViews)
@@ -327,6 +479,7 @@ internal sealed class McpEditorForm : View
             this.suppressSync = false;
         }
     }
+
     // Returns the viewport height used by ApplyState; exposed for unit tests.
     internal int ViewportHeightForTest()
     {
@@ -336,11 +489,21 @@ internal sealed class McpEditorForm : View
         return Math.Max(1, height);
     }
 
+    /// <summary>
+    /// Moves field focus one step in <paramref name="direction"/>; exposed for unit tests that
+    /// cannot drive the key event through the full application focus chain.
+    /// This is the same function that <see cref="OnKeyDown"/> calls for CursorDown/CursorUp.
+    /// </summary>
+    internal void MoveFocusForTest(NavigationDirection direction) =>
+        this.MoveFieldFocus(direction);
+
     /// <inheritdoc/>
     /// <remarks>
-    /// Tab/Shift+Tab and Up/Down move focus between fields by calling
-    /// <see cref="View.AdvanceFocus"/>. The terminal harness does not handle a bare Tab on the
-    /// parent automatically (verified in WidgetIntegrationSpikeTests), so we intercept it here.
+    /// Tab/Shift+Tab move focus between fields. CursorDown/Up use <see cref="MoveFieldFocus"/>
+    /// instead of <see cref="View.AdvanceFocus"/> to guarantee single-step field navigation:
+    /// AdvanceFocus walks all descendant tab stops including the internal CheckBoxes of an
+    /// OptionSelector, which causes two presses to skip past a 2-option selector. MoveFieldFocus
+    /// moves between the form's own direct children only.
     /// </remarks>
     protected override bool OnKeyDown(Key key)
     {
@@ -358,13 +521,13 @@ internal sealed class McpEditorForm : View
 
         if (key == Key.CursorDown)
         {
-            this.AdvanceFocus(NavigationDirection.Forward, TabBehavior.TabStop);
+            this.MoveFieldFocus(NavigationDirection.Forward);
             return true;
         }
 
         if (key == Key.CursorUp)
         {
-            this.AdvanceFocus(NavigationDirection.Backward, TabBehavior.TabStop);
+            this.MoveFieldFocus(NavigationDirection.Backward);
             return true;
         }
 
@@ -397,17 +560,83 @@ internal sealed class McpEditorForm : View
     };
 
     /// <summary>
+    /// Returns the prefix label for a scalar field, or <c>null</c> for fields that do not have
+    /// one (Save, Cancel, or unrecognised values).
+    /// </summary>
+    private Label? PrefixLabelForField(McpEditorField field) => field switch    {
+        McpEditorField.Scope       => this.ScopePrefixLabel,
+        McpEditorField.Name        => this.NamePrefixLabel,
+        McpEditorField.Transport   => this.TransportPrefixLabel,
+        McpEditorField.Command     => this.CommandPrefixLabel,
+        McpEditorField.Arguments   => this.ArgumentsPrefixLabel,
+        McpEditorField.Url         => this.UrlPrefixLabel,
+        McpEditorField.Headers     => this.HeadersPrefixLabel,
+        McpEditorField.AuthMode    => this.AuthModePrefixLabel,
+        McpEditorField.ClientId    => this.ClientIdPrefixLabel,
+        McpEditorField.Scopes      => this.ScopesPrefixLabel,
+        McpEditorField.Environment => this.EnvironmentPrefixLabel,
+        McpEditorField.BearerToken => this.BearerTokenPrefixLabel,
+        _ => null,
+    };
+
+    /// <summary>
+    /// Moves focus to the next or previous DIRECT focusable child of this form without descending
+    /// into any child's internal sub-views (e.g. the CheckBoxes inside an OptionSelector).
+    /// </summary>
+    /// <remarks>
+    /// <see cref="View.AdvanceFocus"/> walks the entire descendant tab-stop tree, so pressing
+    /// CursorDown once while an OptionSelector is focused advances to its next internal CheckBox
+    /// rather than to the next field. This method instead works exclusively with the form's own
+    /// SubViews list, skipping non-focusable and invisible children.
+    /// </remarks>
+    private void MoveFieldFocus(NavigationDirection direction)
+    {
+        var children = this.SubViews.Where(v => v.CanFocus && v.Visible).ToList();
+        if (children.Count == 0) return;
+
+        var currentIdx = children.FindIndex(HasFocusInSubtree);
+        if (currentIdx < 0) { children[0].SetFocus(); return; }
+
+        var nextIdx = direction == NavigationDirection.Forward
+            ? (currentIdx + 1) % children.Count
+            : (currentIdx - 1 + children.Count) % children.Count;
+
+        children[nextIdx].SetFocus();
+    }
+
+    /// <summary>Returns true if <paramref name="v"/> has focus or has a focused descendant.</summary>
+    /// <remarks>
+    /// Uses <see cref="View.MostFocused"/> to detect focus inside composite widgets such as
+    /// <see cref="OptionSelector"/>, whose internal CheckBoxes may live in a nested container
+    /// that is not directly exposed via <see cref="View.SubViews"/>.
+    /// </remarks>
+    private static bool HasFocusInSubtree(View v) =>
+        v.HasFocus || v.MostFocused is not null;
+
+    /// <summary>
     /// Pass 1: position and make visible every field whose list index falls within the scroll
     /// window [<paramref name="offset"/>, <paramref name="offset"/> + <paramref name="height"/>).
+    /// Positions the gutter indicator at the focused row's viewport Y.
     /// Pass 2 (hiding out-of-window views) is the caller's responsibility.
     /// </summary>
     private void LayoutRows(
         IReadOnlyList<EditorRow> rows,
         McpEditorState editor,
         int offset,
-        int height)
+        int height,
+        int focusedIndex)
     {
         var draft = editor.Draft;
+
+        // Position gutter indicator at the focused field's viewport row.
+        var focusedViewportY = focusedIndex - offset;
+        this.GutterIndicator.Y = focusedViewportY;
+        this.GutterIndicator.Visible = focusedViewportY >= 0 && focusedViewportY < height;
+
+        // Keep the accent in step with the gutter: both mark the same row, and a stale colour on a
+        // row the marker has left is worse than no colour at all.
+        this.focusedField = editor.FocusedField;
+        this.RefreshLabelAccents();
 
         for (var i = 0; i < rows.Count; i++)
         {
@@ -415,6 +644,8 @@ internal sealed class McpEditorForm : View
 
             var row = i - offset;
             var descriptor = rows[i];
+            if (descriptor.ItemIndex == int.MinValue) continue; // separator — blank row, no widget
+
             if (descriptor.ItemIndex < 0)
             {
                 this.LayoutScalarField(descriptor.Field, editor, row);
@@ -428,14 +659,15 @@ internal sealed class McpEditorForm : View
 
     /// <summary>
     /// Expands the ordered scalar field set into concrete rows, splitting each non-empty list/map
-    /// field into one row per item. An empty list keeps a single placeholder row (the summary
-    /// label) so the user still has somewhere to press Ctrl+N to add the first item.
+    /// field into one row per item and inserting a blank separator row after each field group.
+    /// An empty list keeps a single placeholder row so the user still has somewhere to press Ctrl+N.
     /// </summary>
     private static IReadOnlyList<EditorRow> BuildRows(
         IReadOnlyList<McpEditorField> fields,
         McpServerDraft draft)
     {
-        var rows = new List<EditorRow>(fields.Count);
+        // Pre-size: each field gets its items (or 1 placeholder) plus 1 separator (except Cancel).
+        var rows = new List<EditorRow>(fields.Count * 2);
         foreach (var field in fields)
         {
             var count = ItemCount(field, draft);
@@ -449,6 +681,14 @@ internal sealed class McpEditorForm : View
             else
             {
                 rows.Add(new EditorRow(field, -1));
+            }
+
+            // Blank separator after each field group, but NOT between Save and Cancel (they
+            // are action buttons that go together, and a separator would expose the button's
+            // bottom-shadow artifact row in the viewport).
+            if (field != McpEditorField.Cancel && field != McpEditorField.Save)
+            {
+                rows.Add(new EditorRow(field, int.MinValue));
             }
         }
 
@@ -471,9 +711,11 @@ internal sealed class McpEditorForm : View
     };
 
     /// <summary>Returns the subview for a row, creating pooled per-item widgets on demand.</summary>
-    private View? ViewForRow(EditorRow row) => row.ItemIndex < 0
-        ? this.ViewForField(row.Field)
-        : row.Field switch
+    private View? ViewForRow(EditorRow row)
+    {
+        if (row.ItemIndex == int.MinValue) return null; // separator
+        if (row.ItemIndex < 0) return this.ViewForField(row.Field);
+        return row.Field switch
         {
             McpEditorField.Arguments => this.EnsureListField(this.argItemFields, row.ItemIndex, McpEditorField.Arguments),
             McpEditorField.Scopes => this.EnsureListField(this.scopeItemFields, row.ItemIndex, McpEditorField.Scopes),
@@ -481,6 +723,7 @@ internal sealed class McpEditorForm : View
             McpEditorField.Headers => this.EnsureMapRow(this.headerItemRows, row.ItemIndex, McpEditorField.Headers),
             _ => this.ViewForField(row.Field),
         };
+    }
 
     private void LayoutItemRow(EditorRow descriptor, McpServerDraft draft, int row)
     {
@@ -538,6 +781,7 @@ internal sealed class McpEditorForm : View
         int index,
         int row)
     {
+        mapRow.X = ValueX;
         mapRow.Y = row;
         var named = !values.IsDefault && index < values.Length ? values[index] : null;
         mapRow.Name.Value = named?.Name ?? string.Empty;
@@ -551,6 +795,7 @@ internal sealed class McpEditorForm : View
 
     /// <summary>
     /// Lays out one scalar field (or the placeholder row of an empty list) at <paramref name="row"/>.
+    /// Also positions and shows the corresponding prefix label.
     /// </summary>
     private void LayoutScalarField(
         McpEditorField field,
@@ -558,6 +803,14 @@ internal sealed class McpEditorForm : View
         int row)
     {
         var draft = editor.Draft;
+
+        // Show the prefix label for this field (non-null for all input fields; null for Save/Cancel).
+        var prefixLabel = this.PrefixLabelForField(field);
+        if (prefixLabel is not null)
+        {
+            prefixLabel.Y = row;
+            prefixLabel.Visible = true;
+        }
 
         {
             switch (field)
@@ -593,7 +846,7 @@ internal sealed class McpEditorForm : View
 
                 case McpEditorField.Arguments:
                     this.ArgumentsSummaryLabel.Y = row;
-                    this.ArgumentsSummaryLabel.Text = FormatCount("Args", draft.Args.IsDefault ? 0 : draft.Args.Length);
+                    this.ArgumentsSummaryLabel.Text = FormatCount(draft.Args.IsDefault ? 0 : draft.Args.Length);
                     this.ArgumentsSummaryLabel.Visible = true;
                     break;
 
@@ -606,7 +859,7 @@ internal sealed class McpEditorForm : View
 
                 case McpEditorField.Headers:
                     this.HeadersSummaryLabel.Y = row;
-                    this.HeadersSummaryLabel.Text = FormatCount("Headers", draft.Headers.Length);
+                    this.HeadersSummaryLabel.Text = FormatCount(draft.Headers.Length);
                     this.HeadersSummaryLabel.Visible = true;
                     break;
 
@@ -630,13 +883,13 @@ internal sealed class McpEditorForm : View
 
                 case McpEditorField.Scopes:
                     this.ScopesSummaryLabel.Y = row;
-                    this.ScopesSummaryLabel.Text = FormatCount("Scopes", draft.Scopes.Length);
+                    this.ScopesSummaryLabel.Text = FormatCount(draft.Scopes.Length);
                     this.ScopesSummaryLabel.Visible = true;
                     break;
 
                 case McpEditorField.Environment:
                     this.EnvironmentSummaryLabel.Y = row;
-                    this.EnvironmentSummaryLabel.Text = FormatCount("Env", draft.Environment.Length);
+                    this.EnvironmentSummaryLabel.Text = FormatCount(draft.Environment.Length);
                     this.EnvironmentSummaryLabel.Visible = true;
                     break;
 
@@ -672,6 +925,7 @@ internal sealed class McpEditorForm : View
             var textField = new TextField
             {
                 Id = $"{field}Item{itemIndex}",
+                X = ValueX,
                 Width = Dim.Fill(),
                 Height = 1,
                 TabStop = TabBehavior.TabStop,
@@ -857,8 +1111,39 @@ internal sealed class McpEditorForm : View
         this.HeadersSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Headers); };
         this.ScopesSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Scopes); };
     }
-    private static string FormatCount(string label, int count) =>
-        count == 0 ? $"{label}: (none)" : $"{label}: {count} item(s)";
+    private static string FormatCount(int count) =>
+        count == 0 ? "(none)" : $"{count} item(s)";
+
+    /// <summary>
+    /// Creates a non-focusable label for the label column (X=<see cref="GutterWidth"/>,
+    /// Width=<see cref="LabelWidth"/>). All prefix labels are built with this factory so the
+    /// column geometry is consistent and easy to change in one place.
+    /// </summary>
+    private Label[] AllPrefixLabels() =>
+    [
+        this.ScopePrefixLabel,
+        this.NamePrefixLabel,
+        this.TransportPrefixLabel,
+        this.CommandPrefixLabel,
+        this.ArgumentsPrefixLabel,
+        this.UrlPrefixLabel,
+        this.HeadersPrefixLabel,
+        this.AuthModePrefixLabel,
+        this.ClientIdPrefixLabel,
+        this.ScopesPrefixLabel,
+        this.EnvironmentPrefixLabel,
+        this.BearerTokenPrefixLabel,
+    ];
+
+    private static Label MakePrefixLabel(string text) => new Label
+    {
+        X = GutterWidth,
+        Width = LabelWidth,
+        Height = 1,
+        Text = text,
+        Visible = false,
+        CanFocus = false,
+    };
 
     private static string FormatSecret(McpSecretChange change) =>
         change.Kind switch

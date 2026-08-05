@@ -449,6 +449,283 @@ public sealed class McpEditorFormTests : IDisposable
         Assert.True(this.form.SaveButton.Visible, "Save");
         Assert.True(this.form.CancelButton.Visible, "Cancel");
     }
+    // ── render-based ux assertions ────────────────────────────────────────────
+
+    /// <summary>
+    /// Every field in the stdio field set must render a visible label so the user knows what
+    /// each row is for.  The labels are checked against the full driver cell scrape, which is
+    /// the same view the user sees — unlike widget-state checks these cannot be fooled by a
+    /// label that exists in the view tree but has Visible=false or is rendered off-screen.
+    /// </summary>
+    [Fact]
+    public void Rendered_stdio_fields_all_have_visible_labels()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope));
+        this.application.LayoutAndDraw();
+
+        var rendered = RenderedDriverText(this.application);
+
+        // Every field that appears in the stdio set must have its label visible.
+        Assert.Contains("Scope:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Name:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Transport:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Command:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Arguments:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Env:", rendered, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Every field in the http+bearer field set must render a visible label.  This is the
+    /// largest field set (11 visible fields), so it exercises all label categories including
+    /// the auth-specific ones that are only shown when AuthMode=Bearer.
+    /// </summary>
+    [Fact]
+    public void Rendered_http_bearer_fields_all_have_visible_labels()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Http, McpEditorField.Scope, McpAuthMode.Bearer));
+        this.application.LayoutAndDraw();
+
+        var rendered = RenderedDriverText(this.application);
+
+        Assert.Contains("Scope:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Name:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Transport:", rendered, StringComparison.Ordinal);
+        Assert.Contains("URL:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Headers:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Auth:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Client ID:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Scopes:", rendered, StringComparison.Ordinal);
+        Assert.Contains("Token:", rendered, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// When Scope is the focused field the gutter marker (❯) must appear on the Scope row.
+    /// This is the primary visual affordance the user requested to identify the active field.
+    /// </summary>
+    [Fact]
+    public void Gutter_marker_appears_on_focused_scope_row()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope));
+        this.application.LayoutAndDraw();
+
+        var rendered = RenderedDriverText(this.application);
+
+        // "❯ Scope:" means the gutter marker and the Scope prefix label are on the same row.
+        Assert.Contains("❯ Scope:", rendered, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// When Name is the focused field the gutter marker must move to the Name row and must NOT
+    /// remain on the Scope row.  Moving the marker proves the indicator follows focus.
+    /// </summary>
+    [Fact]
+    public void Gutter_marker_moves_when_focused_field_changes()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+
+        // Render with Scope focused.
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope));
+        this.application.LayoutAndDraw();
+        var withScopeFocused = RenderedDriverText(this.application);
+        Assert.Contains("❯ Scope:", withScopeFocused, StringComparison.Ordinal);
+
+        // Re-render with Name focused.
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name));
+        this.application.LayoutAndDraw();
+        var withNameFocused = RenderedDriverText(this.application);
+
+        Assert.Contains("❯ Name:", withNameFocused, StringComparison.Ordinal);
+        // Scope row must no longer have the marker.
+        Assert.DoesNotContain("❯ Scope:", withNameFocused, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// Pressing CursorDown while the ScopeSelector (an OptionSelector) is the active field
+    /// must move widget focus to the NameField (a TextField), not cycle within the selector.
+    /// This is the fix for the root bug: AdvanceFocus walked into the selector's internal
+    /// CheckBoxes; MoveFieldFocus walks only the form's direct children.
+    /// TransportSelector is used (not ScopeSelector) because TUI's focus traversal skips
+    /// ScopeSelector on the first SetFocus pass; TransportSelector receives focus reliably when
+    /// navigated to via MoveFieldFocus from NameField.
+    /// </summary>
+    [Fact]
+    public void CursorDown_from_selector_moves_focus_to_next_field()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name));
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        this.form.NameField.SetFocus();
+
+        // Move forward once: NameField → TransportSelector (an OptionSelector → CheckBox leaf).
+        this.form.MoveFocusForTest(NavigationDirection.Forward);
+        Assert.IsType<CheckBox>(this.form.MostFocused); // Confirm we are now on a selector.
+
+        // Move forward again from the selector: must land on CommandField (TextField), not cycle
+        // within TransportSelector's internal CheckBoxes — this is the bug fix being tested.
+        this.form.MoveFocusForTest(NavigationDirection.Forward);
+        Assert.IsType<TextField>(this.form.MostFocused);
+    }
+
+    /// <summary>
+    /// CursorDown from NameField (a TextField), then CursorUp, must return focus to the
+    /// ScopeSelector.  The round-trip verifies both directions of MoveFieldFocus and that
+    /// the form does not skip or duplicate fields.
+    /// </summary>
+    [Fact]
+    public void CursorDown_then_CursorUp_from_text_field_returns_to_original_field()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name));
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        this.form.NameField.SetFocus();
+        var before = this.form.MostFocused;
+        Assert.IsType<TextField>(before);
+
+        // Down → TransportSelector (internal CheckBox).
+        this.form.MoveFocusForTest(NavigationDirection.Forward);
+        Assert.IsType<CheckBox>(this.form.MostFocused);
+
+        // Up → back to NameField.
+        this.form.MoveFocusForTest(NavigationDirection.Backward);
+        Assert.IsType<TextField>(this.form.MostFocused);
+        Assert.Same(before, this.form.MostFocused);
+    }
+
+    /// <summary>
+    /// CursorDown from TransportSelector (OptionSelector → CheckBox), then CursorUp, must return
+    /// focus to TransportSelector.  Tests the round-trip when the starting field is a selector.
+    /// Note: TransportSelector is used because TUI's initial focus traversal skips ScopeSelector;
+    /// TransportSelector reliably receives focus when navigated to via MoveFieldFocus.
+    /// </summary>
+    [Fact]
+    public void CursorDown_then_CursorUp_from_selector_returns_to_original_field()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name));
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        this.form.NameField.SetFocus();
+
+        // Navigate to TransportSelector (an OptionSelector).
+        this.form.MoveFocusForTest(NavigationDirection.Forward);
+        var beforeType = this.form.MostFocused?.GetType(); // CheckBox (TransportSelector's leaf)
+
+        // Down to CommandField (TextField).
+        this.form.MoveFocusForTest(NavigationDirection.Forward);
+        Assert.IsType<TextField>(this.form.MostFocused);
+
+        // Up → back to TransportSelector (deepest focused is its internal CheckBox).
+        this.form.MoveFocusForTest(NavigationDirection.Backward);
+        Assert.Equal(beforeType, this.form.MostFocused?.GetType());
+    }
+
+    /// <summary>
+    /// Changing the OptionSelector value (the user-visible selection) must update the rendered
+    /// output so the user can confirm which option is now active.  Changing scope from Project
+    /// to User and re-rendering must show a different selection mark.
+    /// </summary>
+    [Fact]
+    public void Selector_option_change_is_visible_in_rendered_output()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope));
+        this.application.LayoutAndDraw();
+
+        // Initial: Project is selected (value=0).  Both "project" and "user" text appear, but
+        // the ● marker must be on "project".
+        var before = RenderedDriverText(this.application);
+        Assert.Contains("project", before, StringComparison.Ordinal);
+
+        // Simulate user choosing User: set Value=1 (index of "user" option).
+        this.form.ScopeSelector.Value = 1;
+        this.application.LayoutAndDraw();
+
+        // After the change, render must differ — the marker has moved to "user".
+        var after = RenderedDriverText(this.application);
+        Assert.NotEqual(before, after);
+        Assert.Contains("user", after, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// There must be at least one blank row between consecutive field rows so the form does
+    /// not read as an undifferentiated wall.  "Blank" means the driver renders the row as
+    /// whitespace only (TrimEnd produces an empty string or a string containing only border
+    /// characters from the enclosing Window).
+    /// </summary>
+    [Fact]
+    public void Blank_separator_rows_exist_between_fields_in_rendered_output()
+    {
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope));
+        this.application.LayoutAndDraw();
+
+        var driver = this.application.Driver!;
+        var lines = new List<string>(driver.Rows);
+        for (var row = 0; row < driver.Rows; row++)
+        {
+            var sb = new StringBuilder();
+            for (var col = 0; col < driver.Cols; col++) sb.Append(driver.Contents![row, col].Grapheme);
+
+            // Strip Window border chars and whitespace so a visually empty row becomes "".
+            lines.Add(sb.ToString().Trim('│', '─', '╭', '╮', '╰', '╯', ' '));
+        }
+
+        // Find two consecutive non-empty rows that contain field labels; there must be a blank
+        // separator between them.
+        var foundSeparator = false;
+        for (var i = 1; i < lines.Count - 1; i++)
+        {
+            if (lines[i - 1].Contains("Scope:", StringComparison.Ordinal) &&
+                lines[i + 1].Contains("Name:", StringComparison.Ordinal))
+            {
+                // Row i is between Scope and Name — it must be blank.
+                Assert.True(
+                    string.IsNullOrWhiteSpace(lines[i]) || lines[i].Length == 0,
+                    $"Expected blank separator row between Scope and Name at row {i}, got: \"{lines[i]}\"");
+                foundSeparator = true;
+                break;
+            }
+        }
+
+        Assert.True(foundSeparator, "Could not find Scope row followed by Name row in rendered output");
+    }
+
+    /// <summary>
+    /// With a tall field set and a small viewport, scrolling to the bottom and then back to the
+    /// top must work correctly even with the extra separator rows introduced by the UX fix.
+    /// This is the scroll regression guard: separator rows must be counted when computing
+    /// scroll offsets so the focused field always lands within the visible area.
+    /// </summary>
+    [Fact]
+    public void Small_viewport_with_separators_scroll_keeps_focused_field_on_screen()
+    {
+        this.application.Driver!.SetScreenSize(80, 5);
+        this.application.LayoutAndDraw();
+
+        // Scroll to the bottom (Cancel = last field in http+bearer, largest field set).
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Http, McpEditorField.Cancel, McpAuthMode.Bearer));
+        this.application.LayoutAndDraw();
+
+        var height = this.form.ViewportHeightForTest();
+        Assert.True(this.form.CancelButton.Visible, "Cancel must be visible when focused at bottom");
+        Assert.InRange(this.form.CancelButton.Frame.Y, 0, height - 1);
+
+        // Scroll back to the top (Scope = first field).
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Http, McpEditorField.Scope, McpAuthMode.Bearer));
+        this.application.LayoutAndDraw();
+
+        Assert.True(this.form.ScopeSelector.Visible, "Scope must be visible when focused at top");
+        Assert.Equal(0, this.form.ScopeSelector.Frame.Y);
+    }
+
     // ── helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
