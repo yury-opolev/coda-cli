@@ -74,6 +74,21 @@ public sealed class ModelBrowserTests : IDisposable
         this._app.LayoutAndDraw();
     }
 
+    // ── Rendered selection highlight (defect: selected row was invisible) ──────
+
+    [Fact]
+    public void Selected_row_is_painted_with_the_selection_attribute()
+    {
+        this.ShowWith(MakeResult(count: 5));
+
+        RenderedOutput.AssertSelectionHighlightVisible(this._app, "model-01", "model-02");
+
+        this._overlay.NewKeyDownEvent(Key.CursorDown);
+        this._app.LayoutAndDraw();
+
+        RenderedOutput.AssertSelectionHighlightVisible(this._app, "model-02", "model-01");
+    }
+
     // ── Test 1: Scrolling ──────────────────────────────────────────────────────
 
     [Fact]

@@ -52,6 +52,38 @@ public sealed class PluginBrowserOverlayTests : IDisposable
             _tempDir, stateStore ?? NewStateStore(), new PluginTrustStore(_userCodaDir), Updater: null));
 
     [Fact]
+    public void Selected_row_is_painted_with_the_selection_attribute()
+    {
+        WritePlugin("alpha", "1.0.0");
+        WritePlugin("beta", "2.0.0");
+
+        var controller = NewController();
+        var host = new Window();
+        var overlay = new PluginBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            overlay.Show();
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, "alpha", "beta");
+
+            overlay.NewKeyDownEvent(Key.CursorDown);
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, "beta", "alpha");
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Fact]
     public void Overlay_ListsPlugins_WithEnabledAndTrustState()
     {
         WritePlugin("alpha", "1.0.0");

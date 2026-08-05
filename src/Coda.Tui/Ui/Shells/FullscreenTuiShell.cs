@@ -192,10 +192,8 @@ internal class FullscreenTuiShell(
         // Anchor everything whose vertical position depends on the current composer height.
         this.ApplyBottomAnchors();
 
-        this.PromptOverlay.X = 0;
-        this.PromptOverlay.Y = 0;
-        this.PromptOverlay.Width = Dim.Fill();
-        this.PromptOverlay.Height = Dim.Fill();
+        // The prompt overlay owns its own geometry: it measures its content and centres itself in
+        // this shell, falling back to full-screen when the content will not fit inside its bounds.
 
         this.Add(this.header);
         this.Add(this.transcript);

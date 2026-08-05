@@ -865,6 +865,75 @@ public sealed class McpEditorFormTests : IDisposable
         return string.Join(Environment.NewLine, lines);
     }
 
+    // ── rendered focus affordances ────────────────────────────────────────────
+    // Asserted against the driver cell buffer: the widget-state versions of these checks passed
+    // while the user had no way to tell which button or option the cursor was on.
+
+    [Fact]
+    public void Focused_button_is_painted_inverted_and_carries_the_gutter_marker()
+    {
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Save));
+        this.application.LayoutAndDraw();
+
+        Assert.Contains("\u276f \u27e6 Save \u27e7", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+
+        var save = RenderedOutput.AttributeOf(this.application, "Save");
+        var cancel = RenderedOutput.AttributeOf(this.application, "Cancel");
+        Assert.NotEqual(cancel, save);
+
+        // Filled, not merely tinted: a focused button must change its BACKGROUND, because a
+        // foreground-only accent is what made the previous focus treatment invisible in practice.
+        Assert.NotEqual(cancel.Background, save.Background);
+    }
+
+    [Fact]
+    public void Moving_focus_between_buttons_moves_the_painted_inversion()
+    {
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Save));
+        this.application.LayoutAndDraw();
+        var saveFocused = RenderedOutput.AttributeOf(this.application, "Save");
+        var cancelUnfocused = RenderedOutput.AttributeOf(this.application, "Cancel");
+
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Cancel));
+        this.application.LayoutAndDraw();
+
+        Assert.Contains("\u276f \u27e6 Cancel \u27e7", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+        Assert.Equal(saveFocused, RenderedOutput.AttributeOf(this.application, "Cancel"));
+        Assert.Equal(cancelUnfocused, RenderedOutput.AttributeOf(this.application, "Save"));
+    }
+
+    [Fact]
+    public void Focused_selector_paints_its_cursor_option_distinctly_from_the_other_options()
+    {
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Transport));
+        this.application.LayoutAndDraw();
+
+        var screen = RenderedOutput.Text(this.application);
+
+        // Selection is carried by the glyph (radio-button style) …
+        Assert.Contains("\u25c9 stdio", screen, StringComparison.Ordinal);
+        Assert.Contains("\u25cb http", screen, StringComparison.Ordinal);
+
+        // … and the cursor is carried by the attribute, so the two are independently readable.
+        Assert.NotEqual(
+            RenderedOutput.AttributeOf(this.application, "http"),
+            RenderedOutput.AttributeOf(this.application, "stdio"));
+    }
+
+    [Fact]
+    public void Unfocused_selector_paints_no_cursor_so_the_cursor_attribute_tracks_focus_not_selection()
+    {
+        this.form.ApplyState(MakeEditorState(McpTransportKind.Stdio, McpEditorField.Command));
+        this.application.LayoutAndDraw();
+
+        // stdio is still the SELECTED option here, but the selector does not hold focus, so it must
+        // not steal the cursor treatment away from the field the user is actually on.
+        Assert.Contains("\u25c9 stdio", RenderedOutput.Text(this.application), StringComparison.Ordinal);
+        Assert.Equal(
+            RenderedOutput.AttributeOf(this.application, "http"),
+            RenderedOutput.AttributeOf(this.application, "stdio"));
+    }
+
     public void Dispose()
     {
         this.form.Dispose();

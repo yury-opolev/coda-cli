@@ -54,6 +54,41 @@ public sealed class TaskBrowserOverlayTests : IDisposable
         text.Replace("\r\n", "\n").Split('\n').First(l => l.Contains(needle, StringComparison.Ordinal));
 
     [Fact]
+    public void Selected_row_is_painted_with_the_selection_attribute()
+    {
+        _mgr.Register(TaskKind.Subagent, "alpha-task", parentTaskId: null);
+        _mgr.Register(TaskKind.Subagent, "beta-task", parentTaskId: null);
+        var controller = NewController();
+
+        var host = new Window();
+        var overlay = new TaskBrowserOverlay(_app, controller, TuiTheme.WarmEmber);
+        host.Add(overlay);
+
+        var token = _app.Begin(host)!;
+        try
+        {
+            controller.Open();
+            overlay.Show();
+            _app.LayoutAndDraw();
+
+            var first = controller.State.Selected!.Task.Description;
+            var other = first == "alpha-task" ? "beta-task" : "alpha-task";
+            RenderedOutput.AssertSelectionHighlightVisible(_app, first, other);
+
+            overlay.NewKeyDownEvent(Key.CursorDown);
+            _app.LayoutAndDraw();
+
+            RenderedOutput.AssertSelectionHighlightVisible(_app, other, first);
+        }
+        finally
+        {
+            _app.End(token);
+            overlay.Dispose();
+            host.Dispose();
+        }
+    }
+
+    [Fact]
     public void Overlay_ShowsAndDrawsSelectedTask_WithoutThrowing()
     {
         _mgr.Register(TaskKind.Subagent, "render-me", parentTaskId: null);

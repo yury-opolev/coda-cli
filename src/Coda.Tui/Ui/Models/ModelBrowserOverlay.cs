@@ -87,6 +87,7 @@ internal sealed class ModelBrowserOverlay : View
         this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 3, MaxWidth = 6 };
         this.listTable.Style.ColumnStyles[4] = new ColumnStyle { MinWidth = 0, MaxWidth = 24, TruncationIndicator = "…" };
         this.listTable.Style.RowColorGetter = this.GetRowScheme;
+        this.listTable.FullRowSelect = true;
 
         this.status = new Label { X = 0, Y = Pos.AnchorEnd(2), Width = Dim.Fill(), Height = 1, CanFocus = false };
         this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
@@ -469,6 +470,11 @@ internal sealed class ModelBrowserOverlay : View
 
     private Scheme? GetRowScheme(RowColorGetterArgs args)
     {
+        if (this.IsSelectedRow(args.RowIndex))
+        {
+            return this.EnsureSchemes().Selection;
+        }
+
         if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
         {
             return null;
@@ -480,6 +486,11 @@ internal sealed class ModelBrowserOverlay : View
 
     private Scheme? GetStatusCellScheme(CellColorGetterArgs args)
     {
+        if (this.IsSelectedRow(args.RowIndex))
+        {
+            return this.EnsureSchemes().Selection;
+        }
+
         if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
         {
             return null;
@@ -488,6 +499,15 @@ internal sealed class ModelBrowserOverlay : View
         var model = this.ListTableSource.ModelAt(args.RowIndex);
         return this.EnsureSchemes().For(ModelTableSource.GetState(model, this.controller.State.CurrentModelId));
     }
+
+    /// <summary>
+    /// Whether <paramref name="rowIndex"/> is the row the table cursor is on, which the colour
+    /// getters paint with the inverted selection scheme. Read from the table rather than from
+    /// controller state so a filtered list, whose row indices no longer match the unfiltered
+    /// state, still highlights the row the user is actually on.
+    /// </summary>
+    private bool IsSelectedRow(int rowIndex) =>
+        this.listTable.Value is { } selection && selection.SelectedCell.Y == rowIndex;
 
     private BrowserSchemes EnsureSchemes() =>
         this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);

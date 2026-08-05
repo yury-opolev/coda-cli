@@ -9,6 +9,27 @@ namespace Coda.Tui.Ui.Shells;
 
 internal sealed class PromptOverlay : View, ISelectableOverlay
 {
+    /// <summary>Row the body starts on; rows 0-1 belong to the title (and its optional message).</summary>
+    private const int BodyTop = 2;
+
+    /// <summary>
+    /// Narrowest the dialog is allowed to get. Below this an option label wraps into unreadable
+    /// stubs, which is worse than a box that is wider than its content.
+    /// </summary>
+    private const int MinDialogWidth = 40;
+
+    /// <summary>
+    /// Widest the dialog is allowed to get regardless of terminal size. A prompt stretched across a
+    /// 200-column terminal is harder to read than one the eye can take in without travelling.
+    /// </summary>
+    private const int MaxDialogWidth = 100;
+
+    /// <summary>Share of the host surface the dialog may occupy before it goes full-screen.</summary>
+    private const int MaxHostPercent = 80;
+
+    /// <summary>Rows and columns the rounded border takes off the content area.</summary>
+    private const int Chrome = 2;
+
     private readonly IUiEventPublisher publisher;
     private TuiTheme theme;
     private readonly Label titleLabel;
@@ -30,15 +51,74 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
         this.BorderStyle = LineStyle.Rounded;
 
         this.titleLabel = new Label { X = 0, Y = 0, Width = Dim.Fill(), CanFocus = false };
-        this.bodyLabel = new SelectableTextView(app) { X = 0, Y = 2, Width = Dim.Fill(), Height = Dim.Fill() };
+        this.bodyLabel = new SelectableTextView(app) { X = 0, Y = BodyTop, Width = Dim.Fill(), Height = Dim.Fill() };
         if (onCopyRequested is not null)
         {
             this.bodyLabel.CopyRequested += text => onCopyRequested(text, this.bodyLabel.ClearSelection);
         }
 
+        // The overlay sizes itself to its content and centres in its host. Dim.Func re-measures on
+        // every layout pass, so a terminal resize re-clamps and re-centres the dialog without the
+        // hosting shell having to know anything about prompt geometry.
+        this.X = Pos.Center();
+        this.Y = Pos.Center();
+        this.Width = Dim.Func(_ => this.Measure().Width, this);
+        this.Height = Dim.Func(_ => this.Measure().Height, this);
+
         this.Add(this.titleLabel);
         this.Add(this.bodyLabel);
     }
+
+    /// <summary>The dialog box the overlay should occupy, in host coordinates.</summary>
+    /// <remarks>
+    /// Recomputed rather than cached because <see cref="Dim.Func"/> calls it during layout, which is
+    /// also the only moment the host's own size is reliably known.
+    /// </remarks>
+    private (int Width, int Height) Measure()
+    {
+        var host = this.HostSize();
+        if (host.Width <= 0 || host.Height <= 0 || this.request is null)
+        {
+            return (Math.Max(1, host.Width), Math.Max(1, host.Height));
+        }
+
+        var titleWidth = LongestLine(this.titleLabel.Text);
+        var bodyLines = SplitLines(this.bodyLabel.AllText);
+        var bodyWidth = bodyLines.Max(static line => line.Length);
+
+        // The body is pinned to BodyTop, so the title always reserves those rows whether or not a
+        // message pushed it onto a second line. The trailing row keeps the last option off the border.
+        var contentHeight = BodyTop + bodyLines.Count + 1;
+
+        var maxWidth = Math.Min(host.Width * MaxHostPercent / 100, MaxDialogWidth);
+        var maxHeight = host.Height * MaxHostPercent / 100;
+
+        var width = Math.Max(MinDialogWidth, Math.Max(titleWidth, bodyWidth) + Chrome);
+        var height = contentHeight + Chrome;
+
+        // Anything that will not fit inside the clamped box takes the whole screen instead of being
+        // silently cropped: an option the user cannot see is an option the user cannot choose.
+        return width > maxWidth || height > maxHeight || maxWidth < MinDialogWidth
+            ? (host.Width, host.Height)
+            : (width, height);
+    }
+
+    /// <summary>The surface the dialog is centred in — the hosting shell, or the screen.</summary>
+    private (int Width, int Height) HostSize()
+    {
+        if (this.SuperView is { } superView && superView.Viewport is { Width: > 0, Height: > 0 } viewport)
+        {
+            return (viewport.Width, viewport.Height);
+        }
+
+        var screen = this.App?.Screen ?? default;
+        return (screen.Width, screen.Height);
+    }
+
+    private static List<string> SplitLines(string? text) =>
+        string.IsNullOrEmpty(text) ? [string.Empty] : [.. text.Replace("\r\n", "\n", StringComparison.Ordinal).Split('\n')];
+
+    private static int LongestLine(string? text) => SplitLines(text).Max(static line => line.Length);
 
     internal void ApplyTheme(TuiTheme theme, IDriver? driver)
     {
