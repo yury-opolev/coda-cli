@@ -105,4 +105,57 @@ public class TaskManagerWaitingTests : IDisposable
 
         Assert.Equal(TaskActionResult.Denied, mgr.TryDetach(shell.Id, callerTaskId: a.Id));
     }
+
+    // -------------------------------------------------------------------------
+    // task_wait outbox-consume behaviour (Task 11)
+    // -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task WaitForTerminal_Terminal_ConsumesOutboxEntry()
+    {
+        // Arrange: a background task completes and has an outbox entry for the main agent.
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Subagent, "worker", parentTaskId: null, mode: TaskExecutionMode.Background);
+        mgr.Complete(t.Id, "result");
+
+        // Verify entry is present before wait.
+        var before = mgr.DrainCompletions(ownerTaskId: null);
+        Assert.Single(before);
+
+        // Re-enqueue by completing a second task (the drain consumed the first).
+        var t2 = mgr.Register(TaskKind.Subagent, "worker2", parentTaskId: null, mode: TaskExecutionMode.Background);
+        mgr.Complete(t2.Id, "r2");
+
+        // ConsumeCompletion is what task_wait calls after a terminal return.
+        var consumed = mgr.ConsumeCompletion(t2.Id, ownerTaskId: null);
+        Assert.True(consumed);
+
+        // After consume, the outbox for the main agent is empty.
+        var after = mgr.DrainCompletions(ownerTaskId: null);
+        Assert.Empty(after);
+
+        await Task.CompletedTask; // keep async signature; the real tool test below is sync
+    }
+
+    [Fact]
+    public async Task WaitForTerminal_Timeout_DoesNotConsumeOutboxEntry()
+    {
+        // A timeout must NOT consume the outbox entry — the task is still running and will
+        // complete later; that completion must still be delivered via the injection seam.
+        var mgr = NewManager();
+        var t = mgr.Register(TaskKind.Subagent, "long-worker", parentTaskId: null, mode: TaskExecutionMode.Background);
+
+        // Time out immediately.
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(1));
+        try { await mgr.WaitForTerminalAsync(t.Id, callerTaskId: null, cts.Token); }
+        catch (OperationCanceledException) { /* expected */ }
+
+        // Complete the task now — should land in the outbox.
+        mgr.Complete(t.Id, "late result");
+
+        // The outbox must still have the entry (the timeout consumed nothing).
+        var entries = mgr.DrainCompletions(ownerTaskId: null);
+        Assert.Single(entries);
+        Assert.Equal(t.Id, entries[0].TaskId);
+    }
 }

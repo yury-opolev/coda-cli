@@ -43,6 +43,7 @@ public static class ServeMethods
     public const string EventToolResultModified = "event/toolResultModified";
     public const string EventPermissionDecided = "event/permissionDecided";
     public const string EventPermissionsUpdated = "event/permissionsUpdated";
+    public const string EventTaskCompleted = "event/taskCompleted";
     public const string EventSubagentBlocked = "event/subagentBlocked";
     public const string EventSubagentResultModified = "event/subagentResultModified";
     public const string EventCompactionCancelled = "event/compactionCancelled";

@@ -3,6 +3,16 @@ using System.Collections.Concurrent;
 namespace Coda.Agent.Tasks;
 
 /// <summary>
+/// A terminal-state notification for a background task, delivered via the per-owner
+/// completion outbox on <see cref="TaskManager"/>.
+/// </summary>
+/// <param name="TaskId">The task identifier that reached a terminal state.</param>
+/// <param name="Description">Human-readable label of the task (from <see cref="ManagedTask.Description"/>).</param>
+/// <param name="Status">The terminal status: <see cref="TaskRunStatus.Completed"/>, <see cref="TaskRunStatus.Failed"/>, or <see cref="TaskRunStatus.Stopped"/>.</param>
+/// <param name="Report">The final result or error text, or <see langword="null"/> when not applicable.</param>
+public sealed record TaskCompletionEntry(string TaskId, string Description, TaskRunStatus Status, string? Report);
+
+/// <summary>
 /// In-process registry and coordinator for all long-running work in a session
 /// (subagents and shells). Owns task identity, the depth model, and (in later
 /// tasks) output fan-out, persistent logs, change subscriptions, and shutdown.
@@ -37,6 +47,13 @@ public sealed partial class TaskManager : IDisposable
     /// </summary>
     public const int DefaultMaxRetainedTerminalTasks = 256;
 
+    /// <summary>
+    /// Maximum number of completion entries retained per owner in the outbox.
+    /// When exceeded the oldest entry is silently dropped so the outbox cannot grow without
+    /// bound against a stalled or dead consumer.
+    /// </summary>
+    public const int CompletionOutboxCapacity = 64;
+
     private readonly object _gate = new();
     private readonly List<ManagedTask> _order = new();
     private readonly ConcurrentDictionary<string, ManagedTask> _tasks = new();
@@ -50,6 +67,21 @@ public sealed partial class TaskManager : IDisposable
     // on a pool thread. SemaphoreSlim holds no unmanaged resource unless AvailableWaitHandle is
     // touched, which nothing here does.
     private readonly SemaphoreSlim _subagentSlots;    private int _nextId;
+
+    // Per-owner completion outbox.  Key is the owner's task id, or MainAgentOutboxKey for the
+    // main agent.  Guarded by _outboxGate, which is NEVER taken while _gate is held — the
+    // enqueue site runs after Publish (outside _gate) to preserve the existing lock-ordering
+    // invariant.
+    private readonly object _outboxGate = new();
+    private readonly Dictionary<string, Queue<TaskCompletionEntry>> _outbox = new(StringComparer.Ordinal);
+
+    // Stable sentinel for the main-agent's outbox slot.  The leading NUL cannot collide with a
+    // real task-NNNN id, so a subagent cannot masquerade as the main-agent consumer.
+    private const string MainAgentOutboxKey = "\u0000main";
+
+    /// <summary>Returns the dictionary key for <paramref name="ownerTaskId"/>, mapping null (main agent) to the stable sentinel.</summary>
+    private static string OutboxKey(string? ownerTaskId) => ownerTaskId ?? MainAgentOutboxKey;
+
     private bool _idleLeaseHeld;
 
     /// <summary>
@@ -564,6 +596,10 @@ public sealed partial class TaskManager : IDisposable
             _ = cb("task-complete", id);
         }
 
+        // Enqueue the completion into the per-owner outbox so the owning agent learns about it
+        // at its next iteration boundary without polling.
+        this.EnqueueCompletionIfBackground(t, TaskRunStatus.Completed, result);
+
         return true;
     }
 
@@ -573,6 +609,11 @@ public sealed partial class TaskManager : IDisposable
         if (Find(id) is not { } t || !t.TryFail(error, out var version)) return false;
         Publish(id, version, TaskChangeKind.Status);
         RaiseIdleStateChangedIfIdle();
+
+        // Enqueue failed workers too — Fail fires nothing today and an orchestrator most needs
+        // to hear about failures.
+        this.EnqueueCompletionIfBackground(t, TaskRunStatus.Failed, error);
+
         return true;
     }
 
@@ -582,6 +623,10 @@ public sealed partial class TaskManager : IDisposable
         if (Find(id) is not { } t || !t.TryStop(out var version)) return false;
         Publish(id, version, TaskChangeKind.Status);
         RaiseIdleStateChangedIfIdle();
+
+        // Enqueue stopped workers for the same reason as Fail above.
+        this.EnqueueCompletionIfBackground(t, TaskRunStatus.Stopped, report: null);
+
         return true;
     }
 
@@ -603,6 +648,133 @@ public sealed partial class TaskManager : IDisposable
         foreach (var sub in subs)
         {
             sub.Post(change);
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Completion outbox — per-owner bounded queue of background-task terminals.
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// Enqueues a completion entry for <paramref name="task"/> when it is a background task.
+    /// Foreground tasks skip this — their report is already the tool result and would be double-delivered.
+    /// Resolves the effective owner via orphan roll-up: if the task's direct parent is already terminal
+    /// (or pruned), the entry rolls up to the nearest live strict ancestor, ultimately landing on the
+    /// main agent (null) so no completion is ever permanently lost.
+    /// </summary>
+    /// <remarks>
+    /// MUST be called OUTSIDE <see cref="_gate"/> — same discipline as <see cref="Publish"/>.
+    /// Uses a separate <see cref="_outboxGate"/> so neither lock nests inside the other.
+    /// </remarks>
+    private void EnqueueCompletionIfBackground(ManagedTask task, TaskRunStatus status, string? report)
+    {
+        if (task.Mode != TaskExecutionMode.Background) return;
+
+        // Resolve effective owner: start with the task's direct parent, walk up to find a live ancestor.
+        // The main agent (null) is unconditionally live — the walk always terminates.
+        var owner = this.ResolveEffectiveOwner(task.ParentId);
+        var entry = new TaskCompletionEntry(task.Id, task.Description, status, report);
+
+        lock (this._outboxGate)
+        {
+            if (!this._outbox.TryGetValue(OutboxKey(owner), out var queue))
+            {
+                queue = new Queue<TaskCompletionEntry>();
+                this._outbox[OutboxKey(owner)] = queue;
+            }
+
+            // Enforce capacity: drop the oldest entry to keep the outbox bounded.
+            if (queue.Count >= CompletionOutboxCapacity)
+            {
+                queue.Dequeue();
+            }
+
+            queue.Enqueue(entry);
+        }
+    }
+
+    /// <summary>
+    /// Walks the ancestor chain from <paramref name="startId"/> and returns the first live
+    /// (Running) ancestor's id, or <see langword="null"/> (main agent) when no running
+    /// ancestor exists. The main agent is always considered live so the walk always terminates.
+    /// </summary>
+    private string? ResolveEffectiveOwner(string? startId)
+    {
+        // Main agent is always live — null is the terminal anchor.
+        if (startId is null) return null;
+
+        var current = Find(startId);
+        if (current is null || current.Status == TaskRunStatus.Running)
+        {
+            // Either the owner exists and is live (normal case), or it has been pruned from the
+            // registry (rare); treat pruned the same as dead and roll up.
+            return current is not null ? startId : this.ResolveEffectiveOwner(null);
+        }
+
+        // Owner is terminal — roll up one level.
+        return this.ResolveEffectiveOwner(current.ParentId);
+    }
+
+    /// <summary>
+    /// Drains all completion entries for <paramref name="ownerTaskId"/> from the outbox and
+    /// returns them. Delivery is EXACTLY ONCE: a second call for the same owner returns an
+    /// empty list unless new completions arrived in the meantime.
+    /// </summary>
+    /// <param name="ownerTaskId">
+    /// The task id of the owning agent, or <see langword="null"/> for the main agent.
+    /// </param>
+    public IReadOnlyList<TaskCompletionEntry> DrainCompletions(string? ownerTaskId)
+    {
+        lock (this._outboxGate)
+        {
+            if (!this._outbox.TryGetValue(OutboxKey(ownerTaskId), out var queue) || queue.Count == 0)
+            {
+                return Array.Empty<TaskCompletionEntry>();
+            }
+
+            var result = queue.ToArray();
+            queue.Clear();
+            return result;
+        }
+    }
+
+    /// <summary>
+    /// Removes the completion entry for <paramref name="taskId"/> from
+    /// <paramref name="ownerTaskId"/>'s outbox. Used by <c>task_wait</c> when it returns a
+    /// terminal result so the owning agent does not receive the same completion twice.
+    /// </summary>
+    /// <returns><see langword="true"/> if an entry was found and removed; <see langword="false"/> otherwise.</returns>
+    public bool ConsumeCompletion(string taskId, string? ownerTaskId)
+    {
+        var key = OutboxKey(ownerTaskId);
+        lock (this._outboxGate)
+        {
+            if (!this._outbox.TryGetValue(key, out var queue) || queue.Count == 0)
+            {
+                return false;
+            }
+
+            // Scan for the entry and rebuild the queue without it.
+            var found = false;
+            var rebuilt = new Queue<TaskCompletionEntry>(queue.Count);
+            foreach (var entry in queue)
+            {
+                if (!found && entry.TaskId == taskId)
+                {
+                    found = true; // skip this one
+                }
+                else
+                {
+                    rebuilt.Enqueue(entry);
+                }
+            }
+
+            if (found)
+            {
+                this._outbox[key] = rebuilt;
+            }
+
+            return found;
         }
     }
 

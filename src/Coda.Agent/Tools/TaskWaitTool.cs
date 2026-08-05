@@ -77,6 +77,12 @@ public sealed class TaskWaitTool : ITool
                 return new ToolResult($"Task '{taskId}' not found.");
             }
 
+            // Consume the outbox entry so the owning agent does not receive the same completion
+            // twice: once via task_wait's return value and once via the injection seam.
+            // A timeout (OperationCanceledException below) must NOT consume — the task is still
+            // running and the outbox entry should be delivered at the next iteration boundary.
+            context.Tasks.ConsumeCompletion(taskId, context.CurrentTaskId);
+
             var status = context.Tasks.Get(taskId, context.CurrentTaskId)?.Status.ToString().ToLowerInvariant();
             return new ToolResult(FormatFinished(taskId, status));
         }

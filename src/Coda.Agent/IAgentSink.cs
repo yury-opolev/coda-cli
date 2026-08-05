@@ -152,6 +152,16 @@ public interface IAgentSink
     // -------------------------------------------------------------------------
 
     /// <summary>
+    /// A background task reached a terminal state (completed, failed, or stopped). The report is
+    /// truncated to the same cap as the TUI injection. Optional.
+    /// </summary>
+    /// <param name="taskId">The task identifier.</param>
+    /// <param name="status"><c>"completed"</c>, <c>"failed"</c>, or <c>"stopped"</c>.</param>
+    /// <param name="description">Human-readable task label.</param>
+    /// <param name="report">Truncated result or error text, or <see langword="null"/> when not applicable.</param>
+    void OnTaskCompleted(string taskId, string status, string description, string? report) { }
+
+    /// <summary>
     /// A <c>SubagentStart</c> hook blocked a subagent from running. The <c>task</c> tool will
     /// return <paramref name="reason"/> as an error result. Optional.
     /// </summary>

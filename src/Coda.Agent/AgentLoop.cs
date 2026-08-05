@@ -80,6 +80,73 @@ public sealed partial class AgentLoop : IAgentLoop
     /// <summary>Environment variable overriding the per-tool wall-clock ceiling (whole seconds; &lt;= 0 disables).</summary>
     internal const string ToolMaxSecondsEnv = "CODA_TOOL_MAX_SECONDS";
 
+    /// <summary>
+    /// Maximum characters of a background-task report included in a single
+    /// <see cref="FormatCompletionInjection"/> block. Reports that exceed this are truncated with
+    /// a trailing notice so the context window stays bounded across a wide fan-out.
+    /// </summary>
+    internal const int CompletionReportTruncateAt = 4000;
+
+    /// <summary>
+    /// Maximum number of background-task completions injected as full blocks per iteration.
+    /// Completions beyond this cap are summarised as a count rather than injected wholesale,
+    /// so 20 simultaneous arrivals cannot blow the context window.
+    /// </summary>
+    internal const int CompletionInjectBatchSize = 5;
+
+    /// <summary>
+    /// Formats a synthetic user-message body for the task-completion push seam.
+    /// Each entry in the first <paramref name="batchSize"/> items of <paramref name="entries"/>
+    /// is rendered as an XML-style block; overflow entries beyond the batch are summarised as a count
+    /// so the caller can mention <c>task_output</c> to retrieve the full log.
+    /// </summary>
+    /// <param name="entries">The completion entries to format; must be non-empty.</param>
+    /// <param name="truncateAt">Character limit applied to each report/error field individually.</param>
+    /// <param name="batchSize">Maximum number of full blocks to emit.</param>
+    internal static string FormatCompletionInjection(
+        IReadOnlyList<Tasks.TaskCompletionEntry> entries,
+        int truncateAt,
+        int batchSize)
+    {
+        var sb = new System.Text.StringBuilder();
+        var visible = Math.Min(entries.Count, batchSize);
+
+        for (var i = 0; i < visible; i++)
+        {
+            var e = entries[i];
+            var status = e.Status.ToString().ToLowerInvariant();
+            sb.Append($"<task-completed id=\"{e.TaskId}\" status=\"{status}\" description=\"{System.Security.SecurityElement.Escape(e.Description)}\">");
+            if (e.Report is { Length: > 0 } report)
+            {
+                sb.AppendLine();
+                if (report.Length > truncateAt)
+                {
+                    sb.Append(report.AsSpan(0, truncateAt));
+                    sb.AppendLine();
+                    sb.AppendLine($"(truncated — use task_output for the full log)");
+                }
+                else
+                {
+                    sb.AppendLine(report);
+                }
+            }
+            else
+            {
+                sb.AppendLine();
+            }
+
+            sb.AppendLine("</task-completed>");
+        }
+
+        var overflow = entries.Count - visible;
+        if (overflow > 0)
+        {
+            sb.AppendLine($"{overflow} more task(s) completed — call task_output to see their results.");
+        }
+
+        return sb.ToString().TrimEnd();
+    }
+
     internal static TimeSpan ResolveToolMaxDuration(string? raw)
     {
         if (string.IsNullOrWhiteSpace(raw) || !int.TryParse(raw, out var seconds))
@@ -420,6 +487,32 @@ public sealed partial class AgentLoop : IAgentLoop
                         var steerText = string.Join("\n\n", steers.Select(entry => entry.Text));
                         history.Add(new ChatMessage(ChatRole.User, [new TextBlock(steerText)]));
                         sink.OnSteeringDelivered(steers.Select(entry => entry.Id).ToArray());
+                    }
+                }
+
+                // TASK-COMPLETION PUSH SEAM: drain per-owner background-task completions and
+                // inject them as a synthetic user message so the orchestrator learns of terminal
+                // workers without polling. Steering drains first (operator intent outranks worker
+                // results); we run second. Only injected when the outbox is non-empty, so an idle
+                // turn has no overhead. Reports are truncated and capped so a wide fan-out cannot
+                // blow the context window (see FormatCompletionInjection / CompletionReportTruncateAt).
+                if (this.tasks is not null)
+                {
+                    var completions = this.tasks.DrainCompletions(this.currentTaskId);
+                    if (completions.Count > 0)
+                    {
+                        var injectionText = FormatCompletionInjection(completions, CompletionReportTruncateAt, CompletionInjectBatchSize);
+                        history.Add(new ChatMessage(ChatRole.User, [new TextBlock(injectionText)]));
+
+                        // Emit per-entry serve events so headless orchestrators receive each
+                        // completion independently, identically truncated to the TUI path.
+                        foreach (var c in completions)
+                        {
+                            var truncatedReport = c.Report is { Length: > CompletionReportTruncateAt }
+                                ? c.Report[..CompletionReportTruncateAt]
+                                : c.Report;
+                            sink.OnTaskCompleted(c.TaskId, c.Status.ToString().ToLowerInvariant(), c.Description, truncatedReport);
+                        }
                     }
                 }
 
