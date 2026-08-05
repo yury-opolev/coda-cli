@@ -274,10 +274,10 @@ public sealed class WidgetIntegrationSpikeTests : IDisposable
         view.SetFocus();
         this.application.LayoutAndDraw();
 
-        Assert.Equal(0, view.Value.SelectedCell.Y);
+        Assert.Equal(0, view.Value!.SelectedCell.Y);
 
         view.NewKeyDownEvent(Key.CursorDown);
-        Assert.Equal(1, view.Value.SelectedCell.Y);
+        Assert.Equal(1, view.Value!.SelectedCell.Y);
 
         var rendered = RenderedDriverText(this.application);
         Assert.Contains("alpha", rendered, StringComparison.Ordinal);
@@ -350,7 +350,7 @@ public sealed class WidgetIntegrationSpikeTests : IDisposable
 
         this.application.LayoutAndDraw();
 
-        Assert.Equal(40, view.Value.SelectedCell.Y);
+        Assert.Equal(40, view.Value!.SelectedCell.Y);
 
         // The point of the widget: the selected row is brought into view without us computing a window.
         var rendered = RenderedDriverText(this.application);
