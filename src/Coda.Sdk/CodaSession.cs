@@ -61,6 +61,14 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     private readonly ILogger logger;
     private readonly TurnPipelineBuilder turnPipelineBuilder;
     private readonly SteeringInbox steeringInbox = new();
+
+    /// <summary>
+    /// Resolved allow/deny filter for the main agent's tool registry.
+    /// Null = no filter. Applied per turn in <c>ResolveEffectiveOptions</c> so that
+    /// <see cref="Turns.TurnPipelineBuilder.BuildParentTools"/> picks it up without
+    /// needing a separate constructor parameter on the builder.
+    /// </summary>
+    private readonly Coda.Agent.Tools.ToolNameFilter? agentToolFilter;
     /// <summary>
     /// Test seam: when non-null, overrides the <see cref="UserHookRunner"/> produced by
     /// <see cref="Turns.TurnPipelineBuilder"/> so unit tests can inject controlled hook behaviour
@@ -186,6 +194,9 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         // configured limits instead of silently falling back to the defaults.
         var settings = SettingsLoader.Load(options.WorkingDirectory);
         this.subagentSettings = options.SubagentSettings ?? settings.Subagents;
+
+        // Resolve agent.tools filter from settings; options can override for testing.
+        this.agentToolFilter = options.AgentToolFilter ?? settings.AgentToolFilter;
 
         // The manager groups persistent task logs under the session id captured HERE. If the id
         // is later adopted (AdoptSessionId/Resume), the manager keeps this original grouping so
@@ -902,6 +913,10 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         {
             AutoCompactTokenThreshold = ModelLimits.ResolveAutoCompactThreshold(
                 ModelCatalog.Default, options.ProviderId, options.Model, options.AutoCompactTokenThreshold),
+            // Inject the session-resolved tool filter so BuildParentTools picks it up without
+            // needing a separate TurnPipelineBuilder parameter. Options-level filter wins if set
+            // directly (test override); otherwise this seeds from the settings-derived value.
+            AgentToolFilter = this.agentToolFilter,
         };
     }
 

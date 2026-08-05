@@ -893,6 +893,54 @@ project files if they exist (it never writes to them).
 | Session memory | `<project>/.coda/SESSION_MEMORY.md` | when enabled |
 | Telemetry logs | `~/.coda/logs/coda-<timestamp>-<pid>.log` | JSON-lines; opt-in; secrets redacted |
 
+### Agent tool filter
+
+> **This is a workflow control, NOT a security boundary.** Subagents, scheduled roots,
+> and hook-spawned agents keep their full tool sets regardless of this setting. See the
+> note at the end of this section.
+
+`agent.tools` restricts which tools the **main agent** may use directly. Subagent registries
+are built independently and are never filtered here, so a delegation-only workflow can be
+enforced while the agents doing the actual work retain full capability:
+
+```json
+{
+  "agent": {
+    "tools": {
+      "allow": ["task", "task_start"],
+      "deny":  ["run_command"]
+    }
+  }
+}
+```
+
+| Field | Effect |
+|---|---|
+| `allow` | When present, the main agent gets ONLY the tools in this list. Absent (or the key not present) means no allowlist — today's behaviour. An empty array (`[]`) is honoured literally and blocks every tool, which trips the inert-agent guard (see below). |
+| `deny` | Removes the listed tools AFTER the allowlist step. Deny wins when a name appears in both lists. |
+
+Matching is by `ITool.Name`, case-insensitive, so built-in, MCP, and plugin tools are all
+addressable by the same rule. Unknown tool names in either list are silently ignored (inert).
+
+**Merge rules** (user + project files):
+
+- `allow` is **intersected** — a project file can restrict further but can never widen what
+  the user file permitted.
+- `deny` is **unioned** — either file's denials are always honoured.
+
+**Inert-agent guard:** if the resolved filter would leave the main agent with neither `task`
+nor `task_start`, Coda refuses to start and reports the offending settings file by path.
+This prevents a configuration that silently cannot do anything useful.
+
+**Not a security boundary.** The `agent.tools` filter is applied only to the main-agent
+composition in `TurnPipelineBuilder.BuildParentTools`. Subagents, scheduled roots, and
+hook-spawned agents each have their own independently built registries and are never
+filtered by this setting. If the main agent can launch a subagent (`task` passes the
+filter), that subagent can still run any tool it has — including ones the main agent cannot
+call directly. This is intentional: `agent.tools` shapes _workflow_ (what the root turn
+does), not _capability_ (what the session can ultimately do). Do not use it as an access
+control mechanism.
+
 ### Subagent limits & prompts
 
 How deep and how wide a session may fan out into subagents is configurable in

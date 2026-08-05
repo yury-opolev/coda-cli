@@ -1,5 +1,6 @@
 using Coda.Agent.Hooks;
 using Coda.Agent.Lsp;
+using Coda.Agent.Tools;
 
 namespace Coda.Agent.Settings;
 
@@ -90,6 +91,21 @@ public sealed record CodaSettings(
     /// </summary>
     public IReadOnlyList<string> HookDisabledHashes { get; init; } = [];
 
+    /// <summary>
+    /// The resolved allow/deny filter for the MAIN AGENT's tool registry, derived from the
+    /// <c>agent.tools</c> block. Null means no filter is configured (today's behaviour).
+    /// Subagents, scheduled roots, and hook-spawned agents always keep their full toolsets
+    /// regardless of this value — it is applied only in
+    /// <c>TurnPipelineBuilder.BuildParentTools</c>.
+    /// </summary>
+    public ToolNameFilter? AgentToolFilter { get; init; }
+
+    /// <summary>
+    /// The raw <c>agent.tools</c> overrides from the per-file parse; used only so the
+    /// user/project merge can operate per field before the filter is materialised.
+    /// </summary>
+    internal AgentToolsOverrides? AgentToolsOverrides { get; init; }
+
     /// <summary>An empty settings instance with no allow/deny rules, hooks, or LSP servers.</summary>
     public static CodaSettings Empty { get; } = new([], [], []);
 
@@ -147,4 +163,44 @@ internal sealed record SubagentOverrides(
         ModelByType = this.ModelByType
             ?? new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase),
     };
+}
+
+/// <summary>
+/// The raw <c>agent.tools</c> values parsed from a single settings file.
+/// Null fields mean the file did not mention that property; used for per-field merging before
+/// the final <see cref="ToolNameFilter"/> is materialised.
+/// </summary>
+internal sealed record AgentToolsOverrides(IReadOnlyList<string>? Allow, IReadOnlyList<string> Deny)
+{
+    /// <summary>
+    /// Merges user and project overrides into a single <see cref="ToolNameFilter"/>:
+    /// <c>allow</c> is intersected (project can only restrict further); <c>deny</c> is unioned.
+    /// Returns null when neither file has an <c>agent.tools</c> block.
+    /// </summary>
+    public static AgentToolsOverrides? Merge(AgentToolsOverrides? user, AgentToolsOverrides? project) =>
+        user is null && project is null
+            ? null
+            : new AgentToolsOverrides(
+                MergeAllow(user?.Allow, project?.Allow),
+                MergeDeny(user?.Deny ?? [], project?.Deny ?? []));
+
+    /// <summary>Materialises this record as a <see cref="ToolNameFilter"/>.</summary>
+    public ToolNameFilter ToFilter() => new(this.Allow, this.Deny);
+
+    private static IReadOnlyList<string>? MergeAllow(IReadOnlyList<string>? user, IReadOnlyList<string>? project)
+    {
+        if (user is null && project is null) return null;
+        if (user is null) return project;
+        if (project is null) return user;
+        var projectSet = new HashSet<string>(project, StringComparer.OrdinalIgnoreCase);
+        return [.. user.Where(n => projectSet.Contains(n))];
+    }
+
+    private static IReadOnlyList<string> MergeDeny(IReadOnlyList<string> user, IReadOnlyList<string> project)
+    {
+        if (user.Count == 0 && project.Count == 0) return [];
+        var combined = new HashSet<string>(user, StringComparer.OrdinalIgnoreCase);
+        foreach (var n in project) combined.Add(n);
+        return [.. combined];
+    }
 }

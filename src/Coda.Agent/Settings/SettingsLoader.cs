@@ -111,6 +111,26 @@ public static class SettingsLoader
         // httpHookAllowlist: union of user and project lists (deduplicated, case-insensitive).
         var httpHookAllowlist = MergeHttpHookAllowlist(userSettings.HttpHookAllowlist, projectSettings.HttpHookAllowlist);
 
+        // agent.tools: allow intersected, deny unioned (same monotonic-tightening rule as hook allowedTools).
+        var agentToolsMerged = AgentToolsOverrides.Merge(
+            userSettings.AgentToolsOverrides, projectSettings.AgentToolsOverrides);
+
+        // Inert-agent guard: refuse a configuration that would leave the main agent with no way to
+        // launch subagents. task / task_start are always in the built-in set, so if both are
+        // filtered out the agent can neither act meaningfully nor delegate — it would silently fail
+        // every real request. Refuse loudly at load time rather than letting it start.
+        if (agentToolsMerged is not null)
+        {
+            var filter = agentToolsMerged.ToFilter();
+            if (!filter.Passes("task") && !filter.Passes("task_start"))
+            {
+                throw new InvalidOperationException(
+                    $"The agent.tools filter configured in '{userFile}' / '{projectFile}' would prevent the main " +
+                    "agent from launching subagents: neither 'task' nor 'task_start' passes the allow/deny rules. " +
+                    "Add at least one of them to the allow list (or remove it from deny) so the agent can delegate.");
+            }
+        }
+
         if (userSettings.Allow.Count == 0 && userSettings.Deny.Count == 0
             && userSettings.Hooks.Count == 0
             && userSettings.LspServers.Count == 0
@@ -127,6 +147,7 @@ public static class SettingsLoader
             && userSettings.ToolDisplayMode is null
             && effortByModel.Count == 0
             && httpHookAllowlist.Count == 0
+            && agentToolsMerged is null
             && !userSettings.CacheUse1hTtl
             && !projectSettings.CacheUse1hTtl)
         {
@@ -186,6 +207,8 @@ public static class SettingsLoader
             HttpHookAllowlist = httpHookAllowlist,
             // CacheUse1hTtl: project setting wins; user setting is the fallback.
             CacheUse1hTtl = projectSettings.CacheUse1hTtl || userSettings.CacheUse1hTtl,
+            AgentToolsOverrides = agentToolsMerged,
+            AgentToolFilter = agentToolsMerged?.ToFilter(),
         };
     }
 
@@ -212,6 +235,10 @@ public static class SettingsLoader
             // are what a caller reads. Two calls could drift.
             var subagentOverrides = ParseSubagentOverrides(doc?.Subagents);
 
+            // Parse agent.tools block. Allow can be an empty array (means "allow nothing"),
+            // so we must distinguish absent (null) from present-but-empty.
+            var agentToolsOverrides = ParseAgentToolsOverrides(doc?.Agent?.Tools);
+
             return new CodaSettings(allow, deny, hooks)
             {
                 LspServers = lspServers,
@@ -228,6 +255,7 @@ public static class SettingsLoader
                 HttpHookAllowlist = ParseHttpHookAllowlist(doc?.HttpHookAllowlist),
                 HookDisabledHashes = ParseHookDisabledHashes(doc?.HookDisabledHashes),
                 CacheUse1hTtl = doc?.CacheUse1hTtl ?? false,
+                AgentToolsOverrides = agentToolsOverrides,
             };
         }
         catch (Exception ex) when (ex is JsonException or IOException)
@@ -414,6 +442,37 @@ public static class SettingsLoader
                 section.ModelByType is { Count: > 0 }
                     ? new Dictionary<string, string>(section.ModelByType, StringComparer.OrdinalIgnoreCase)
                     : null);
+
+    /// <summary>
+    /// Reads the <c>agent.tools</c> block. Returns null when the block is absent.
+    /// An explicitly empty <c>allow</c> array is preserved as an empty list (not collapsed to null),
+    /// so the inert-agent guard can distinguish "no allowlist" from "allow nothing".
+    /// </summary>
+    private static AgentToolsOverrides? ParseAgentToolsOverrides(AgentToolsSection? section)
+    {
+        if (section is null)
+        {
+            return null;
+        }
+
+        // Allow: null JSON means absent (no allowlist); explicit array (even empty) is preserved.
+        IReadOnlyList<string>? allow = section.Allow is null
+            ? null
+            : [.. section.Allow.Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim())];
+
+        // Deny: absent or null means no denials.
+        IReadOnlyList<string> deny = section.Deny is { Count: > 0 }
+            ? [.. section.Deny.Where(n => !string.IsNullOrWhiteSpace(n)).Select(n => n.Trim())]
+            : [];
+
+        // If both are trivially empty, treat the section as absent (no-op).
+        if (allow is null && deny.Count == 0)
+        {
+            return null;
+        }
+
+        return new AgentToolsOverrides(allow, deny);
+    }
 
     private static GoalSettings? ParseGoalSettings(GoalSection? section)
     {
@@ -665,6 +724,25 @@ public static class SettingsLoader
         public List<string>? HookDisabledHashes { get; set; }
         [JsonPropertyName("cacheUse1hTtl")]
         public bool? CacheUse1hTtl { get; set; }
+
+        [JsonPropertyName("agent")]
+        public AgentSection? Agent { get; set; }
+    }
+
+    private sealed class AgentSection
+    {
+        [JsonPropertyName("tools")]
+        public AgentToolsSection? Tools { get; set; }
+    }
+
+    private sealed class AgentToolsSection
+    {
+        /// <summary>Null means absent (no allowlist). An empty array means "allow nothing".</summary>
+        [JsonPropertyName("allow")]
+        public List<string>? Allow { get; set; }
+
+        [JsonPropertyName("deny")]
+        public List<string>? Deny { get; set; }
     }
 
     private sealed class GoalSection

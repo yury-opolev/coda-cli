@@ -162,4 +162,13 @@ public sealed record SessionOptions
     /// Populated from <c>SkillSessionState.GetGrantedDirectories</c> at composition time.
     /// </summary>
     public Func<IReadOnlySet<string>?>? GrantedDirectoriesSource { get; init; }
+
+    /// <summary>
+    /// Allow/deny filter applied to the MAIN AGENT's tool registry only. Null means no filter
+    /// (today's behaviour). Subagents, scheduled roots, and hook-spawned agents always keep
+    /// their full toolsets — this is a workflow control, NOT a security boundary.
+    /// Resolved from <see cref="Coda.Agent.Settings.CodaSettings.AgentToolFilter"/> by
+    /// <see cref="CodaSession"/>, but can be overridden here for testing or programmatic use.
+    /// </summary>
+    public Coda.Agent.Tools.ToolNameFilter? AgentToolFilter { get; init; }
 }

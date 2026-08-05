@@ -563,6 +563,9 @@ public sealed class TurnPipelineBuilder
     /// <summary>
     /// Builds the parent (leader) tool registry: the built-ins + extra tools, plus the LSP
     /// and tool-search tools gated on whether their backing collaborators are configured.
+    /// The <c>agent.tools</c> allow/deny filter (from <see cref="SessionOptions.AgentToolFilter"/>)
+    /// is applied HERE and NOWHERE ELSE, so subagent and scheduled-root registries are never
+    /// affected — non-propagation is guaranteed by construction.
     /// </summary>
     private ToolRegistry BuildParentTools(SessionOptions options)
     {
@@ -578,7 +581,17 @@ public sealed class TurnPipelineBuilder
             ? new ITool[] { new ToolSearchTool() }
             : [];
 
-        return new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools, .. extraLspTools, .. toolSearchTools]);
+        IEnumerable<ITool> allTools = [.. BuiltInTools.All(), .. options.ExtraTools, .. extraLspTools, .. toolSearchTools];
+
+        // Apply the agent.tools filter when configured. Subagent registries (BuildSubagentHost,
+        // BuildScheduledTools, the scheduled-root's child host, and the hook-free host in
+        // BuildHookHandlers) are intentionally NOT filtered here.
+        if (options.AgentToolFilter is { } filter)
+        {
+            allTools = filter.Apply(allTools);
+        }
+
+        return new ToolRegistry(allTools);
     }
 
     /// <summary>Builds the watcher/stop-hook bus from the opt-in options, or null when none are enabled.</summary>
