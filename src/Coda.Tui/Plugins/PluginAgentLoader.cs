@@ -31,12 +31,14 @@ public static class PluginAgentLoader
     /// <param name="plugin">The plugin to load agents from.</param>
     /// <param name="workingDirectory">
     /// The session working directory used to determine whether the plugin is project-scoped.
+    /// This parameter is required so each caller states the trust boundary explicitly instead of
+    /// silently defaulting to user-scoped behavior when it forgot to pass the current workspace.
     /// When null, the plugin is treated as user-scoped (model key is accepted).
     /// </param>
     /// <param name="logger">Optional logger for warnings and errors.</param>
     public static IReadOnlyList<SubagentDefinition> Load(
         PluginInfo plugin,
-        string? workingDirectory = null,
+        string? workingDirectory,
         ILogger? logger = null)
     {
         if (!plugin.IsEnabled) return [];

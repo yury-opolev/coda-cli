@@ -213,7 +213,7 @@ public sealed class SubagentPluginTests : IDisposable
             IsEnabled = false,
         };
 
-        var agents = PluginAgentLoader.Load(plugin);
+        var agents = PluginAgentLoader.Load(plugin, workingDirectory: null); // user-scoped: no working directory needed
         Assert.Empty(agents);
     }
 
@@ -231,7 +231,7 @@ public sealed class SubagentPluginTests : IDisposable
             Manifest = manifest,
         };
 
-        var agents = PluginAgentLoader.Load(plugin);
+        var agents = PluginAgentLoader.Load(plugin, workingDirectory: null); // user-scoped: no working directory needed
         Assert.Single(agents);
         Assert.Equal("custom-agent", agents[0].Type);
     }

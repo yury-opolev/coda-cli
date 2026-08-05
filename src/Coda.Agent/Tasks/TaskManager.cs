@@ -599,6 +599,7 @@ public sealed partial class TaskManager : IDisposable
         // Enqueue the completion into the per-owner outbox so the owning agent learns about it
         // at its next iteration boundary without polling.
         this.EnqueueCompletionIfBackground(t, TaskRunStatus.Completed, result);
+        this.SweepOutboxToLiveAncestor(id);
 
         return true;
     }
@@ -613,6 +614,7 @@ public sealed partial class TaskManager : IDisposable
         // Enqueue failed workers too — Fail fires nothing today and an orchestrator most needs
         // to hear about failures.
         this.EnqueueCompletionIfBackground(t, TaskRunStatus.Failed, error);
+        this.SweepOutboxToLiveAncestor(id);
 
         return true;
     }
@@ -626,6 +628,7 @@ public sealed partial class TaskManager : IDisposable
 
         // Enqueue stopped workers for the same reason as Fail above.
         this.EnqueueCompletionIfBackground(t, TaskRunStatus.Stopped, report: null);
+        this.SweepOutboxToLiveAncestor(id);
 
         return true;
     }
@@ -670,13 +673,17 @@ public sealed partial class TaskManager : IDisposable
     {
         if (task.Mode != TaskExecutionMode.Background) return;
 
-        // Resolve effective owner: start with the task's direct parent, walk up to find a live ancestor.
-        // The main agent (null) is unconditionally live — the walk always terminates.
-        var owner = this.ResolveEffectiveOwner(task.ParentId);
         var entry = new TaskCompletionEntry(task.Id, task.Description, status, report);
 
         lock (this._outboxGate)
         {
+            // Resolve owner INSIDE _outboxGate so observing the ancestor's status and enqueuing
+            // are one atomic step. Without this, a parent could terminate between the resolve
+            // (observing it as Running) and the enqueue, placing the child's entry in a dead
+            // owner's outbox where nothing ever drains it. Lock ordering: _outboxGate -> ManagedTask._gate
+            // (ResolveEffectiveOwner reads current.Status which locks ManagedTask._gate). There is no
+            // reverse edge: TryComplete/TryFail/TryStop never take _outboxGate.
+            var owner = this.ResolveEffectiveOwner(task.ParentId);
             if (!this._outbox.TryGetValue(OutboxKey(owner), out var queue))
             {
                 queue = new Queue<TaskCompletionEntry>();
@@ -690,6 +697,50 @@ public sealed partial class TaskManager : IDisposable
             }
 
             queue.Enqueue(entry);
+        }
+    }
+
+    /// <summary>
+    /// Sweeps any entries accumulated in <paramref name="terminatedId"/>'s outbox slot to the nearest
+    /// live strict ancestor. Called after every terminal transition so that late-arriving child entries
+    /// — enqueued between the parent's status flip and this sweep — are never stranded in a dead owner.
+    /// Together with the atomic resolve+enqueue in <see cref="EnqueueCompletionIfBackground"/> this
+    /// closes both halves of the concurrent parent+child termination race (spec §6.3).
+    /// </summary>
+    private void SweepOutboxToLiveAncestor(string terminatedId)
+    {
+        lock (this._outboxGate)
+        {
+            var key = OutboxKey(terminatedId);
+            if (!this._outbox.TryGetValue(key, out var queue) || queue.Count == 0)
+            {
+                this._outbox.Remove(key);
+                return;
+            }
+
+            this._outbox.Remove(key);
+
+            // The terminated task's parent is the correct starting point — the task itself is
+            // already terminal so ResolveEffectiveOwner would skip it anyway.
+            var terminated = this.Find(terminatedId);
+            var liveAncestorId = this.ResolveEffectiveOwner(terminated?.ParentId);
+
+            var targetKey = OutboxKey(liveAncestorId);
+            if (!this._outbox.TryGetValue(targetKey, out var target))
+            {
+                target = new Queue<TaskCompletionEntry>();
+                this._outbox[targetKey] = target;
+            }
+
+            foreach (var entry in queue)
+            {
+                if (target.Count >= CompletionOutboxCapacity)
+                {
+                    target.Dequeue();
+                }
+
+                target.Enqueue(entry);
+            }
         }
     }
 
@@ -744,32 +795,35 @@ public sealed partial class TaskManager : IDisposable
     /// terminal result so the owning agent does not receive the same completion twice.
     /// </summary>
     /// <returns><see langword="true"/> if an entry was found and removed; <see langword="false"/> otherwise.</returns>
-    public bool ConsumeCompletion(string taskId, string? ownerTaskId)
+    public TaskCompletionEntry? ConsumeCompletion(string taskId, string? ownerTaskId)
     {
         var key = OutboxKey(ownerTaskId);
         lock (this._outboxGate)
         {
             if (!this._outbox.TryGetValue(key, out var queue) || queue.Count == 0)
             {
-                return false;
+                this._outbox.Remove(key);
+                return null;
             }
 
-            // Scan for the entry and rebuild the queue without it.
-            var found = false;
             var rebuilt = new Queue<TaskCompletionEntry>(queue.Count);
+            TaskCompletionEntry? found = null;
             foreach (var entry in queue)
             {
-                if (!found && entry.TaskId == taskId)
+                if (found is null && entry.TaskId == taskId)
                 {
-                    found = true; // skip this one
+                    found = entry;
+                    continue;
                 }
-                else
-                {
-                    rebuilt.Enqueue(entry);
-                }
+
+                rebuilt.Enqueue(entry);
             }
 
-            if (found)
+            if (rebuilt.Count == 0)
+            {
+                this._outbox.Remove(key);
+            }
+            else
             {
                 this._outbox[key] = rebuilt;
             }

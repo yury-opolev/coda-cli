@@ -119,15 +119,15 @@ public sealed partial class AgentLoop : IAgentLoop
             if (e.Report is { Length: > 0 } report)
             {
                 sb.AppendLine();
+                // Truncate at rune boundary first, then escape for XML safety — same containment
+                // as the description attribute. A report containing </task-completed> or a spoofed
+                // <task-completed> opening tag would otherwise break the wrapper's structure and
+                // confuse the model's parse of sibling blocks.
+                var truncated = TruncateAtRuneBoundary(report, truncateAt);
+                sb.AppendLine(System.Security.SecurityElement.Escape(truncated));
                 if (report.Length > truncateAt)
                 {
-                    sb.Append(report.AsSpan(0, truncateAt));
-                    sb.AppendLine();
                     sb.AppendLine($"(truncated — use task_output for the full log)");
-                }
-                else
-                {
-                    sb.AppendLine(report);
                 }
             }
             else
@@ -145,6 +145,24 @@ public sealed partial class AgentLoop : IAgentLoop
         }
 
         return sb.ToString().TrimEnd();
+    }
+
+    /// <summary>
+    /// Truncates <paramref name="s"/> to at most <paramref name="maxCodeUnits"/> UTF-16 code units,
+    /// backing off one position when the cut would land between a high and low surrogate — preventing
+    /// lone surrogates that render as U+FFFD. Used at every report-truncation site so both the push
+    /// seam and the <c>task_wait</c> path agree on the boundary.
+    /// </summary>
+    internal static string TruncateAtRuneBoundary(string s, int maxCodeUnits)
+    {
+        if (s.Length <= maxCodeUnits) return s;
+        var end = maxCodeUnits;
+        if (end > 0 && char.IsHighSurrogate(s[end - 1]))
+        {
+            end--;
+        }
+
+        return s[..end];
     }
 
     internal static TimeSpan ResolveToolMaxDuration(string? raw)
@@ -509,7 +527,7 @@ public sealed partial class AgentLoop : IAgentLoop
                         foreach (var c in completions)
                         {
                             var truncatedReport = c.Report is { Length: > CompletionReportTruncateAt }
-                                ? c.Report[..CompletionReportTruncateAt]
+                                ? TruncateAtRuneBoundary(c.Report, CompletionReportTruncateAt)
                                 : c.Report;
                             sink.OnTaskCompleted(c.TaskId, c.Status.ToString().ToLowerInvariant(), c.Description, truncatedReport);
                         }
