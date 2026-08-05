@@ -14,7 +14,7 @@
 
 ---
 
-## Terminal.Gui 2.4.17 API notes (verified by reflecting on the shipped assembly)
+## Terminal.Gui 2.4.17 API notes (verified by reflecting on the shipped assembly, then **corrected by the Task 1 spike**)
 
 Do not trust v1 muscle memory. Verified facts:
 
@@ -22,13 +22,23 @@ Do not trust v1 muscle memory. Verified facts:
   `Value`, `Values`, `Labels`, `Orientation`, `TabBehavior`, `ValueChanged`).
 - **`DropDownList`** derives from `TextField` and exposes `Source : IListDataSource` and
   `KeystrokeNavigator`.
-- **`TextField`** exposes `Value`, `Text`, `InsertionPoint` (the caret), `ReadOnly`, `Secret`,
-  `Autocomplete`, `SelectedText`/`SelectedStart`/`SelectedLength`, `ScrollOffset`,
-  `DefaultCursorStyle`, and `ValueChanging`/`ValueChanged`/`TextChanging`.
+- **`TextField`** exposes `Value`, `Text`, `InsertionPoint` (the caret), `Used` (insert vs
+  overwrite), `ReadOnly`, `Secret`, `Autocomplete`, `SelectedText`/`SelectedStart`/`SelectedLength`,
+  `ScrollOffset`, `DefaultCursorStyle`, and `ValueChanging`/`ValueChanged`/`TextChanging`.
 - **`TableView`** styling: `TableStyle.RowColorGetter` (`RowColorGetterDelegate` → `Scheme`),
   `ColumnStyle.ColorGetter` (`CellColorGetterDelegate`), `RepresentationGetter`, `Alignment`,
   `MinWidth`/`MaxWidth`, `TruncationIndicator`, `ShowHeaders`, `HeaderScheme`.
 - All live in namespace `Terminal.Gui.Views`.
+
+**Corrections found by the spike — the earlier draft of this plan had these wrong:**
+
+| Assumed | Actual |
+|---|---|
+| `TableView.SelectedRow` | **Does not exist.** Selection is `TableView.Value : TableSelection`; the row is `view.Value.SelectedCell.Y` |
+| `TableStyle.ColumnStyles[DataColumn]` | Keyed by **column index** — `Dictionary<int, ColumnStyle>` |
+| `CheckBox.CheckedState` | Property is **`CheckBox.Value : CheckState`** (`CheckBox` also has `RadioStyle`) |
+| Tab is handled by the container automatically | In this harness a bare `Tab` key event on the parent does **not** traverse. Call `view.AdvanceFocus(NavigationDirection.Forward\|Backward, TabBehavior.TabStop)`, and set `TabStop = TabBehavior.TabStop` on each field |
+| A `TextField` inserts at the caret by default | Two traps: `Used` must be **`true`** for insert (`false` overwrites), and the value must be assigned **after** the field is added to the view tree — setting `Text` in the object initialiser leaves a selection, so the first keystroke replaces a character instead of inserting |
 
 **No Terminal.Gui input widget is used anywhere in the codebase today** — this is greenfield here, so
 Task 1 exists to derisk it before anything depends on it.
@@ -83,7 +93,8 @@ scaffolding whose only job is to fail fast if an assumption in the spec is wrong
   `RowColorGetter` renders and reports `SelectedRow`; and the driver cell-scrape helper can still
   read what is on screen.
 - [ ] **Step 2: Record findings** in the plan if any assumption fails — **stop and report rather than
-  working around it**, since Tasks 2–12 all depend on these.
+  working around it**, since Tasks 2–12 all depend on these. *(Done: five corrections recorded in the
+  API notes above; `tests/Coda.Tui.Tests/WidgetIntegrationSpikeTests.cs` pins all of them, 16 tests.)*
 - [ ] **Step 3: Verify** — `dotnet test tests\Coda.Tui.Tests\Coda.Tui.Tests.csproj --filter "FullyQualifiedName~WidgetIntegrationSpike"`
 
 ### Task 2: Unblock input — stop swallowing keys, mouse and focus
