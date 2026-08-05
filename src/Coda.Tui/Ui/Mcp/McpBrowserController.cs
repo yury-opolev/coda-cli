@@ -292,6 +292,38 @@ internal sealed class McpBrowserController
 
     internal void NotifyChangedForTest() => this.RaiseChanged();
 
+    /// <summary>
+    /// Applies a draft mutation originating from a widget value-change event.
+    /// Does not require epoch guards because it comes from the UI thread, not an async action.
+    /// </summary>
+    internal void UpdateEditorDraft(Func<McpServerDraft, McpServerDraft> update)
+    {
+        lock (this.sync)
+        {
+            if (this.state.Editor is not { } editor) return;
+            this.state = this.state with { Editor = editor with { Draft = update(editor.Draft) } };
+        }
+
+        this.RaiseChanged();
+    }
+
+    /// <summary>
+    /// Updates the focused-field cursor in the editor state when a widget gains focus.
+    /// Keeps <see cref="McpEditorState.FocusedField"/> in sync so that
+    /// <c>ApplyEditorAsync</c> acts on the correct field when Enter is pressed.
+    /// </summary>
+    internal void UpdateEditorFocus(McpEditorField field)
+    {
+        lock (this.sync)
+        {
+            if (this.state.Editor is not { } editor) return;
+            if (editor.FocusedField == field) return;
+            this.state = this.state with { Editor = editor with { FocusedField = field } };
+        }
+
+        this.RaiseChanged();
+    }
+
     private async Task ExecuteCoreAsync(
         McpBrowserProvider current,
         long openEpoch,
@@ -354,20 +386,11 @@ internal sealed class McpBrowserController
             case McpBrowserCommand.Reauthenticate:
                 await this.ReauthenticateAsync(current, openEpoch, ct).ConfigureAwait(false);
                 return;
-            case McpBrowserCommand.EditorNext:
-                this.MoveEditor(current, openEpoch, 1);
-                return;
-            case McpBrowserCommand.EditorPrevious:
-                this.MoveEditor(current, openEpoch, -1);
-                return;
             case McpBrowserCommand.EditorCancel:
                 this.Mutate(current, openEpoch, state => state.CancelEditor());
                 return;
             case McpBrowserCommand.EditorApply:
                 await this.ApplyEditorAsync(current, openEpoch, ct).ConfigureAwait(false);
-                return;
-            case McpBrowserCommand.EditorInsert:
-                this.InsertEditorCharacter(current, openEpoch, key);
                 return;
             case McpBrowserCommand.EditorAddItem:
                 this.AddEditorItem(current, openEpoch);
@@ -386,13 +409,6 @@ internal sealed class McpBrowserController
                 return;
             case McpBrowserCommand.EditorNextItemPart:
                 this.MoveEditorItemPart(current, openEpoch, 1);
-                return;
-            case McpBrowserCommand.EditorBackspace:
-                this.EditEditorText(current, openEpoch, value =>
-                    value.Length == 0 ? value : value[..^1]);
-                return;
-            case McpBrowserCommand.EditorDelete:
-                this.EditEditorText(current, openEpoch, _ => string.Empty);
                 return;
         }
     }
@@ -571,7 +587,6 @@ internal sealed class McpBrowserController
 
                 return;
             default:
-                this.MoveEditor(current, openEpoch, 1);
                 return;
         }
     }
@@ -867,62 +882,6 @@ internal sealed class McpBrowserController
             }
             : state);
 
-    private void MoveEditor(McpBrowserProvider current, long openEpoch, int direction) =>
-        this.Mutate(current, openEpoch, state => state.Editor is { } editor
-            ? state with { Editor = editor with { FocusedField = NextField(editor.FocusedField, direction) } }
-            : state);
-
-    private void InsertEditorCharacter(McpBrowserProvider current, long openEpoch, Key? key)
-    {
-        var rune = key?.AsRune;
-        if (rune is null || rune.Value.Value == 0 || System.Text.Rune.IsControl(rune.Value))
-        {
-            return;
-        }
-
-        this.EditEditorText(current, openEpoch, value => value + rune.Value.ToString());
-    }
-
-    private void EditEditorText(
-        McpBrowserProvider current,
-        long openEpoch,
-        Func<string, string> change)
-    {
-        this.Mutate(current, openEpoch, state =>
-        {
-            if (state.Editor is not { } editor)
-            {
-                return state;
-            }
-
-            var draft = editor.Draft;
-            draft = editor.FocusedField switch
-            {
-                McpEditorField.Name => draft with { Name = change(draft.Name) },
-                McpEditorField.Command => draft with { Command = change(draft.Command ?? string.Empty) },
-                McpEditorField.Url => draft with { Url = change(draft.Url ?? string.Empty), UrlChanged = true },
-                McpEditorField.ClientId => draft with { ClientId = change(draft.ClientId ?? string.Empty) },
-                McpEditorField.Scopes => draft with
-                {
-                    Scopes = ChangeItem(draft.Scopes, editor.SelectedItem, change),
-                    ScopeItems = ChangeItem(draft.ScopeItems, editor.SelectedItem, change),
-                },
-                McpEditorField.Arguments => draft with
-                {
-                    Args = ChangeItem(draft.Args, editor.SelectedItem, change),
-                    ArgumentItems = ChangeItem(draft.ArgumentItems, editor.SelectedItem, change),
-                },
-                McpEditorField.Environment when editor.SelectedItemPart == McpEditorItemPart.Name =>
-                    draft with { Environment = ChangeNamedName(draft.Environment, editor.SelectedItem, "env", change) },
-                McpEditorField.Headers when editor.SelectedItemPart == McpEditorItemPart.Name =>
-                    draft with { Headers = ChangeNamedName(draft.Headers, editor.SelectedItem, "header", change) },
-                _ => draft,
-            };
-
-            return state with { Editor = editor with { Draft = draft } };
-        });
-    }
-
     private async Task PromptNamedReplacementAsync(
         McpBrowserProvider current,
         long openEpoch,
@@ -1199,28 +1158,6 @@ internal sealed class McpBrowserController
                         named.Change.Field,
                         McpSecretChangeKind.Remove),
                 });
-    }
-
-    private static ImmutableArray<McpNamedSecretDraft> ChangeNamedName(
-        ImmutableArray<McpNamedSecretDraft> values,
-        int index,
-        string fieldPrefix,
-        Func<string, string> change)
-    {
-        if (index < 0 || index >= values.Length)
-        {
-            return values;
-        }
-
-        var named = values[index];
-        var name = change(named.Name);
-        return values.SetItem(
-            index,
-            named with
-            {
-                Name = name,
-                Change = named.Change with { Field = $"{fieldPrefix}/{name}" },
-            });
     }
 
     private static string SafeText(string? value) =>

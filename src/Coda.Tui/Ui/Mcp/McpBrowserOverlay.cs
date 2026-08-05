@@ -13,9 +13,6 @@ namespace Coda.Tui.Ui.Mcp;
 /// </summary>
 internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 {
-    /// <summary>The glyph marking the focused editor field.</summary>
-    private const string SelectionMarker = "\u276f";
-
     private readonly IApplication app;
     private readonly McpBrowserController controller;
     private TuiTheme theme;
@@ -23,6 +20,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private readonly Label header;
     private readonly SelectableTextView body;
     private readonly TableView listTable;
+    private readonly McpEditorForm editorForm;
     private readonly Label status;
     private readonly Label footer;
 
@@ -33,7 +31,6 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private bool subscribed;
     private bool disposed;
     private int detailOffset;
-    private int editorOffset;
 
     /// <summary>
     /// The glyph set for status cells, chosen once from the terminal's Unicode capability so a
@@ -133,7 +130,22 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             Height = 1,
             CanFocus = false,
         };
-        this.Add(this.header, this.body, this.listTable, this.status, this.footer);
+        this.editorForm = new McpEditorForm(controller)
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            Visible = false,
+        };
+        this.editorForm.SaveRequested += () =>
+            this.Observe(this.controller.ExecuteAsync(
+                McpBrowserCommand.EditorApply, null, this.lifetime?.Token ?? CancellationToken.None));
+        this.editorForm.CancelRequested += () =>
+            this.Observe(this.controller.ExecuteAsync(
+                McpBrowserCommand.EditorCancel, null, this.lifetime?.Token ?? CancellationToken.None));
+
+        this.Add(this.header, this.body, this.listTable, this.editorForm, this.status, this.footer);
         this.FrameChanged += (_, _) =>
         {
             if (this.active)
@@ -343,7 +355,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
                 break;
             case McpBrowserView.Editor:
                 this.RenderEditor(state);
-                bodyText = this.body.AllText;
+                bodyText = this.editorForm.VisibleTextForTest;
                 break;
             default:
                 bodyText = this.RenderList(state);
@@ -489,104 +501,20 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     private void RenderEditor(McpBrowserState state)
     {
         this.listTable.Visible = false;
-        this.body.Visible = true;
-        var lines = new List<string>();
-        var focusedLine = -1;
-        if (state.Editor is not { } editor)
-        {
-            lines.Add("(editor unavailable)");
-        }
-        else
-        {
-            var draft = editor.Draft;
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Scope, Scope(draft.Scope), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Name, draft.Name, focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Transport, Transport(draft.Transport), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Command, draft.Command, focusedLine);
-            focusedLine = AppendEditorCollection(lines, editor, McpEditorField.Arguments, DraftArgs(draft), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Url, draft.Url, focusedLine);
-            focusedLine = AppendEditorNamedSecrets(lines, editor, McpEditorField.Environment, draft.Environment, focusedLine);
-            focusedLine = AppendEditorNamedSecrets(lines, editor, McpEditorField.Headers, draft.Headers, focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.AuthMode, draft.AuthMode.ToString(), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.ClientId, draft.ClientId, focusedLine);
-            focusedLine = AppendEditorCollection(lines, editor, McpEditorField.Scopes, DraftScopes(draft), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.BearerToken, DraftSecret(draft.BearerToken), focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Save, "apply", focusedLine);
-            focusedLine = AppendEditorField(lines, editor, McpEditorField.Cancel, "cancel", focusedLine);
-        }
+        this.body.Visible = false;
+        this.editorForm.Visible = true;
 
-        lines.Add($"Busy: turn={(state.TurnBusy ? "yes" : "no")} action={(state.ActionBusy ? "yes" : "no")}");
         this.header.Text = SafeSingle($"MCP editor — {state.Editor?.Mode.ToString() ?? "unavailable"}");
-        this.body.SetText(Window(lines, ref this.editorOffset, this.BodyViewportRows(), focusedLine));
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "Tab/Shift+Tab field · Enter apply/next · Ctrl+N add · Ctrl+R remove · Ctrl+↑/↓ item · Ctrl+←/→ part · Esc cancel",
-                "Enter Save · Esc Cancel"));
-    }
+                "Tab/↑/↓ field · Enter save · Ctrl+N add · Ctrl+R remove · Ctrl+↑/↓ item · Ctrl+←/→ part · Esc cancel",
+                "Tab field · Enter save · Esc cancel"));
 
-    private static int AppendEditorField(
-        List<string> lines,
-        McpEditorState editor,
-        McpEditorField field,
-        string? value,
-        int focusedLine)
-    {
-        var line = lines.Count;
-        var marker = editor.FocusedField == field ? SelectionMarker : " ";
-        lines.Add(marker + " " + field + ": " + SafeSingle(value));
-        return focusedLine >= 0 || editor.FocusedField != field ? focusedLine : line;
-    }
-
-    private static int AppendEditorCollection(
-        List<string> lines,
-        McpEditorState editor,
-        McpEditorField field,
-        IReadOnlyList<string> values,
-        int focusedLine)
-    {
-        focusedLine = AppendEditorField(
-            lines,
-            editor,
-            field,
-            values.Count == 0 ? "(none)" : $"{values.Count} item(s)",
-            focusedLine);
-        for (var index = 0; index < values.Count; index++)
+        if (state.Editor is { } editor)
         {
-            var marker = editor.FocusedField == field && editor.SelectedItem == index ? SelectionMarker : " ";
-            lines.Add($"  {marker} {index + 1}: {SafeSingle(values[index])}");
+            this.editorForm.ApplyState(editor);
         }
-
-        return focusedLine;
-    }
-
-    private static int AppendEditorNamedSecrets(
-        List<string> lines,
-        McpEditorState editor,
-        McpEditorField field,
-        IReadOnlyList<McpNamedSecretDraft> values,
-        int focusedLine)
-    {
-        focusedLine = AppendEditorField(
-            lines,
-            editor,
-            field,
-            values.Count == 0 ? "(none)" : $"{values.Count} item(s)",
-            focusedLine);
-        for (var index = 0; index < values.Count; index++)
-        {
-            var item = values[index];
-            var marker = editor.FocusedField == field && editor.SelectedItem == index ? SelectionMarker : " ";
-            var part = editor.FocusedField == field && editor.SelectedItem == index
-                ? editor.SelectedItemPart
-                : McpEditorItemPart.Value;
-            var value = part == McpEditorItemPart.Name
-                ? SafeSingle(item.Name)
-                : DraftSecret(item.Change);
-            lines.Add($"  {marker} {index + 1}: {value} ({item.ExistingSource})");
-        }
-
-        return focusedLine;
     }
 
     private static void AppendValues(List<string> lines, string label, IReadOnlyList<string> values)
@@ -743,24 +671,6 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
     private static IReadOnlyList<string> EffectiveArgs(ImmutableArray<string> args) =>
         args.IsDefault ? [] : args.ToArray();
-
-    private static IReadOnlyList<string> DraftArgs(McpServerDraft draft) =>
-        draft.ArgumentItems.IsDefault
-            ? draft.Args
-            : draft.ArgumentItems.Select(item => item.Value).ToArray();
-
-    private static IReadOnlyList<string> DraftScopes(McpServerDraft draft) =>
-        draft.ScopeItems.IsDefault
-            ? draft.Scopes
-            : draft.ScopeItems.Select(item => item.Value).ToArray();
-
-    private static string DraftSecret(McpSecretChange change) =>
-        change.Kind switch
-        {
-            McpSecretChangeKind.Replace => "*****",
-            McpSecretChangeKind.Remove => "(removed)",
-            _ => "(unchanged)",
-        };
 
     private static string MaskedSecret(string? value) => "*****";
 

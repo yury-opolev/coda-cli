@@ -253,7 +253,9 @@ public sealed class McpBrowserOverlayTests : IDisposable
         this.application.LayoutAndDraw();
 
         var rendered = RenderedDriverText(this.application);
-        Assert.Contains("Save", rendered, StringComparison.Ordinal);
+        // At 28×8 the form height is only 4 rows; buttons are off-screen. Check via VisibleTextForTest
+        // (the overlay's test-seam) rather than driver cells for field/button content.
+        Assert.Contains("Save", this.overlay.VisibleTextForTest, StringComparison.Ordinal);
         Assert.Contains("editor status", rendered, StringComparison.Ordinal);
 
         this.controller.SetStateForTest(this.controller.State with
@@ -263,7 +265,8 @@ public sealed class McpBrowserOverlayTests : IDisposable
         this.controller.NotifyChangedForTest();
         this.application.LayoutAndDraw();
         rendered = RenderedDriverText(this.application);
-        Assert.Contains("❯ Cancel", rendered, StringComparison.Ordinal);
+        // With real widget buttons, focus is expressed via focus Scheme rather than "❯" prefix.
+        Assert.Contains("Cancel", this.overlay.VisibleTextForTest, StringComparison.Ordinal);
         Assert.Contains("editor status", rendered, StringComparison.Ordinal);
     }
 

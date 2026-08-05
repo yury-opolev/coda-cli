@@ -281,10 +281,13 @@ public sealed class McpBrowserControllerTests
                 McpEditorField.Arguments),
         });
 
-        await controller.ExecuteAsync(
-            McpBrowserCommand.EditorInsert,
-            new Key('x'),
-            CancellationToken.None);
+        // Scalar item value editing is widget-driven (Task 8). Use UpdateEditorDraft to simulate
+        // the widget writing back "argx" and verify that the authoritative item identity is preserved.
+        controller.UpdateEditorDraft(d => d with
+        {
+            Args = d.Args.SetItem(0, "argx"),
+            ArgumentItems = d.ArgumentItems.SetItem(0, d.ArgumentItems[0] with { Value = "argx" }),
+        });
 
         var changed = controller.State.Editor!.Draft;
         Assert.Equal("argx", Assert.Single(changed.Args));
@@ -306,21 +309,27 @@ public sealed class McpBrowserControllerTests
 
         await SetEditorFieldAsync(controller, McpEditorField.Arguments);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('a'), CancellationToken.None);
+        // Scalar item value editing is now done by widgets (Task 8). Use UpdateEditorDraft to
+        // simulate what the widget does, preserving the add/remove invariant under test.
+        controller.UpdateEditorDraft(d => d with { Args = d.Args.SetItem(0, "a") });
         Assert.Equal("a", Assert.Single(controller.State.Editor!.Draft.Args));
         await controller.ExecuteAsync(McpBrowserCommand.EditorRemoveItem, null, CancellationToken.None);
         Assert.Empty(controller.State.Editor!.Draft.Args);
 
         await SetEditorFieldAsync(controller, McpEditorField.Scopes);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('s'), CancellationToken.None);
+        controller.UpdateEditorDraft(d => d with { Scopes = d.Scopes.SetItem(0, "s") });
         Assert.Equal("s", Assert.Single(controller.State.Editor!.Draft.Scopes));
         await controller.ExecuteAsync(McpBrowserCommand.EditorRemoveItem, null, CancellationToken.None);
         Assert.Empty(controller.State.Editor!.Draft.Scopes);
 
         await SetEditorFieldAsync(controller, McpEditorField.Environment, McpEditorItemPart.Name);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('E'), CancellationToken.None);
+        // Environment variable name editing is widget-driven (Task 8). Set the name directly.
+        controller.UpdateEditorDraft(d => d with
+        {
+            Environment = d.Environment.SetItem(0, d.Environment[0] with { Name = "E" }),
+        });
         await controller.ExecuteAsync(McpBrowserCommand.EditorNextItemPart, null, CancellationToken.None);
         await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
         var environment = Assert.Single(controller.State.Editor!.Draft.Environment);
@@ -331,7 +340,10 @@ public sealed class McpBrowserControllerTests
 
         await SetEditorFieldAsync(controller, McpEditorField.Headers, McpEditorItemPart.Name);
         await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
-        await controller.ExecuteAsync(McpBrowserCommand.EditorInsert, new Key('H'), CancellationToken.None);
+        controller.UpdateEditorDraft(d => d with
+        {
+            Headers = d.Headers.SetItem(0, d.Headers[0] with { Name = "H" }),
+        });
         await controller.ExecuteAsync(McpBrowserCommand.EditorNextItemPart, null, CancellationToken.None);
         await controller.ExecuteAsync(McpBrowserCommand.EditorApply, null, CancellationToken.None);
         var header = Assert.Single(controller.State.Editor!.Draft.Headers);

@@ -48,24 +48,13 @@ internal static class McpBrowserKeyMap
     private static McpBrowserCommand MapEditor(Key key)
     {
         if (key == Key.Esc) return McpBrowserCommand.EditorCancel;
-        if (key == Key.Tab.WithShift) return McpBrowserCommand.EditorPrevious;
-        if (key == Key.Tab) return McpBrowserCommand.EditorNext;
         if (key == Key.Enter) return McpBrowserCommand.EditorApply;
-        if (key == Key.Backspace) return McpBrowserCommand.EditorBackspace;
-        if (key == Key.Delete) return McpBrowserCommand.EditorDelete;
         if (key == Key.N.WithCtrl) return McpBrowserCommand.EditorAddItem;
         if (key == Key.R.WithCtrl) return McpBrowserCommand.EditorRemoveItem;
         if (key == Key.CursorUp.WithCtrl) return McpBrowserCommand.EditorPreviousItem;
         if (key == Key.CursorDown.WithCtrl) return McpBrowserCommand.EditorNextItem;
         if (key == Key.CursorLeft.WithCtrl) return McpBrowserCommand.EditorPreviousItemPart;
         if (key == Key.CursorRight.WithCtrl) return McpBrowserCommand.EditorNextItemPart;
-
-        var rune = key.AsRune;
-        return !key.IsCtrl &&
-            !key.IsAlt &&
-            rune.Value != 0 &&
-            !System.Text.Rune.IsControl(rune)
-                ? McpBrowserCommand.EditorInsert
-                : McpBrowserCommand.None;
+        return McpBrowserCommand.None;
     }
 }

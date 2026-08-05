@@ -41,8 +41,11 @@ public sealed class McpBrowserKeyMapTests
     [InlineData(' ')]
     public void Printable_action_letters_are_text_in_the_editor(char value)
     {
+        // Printable characters are no longer mapped by the editor key map — the form's child
+        // TextFields receive them directly, so the overlay should return None and let the event
+        // reach the focused widget.
         Assert.Equal(
-            McpBrowserCommand.EditorInsert,
+            McpBrowserCommand.None,
             McpBrowserKeyMap.Map(new Key(value), McpBrowserView.Editor));
     }
 
@@ -50,11 +53,14 @@ public sealed class McpBrowserKeyMapTests
     public void Editor_maps_navigation_editing_and_focus_actions()
     {
         Assert.Equal(McpBrowserCommand.EditorCancel, McpBrowserKeyMap.Map(Key.Esc, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorNext, McpBrowserKeyMap.Map(Key.Tab, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorPrevious, McpBrowserKeyMap.Map(Key.Tab.WithShift, McpBrowserView.Editor));
         Assert.Equal(McpBrowserCommand.EditorApply, McpBrowserKeyMap.Map(Key.Enter, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorBackspace, McpBrowserKeyMap.Map(Key.Backspace, McpBrowserView.Editor));
-        Assert.Equal(McpBrowserCommand.EditorDelete, McpBrowserKeyMap.Map(Key.Delete, McpBrowserView.Editor));
+        // Tab/Shift+Tab are now handled by McpEditorForm.AdvanceFocus — not mapped here.
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Tab, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Tab.WithShift, McpBrowserView.Editor));
+        // Backspace/Delete are handled by the focused TextField — not mapped here.
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Backspace, McpBrowserView.Editor));
+        Assert.Equal(McpBrowserCommand.None, McpBrowserKeyMap.Map(Key.Delete, McpBrowserView.Editor));
+        // Item management chords remain.
         Assert.Equal(McpBrowserCommand.EditorAddItem, McpBrowserKeyMap.Map(Key.N.WithCtrl, McpBrowserView.Editor));
         Assert.Equal(McpBrowserCommand.EditorRemoveItem, McpBrowserKeyMap.Map(Key.R.WithCtrl, McpBrowserView.Editor));
         Assert.Equal(McpBrowserCommand.EditorPreviousItem, McpBrowserKeyMap.Map(Key.CursorUp.WithCtrl, McpBrowserView.Editor));
