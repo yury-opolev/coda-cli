@@ -19,9 +19,9 @@ internal static class McpBrowserKeyMap
 
     private static McpBrowserCommand MapList(Key key)
     {
-        if (key == Key.Esc) return McpBrowserCommand.Close;
-        if (key == Key.CursorUp) return McpBrowserCommand.MoveUp;
-        if (key == Key.CursorDown) return McpBrowserCommand.MoveDown;
+        if (key == Key.Esc || key == Key.Q) return McpBrowserCommand.Close;
+        if (key == Key.CursorUp || key == Key.K) return McpBrowserCommand.MoveUp;
+        if (key == Key.CursorDown || key == Key.J) return McpBrowserCommand.MoveDown;
         if (key == Key.PageUp) return McpBrowserCommand.PageUp;
         if (key == Key.PageDown) return McpBrowserCommand.PageDown;
         if (key == Key.Home) return McpBrowserCommand.MoveToStart;
@@ -32,12 +32,16 @@ internal static class McpBrowserKeyMap
         if (key == Key.Space) return McpBrowserCommand.ToggleEnabled;
         if (key == new Key('u')) return McpBrowserCommand.Reauthenticate;
         if (key == Key.Delete) return McpBrowserCommand.DeleteServer;
+        if (key == new Key('r')) return McpBrowserCommand.Reload;
+        if (key == new Key('/')) return McpBrowserCommand.Filter;
         return McpBrowserCommand.None;
     }
 
     private static McpBrowserCommand MapDetail(Key key)
     {
-        if (key == Key.Esc) return McpBrowserCommand.ReturnToList;
+        if (key == Key.Esc || key == Key.Q) return McpBrowserCommand.ReturnToList;
+        if (key == Key.CursorUp || key == Key.K) return McpBrowserCommand.MoveUp;
+        if (key == Key.CursorDown || key == Key.J) return McpBrowserCommand.MoveDown;
         if (key == new Key('e')) return McpBrowserCommand.BeginEdit;
         if (key == Key.Space) return McpBrowserCommand.ToggleEnabled;
         if (key == new Key('u')) return McpBrowserCommand.Reauthenticate;

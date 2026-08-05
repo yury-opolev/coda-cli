@@ -449,6 +449,13 @@ internal sealed class McpBrowserController
             case McpBrowserCommand.EditorReorderDown:
                 this.ReorderEditorItem(current, openEpoch, 1);
                 return;
+            case McpBrowserCommand.Reload:
+                // Re-emit the current state so the overlay re-renders with fresh data.
+                this.Mutate(current, openEpoch, state => state);
+                return;
+            case McpBrowserCommand.Filter:
+                // Filter mode is managed by the overlay itself; the controller is never invoked for it.
+                return;
         }
     }
 

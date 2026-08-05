@@ -67,6 +67,12 @@ internal enum McpBrowserCommand
     EditorNextItem,
     EditorPreviousItemPart,
     EditorNextItemPart,
+
+    /// <summary>Reload / refresh the server list (list view only).</summary>
+    Reload,
+
+    /// <summary>Enter type-to-filter mode (list view only).</summary>
+    Filter,
 }
 
 internal sealed record McpEditorState(

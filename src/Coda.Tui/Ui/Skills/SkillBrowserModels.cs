@@ -50,6 +50,9 @@ internal enum SkillBrowserCommand
 
     /// <summary>Reload the skill set from disk.</summary>
     Reload,
+
+    /// <summary>Enter type-to-filter mode.</summary>
+    Filter,
 }
 
 /// <summary>

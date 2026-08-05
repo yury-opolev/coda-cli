@@ -7,12 +7,11 @@ namespace Coda.Tui.Ui.Schedule;
 /// <summary>
 /// The <c>/schedule</c> browser overlay: a hidden-by-default, focused full-screen Terminal.Gui view
 /// that renders <see cref="ScheduleBrowserController"/> state (definition list, status bar) and routes
-/// keys to the controller's create/delete/navigate actions.
+/// keys through <see cref="ScheduleBrowserKeyMap"/>.
 ///
 /// <para><b>Threading.</b> <see cref="ScheduleBrowserController.Changed"/> may fire on a background
 /// pump thread. <see cref="OnControllerChanged"/> marshals every view mutation through
-/// <see cref="IApplication.Invoke"/> so no Terminal.Gui control is ever touched off the UI thread.
-/// The callback is also isolated: a disposed overlay cannot throw back into the pump.</para>
+/// <see cref="IApplication.Invoke"/> so no Terminal.Gui control is ever touched off the UI thread.</para>
 ///
 /// <para><b>Lifecycle.</b> <see cref="Show"/> and <see cref="Hide"/> are idempotent: a repeated Show
 /// never double-subscribes or double-pumps; a repeated Hide never re-notifies. <see cref="Dispose"/>
@@ -26,26 +25,37 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
     private readonly ScheduleBrowserController controller;
     private TuiTheme theme;
     private readonly Action? onChanged;
+    private readonly StatusGlyphs statusGlyphs;
 
     private readonly Label header;
-    private readonly SelectableTextView body;
+    private readonly SelectableTextView body;   // kept as ISelectableOverlay.Body; not used for list rendering
+    private readonly TableView listTable;
+    private readonly Label status;
     private readonly Label footer;
+
+    private BrowserSchemes? browserSchemes;
 
     private CancellationTokenSource? pumpCts;
     private bool active;
     private bool disposed;
+
+    // Filter-mode state: / enters filter mode; keys go to the buffer; Esc exits filter first.
+    private bool filterMode;
+    private string filterBuffer = string.Empty;
 
     public ScheduleBrowserOverlay(
         IApplication app,
         ScheduleBrowserController controller,
         TuiTheme? theme = null,
         Action? onChanged = null,
-        Action<string, Action>? onCopyRequested = null)
+        Action<string, Action>? onCopyRequested = null,
+        StatusGlyphs? statusGlyphs = null)
     {
         this.app = app ?? throw new ArgumentNullException(nameof(app));
         this.controller = controller ?? throw new ArgumentNullException(nameof(controller));
         this.theme = theme ?? CodaThemes.Current.Tui;
         this.onChanged = onChanged;
+        this.statusGlyphs = statusGlyphs ?? StatusGlyphs.Unicode;
 
         this.Visible = false;
         this.CanFocus = true;
@@ -54,21 +64,61 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
         this.BorderStyle = LineStyle.Rounded;
 
         this.header = new Label { X = 0, Y = 0, Width = Dim.Fill(), Height = 1, CanFocus = false };
-        this.body = new SelectableTextView(app) { X = 0, Y = 1, Width = Dim.Fill(), Height = Dim.Fill(1) };
-        this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+
+        this.listTable = new TableView
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            CanFocus = false,
+            Visible = true,
+        };
+        this.listTable.Style.ShowHeaders = false;
+        this.listTable.Style.ShowHorizontalHeaderUnderline = false;
+        this.listTable.Style.ShowHorizontalHeaderOverline = false;
+        this.listTable.Style.ShowVerticalCellLines = false;
+        this.listTable.Style.ColumnStyles[0] = new ColumnStyle { MinWidth = 1, MaxWidth = 1, ColorGetter = this.GetStatusCellScheme };
+        this.listTable.Style.ColumnStyles[1] = new ColumnStyle { MinWidth = 4, MaxWidth = 14 };
+        this.listTable.Style.ColumnStyles[2] = new ColumnStyle { MinWidth = 0, MaxWidth = 16 };
+        this.listTable.Style.ColumnStyles[3] = new ColumnStyle { MinWidth = 4, MaxWidth = 14 };
+        this.listTable.Style.ColumnStyles[4] = new ColumnStyle { MinWidth = 3, MaxWidth = 8 };
+        this.listTable.Style.ColumnStyles[5] = new ColumnStyle { MinWidth = 10, MaxWidth = 16 };
+        this.listTable.Style.ColumnStyles[6] = new ColumnStyle { MinWidth = 0, MaxWidth = 12 };
+        this.listTable.Style.RowColorGetter = this.GetRowScheme;
+
+        // Body is kept as a no-op view to satisfy ISelectableOverlay; schedule has no detail pane.
+        this.body = new SelectableTextView(app)
+        {
+            X = 0,
+            Y = 1,
+            Width = Dim.Fill(),
+            Height = Dim.Fill(2),
+            Visible = false,
+        };
         if (onCopyRequested is not null)
         {
             this.body.CopyRequested += text => onCopyRequested(text, this.body.ClearSelection);
         }
 
-        this.Add(this.header);
-        this.Add(this.body);
-        this.Add(this.footer);
+        this.status = new Label { X = 0, Y = Pos.AnchorEnd(2), Width = Dim.Fill(), Height = 1, CanFocus = false };
+        this.footer = new Label { X = 0, Y = Pos.AnchorEnd(1), Width = Dim.Fill(), Height = 1, CanFocus = false };
+
+        this.Add(this.header, this.listTable, this.body, this.status, this.footer);
+
+        this.listTable.FrameChanged += (_, _) =>
+        {
+            if (this.active && this.listTable.Visible)
+            {
+                this.listTable.EnsureCursorIsVisible();
+            }
+        };
     }
 
     internal void ApplyTheme(TuiTheme theme)
     {
         this.theme = theme ?? throw new ArgumentNullException(nameof(theme));
+        this.browserSchemes = null;
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
@@ -85,21 +135,24 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
     internal bool IsPumping => this.pumpCts is not null;
 
     internal string HeaderText => this.header.Text ?? string.Empty;
-    internal string BodyText => this.body.AllText;
+
+    /// <summary>Synthesizes row text from the table source for test assertions.</summary>
+    internal string BodyText => this.SynthesizeListText();
+
+    internal string StatusText => this.status.Text ?? string.Empty;
     internal string FooterText => this.footer.Text ?? string.Empty;
 
-    // ── ISelectableOverlay ────────────────────────────────────────────────────
+    /// <summary>The current table source. Test seam for direct row inspection.</summary>
+    internal ScheduleTableSource? ListTableSource { get; private set; }
+
+    // -- ISelectableOverlay ---
     SelectableTextView ISelectableOverlay.Body => this.body;
 
-    // ── Show / Hide / Teardown ────────────────────────────────────────────────
-
-    /// <summary>Opens the controller, subscribes to changes, starts a fresh pump, focuses, and renders.</summary>
     public void Show()
     {
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
 
-        // Idempotent: a second Show while already active must never double-subscribe or double-pump.
         if (this.active)
         {
             this.Visible = true;
@@ -120,7 +173,6 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
         this.Render();
     }
 
-    /// <summary>Cancels the pump, unsubscribes, closes the controller, and hides.</summary>
     public void Hide()
     {
         if (!this.active) return;
@@ -143,50 +195,96 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
         this.controller.Close();
     }
 
-    // ── Key routing ───────────────────────────────────────────────────────────
-
     protected override bool OnKeyDown(Key key)
     {
         if (key is null) return false;
         if (!this.Visible) return base.OnKeyDown(key);
 
-        switch (key)
+        if (this.filterMode)
         {
-            case { } k when k == Key.Esc || k == Key.Q:
+            if (key == Key.Esc)
+            {
+                this.filterMode = false;
+                this.filterBuffer = string.Empty;
+                this.Render();
+                return true;
+            }
+
+            if (key == Key.Backspace && this.filterBuffer.Length > 0)
+            {
+                this.filterBuffer = this.filterBuffer[..^1];
+                this.Render();
+                return true;
+            }
+
+            if (TryGetPrintable(key, out var ch))
+            {
+                this.filterBuffer += ch;
+                this.Render();
+                return true;
+            }
+
+            return true;
+        }
+
+        var command = ScheduleBrowserKeyMap.Map(key);
+        switch (command)
+        {
+            case ScheduleBrowserCommand.Close:
                 this.Hide();
                 return true;
 
-            case { } k when k == Key.CursorUp || k == Key.K:
+            case ScheduleBrowserCommand.MoveUp:
                 this.controller.MoveSelection(-1);
+                this.Render();
                 return true;
 
-            case { } k when k == Key.CursorDown || k == Key.J:
+            case ScheduleBrowserCommand.MoveDown:
                 this.controller.MoveSelection(1);
+                this.Render();
                 return true;
 
-            case { } k when k == Key.PageUp:
+            case ScheduleBrowserCommand.PageUp:
                 this.controller.MoveSelection(-PageStep);
+                this.Render();
                 return true;
 
-            case { } k when k == Key.PageDown:
+            case ScheduleBrowserCommand.PageDown:
                 this.controller.MoveSelection(PageStep);
+                this.Render();
                 return true;
 
-            case { } k when k == Key.D:
-                // Delete with confirmation
+            case ScheduleBrowserCommand.MoveToStart:
+                this.controller.MoveToStart();
+                this.Render();
+                return true;
+
+            case ScheduleBrowserCommand.MoveToEnd:
+                this.controller.MoveToEnd();
+                this.Render();
+                return true;
+
+            case ScheduleBrowserCommand.DeleteSelected:
                 this.Observe(this.controller.DeleteSelectedAsync(CancellationToken.None));
                 return true;
 
-            case { } k when k == Key.N:
-                // New (create)
+            case ScheduleBrowserCommand.CreateNew:
                 this.Observe(this.controller.CreateAsync(CancellationToken.None));
+                return true;
+
+            case ScheduleBrowserCommand.Reload:
+                this.controller.Reload();
+                return true;
+
+            case ScheduleBrowserCommand.Filter:
+                this.filterMode = true;
+                this.filterBuffer = string.Empty;
+                this.Render();
                 return true;
         }
 
         return base.OnKeyDown(key);
     }
-
-    // ── Render ────────────────────────────────────────────────────────────────
 
     private void OnControllerChanged()
     {
@@ -213,6 +311,7 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
         var state = this.controller.State;
         this.RenderHeader(state);
         this.RenderBody(state);
+        this.RenderStatus(state);
         this.RenderFooter(state);
         this.SetNeedsDraw();
     }
@@ -226,49 +325,118 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
 
     private void RenderBody(ScheduleBrowserState state)
     {
-        if (state.Rows.Count == 0)
+        var rows = ApplyFilter(state.Rows, this.filterBuffer);
+        var source = new ScheduleTableSource(rows, this.statusGlyphs);
+        this.ListTableSource = source;
+        this.listTable.Table = source;
+
+        if (rows.Count > 0)
         {
-            this.body.SetText("  (no scheduled tasks — press N to create one)");
-            return;
+            var selIdx = rows.ToList().FindIndex(r => r.Id == state.SelectedId);
+            if (selIdx >= 0)
+            {
+                this.listTable.SetSelection(0, selIdx, false);
+                this.listTable.EnsureCursorIsVisible();
+            }
         }
+    }
 
-        var lines = new System.Text.StringBuilder();
-        foreach (var row in state.Rows)
+    private void RenderStatus(ScheduleBrowserState state)
+    {
+        if (this.filterMode)
         {
-            var selected = row.Id == state.SelectedId;
-            var prefix = selected ? "\u276f " : "  ";
-            var id = TerminalTextSanitizer.SanitizeSingleLine(row.Id);
-            var name = row.Name is { Length: > 0 } n
-                ? $" \"{TerminalTextSanitizer.SanitizeSingleLine(n)}\""
-                : string.Empty;
-            var rule = TerminalTextSanitizer.SanitizeSingleLine(row.Rule);
-            var tz = TerminalTextSanitizer.SanitizeSingleLine(row.TimeZone);
-            var nextUtc = row.NextRunUtc.UtcDateTime.ToString("yyyy-MM-dd HH:mm");
-            var statusStr = row.State.ToString();
-            var outcome = row.LastOutcome is { } lo
-                ? $" [{TerminalTextSanitizer.SanitizeSingleLine(lo.Outcome.ToString())}]"
-                : string.Empty;
-
-            lines.AppendLine(
-                $"{prefix}{id}{name}  {rule}  {tz}  next {nextUtc} UTC  {statusStr}{outcome}");
+            this.status.Text = $" filter: {this.filterBuffer}▏";
         }
-
-        this.body.SetText(lines.ToString());
+        else if (state.StatusMessage is { Length: > 0 } msg)
+        {
+            this.status.Text = $" {TerminalTextSanitizer.SanitizeSingleLine(msg)}";
+        }
+        else
+        {
+            this.status.Text = string.Empty;
+        }
     }
 
     private void RenderFooter(ScheduleBrowserState state)
     {
-        if (state.StatusMessage is { Length: > 0 } msg)
-        {
-            this.footer.Text = $" {TerminalTextSanitizer.SanitizeSingleLine(msg)}";
-            return;
-        }
-
         var busy = state.IsActionBusy ? " [busy]" : string.Empty;
-        this.footer.Text = $" ↑/↓ navigate · N create · D delete · Esc close{busy}";
+        this.footer.Text = $" ↑/↓ k/j move · n create · d delete · r reload · / filter · Esc q close{busy}";
     }
 
-    // ── IDisposable ───────────────────────────────────────────────────────────
+    private Scheme? GetRowScheme(RowColorGetterArgs args)
+    {
+        if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
+        {
+            return null;
+        }
+
+        var item = this.ListTableSource.ItemAt(args.RowIndex);
+        return this.EnsureSchemes().ForRow(ScheduleTableSource.GetState(item));
+    }
+
+    private Scheme? GetStatusCellScheme(CellColorGetterArgs args)
+    {
+        if (this.ListTableSource is null || args.RowIndex >= this.ListTableSource.Rows)
+        {
+            return null;
+        }
+
+        var item = this.ListTableSource.ItemAt(args.RowIndex);
+        return this.EnsureSchemes().For(ScheduleTableSource.GetState(item));
+    }
+
+    private BrowserSchemes EnsureSchemes() =>
+        this.browserSchemes ??= new BrowserSchemes(this.theme, this.app.Driver);
+
+    private string SynthesizeListText()
+    {
+        if (this.ListTableSource is null)
+        {
+            return string.Empty;
+        }
+
+        var sb = new System.Text.StringBuilder();
+        for (var r = 0; r < this.ListTableSource.Rows; r++)
+        {
+            for (var c = 0; c < this.ListTableSource.Columns; c++)
+            {
+                if (c > 0)
+                {
+                    sb.Append(' ');
+                }
+
+                sb.Append(this.ListTableSource[r, c]);
+            }
+
+            sb.AppendLine();
+        }
+
+        return sb.ToString();
+    }
+
+    private static IReadOnlyList<ScheduledTaskReadModel> ApplyFilter(IReadOnlyList<ScheduledTaskReadModel> rows, string filter)
+    {
+        if (string.IsNullOrEmpty(filter))
+        {
+            return rows;
+        }
+
+        return rows.Where(r => r.Id.Contains(filter, StringComparison.OrdinalIgnoreCase)
+            || (r.Name?.Contains(filter, StringComparison.OrdinalIgnoreCase) ?? false)).ToList();
+    }
+
+    private static bool TryGetPrintable(Key key, out string text)
+    {
+        var rune = key.AsRune;
+        if (rune.Value > 0x1F && !char.IsControl((char)rune.Value))
+        {
+            text = rune.ToString();
+            return true;
+        }
+
+        text = string.Empty;
+        return false;
+    }
 
     protected override void Dispose(bool disposing)
     {
@@ -285,9 +453,6 @@ internal sealed class ScheduleBrowserOverlay : View, ISelectableOverlay
         base.Dispose(disposing);
     }
 
-    // ── Helpers ───────────────────────────────────────────────────────────────
-
-    /// <summary>Observes a background task's faults so they never become unhandled exceptions.</summary>
     private void Observe(Task task) =>
         task.ContinueWith(
             static t => { _ = t.Exception; },

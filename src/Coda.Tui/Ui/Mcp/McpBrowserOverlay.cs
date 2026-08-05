@@ -38,6 +38,10 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
     /// </summary>
     private readonly StatusGlyphs statusGlyphs;
 
+    // Filter-mode state: / enters filter mode; keys go to the buffer; Esc exits filter first.
+    private bool filterMode;
+    private string filterBuffer = string.Empty;
+
     internal McpBrowserOverlay(
         IApplication app,
         McpBrowserController controller,
@@ -276,7 +280,44 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
             return true;
         }
 
+        // Filter mode: keys go to the filter buffer; Esc exits filter (does not close browser).
+        if (this.filterMode)
+        {
+            if (key == Key.Esc)
+            {
+                this.filterMode = false;
+                this.filterBuffer = string.Empty;
+                this.Render();
+                return true;
+            }
+
+            if (key == Key.Backspace && this.filterBuffer.Length > 0)
+            {
+                this.filterBuffer = this.filterBuffer[..^1];
+                this.Render();
+                return true;
+            }
+
+            if (key.AsRune.Value > 0x1F && !char.IsControl((char)key.AsRune.Value))
+            {
+                this.filterBuffer += key.AsRune.ToString();
+                this.Render();
+                return true;
+            }
+
+            return true; // swallow all other keys in filter mode
+        }
+
         var command = McpBrowserKeyMap.Map(key, this.controller.State.View);
+
+        // Filter command is overlay-level state; do not route to the controller.
+        if (command == McpBrowserCommand.Filter)
+        {
+            this.filterMode = true;
+            this.Render();
+            return true;
+        }
+
         if (command == McpBrowserCommand.None)
         {
             if (this.controller.State.View == McpBrowserView.Detail && this.TryScrollDetail(key))
@@ -376,19 +417,24 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.listTable.Visible = true;
         this.body.Visible = false;
 
-        var source = new McpServerTableSource(state.Servers, this.statusGlyphs, null);
+        // Apply case-insensitive name filter when in filter mode.
+        var servers = this.filterBuffer.Length > 0
+            ? state.Servers.Where(s => s.Key.Name.Contains(this.filterBuffer, StringComparison.OrdinalIgnoreCase)).ToImmutableArray()
+            : state.Servers;
+
+        var source = new McpServerTableSource(servers, this.statusGlyphs, null);
         this.listTable.Table = source;
 
         // Sync the table's selection from controller state, then scroll it into view. Without the
         // second step the table renders from row 0 regardless of the selection, so on a short
         // terminal the selected server is simply not on screen — which is exactly the case the
         // narrow-terminal tests cover.
-        if (!state.Servers.IsDefaultOrEmpty && state.SelectedKey is { } key)
+        if (!servers.IsDefaultOrEmpty && state.SelectedKey is { } key)
         {
             var idx = 0;
-            for (var i = 0; i < state.Servers.Length; i++)
+            for (var i = 0; i < servers.Length; i++)
             {
-                if (state.Servers[i].Key == key)
+                if (servers[i].Key == key)
                 {
                     idx = i;
                     break;
@@ -400,11 +446,20 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         }
 
         this.header.Text = SafeSingle("MCP manager");
-        this.status.Text = SafeSingle(state.StatusMessage);
+
+        if (this.filterMode)
+        {
+            this.status.Text = SafeSingle($" filter: {this.filterBuffer}▏");
+        }
+        else
+        {
+            this.status.Text = SafeSingle(state.StatusMessage);
+        }
+
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "↑/↓ move · PgUp/PgDn · Home/End · Enter detail · a add · e edit · Space enable · u reauth · Delete remove · Esc close",
-                "↑/↓ · PgUp/PgDn · Home/End · Enter · Esc"));
+                "↑/↓ k/j move · PgUp/PgDn · Home/End · Enter detail · a add · e edit · Space enable · u reauth · Delete remove · r reload · / filter · Esc q close",
+                "↑/↓ k/j · PgUp/PgDn · r reload · / filter · Esc q"));
 
         return BuildListText(state, source);
     }
@@ -494,8 +549,8 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "↑/↓ scroll · PgUp/PgDn · Home/End · e edit · Space enable · u reauth · Delete remove · Esc back",
-                "↑/↓ · PgUp/PgDn · Home/End · Esc back"));
+                "↑/↓ k/j scroll · PgUp/PgDn · Home/End · e edit · Space enable · u reauth · Delete remove · Esc q back",
+                "↑/↓ k/j · PgUp/PgDn · Home/End · Esc q back"));
     }
 
     private void RenderEditor(McpBrowserState state)
