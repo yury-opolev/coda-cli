@@ -950,8 +950,10 @@ How deep and how wide a session may fan out into subagents is configurable in
 {
   "subagents": {
     "maxDepth": 2,
-    "maxConcurrent": 8,
-    "allowSystemPromptReplacement": false
+    "maxConcurrent": 20,
+    "allowSystemPromptReplacement": false,
+    "model": "claude-haiku-4-5",
+    "modelByType": { "explore": "claude-haiku-4-5" }
   }
 }
 ```
@@ -959,12 +961,55 @@ How deep and how wide a session may fan out into subagents is configurable in
 | Field | Default | Effect |
 |---|---|---|
 | `maxDepth` | `2` | Deepest subagent nesting. The main agent is depth 0, so `2` permits a subagent and a grandchild. A subagent at the limit gets no task-management tools at all, so it cannot spawn or inspect anything. Clamped to `1`–`10`. |
-| `maxConcurrent` | `8` | How many subagents may run at once across the session, foreground and background together. The budget is session-wide and counts ancestors, so a running parent still holds a slot while its child asks for one. A launch that cannot get a slot is **refused, never queued** — the tool returns an error naming the limit so the model can wait, work inline, or explain why it cannot. Clamped to `1`–`64`. |
+| `maxConcurrent` | `20` | How many subagents may run at once across the session, foreground and background together. The budget is session-wide and counts ancestors, so a running parent still holds a slot while its child asks for one. A launch that cannot get a slot is **refused, never queued** — the tool returns an error naming the limit so the model can wait, work inline, or explain why it cannot. Clamped to `1`–`64`. |
 | `allowSystemPromptReplacement` | `false` | Whether the `system_prompt` tool parameter (below) may replace a subagent's own instructions outright. **User file only** — a project file cannot set it in either direction, because `<project>/.coda/settings.json` belongs to whoever wrote the repo you cloned, and this is the one field that would hand a prompt-injected model the subagent's own instructions. |
+| `model` | *(session model)* | Default model for every subagent. **User file only** (see below). |
+| `modelByType` | *(none)* | Per-subagent-type model, keyed by type name (case-insensitive). **User file only.** |
 
 Both limits are **clamped on load**: a settings file can raise one within reason but
 never remove it. None of the three is reachable from tool input — the model cannot
 widen its own budget or ungate its own prompt.
+
+> **Fan-out is a fleet budget, not a per-level one.** The slot count is session-wide,
+> so a leader that dispatches 20 workers holds every slot and those workers cannot then
+> spawn children of their own. If you want depth *and* width, raise `maxConcurrent`.
+> Note also that `task` blocks until its subagent finishes, so genuine parallelism comes
+> from `task_start`, which returns immediately.
+
+#### Choosing a subagent's model
+
+`task` and `task_start` accept an optional `model`, so an expensive orchestrator can
+dispatch cheap workers. The model must be one the **session's provider** serves —
+this selects a model, not a provider.
+
+Resolution order, first match wins:
+
+1. the `model` argument on the tool call
+2. `subagents.modelByType[<type>]`
+3. `subagents.model`
+4. a model declared by a plugin's agent definition
+5. the session model
+
+`subagents.model` and `subagents.modelByType` are **user-settings-file only**, and a
+plugin-declared model is honoured only for **user-scoped** plugins. Both restrictions
+exist for the same reason as `allowSystemPromptReplacement`: a project settings file
+and a project-scoped plugin both belong to whoever wrote the repository you cloned, and
+model choice is a spending lever. Operator settings outrank a plugin's declaration at
+every level, so a plugin can only supply a model when you have expressed no opinion.
+
+Model ids are **not validated** — Coda keeps no handcrafted model list, so an unknown id
+surfaces as the provider's own error on the subagent's first call, which the agent can
+read and correct. `task_get` reports the model a subagent actually resolved to.
+
+#### Completion notifications
+
+A **background** subagent that reaches a terminal state — completed, failed *or*
+stopped — delivers its report into its owner's context at the next model call, instead
+of the owner having to poll. Reports are truncated and the batch is capped, so a wide
+fan-out cannot flood the context window; `task_output` still has the full log. A
+`task_wait` that returns terminal consumes the entry it reports, so you never see the
+same completion twice. Foreground `task` calls are unaffected — their report is already
+the tool result. `coda serve` receives the same events as `event/taskCompleted`.
 
 #### Influencing a subagent's system prompt
 
