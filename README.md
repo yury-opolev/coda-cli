@@ -258,16 +258,20 @@ The list shows **active tasks first as a parent/child hierarchy**, then **recent
 failed, and stopped** tasks, each with a status glyph, description, kind (subagent/shell),
 foreground/background mode, and duration. Selection is stable by task id.
 
-- **List:** `Up`/`Down`, `PageUp`/`PageDown`, `Home`/`End` navigate · `Enter` opens the detail
-  page · `x` twice within ~1.5 s stops a running task · `r` dismisses a **terminal** task from the
-  in-memory list (its **persistent log is preserved**) · `Esc` closes.
+- **List:** `Up`/`Down` or `k`/`j`, `PageUp`/`PageDown`, `Home`/`End` navigate · `Enter` opens the
+  detail page · `/` filters by name · `x` twice within ~1.5 s stops a running task · `d` dismisses a
+  **terminal** task from the in-memory list (its **persistent log is preserved**) · `r` reloads ·
+  `Esc` or `q` closes.
 - **Detail:** `s` steers a running **subagent** (modal editor: `Enter` queues, `Shift+Enter` /
   `Ctrl+Enter` / `Ctrl+J` insert a newline, `Esc` cancels; messages are delivered FIFO at the
   subagent's next safe loop boundary) · `a` **attaches** a running **background shell**'s output
   and pauses the main agent · `Ctrl+B` releases a UI attachment (or backgrounds an originally
-  foreground shell) · `x` twice stops · `r` dismisses a terminal task · `l` toggles between recent
+  foreground shell) · `x` twice stops · `d` dismisses a terminal task · `l` toggles between recent
   live output and the persistent **log** tail · `End` jumps to newest and restores **auto-follow**
-  · `Esc` returns to the list (releasing any attachment first).
+  · `Esc` or `q` returns to the list (releasing any attachment first).
+
+> **Changed:** `r` used to dismiss a task here while meaning *reload* in the other browsers. It now
+> means **reload** everywhere and dismiss moved to `d`.
 
 **Attachment is output-only** — there is **no shell stdin** in this phase. Attaching requests a
 pause through a reference-counted execution gate: if the main agent is idle the pause is immediate,
@@ -291,8 +295,49 @@ in serve.
   call fails (e.g. Claude.ai OAuth, or offline). Each model is annotated with its
   display name and context window from the **model catalog** (see below).
   `/model refresh` re-fetches the live list *and* refreshes the catalog. Run
-  interactively with no argument, `/model` opens a picker that marks the active
-  model as **Current** and opens with it selected.
+  interactively with no argument, `/model` opens a **model browser** (see below).
+
+### Browsers — `/model`, `/mcp`, `/skills`, `/plugin`, `/tasks`, `/schedule`
+
+In the Terminal.Gui shells these open focused, full-overlay browsers. They share one set of
+bindings, one status vocabulary, and one look.
+
+**Status glyphs.** Each row carries a glyph coloured by state, with an ASCII fallback for terminals
+that cannot draw geometric characters:
+
+| Glyph | ASCII | Meaning |
+|---|---|---|
+| `●` | `*` | healthy — connected, running |
+| `○` | `o` | enabled but idle or disconnected |
+| `⊘` | `x` | disabled |
+| `✗` | `!` | error |
+| `!` | `!` | needs attention — untrusted, expiring credentials |
+| `↑` | `^` | overridden by a higher-precedence scope (row dimmed) |
+
+**List bindings**, the same in every browser: `Esc` or `q` closes · `Up`/`Down` or `k`/`j` move ·
+`PageUp`/`PageDown`, `Home`/`End` page and jump · `Enter` opens the detail page · `Space` toggles
+enabled where the browser supports it · `r` reloads · `/` filters by name.
+
+**Filter mode** narrows rows as you type. `Esc` leaves the filter and returns to the full list; a
+second `Esc` closes the browser.
+
+**Detail bindings:** `Esc` or `q` returns to the list, with the same movement and paging keys.
+
+The **model browser** shows each model's id, display name, context window and reasoning levels, marks
+the model in use, and states in its header where the list came from — live from the provider, the
+models.dev catalog, or the built-in fallback — warning when it is the built-in list. `/model <id>`
+still applies a model directly without opening the browser.
+
+The **MCP browser** additionally offers `a` add · `e` edit · `Space` enable/disable · `u`
+re-authenticate · `Delete` remove. Its editor is a real form: `Tab`/`Shift+Tab` and `Up`/`Down` move
+between fields, text fields have a cursor and full editing, fixed-value fields are selectors, and the
+fields shown change with the transport — a stdio server has a command, arguments and environment; an
+HTTP server has a URL, headers and auth. `Ctrl+N` adds a list item, `Ctrl+R` removes one, and
+`Alt+Up`/`Alt+Down` reorder. Secrets are never typed into the form: they are entered through a
+masked prompt and shown only as `*****`.
+
+Changing an existing server's **transport** rewrites it to the other shape and drops the fields that
+do not apply, so saving such a change asks for confirmation first and names what will be lost.
 - **`/effort [low|medium|high|max|auto]`** sets the reasoning effort level. It is
   sent to the Anthropic API as `output_config.effort` (with the
   `effort-2025-11-24` beta) and is honored only by models that support it
