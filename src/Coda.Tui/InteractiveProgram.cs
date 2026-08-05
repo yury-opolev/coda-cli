@@ -291,8 +291,14 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
         var pluginStateStore = new Coda.Tui.Plugins.PluginStateStore(userCodaDir);
 
-        // Load and compose plugins for this working directory.
-        var plugins = PluginLoader.Load(cwd);
+        // Start plugin and skill disk scans concurrently — they are independent I/O passes.
+        // Skills need only pluginStateStore (already available); they do not depend on the
+        // plugin composition that follows. Overlap them so startup pays the MAX, not the SUM.
+        var pluginLoadTask = Task.Run(() => PluginLoader.Load(cwd));
+        var skillLoadTask = Task.Run(() => Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore));
+
+        // Await plugins first — the trust prompt and composition depend on them.
+        var plugins = await pluginLoadTask.ConfigureAwait(false);
 
         // Construct the plugin trust store (same home-directory convention as /plugin command).
         var homeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
@@ -324,7 +330,8 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // The session state is shared between the skill tool and the reattach callback so compaction
         // re-injects exactly the bodies the model loaded in this session.
         var skillState = new Coda.Tui.Skills.SkillSessionState();
-        var loadedSkills = Coda.Tui.Skills.SkillLoader.Load(cwd, pluginStateStore: pluginStateStore);
+        // Await the concurrent skill-scan task started above (alongside PluginLoader.Load).
+        var loadedSkills = await skillLoadTask.ConfigureAwait(false);
         // Gate model invocations of Claude/Plugin-origin skills behind an interactive prompt.
         // The lambda closes over actorPrompts; it is called only during live session turns
         // (when the UI actor is already running), so there is no startup-time deadlock.
@@ -513,6 +520,9 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         // the SAME completion (via the memoizing gate). A frame/actor fault in one mode therefore can
         // neither re-run resume/MCP/setup side effects nor let a fallback mode enable submission before
         // startup has actually finished — the fallback awaits the original in-flight run to completion.
+        // Tracks the background MCP connect task so it can be awaited at shutdown — never fire-and-forget.
+        Task? mcpBackgroundTask = null;
+
         var startupGate = new AsyncStartupGate();
         Task EnsureStartupAsync() => startupGate.RunOnceAsync(RunStartupCoreAsync);
 
@@ -521,19 +531,48 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             try
             {
                 await SeedSessionAsync(context, options, mailbox, hostToken).ConfigureAwait(false);
-                await ConnectMcpAsync(context, mcp, store, mailbox, pluginMcpServers, hostToken).ConfigureAwait(false);
+
+                // Start MCP connect in the background so it does NOT hold up the submission gate.
+                // If the user types a prompt before servers finish connecting, the turn runs without
+                // MCP tools — ExtraToolsProvider is re-read per turn (AgentRunner.cs), so tools
+                // appear automatically from whichever turn they are ready for. This is safe.
+                mcpBackgroundTask = Task.Run(async () =>
+                {
+                    // Publish the status indicator at the start of the task so it appears after
+                    // CompleteStartup (which clears the "Starting…" operation). The brief gap
+                    // between CompleteStartup and this publish is imperceptible in practice.
+                    Publish(mailbox, new ActiveOperationChangedEvent(new ActiveOperation("mcp-connecting", "Connecting MCP servers…", null)));
+                    try
+                    {
+                        await ConnectMcpAsync(context, mcp, store, mailbox, pluginMcpServers, hostToken).ConfigureAwait(false);
+                    }
+                    catch (OperationCanceledException) when (hostToken.IsCancellationRequested)
+                    {
+                        // Shutdown: clear indicator and stop — nothing further to publish.
+                        Publish(mailbox, new ActiveOperationChangedEvent(null));
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        // Unexpected exception: surface it but continue so the snapshot and indicator are updated.
+                        Publish(mailbox, new DiagnosticEvent("MCP", ex.Message, UiNotificationLevel.Error));
+                    }
+
+                    // Clear the "Connecting MCP servers…" indicator, then publish the final snapshot
+                    // so the UI reflects which servers connected (and any that failed).
+                    Publish(mailbox, new ActiveOperationChangedEvent(null));
+                    Publish(mailbox, new McpRuntimeChangedEvent(mcp.GetSnapshot()));
+                }, hostToken);
+
                 var ranSetup = await MaybeRunFirstRunSetupAsync(context, hostToken).ConfigureAwait(false);
                 if (!ranSetup)
                 {
                     SystemPromptCompatibilityWarning.Publish(context);
                 }
 
-                // Eagerly create + initialize the session BEFORE ready metadata/banner/composer
-                // enablement: this starts the schedule runtime so persisted schedules resume before the
-                // first prompt, sees the just-connected MCP tools, and makes the /tasks provider non-null
-                // (context.TaskManagerProvider / the TaskBrowserProvider). No model turn runs and history
-                // is untouched. A failure here is caught below and surfaced as a startup diagnostic; the
-                // session simply stays degraded, exactly as MCP-connect faults already do.
+                // InitializeSessionAsync no longer needs to run after MCP connect. ExtraToolsProvider
+                // is re-read every turn (AgentRunner.cs), so the session sees MCP tools as soon as
+                // they arrive — no ordering dependency exists here.
                 await agentRunner.InitializeSessionAsync(context, hostToken).ConfigureAwait(false);
 
                 var currentConnectedProviderId = await credentials
@@ -541,11 +580,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
                     .ConfigureAwait(false);
                 InteractiveProgram.RenderStartupBanner(context, mode, currentConnectedProviderId);
 
-                // Immutable initial metadata/MCP publication. The git cache stays unwired and the context
+                // Immutable initial metadata publication. The git cache stays unwired and the context
                 // cache stays lazy (populated only after the first turn), exactly as the legacy REPL, so no
-                // expensive analysis runs at startup.
+                // expensive analysis runs at startup. The MCP snapshot is published by the background connect
+                // task when it completes (it may arrive after this point).
                 Publish(mailbox, SessionMetadataEvents.Build(context) with { Connected = currentConnectedProviderId is not null });
-                Publish(mailbox, new McpRuntimeChangedEvent(mcp.GetSnapshot()));
             }
             catch (OperationCanceledException) when (hostToken.IsCancellationRequested)
             {
@@ -748,6 +787,13 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             finalize: async () =>
             {
                 hostCts.Cancel();
+                // Await the background MCP connect task so it is never stranded or unobserved.
+                // hostToken is already cancelled above, so the task exits quickly (or has already exited).
+                if (mcpBackgroundTask is not null)
+                {
+                    try { await mcpBackgroundTask.ConfigureAwait(false); }
+                    catch { /* cancellation or any other exception: already surfaced as a diagnostic */ }
+                }
                 await actorTask.ConfigureAwait(false);
             },
             hostToken,

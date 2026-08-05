@@ -11,10 +11,13 @@ namespace Coda.Mcp;
 /// their tools (as <see cref="ITool"/>s), and owns the stdio server processes. A failing or
 /// slow server is skipped (logged) rather than blocking startup.
 /// <para>
-/// Thread-safety by convention: the client/tool lists are mutated only from the REPL thread
-/// between agent turns (via <c>/mcp start|stop</c>) and read by a turn that has already started
-/// (which copies <see cref="Tools"/> into a fresh array). There is no background reconnect, so no
-/// lock is used. A future background mutator would need synchronization here.
+/// Thread-safety: <see cref="ConnectAllAsync"/> now runs all server connects concurrently and
+/// MCP connect is started as a background task during interactive startup so submission is not
+/// gated on it. All mutable state (<c>clients</c>, <c>tools</c>, error maps, <c>Version</c>) is
+/// guarded by a single <c>gate</c> lock. Expensive I/O (initialize/tools-list) happens outside
+/// the lock; only the final atomic adoption or the error-record write takes the lock.
+/// Reader methods that need async work first snapshot the client list under the lock, then
+/// perform the async call outside.
 /// </para>
 /// </summary>
 public sealed partial class McpClientManager : IAsyncDisposable
@@ -25,6 +28,9 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// The startup handshake is <c>initialize</c> then <c>tools/list</c>.
     /// </summary>
     private const string DefaultConnectPhase = "initialize/tools/list";
+
+    /// <summary>Serialises all reads and writes of <c>clients</c>, <c>tools</c>, error maps, and <c>Version</c>.</summary>
+    private readonly object gate = new();
 
     private readonly List<IMcpClient> clients = [];
     private readonly List<ITool> tools = [];
@@ -72,18 +78,35 @@ public sealed partial class McpClientManager : IAsyncDisposable
             : Timeout.InfiniteTimeSpan;
     }
 
-    public IReadOnlyList<ITool> Tools => this.tools;
+    /// <summary>Returns a snapshot of the currently connected tools; safe to enumerate while connects run concurrently.</summary>
+    public IReadOnlyList<ITool> Tools
+    {
+        get
+        {
+            lock (this.gate) { return [..this.tools]; }
+        }
+    }
 
-    /// <summary>Exposes the connected clients for resource/prompt fan-out operations.</summary>
-    public IReadOnlyList<IMcpClient> Clients => this.clients;
+    /// <summary>Exposes a snapshot of the connected clients for resource/prompt fan-out operations.</summary>
+    public IReadOnlyList<IMcpClient> Clients
+    {
+        get
+        {
+            lock (this.gate) { return [..this.clients]; }
+        }
+    }
 
     /// <summary>True when a client for <paramref name="serverName"/> is currently connected.</summary>
-    public bool IsServerConnected(string serverName) =>
-        this.clients.Any(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal));
+    public bool IsServerConnected(string serverName)
+    {
+        lock (this.gate) { return this.clients.Any(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal)); }
+    }
 
     /// <summary>The identity a connected server reported at initialize, or null when not connected / none.</summary>
-    public McpServerInfo? ServerInfoFor(string serverName) =>
-        this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal))?.ServerInfo;
+    public McpServerInfo? ServerInfoFor(string serverName)
+    {
+        lock (this.gate) { return this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal))?.ServerInfo; }
+    }
 
     /// <summary>
     /// The last safe, actionable runtime error for <paramref name="serverName"/>, or null when the
@@ -92,11 +115,14 @@ public sealed partial class McpClientManager : IAsyncDisposable
     public string? LastConnectionErrorFor(string serverName)
     {
         ArgumentNullException.ThrowIfNull(serverName);
-        return this.lastConnectionErrors.GetValueOrDefault(serverName);
+        lock (this.gate) { return this.lastConnectionErrors.GetValueOrDefault(serverName); }
     }
 
     /// <summary>The connected tools that belong to <paramref name="serverName"/> (empty when not connected).</summary>
-    public IReadOnlyList<McpTool> ServerTools(string serverName) => McpServerTools.ForServer(this.tools, serverName);
+    public IReadOnlyList<McpTool> ServerTools(string serverName)
+    {
+        lock (this.gate) { return McpServerTools.ForServer(this.tools, serverName); }
+    }
 
     /// <summary>
     /// A versioned, immutable snapshot of the connected servers for the UI status view: each server's
@@ -105,36 +131,52 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public McpRuntimeSnapshot GetSnapshot()
     {
-        var servers = this.clients
-            .OrderBy(c => c.ServerName, StringComparer.Ordinal)
-            .Select(c => new McpServerRuntimeSnapshot(
-                c.ServerName,
-                c.ServerInfo,
-                McpServerTools.ForServer(this.tools, c.ServerName).Count))
-            .ToList();
+        lock (this.gate)
+        {
+            var servers = this.clients
+                .OrderBy(c => c.ServerName, StringComparer.Ordinal)
+                .Select(c => new McpServerRuntimeSnapshot(
+                    c.ServerName,
+                    c.ServerInfo,
+                    McpServerTools.ForServer(this.tools, c.ServerName).Count))
+                .ToList();
 
-        return new McpRuntimeSnapshot(this.Version, servers);
+            return new McpRuntimeSnapshot(this.Version, servers);
+        }
     }
 
     /// <summary>
     /// Bumped on every connect/disconnect. A live tool source can compare it to detect changes
     /// (the TUI re-reads <see cref="Tools"/> per turn, so it picks up changes without polling).
     /// </summary>
-    public int Version { get; private set; }
+    public int Version
+    {
+        get
+        {
+            lock (this.gate) { return this.version; }
+        }
+    }
 
-    /// <summary>Connect every server in <paramref name="servers"/>; <paramref name="log"/> receives status/errors.</summary>
+    private int version;
+
+    /// <summary>
+    /// Connect every server in <paramref name="servers"/> concurrently (all in parallel, so startup
+    /// costs the slowest server rather than the sum). Each result is logged via <paramref name="log"/>
+    /// in arrival order using the same wording as before.
+    /// </summary>
     public async Task ConnectAllAsync(
         IReadOnlyDictionary<string, McpServerConfig> servers,
         Action<string>? log = null,
         CancellationToken cancellationToken = default)
     {
-        foreach (var (name, config) in servers)
+        var tasks = servers.Select(async kvp =>
         {
-            var result = await this.ConnectServerAsync(name, config, cancellationToken).ConfigureAwait(false);
+            var result = await this.ConnectServerAsync(kvp.Key, kvp.Value, cancellationToken).ConfigureAwait(false);
             log?.Invoke(result.Connected
-                ? $"MCP server '{name}': {result.ToolCount} tool(s)."
-                : $"MCP server '{name}' failed to connect: {result.Error}");
-        }
+                ? $"MCP server '{kvp.Key}': {result.ToolCount} tool(s)."
+                : $"MCP server '{kvp.Key}' failed to connect: {result.Error}");
+        });
+        await Task.WhenAll(tasks).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -155,7 +197,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
 
         const string error = "HTTP transport is not available.";
-        this.SetLastConnectionError(name, error);
+        lock (this.gate) { this.SetLastConnectionError(name, error); }
         return McpConnectResult.Failure(error);
     }
 
@@ -198,15 +240,19 @@ public sealed partial class McpClientManager : IAsyncDisposable
             var callerCanceled = cancellationToken.IsCancellationRequested;
             var timedOut = !callerCanceled && linkedCts.IsCancellationRequested;
             var error = this.SanitizeRuntimeError(this.ClassifyFailure(ex, client.ServerName, callerCanceled, timedOut));
-            this.SetLastConnectionError(client.ServerName, error);
+            lock (this.gate) { this.SetLastConnectionError(client.ServerName, error); }
             return McpConnectResult.Failure(error);
         }
 
         // Atomic adoption: only after initialize and every wrapper succeeded.
-        this.clients.Add(client);
-        this.tools.AddRange(newTools);
-        this.ClearLastConnectionError(client.ServerName);
-        this.Version++;
+        // Hold the lock only for the brief state mutation — not across any await.
+        lock (this.gate)
+        {
+            this.clients.Add(client);
+            this.tools.AddRange(newTools);
+            this.ClearLastConnectionError(client.ServerName);
+            this.version++;
+        }
         return McpConnectResult.Success(serverTools.Count);
     }
 
@@ -252,23 +298,28 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<bool> DisconnectServerAsync(string name)
     {
-        var client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, name, StringComparison.Ordinal));
-        if (client is null)
+        IMcpClient? client;
+        lock (this.gate)
         {
-            return false;
+            client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, name, StringComparison.Ordinal));
+            if (client is null)
+            {
+                return false;
+            }
+
+            this.clients.Remove(client);
+            this.tools.RemoveAll(t => t is McpTool mcpTool && string.Equals(mcpTool.ServerName, name, StringComparison.Ordinal));
+            this.version++;
         }
 
-        this.clients.Remove(client);
-        this.tools.RemoveAll(t => t is McpTool mcpTool && string.Equals(mcpTool.ServerName, name, StringComparison.Ordinal));
-        this.Version++;
         try
         {
             await client.DisposeAsync().ConfigureAwait(false);
-            this.ClearLastConnectionError(name);
+            lock (this.gate) { this.ClearLastConnectionError(name); }
         }
         catch (Exception ex)
         {
-            this.SetLastConnectionError(name, this.SanitizeRuntimeError(ex.Message));
+            lock (this.gate) { this.SetLastConnectionError(name, this.SanitizeRuntimeError(ex.Message)); }
         }
 
         return true;
@@ -291,7 +342,10 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<IReadOnlyList<McpResourceInfo>> ListResourcesAsync(CancellationToken cancellationToken = default)
     {
-        var tasks = this.clients
+        IReadOnlyList<IMcpClient> snapshot;
+        lock (this.gate) { snapshot = [..this.clients]; }
+
+        var tasks = snapshot
             .Select(c => this.TryListResourcesAsync(c, cancellationToken))
             .ToList();
 
@@ -305,7 +359,8 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<string> ReadResourceAsync(string serverName, string uri, CancellationToken cancellationToken = default)
     {
-        var client = this.clients.FirstOrDefault(c => c.ServerName == serverName);
+        IMcpClient? client;
+        lock (this.gate) { client = this.clients.FirstOrDefault(c => c.ServerName == serverName); }
         if (client is null)
         {
             return $"No MCP server named '{serverName}' is connected.";
@@ -320,7 +375,10 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<IReadOnlyList<McpPromptInfo>> ListPromptsAsync(CancellationToken cancellationToken = default)
     {
-        var tasks = this.clients
+        IReadOnlyList<IMcpClient> snapshot;
+        lock (this.gate) { snapshot = [..this.clients]; }
+
+        var tasks = snapshot
             .Select(c => this.TryListPromptsAsync(c, cancellationToken))
             .ToList();
 
@@ -335,7 +393,8 @@ public sealed partial class McpClientManager : IAsyncDisposable
     public async Task<IReadOnlyList<McpPromptInfo>> ServerPromptsAsync(string serverName, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(serverName);
-        var client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal));
+        IMcpClient? client;
+        lock (this.gate) { client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal)); }
         if (client is null)
         {
             return [];
@@ -344,7 +403,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         try
         {
             var prompts = await client.ListPromptsAsync(ct).ConfigureAwait(false);
-            this.ClearCapabilityError(serverName);
+            lock (this.gate) { this.ClearCapabilityError(serverName); }
             return prompts;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -353,7 +412,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability);
+            lock (this.gate) { this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability); }
             return [];
         }
     }
@@ -364,7 +423,8 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<string> GetPromptAsync(string serverName, string promptName, CancellationToken cancellationToken = default)
     {
-        var client = this.clients.FirstOrDefault(c => c.ServerName == serverName);
+        IMcpClient? client;
+        lock (this.gate) { client = this.clients.FirstOrDefault(c => c.ServerName == serverName); }
         if (client is null)
         {
             return $"No MCP server named '{serverName}' is connected.";
@@ -380,7 +440,8 @@ public sealed partial class McpClientManager : IAsyncDisposable
     public async Task<IReadOnlyList<McpResourceInfo>> ServerResourcesAsync(string serverName, CancellationToken ct = default)
     {
         ArgumentNullException.ThrowIfNull(serverName);
-        var client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal));
+        IMcpClient? client;
+        lock (this.gate) { client = this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal)); }
         if (client is null)
         {
             return [];
@@ -389,7 +450,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         try
         {
             var resources = await client.ListResourcesAsync(ct).ConfigureAwait(false);
-            this.ClearCapabilityError(serverName);
+            lock (this.gate) { this.ClearCapabilityError(serverName); }
             return resources;
         }
         catch (OperationCanceledException) when (ct.IsCancellationRequested)
@@ -398,7 +459,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability);
+            lock (this.gate) { this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability); }
             return [];
         }
     }
@@ -566,15 +627,27 @@ public sealed partial class McpClientManager : IAsyncDisposable
 
     public async ValueTask DisposeAsync()
     {
-        if (this.ownsClients)
+        if (!this.ownsClients)
         {
-            foreach (var client in this.clients)
+            lock (this.gate)
             {
-                await client.DisposeAsync().ConfigureAwait(false);
+                this.clients.Clear();
+                this.tools.Clear();
             }
+            return;
         }
 
-        this.clients.Clear();
-        this.tools.Clear();
+        IReadOnlyList<IMcpClient> toDispose;
+        lock (this.gate)
+        {
+            toDispose = [..this.clients];
+            this.clients.Clear();
+            this.tools.Clear();
+        }
+
+        foreach (var client in toDispose)
+        {
+            await client.DisposeAsync().ConfigureAwait(false);
+        }
     }
 }
