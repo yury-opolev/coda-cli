@@ -183,6 +183,7 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.browserSchemes = null;
         this.SetScheme(this.theme.SurfaceScheme(this.app.Driver));
         this.body.ApplyTheme(this.theme, this.app.Driver);
+        this.editorForm.ApplyTheme(this.theme, this.app.Driver);
         if (this.active)
         {
             this.Render();
@@ -576,8 +577,8 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.status.Text = SafeSingle(state.StatusMessage);
         this.footer.Text = SafeSingle(
             this.FooterForWidth(
-                "Tab/↑/↓ field · Enter save · Ctrl+N add · Ctrl+R remove · Alt+↑/↓ reorder · Esc cancel",
-                "Tab field · Enter save · Esc cancel"));
+                "↑/↓ field · ←/→ option · Enter save · Ctrl+N add · Ctrl+R remove · Alt+↑/↓ reorder · Esc cancel",
+                "↑/↓ field · Enter save · Esc cancel"));
 
         if (state.Editor is { } editor)
         {

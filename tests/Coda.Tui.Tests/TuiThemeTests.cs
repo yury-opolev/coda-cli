@@ -177,12 +177,26 @@ public sealed class TuiThemeTests
     [Fact]
     public void Composer_panel_background_is_a_distinct_warm_surface_from_the_shell_background()
     {
-        var theme = TuiTheme.WarmEmber;
+        // Asserted as a relationship rather than an exact triple: the requirement is that the input
+        // region reads as its own panel, and a hardcoded RGB only detects change, it does not
+        // detect the panel becoming indistinguishable.
+        foreach (var theme in new[] { TuiTheme.WarmEmber, CodaThemes.Default.Tui, CodaThemes.CoolDark.Tui })
+        {
+            var background = theme.Background.TrueColor;
+            var panel = theme.ComposerPanelBackground.TrueColor;
 
-        // The composer panel is a slightly lighter warm near-black than the shell surface, so the input
-        // region reads as its own panel rather than blending into the transcript background.
-        Assert.Equal(new TgColor(34, 28, 23), theme.ComposerPanelBackground.TrueColor);
-        Assert.NotEqual(theme.Background.TrueColor, theme.ComposerPanelBackground.TrueColor);
+            Assert.NotEqual(background, panel);
+
+            // The panel must be LIGHTER than the shell and by enough to be visible: the sum of the
+            // per-channel lift was previously as low as 4 per channel, which read as no panel at all.
+            var lift = (panel.R - background.R) + (panel.G - background.G) + (panel.B - background.B);
+            Assert.True(lift >= 24, $"composer panel lift {lift} is too subtle to read as a panel");
+
+            // The half-block edges are drawn in the edge colour against the SHELL background, so if
+            // the edge differs from the panel it renders as a bright bar around the input instead of
+            // the panel bleeding half a row outward.
+            Assert.Equal(panel, theme.ComposerPanelEdge.TrueColor);
+        }
     }
 
     [Fact]
