@@ -50,6 +50,13 @@ public sealed partial class AgentLoop : IAgentLoop
     private readonly LspServerManager? lsp;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearch;
+
+    /// <summary>
+    /// Tools withheld from the wire after the model API rejected their definitions. Session-scoped
+    /// when supplied by the host; a private instance otherwise, so the loop still recovers within
+    /// a single run.
+    /// </summary>
+    private readonly ToolQuarantine quarantine;
     private readonly GoalSupervisor? goal;
     private readonly Func<List<ChatMessage>, IAgentSink, CancellationToken, Task<bool>>? compactAsync;
     private readonly SteeringInbox? steering;
@@ -214,7 +221,8 @@ public sealed partial class AgentLoop : IAgentLoop
         AgentExecutionGate? gate = null,
         ToolActivityContext? toolActivity = null,
         PermissionRuleStore? permissionRules = null,
-        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null)
+        Func<IReadOnlySet<string>?>? grantedDirectoriesSource = null,
+        ToolQuarantine? quarantine = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.tools = tools ?? throw new ArgumentNullException(nameof(tools));
@@ -252,6 +260,7 @@ public sealed partial class AgentLoop : IAgentLoop
         this.persistTurn = persistTurnAsync;
         this.initialToolActivity = toolActivity ?? ToolActivityContext.CreateRoot();
         this.grantedDirectoriesSource = grantedDirectoriesSource;
+        this.quarantine = quarantine ?? new ToolQuarantine();
     }
 
     [LoggerMessage(Level = LogLevel.Debug, Message = "turn start: iteration={iteration}, model={model}, historyMessages={messageCount}, tools={toolCount}")]
@@ -286,6 +295,9 @@ public sealed partial class AgentLoop : IAgentLoop
 
     [LoggerMessage(Level = LogLevel.Warning, Message = "transient transport error before first content (iteration={iteration}); retrying turn (attempt {attempt})")]
     private partial void LogTransportRetry(int iteration, int attempt, Exception ex);
+
+    [LoggerMessage(Level = LogLevel.Error, Message = "model API rejected the definition of tool '{toolName}' ({reason}); quarantining it for this session and retrying the turn without it")]
+    private partial void LogToolSchemaEviction(string toolName, string reason);
 
     /// <summary>
     /// Whether an exception from the LLM call signals the request was too long for the model's
@@ -325,6 +337,21 @@ public sealed partial class AgentLoop : IAgentLoop
     // Bounded pre-content retry of a turn on a transient transport failure (e.g. the provider
     // forcibly closed the connection before the first token): 2 retries, 0.5s then 2s backoff.
     private const int MaxTransportRetries = 2;
+
+    /// <summary>
+    /// Maximum tools evicted per turn on schema rejections. A server can ship many bad tools, so
+    /// one eviction is not enough; a cap still stops a pathological loop if the provider keeps
+    /// blaming a different tool on every attempt.
+    /// </summary>
+    private const int MaxSchemaEvictions = 5;
+
+    /// <summary>
+    /// The text to attribute a tool rejection from: the raw response body when present (untruncated
+    /// and unredacted), else the exception message, which the client has already truncated to 300
+    /// characters and could otherwise cut the offending index off.
+    /// </summary>
+    private static string RejectionText(LlmClientException ex) =>
+        string.IsNullOrWhiteSpace(ex.ResponseBody) ? ex.Message : ex.ResponseBody;
 
     private TimeSpan TransportRetryBackoff(int attempt) =>
         this.transportRetryDelay ?? TimeSpan.FromMilliseconds(attempt <= 1 ? 500 : 2000);
@@ -553,6 +580,9 @@ public sealed partial class AgentLoop : IAgentLoop
                 // discovered set may grow during the turn, so we recompute each call.
                 // When inactive (or no coordinator), use the resolver's pre-computed definitions.
                 // Apply shape filtering after whichever branch produced the definitions.
+                // The quarantine is applied to BOTH branches: Standard mode never consults the
+                // coordinator, so filtering there only would leave a rejected tool on the wire
+                // forever and no turn could succeed.
                 IReadOnlyList<ToolDefinition> toolDefinitions;
                 if (this.toolSearch is not null && this.toolSearch.IsActive)
                 {
@@ -562,6 +592,8 @@ public sealed partial class AgentLoop : IAgentLoop
                 {
                     toolDefinitions = resolution.ToolDefinitions;
                 }
+
+                toolDefinitions = this.quarantine.Filter(toolDefinitions);
 
                 var request = new ChatRequest
                 {
@@ -593,6 +625,7 @@ public sealed partial class AgentLoop : IAgentLoop
                 // is the safety net for a single oversized turn.)
                 var overflowRetried = false;
                 var transportRetries = 0;
+                var schemaEvictions = 0;
                 while (true)
                 {
                     try
@@ -712,6 +745,40 @@ public sealed partial class AgentLoop : IAgentLoop
                         transportRetries++;
                         this.LogTransportRetry(iteration, transportRetries, ex);
                         await Task.Delay(this.TransportRetryBackoff(transportRetries), cancellationToken).ConfigureAwait(false);
+                    }
+                    catch (LlmClientException ex) when (schemaEvictions < MaxSchemaEvictions
+                        && !cancellationToken.IsCancellationRequested
+                        && ex.StatusCode == 400
+                        && text.Length == 0 && toolUses.Count == 0 && stopReason is null
+                        && thinkingBlocks.Count == 0 && redactedThinkingBlocks.Count == 0
+                        && !thinkingBurstOpen && capturedUsage is null
+                        && ToolSchemaRejection.TryIdentify(RejectionText(ex), request.Tools, out var offending))
+                    {
+                        // The provider refused ONE tool's definition and therefore failed the whole
+                        // request. Left alone this repeats on every subsequent request — the tool
+                        // stays on the wire and the session is dead. Quarantining the named tool and
+                        // retrying costs one tool instead. Request validation happens before any
+                        // streaming, so every accumulator above is provably empty here; asserting
+                        // them anyway keeps that invariant explicit rather than depending on a
+                        // client never emitting content before surfacing a 400.
+                        schemaEvictions++;
+                        this.quarantine.Add(offending);
+                        this.toolSearch?.RemoveDiscovered(offending);
+                        this.LogToolSchemaEviction(offending, ex.Message);
+                        sink.OnError(
+                            $"The model provider rejected the definition of tool '{offending}': {ex.Message} " +
+                            "The tool has been disabled for the rest of this session; retrying without it.");
+
+                        var retryDefinitions = this.quarantine.Filter(toolDefinitions);
+                        if (retryDefinitions.Count == request.Tools.Count)
+                        {
+                            // The eviction changed nothing (the name is not in this request's list),
+                            // so retrying would loop on the identical body. Surface instead.
+                            throw;
+                        }
+
+                        toolDefinitions = retryDefinitions;
+                        request = request with { Tools = retryDefinitions };
                     }
                 }
 

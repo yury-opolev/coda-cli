@@ -95,4 +95,11 @@ public sealed record AgentLoopSpec(
     /// Populated from skill directory-consent grants via <c>SkillSessionState.GetGrantedDirectories</c>.
     /// </summary>
     public Func<IReadOnlySet<string>?>? GrantedDirectoriesSource { get; init; }
+
+    /// <summary>
+    /// Session-scoped set of tools withheld from the wire because the model API rejected their
+    /// definitions. Shared across turns so one bad tool costs a tool rather than the session; a
+    /// null value gives the loop a private instance (recovery still works within one run).
+    /// </summary>
+    public ToolQuarantine? Quarantine { get; init; }
 }

@@ -18,6 +18,14 @@ public sealed class ToolSearchCoordinator
     private readonly int contextWindowTokens;
     private readonly HashSet<string> discovered = new(StringComparer.Ordinal);
 
+    /// <summary>
+    /// Guards <see cref="discovered"/>. One coordinator instance is shared by every loop a session
+    /// builds, and a scheduled turn runs on a background task concurrently with a main turn — so
+    /// reads (<c>Contains</c>, snapshots) genuinely race writes (<c>Add</c>/<c>Remove</c>/<c>Clear</c>),
+    /// which <see cref="HashSet{T}"/> does not tolerate.
+    /// </summary>
+    private readonly Lock gate = new();
+
     public ToolSearchCoordinator(ToolSearchMode mode, int autoPercent = 10, int contextWindowTokens = ContextWindow.DefaultTokens)
     {
         this.mode = mode;
@@ -66,14 +74,63 @@ public sealed class ToolSearchCoordinator
     }
 
     /// <summary>
-    /// Adds tool names to the discovered set.  Thread-safe enough for single-threaded loops.
+    /// Adds tool names to the discovered set.
     /// </summary>
     public void AddDiscovered(IEnumerable<string> names)
     {
         ArgumentNullException.ThrowIfNull(names);
-        foreach (var name in names)
+        lock (this.gate)
         {
-            this.discovered.Add(name);
+            foreach (var name in names)
+            {
+                this.discovered.Add(name);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Removes a tool from the discovered set, returning it to deferred state. Returns false when
+    /// it was not discovered.
+    /// </summary>
+    /// <remarks>
+    /// Discovery used to be add-only, which turned a single tool definition the model API refuses
+    /// into a permanently unusable session: once discovered, the bad definition was re-sent on
+    /// every subsequent request and there was no way to take it back. Eviction is what makes that
+    /// recoverable in-process.
+    /// </remarks>
+    public bool RemoveDiscovered(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        lock (this.gate)
+        {
+            return this.discovered.Remove(name);
+        }
+    }
+
+    /// <summary>
+    /// Clears all discovery state (e.g. on <c>/clear</c>), so the deferred tools return to their
+    /// unloaded state along with the conversation they were loaded for.
+    /// </summary>
+    public void ResetDiscovered()
+    {
+        lock (this.gate)
+        {
+            this.discovered.Clear();
+        }
+    }
+
+    /// <summary>A snapshot of the currently discovered tool names.</summary>
+    public IReadOnlyCollection<string> Discovered => this.SnapshotDiscovered();
+
+    /// <summary>
+    /// A private copy of the discovered set, taken under the lock so callers can enumerate it
+    /// freely while another turn mutates the original.
+    /// </summary>
+    private HashSet<string> SnapshotDiscovered()
+    {
+        lock (this.gate)
+        {
+            return [.. this.discovered];
         }
     }
 
@@ -93,8 +150,9 @@ public sealed class ToolSearchCoordinator
             return registry.Definitions;
         }
 
+        var snapshot = this.SnapshotDiscovered();
         return [.. registry.All
-            .Where(t => !DeferredTools.IsDeferred(t) || this.discovered.Contains(t.Name))
+            .Where(t => !DeferredTools.IsDeferred(t) || snapshot.Contains(t.Name))
             .Select(t => t.ToDefinition())];
     }
 
@@ -111,8 +169,9 @@ public sealed class ToolSearchCoordinator
             return null;
         }
 
+        var snapshot = this.SnapshotDiscovered();
         var undiscovered = registry.All
-            .Where(t => DeferredTools.IsDeferred(t) && !this.discovered.Contains(t.Name))
+            .Where(t => DeferredTools.IsDeferred(t) && !snapshot.Contains(t.Name))
             .ToList();
 
         if (undiscovered.Count == 0)

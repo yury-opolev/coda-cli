@@ -149,7 +149,8 @@ public static class SettingsLoader
             && httpHookAllowlist.Count == 0
             && agentToolsMerged is null
             && !userSettings.CacheUse1hTtl
-            && !projectSettings.CacheUse1hTtl)
+            && !projectSettings.CacheUse1hTtl
+            && userSettings.McpSchemaPolicy is null)
         {
             return CodaSettings.Empty;
         }
@@ -207,6 +208,8 @@ public static class SettingsLoader
             HttpHookAllowlist = httpHookAllowlist,
             // CacheUse1hTtl: project setting wins; user setting is the fallback.
             CacheUse1hTtl = projectSettings.CacheUse1hTtl || userSettings.CacheUse1hTtl,
+            // User-only: a hostile project must not be able to disable the user's MCP servers.
+            McpSchemaPolicy = userSettings.McpSchemaPolicy,
             AgentToolsOverrides = agentToolsMerged,
             AgentToolFilter = agentToolsMerged?.ToFilter(),
         };
@@ -255,6 +258,7 @@ public static class SettingsLoader
                 HttpHookAllowlist = ParseHttpHookAllowlist(doc?.HttpHookAllowlist),
                 HookDisabledHashes = ParseHookDisabledHashes(doc?.HookDisabledHashes),
                 CacheUse1hTtl = doc?.CacheUse1hTtl ?? false,
+                McpSchemaPolicy = NullIfBlank(doc?.McpSchemaPolicy),
                 AgentToolsOverrides = agentToolsOverrides,
             };
         }
@@ -724,6 +728,8 @@ public static class SettingsLoader
         public List<string>? HookDisabledHashes { get; set; }
         [JsonPropertyName("cacheUse1hTtl")]
         public bool? CacheUse1hTtl { get; set; }
+        [JsonPropertyName("mcpSchemaPolicy")]
+        public string? McpSchemaPolicy { get; set; }
 
         [JsonPropertyName("agent")]
         public AgentSection? Agent { get; set; }

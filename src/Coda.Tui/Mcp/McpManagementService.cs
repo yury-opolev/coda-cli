@@ -228,6 +228,7 @@ internal sealed partial class McpManagementService : IMcpManagementService
             Tools = capabilities.Tools,
             Prompts = capabilities.Prompts,
             Resources = capabilities.Resources,
+            SchemaNote = capabilities.SchemaNote,
         };
     }
 
@@ -3462,7 +3463,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
         var tools = manager.ServerTools(serverName)
             .Select(tool => new McpCapabilitySummary(
                 SanitizeIdentifier(DisplayToolName(tool)),
-                SanitizeOptionalCredentialBearingText(tool.Description)))
+                SanitizeOptionalCredentialBearingText(tool.Description),
+                tool.SchemaCoerced))
             .OrderBy(tool => tool.Name, StringComparer.Ordinal)
             .ToImmutableArray();
 
@@ -3503,7 +3505,18 @@ internal sealed partial class McpManagementService : IMcpManagementService
             lastError = "MCP capability request timed out.";
         }
 
-        return new CapabilityRead(tools, prompts, resources, lastError);
+        return new CapabilityRead(tools, prompts, resources, lastError, SchemaNoteFor(manager, serverName));
+    }
+
+    /// <summary>
+    /// The connect-time schema warning for a server, if any. Surfaced in the detail view because a
+    /// tool dropped by the <c>skip</c> policy leaves no other trace: it is simply absent from the
+    /// tool list, which is indistinguishable from a server that never advertised it.
+    /// </summary>
+    private static string? SchemaNoteFor(McpClientManager manager, string serverName)
+    {
+        var note = manager.SchemaWarningFor(serverName);
+        return note is null ? null : SanitizeError(note);
     }
 
     private static string? RuntimeErrorFor(McpClientManager manager, string serverName)
@@ -3759,7 +3772,8 @@ internal sealed partial class McpManagementService : IMcpManagementService
         ImmutableArray<McpCapabilitySummary> Tools,
         ImmutableArray<McpCapabilitySummary> Prompts,
         ImmutableArray<McpCapabilitySummary> Resources,
-        string? LastError);
+        string? LastError,
+        string? SchemaNote = null);
 
     private sealed class McpConfigWriterMutator : IRevisionedMcpConfigMutator
     {

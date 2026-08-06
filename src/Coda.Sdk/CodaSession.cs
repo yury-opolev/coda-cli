@@ -460,7 +460,15 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
     };
 
     /// <summary>Clear the conversation.</summary>
-    public void Reset() => this.history.Clear();
+    /// <remarks>
+    /// Discovery state is cleared with it: the deferred tools were loaded for a conversation that
+    /// no longer exists, so leaving them on the wire keeps paying their context cost for nothing.
+    /// </remarks>
+    public void Reset()
+    {
+        this.history.Clear();
+        this.toolSearchCoordinator?.ResetDiscovered();
+    }
 
     /// <summary>
     /// Sets the reason reported in the <c>SessionEnd</c> hook payload. Call this before
@@ -971,7 +979,8 @@ public sealed partial class CodaSession : IDisposable, IAsyncDisposable
         var systemPrompt = EffectiveSystemPrompt.Resolve(options);
 
         var registry = new ToolRegistry([.. BuiltInTools.All(), .. options.ExtraTools]);
-        var allDefs = this.toolSearchCoordinator?.BuildWireDefinitions(registry) ?? registry.Definitions;
+        var allDefs = this.turnPipelineBuilder.Quarantine.Filter(
+            this.toolSearchCoordinator?.BuildWireDefinitions(registry) ?? registry.Definitions);
         // MCP tools are namespaced "mcp__<server>__<tool>"; everything else is built-in.
         var mcpDefs = allDefs.Where(d => d.Name.StartsWith("mcp__", StringComparison.Ordinal)).ToList();
         var builtinDefs = allDefs.Where(d => !d.Name.StartsWith("mcp__", StringComparison.Ordinal)).ToList();

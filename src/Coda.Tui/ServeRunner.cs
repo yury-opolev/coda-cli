@@ -179,6 +179,7 @@ public static class ServeRunner
     /// <param name="userMcpDir">Test/override seam for the user-level <c>.mcp.json</c> directory;
     /// null uses the default resolution (<c>CODA_USER_MCP_DIR</c> or <c>~/.coda</c>).</param>
     /// <param name="pluginServers">Plugin-contributed servers (lowest precedence). Null skips the plugin layer.</param>
+    /// <param name="schemaPolicy">What to do about a server advertising an invalid tool input schema.</param>
     public static async Task<(IReadOnlyList<ITool> Tools, McpClientManager? Manager)> LoadMcpToolsAsync(
         bool enableMcp,
         string workingDirectory,
@@ -188,7 +189,8 @@ public static class ServeRunner
         string? userMcpDir = null,
         ITokenStore? secretStore = null,
         bool includeProjectMcp = true,
-        IReadOnlyDictionary<string, McpServerConfig>? pluginServers = null)
+        IReadOnlyDictionary<string, McpServerConfig>? pluginServers = null,
+        McpSchemaPolicy schemaPolicy = McpSchemaPolicy.Coerce)
     {
         if (!enableMcp)
         {
@@ -209,7 +211,7 @@ public static class ServeRunner
             servers = await McpSecretResolver.ResolveAsync(servers, secretStore, cancellationToken, log).ConfigureAwait(false);
         }
 
-        var manager = new McpClientManager(httpFactory);
+        var manager = new McpClientManager(httpFactory, schemaPolicy: schemaPolicy);
         await manager.ConnectAllAsync(servers, log, cancellationToken).ConfigureAwait(false);
         return (BuildMcpExtraTools(manager), manager);
     }
@@ -477,7 +479,8 @@ public static class ServeRunner
                     enableMcp, options.WorkingDirectory!, mcpHttpFactory,
                     msg => Console.Error.WriteLine(msg), cts.Token, userMcpDir: null,
                     secretStore: mcpCredentialStore, includeProjectMcp: includeProjectMcp,
-                    pluginServers: pluginMcpServers).ConfigureAwait(false);
+                    pluginServers: pluginMcpServers,
+                    schemaPolicy: McpSchemaPolicyFilter.Parse(settings.McpSchemaPolicy)).ConfigureAwait(false);
                 await using var mcpScope = mcpManager; // no-op when null; disposes the manager after the host stops
 
                 // Load skills once per serve session; build the skill tool if any are model-invocable.

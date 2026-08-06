@@ -86,7 +86,8 @@ public sealed record McpSecretDescriptor(
 
 public sealed record McpCapabilitySummary(
     string Name,
-    string? Description);
+    string? Description,
+    bool SchemaCoerced = false);
 
 public sealed record McpServerSummary(
     McpServerKey Key,
@@ -119,7 +120,8 @@ public sealed record McpServerDetail(
     McpSecretDescriptor? BearerToken,
     ImmutableArray<McpCapabilitySummary> Tools,
     ImmutableArray<McpCapabilitySummary> Prompts,
-    ImmutableArray<McpCapabilitySummary> Resources);
+    ImmutableArray<McpCapabilitySummary> Resources,
+    string? SchemaNote = null);
 
 /// <summary>
 /// A safe, display-only list item in an MCP edit draft. Service-created item IDs identify an
