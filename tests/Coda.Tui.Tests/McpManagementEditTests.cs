@@ -215,9 +215,8 @@ public sealed class McpManagementEditTests
         var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
         Assert.NotNull(detail);
         Assert.NotNull(draft);
-        Assert.Equal("https://example.test/mcp", detail.Url);
+        Assert.Equal("https://example.test/mcp?access_token=***redacted***", detail.Url);
         Assert.Equal(detail.Url, draft.Url);
-        Assert.DoesNotContain(querySecret, detail.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(querySecret, draft.ToString(), StringComparison.Ordinal);
 
         var preview = await harness.Service.PrepareEditAsync(original, draft, CancellationToken.None);
@@ -280,7 +279,7 @@ public sealed class McpManagementEditTests
         var original = new McpServerKey(McpConfigScope.Project, "server");
         var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
         Assert.NotNull(draft);
-        Assert.Equal("[redacted URL]", draft.Args[0]);
+        Assert.Equal("https://example.test/mcp?access_token=***redacted***", draft.Args[0]);
         Assert.Equal("preserve this exactly", draft.Args[1]);
 
         var preview = await harness.Service.PrepareEditAsync(
@@ -424,9 +423,8 @@ public sealed class McpManagementEditTests
         Assert.Equal(enteredUrl, config.Url.OriginalString);
         Assert.Contains(enteredUrl, Encoding.UTF8.GetString(harness.ReadProjectBytes()), StringComparison.Ordinal);
         Assert.NotNull(detail);
-        Assert.Equal("https://example.test/mcp", detail.Url);
+        Assert.Equal("https://example.test/mcp?token=***redacted***", detail.Url);
         Assert.DoesNotContain("token=value", detail.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain("frag", detail.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -468,7 +466,7 @@ public sealed class McpManagementEditTests
         var original = new McpServerKey(McpConfigScope.Project, "server");
         var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
         Assert.NotNull(draft);
-        Assert.Equal("[redacted URL]", draft.Scopes[0]);
+        Assert.Equal("https://scopes.example.test/read?access_token=***redacted***", draft.Scopes[0]);
         Assert.DoesNotContain("original-scope-secret", draft.ToString(), StringComparison.Ordinal);
 
         var preview = await harness.Service.PrepareEditAsync(
@@ -538,21 +536,24 @@ public sealed class McpManagementEditTests
     [Fact]
     public async Task Commit_edit_preserves_duplicate_redacted_oauth_scopes_in_first_ordinal_order()
     {
-        const string firstRawScope = "https://scopes.example.test/first?access_token=first-scope-secret";
-        const string secondRawScope = "https://scopes.example.test/second?access_token=second-scope-secret";
+        const string firstRawScope = "https://scopes.example.test/read?access_token=first-scope-secret";
+        const string secondRawScope = "https://scopes.example.test/read?access_token=second-scope-secret";
         await using var harness = await McpManagementTestHarness.CreateAsync();
         harness.WriteProject(
             """
             {"mcpServers":{"server":{
               "type":"http",
               "url":"https://example.test/mcp",
-              "auth":{"mode":"oauth","scopes":["https://scopes.example.test/first?access_token=first-scope-secret","https://scopes.example.test/second?access_token=second-scope-secret","profile"]}
+              "auth":{"mode":"oauth","scopes":["https://scopes.example.test/read?access_token=first-scope-secret","https://scopes.example.test/read?access_token=second-scope-secret","profile"]}
             }}}
             """);
         var original = new McpServerKey(McpConfigScope.Project, "server");
         var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
         Assert.NotNull(draft);
-        Assert.Equal("[redacted URL]", draft.Scopes[0]);
+
+        // Same endpoint, different tokens: the two scopes DISPLAY identically once their secrets
+        // are redacted, so only item identity can keep their raw values apart.
+        Assert.Equal("https://scopes.example.test/read?access_token=***redacted***", draft.Scopes[0]);
         Assert.Equal(draft.Scopes[0], draft.Scopes[1]);
 
         var unchangedPreview = await harness.Service.PrepareEditAsync(
@@ -1337,8 +1338,8 @@ public sealed class McpManagementEditTests
     [Fact]
     public async Task Commit_edit_uses_argument_item_identities_for_duplicate_redacted_values()
     {
-        const string firstRaw = "https://args.example.test/first?token=first-secret#first";
-        const string secondRaw = "https://args.example.test/second?token=second-secret#second";
+        const string firstRaw = "https://args.example.test/path?token=first-secret";
+        const string secondRaw = "https://args.example.test/path?token=second-secret";
 
         async Task<string[]> SaveAsync(Func<McpServerDraft, McpServerDraft> edit)
         {
@@ -1346,8 +1347,8 @@ public sealed class McpManagementEditTests
             harness.WriteProject(
                 """
                 {"mcpServers":{"server":{"command":"node","args":[
-                  "https://args.example.test/first?token=first-secret#first",
-                  "https://args.example.test/second?token=second-secret#second"
+                  "https://args.example.test/path?token=first-secret",
+                  "https://args.example.test/path?token=second-secret"
                 ]}}}
                 """);
             var original = new McpServerKey(McpConfigScope.Project, "server");
@@ -1356,7 +1357,12 @@ public sealed class McpManagementEditTests
             Assert.NotEqual(Guid.Empty, draft.DraftId);
             Assert.Equal(2, draft.ArgumentItems.Length);
             Assert.NotEqual(draft.ArgumentItems[0].Id, draft.ArgumentItems[1].Id);
-            Assert.All(draft.ArgumentItems, item => Assert.Equal("[redacted URL]", item.Value));
+
+            // Same endpoint, different tokens: both DISPLAY identically once redacted, so only
+            // item identity can carry each row's raw value back to the config.
+            Assert.All(
+                draft.ArgumentItems,
+                item => Assert.Equal("https://args.example.test/path?token=***redacted***", item.Value));
             Assert.DoesNotContain("first-secret", draft.ArgumentItems.ToString(), StringComparison.Ordinal);
             Assert.DoesNotContain("second-secret", draft.ToString(), StringComparison.Ordinal);
 
@@ -1405,8 +1411,8 @@ public sealed class McpManagementEditTests
     [Fact]
     public async Task Commit_edit_uses_scope_item_identities_for_duplicate_redacted_values()
     {
-        const string firstRaw = "https://scopes.example.test/first?token=first-secret#first";
-        const string secondRaw = "https://scopes.example.test/second?token=second-secret#second";
+        const string firstRaw = "https://scopes.example.test/path?token=first-secret";
+        const string secondRaw = "https://scopes.example.test/path?token=second-secret";
 
         async Task<string[]> SaveAsync(Func<McpServerDraft, McpServerDraft> edit)
         {
@@ -1417,8 +1423,8 @@ public sealed class McpManagementEditTests
                   "type":"http",
                   "url":"https://example.test/mcp",
                   "auth":{"mode":"oauth","scopes":[
-                    "https://scopes.example.test/first?token=first-secret#first",
-                    "https://scopes.example.test/second?token=second-secret#second"
+                    "https://scopes.example.test/path?token=first-secret",
+                    "https://scopes.example.test/path?token=second-secret"
                   ]}
                 }}}
                 """);
@@ -1427,7 +1433,11 @@ public sealed class McpManagementEditTests
             Assert.NotNull(draft);
             Assert.Equal(2, draft.ScopeItems.Length);
             Assert.NotEqual(draft.ScopeItems[0].Id, draft.ScopeItems[1].Id);
-            Assert.All(draft.ScopeItems, item => Assert.Equal("[redacted URL]", item.Value));
+
+            // Same endpoint, different tokens: identical display, distinct raw values.
+            Assert.All(
+                draft.ScopeItems,
+                item => Assert.Equal("https://scopes.example.test/path?token=***redacted***", item.Value));
             Assert.DoesNotContain("first-secret", draft.ScopeItems.ToString(), StringComparison.Ordinal);
 
             var preview = await harness.Service.PrepareEditAsync(original, edit(draft), CancellationToken.None);
@@ -1650,7 +1660,7 @@ public sealed class McpManagementEditTests
     public async Task Commit_edit_honors_explicit_url_dirty_state_when_display_is_unchanged()
     {
         const string rawUrl = "https://example.test/mcp?token=hidden-value#hidden-fragment";
-        const string displayUrl = "https://example.test/mcp";
+        const string displayUrl = "https://example.test/mcp?token=***redacted***";
         await using var harness = await McpManagementTestHarness.CreateAsync();
         harness.WriteProject(
             """{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp?token=hidden-value#hidden-fragment"}}}""");

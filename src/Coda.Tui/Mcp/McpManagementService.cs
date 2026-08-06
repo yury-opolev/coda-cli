@@ -3633,35 +3633,58 @@ internal sealed partial class McpManagementService : IMcpManagementService
     private static string? SanitizeOptionalCredentialBearingText(string? value) =>
         value is null ? null : SanitizeCredentialBearingText(value);
 
-    private static string DisplayUrl(Uri url)
+    /// <summary>
+    /// Renders a URL for display. An MCP endpoint is configuration, not a secret — it is written
+    /// in plaintext in <c>.mcp.json</c> and the user needs to see which endpoint they are looking
+    /// at — so scheme, host, port, path, query and fragment are all shown as-is.
+    /// </summary>
+    /// <remarks>
+    /// The one part removed is <c>userinfo</c> (the <c>user:password@</c> prefix), which is a
+    /// credential by definition and, unlike <c>?access_token=…</c>, is not caught by
+    /// <see cref="RedactSecrets"/> when the password is an arbitrary string.
+    /// </remarks>
+    private static string DisplayUrl(Uri url) => SanitizeFreeText(WithoutUserInfo(url));
+
+    private static string WithoutUserInfo(Uri url)
     {
-        if (!url.IsAbsoluteUri || string.IsNullOrEmpty(url.Host))
+        if (!url.IsAbsoluteUri)
         {
-            return $"{url.Scheme}:[redacted]";
+            return url.ToString();
         }
 
-        var host = url.HostNameType == UriHostNameType.IPv6
-            ? $"[{url.DnsSafeHost.Trim('[', ']')}]"
-            : url.Host;
-        var port = url.IsDefaultPort ? string.Empty : $":{url.Port}";
-        var path = url.AbsolutePath;
-        return SanitizeFreeText($"{url.Scheme}://{host}{port}{path}");
+        if (string.IsNullOrEmpty(url.UserInfo))
+        {
+            return url.AbsoluteUri;
+        }
+
+        return new UriBuilder(url) { UserName = string.Empty, Password = string.Empty }.Uri.AbsoluteUri;
     }
 
     private static string DisplayUri(string value)
     {
-        var withoutQueryOrFragment = StripQueryAndFragment(value);
-        if (withoutQueryOrFragment.StartsWith("//", StringComparison.Ordinal))
+        if (value.StartsWith("//", StringComparison.Ordinal))
         {
-            return DisplaySchemeRelativeUri(withoutQueryOrFragment);
+            return SanitizeFreeText(WithoutSchemeRelativeUserInfo(value));
         }
 
-        if (Uri.TryCreate(withoutQueryOrFragment, UriKind.Absolute, out var uri))
+        return Uri.TryCreate(value, UriKind.Absolute, out var uri)
+            ? DisplayUrl(uri)
+            : SanitizeFreeText(value);
+    }
+
+    /// <summary>Drops the <c>user:password@</c> prefix from a scheme-relative <c>//authority/path</c>.</summary>
+    private static string WithoutSchemeRelativeUserInfo(string value)
+    {
+        var pathStart = value.IndexOf('/', 2);
+        var authority = pathStart < 0 ? value[2..] : value[2..pathStart];
+        var userInfo = authority.LastIndexOf('@');
+        if (userInfo < 0)
         {
-            return DisplayUrl(uri);
+            return value;
         }
 
-        return SanitizeCredentialBearingText(withoutQueryOrFragment);
+        var rest = pathStart < 0 ? string.Empty : value[pathStart..];
+        return $"//{authority[(userInfo + 1)..]}{rest}";
     }
 
     private static string SanitizeIdentifier(string? value) => SanitizeSingleLine(value);
@@ -3669,14 +3692,21 @@ internal sealed partial class McpManagementService : IMcpManagementService
     private static string SanitizeFreeText(string? value)
     {
         var redacted = RedactSecrets(value);
+
+        // Strip "user:password@" from any URL in free text too. URLs themselves are shown in full,
+        // but userinfo is a credential by definition and RedactSecrets cannot recognise an
+        // arbitrary password.
+        redacted = UrlUserInfoPattern().Replace(redacted, "$1");
         return RedactSecrets(SanitizeSingleLine(redacted));
     }
 
-    private static string SanitizeCredentialBearingText(string? value) =>
-        NetworkUriPattern().Replace(SanitizeFreeText(value), "[redacted URL]");
+    /// <summary>
+    /// Text that may legitimately contain a URL (a command, an argument, a description, an error).
+    /// URLs are left intact; only actual secrets are redacted.
+    /// </summary>
+    private static string SanitizeCredentialBearingText(string? value) => SanitizeFreeText(value);
 
-    private static string SanitizeScopeLabel(string? value) =>
-        NetworkUriPattern().Replace(SanitizeIdentifier(value), "[redacted URL]");
+    private static string SanitizeScopeLabel(string? value) => SanitizeFreeText(value);
 
     private static string SanitizeError(string? value)
     {
@@ -3689,26 +3719,6 @@ internal sealed partial class McpManagementService : IMcpManagementService
         {
             return "MCP operation failed.";
         }
-    }
-
-    private static string StripQueryAndFragment(string value)
-    {
-        var queryOrFragment = value.IndexOfAny(['?', '#']);
-        return queryOrFragment < 0 ? value : value[..queryOrFragment];
-    }
-
-    private static string DisplaySchemeRelativeUri(string value)
-    {
-        var pathStart = value.IndexOf('/', 2);
-        var authority = pathStart < 0 ? value[2..] : value[2..pathStart];
-        var userInfo = authority.LastIndexOf('@');
-        if (userInfo >= 0)
-        {
-            authority = authority[(userInfo + 1)..];
-        }
-
-        var path = pathStart < 0 ? string.Empty : value[pathStart..];
-        return SanitizeFreeText($"//{authority}{path}");
     }
 
     private static string RedactSecrets(string? value) =>
@@ -3762,11 +3772,13 @@ internal sealed partial class McpManagementService : IMcpManagementService
         1000)]
     private static partial Regex SecretAssignmentPattern();
 
-    [GeneratedRegex(
-        @"(?:(?:[a-z][a-z0-9+.-]*:)?//|\b[a-z][a-z0-9+.-]+:)[^\s""'<>]+",
-        RegexOptions.IgnoreCase | RegexOptions.NonBacktracking,
-        1000)]
-    private static partial Regex NetworkUriPattern();
+    /// <summary>
+    /// Matches the <c>user:password@</c> authority prefix of a URL (the capture keeps the
+    /// leading <c>//</c>). The character class excludes whitespace, so a bare <c>//</c> followed by
+    /// prose containing an e-mail address is not affected.
+    /// </summary>
+    [GeneratedRegex(@"(//)[^/?#\s@]*@", RegexOptions.NonBacktracking, 1000)]
+    private static partial Regex UrlUserInfoPattern();
 
     private sealed record CapabilityRead(
         ImmutableArray<McpCapabilitySummary> Tools,

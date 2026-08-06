@@ -501,8 +501,10 @@ internal sealed class McpEditorForm : View
             if (rows[i].ItemIndex == int.MinValue) continue; // separator — no widget
             var v = this.ViewForRow(rows[i]);
             if (v is not null) visibleViews.Add(v);
-            // Prefix label for scalar rows only (item rows share the field label group).
-            if (rows[i].ItemIndex < 0)
+
+            // Prefix label: shown on a scalar row, and on the FIRST row of a multi-row field
+            // group so the group is still labelled. Later item rows align underneath it.
+            if (rows[i].ItemIndex < 0 || rows[i].ItemIndex == 0)
             {
                 var pl = this.PrefixLabelForField(rows[i].Field);
                 if (pl is not null) visibleViews.Add(pl);
@@ -820,6 +822,15 @@ internal sealed class McpEditorForm : View
 
     private void LayoutItemRow(EditorRow descriptor, McpServerDraft draft, int row)
     {
+        // A non-empty list/map field is split into one row per item, so the field's own label has
+        // no scalar row to live on. Put it on the first item row — without this an expanded field
+        // renders as an unlabelled orphan row and the user cannot tell what it belongs to.
+        if (descriptor.ItemIndex == 0 && this.PrefixLabelForField(descriptor.Field) is { } groupLabel)
+        {
+            groupLabel.Y = row;
+            groupLabel.Visible = true;
+        }
+
         switch (descriptor.Field)
         {
             case McpEditorField.Arguments:

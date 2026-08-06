@@ -97,8 +97,77 @@ public sealed class McpEditorFormTests : IDisposable
         Assert.Contains(AllLabels(this.form), label => (label.Text ?? string.Empty).Contains("*****", StringComparison.Ordinal));
     }
 
-    // ── text field behaviour ──────────────────────────────────────────────────
+    // ── field group labelling ─────────────────────────────────────────────────
 
+    /// <summary>
+    /// A non-empty list/map field is split into one row per item, which used to leave the field's
+    /// own label with no row to live on — so an expanded Env/Args/Headers/Scopes group rendered as
+    /// an unlabelled orphan row and the user could not tell what it belonged to.
+    /// </summary>
+    [Fact]
+    public void An_expanded_map_field_still_shows_its_group_label()
+    {
+        var draft = MakeStdioDraftWithEnv("MemoryMcp__DataDirectory");
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Arguments));
+        this.application.LayoutAndDraw();
+
+        Assert.NotNull(VisibleLabelStartingWith(this.form, "Env:"));
+    }
+
+    [Fact]
+    public void An_expanded_list_field_still_shows_its_group_label()
+    {
+        var draft = MakeStdioDraftWithEnv("TOKEN") with { Args = ["--port", "8080"] };
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Name));
+        this.application.LayoutAndDraw();
+
+        Assert.NotNull(VisibleLabelStartingWith(this.form, "Arguments:"));
+    }
+
+    /// <summary>The label marks the group once; later item rows align underneath it.</summary>
+    [Fact]
+    public void A_group_label_sits_on_the_first_item_row()
+    {
+        var draft = MakeStdioDraftWithEnv("TOKEN") with { Args = ["--first", "--second"] };
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Name));
+        this.application.LayoutAndDraw();
+
+        var label = VisibleLabelStartingWith(this.form, "Arguments:");
+        Assert.NotNull(label);
+        Assert.Equal(
+            label.Frame.Y,
+            AllTextFields(this.form).First(f => (f.Text ?? string.Empty) == "--first").Frame.Y);
+    }
+
+    private static Label? VisibleLabelStartingWith(View parent, string prefix) =>
+        AllLabels(parent).FirstOrDefault(l =>
+            l.Visible && (l.Text ?? string.Empty).StartsWith(prefix, StringComparison.Ordinal));
+
+    private static McpServerDraft MakeStdioDraftWithEnv(string envName) => new(
+        Name: "memory",
+        Scope: McpConfigScope.User,
+        Enabled: true,
+        Transport: McpTransportKind.Stdio,
+        Command: @"C:\Users\yurio\AppData\Local\memory-mcp\bin\MemoryMcp.exe",
+        Args: [],
+        Url: null,
+        Environment:
+        [
+            new McpNamedSecretDraft(
+                envName,
+                McpSecretSource.None,
+                new McpSecretChange($"env/{envName}", McpSecretChangeKind.Unchanged)),
+        ],
+        Headers: [],
+        AuthMode: McpAuthMode.None,
+        ClientId: null,
+        Scopes: [],
+        BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+
+    // ── text field behaviour ──────────────────────────────────────────────────
     /// <summary>
     /// Keys that are browser accelerators in list view (q k j r /) must be plain text
     /// when a TextField has focus — regression locked by the spike.

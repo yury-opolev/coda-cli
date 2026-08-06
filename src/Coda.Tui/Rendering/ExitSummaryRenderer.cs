@@ -22,6 +22,7 @@ public static class ExitSummaryRenderer
 
         console.MarkupLine(Theme.AccentMarkup("Session summary"));
         console.MarkupLine(
+            $"{Theme.DimMarkup("coda:")} v{Markup.Escape(Branding.Version)}   " +
             $"{Theme.DimMarkup("Duration:")} {Markup.Escape(FormatDuration(snapshot.Duration))}   " +
             $"{Theme.DimMarkup("Messages:")} {snapshot.MessageCount:N0}");
         console.MarkupLine(

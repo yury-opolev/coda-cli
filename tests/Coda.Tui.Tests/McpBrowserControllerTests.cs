@@ -659,20 +659,22 @@ public sealed class McpBrowserControllerTests
     /// <summary>
     /// The critical invariant (spec Task 8): reordering redacted argument rows must move the
     /// identity items so each Guid travels with its row, letting the commit path recover the true
-    /// raw value. If reorder only swapped display strings, both rows (which redact to the same
-    /// "[redacted URL]") would be indistinguishable and a redaction sentinel would be written back.
+    /// raw value. If reorder only swapped display strings, both rows (which display identically
+    /// once their secrets are redacted) would be indistinguishable and a redacted display string
+    /// would be written back over a real value.
     /// </summary>
     [Fact]
     public async Task Reorder_preserves_redacted_raw_values_through_guid_identity()
     {
-        const string firstRaw = "https://args.example.test/first?token=first-secret#first";
-        const string secondRaw = "https://args.example.test/second?token=second-secret#second";
+        const string display = "https://args.example.test/path?token=***redacted***";
+        const string firstRaw = "https://args.example.test/path?token=first-secret";
+        const string secondRaw = "https://args.example.test/path?token=second-secret";
         await using var harness = await McpManagementTestHarness.CreateAsync();
         harness.WriteProject(
             """
             {"mcpServers":{"server":{"command":"node","args":[
-              "https://args.example.test/first?token=first-secret#first",
-              "https://args.example.test/second?token=second-secret#second"
+              "https://args.example.test/path?token=first-secret",
+              "https://args.example.test/path?token=second-secret"
             ]}}}
             """);
         var gate = new TestIdleGate();
@@ -683,10 +685,11 @@ public sealed class McpBrowserControllerTests
         await controller.RefreshAsync(CancellationToken.None);
         await controller.ExecuteAsync(McpBrowserCommand.BeginEdit, null, CancellationToken.None);
 
-        // Both rows redact to the same display value, so ONLY identity travel can keep them apart.
+        // Same endpoint, different tokens: both rows display identically, so ONLY identity travel
+        // can keep them apart.
         var loaded = controller.State.Editor!.Draft;
         Assert.Equal(2, loaded.ArgumentItems.Length);
-        Assert.All(loaded.Args, value => Assert.Equal("[redacted URL]", value));
+        Assert.All(loaded.Args, value => Assert.Equal(display, value));
 
         controller.SetStateForTest(controller.State with
         {
@@ -707,7 +710,7 @@ public sealed class McpBrowserControllerTests
         var config = Assert.IsType<McpStdioServerConfig>(
             Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
         Assert.Equal([secondRaw, firstRaw], config.Args);
-        Assert.DoesNotContain("[redacted URL]", config.Args);
+        Assert.DoesNotContain(display, config.Args);
         controller.Close();
     }
 

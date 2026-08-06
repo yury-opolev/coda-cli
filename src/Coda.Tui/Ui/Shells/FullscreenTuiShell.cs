@@ -466,12 +466,16 @@ internal class FullscreenTuiShell(
         }
     }
 
+    /// <summary>
+    /// Header line: the session id plus the coda version. The model deliberately does NOT appear
+    /// here — it is already the first field of the bottom status line, and the version is otherwise
+    /// invisible during a session.
+    /// </summary>
     private void UpdateHeader(UiSessionSnapshot snapshot)
     {
         var session = string.IsNullOrEmpty(snapshot.SessionId) ? "no session" : snapshot.SessionId;
-        var left = string.IsNullOrEmpty(snapshot.Model) ? session : $"{session} · {snapshot.Model}";
 
-        this.header.SetText(left);
+        this.header.SetText($"{session} · v{Branding.Version}");
     }
 
     /// <summary>

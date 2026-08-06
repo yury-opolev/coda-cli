@@ -428,10 +428,11 @@ public sealed class McpManagementReadTests
     }
 
     [Fact]
-    public async Task Detail_draft_and_resource_summaries_remove_url_queries_and_fragments()
+    public async Task Detail_draft_and_resource_summaries_keep_url_queries_and_fragments_but_drop_user_info()
     {
-        const string querySecret = "never-show-signed-query";
-        const string fragmentSecret = "never-show-url-fragment";
+        const string queryValue = "signed-query-value";
+        const string fragmentValue = "url-fragment-value";
+        const string userInfoSecret = "never-show-url-password";
         await using var harness = await McpManagementTestHarness.CreateAsync();
         var behavior = harness.RuntimeFactory.ConfigureServer("server");
         behavior.Prompts =
@@ -439,31 +440,31 @@ public sealed class McpManagementReadTests
             new McpPromptInfo(
                 "server",
                 "prompt",
-                $"Open //{querySecret}:{fragmentSecret}@prompts.test/path?sig={querySecret}"),
+                $"Open //user:{userInfoSecret}@prompts.test/path?sig={queryValue}"),
         ];
         behavior.Resources =
         [
             new McpResourceInfo(
                 "server",
-                $"https://resources.test/file?sig={querySecret}#{fragmentSecret}",
+                $"https://resources.test/file?sig={queryValue}#{fragmentValue}",
                 "resource",
                 "text/plain"),
             new McpResourceInfo(
                 "server",
-                $"relative/file?sig={querySecret}#{fragmentSecret}",
+                $"relative/file?sig={queryValue}#{fragmentValue}",
                 "relative resource",
                 "text/plain"),
             new McpResourceInfo(
                 "server",
-                $"//{querySecret}:{fragmentSecret}@network.test/file?sig={querySecret}",
+                $"//user:{userInfoSecret}@network.test/file?sig={queryValue}",
                 "network resource",
                 "text/plain"),
         ];
         harness.WriteProject(
             "{\"mcpServers\":{\"server\":{\"type\":\"http\",\"url\":\"https://example.test/mcp?sig="
-            + querySecret
+            + queryValue
             + "#"
-            + fragmentSecret
+            + fragmentValue
             + "\"}}}");
         await harness.ConnectEffectiveAsync("server");
         var key = new McpServerKey(McpConfigScope.Project, "server");
@@ -473,22 +474,29 @@ public sealed class McpManagementReadTests
 
         Assert.NotNull(detail);
         Assert.NotNull(draft);
-        Assert.Equal("https://example.test/mcp", detail.Url);
-        Assert.Equal("https://example.test/mcp", draft.Url);
+
+        // An MCP endpoint is configuration, not a secret: the whole URL is shown.
+        Assert.Equal($"https://example.test/mcp?sig={queryValue}#{fragmentValue}", detail.Url);
+        Assert.Equal(detail.Url, draft.Url);
         Assert.Equal(
-            "https://resources.test/file",
+            $"https://resources.test/file?sig={queryValue}#{fragmentValue}",
             detail.Resources.Single(resource => resource.Name == "resource").Description);
         Assert.Equal(
-            "relative/file",
+            $"relative/file?sig={queryValue}#{fragmentValue}",
             detail.Resources.Single(resource => resource.Name == "relative resource").Description);
-        Assert.DoesNotContain(querySecret, detail.Prompts.Single().Description);
-        Assert.DoesNotContain(fragmentSecret, detail.Prompts.Single().Description);
-        Assert.DoesNotContain(querySecret, detail.Resources.Single(resource => resource.Name == "network resource").Description);
-        Assert.DoesNotContain(fragmentSecret, detail.Resources.Single(resource => resource.Name == "network resource").Description);
-        Assert.DoesNotContain(querySecret, detail.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(fragmentSecret, detail.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(querySecret, draft.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain(fragmentSecret, draft.ToString(), StringComparison.Ordinal);
+
+        // ...but "user:password@" is a credential by definition and never appears.
+        Assert.DoesNotContain(userInfoSecret, detail.Prompts.Single().Description, StringComparison.Ordinal);
+        Assert.DoesNotContain(
+            userInfoSecret,
+            detail.Resources.Single(resource => resource.Name == "network resource").Description,
+            StringComparison.Ordinal);
+        Assert.Contains(
+            "network.test/file",
+            detail.Resources.Single(resource => resource.Name == "network resource").Description,
+            StringComparison.Ordinal);
+        Assert.DoesNotContain(userInfoSecret, detail.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(userInfoSecret, draft.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
@@ -504,12 +512,10 @@ public sealed class McpManagementReadTests
 
         Assert.NotNull(detail);
         Assert.NotNull(draft);
-        Assert.Equal("https://[2001:db8::1]:8443/mcp", detail.Url);
+        Assert.Equal("https://[2001:db8::1]:8443/mcp?x=y#z", detail.Url);
         Assert.Equal(detail.Url, draft.Url);
-        Assert.DoesNotContain("?x=y", detail.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain("#z", detail.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain("?x=y", draft.ToString(), StringComparison.Ordinal);
-        Assert.DoesNotContain("#z", draft.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("[[", detail.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain("[[", draft.ToString(), StringComparison.Ordinal);
     }
 
     [Fact]
