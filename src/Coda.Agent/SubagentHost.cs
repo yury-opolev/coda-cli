@@ -2,6 +2,7 @@ using System.Text;
 using Coda.Agent.Hooks;
 using Coda.Agent.Subagents;
 using Coda.Agent.Tasks;
+using Coda.Agent.ToolSearch;
 using LlmClient;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Logging.Abstractions;
@@ -27,6 +28,12 @@ public sealed partial class SubagentHost : ISubagentHost
     private readonly SubagentRegistry? subagentRegistry;
     private readonly ILogger logger;
 
+    /// <summary>
+    /// The session's quarantine, shared with every child loop so a tool the model API already
+    /// refused never reaches a subagent's wire either.
+    /// </summary>
+    private readonly ToolQuarantine quarantine;
+
     public SubagentHost(
         ILlmClient client,
         ToolRegistry subagentTools,
@@ -37,7 +44,8 @@ public sealed partial class SubagentHost : ISubagentHost
         UserHookRunner? userHooks = null,
         TimeSpan? toolProgressInterval = null,
         SubagentRegistry? subagentRegistry = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        ToolQuarantine? quarantine = null)
     {
         this.client = client ?? throw new ArgumentNullException(nameof(client));
         this.subagentTools = subagentTools ?? throw new ArgumentNullException(nameof(subagentTools));
@@ -52,6 +60,7 @@ public sealed partial class SubagentHost : ISubagentHost
         this.toolProgressInterval = toolProgressInterval;
         this.subagentRegistry = subagentRegistry;
         this.logger = logger ?? NullLogger.Instance;
+        this.quarantine = quarantine ?? new ToolQuarantine();
     }
 
     /// <summary>
@@ -303,7 +312,10 @@ public sealed partial class SubagentHost : ISubagentHost
             currentDepth: depth,
             steering: steering,
             toolProgressInterval: this.toolProgressInterval,
-            toolActivity: childActivity);
+            toolActivity: childActivity,
+            // Shared with the session: a tool definition the provider has already refused must not
+            // cost every subagent one more failed request to rediscover.
+            quarantine: this.quarantine);
 
         // SubagentStop continuation loop: re-runs the agent when a Stop hook forces continuation.
         // The outer SubagentStop counter (subagentStopContinuations) and the inner in-loop Stop

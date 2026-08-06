@@ -179,4 +179,81 @@ public sealed class McpViewTests
         Assert.DoesNotContain(secret, info, StringComparison.Ordinal);
         Assert.DoesNotContain('\u001b', info);
     }
+
+    // ── coerced-schema reporting ────────────────────────────────────────────
+
+    private static McpServerDetail Detail(params McpCapabilitySummary[] tools) =>
+        new(
+            new McpServerSummary(
+                new McpServerKey(McpConfigScope.Project, "playwright"),
+                @"C:\project\.mcp.json",
+                Enabled: true,
+                IsEffective: true,
+                Transport: McpTransportKind.Stdio,
+                Connection: McpConnectionState.Connected,
+                LastError: null),
+            Command: "npx",
+            Args: ["-y", "@playwright/mcp"],
+            Url: null,
+            Environment: [],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: null,
+            Tools: [.. tools],
+            Prompts: [],
+            Resources: []);
+
+    [Fact]
+    public void Detail_view_marks_a_tool_whose_schema_was_coerced()
+    {
+        var text = McpView.FormatInfo(Detail(
+            new McpCapabilitySummary("browser_navigate", "Navigate", SchemaCoerced: true),
+            new McpCapabilitySummary("browser_close", "Close")));
+
+        var navigateLine = text.Split('\n').Single(l => l.Contains("browser_navigate", StringComparison.Ordinal));
+        var closeLine = text.Split('\n').Single(l => l.Contains("browser_close", StringComparison.Ordinal));
+
+        Assert.Contains("coerced schema", navigateLine, StringComparison.Ordinal);
+        Assert.DoesNotContain("coerced schema", closeLine, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Detail_view_explains_the_marker_once()
+    {
+        var text = McpView.FormatInfo(Detail(
+            new McpCapabilitySummary("a", "A", SchemaCoerced: true),
+            new McpCapabilitySummary("b", "B", SchemaCoerced: true)));
+
+        var notes = text.Split('\n').Count(l => l.Contains("note:", StringComparison.Ordinal));
+        Assert.Equal(1, notes);
+        Assert.Contains("may not accept arguments correctly", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Detail_view_stays_quiet_when_every_schema_is_valid()
+    {
+        var text = McpView.FormatInfo(Detail(new McpCapabilitySummary("a", "A")));
+
+        Assert.DoesNotContain("coerced schema", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("note:", text, StringComparison.Ordinal);
+        Assert.DoesNotContain("schema:", text, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Detail_view_reports_tools_the_skip_policy_dropped()
+    {
+        // A dropped tool is simply absent from the list, which is indistinguishable from a server
+        // that never advertised it — the note is the only signal the user gets.
+        var detail = Detail(new McpCapabilitySummary("browser_close", "Close")) with
+        {
+            SchemaNote = "MCP server 'playwright': 10 of 11 tool(s) advertised an invalid input schema; dropped (mcpSchemaPolicy is \"skip\").",
+        };
+
+        var text = McpView.FormatInfo(detail);
+
+        Assert.Contains("dropped", text, StringComparison.Ordinal);
+        Assert.Contains("10 of 11", text, StringComparison.Ordinal);
+    }
 }

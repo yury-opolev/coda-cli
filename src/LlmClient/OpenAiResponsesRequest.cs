@@ -33,7 +33,7 @@ public static class OpenAiResponsesRequest
                     ["type"] = "function",
                     ["name"] = tool.Name,
                     ["description"] = tool.Description,
-                    ["parameters"] = ParseOrEmpty(tool.InputSchemaJson),
+                    ["parameters"] = ToolSchema.ParseSafe(tool.InputSchemaJson),
                 })]);
         }
 
@@ -170,15 +170,4 @@ public static class OpenAiResponsesRequest
         }
     }
 
-    private static JsonNode ParseOrEmpty(string json)
-    {
-        try
-        {
-            return JsonNode.Parse(string.IsNullOrWhiteSpace(json) ? "{}" : json) ?? new JsonObject();
-        }
-        catch (System.Text.Json.JsonException)
-        {
-            return new JsonObject();
-        }
-    }
 }

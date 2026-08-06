@@ -40,6 +40,19 @@ public sealed class TurnPipelineBuilder
     private readonly LspServerManager? lspManager;
     private readonly LspDiagnosticRegistry? lspDiagnostics;
     private readonly ToolSearchCoordinator? toolSearchCoordinator;
+
+    /// <summary>
+    /// Session-scoped quarantine shared by every loop this builder produces, so a tool the model
+    /// API refused stays off the wire for the whole session rather than only the turn that
+    /// discovered the problem.
+    /// </summary>
+    private readonly ToolQuarantine quarantine = new();
+
+    /// <summary>
+    /// The session-scoped quarantine this builder shares with every loop and subagent host it
+    /// produces. Exposed so <c>/context</c> measures the same tool set the wire actually carries.
+    /// </summary>
+    public ToolQuarantine Quarantine => this.quarantine;
     private readonly ILoggerFactory loggerFactory;
     private readonly Func<ILlmClient, string, string, IAgentSink?, CancellationToken, Task<bool>> compactHistoryAsync;
     private readonly Func<IScheduleRuntimeView?> scheduleRuntimeProvider;
@@ -178,7 +191,7 @@ public sealed class TurnPipelineBuilder
                 trustGuard: this.trustGuard, runLog: this.runLog)
             : null;
 
-        var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks, this.subagentRegistry, this.subagentSettings, this.loggerFactory.CreateLogger("Coda.Subagents"));
+        var subagentHost = BuildSubagentHost(options, client, agentOptions, permissions, includeAnthropicSystemPrefix, userHooks, this.tasks, this.subagentRegistry, this.subagentSettings, this.loggerFactory.CreateLogger("Coda.Subagents"), this.quarantine);
 
         var parentTools = this.BuildParentTools(options);
 
@@ -214,6 +227,7 @@ public sealed class TurnPipelineBuilder
         {
             PermissionRules = permissionRules,
             GrantedDirectoriesSource = options.GrantedDirectoriesSource,
+            Quarantine = this.quarantine,
         };
     }
 
@@ -333,7 +347,7 @@ public sealed class TurnPipelineBuilder
         // is rejected by the child host (depth >= MaxSubagentDepth). Built with schedule_* tools
         // stripped so a depth-2 child cannot reintroduce them.
         var subagentTools = StripSkillTool(StripScheduleTools([.. BuiltInTools.All(), .. options.ExtraTools]).All);
-        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: this.subagentRegistry, logger: this.loggerFactory.CreateLogger("Coda.Subagents"));
+        var subagentHost = new SubagentHost(client, subagentTools, permissions, agentOptions, this.tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: this.subagentRegistry, logger: this.loggerFactory.CreateLogger("Coda.Subagents"), quarantine: this.quarantine);
 
         var tools = this.BuildScheduledTools(options);
 
@@ -371,6 +385,7 @@ public sealed class TurnPipelineBuilder
         {
             PermissionRules = permissionRules,
             GrantedDirectoriesSource = options.GrantedDirectoriesSource,
+            Quarantine = this.quarantine,
         };
     }
 
@@ -508,10 +523,11 @@ public sealed class TurnPipelineBuilder
         TaskManager tasks,
         Coda.Agent.Subagents.SubagentRegistry? subagentRegistry = null,
         Coda.Agent.Settings.SubagentSettings? subagentSettings = null,
-        ILogger? logger = null)
+        ILogger? logger = null,
+        ToolQuarantine? quarantine = null)
     {
         var subagentTools = StripSkillTool([.. BuiltInTools.All(), .. options.ExtraTools]);
-        return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: subagentRegistry, logger: logger);
+        return new SubagentHost(client, subagentTools, permissions, agentOptions, tasks, includeAnthropicSystemPrefix, userHooks, subagentRegistry: subagentRegistry, logger: logger, quarantine: quarantine);
     }
 
     /// <summary>
@@ -551,7 +567,7 @@ public sealed class TurnPipelineBuilder
         // hook-spawned subagents.
         var hookFreeHost = BuildSubagentHost(
             options, client, agentOptions, permissions, includeAnthropicSystemPrefix,
-            userHooks: null, this.tasks, this.subagentRegistry, this.subagentSettings, this.loggerFactory.CreateLogger("Coda.Subagents"));
+            userHooks: null, this.tasks, this.subagentRegistry, this.subagentSettings, this.loggerFactory.CreateLogger("Coda.Subagents"), this.quarantine);
         var agentHandler = new AgentHookHandler(
             hookFreeHost,
             this.loggerFactory.CreateLogger("Coda.Hooks.Agent"),

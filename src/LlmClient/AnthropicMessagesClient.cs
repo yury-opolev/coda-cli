@@ -266,7 +266,7 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
                 {
                     ["name"] = tool.Name,
                     ["description"] = tool.Description,
-                    ["input_schema"] = ParseOrEmpty(tool.InputSchemaJson),
+                    ["input_schema"] = ToolSchema.ParseSafe(tool.InputSchemaJson),
                 };
                 if (plan.ToolsBreakpoint && i == request.Tools.Count - 1)
                 {
@@ -499,7 +499,7 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
             ["type"] = "tool_use",
             ["id"] = tool.Id,
             ["name"] = tool.Name,
-            ["input"] = ParseOrEmpty(tool.InputJson),
+            ["input"] = ParseArgumentsOrEmpty(tool.InputJson),
         },
         ToolResultBlock result => BuildToolResult(result),
         ImageBlock image => new JsonObject
@@ -565,7 +565,12 @@ public sealed partial class AnthropicMessagesClient : ILlmClient, IDisposable
         return new JsonObject { ["type"] = "ephemeral" };
     }
 
-    private static JsonNode ParseOrEmpty(string json)
+    /// <summary>
+    /// Parses a tool call's raw <em>arguments</em> JSON, falling back to an empty object.
+    /// Deliberately not <see cref="ToolSchema.ParseSafe"/>: arguments are data, and injecting a
+    /// <c>type</c> key into them would corrupt the call.
+    /// </summary>
+    private static JsonNode ParseArgumentsOrEmpty(string json)
     {
         try
         {

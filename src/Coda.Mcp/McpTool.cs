@@ -45,6 +45,12 @@ public sealed class McpTool : ITool
 
     public bool IsReadOnly => this.info.ReadOnly;
 
+    /// <summary>
+    /// True when the server's advertised input schema was invalid and had to be repaired at
+    /// ingestion; the tool may not accept its arguments correctly. Surfaced in <c>/mcp</c>.
+    /// </summary>
+    public bool SchemaCoerced => this.info.SchemaCoerced;
+
     public bool ShouldDefer => true;
 
     public async Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)

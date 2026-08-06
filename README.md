@@ -555,6 +555,41 @@ When a server fails to start it is skipped with a message that names the failed 
 A failed connection is atomic: the server's tools, connected client, and version counter are left
 exactly as they were, so a slow or broken server can never half-register.
 
+**Malformed tool schemas.** MCP servers are untrusted third-party input: they are installed
+casually (`npx -y <pkg>@latest`), update without warning, and a published build can simply be
+broken. A tool whose `inputSchema` is missing `"type": "object"` is rejected by the model APIs in a
+way that fails the **entire request**, so — left alone — one bad tool would break every turn in the
+session rather than just calls to that tool. Coda therefore guarantees that *a misbehaving server
+costs you that server's tools, never your session*:
+
+- **At ingestion**, an unusable schema is repaired least-destructively: every advertised key is
+  preserved and only the missing `type` (and, if absent, `properties`) is added. A tool that may
+  not accept arguments correctly is strictly better than one that cannot be used at all.
+- **At the wire**, the request serializers enforce the same invariant independently, so a bad
+  schema from *any* source (built-in tool, skill, subagent) can never reach a provider.
+- **On rejection**, if a provider refuses a tool definition anyway, coda names the offending tool,
+  quarantines it for the rest of the session, tells you, and retries the turn without it — up to
+  five tools per turn — instead of failing.
+- **Reporting**: a repaired server is called out at connect time and in `/mcp info <name>`, where
+  affected tools are marked `[!] coerced schema`. When *every* tool is affected the message says so,
+  since that almost always means a broken package version rather than one quirky tool.
+
+Choose stricter handling with `mcpSchemaPolicy` in the **user** settings file
+(`~/.coda/settings.json`; a project file cannot set it, so a cloned repo cannot disable the MCP
+servers you rely on):
+
+```json
+{ "mcpSchemaPolicy": "coerce" }
+```
+
+| Value | Effect |
+|---|---|
+| `"coerce"` (default) | Repair the schema and keep the tool; warn. |
+| `"skip"` | Drop the affected tools; the server's other tools still work. Reported in `/mcp info`, since a dropped tool otherwise leaves no trace. |
+| `"strict"` | Refuse to register the server at all, with a hard error at connect time. |
+
+An unrecognized value falls back to `"coerce"` — a typo must not silently disable a server.
+
 **`coda serve` MCP controls.** MCP loads by default under serve (parity with the TUI and
 `coda run`). Disable it per session with `--no-mcp` (or `CODA_SERVE_DISABLE_MCP=1`). Point serve
 at an orchestrator-curated config with `CODA_USER_MCP_DIR` — the cleanest way to give a
@@ -882,7 +917,7 @@ project files if they exist (it never writes to them).
 
 | What | Location | Notes |
 |---|---|---|
-| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers, subagent limits |
+| User settings | `~/.coda/settings.json` | allow/deny rules, hooks, LSP servers, subagent limits, `mcpSchemaPolicy` |
 | Project settings | `<project>/.coda/settings.json` | overrides user settings |
 | Credentials | `~/.coda/credentials/` | DPAPI-encrypted (Windows) / AES-GCM (other OS) |
 | Session transcripts | `<project>/.coda/sessions/<id>.json` | for `/resume` |

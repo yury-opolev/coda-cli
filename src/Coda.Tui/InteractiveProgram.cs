@@ -278,7 +278,9 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var mcpHttpFactory = new Coda.Mcp.DefaultMcpHttpClientFactory(
             mcpHttp, store, interactive: true,
             msg => Publish(mailbox, new DiagnosticEvent("MCP", msg, UiNotificationLevel.Information)));
-        await using var mcp = new Coda.Mcp.McpClientManager(mcpHttpFactory);
+        await using var mcp = new Coda.Mcp.McpClientManager(
+            mcpHttpFactory,
+            schemaPolicy: Coda.Mcp.McpSchemaPolicyFilter.Parse(startupSettings.McpSchemaPolicy));
 
         Coda.Agent.ITool[] mcpHelperTools =
         [

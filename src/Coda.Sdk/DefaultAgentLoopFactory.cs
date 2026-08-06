@@ -41,6 +41,7 @@ public sealed class DefaultAgentLoopFactory : IAgentLoopFactory
             currentDepth: spec.CurrentDepth,
             toolActivity: spec.ToolActivity,
             permissionRules: spec.PermissionRules,
-            grantedDirectoriesSource: spec.GrantedDirectoriesSource);
+            grantedDirectoriesSource: spec.GrantedDirectoriesSource,
+            quarantine: spec.Quarantine);
     }
 }

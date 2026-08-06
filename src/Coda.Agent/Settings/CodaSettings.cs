@@ -116,6 +116,21 @@ public sealed record CodaSettings(
     /// Set via <c>"cacheUse1hTtl": true</c> in <c>settings.json</c>. Default: <see langword="false"/>.
     /// </summary>
     public bool CacheUse1hTtl { get; init; }
+
+    /// <summary>
+    /// Raw <c>"mcpSchemaPolicy"</c> string — <c>"coerce"</c> (default), <c>"skip"</c>, or
+    /// <c>"strict"</c> — deciding what happens when an MCP server advertises a tool whose input
+    /// schema the model APIs would reject. Null when absent. Interpreted by
+    /// <c>McpSchemaPolicyFilter.Parse</c> in the composition root; kept as a string here because
+    /// <c>Coda.Agent</c> must not depend on <c>Coda.Mcp</c>.
+    /// </summary>
+    /// <remarks>
+    /// SECURITY: read from the <em>user</em> file only, like <c>theme</c> and
+    /// <c>toolDisplayMode</c>. A project settings file is attacker-controlled the moment someone
+    /// clones a hostile repo, and <c>"strict"</c> would let it silently disable MCP servers the
+    /// user relies on.
+    /// </remarks>
+    public string? McpSchemaPolicy { get; init; }
 }
 
 

@@ -36,6 +36,12 @@ public sealed partial class McpClientManager : IAsyncDisposable
     private readonly List<ITool> tools = [];
     private readonly Dictionary<string, string> lastConnectionErrors = new(StringComparer.Ordinal);
     private readonly Dictionary<string, RuntimeErrorSource> lastConnectionErrorSources = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// Per-server description of invalid tool schemas found at the last connect, so <c>/mcp</c>
+    /// can surface it long after the startup log line scrolled away.
+    /// </summary>
+    private readonly Dictionary<string, string> schemaWarnings = new(StringComparer.Ordinal);
     private readonly bool ownsClients;
     private readonly IMcpHttpClientFactory? httpFactory;
 
@@ -47,6 +53,13 @@ public sealed partial class McpClientManager : IAsyncDisposable
     private readonly TimeSpan connectTimeout;
 
     /// <summary>
+    /// What to do about a server that advertises a tool schema the model APIs would reject.
+    /// Repair always happens at ingestion; this decides whether such a tool is kept, dropped, or
+    /// fatal to the whole server.
+    /// </summary>
+    private readonly McpSchemaPolicy schemaPolicy;
+
+    /// <summary>
     /// Standard constructor: starts with no clients (use <see cref="ConnectAllAsync"/> to
     /// populate). <paramref name="httpFactory"/> builds clients for HTTP servers; when null,
     /// HTTP servers are skipped (logged). <paramref name="connectTimeout"/> overrides the connect
@@ -54,10 +67,14 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// override is normalized with <see cref="McpConnectTimeout.Normalize"/> exactly like an
     /// environment value.
     /// </summary>
-    public McpClientManager(IMcpHttpClientFactory? httpFactory = null, TimeSpan? connectTimeout = null)
+    public McpClientManager(
+        IMcpHttpClientFactory? httpFactory = null,
+        TimeSpan? connectTimeout = null,
+        McpSchemaPolicy schemaPolicy = McpSchemaPolicy.Coerce)
     {
         this.ownsClients = true;
         this.httpFactory = httpFactory;
+        this.schemaPolicy = schemaPolicy;
         this.connectTimeout = connectTimeout is { } value
             ? McpConnectTimeout.Normalize(value)
             : McpConnectTimeout.FromEnvironment();
@@ -69,10 +86,14 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// <see cref="Timeout.InfiniteTimeSpan"/> (no timer) unless a test supplies an explicit
     /// <paramref name="connectTimeout"/>, which is normalized like any other value.
     /// </summary>
-    internal McpClientManager(IEnumerable<IMcpClient> prebuiltClients, TimeSpan? connectTimeout = null)
+    internal McpClientManager(
+        IEnumerable<IMcpClient> prebuiltClients,
+        TimeSpan? connectTimeout = null,
+        McpSchemaPolicy schemaPolicy = McpSchemaPolicy.Coerce)
     {
         this.ownsClients = false;
         this.clients.AddRange(prebuiltClients);
+        this.schemaPolicy = schemaPolicy;
         this.connectTimeout = connectTimeout is { } value
             ? McpConnectTimeout.Normalize(value)
             : Timeout.InfiniteTimeSpan;
@@ -125,6 +146,17 @@ public sealed partial class McpClientManager : IAsyncDisposable
     }
 
     /// <summary>
+    /// What the schema policy did about invalid tool schemas advertised by
+    /// <paramref name="serverName"/> at its last connect, or null when every schema was usable.
+    /// Needed in the UI because a <em>skipped</em> tool leaves no trace in the tool list at all.
+    /// </summary>
+    public string? SchemaWarningFor(string serverName)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        lock (this.gate) { return this.schemaWarnings.GetValueOrDefault(serverName); }
+    }
+
+    /// <summary>
     /// A versioned, immutable snapshot of the connected servers for the UI status view: each server's
     /// name, the identity it reported at initialize, and its tool count. Server list is copied and
     /// name-ordered; no <see cref="IMcpClient"/> instances are surfaced.
@@ -172,9 +204,22 @@ public sealed partial class McpClientManager : IAsyncDisposable
         var tasks = servers.Select(async kvp =>
         {
             var result = await this.ConnectServerAsync(kvp.Key, kvp.Value, cancellationToken).ConfigureAwait(false);
+
+            // The server name is an unvalidated .mcp.json object key, and several hosts route this
+            // log straight to Console.Error — so it is scrubbed of terminal escapes and newlines
+            // before it can reach a terminal.
+            var name = McpSchemaPolicyFilter.Safe(kvp.Key);
             log?.Invoke(result.Connected
-                ? $"MCP server '{kvp.Key}': {result.ToolCount} tool(s)."
-                : $"MCP server '{kvp.Key}' failed to connect: {result.Error}");
+                ? $"MCP server '{name}': {result.ToolCount} tool(s)."
+                : $"MCP server '{name}' failed to connect: {result.Error}");
+
+            // A repaired schema is not a connect failure, but the user must still learn that a
+            // server shipped one — silently running a half-broken tool is how the original
+            // incident stayed mysterious.
+            if (result.SchemaWarning is { } warning)
+            {
+                log?.Invoke(warning);
+            }
         });
         await Task.WhenAll(tasks).ConfigureAwait(false);
     }
@@ -213,10 +258,18 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
 
         IReadOnlyList<McpToolInfo> serverTools;
+        string? schemaWarning;
         List<ITool> newTools;
         try
         {
-            serverTools = await client.InitializeAndListToolsAsync(linkedCts.Token).ConfigureAwait(false);
+            var advertised = await client.InitializeAndListToolsAsync(linkedCts.Token).ConfigureAwait(false);
+
+            // Report on the full advertised set (so a skipped tool is still counted) with wording
+            // that matches what the policy actually did, then apply it. Under Strict this throws
+            // and is handled exactly like any other connect failure: the client is disposed and
+            // nothing is adopted.
+            schemaWarning = McpSchemaPolicyFilter.DescribeCoercions(client.ServerName, advertised, this.schemaPolicy);
+            serverTools = McpSchemaPolicyFilter.Apply(advertised, this.schemaPolicy, client.ServerName);
 
             // Build every wrapper into a temporary list before touching manager state, so a wrapper
             // failure cannot leave a half-registered client or a stray tool behind.
@@ -251,9 +304,10 @@ public sealed partial class McpClientManager : IAsyncDisposable
             this.clients.Add(client);
             this.tools.AddRange(newTools);
             this.ClearLastConnectionError(client.ServerName);
+            this.SetSchemaWarning(client.ServerName, schemaWarning);
             this.version++;
         }
-        return McpConnectResult.Success(serverTools.Count);
+        return McpConnectResult.Success(serverTools.Count, schemaWarning);
     }
 
     /// <summary>
@@ -309,6 +363,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
 
             this.clients.Remove(client);
             this.tools.RemoveAll(t => t is McpTool mcpTool && string.Equals(mcpTool.ServerName, name, StringComparison.Ordinal));
+            this.schemaWarnings.Remove(name);
             this.version++;
         }
 
@@ -498,6 +553,19 @@ public sealed partial class McpClientManager : IAsyncDisposable
     {
         this.lastConnectionErrors.Remove(serverName);
         this.lastConnectionErrorSources.Remove(serverName);
+    }
+
+    /// <summary>Records (or clears) a server's schema warning. Caller must hold <c>gate</c>.</summary>
+    private void SetSchemaWarning(string serverName, string? warning)
+    {
+        if (warning is null)
+        {
+            this.schemaWarnings.Remove(serverName);
+        }
+        else
+        {
+            this.schemaWarnings[serverName] = warning;
+        }
     }
 
     private void ClearCapabilityError(string serverName)

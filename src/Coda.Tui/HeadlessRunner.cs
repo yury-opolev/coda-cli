@@ -67,10 +67,10 @@ public static class HeadlessRunner
         }
 
         var workingDirectory = options.WorkingDirectory ?? Directory.GetCurrentDirectory();
+        var headlessSettings = Coda.Agent.Settings.SettingsLoader.Load(workingDirectory);
 
         using var claude = new ClaudeAiProvider();
-        CopilotEnvironment.ApplyEnterpriseDomain(
-            Coda.Agent.Settings.SettingsLoader.Load(workingDirectory).GitHubEnterpriseDomain);
+        CopilotEnvironment.ApplyEnterpriseDomain(headlessSettings.GitHubEnterpriseDomain);
         var copilotConfig = GitHubCopilotConfig.FromEnvironment();
         using var copilot = new GitHubCopilotProvider(copilotConfig);
         var apiKey = new ApiKeyProvider();
@@ -111,7 +111,8 @@ public static class HeadlessRunner
         var mcpCredentialStore = CredentialStoreFactory.Create();
         var mcpHttpFactory = new DefaultMcpHttpClientFactory(
             mcpHttp, mcpCredentialStore, interactive: false, msg => Console.Error.WriteLine(msg));
-        await using var mcp = new McpClientManager(mcpHttpFactory);
+        await using var mcp = new McpClientManager(
+            mcpHttpFactory, schemaPolicy: McpSchemaPolicyFilter.Parse(headlessSettings.McpSchemaPolicy));
         var pluginMcpServers = pluginComposition.McpServers.ToDictionary(
             kvp => kvp.Key, kvp => kvp.Value.Config);
         var mcpServers = McpConfig.LoadWithPlugins(workingDirectory, pluginMcpServers);

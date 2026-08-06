@@ -79,6 +79,11 @@ public static class McpView
         AppendCapabilities(builder, "tools", detail.Tools);
         AppendCapabilities(builder, "prompts", detail.Prompts);
         AppendCapabilities(builder, "resources", detail.Resources);
+        if (detail.SchemaNote is { Length: > 0 } schemaNote)
+        {
+            builder.AppendLine($"  schema:      {FreeText(schemaNote)}");
+        }
+
         return builder.ToString().TrimEnd();
     }
 
@@ -129,7 +134,15 @@ public static class McpView
                 foreach (var tool in server.Tools)
                 {
                     var desc = string.IsNullOrWhiteSpace(tool.Description) ? "(no description)" : FreeText(tool.Description);
-                    builder.AppendLine($"    {Identifier(tool.Name)} — {desc}");
+                    var mark = tool.SchemaCoerced ? "  [!] coerced schema" : string.Empty;
+                    builder.AppendLine($"    {Identifier(tool.Name)} — {desc}{mark}");
+                }
+
+                if (server.Tools.Any(t => t.SchemaCoerced))
+                {
+                    builder.AppendLine(
+                        "  note:        [!] the server advertised an invalid input schema for these tools " +
+                        "(missing \"type\": \"object\"); coda repaired it, so they may not accept arguments correctly.");
                 }
             }
         }
@@ -259,7 +272,17 @@ public static class McpView
             var description = string.IsNullOrWhiteSpace(capability.Description)
                 ? "(no description)"
                 : FreeText(capability.Description);
-            builder.AppendLine($"    {Identifier(capability.Name)} — {description}");
+            var mark = capability.SchemaCoerced ? "  [!] coerced schema" : string.Empty;
+            builder.AppendLine($"    {Identifier(capability.Name)} — {description}{mark}");
+        }
+
+        // A repaired tool is usable but may not accept its arguments correctly, so the marker
+        // above always comes with an explanation of what it means and who is at fault.
+        if (values.Any(v => v.SchemaCoerced))
+        {
+            builder.AppendLine(
+                "  note:        [!] the server advertised an invalid input schema for these tools " +
+                "(missing \"type\": \"object\"); coda repaired it, so they may not accept arguments correctly.");
         }
     }
 
