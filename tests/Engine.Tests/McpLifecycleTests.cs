@@ -241,7 +241,6 @@ public sealed class McpLifecycleTests
         AssertBoundedNonBacktrackingRegex("TerminalEscapePattern");
         AssertBoundedNonBacktrackingRegex("SecretAssignmentPattern");
         AssertBoundedNonBacktrackingRegex("ObfuscatedSecretAssignmentPattern");
-        AssertBoundedNonBacktrackingRegex("UrlPattern");
         Assert.True(
             GetGeneratedRegex("SecretAssignmentPattern").Options.HasFlag(RegexOptions.IgnoreCase),
             "SecretAssignmentPattern must use case-insensitive matching.");

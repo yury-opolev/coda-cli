@@ -580,6 +580,11 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// Creates a bounded, single-line user-visible error after redacting secrets and removing terminal
     /// control sequences plus Unicode control and format characters.
     /// </summary>
+    /// <remarks>
+    /// URLs are deliberately left intact: an MCP endpoint is configuration, not a secret, and an
+    /// error that hides the address it failed to reach is not actionable. Credentials embedded in
+    /// one are still caught by the secret-assignment passes above.
+    /// </remarks>
     private string SanitizeRuntimeError(string error)
     {
         try
@@ -589,7 +594,6 @@ public sealed partial class McpClientManager : IAsyncDisposable
             safe = SanitizeSingleLine(safe);
             safe = SecretRedactor.Redact(safe);
             safe = SecretAssignmentPattern().Replace(safe, $"$1$2{SecretRedactor.Placeholder}");
-            safe = UrlPattern().Replace(safe, "[redacted URL]");
             return TelemetryText.Truncate(safe);
         }
         catch (RegexMatchTimeoutException)
@@ -683,9 +687,6 @@ public sealed partial class McpClientManager : IAsyncDisposable
 
     [GeneratedRegex(@"\b([a-z_][a-z0-9_\-\p{Cc}\p{Cf}]*)(\s*(?:=|:)\s*)(?:Bearer\s+)?(?:""[^""]*""|'[^']*'|[^\s;,]+)", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
     private static partial Regex ObfuscatedSecretAssignmentPattern();
-
-    [GeneratedRegex(@"https?://\S+", RegexOptions.IgnoreCase | RegexOptions.NonBacktracking, 1000)]
-    private static partial Regex UrlPattern();
 
     private enum RuntimeErrorSource
     {

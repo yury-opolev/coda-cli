@@ -494,6 +494,16 @@ public sealed class ExitSummaryRendererTests
     }
 
     [Fact]
+    public void Render_shows_the_coda_version()
+    {
+        var console = NewConsole();
+
+        ExitSummaryRenderer.Render(console, Snapshot());
+
+        Assert.Contains($"coda: v{Branding.Version}", console.Output, StringComparison.Ordinal);
+    }
+
+    [Fact]
     public void Render_without_session_id_says_not_saved()
     {
         var console = NewConsole();
