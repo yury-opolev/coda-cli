@@ -113,22 +113,13 @@ public sealed class PresentedFrameByteGateTests(ITestOutputHelper output)
         public bool LastFrameTrusted { get; private set; }
 
         /// <param name="alreadyAt">
-        /// Optional position for which the emitter returns <see langword="false"/> without
-        /// counting characters, simulating the Terminal.Gui behaviour where
-        /// <c>AnsiOutput.SetCursorPositionImpl</c> skips a move when it believes the
-        /// cursor is already at the requested position.
+        /// Retained for call-site compatibility. The coalescer now owns emission and never declines,
+        /// so this no longer suppresses a move — a position it names is still counted.
         /// </param>
         public CountingCoalescingOutput((int Col, int Row)? alreadyAt = null)
         {
-            coalescer = new CursorCoalescer((c, r) =>
-            {
-                if (alreadyAt.HasValue && c == alreadyAt.Value.Col && r == alreadyAt.Value.Row)
-                {
-                    return false;
-                }
-                CharsWritten += CursorSequenceLength(c, r);
-                return true;
-            });
+            _ = alreadyAt;
+            coalescer = new CursorCoalescer((c, r) => CharsWritten += CursorSequenceLength(c, r));
         }
 
         public override void Write(IOutputBuffer buffer)
@@ -169,8 +160,14 @@ public sealed class PresentedFrameByteGateTests(ITestOutputHelper output)
     private static int CursorSequenceLength(int col, int row)
         => $"\x1b[{row + 1};{col + 1}H".Length;
 
+    /// <summary>
+    /// The corruption this layer exists to prevent: a cursor move that lands on the stale
+    /// application caret used to be silently dropped, the following run landed at the wrong place,
+    /// and the frame was still reported trusted — so it became the diff baseline and those cells
+    /// were suppressed forever. The coalescer now owns emission, so no move can be declined.
+    /// </summary>
     [Fact]
-    public void Dropped_cursor_move_after_text_marks_frame_untrusted_and_forces_full_repaint()
+    public void A_move_onto_the_stale_caret_is_still_emitted_and_the_frame_stays_trusted()
     {
         var buffer = new OutputBufferImpl();
         buffer.SetSize(cols: 100, rows: 30);
@@ -179,36 +176,66 @@ public sealed class PresentedFrameByteGateTests(ITestOutputHelper output)
         var frame = new PresentedFrame();
         frame.Adopt(buffer);
 
-        // Draw a second frame with one changed cell; after suppression only row 15 is dirty.
         DrawFrame(buffer, changedCell: true);
         Assert.True(frame.SuppressUnchangedCells(buffer));
 
-        // The base write loop moves the cursor to every cell in dirty rows. After writing
-        // the one dirty cell at col 50 it continues positioning through cols 51–99, so the
-        // last pending position at EndFrame time is (99, 15).
-        //
-        // Configure the emitter to return false (without counting) for that trailing position,
-        // simulating AnsiOutput._currentCursor being there from a previous frame. At the time
-        // EndFrame flushes this move the frame has already written text at col 50, so
-        // frameEmittedAnything is true and the dropped move must mark the frame untrusted.
+        // (99, 15) is the trailing position of the dirty row — exactly the kind of cell that used
+        // to collide with AnsiOutput's stale caret and be swallowed.
         var output = new CountingCoalescingOutput(alreadyAt: (Col: 99, Row: 15));
         output.Write(buffer);
 
-        Assert.False(output.LastFrameTrusted,
-            "A dropped cursor move after text was written must mark the frame untrusted.");
+        Assert.True(output.LastFrameTrusted);
+        Assert.True(output.CharsWritten > 0, "The frame must have emitted cursor positioning.");
 
-        // DiffingAnsiOutput calls frame.Invalidate() instead of frame.Adopt(buffer) when
-        // untrusted. Replicate that decision here to verify the downstream effect.
-        if (!output.LastFrameTrusted)
-        {
-            frame.Invalidate();
-        }
-
-        // Third frame: same content. Because the baseline was invalidated, the next
-        // SuppressUnchangedCells call must report that no compatible frame exists, forcing
-        // a full repaint and preventing the corrupted position from becoming permanent.
+        // A trusted frame is adopted, and the next identical frame is then fully suppressed —
+        // which is only safe because nothing was misplaced.
+        frame.Adopt(buffer);
         DrawFrame(buffer, changedCell: true);
-        Assert.False(frame.SuppressUnchangedCells(buffer),
-            "An invalidated baseline must require a full repaint on the next frame.");
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+    }
+
+    /// <summary>
+    /// Recovery must actually repaint. <c>Invalidate</c> alone only stops suppression — it
+    /// re-dirties nothing, so Terminal.Gui's write loop still skips every row whose DirtyLines
+    /// entry is false, and in an idle TUI the stale cells are never rewritten.
+    /// </summary>
+    [Fact]
+    public void ForceFullRepaintNextFrame_redirties_every_row()
+    {
+        var buffer = new OutputBufferImpl();
+        buffer.SetSize(cols: 100, rows: 30);
+        DrawFrame(buffer, changedCell: false);
+
+        var frame = new PresentedFrame();
+        frame.Adopt(buffer);
+
+        // An unchanged frame: nothing is dirty and every row flag is down.
+        DrawFrame(buffer, changedCell: false);
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+        Assert.DoesNotContain(buffer.DirtyLines, line => line);
+
+        frame.ForceFullRepaintNextFrame();
+
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+        Assert.All(buffer.DirtyLines, Assert.True);
+    }
+
+    /// <summary>A bare Invalidate is NOT enough on its own — this is why Fix B exists.</summary>
+    [Fact]
+    public void Invalidate_alone_does_not_redirty_anything()
+    {
+        var buffer = new OutputBufferImpl();
+        buffer.SetSize(cols: 100, rows: 30);
+        DrawFrame(buffer, changedCell: false);
+
+        var frame = new PresentedFrame();
+        frame.Adopt(buffer);
+        DrawFrame(buffer, changedCell: false);
+        Assert.True(frame.SuppressUnchangedCells(buffer));
+
+        frame.Invalidate();
+
+        Assert.False(frame.SuppressUnchangedCells(buffer));
+        Assert.DoesNotContain(buffer.DirtyLines, line => line);
     }
 }

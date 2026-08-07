@@ -1,3 +1,5 @@
+using System.Drawing;
+using System.Reflection;
 using System.Text;
 using Terminal.Gui.App;
 using Terminal.Gui.Drivers;
@@ -27,11 +29,51 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
     private readonly CursorCoalescer coalescer;
     private bool coalescing;
     private bool graphicsPresentedLastFrame;
+    private Func<Rectangle>? screenGetter;
+    private bool screenGetterResolved;
 
     /// <summary>Initializes a new instance backed by the given application model.</summary>
     public DiffingAnsiOutput(AppModel appModel) : base(appModel)
     {
-        coalescer = new CursorCoalescer((c, r) => base.SetCursorPositionImpl(c, r));
+        coalescer = new CursorCoalescer(this.EmitCursorPosition);
+    }
+
+    /// <summary>
+    /// Writes a cursor-position sequence unconditionally, bypassing both Terminal.Gui's
+    /// stale-caret check and this class's own <see cref="Write(StringBuilder)"/> override.
+    /// </summary>
+    /// <remarks>
+    /// The span overload is the same raw path <c>AnsiOutput</c> uses internally and is NOT
+    /// overridden here, so it cannot re-enter the coalescer.
+    /// </remarks>
+    private void EmitCursorPosition(int col, int row) =>
+        base.Write(EscSeqUtils.CSI_SetCursorPosition(row + 1 + this.InlineRowOffset(), col + 1).AsSpan());
+
+    /// <summary>
+    /// The row offset <c>AnsiOutput.SetCursorPositionImpl</c> applies, so inline mode addresses rows
+    /// relative to its region rather than the physical terminal.
+    /// </summary>
+    /// <remarks>
+    /// This MUST be the same value the base class uses, or inline mode is misaddressed — worse than
+    /// the misplacement this class exists to prevent. The base class reads an instance
+    /// <c>AppScreenGetter</c> that the main-loop coordinator binds to the running application. The
+    /// static <c>Application.Screen</c> is NOT an equivalent: coda builds its application the
+    /// instance-based way, and the legacy static accessor throws once that model is in use. So the
+    /// internal instance property is reflected once and cached, mirroring the reflection
+    /// <c>DiffingApplicationFactory</c> already needs. A missing getter degrades to no offset, which
+    /// is correct for full-screen mode.
+    /// </remarks>
+    private int InlineRowOffset()
+    {
+        if (!this.screenGetterResolved)
+        {
+            this.screenGetter = typeof(AnsiOutput)
+                .GetProperty("AppScreenGetter", BindingFlags.Instance | BindingFlags.NonPublic)
+                ?.GetValue(this) as Func<Rectangle>;
+            this.screenGetterResolved = true;
+        }
+
+        return this.screenGetter?.Invoke().Y ?? 0;
     }
 
     /// <inheritdoc />
@@ -46,7 +88,14 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
         // disappear prevents cells the graphics subsystem may have force-cleared from being
         // silently adopted as the new baseline: they remain dirty and are re-emitted the next
         // time Terminal.Gui writes their row.
-        if (hasGraphics || graphicsPresentedLastFrame)
+        // Ctrl+L: drop the baseline AND re-dirty everything, so the repaint is a guarantee rather
+        // than a hope that some view happens to redraw the stale cells.
+        if (FullRepaintSignal.TryConsume())
+        {
+            frame.Invalidate();
+            PresentedFrame.RedirtyAll(buffer);
+        }
+        else if (hasGraphics || graphicsPresentedLastFrame)
         {
             frame.Invalidate();
             PresentedFrame.SyncDirtyLines(buffer);
@@ -73,8 +122,9 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
         catch
         {
             // If the underlying write partially succeeded the URL cache and dirty-flag state
-            // may be inconsistent; drop the baseline so the next frame starts from scratch.
-            frame.Invalidate();
+            // may be inconsistent; force a full repaint so the next frame starts from scratch
+            // AND actually reaches the terminal.
+            frame.ForceFullRepaintNextFrame();
             throw;
         }
         finally
@@ -82,17 +132,17 @@ internal sealed class DiffingAnsiOutput : AnsiOutput
             coalescing = false;
         }
 
-        // When a cursor move was silently dropped after this frame had already emitted content,
-        // the text that followed it appeared at the wrong position. Invalidating the baseline
-        // converts a permanent corruption into a single-frame glitch by forcing a full repaint
-        // on the next frame.
+        // A frame is only trusted when every requested move was satisfied. With the coalescer
+        // owning emission that should always hold; when it does not, a plain Invalidate would
+        // merely stop suppressing without re-dirtying anything, so the corrupted cells would never
+        // be rewritten. Force the repaint instead.
         if (trusted)
         {
             frame.Adopt(buffer);
         }
         else
         {
-            frame.Invalidate();
+            frame.ForceFullRepaintNextFrame();
         }
     }
 

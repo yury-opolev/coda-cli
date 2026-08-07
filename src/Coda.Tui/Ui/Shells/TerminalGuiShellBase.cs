@@ -2118,6 +2118,11 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         // to cure. Setting the flag and marking the tree dirty is enough on both paths: the application
         // physically erases the screen on the next iteration, and every view redraws into a grid the
         // differ has no usable baseline for.
+        //
+        // Dropping the baseline is NOT sufficient on its own: Terminal.Gui's write loop skips any row
+        // whose DirtyLines entry is false, so cells no view happens to redraw would keep their stale
+        // content. The signal makes the diffing layer re-dirty every cell for that frame.
+        FullRepaintSignal.Request();
         this.app.ClearScreenNextIteration = true;
         this.SetNeedsDraw();
         this.ForceRedrawCount++;
