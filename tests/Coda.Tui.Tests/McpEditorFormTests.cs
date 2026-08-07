@@ -1052,6 +1052,77 @@ public sealed class McpEditorFormTests : IDisposable
             RenderedOutput.AttributeOf(this.application, "stdio"));
     }
 
+    // ── UX spec: empty placeholder and map row separator ─────────────────────
+
+    /// <summary>
+    /// An empty Arguments field must show a placeholder that includes Ctrl+N so the user
+    /// knows how to add the first item without consulting external docs.
+    /// </summary>
+    [Fact]
+    public void Empty_arguments_placeholder_mentions_ctrl_n()
+    {
+        var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Arguments);
+        this.form.ApplyState(state);
+        this.application.LayoutAndDraw();
+
+        var labelText = this.form.ArgumentsSummaryLabel.Text ?? string.Empty;
+        Assert.Contains("Ctrl+N", labelText, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A map row must render a visible "=" label between the name and value fields so the
+    /// user can read the row as a key = value pair.  The separator must not be focusable.
+    /// </summary>
+    [Fact]
+    public void Map_row_renders_equals_separator_that_is_not_focusable()
+    {
+        var draft = MakeStdioDraftWithEnv("TOKEN");
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+            {
+                SelectedItem = 0,
+            });
+        this.application.LayoutAndDraw();
+
+        var separators = AllLabels(this.form)
+            .Where(l => (l.Text ?? string.Empty).Contains("=", StringComparison.Ordinal)
+                && l.Visible)
+            .ToList();
+
+        Assert.NotEmpty(separators);
+        Assert.All(separators, lbl => Assert.False(lbl.CanFocus));
+    }
+
+    /// <summary>
+    /// Tab traversal on a map row must reach exactly the Name and Value text fields.
+    /// The "=" separator label must not be a tab stop.
+    /// </summary>
+    [Fact]
+    public void Tab_traversal_for_map_row_reaches_name_and_value_but_not_separator()
+    {
+        var draft = MakeStdioDraftWithEnv("TOKEN");
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+            {
+                SelectedItem = 0,
+            });
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        var visited = CollectTabOrder(this.form, maxSteps: 30);
+
+        // Must reach both TextFields in the map row.
+        var textFields = visited.OfType<TextField>().ToList();
+        Assert.NotEmpty(textFields);
+
+        // The separator Label must never appear in the tab order.
+        var separatorLabels = visited
+            .OfType<Label>()
+            .Where(l => (l.Text ?? string.Empty).Contains("=", StringComparison.Ordinal))
+            .ToList();
+        Assert.Empty(separatorLabels);
+    }
+
     public void Dispose()
     {
         this.form.Dispose();

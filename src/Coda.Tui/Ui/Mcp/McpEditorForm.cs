@@ -1254,7 +1254,7 @@ internal sealed class McpEditorForm : View
         this.ScopesSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Scopes); };
     }
     private static string FormatCount(int count) =>
-        count == 0 ? "(none)" : $"{count} item(s)";
+        count == 0 ? "(none) — Ctrl+N to add" : $"{count} item(s)";
 
     /// <summary>
     /// Creates a non-focusable label for the label column (X=<see cref="GutterWidth"/>,
@@ -1324,17 +1324,28 @@ internal sealed class McpEditorForm : View
                 Used = true,
             };
 
+            // Non-focusable separator so the user can read the row as "name = value".
+            var separator = new Label
+            {
+                Id = id + "Separator",
+                X = Pos.Right(this.Name),
+                Width = 3,
+                Height = 1,
+                Text = " = ",
+                CanFocus = false,
+            };
+
             this.Value = new TextField
             {
                 Id = id + "Value",
-                X = Pos.Right(this.Name) + 1,
+                X = Pos.Right(separator),
                 Width = Dim.Fill(),
                 Height = 1,
                 TabStop = TabBehavior.TabStop,
                 Used = true,
             };
 
-            this.Add(this.Name, this.Value);
+            this.Add(this.Name, separator, this.Value);
         }
     }
 }

@@ -407,6 +407,94 @@ public sealed class McpBrowserOverlayTests : IDisposable
         Assert.DoesNotContain("(no server selected)", RenderedOutput.Text(this.application), StringComparison.Ordinal);
     }
 
+    // ── context-sensitive footer tests ───────────────────────────────────────
+
+    /// <summary>
+    /// With the editor open and Env focused on the Value part, the footer must show
+    /// "Enter encrypt" so the user knows pressing Enter stores a secret.
+    /// </summary>
+    [Fact]
+    public void Editor_footer_shows_enter_encrypt_when_env_value_part_focused()
+    {
+        this.overlay.Show();
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment:
+            [
+                new McpNamedSecretDraft(
+                    "TOKEN",
+                    McpSecretSource.None,
+                    new McpSecretChange("env/TOKEN", McpSecretChangeKind.Unchanged)),
+            ],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        this.controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = new McpEditorState(
+                McpEditorMode.Edit,
+                McpBrowserView.List,
+                draft,
+                McpEditorField.Environment)
+            {
+                SelectedItem = 0,
+                SelectedItemPart = McpEditorItemPart.Value,
+            },
+        });
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        Assert.Contains("Enter encrypt", this.overlay.FooterText, StringComparison.Ordinal);
+        Assert.DoesNotContain("Enter save", this.overlay.FooterText, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// With the editor open and Arguments focused, the footer must show "Ctrl+N add"
+    /// and must NOT show "←/→ name/value" (Arguments is a plain list, not a map).
+    /// </summary>
+    [Fact]
+    public void Editor_footer_shows_ctrl_n_add_when_arguments_focused()
+    {
+        this.overlay.Show();
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment: [],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        this.controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = new McpEditorState(
+                McpEditorMode.Edit,
+                McpBrowserView.List,
+                draft,
+                McpEditorField.Arguments),
+        });
+        this.controller.NotifyChangedForTest();
+        this.application.LayoutAndDraw();
+
+        Assert.Contains("Ctrl+N add", this.overlay.FooterText, StringComparison.Ordinal);
+        Assert.DoesNotContain("←/→ name/value", this.overlay.FooterText, StringComparison.Ordinal);
+    }
+
     private static McpBrowserState ListStateWithServers(int selectedIndex)
     {
         var servers = Enumerable.Range(1, 5)
