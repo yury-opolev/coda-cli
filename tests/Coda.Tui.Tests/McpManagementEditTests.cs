@@ -2199,4 +2199,223 @@ public sealed class McpManagementEditTests
         McpSecretReplacement? replacement = null,
         string fieldPrefix = "header") =>
         new(name, source, new McpSecretChange($"{fieldPrefix}/{name}", change, replacement));
+
+    // ── env/header Value round-trip (spec §4–§8) ──────────────────────────────────────────────
+
+    /// <summary>
+    /// Editing an env VALUE and committing must write the new value verbatim into .mcp.json
+    /// (spec §4).
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_writes_new_env_value_verbatim_when_value_is_edited()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","env":{"DIR":"C:\\old\\path"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        Assert.Equal(@"C:\old\path", draft.Environment[0].Value);
+
+        // Simulate user editing the value field.
+        var edited = draft with
+        {
+            Environment = draft.Environment.SetItem(0, draft.Environment[0] with { Value = @"C:\new\path" }),
+        };
+        var preview = await harness.Service.PrepareEditAsync(original, edited, CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        Assert.Equal(@"C:\new\path", config.Env["DIR"]);
+    }
+
+    /// <summary>
+    /// Committing WITHOUT touching the value must preserve the original raw value byte-for-byte
+    /// — the sanitized display form must not be written back (spec §5).
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_preserves_raw_env_value_when_value_is_not_edited()
+    {
+        // A value with tabs/double-spaces that SanitizeIdentifier collapses.
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            "{\"mcpServers\":{\"server\":{\"command\":\"node\",\"env\":{\"TRICKY\":\"val\\twith\\ttabs  spaces\"}}}}");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        // Sanity: the display form is sanitized (no raw tabs).
+        Assert.DoesNotContain('\t', draft.Environment[0].Value);
+
+        var preview = await harness.Service.PrepareEditAsync(original, draft, CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        // The raw original must be preserved, not the sanitized display form.
+        Assert.Equal("val\twith\ttabs  spaces", config.Env["TRICKY"]);
+    }
+
+    /// <summary>
+    /// Renaming an env KEY while leaving the value text alone must carry the display value across
+    /// to the new key (spec §6).
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_carries_env_value_across_key_rename()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","env":{"OLD_KEY":"my-value"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        // Simulate SetNamedName: the form keeps Change.Field aligned with the current name.
+        var originalItem = draft.Environment[0];
+        var renamedItem = originalItem with
+        {
+            Name = "NEW_KEY",
+            Change = originalItem.Change with { Field = "env/NEW_KEY" },
+        };
+        var renamed = draft with
+        {
+            Environment = draft.Environment.SetItem(0, renamedItem),
+        };
+        var preview = await harness.Service.PrepareEditAsync(original, renamed, CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        Assert.Equal("my-value", config.Env["NEW_KEY"]);
+
+        // The rename must MOVE the entry: the commit path re-adds every original key the draft no
+        // longer mentions, so without an explicit removal the old key is silently resurrected and
+        // .mcp.json ends up with both.
+        Assert.False(config.Env.ContainsKey("OLD_KEY"));
+        Assert.Single(config.Env);
+    }
+
+    /// <summary>
+    /// The add path has no baseline to preserve from, but a value typed into a new row must still
+    /// be written — otherwise the editor invites input and silently discards it.
+    /// </summary>
+    [Fact]
+    public async Task Commit_add_writes_an_inline_env_value()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        var draft = StdioDraft(
+            "server",
+            [
+                new McpNamedSecretDraft(
+                    "FOO",
+                    McpSecretSource.None,
+                    new McpSecretChange("env/FOO", McpSecretChangeKind.Unchanged),
+                    "bar"),
+            ]);
+
+        var preview = await harness.Service.PrepareAddAsync(draft, CancellationToken.None);
+        var result = await harness.Service.CommitAddAsync(preview, CancellationToken.None);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        Assert.Equal("bar", config.Env["FOO"]);
+    }
+
+    /// <summary>An added row the user never filled in is still dropped rather than written empty.</summary>
+    [Fact]
+    public async Task Commit_add_drops_an_env_row_with_no_value()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        var draft = StdioDraft(
+            "server",
+            [
+                new McpNamedSecretDraft(
+                    "EMPTY",
+                    McpSecretSource.None,
+                    new McpSecretChange("env/EMPTY", McpSecretChangeKind.Unchanged),
+                    string.Empty),
+            ]);
+
+        var preview = await harness.Service.PrepareAddAsync(draft, CancellationToken.None);
+        await harness.Service.CommitAddAsync(preview, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        Assert.Empty(config.Env);
+    }
+
+    /// <summary>
+    /// Headers behave the same as env for value editing and raw-value preservation (spec §7).
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_writes_new_header_value_verbatim_and_preserves_raw_when_unchanged()
+    {
+        await using var editHarness = await McpManagementTestHarness.CreateAsync();
+        editHarness.WriteProject(
+            """{"mcpServers":{"server":{"type":"http","url":"https://example.test/mcp","headers":{"X-Custom":"old-value"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await editHarness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        Assert.Equal("old-value", draft.Headers[0].Value);
+
+        var edited = draft with
+        {
+            Headers = draft.Headers.SetItem(0, draft.Headers[0] with { Value = "new-value" }),
+        };
+        var editPreview = await editHarness.Service.PrepareEditAsync(original, edited, CancellationToken.None);
+        await editHarness.Service.CommitEditAsync(editPreview, CancellationToken.None);
+        var editedConfig = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(editHarness.Project, editHarness.User)).Config);
+        Assert.Equal("new-value", editedConfig.Headers["X-Custom"]);
+
+        // Preserve raw: header value with tabs must survive round-trip unchanged.
+        await using var preserveHarness = await McpManagementTestHarness.CreateAsync();
+        preserveHarness.WriteProject(
+            "{\"mcpServers\":{\"server\":{\"type\":\"http\",\"url\":\"https://example.test/mcp\",\"headers\":{\"X-H\":\"val\\twith\\ttab\"}}}}");
+        var preserveDraft = await preserveHarness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(preserveDraft);
+        Assert.DoesNotContain('\t', preserveDraft.Headers[0].Value);
+        var preservePreview = await preserveHarness.Service.PrepareEditAsync(original, preserveDraft, CancellationToken.None);
+        await preserveHarness.Service.CommitEditAsync(preservePreview, CancellationToken.None);
+        var preservedConfig = Assert.IsType<McpHttpServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(preserveHarness.Project, preserveHarness.User)).Config);
+        Assert.Equal("val\twith\ttab", preservedConfig.Headers["X-H"]);
+    }
+
+    /// <summary>
+    /// A modal-entered <see cref="McpSecretChangeKind.Replace"/> replacement (non-literal) must
+    /// still be encrypted into the credential store — it must NOT be downgraded to a plain literal
+    /// by the new reconciliation path (spec §8).
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_modal_replacement_still_encrypts_into_credential_store()
+    {
+        const string secret = "super-secret-value-modal-99";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","env":{"TOKEN":"existing"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        // Simulate modal entry (non-Literal replacement — StoreInCredentialStore=true).
+        var modalDraft = draft with
+        {
+            Environment = draft.Environment.SetItem(0, draft.Environment[0] with
+            {
+                Change = new McpSecretChange("env/TOKEN", McpSecretChangeKind.Replace, new McpSecretReplacement(secret)),
+            }),
+        };
+        var preview = await harness.Service.PrepareEditAsync(original, modalDraft, CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+        // Must be a coda-secret: reference, not the plaintext.
+        Assert.StartsWith("coda-secret:", config.Env["TOKEN"], StringComparison.Ordinal);
+        Assert.DoesNotContain(secret, config.Env["TOKEN"], StringComparison.Ordinal);
+        // The plaintext must be in the credential store.
+        Assert.Contains(harness.Store.Keys, k => harness.Store.ValueFor(k) == secret);
+    }
 }

@@ -49,12 +49,12 @@ public sealed class McpEditorFormTests : IDisposable
     }
 
     /// <summary>
-    /// Task 8 invariant: environment/header VALUES are per-item rows too, but their value is a
-    /// read-only label — never a <see cref="TextField"/>. A secret env value must therefore never
-    /// reach a TextField, and must render as the masked placeholder.
+    /// Task 8 invariant (updated): environment/header values are now editable TextFields.  A
+    /// secret entered through the modal path (<see cref="McpSecretChangeKind.Replace"/>) must
+    /// NEVER appear in any TextField — it renders as <c>"*****"</c> and its row is read-only.
     /// </summary>
     [Fact]
-    public void Map_entry_value_is_never_a_text_field()
+    public void Map_entry_value_is_never_a_text_field_when_modal_replace_is_pending()
     {
         const string secret = "env-header-secret-value";
         var draft = new McpServerDraft(
@@ -88,13 +88,62 @@ public sealed class McpEditorFormTests : IDisposable
         this.form.ApplyState(editor);
         this.application.LayoutAndDraw();
 
+        // The modal secret must never reach a TextField.
         foreach (var field in AllTextFields(this.form))
         {
             Assert.DoesNotContain(secret, field.Text ?? string.Empty, StringComparison.Ordinal);
         }
 
-        // The value must still be shown, but only as the masked placeholder on a Label.
-        Assert.Contains(AllLabels(this.form), label => (label.Text ?? string.Empty).Contains("*****", StringComparison.Ordinal));
+        // The value must still be shown, but only as the masked placeholder on a TextField that
+        // is read-only — the secret cannot be extracted by a user.
+        Assert.Contains(
+            AllTextFields(this.form),
+            tf => (tf.Text ?? string.Empty).Contains("*****", StringComparison.Ordinal)
+                && tf.ReadOnly);
+    }
+
+    /// <summary>
+    /// An ordinary env value (Unchanged, no modal entry) must render in an editable TextField
+    /// showing the plain value (spec §9).
+    /// </summary>
+    [Fact]
+    public void Ordinary_env_value_renders_in_editable_text_field_showing_the_value()
+    {
+        const string plainValue = "C:\\Users\\me\\data";
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment:
+            [
+                new McpNamedSecretDraft(
+                    "DIR",
+                    McpSecretSource.Literal,
+                    new McpSecretChange("env/DIR", McpSecretChangeKind.Unchanged),
+                    Value: plainValue),
+            ],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        var editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+        {
+            SelectedItem = 0,
+        };
+
+        this.form.ApplyState(editor);
+        this.application.LayoutAndDraw();
+
+        // There must be an editable (non-read-only) TextField containing the plain value.
+        Assert.Contains(
+            AllTextFields(this.form),
+            tf => (tf.Text ?? string.Empty).Contains(plainValue, StringComparison.Ordinal)
+                && !tf.ReadOnly);
     }
 
     // ── field group labelling ─────────────────────────────────────────────────

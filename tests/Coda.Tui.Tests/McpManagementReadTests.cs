@@ -675,4 +675,73 @@ public sealed class McpManagementReadTests
             public void Dispose() { }
         }
     }
+
+    // ── draft Value field (spec: env/header values must be visible and editable) ──────────────
+
+    /// <summary>
+    /// An env entry with a plain literal value must expose that exact value on the draft so the
+    /// editor can display and edit it (spec §1).
+    /// </summary>
+    [Fact]
+    public async Task Edit_draft_exposes_literal_env_value_on_draft()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """
+            {"mcpServers":{"server":{"command":"node","env":{"MemoryMcp__DataDirectory":"C:\\Users\\me\\data"}}}}
+            """);
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+
+        Assert.NotNull(draft);
+        var envItem = Assert.Single(draft.Environment);
+        Assert.Equal(@"C:\Users\me\data", envItem.Value);
+    }
+
+    /// <summary>
+    /// A <c>${VAR}</c> reference is a reference, not a secret — the display value must be the
+    /// literal reference string so the user can see and edit it (spec §2).
+    /// </summary>
+    [Fact]
+    public async Task Edit_draft_exposes_env_variable_reference_verbatim()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","env":{"MY_VAR":"${FROM_ENV}"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+
+        Assert.NotNull(draft);
+        var envItem = Assert.Single(draft.Environment);
+        Assert.Equal("${FROM_ENV}", envItem.Value);
+    }
+
+    /// <summary>
+    /// A <c>coda-secret:</c> value is a reference stored in .mcp.json — it must be shown verbatim
+    /// so the user can see the reference.  The decrypted plaintext must NEVER appear anywhere in
+    /// the draft (spec §3).
+    /// </summary>
+    [Fact]
+    public async Task Edit_draft_exposes_coda_secret_reference_verbatim_and_does_not_resolve_plaintext()
+    {
+        const string storeKey = "mcp:server/env/MY_SECRET";
+        const string plaintext = "never-show-this-plaintext-99887766";
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        await harness.Store.SetAsync(storeKey, plaintext, CancellationToken.None);
+        harness.WriteProject(
+            $"{{\"mcpServers\":{{\"server\":{{\"command\":\"node\",\"env\":{{\"MY_SECRET\":\"coda-secret:{storeKey}\"}}}}}}}}");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+
+        Assert.NotNull(draft);
+        var envItem = Assert.Single(draft.Environment);
+        Assert.Equal($"coda-secret:{storeKey}", envItem.Value);
+        // The plaintext must not appear anywhere in the draft's string representation.
+        Assert.DoesNotContain(plaintext, draft.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(plaintext, envItem.Value, StringComparison.Ordinal);
+        Assert.DoesNotContain(plaintext, envItem.Name, StringComparison.Ordinal);
+    }
 }

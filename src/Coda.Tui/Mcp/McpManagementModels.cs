@@ -76,7 +76,15 @@ public sealed record McpSecretChange(
 public sealed record McpNamedSecretDraft(
     string Name,
     McpSecretSource ExistingSource,
-    McpSecretChange Change);
+    McpSecretChange Change,
+    /// <summary>
+    /// The display value shown in the editor — the raw value exactly as it appears in .mcp.json,
+    /// sanitized by <c>SanitizeIdentifier</c>.  <c>coda-secret:</c> and <c>${VAR}</c> references
+    /// are stored here verbatim; they are never resolved to plaintext.  A modal-entered secret
+    /// replacement keeps <see cref="McpSecretChangeKind.Replace"/> on the <see cref="Change"/>
+    /// and is never placed in this field.
+    /// </summary>
+    string Value = "");
 
 public sealed record McpSecretDescriptor(
     string Field,
