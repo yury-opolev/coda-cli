@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using Coda.Sdk;
 
 namespace Coda.Tui.Ui.Models;
@@ -37,6 +38,12 @@ internal enum ModelBrowserCommand
 
     /// <summary>Enter type-to-filter mode.</summary>
     Filter,
+
+    /// <summary>Cycle the focused row's reasoning effort one step toward lower.</summary>
+    EffortLeft,
+
+    /// <summary>Cycle the focused row's reasoning effort one step toward higher.</summary>
+    EffortRight,
 }
 
 /// <summary>
@@ -49,10 +56,19 @@ internal sealed record ModelBrowserState(
     string? CurrentModelId,
     string? SelectedId,
     string? StatusMessage,
-    bool ActionBusy)
+    bool ActionBusy,
+    ImmutableDictionary<string, string> EffortByModel)
 {
+    /// <summary>
+    /// The shared empty effort map (OrdinalIgnoreCase). Using a single static instance ensures that
+    /// <c>Empty == Empty</c> holds under record equality, which <see cref="ModelBrowserController.Close"/>
+    /// relies on for its idempotency guard.
+    /// </summary>
+    internal static readonly ImmutableDictionary<string, string> EmptyEffortMap =
+        ImmutableDictionary.Create<string, string>(StringComparer.OrdinalIgnoreCase);
+
     /// <summary>Empty initial state (no result, no selection).</summary>
-    public static readonly ModelBrowserState Empty = new(null, null, null, null, false);
+    public static readonly ModelBrowserState Empty = new(null, null, null, null, false, EmptyEffortMap);
 
     /// <summary>The model entries from the current result, or an empty list if none.</summary>
     public IReadOnlyList<ModelListEntry> Models =>
@@ -85,6 +101,75 @@ internal sealed record ModelBrowserState(
 
         var next = Math.Clamp(idx + delta, 0, models.Count - 1);
         return this with { SelectedId = models[next].Id };
+    }
+
+    /// <summary>
+    /// The ordered effort choices for a model: <c>["auto", ...levels]</c>.
+    /// Returns an empty list when the model has no reasoning levels (no effort control at all).
+    /// </summary>
+    public static IReadOnlyList<string> EffortChoices(ModelListEntry model)
+    {
+        ArgumentNullException.ThrowIfNull(model);
+        if (model.ReasoningLevels is null or { Count: 0 })
+        {
+            return [];
+        }
+
+        return ["auto", .. model.ReasoningLevels];
+    }
+
+    /// <summary>The staged effort for <paramref name="modelId"/>; <c>"auto"</c> when not set.</summary>
+    public string EffortFor(string modelId) =>
+        this.EffortByModel.TryGetValue(modelId, out var v) ? v : "auto";
+
+    /// <summary>
+    /// Returns a copy with the selected model's effort cycled by <paramref name="direction"/> (+1 or -1),
+    /// clamped at both ends. Cycling back to <c>"auto"</c> removes the key from <see cref="EffortByModel"/>.
+    /// Returns the same instance (no allocation) when nothing can change.
+    /// </summary>
+    public ModelBrowserState CycleEffort(int direction)
+    {
+        if (this.SelectedId is null)
+        {
+            return this;
+        }
+
+        var model = this.Models.FirstOrDefault(m =>
+            string.Equals(m.Id, this.SelectedId, StringComparison.OrdinalIgnoreCase));
+        if (model is null)
+        {
+            return this;
+        }
+
+        var choices = EffortChoices(model);
+        if (choices.Count == 0)
+        {
+            return this;
+        }
+
+        var current = this.EffortFor(this.SelectedId);
+        var idx = 0;
+        for (var i = 0; i < choices.Count; i++)
+        {
+            if (string.Equals(choices[i], current, StringComparison.OrdinalIgnoreCase))
+            {
+                idx = i;
+                break;
+            }
+        }
+
+        var next = Math.Clamp(idx + direction, 0, choices.Count - 1);
+        if (next == idx)
+        {
+            return this;
+        }
+
+        var chosen = choices[next];
+        var newMap = string.Equals(chosen, "auto", StringComparison.OrdinalIgnoreCase)
+            ? this.EffortByModel.Remove(this.SelectedId)
+            : this.EffortByModel.SetItem(this.SelectedId, chosen);
+
+        return this with { EffortByModel = newMap };
     }
 
     private static int IndexOf(IReadOnlyList<ModelListEntry> models, string? id)

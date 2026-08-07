@@ -1,3 +1,5 @@
+using System.Collections.Generic;
+using System.Collections.Immutable;
 using System.Threading;
 using Coda.Sdk;
 using Coda.Tui.Commands;
@@ -227,10 +229,10 @@ public sealed class ModelBrowserTests : IDisposable
         Assert.Contains("unavailable", this._overlay.HeaderText, StringComparison.Ordinal);
     }
 
-    // ── Test 5: Reasoning levels are rendered ─────────────────────────────────
+    // ── Test 5: Effort column rendering ───────────────────────────────────────
 
     [Fact]
-    public void Reasoning_levels_appear_in_table_source()
+    public void Effort_column_shows_auto_for_model_with_levels_and_no_choice()
     {
         var levels = (IReadOnlyList<string>)["low", "medium", "high"];
         var entries = new List<ModelListEntry>
@@ -239,15 +241,12 @@ public sealed class ModelBrowserTests : IDisposable
         };
         var source = new ModelTableSource(entries, null, StatusGlyphs.Ascii);
 
-        // Column 4 is the Reasoning column.
-        var rendered = source[0, 4].ToString()!;
-        Assert.Contains("low", rendered, StringComparison.Ordinal);
-        Assert.Contains("medium", rendered, StringComparison.Ordinal);
-        Assert.Contains("high", rendered, StringComparison.Ordinal);
+        // Column 4 shows "auto" when no effort is chosen.
+        Assert.Equal("auto", source[0, 4]);
     }
 
     [Fact]
-    public void Reasoning_levels_column_is_empty_when_not_set()
+    public void Effort_column_shows_em_dash_when_model_has_no_levels()
     {
         var entries = new List<ModelListEntry>
         {
@@ -255,7 +254,7 @@ public sealed class ModelBrowserTests : IDisposable
         };
         var source = new ModelTableSource(entries, null, StatusGlyphs.Ascii);
 
-        Assert.Equal(string.Empty, source[0, 4]);
+        Assert.Equal("—", source[0, 4]);
     }
 
     // ── Test 6: Enter applies the selected model ───────────────────────────────
@@ -264,15 +263,15 @@ public sealed class ModelBrowserTests : IDisposable
     public void Enter_invokes_completion_callback_with_selected_id_and_closes_overlay()
     {
         var result = MakeResult(count: 3);
-        string? chosen = null;
-        this._overlay.Show(result, null, id => chosen = id);
+        ModelSelection? chosen = null;
+        this._overlay.Show(result, null, s => chosen = s);
         this._app.LayoutAndDraw();
 
         // Move to second row (model-02) then press Enter.
         this._overlay.NewKeyDownEvent(Key.CursorDown);
         this._overlay.NewKeyDownEvent(Key.Enter);
 
-        Assert.Equal("model-02", chosen);
+        Assert.Equal("model-02", chosen?.ModelId);
         Assert.False(this._overlay.Visible);
     }
 
@@ -281,11 +280,11 @@ public sealed class ModelBrowserTests : IDisposable
     {
         var result = MakeResult(count: 3);
         var callbackInvoked = false;
-        string? chosen = "initial";
-        this._overlay.Show(result, null, id =>
+        ModelSelection? chosen = new ModelSelection("initial", null);
+        this._overlay.Show(result, null, s =>
         {
             callbackInvoked = true;
-            chosen = id;
+            chosen = s;
         });
         this._app.LayoutAndDraw();
 
@@ -348,8 +347,8 @@ public sealed class ModelBrowserTests : IDisposable
         var refreshed = MakeResult(count: 5); // different entry count so we can detect the swap
 
         var result = MakeResult(count: 3);
-        string? chosen = null;
-        this._overlay.Show(result, null, id => chosen = id, onReload: async ct =>
+        ModelSelection? chosen = null;
+        this._overlay.Show(result, null, s => chosen = s, onReload: async ct =>
         {
             fetchCount++;
             await Task.Yield(); // genuine async hop
@@ -391,13 +390,14 @@ public sealed class ModelBrowserTests : IDisposable
             this.onCalled = onCalled;
         }
 
-        public Task<string?> SelectModelAsync(
+        public Task<ModelSelection?> SelectModelAsync(
             ModelListResult result,
             string? currentModelId,
-            CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default,
+            IReadOnlyDictionary<string, string>? initialEffortByModel = null)
         {
             this.onCalled();
-            return Task.FromResult<string?>(null);
+            return Task.FromResult<ModelSelection?>(null);
         }
     }
 }
@@ -441,18 +441,287 @@ public sealed class ModelTableSourceTests
         Assert.Equal(5, source.Columns);
         Assert.Equal(2, source.Rows);
 
-        // Row 0 is id-1 (current).
+        // Row 0 is id-1 (current): effort column shows "auto" (no effort chosen, not the selected row).
         Assert.Equal(StatusGlyphs.Unicode[BrowserItemState.Healthy], source[0, 0]);
         Assert.Equal("id-1", source[0, 1]);
         Assert.Equal("Name 1", source[0, 2]);
         Assert.Equal("100K", source[0, 3]);
-        Assert.Contains("low", source[0, 4].ToString()!, StringComparison.Ordinal);
+        Assert.Equal("auto", source[0, 4]);
 
-        // Row 1 is id-2 (not current, no display name, no context, no reasoning).
+        // Row 1 is id-2 (not current, no display name, no context, no reasoning levels → "—").
         Assert.Equal(StatusGlyphs.Unicode[BrowserItemState.Idle], source[1, 0]);
         Assert.Equal("id-2", source[1, 1]);
         Assert.Equal(string.Empty, source[1, 2]);
         Assert.Equal(string.Empty, source[1, 3]);
-        Assert.Equal(string.Empty, source[1, 4]);
+        Assert.Equal("—", source[1, 4]);
+    }
+}
+
+/// <summary>
+/// Unit tests for the inline effort cycling feature (spec §1–9). No Terminal.Gui driver needed.
+/// </summary>
+public sealed class ModelBrowserEffortTests
+{
+    private static ModelListEntry WithLevels(string id, params string[] levels) =>
+        new(id, id, 200_000, levels.Length > 0 ? levels : null);
+
+    private static ModelBrowserState StateWith(
+        IReadOnlyList<ModelListEntry> models,
+        string? selectedId,
+        ImmutableDictionary<string, string>? effortByModel = null) =>
+        new ModelBrowserState(
+            new ModelListResult("p", ModelSource.Live, models),
+            null,
+            selectedId,
+            null,
+            false,
+            effortByModel ?? ModelBrowserState.EmptyEffortMap);
+
+    // ── Test 1: EffortChoices ─────────────────────────────────────────────────
+
+    [Fact]
+    public void EffortChoices_returns_auto_plus_levels_for_model_with_levels()
+    {
+        var model = WithLevels("m", "low", "medium", "high");
+        var choices = ModelBrowserState.EffortChoices(model);
+
+        Assert.Equal(["auto", "low", "medium", "high"], choices);
+    }
+
+    [Fact]
+    public void EffortChoices_returns_empty_for_model_with_null_levels()
+    {
+        var model = new ModelListEntry("m");
+        Assert.Empty(ModelBrowserState.EffortChoices(model));
+    }
+
+    [Fact]
+    public void EffortChoices_returns_empty_for_model_with_empty_levels()
+    {
+        var model = new ModelListEntry("m", ReasoningLevels: []);
+        Assert.Empty(ModelBrowserState.EffortChoices(model));
+    }
+
+    // ── Test 2: CycleEffort +1 ────────────────────────────────────────────────
+
+    [Fact]
+    public void CycleEffort_forward_from_auto_moves_to_first_level()
+    {
+        var models = new[] { WithLevels("m", "low", "medium", "high") };
+        var state = StateWith(models, "m");
+
+        var next = state.CycleEffort(+1);
+
+        Assert.Equal("low", next.EffortFor("m"));
+    }
+
+    [Fact]
+    public void CycleEffort_forward_walks_through_levels()
+    {
+        var models = new[] { WithLevels("m", "low", "medium", "high") };
+        var state = StateWith(models, "m", ModelBrowserState.EmptyEffortMap.SetItem("m", "low"));
+
+        var s2 = state.CycleEffort(+1);
+        Assert.Equal("medium", s2.EffortFor("m"));
+
+        var s3 = s2.CycleEffort(+1);
+        Assert.Equal("high", s3.EffortFor("m"));
+    }
+
+    [Fact]
+    public void CycleEffort_forward_clamps_at_last_level_and_does_not_wrap()
+    {
+        var models = new[] { WithLevels("m", "low", "medium", "high") };
+        var state = StateWith(models, "m", ModelBrowserState.EmptyEffortMap.SetItem("m", "high"));
+
+        var next = state.CycleEffort(+1);
+
+        Assert.Equal("high", next.EffortFor("m")); // still high, no wrap
+        Assert.Same(state.EffortByModel, next.EffortByModel); // same reference — no mutation
+    }
+
+    // ── Test 3: CycleEffort -1 ────────────────────────────────────────────────
+
+    [Fact]
+    public void CycleEffort_backward_walks_down()
+    {
+        var models = new[] { WithLevels("m", "low", "medium", "high") };
+        var state = StateWith(models, "m", ModelBrowserState.EmptyEffortMap.SetItem("m", "high"));
+
+        var s2 = state.CycleEffort(-1);
+        Assert.Equal("medium", s2.EffortFor("m"));
+
+        var s3 = s2.CycleEffort(-1);
+        Assert.Equal("low", s3.EffortFor("m"));
+    }
+
+    [Fact]
+    public void CycleEffort_backward_from_first_level_returns_to_auto_and_removes_key()
+    {
+        var models = new[] { WithLevels("m", "low", "medium", "high") };
+        var state = StateWith(models, "m", ModelBrowserState.EmptyEffortMap.SetItem("m", "low"));
+
+        var next = state.CycleEffort(-1);
+
+        Assert.Equal("auto", next.EffortFor("m"));
+        Assert.False(next.EffortByModel.ContainsKey("m")); // key removed when returning to auto
+    }
+
+    [Fact]
+    public void CycleEffort_backward_clamps_at_auto_and_does_not_go_further()
+    {
+        var models = new[] { WithLevels("m", "low", "high") };
+        var state = StateWith(models, "m"); // already at auto (no key)
+
+        var next = state.CycleEffort(-1);
+
+        Assert.Equal("auto", next.EffortFor("m"));
+        Assert.False(next.EffortByModel.ContainsKey("m"));
+    }
+
+    // ── Test 4: No-op cases ───────────────────────────────────────────────────
+
+    [Fact]
+    public void CycleEffort_is_noop_for_model_with_no_levels()
+    {
+        var models = new[] { new ModelListEntry("m") };
+        var state = StateWith(models, "m");
+
+        Assert.Same(state, state.CycleEffort(+1));
+        Assert.Same(state, state.CycleEffort(-1));
+    }
+
+    [Fact]
+    public void CycleEffort_is_noop_when_no_selection()
+    {
+        var models = new[] { WithLevels("m", "low", "high") };
+        var state = StateWith(models, null);
+
+        Assert.Same(state, state.CycleEffort(+1));
+    }
+
+    // ── Test 5: Only selected model is affected ───────────────────────────────
+
+    [Fact]
+    public void CycleEffort_only_affects_the_selected_model()
+    {
+        var models = new[]
+        {
+            WithLevels("a", "low", "high"),
+            WithLevels("b", "low", "high"),
+        };
+        var initialMap = ModelBrowserState.EmptyEffortMap.SetItem("b", "low");
+        var state = StateWith(models, "a", initialMap); // "a" is selected, "b" has "low"
+
+        var next = state.CycleEffort(+1); // cycles "a" from auto -> low
+
+        Assert.Equal("low", next.EffortFor("a"));
+        Assert.Equal("low", next.EffortFor("b")); // "b" must be unchanged
+    }
+
+    // ── Test 6: ModelTableSource column 4 rendering ───────────────────────────
+
+    [Fact]
+    public void ModelTableSource_col4_shows_em_dash_for_model_with_no_levels()
+    {
+        var entries = new List<ModelListEntry> { new("m") };
+        var source = new ModelTableSource(entries, null, StatusGlyphs.Ascii,
+            selectedModelId: "m");
+
+        Assert.Equal("—", source[0, 4]);
+    }
+
+    [Fact]
+    public void ModelTableSource_col4_shows_arrow_format_for_selected_row_with_chosen_effort()
+    {
+        var entries = new List<ModelListEntry> { WithLevels("m", "low", "medium", "high") };
+        var effort = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["m"] = "high" };
+        var source = new ModelTableSource(entries, null, StatusGlyphs.Ascii,
+            selectedModelId: "m", effortByModel: effort);
+
+        Assert.Equal("← high →", source[0, 4]);
+    }
+
+    [Fact]
+    public void ModelTableSource_col4_shows_plain_effort_for_non_selected_row()
+    {
+        var entries = new List<ModelListEntry>
+        {
+            WithLevels("a", "low", "medium", "high"),
+            WithLevels("b", "low", "medium", "high"),
+        };
+        var effort = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase) { ["a"] = "medium" };
+        var source = new ModelTableSource(entries, null, StatusGlyphs.Ascii,
+            selectedModelId: "b", effortByModel: effort);
+
+        // Row 0 (a) is not selected → plain "medium".
+        Assert.Equal("medium", source[0, 4]);
+        // Row 1 (b) is selected, no effort chosen → "← auto →".
+        Assert.Equal("← auto →", source[1, 4]);
+    }
+
+    [Fact]
+    public void ModelTableSource_col4_shows_auto_for_row_with_nothing_chosen_and_not_selected()
+    {
+        var entries = new List<ModelListEntry> { WithLevels("m", "low", "high") };
+        var source = new ModelTableSource(entries, null, StatusGlyphs.Ascii);
+
+        // No selectedModelId, no effortByModel → "auto".
+        Assert.Equal("auto", source[0, 4]);
+    }
+
+    // ── Test 7: KeyMap ────────────────────────────────────────────────────────
+
+    [Fact]
+    public void KeyMap_maps_CursorLeft_to_EffortLeft_and_CursorRight_to_EffortRight()
+    {
+        Assert.Equal(ModelBrowserCommand.EffortLeft, ModelBrowserKeyMap.Map(Key.CursorLeft));
+        Assert.Equal(ModelBrowserCommand.EffortRight, ModelBrowserKeyMap.Map(Key.CursorRight));
+    }
+
+    [Fact]
+    public void KeyMap_existing_bindings_still_resolve()
+    {
+        Assert.Equal(ModelBrowserCommand.MoveUp, ModelBrowserKeyMap.Map(Key.CursorUp));
+        Assert.Equal(ModelBrowserCommand.MoveDown, ModelBrowserKeyMap.Map(Key.CursorDown));
+        Assert.Equal(ModelBrowserCommand.Select, ModelBrowserKeyMap.Map(Key.Enter));
+        Assert.Equal(ModelBrowserCommand.Close, ModelBrowserKeyMap.Map(Key.Esc));
+        Assert.Equal(ModelBrowserCommand.PageUp, ModelBrowserKeyMap.Map(Key.PageUp));
+        Assert.Equal(ModelBrowserCommand.PageDown, ModelBrowserKeyMap.Map(Key.PageDown));
+        Assert.Equal(ModelBrowserCommand.MoveToStart, ModelBrowserKeyMap.Map(Key.Home));
+        Assert.Equal(ModelBrowserCommand.MoveToEnd, ModelBrowserKeyMap.Map(Key.End));
+        Assert.Equal(ModelBrowserCommand.Reload, ModelBrowserKeyMap.Map(new Key('r')));
+        Assert.Equal(ModelBrowserCommand.Filter, ModelBrowserKeyMap.Map(new Key('/')));
+    }
+
+    // ── Test 8: Controller CycleEffort ────────────────────────────────────────
+
+    [Fact]
+    public void Controller_CycleEffort_raises_Changed_once_and_updates_State()
+    {
+        var controller = new ModelBrowserController();
+        var models = new List<ModelListEntry> { WithLevels("m", "low", "high") };
+        var result = new ModelListResult("p", ModelSource.Live, models);
+        controller.Open(result, null);
+
+        var changeCount = 0;
+        controller.Changed += () => changeCount++;
+
+        controller.CycleEffort(+1);
+
+        Assert.Equal(1, changeCount);
+        Assert.Equal("low", controller.State.EffortFor("m"));
+    }
+
+    // ── Test 9: Empty state equality ─────────────────────────────────────────
+
+    [Fact]
+    public void Empty_state_equality_holds_after_adding_EffortByModel_field()
+    {
+        // Close() relies on `state == ModelBrowserState.Empty` for its idempotency guard.
+        var a = ModelBrowserState.Empty;
+        var b = ModelBrowserState.Empty;
+        Assert.Equal(a, b);
+        Assert.True(a == b);
     }
 }

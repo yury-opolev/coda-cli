@@ -9,21 +9,30 @@ namespace Coda.Tui.Ui.Models;
 ///
 /// <para>This type holds no I/O and no Terminal.Gui driver dependency — it can be created and asserted
 /// in unit tests without initializing an application. Column order: Status, Id, DisplayName, Context,
-/// Reasoning.</para>
+/// Effort.</para>
 /// </summary>
 internal sealed class ModelTableSource : ITableSource
 {
-    private static readonly string[] ColumnNamesArray = ["Status", "Id", "Name", "Ctx", "Reasoning"];
+    private static readonly string[] ColumnNamesArray = ["Status", "Id", "Name", "Ctx", "Effort"];
 
     private readonly IReadOnlyList<ModelListEntry> models;
     private readonly string? currentModelId;
     private readonly StatusGlyphs glyphs;
+    private readonly string? selectedModelId;
+    private readonly IReadOnlyDictionary<string, string>? effortByModel;
 
-    public ModelTableSource(IReadOnlyList<ModelListEntry> models, string? currentModelId, StatusGlyphs glyphs)
+    public ModelTableSource(
+        IReadOnlyList<ModelListEntry> models,
+        string? currentModelId,
+        StatusGlyphs glyphs,
+        string? selectedModelId = null,
+        IReadOnlyDictionary<string, string>? effortByModel = null)
     {
         this.models = models ?? [];
         this.currentModelId = currentModelId;
         this.glyphs = glyphs ?? StatusGlyphs.Unicode;
+        this.selectedModelId = selectedModelId;
+        this.effortByModel = effortByModel;
     }
 
     /// <inheritdoc/>
@@ -47,7 +56,7 @@ internal sealed class ModelTableSource : ITableSource
                 1 => TerminalTextSanitizer.SanitizeSingleLine(model.Id),
                 2 => TerminalTextSanitizer.SanitizeSingleLine(model.DisplayName ?? string.Empty),
                 3 => model.ContextLimit is int ctx ? FormatContext(ctx) : string.Empty,
-                4 => FormatReasoningLevels(model.ReasoningLevels),
+                4 => this.RenderEffortCell(model),
                 _ => string.Empty,
             };
         }
@@ -77,13 +86,32 @@ internal sealed class ModelTableSource : ITableSource
         _ => tokens.ToString(),
     };
 
-    private static string FormatReasoningLevels(IReadOnlyList<string>? levels)
+    /// <summary>
+    /// Renders the Effort cell for a given model row. The focused row shows <c>← value →</c> so the user
+    /// can see that ←/→ will cycle the value; all other rows show the plain chosen level (or <c>auto</c>).
+    /// Models with no reasoning levels show an em dash to indicate no effort control exists.
+    /// </summary>
+    private string RenderEffortCell(ModelListEntry model)
     {
-        if (levels is null or { Count: 0 })
+        if (model.ReasoningLevels is null or { Count: 0 })
         {
-            return string.Empty;
+            return "—";
         }
 
-        return TerminalTextSanitizer.SanitizeSingleLine(string.Join(", ", levels));
+        string value;
+        if (this.effortByModel is not null &&
+            this.effortByModel.TryGetValue(model.Id, out var stored))
+        {
+            value = TerminalTextSanitizer.SanitizeSingleLine(stored);
+        }
+        else
+        {
+            value = "auto";
+        }
+
+        var isSelected = this.selectedModelId is not null &&
+            string.Equals(model.Id, this.selectedModelId, StringComparison.OrdinalIgnoreCase);
+
+        return isSelected ? $"← {value} →" : value;
     }
 }

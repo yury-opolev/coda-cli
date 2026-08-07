@@ -304,11 +304,16 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// Opens the model browser, returns the selected model id, or <c>null</c> when the user dismisses.
     /// Marshals to the UI thread, so the caller may be on any thread.
     /// </summary>
-    internal Task<string?> SelectModelAsync(ModelListResult result, string? currentModelId, CancellationToken cancellationToken)
+    /// <summary>
+    /// Opens the model browser, returns the selected model and effort, or <c>null</c> when the user
+    /// dismisses. Marshals to the UI thread, so the caller may be on any thread.
+    /// </summary>
+    internal Task<ModelSelection?> SelectModelAsync(ModelListResult result, string? currentModelId,
+        CancellationToken cancellationToken, IReadOnlyDictionary<string, string>? initialEffortByModel = null)
     {
         ArgumentNullException.ThrowIfNull(result);
 
-        var tcs = new TaskCompletionSource<string?>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var tcs = new TaskCompletionSource<ModelSelection?>(TaskCreationOptions.RunContinuationsAsynchronously);
         var reg = cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken));
 
         tcs.Task.ContinueWith(
@@ -330,7 +335,8 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
                 // Mutual exclusion: hide any currently visible browser before opening the model one.
                 this.HideAllBrowsersExcept(this.modelBrowserOverlay);
 
-                this.modelBrowserOverlay.Show(result, currentModelId, id => tcs.TrySetResult(id));
+                this.modelBrowserOverlay.Show(result, currentModelId, s => tcs.TrySetResult(s),
+                    initialEffortByModel: initialEffortByModel);
             });
         }
         catch (Exception ex)
@@ -342,8 +348,9 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     }
 
     /// <inheritdoc/>
-    Task<string?> IModelBrowserService.SelectModelAsync(ModelListResult result, string? currentModelId, CancellationToken cancellationToken)
-        => this.SelectModelAsync(result, currentModelId, cancellationToken);
+    Task<ModelSelection?> IModelBrowserService.SelectModelAsync(ModelListResult result, string? currentModelId,
+        CancellationToken cancellationToken, IReadOnlyDictionary<string, string>? initialEffortByModel)
+        => this.SelectModelAsync(result, currentModelId, cancellationToken, initialEffortByModel);
 
     /// <summary>
     /// The slash-command completion menu, owned here and synchronized from the composer. Concrete shells

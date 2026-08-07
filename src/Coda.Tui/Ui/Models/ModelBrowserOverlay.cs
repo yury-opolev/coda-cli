@@ -41,7 +41,7 @@ internal sealed class ModelBrowserOverlay : View
     private string filterBuffer = string.Empty;
 
     // Completion callback set on each Show call; null when no session is active.
-    private Action<string?>? onCompleted;
+    private Action<ModelSelection?>? onCompleted;
 
     // Reload factory set on each Show call; null when the caller cannot supply fresh data.
     private Func<CancellationToken, Task<ModelListResult>>? reloadFactory;
@@ -143,8 +143,9 @@ internal sealed class ModelBrowserOverlay : View
     public void Show(
         ModelListResult result,
         string? currentModelId,
-        Action<string?> onCompleted,
-        Func<CancellationToken, Task<ModelListResult>>? onReload = null)
+        Action<ModelSelection?> onCompleted,
+        Func<CancellationToken, Task<ModelListResult>>? onReload = null,
+        IReadOnlyDictionary<string, string>? initialEffortByModel = null)
     {
         ArgumentNullException.ThrowIfNull(result);
         ArgumentNullException.ThrowIfNull(onCompleted);
@@ -161,7 +162,7 @@ internal sealed class ModelBrowserOverlay : View
             this.active = true;
         }
 
-        this.controller.Open(result, currentModelId);
+        this.controller.Open(result, currentModelId, initialEffortByModel);
         this.Visible = true;
         this.SetFocus();
         this.Render();
@@ -180,7 +181,7 @@ internal sealed class ModelBrowserOverlay : View
         this.onChanged?.Invoke();
     }
 
-    private void Teardown(string? result)
+    private void Teardown(ModelSelection? result)
     {
         this.active = false;
         this.controller.Changed -= this.OnControllerChanged;
@@ -287,16 +288,30 @@ internal sealed class ModelBrowserOverlay : View
 
             case ModelBrowserCommand.Select:
             {
-                var selected = this.controller.State.SelectedId;
+                var state = this.controller.State;
+                var selected = state.SelectedId;
                 if (selected is not null)
                 {
-                    this.Teardown(selected);
+                    // Convert "auto" (the display sentinel) to null so callers can distinguish
+                    // "user explicitly chose auto" from "user made no choice at all".
+                    var rawEffort = state.EffortFor(selected);
+                    var effort = string.Equals(rawEffort, "auto", StringComparison.OrdinalIgnoreCase)
+                        ? null : rawEffort;
+                    this.Teardown(new ModelSelection(selected, effort) { EffortChosen = true });
                     this.Visible = false;
                     this.onChanged?.Invoke();
                 }
 
                 return true;
             }
+
+            case ModelBrowserCommand.EffortLeft:
+                this.controller.CycleEffort(-1);
+                return true;
+
+            case ModelBrowserCommand.EffortRight:
+                this.controller.CycleEffort(+1);
+                return true;
 
             case ModelBrowserCommand.Reload:
                 this.StartReload();
@@ -412,7 +427,8 @@ internal sealed class ModelBrowserOverlay : View
         this.header.Text = $" Models{currentLabel}{sourceLabel}{warning}";
 
         // Build / update the table source.
-        var source2 = new ModelTableSource(filtered, state.CurrentModelId, this.statusGlyphs);
+        var source2 = new ModelTableSource(filtered, state.CurrentModelId, this.statusGlyphs,
+            state.SelectedId, state.EffortByModel);
         this.ListTableSource = source2;
         this.listTable.Table = source2;
 
@@ -442,7 +458,7 @@ internal sealed class ModelBrowserOverlay : View
             this.status.Text = string.Empty;
         }
 
-        this.footer.Text = " ↑/↓ k/j move · Enter select · r reload · / filter · Esc q close";
+        this.footer.Text = " ↑/↓ k/j move · ←/→ effort · Enter select · r reload · / filter · Esc q close";
     }
 
     // Sync the table's visual selection without re-building the source (called after navigation).
