@@ -146,6 +146,67 @@ public sealed class McpEditorFormTests : IDisposable
                 && !tf.ReadOnly);
     }
 
+    /// <summary>
+    /// A MANAGED value is a <c>coda-secret:</c> reference whose real content lives encrypted in the
+    /// credential store. It is shown — it is only a pointer, not a secret — but must NOT be
+    /// editable: retyping it in place would write a secret into .mcp.json in cleartext, and a single
+    /// stray keystroke would dangle the reference and let the post-save sweep delete the only copy
+    /// of the credential. Replacing it goes through the encrypt modal instead.
+    /// </summary>
+    [Fact]
+    public void A_managed_env_value_is_shown_but_not_editable()
+    {
+        const string reference = "coda-secret:mcp:server/env/TOKEN";
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment:
+            [
+                new McpNamedSecretDraft(
+                    "TOKEN",
+                    McpSecretSource.Managed,
+                    new McpSecretChange("env/TOKEN", McpSecretChangeKind.Unchanged),
+                    Value: reference),
+            ],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        var editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+        {
+            SelectedItem = 0,
+        };
+
+        this.form.ApplyState(editor);
+        this.application.LayoutAndDraw();
+
+        var field = Assert.Single(
+            AllTextFields(this.form),
+            tf => (tf.Text ?? string.Empty).Contains(reference, StringComparison.Ordinal));
+        Assert.True(field.ReadOnly);
+    }
+
+    /// <summary>The raw value must not leak through the record's generated formatting.</summary>
+    [Fact]
+    public void A_named_value_is_masked_in_its_string_representation()
+    {
+        const string secret = "ghp_a_real_looking_token";
+        var item = new McpNamedSecretDraft(
+            "TOKEN",
+            McpSecretSource.Literal,
+            new McpSecretChange("env/TOKEN", McpSecretChangeKind.Unchanged),
+            Value: secret);
+
+        Assert.DoesNotContain(secret, item.ToString(), StringComparison.Ordinal);
+        Assert.Contains("TOKEN", item.ToString(), StringComparison.Ordinal);
+    }
+
     // ── field group labelling ─────────────────────────────────────────────────
 
     /// <summary>

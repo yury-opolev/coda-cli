@@ -199,4 +199,59 @@ public sealed class ModelBrowserSelectionTests
 
         Assert.Contains(events.Events, e => e is SessionMetadataChangedEvent);
     }
+
+    /// <summary>
+    /// Copilot/OpenAI models advertise their levels at runtime rather than through static rules, so
+    /// the capability must be resolved WITH those levels. Resolving without them reports every such
+    /// model as unsupported, which silently resolves the picked level to null — the session then
+    /// reasons at the model default while the status bar agrees with the wrong value.
+    /// </summary>
+    [Fact]
+    public async Task A_level_picked_for_a_copilot_model_reaches_the_session()
+    {
+        const string copilot = "github-copilot";
+        var prompts = new RecordingPromptService(new UiPromptResponse(false, [], null));
+        var (_, context, _, _) = TestAppBuilder.BuildApp(prompts: prompts);
+        context.Session.ActiveProviderId = copilot;
+        context.Session.Model = "gpt-5.5";
+        context.ModelBrowserService = new StubBrowser(
+            new ModelSelection("gpt-5.6-sol", "xhigh") { EffortChosen = true });
+        context.Session.ModelListCache[copilot] = new ModelListResult(
+            copilot,
+            ModelSource.Live,
+            [
+                new ModelListEntry("gpt-5.5", "GPT-5.5", 400_000, ["low", "medium", "high"]),
+                new ModelListEntry("gpt-5.6-sol", "Sol", 400_000, ["low", "medium", "high", "xhigh"]),
+            ]);
+        var command = new ModelCommand((_, _) => "note", (_, _, _) => "saved");
+
+        await command.ExecuteAsync(context, [], CancellationToken.None);
+
+        Assert.Equal("gpt-5.6-sol", context.Session.Model);
+        Assert.Equal("xhigh", context.Session.EffortByModel[$"{copilot}/gpt-5.6-sol"]);
+        Assert.Equal("xhigh", context.Session.Effort);
+    }
+
+    /// <summary>Switching TO a Copilot model must likewise restore its stored level, not drop it.</summary>
+    [Fact]
+    public async Task Switching_to_a_copilot_model_restores_its_stored_level()
+    {
+        const string copilot = "github-copilot";
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.Session.ActiveProviderId = copilot;
+        context.Session.Model = "gpt-5.5";
+        context.Session.EffortByModel[$"{copilot}/gpt-5.6-sol"] = "xhigh";
+        context.Session.ModelListCache[copilot] = new ModelListResult(
+            copilot,
+            ModelSource.Live,
+            [
+                new ModelListEntry("gpt-5.5", "GPT-5.5", 400_000, ["low", "medium", "high"]),
+                new ModelListEntry("gpt-5.6-sol", "Sol", 400_000, ["low", "medium", "high", "xhigh"]),
+            ]);
+
+        var command = new ModelCommand((_, _) => "note", (_, _, _) => "saved");
+        await command.ExecuteAsync(context, ["gpt-5.6-sol"], CancellationToken.None);
+
+        Assert.Equal("xhigh", context.Session.Effort);
+    }
 }

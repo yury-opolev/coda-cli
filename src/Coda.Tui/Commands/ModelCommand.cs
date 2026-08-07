@@ -100,7 +100,9 @@ public sealed class ModelCommand : ISlashCommand
                 {
                     // EffortByModel keeps the RAW choice; Session.Effort keeps the RESOLVED one, so a
                     // level this model clamps (e.g. "max" on Sonnet) behaves exactly as /effort does.
-                    var capability = ReasoningCapabilityResolver.Resolve(providerId, selection.ModelId);
+                    // Resolution MUST go through EffortCommand so the model's advertised levels are
+                    // consulted — a Copilot model resolves to "unsupported" without them.
+                    var capability = EffortCommand.ResolveCapability(context, selection.ModelId);
                     context.Session.EffortByModel[effortKey] = selection.Effort;
                     context.Session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(
                         capability, selection.Effort);
@@ -135,10 +137,12 @@ public sealed class ModelCommand : ISlashCommand
         context.Session.Model = model;
 
         // Restore the persisted effort for the new (provider, model) key, resolved through the
-        // capability resolver so a stale or unsupported stored level is clamped or dropped.
+        // capability resolver so a stale or unsupported stored level is clamped or dropped. The
+        // model's advertised levels come from the session cache — without them a Copilot model
+        // reports "unsupported" and the restored level is silently thrown away.
         var effortKey = $"{context.ActiveProvider.Id}/{model}";
         context.Session.EffortByModel.TryGetValue(effortKey, out var storedEffort);
-        var effortCapability = ReasoningCapabilityResolver.Resolve(context.ActiveProvider.Id, model);
+        var effortCapability = EffortCommand.ResolveCapability(context, model);
         context.Session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(effortCapability, storedEffort);
 
         var note = this.persistModel(context.ActiveProvider.Id, model);

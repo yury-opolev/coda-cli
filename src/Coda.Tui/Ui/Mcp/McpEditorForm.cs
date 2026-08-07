@@ -894,10 +894,21 @@ internal sealed class McpEditorForm : View
         // Modal-entered secrets (Replace) and explicit removals (Remove) are masked — the real
         // replacement must never appear in a TextField.  Ordinary values (Unchanged or a newly
         // typed literal) are shown plainly and are editable.
+        //
+        // A MANAGED value is shown but NOT editable. It is a `coda-secret:` reference whose real
+        // value lives encrypted in the credential store, so retyping it in place would either write
+        // a secret into .mcp.json in cleartext or — with one stray keystroke — dangle the reference
+        // and let the post-save sweep delete the only copy of the credential. Replacing it goes
+        // through the encrypt modal (Enter), which the footer advertises.
         if (named?.Change.Kind == McpSecretChangeKind.Replace
             || named?.Change.Kind == McpSecretChangeKind.Remove)
         {
             mapRow.Value.Text = FormatSecret(named.Change);
+            mapRow.Value.ReadOnly = true;
+        }
+        else if (named?.ExistingSource == McpSecretSource.Managed)
+        {
+            mapRow.Value.Text = named.Value;
             mapRow.Value.ReadOnly = true;
         }
         else

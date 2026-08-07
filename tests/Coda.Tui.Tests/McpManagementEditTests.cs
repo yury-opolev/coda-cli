@@ -2322,6 +2322,51 @@ public sealed class McpManagementEditTests
         Assert.Equal("bar", config.Env["FOO"]);
     }
 
+    /// <summary>
+    /// A managed value must never be demoted to a literal by an edited display string. Its real
+    /// content is encrypted in the credential store, so writing the display text out would either
+    /// put a secret into .mcp.json in cleartext or persist a dangling reference — after which the
+    /// post-save sweep deletes the only copy of the credential. The editor keeps such rows
+    /// read-only; this is the service-level guarantee for every other caller.
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_never_demotes_a_managed_value_to_a_literal()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        await harness.Store.SetAsync("mcp:server/env/TOKEN", "ghp_real_secret");
+        harness.WriteProject(
+            """{"mcpServers":{"server":{"command":"node","env":{"TOKEN":"coda-secret:mcp:server/env/TOKEN"}}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+        Assert.Equal(McpSecretSource.Managed, draft.Environment[0].ExistingSource);
+
+        // Simulate an edit that the read-only field prevents in the UI but a stale or scripted
+        // draft could still carry: the reference overwritten with the plaintext secret.
+        var tampered = draft with
+        {
+            Environment = draft.Environment.SetItem(
+                0,
+                draft.Environment[0] with { Value = "ghp_real_secret" }),
+        };
+
+        var preview = await harness.Service.PrepareEditAsync(original, tampered, CancellationToken.None);
+        await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        // The reference survives; the secret never lands in .mcp.json.
+        Assert.Equal("coda-secret:mcp:server/env/TOKEN", config.Env["TOKEN"]);
+        Assert.DoesNotContain(
+            "ghp_real_secret",
+            Encoding.UTF8.GetString(harness.ReadProjectBytes()),
+            StringComparison.Ordinal);
+
+        // ...and the encrypted copy is still there.
+        Assert.Equal("ghp_real_secret", await harness.Store.GetAsync("mcp:server/env/TOKEN", CancellationToken.None));
+    }
+
     /// <summary>An added row the user never filled in is still dropped rather than written empty.</summary>
     [Fact]
     public async Task Commit_add_drops_an_env_row_with_no_value()

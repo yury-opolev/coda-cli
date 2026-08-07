@@ -3375,6 +3375,17 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 continue;
             }
 
+            // Never demote a managed value to a literal. Its real content lives encrypted in the
+            // credential store, so writing the display text out would either put a secret into
+            // .mcp.json in cleartext or persist a dangling reference — and the post-save sweep
+            // would then delete the only copy. The editor keeps these rows read-only; this is the
+            // matching guarantee for any other caller (the CLI, a future surface, a stale draft).
+            if (item.ExistingSource == McpSecretSource.Managed)
+            {
+                result.Add(item);
+                continue;
+            }
+
             if (item.Value.Length == 0 && baselineItem is null)
             {
                 // A brand-new row the user never filled in: leave it for the commit path to drop.

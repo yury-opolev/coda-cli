@@ -285,26 +285,29 @@ public sealed class EffortCommand : ISlashCommand
     }
 
     /// <summary>
-    /// Resolves the <see cref="ReasoningCapability"/> for the current session synchronously,
-    /// reading only from the in-session model-list cache (populated by <c>/model</c>).
-    /// Used by <see cref="SessionMetadataEvents"/> and other non-async callers that only
-    /// need the best-available cached info. For the interactive /effort command, prefer
-    /// <see cref="ResolveCapabilityAsync"/> which lazily fetches when the cache is empty.
+    /// Resolves the <see cref="ReasoningCapability"/> for a model synchronously, reading only from
+    /// the in-session model-list cache (populated by <c>/model</c>). Defaults to the session's
+    /// current model.
     /// </summary>
-    internal static ReasoningCapability ResolveCapability(CommandContext context)
+    /// <remarks>
+    /// Passing the cached <c>ReasoningLevels</c> is what makes this correct for Copilot/OpenAI
+    /// models, whose levels are advertised at runtime rather than derived from static rules. The
+    /// two-argument <see cref="ReasoningCapabilityResolver.Resolve(string, string)"/> reports every
+    /// such model as UNSUPPORTED, which silently resolves any chosen level to null — so every
+    /// caller that applies an effort must come through here.
+    /// </remarks>
+    internal static ReasoningCapability ResolveCapability(CommandContext context, string? modelId = null)
     {
+        var model = modelId ?? context.Session.Model;
         IReadOnlyList<string>? reasoningLevels = null;
         if (context.Session.ModelListCache.TryGetValue(context.ActiveProvider.Id, out var list))
         {
             reasoningLevels = list.Models
-                .FirstOrDefault(m => string.Equals(m.Id, context.Session.Model, StringComparison.OrdinalIgnoreCase))
+                .FirstOrDefault(m => string.Equals(m.Id, model, StringComparison.OrdinalIgnoreCase))
                 ?.ReasoningLevels;
         }
 
-        return ReasoningCapabilityResolver.Resolve(
-            context.ActiveProvider.Id,
-            context.Session.Model,
-            reasoningLevels);
+        return ReasoningCapabilityResolver.Resolve(context.ActiveProvider.Id, model, reasoningLevels);
     }
 
     /// <summary>

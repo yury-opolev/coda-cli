@@ -84,7 +84,22 @@ public sealed record McpNamedSecretDraft(
     /// replacement keeps <see cref="McpSecretChangeKind.Replace"/> on the <see cref="Change"/>
     /// and is never placed in this field.
     /// </summary>
-    string Value = "");
+    string Value = "")
+{
+    /// <summary>
+    /// Keeps <see cref="Value"/> out of the generated <c>ToString()</c>. Nothing logs a draft today,
+    /// but the value is the raw <c>.mcp.json</c> content — a literal one IS the secret — and a
+    /// record's default formatting would put it into any future log or telemetry line for free.
+    /// </summary>
+    private bool PrintMembers(System.Text.StringBuilder builder)
+    {
+        builder.Append("Name = ").Append(this.Name)
+            .Append(", ExistingSource = ").Append(this.ExistingSource)
+            .Append(", Change = ").Append(this.Change)
+            .Append(", Value = *****");
+        return true;
+    }
+}
 
 public sealed record McpSecretDescriptor(
     string Field,
