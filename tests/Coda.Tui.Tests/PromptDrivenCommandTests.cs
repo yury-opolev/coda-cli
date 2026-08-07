@@ -71,7 +71,11 @@ public sealed class PromptDrivenCommandTests : IDisposable
 
         var selected = await ModelCommand.ChooseModelAsync(built.Context, models);
 
-        Assert.Equal("model-b", selected);
+        Assert.Equal("model-b", selected?.ModelId);
+
+        // The generic prompt has no effort control, so it must report "no opinion" rather than a
+        // choice of auto — otherwise switching model here would clear the model's saved level.
+        Assert.False(selected?.EffortChosen);
         Assert.Equal("Choose a model", Assert.Single(prompts.Requests).Title);
     }
 

@@ -2,6 +2,7 @@ using Coda.Agent.Settings;
 using Coda.Sdk;
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
+using Coda.Tui.Ui.Models;
 using Coda.Tui.Ui.Prompts;
 using LlmClient;
 using Spectre.Console;
@@ -17,15 +18,24 @@ namespace Coda.Tui.Commands;
 public sealed class ModelCommand : ISlashCommand
 {
     private readonly Func<string, string, string> persistModel;
+    private readonly Func<string, string, string?, string> persistEffort;
 
     public ModelCommand()
         : this(TryPersistModelForProvider)
     {
     }
 
-    internal ModelCommand(Func<string, string, string> persistModel)
+    /// <summary>
+    /// Test seam. <paramref name="persistEffort"/> defaults to the real settings writer; tests inject
+    /// a recorder so the browser-selection path (which is the only place effort is persisted from
+    /// here) can be asserted without touching settings.json.
+    /// </summary>
+    internal ModelCommand(
+        Func<string, string, string> persistModel,
+        Func<string, string, string?, string>? persistEffort = null)
     {
         this.persistModel = persistModel ?? throw new ArgumentNullException(nameof(persistModel));
+        this.persistEffort = persistEffort ?? EffortCommand.TryPersistEffortForModel;
     }
 
     public string Name => "model";
@@ -72,13 +82,38 @@ public sealed class ModelCommand : ISlashCommand
         // the choice; otherwise print the list and never await a prompt.
         if (context.Prompts.IsInteractive)
         {
-            var chosen = await ChooseModelAsync(context, result, cancellationToken).ConfigureAwait(false);
-            if (chosen is null)
+            var selection = await ChooseModelAsync(context, result, cancellationToken).ConfigureAwait(false);
+            if (selection is null)
             {
                 return CommandResult.Continue; // dismissed — no model change persisted
             }
 
-            this.ApplyModel(context, chosen);
+            this.ApplyModel(context, selection.ModelId);
+
+            // Only the browser offers an effort control; the generic prompt fallback must not touch
+            // a saved level just because the user switched model through it.
+            if (selection.EffortChosen)
+            {
+                var effortKey = $"{providerId}/{selection.ModelId}";
+                context.Session.EffortByModel.TryGetValue(effortKey, out var existingEffort);
+                if (!string.Equals(selection.Effort, existingEffort, StringComparison.OrdinalIgnoreCase))
+                {
+                    // EffortByModel keeps the RAW choice; Session.Effort keeps the RESOLVED one, so a
+                    // level this model clamps (e.g. "max" on Sonnet) behaves exactly as /effort does.
+                    // Resolution MUST go through EffortCommand so the model's advertised levels are
+                    // consulted — a Copilot model resolves to "unsupported" without them.
+                    var capability = EffortCommand.ResolveCapability(context, selection.ModelId);
+                    context.Session.EffortByModel[effortKey] = selection.Effort;
+                    context.Session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(
+                        capability, selection.Effort);
+                    this.persistEffort(providerId, selection.ModelId, selection.Effort);
+
+                    // ApplyModel publishes before the effort is settled — and not at all when the
+                    // model is unchanged — so the status line needs this to see the new level.
+                    SessionMetadataEvents.Publish(context);
+                }
+            }
+
             return CommandResult.Continue;
         }
 
@@ -102,10 +137,12 @@ public sealed class ModelCommand : ISlashCommand
         context.Session.Model = model;
 
         // Restore the persisted effort for the new (provider, model) key, resolved through the
-        // capability resolver so a stale or unsupported stored level is clamped or dropped.
+        // capability resolver so a stale or unsupported stored level is clamped or dropped. The
+        // model's advertised levels come from the session cache — without them a Copilot model
+        // reports "unsupported" and the restored level is silently thrown away.
         var effortKey = $"{context.ActiveProvider.Id}/{model}";
         context.Session.EffortByModel.TryGetValue(effortKey, out var storedEffort);
-        var effortCapability = ReasoningCapabilityResolver.Resolve(context.ActiveProvider.Id, model);
+        var effortCapability = EffortCommand.ResolveCapability(context, model);
         context.Session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(effortCapability, storedEffort);
 
         var note = this.persistModel(context.ActiveProvider.Id, model);
@@ -120,7 +157,7 @@ public sealed class ModelCommand : ISlashCommand
     /// prompt overlay handles the selection. Returns the chosen model id, or <c>null</c> when the
     /// surface is non-interactive or the user dismisses — the caller mutates nothing until an id returns.
     /// </summary>
-    internal static async Task<string?> ChooseModelAsync(
+    internal static async Task<ModelSelection?> ChooseModelAsync(
         CommandContext context,
         ModelListResult models,
         CancellationToken cancellationToken = default)
@@ -128,8 +165,21 @@ public sealed class ModelCommand : ISlashCommand
         // Prefer the dedicated browser overlay when the shell wires it (Terminal.Gui modes).
         if (context.ModelBrowserService is { } browser)
         {
-            return await browser.SelectModelAsync(models, context.Session.Model, cancellationToken)
-                .ConfigureAwait(false);
+            // Seed the browser with per-model efforts already persisted for THIS provider. The
+            // session dictionary is keyed "{provider}/{model}" but the browser looks rows up by the
+            // bare ModelListEntry.Id, so the prefix must be stripped — otherwise no row ever shows
+            // its saved level, and a plain Enter would then report "auto" and wipe it.
+            var prefix = models.ProviderId + "/";
+            var initialEfforts = context.Session.EffortByModel
+                .Where(kvp => kvp.Value is not null
+                    && kvp.Key.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+                .ToDictionary(
+                    kvp => kvp.Key[prefix.Length..],
+                    kvp => kvp.Value!,
+                    StringComparer.OrdinalIgnoreCase);
+
+            return await browser.SelectModelAsync(models, context.Session.Model, cancellationToken,
+                initialEfforts).ConfigureAwait(false);
         }
 
         if (!context.Prompts.IsInteractive)
@@ -170,7 +220,8 @@ public sealed class ModelCommand : ISlashCommand
             return null;
         }
 
-        return response.SelectedIds[0];
+        // The generic prompt has no effort picker, so effort is null (auto / unchanged).
+        return new ModelSelection(response.SelectedIds[0], null);
     }
 
     private async Task<ModelListResult> ResolveAsync(CommandContext context, bool refresh, CancellationToken cancellationToken)

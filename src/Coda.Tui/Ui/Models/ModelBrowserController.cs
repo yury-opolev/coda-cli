@@ -37,17 +37,24 @@ internal sealed class ModelBrowserController
 
     /// <summary>
     /// Seeds state from the given <paramref name="result"/> and <paramref name="currentModelId"/>, then
-    /// raises <see cref="Changed"/>.
+    /// raises <see cref="Changed"/>. When <paramref name="initialEfforts"/> is provided the browser opens
+    /// with those staged efforts pre-populated so existing per-model choices are immediately visible.
     /// </summary>
-    public void Open(ModelListResult result, string? currentModelId)
+    public void Open(ModelListResult result, string? currentModelId,
+        IReadOnlyDictionary<string, string>? initialEfforts = null)
     {
         ArgumentNullException.ThrowIfNull(result);
 
         lock (this.sync)
         {
             this.open = true;
+
+            var effortMap = initialEfforts is { Count: > 0 }
+                ? ModelBrowserState.EmptyEffortMap.AddRange(initialEfforts)
+                : ModelBrowserState.EmptyEffortMap;
+
             this.state = ModelBrowserState.Empty
-                .WithResult(result) with { CurrentModelId = currentModelId };
+                .WithResult(result) with { CurrentModelId = currentModelId, EffortByModel = effortMap };
 
             // Pre-select the current model so the cursor lands on it when the browser opens.
             if (currentModelId is not null)
@@ -111,6 +118,17 @@ internal sealed class ModelBrowserController
         lock (this.sync)
         {
             this.state = this.state.MoveSelection(int.MaxValue / 2);
+        }
+
+        this.RaiseChanged();
+    }
+
+    /// <summary>Cycles the selected row's staged effort by <paramref name="direction"/> (+1 or -1), clamped.</summary>
+    public void CycleEffort(int direction)
+    {
+        lock (this.sync)
+        {
+            this.state = this.state.CycleEffort(direction);
         }
 
         this.RaiseChanged();

@@ -1228,12 +1228,15 @@ internal sealed partial class McpManagementService : IMcpManagementService
                     .ConfigureAwait(false);
             }
 
-            var finalDraft = original is null
-                ? draft
-                : PreserveUnchangedNonSecretValues(
-                    draft,
-                    this.CreateDraft(original, currentRevision, draft.DraftId),
-                    original.Config);
+            // Env/header values are reconciled on BOTH paths: on add the baseline is empty, so a
+            // value typed into a new row is promoted to a literal write instead of being dropped.
+            var commitBaseline = original is null
+                ? null
+                : this.CreateDraft(original, currentRevision, draft.DraftId);
+            var reconciledDraft = ReconcileNamedSecrets(draft, commitBaseline);
+            var finalDraft = original is null || commitBaseline is null
+                ? reconciledDraft
+                : PreserveUnchangedNonSecretValues(reconciledDraft, commitBaseline, original.Config);
             var renamed = original is not null
                 && !string.Equals(original.Key.Name, finalDraft.Name, StringComparison.Ordinal);
             var config = await this.BuildFinalConfigAsync(
@@ -3243,54 +3246,172 @@ internal sealed partial class McpManagementService : IMcpManagementService
     {
         var originalStdio = original as McpStdioServerConfig;
         var originalHttp = original as McpHttpServerConfig;
-        return draft.Transport switch
+        var reconciled = draft;
+
+        return reconciled.Transport switch
         {
-            McpTransportKind.Stdio => draft with
+            McpTransportKind.Stdio => reconciled with
             {
                 Command = originalStdio is not null
                     && baseline.Transport == McpTransportKind.Stdio
-                    && string.Equals(draft.Command, baseline.Command, StringComparison.Ordinal)
+                    && string.Equals(reconciled.Command, baseline.Command, StringComparison.Ordinal)
                     ? originalStdio.Command
-                    : draft.Command,
+                    : reconciled.Command,
                 Args = MergeDraftListValues(
                     originalStdio?.Args ?? [],
                     originalStdio is not null && baseline.Transport == McpTransportKind.Stdio
                         ? baseline.Args
                         : [],
-                    draft.Args,
-                    draft.DraftId,
+                    reconciled.Args,
+                    reconciled.DraftId,
                     originalStdio is not null && baseline.Transport == McpTransportKind.Stdio
                         ? baseline.ArgumentItems
                         : ImmutableArray<McpDraftListItem>.Empty,
-                    draft.ArgumentItems),
+                    reconciled.ArgumentItems),
             },
-            McpTransportKind.Http => draft with
+            McpTransportKind.Http => reconciled with
             {
                 Url = originalHttp is not null
                     && baseline.Transport == McpTransportKind.Http
-                    && !draft.UrlChanged
-                    && string.Equals(draft.Url, baseline.Url, StringComparison.Ordinal)
+                    && !reconciled.UrlChanged
+                    && string.Equals(reconciled.Url, baseline.Url, StringComparison.Ordinal)
                     ? originalHttp.Url.OriginalString
-                    : draft.Url,
+                    : reconciled.Url,
                 ClientId = originalHttp is not null
                     && baseline.Transport == McpTransportKind.Http
-                    && string.Equals(draft.ClientId, baseline.ClientId, StringComparison.Ordinal)
+                    && string.Equals(reconciled.ClientId, baseline.ClientId, StringComparison.Ordinal)
                     ? originalHttp.Auth.ClientId
-                    : draft.ClientId,
+                    : reconciled.ClientId,
                 Scopes = MergeDraftListValues(
                     originalHttp?.Auth.Scopes ?? [],
                     originalHttp is not null && baseline.Transport == McpTransportKind.Http
                         ? baseline.Scopes
                         : [],
-                    draft.Scopes,
-                    draft.DraftId,
+                    reconciled.Scopes,
+                    reconciled.DraftId,
                     originalHttp is not null && baseline.Transport == McpTransportKind.Http
                         ? baseline.ScopeItems
                         : ImmutableArray<McpDraftListItem>.Empty,
-                    draft.ScopeItems),
+                    reconciled.ScopeItems),
             },
             _ => throw new McpException("MCP configuration has an unsupported transport."),
         };
+    }
+
+    /// <summary>
+    /// Converts <see cref="McpSecretChangeKind.Unchanged"/> items whose display <c>Value</c>
+    /// differs from the baseline (i.e. the user edited the value field) into
+    /// <see cref="McpSecretChangeKind.Replace"/> / <see cref="McpSecretReplacement.Literal"/>
+    /// so the commit path writes the new value verbatim.  Items that were already set through
+    /// the modal secret path (<c>Replace</c>) or explicitly removed (<c>Remove</c>) are left
+    /// untouched — an explicit modal entry must always win.
+    /// </summary>
+    /// <summary>
+    /// Applies <see cref="ReconcileNamedValues"/> to a draft's env and headers. Split out of
+    /// <see cref="PreserveUnchangedNonSecretValues"/> because it must run on the ADD path too,
+    /// where there is no original config to preserve anything from but a typed value must still be
+    /// written rather than silently dropped.
+    /// </summary>
+    private static McpServerDraft ReconcileNamedSecrets(McpServerDraft draft, McpServerDraft? baseline) =>
+        draft with
+        {
+            Environment = ReconcileNamedValues(
+                draft.Environment,
+                baseline?.Environment ?? ImmutableArray<McpNamedSecretDraft>.Empty),
+            Headers = ReconcileNamedValues(
+                draft.Headers,
+                baseline?.Headers ?? ImmutableArray<McpNamedSecretDraft>.Empty),
+        };
+
+    /// <summary>
+    /// Reconciles the edited env/header items against the baseline the draft was opened from.
+    /// </summary>
+    /// <remarks>
+    /// An item the user never touched stays <see cref="McpSecretChangeKind.Unchanged"/> so the
+    /// commit path restores its ORIGINAL raw bytes — the displayed value is single-line-sanitized
+    /// and would otherwise be written back mangled. An item whose displayed value differs becomes a
+    /// literal replacement carrying exactly what was typed.
+    /// <para>
+    /// A baseline name that is no longer present was renamed away, so a synthetic
+    /// <see cref="McpSecretChangeKind.Remove"/> is appended for it. Without that the commit path's
+    /// "re-add every original key the draft does not mention" pass resurrects the old key and the
+    /// rename silently produces BOTH entries.
+    /// </para>
+    /// <para>
+    /// Consequence of sanitizing for display: two raw values that sanitize identically are
+    /// indistinguishable here, and retyping the exact displayed text counts as untouched (the raw
+    /// value wins). That is the deliberate trade-off of preserving raw bytes for untouched rows.
+    /// </para>
+    /// </remarks>
+    private static ImmutableArray<McpNamedSecretDraft> ReconcileNamedValues(
+        ImmutableArray<McpNamedSecretDraft> edited,
+        ImmutableArray<McpNamedSecretDraft> baseline)
+    {
+        var editedItems = edited.IsDefault ? ImmutableArray<McpNamedSecretDraft>.Empty : edited;
+        var baselineItems = baseline.IsDefault ? ImmutableArray<McpNamedSecretDraft>.Empty : baseline;
+        if (editedItems.IsEmpty && baselineItems.IsEmpty)
+        {
+            return edited;
+        }
+
+        var baselineByName = baselineItems.IsEmpty
+            ? new Dictionary<string, McpNamedSecretDraft>(0, StringComparer.Ordinal)
+            : baselineItems.ToDictionary(item => item.Name, StringComparer.Ordinal);
+
+        var result = ImmutableArray.CreateBuilder<McpNamedSecretDraft>(editedItems.Length);
+        foreach (var item in editedItems)
+        {
+            // Replace/Remove were set deliberately (the modal secret path, or Ctrl+R) and win.
+            if (item.Change.Kind != McpSecretChangeKind.Unchanged)
+            {
+                result.Add(item);
+                continue;
+            }
+
+            if (baselineByName.TryGetValue(item.Name, out var baselineItem)
+                && string.Equals(item.Value, baselineItem.Value, StringComparison.Ordinal))
+            {
+                result.Add(item);
+                continue;
+            }
+
+            // Never demote a managed value to a literal. Its real content lives encrypted in the
+            // credential store, so writing the display text out would either put a secret into
+            // .mcp.json in cleartext or persist a dangling reference — and the post-save sweep
+            // would then delete the only copy. The editor keeps these rows read-only; this is the
+            // matching guarantee for any other caller (the CLI, a future surface, a stale draft).
+            if (item.ExistingSource == McpSecretSource.Managed)
+            {
+                result.Add(item);
+                continue;
+            }
+
+            if (item.Value.Length == 0 && baselineItem is null)
+            {
+                // A brand-new row the user never filled in: leave it for the commit path to drop.
+                result.Add(item);
+                continue;
+            }
+
+            result.Add(item with
+            {
+                Change = new McpSecretChange(
+                    item.Change.Field,
+                    McpSecretChangeKind.Replace,
+                    McpSecretReplacement.Literal(item.Value)),
+            });
+        }
+
+        var editedNames = editedItems.Select(item => item.Name).ToHashSet(StringComparer.Ordinal);
+        foreach (var stale in baselineItems.Where(item => !editedNames.Contains(item.Name)))
+        {
+            result.Add(stale with
+            {
+                Change = new McpSecretChange(stale.Change.Field, McpSecretChangeKind.Remove),
+            });
+        }
+
+        return result.ToImmutable();
     }
 
     private static ImmutableArray<string> MergeDraftListValues(
@@ -3561,7 +3682,10 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 ClassifySecret(pair.Value),
                 new McpSecretChange(
                     $"{fieldPrefix}/{pair.Key}",
-                    McpSecretChangeKind.Unchanged)))
+                    McpSecretChangeKind.Unchanged),
+                // Surface the raw config value so the editor can display and edit it.  References
+                // like coda-secret: and ${VAR} are shown verbatim — they must never be resolved.
+                Value: SanitizeIdentifier(pair.Value)))
             .ToImmutableArray();
     }
 

@@ -12,11 +12,17 @@ public interface IModelBrowserService
 {
     /// <summary>
     /// Shows the model browser populated from <paramref name="result"/> with
-    /// <paramref name="currentModelId"/> marked. Returns the id of the chosen model, or <c>null</c>
-    /// when the user dismisses without selecting.
+    /// <paramref name="currentModelId"/> marked. Returns the selection (model id and effort), or
+    /// <c>null</c> when the user dismisses without selecting.
     /// </summary>
-    Task<string?> SelectModelAsync(
+    /// <param name="initialEffortByModel">
+    /// Optional pre-seeded per-model efforts (e.g. from the session) so existing choices appear in the
+    /// browser without the user needing to re-pick them. Keys are <c>"{providerId}/{modelId}"</c> or
+    /// just <c>modelId</c> — whatever the caller uses.
+    /// </param>
+    Task<ModelSelection?> SelectModelAsync(
         ModelListResult result,
         string? currentModelId,
-        CancellationToken cancellationToken = default);
+        CancellationToken cancellationToken = default,
+        IReadOnlyDictionary<string, string>? initialEffortByModel = null);
 }

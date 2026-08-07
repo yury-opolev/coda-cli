@@ -634,14 +634,21 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
 
         this.header.Text = SafeSingle($"MCP editor — {state.Editor?.Mode.ToString() ?? "unavailable"}");
         this.status.Text = SafeSingle(state.StatusMessage);
-        this.footer.Text = SafeSingle(
-            this.FooterForWidth(
-                "↑/↓ field · ←/→ option · Enter save · Ctrl+N add · Ctrl+R remove · Alt+↑/↓ reorder · Esc cancel",
-                "↑/↓ field · Enter save · Esc cancel"));
 
         if (state.Editor is { } editor)
         {
+            this.footer.Text = SafeSingle(
+                this.FooterForWidth(
+                    McpEditorHints.ForField(editor.FocusedField, editor.SelectedItemPart),
+                    McpEditorHints.Compact));
             this.editorForm.ApplyState(editor);
+        }
+        else
+        {
+            this.footer.Text = SafeSingle(
+                this.FooterForWidth(
+                    McpEditorHints.ForField(McpEditorField.Name, McpEditorItemPart.Value),
+                    McpEditorHints.Compact));
         }
     }
 

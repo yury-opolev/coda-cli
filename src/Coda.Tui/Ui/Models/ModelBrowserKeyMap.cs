@@ -21,6 +21,8 @@ internal static class ModelBrowserKeyMap
         if (key == Key.Enter) return ModelBrowserCommand.Select;
         if (key == new Key('r')) return ModelBrowserCommand.Reload;
         if (key == new Key('/')) return ModelBrowserCommand.Filter;
+        if (key == Key.CursorLeft) return ModelBrowserCommand.EffortLeft;
+        if (key == Key.CursorRight) return ModelBrowserCommand.EffortRight;
         return ModelBrowserCommand.None;
     }
 }

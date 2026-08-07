@@ -891,9 +891,33 @@ internal sealed class McpEditorForm : View
         mapRow.Name.Value = named?.Name ?? string.Empty;
         mapRow.Name.InsertionPoint = mapRow.Name.Text?.Length ?? 0;
 
-        // Invariant: the map VALUE is never an editable field. It is a read-only label showing the
-        // secret placeholder; the real value flows through the modal secret-prompt path.
-        mapRow.Value.Text = named is null ? "(unchanged)" : FormatSecret(named.Change);
+        // Modal-entered secrets (Replace) and explicit removals (Remove) are masked — the real
+        // replacement must never appear in a TextField.  Ordinary values (Unchanged or a newly
+        // typed literal) are shown plainly and are editable.
+        //
+        // A MANAGED value is shown but NOT editable. It is a `coda-secret:` reference whose real
+        // value lives encrypted in the credential store, so retyping it in place would either write
+        // a secret into .mcp.json in cleartext or — with one stray keystroke — dangle the reference
+        // and let the post-save sweep delete the only copy of the credential. Replacing it goes
+        // through the encrypt modal (Enter), which the footer advertises.
+        if (named?.Change.Kind == McpSecretChangeKind.Replace
+            || named?.Change.Kind == McpSecretChangeKind.Remove)
+        {
+            mapRow.Value.Text = FormatSecret(named.Change);
+            mapRow.Value.ReadOnly = true;
+        }
+        else if (named?.ExistingSource == McpSecretSource.Managed)
+        {
+            mapRow.Value.Text = named.Value;
+            mapRow.Value.ReadOnly = true;
+        }
+        else
+        {
+            mapRow.Value.Text = named?.Value ?? string.Empty;
+            mapRow.Value.InsertionPoint = mapRow.Value.Text?.Length ?? 0;
+            mapRow.Value.ReadOnly = false;
+        }
+
         mapRow.Visible = true;
     }
 
@@ -1059,8 +1083,10 @@ internal sealed class McpEditorForm : View
 
     /// <summary>
     /// Returns the pooled environment/header row for <paramref name="index"/>, creating and wiring
-    /// pooled widgets on demand. The name is an editable field; the value is a read-only label
-    /// (never a TextField — see <see cref="MapItemRow"/>).
+    /// pooled widgets on demand.  The name and value are both editable TextFields for ordinary
+    /// configuration; a value entered through the modal secret path is shown as <c>"*****"</c>
+    /// in the value TextField with <c>ReadOnly = true</c> so the real replacement never appears
+    /// in a plain text widget (see <see cref="MapItemRow"/>).
     /// </summary>
     private MapItemRow EnsureMapRow(List<MapItemRow> pool, int index, McpEditorField field)
     {
@@ -1083,6 +1109,12 @@ internal sealed class McpEditorForm : View
                 {
                     this.controller.UpdateEditorFocusItem(field, itemIndex, McpEditorItemPart.Name);
                 }
+            };
+            mapRow.Value.ValueChanged += (_, _) =>
+            {
+                if (this.suppressSync || mapRow.Value.ReadOnly) return;
+                var value = mapRow.Value.Text ?? string.Empty;
+                this.controller.UpdateEditorDraft(d => SetNamedValue(d, field, itemIndex, value));
             };
             mapRow.Value.HasFocusChanged += (sender, _) =>
             {
@@ -1124,11 +1156,28 @@ internal sealed class McpEditorForm : View
         if (field == McpEditorField.Environment)
         {
             if (draft.Environment.IsDefault || index >= draft.Environment.Length) return draft;
-            return draft with { Environment = draft.Environment.SetItem(index, draft.Environment[index] with { Name = value }) };
+            var item = draft.Environment[index];
+            // Keep Change.Field aligned with the name so normalization validation passes.
+            var change = item.Change with { Field = $"env/{value}" };
+            return draft with { Environment = draft.Environment.SetItem(index, item with { Name = value, Change = change }) };
         }
 
         if (draft.Headers.IsDefault || index >= draft.Headers.Length) return draft;
-        return draft with { Headers = draft.Headers.SetItem(index, draft.Headers[index] with { Name = value }) };
+        var headerItem = draft.Headers[index];
+        var headerChange = headerItem.Change with { Field = $"header/{value}" };
+        return draft with { Headers = draft.Headers.SetItem(index, headerItem with { Name = value, Change = headerChange }) };
+    }
+
+    private static McpServerDraft SetNamedValue(McpServerDraft draft, McpEditorField field, int index, string value)
+    {
+        if (field == McpEditorField.Environment)
+        {
+            if (draft.Environment.IsDefault || index >= draft.Environment.Length) return draft;
+            return draft with { Environment = draft.Environment.SetItem(index, draft.Environment[index] with { Value = value }) };
+        }
+
+        if (draft.Headers.IsDefault || index >= draft.Headers.Length) return draft;
+        return draft with { Headers = draft.Headers.SetItem(index, draft.Headers[index] with { Value = value }) };
     }
 
     private void WireValueChanged()
@@ -1216,7 +1265,7 @@ internal sealed class McpEditorForm : View
         this.ScopesSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Scopes); };
     }
     private static string FormatCount(int count) =>
-        count == 0 ? "(none)" : $"{count} item(s)";
+        count == 0 ? "(none) — Ctrl+N to add" : $"{count} item(s)";
 
     /// <summary>
     /// Creates a non-focusable label for the label column (X=<see cref="GutterWidth"/>,
@@ -1258,16 +1307,17 @@ internal sealed class McpEditorForm : View
         };
 
     /// <summary>
-    /// A single environment/header row: an editable name <see cref="TextField"/> next to a
-    /// read-only value <see cref="Label"/>. The value is DELIBERATELY a label and never a
-    /// <see cref="TextField"/> — this is the hard secret-safety invariant (spec §7.3): map values
-    /// only ever render as <c>"*****"</c>/<c>"(removed)"</c>/<c>"(unchanged)"</c> and their real
-    /// replacement flows through the modal secret-prompt path.
+    /// A single environment/header row: an editable name <see cref="TextField"/> next to an
+    /// editable value <see cref="TextField"/>.  Ordinary configuration values are shown plainly
+    /// and can be edited in place.  When a value was entered through the modal secret path
+    /// (<see cref="McpSecretChangeKind.Replace"/>), the value field is set to <c>"*****"</c>
+    /// and made read-only so the real replacement never reaches a plain text widget — the
+    /// hard secret-safety invariant (spec §7.3) is preserved for modal entries.
     /// </summary>
     private sealed class MapItemRow : View
     {
         internal readonly TextField Name;
-        internal readonly Label Value;
+        internal readonly TextField Value;
 
         internal MapItemRow(string id)
         {
@@ -1285,17 +1335,28 @@ internal sealed class McpEditorForm : View
                 Used = true,
             };
 
-            this.Value = new Label
+            // Non-focusable separator so the user can read the row as "name = value".
+            var separator = new Label
             {
-                Id = id + "Value",
-                X = Pos.Right(this.Name) + 1,
-                Width = Dim.Fill(),
+                Id = id + "Separator",
+                X = Pos.Right(this.Name),
+                Width = 3,
                 Height = 1,
-                CanFocus = true,
-                TabStop = TabBehavior.TabStop,
+                Text = " = ",
+                CanFocus = false,
             };
 
-            this.Add(this.Name, this.Value);
+            this.Value = new TextField
+            {
+                Id = id + "Value",
+                X = Pos.Right(separator),
+                Width = Dim.Fill(),
+                Height = 1,
+                TabStop = TabBehavior.TabStop,
+                Used = true,
+            };
+
+            this.Add(this.Name, separator, this.Value);
         }
     }
 }

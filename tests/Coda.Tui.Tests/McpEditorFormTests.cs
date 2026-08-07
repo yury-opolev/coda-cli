@@ -49,12 +49,12 @@ public sealed class McpEditorFormTests : IDisposable
     }
 
     /// <summary>
-    /// Task 8 invariant: environment/header VALUES are per-item rows too, but their value is a
-    /// read-only label — never a <see cref="TextField"/>. A secret env value must therefore never
-    /// reach a TextField, and must render as the masked placeholder.
+    /// Task 8 invariant (updated): environment/header values are now editable TextFields.  A
+    /// secret entered through the modal path (<see cref="McpSecretChangeKind.Replace"/>) must
+    /// NEVER appear in any TextField — it renders as <c>"*****"</c> and its row is read-only.
     /// </summary>
     [Fact]
-    public void Map_entry_value_is_never_a_text_field()
+    public void Map_entry_value_is_never_a_text_field_when_modal_replace_is_pending()
     {
         const string secret = "env-header-secret-value";
         var draft = new McpServerDraft(
@@ -88,13 +88,123 @@ public sealed class McpEditorFormTests : IDisposable
         this.form.ApplyState(editor);
         this.application.LayoutAndDraw();
 
+        // The modal secret must never reach a TextField.
         foreach (var field in AllTextFields(this.form))
         {
             Assert.DoesNotContain(secret, field.Text ?? string.Empty, StringComparison.Ordinal);
         }
 
-        // The value must still be shown, but only as the masked placeholder on a Label.
-        Assert.Contains(AllLabels(this.form), label => (label.Text ?? string.Empty).Contains("*****", StringComparison.Ordinal));
+        // The value must still be shown, but only as the masked placeholder on a TextField that
+        // is read-only — the secret cannot be extracted by a user.
+        Assert.Contains(
+            AllTextFields(this.form),
+            tf => (tf.Text ?? string.Empty).Contains("*****", StringComparison.Ordinal)
+                && tf.ReadOnly);
+    }
+
+    /// <summary>
+    /// An ordinary env value (Unchanged, no modal entry) must render in an editable TextField
+    /// showing the plain value (spec §9).
+    /// </summary>
+    [Fact]
+    public void Ordinary_env_value_renders_in_editable_text_field_showing_the_value()
+    {
+        const string plainValue = "C:\\Users\\me\\data";
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment:
+            [
+                new McpNamedSecretDraft(
+                    "DIR",
+                    McpSecretSource.Literal,
+                    new McpSecretChange("env/DIR", McpSecretChangeKind.Unchanged),
+                    Value: plainValue),
+            ],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        var editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+        {
+            SelectedItem = 0,
+        };
+
+        this.form.ApplyState(editor);
+        this.application.LayoutAndDraw();
+
+        // There must be an editable (non-read-only) TextField containing the plain value.
+        Assert.Contains(
+            AllTextFields(this.form),
+            tf => (tf.Text ?? string.Empty).Contains(plainValue, StringComparison.Ordinal)
+                && !tf.ReadOnly);
+    }
+
+    /// <summary>
+    /// A MANAGED value is a <c>coda-secret:</c> reference whose real content lives encrypted in the
+    /// credential store. It is shown — it is only a pointer, not a secret — but must NOT be
+    /// editable: retyping it in place would write a secret into .mcp.json in cleartext, and a single
+    /// stray keystroke would dangle the reference and let the post-save sweep delete the only copy
+    /// of the credential. Replacing it goes through the encrypt modal instead.
+    /// </summary>
+    [Fact]
+    public void A_managed_env_value_is_shown_but_not_editable()
+    {
+        const string reference = "coda-secret:mcp:server/env/TOKEN";
+        var draft = new McpServerDraft(
+            Name: "server",
+            Scope: McpConfigScope.Project,
+            Enabled: true,
+            Transport: McpTransportKind.Stdio,
+            Command: "node",
+            Args: [],
+            Url: null,
+            Environment:
+            [
+                new McpNamedSecretDraft(
+                    "TOKEN",
+                    McpSecretSource.Managed,
+                    new McpSecretChange("env/TOKEN", McpSecretChangeKind.Unchanged),
+                    Value: reference),
+            ],
+            Headers: [],
+            AuthMode: McpAuthMode.None,
+            ClientId: null,
+            Scopes: [],
+            BearerToken: new McpSecretChange("auth/token", McpSecretChangeKind.Unchanged));
+        var editor = new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+        {
+            SelectedItem = 0,
+        };
+
+        this.form.ApplyState(editor);
+        this.application.LayoutAndDraw();
+
+        var field = Assert.Single(
+            AllTextFields(this.form),
+            tf => (tf.Text ?? string.Empty).Contains(reference, StringComparison.Ordinal));
+        Assert.True(field.ReadOnly);
+    }
+
+    /// <summary>The raw value must not leak through the record's generated formatting.</summary>
+    [Fact]
+    public void A_named_value_is_masked_in_its_string_representation()
+    {
+        const string secret = "ghp_a_real_looking_token";
+        var item = new McpNamedSecretDraft(
+            "TOKEN",
+            McpSecretSource.Literal,
+            new McpSecretChange("env/TOKEN", McpSecretChangeKind.Unchanged),
+            Value: secret);
+
+        Assert.DoesNotContain(secret, item.ToString(), StringComparison.Ordinal);
+        Assert.Contains("TOKEN", item.ToString(), StringComparison.Ordinal);
     }
 
     // ── field group labelling ─────────────────────────────────────────────────
@@ -1001,6 +1111,77 @@ public sealed class McpEditorFormTests : IDisposable
         Assert.Equal(
             RenderedOutput.AttributeOf(this.application, "http"),
             RenderedOutput.AttributeOf(this.application, "stdio"));
+    }
+
+    // ── UX spec: empty placeholder and map row separator ─────────────────────
+
+    /// <summary>
+    /// An empty Arguments field must show a placeholder that includes Ctrl+N so the user
+    /// knows how to add the first item without consulting external docs.
+    /// </summary>
+    [Fact]
+    public void Empty_arguments_placeholder_mentions_ctrl_n()
+    {
+        var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Arguments);
+        this.form.ApplyState(state);
+        this.application.LayoutAndDraw();
+
+        var labelText = this.form.ArgumentsSummaryLabel.Text ?? string.Empty;
+        Assert.Contains("Ctrl+N", labelText, StringComparison.Ordinal);
+    }
+
+    /// <summary>
+    /// A map row must render a visible "=" label between the name and value fields so the
+    /// user can read the row as a key = value pair.  The separator must not be focusable.
+    /// </summary>
+    [Fact]
+    public void Map_row_renders_equals_separator_that_is_not_focusable()
+    {
+        var draft = MakeStdioDraftWithEnv("TOKEN");
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+            {
+                SelectedItem = 0,
+            });
+        this.application.LayoutAndDraw();
+
+        var separators = AllLabels(this.form)
+            .Where(l => (l.Text ?? string.Empty).Contains("=", StringComparison.Ordinal)
+                && l.Visible)
+            .ToList();
+
+        Assert.NotEmpty(separators);
+        Assert.All(separators, lbl => Assert.False(lbl.CanFocus));
+    }
+
+    /// <summary>
+    /// Tab traversal on a map row must reach exactly the Name and Value text fields.
+    /// The "=" separator label must not be a tab stop.
+    /// </summary>
+    [Fact]
+    public void Tab_traversal_for_map_row_reaches_name_and_value_but_not_separator()
+    {
+        var draft = MakeStdioDraftWithEnv("TOKEN");
+        this.form.ApplyState(
+            new McpEditorState(McpEditorMode.Edit, McpBrowserView.List, draft, McpEditorField.Environment)
+            {
+                SelectedItem = 0,
+            });
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        var visited = CollectTabOrder(this.form, maxSteps: 30);
+
+        // Must reach both TextFields in the map row.
+        var textFields = visited.OfType<TextField>().ToList();
+        Assert.NotEmpty(textFields);
+
+        // The separator Label must never appear in the tab order.
+        var separatorLabels = visited
+            .OfType<Label>()
+            .Where(l => (l.Text ?? string.Empty).Contains("=", StringComparison.Ordinal))
+            .ToList();
+        Assert.Empty(separatorLabels);
     }
 
     public void Dispose()
