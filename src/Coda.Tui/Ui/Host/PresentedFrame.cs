@@ -41,6 +41,12 @@ internal sealed class PresentedFrame
     private int rows;
 
     /// <summary>
+    /// Set by <see cref="ForceFullRepaintNextFrame"/>; consumed by the next
+    /// <see cref="SuppressUnchangedCells"/> call, which re-dirties every cell and row.
+    /// </summary>
+    private bool forceFullRepaint;
+
+    /// <summary>
     /// Clears dirty flags on cells unchanged from the previous frame and recomputes dirty lines.
     /// </summary>
     /// <returns>
@@ -52,6 +58,19 @@ internal sealed class PresentedFrame
     public bool SuppressUnchangedCells(IOutputBuffer buffer)
     {
         ArgumentNullException.ThrowIfNull(buffer);
+
+        // A forced repaint outranks suppression: re-dirty everything and decline, so the caller
+        // does not also re-derive line flags and lower the ones we just raised.
+        if (this.forceFullRepaint)
+        {
+            this.forceFullRepaint = false;
+            if (RedirtyAll(buffer))
+            {
+                return true;
+            }
+
+            return false;
+        }
 
         var contents = buffer.Contents;
         if (cells is null
@@ -298,6 +317,60 @@ internal sealed class PresentedFrame
         cols = 0;
         rows = 0;
         urlCacheValid = false;
+    }
+
+    /// <summary>
+    /// Drops the baseline AND guarantees the next frame actually reaches the terminal, by
+    /// re-dirtying every cell and row before Terminal.Gui's write loop runs.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="Invalidate"/> alone only stops suppression; it re-dirties nothing, so the write
+    /// loop still skips rows whose <c>DirtyLines</c> entry is false. Recovery then depends on some
+    /// view happening to redraw those cells — which in an idle TUI never happens, so a corruption
+    /// the diffing layer detected would persist anyway. This makes recovery a guarantee rather
+    /// than a hope.
+    /// </remarks>
+    public void ForceFullRepaintNextFrame()
+    {
+        this.Invalidate();
+        this.forceFullRepaint = true;
+    }
+
+    /// <summary>
+    /// Marks every cell and row of <paramref name="buffer"/> dirty. Returns false when the buffer
+    /// has no contents to mark.
+    /// </summary>
+    /// <summary>
+    /// Marks every cell and row of <paramref name="buffer"/> dirty, so Terminal.Gui's write loop
+    /// cannot skip a row. Returns false when the buffer has no contents to mark.
+    /// </summary>
+    public static bool RedirtyAll(IOutputBuffer buffer)
+    {
+        ArgumentNullException.ThrowIfNull(buffer);
+
+        var contents = buffer.Contents;
+        if (contents is null)
+        {
+            return false;
+        }
+
+        var dirtyLines = buffer.DirtyLines;
+        var bufferRows = Math.Min(buffer.Rows, contents.GetLength(0));
+        var bufferCols = Math.Min(buffer.Cols, contents.GetLength(1));
+        for (var row = 0; row < bufferRows; row++)
+        {
+            for (var col = 0; col < bufferCols; col++)
+            {
+                contents[row, col].IsDirty = true;
+            }
+
+            if (dirtyLines is not null && row < dirtyLines.Length)
+            {
+                dirtyLines[row] = true;
+            }
+        }
+
+        return true;
     }
 
     private void EnsureScratchArrays(int neededRows, int neededCols)

@@ -71,8 +71,21 @@ the terminal supports full-screen:
 15. **Bounded 10k** — full-screen visible-row formatting stays bounded with 10,000 blocks.
 16. **Redirected** — redirected input and redirected output both use plain behavior.
 17. **Min size** — **60×12** is the minimum usable interactive layout; **59×12** and **60×11** verify the fallback/error path (not usable interactive layouts).
+18. **Stale cells after overlay transition** — open `/tasks`, press `Enter` on a task, press `Esc`. No fragments of the detail view may remain in the list body, and none may survive scrolling or reopening the overlay. Repeat with `CODA_TUI_DIFF=0` to distinguish a diffing-layer regression from a view-layer one.
 
 Legend: `☐` untested · `✅` pass · `❌` fail · `➖` not applicable / unsupported.
+
+### Note: Terminal.Gui cursor positioning (observed on 2.4.17)
+
+`AnsiOutput.SetCursorPositionImpl` decides whether to emit by comparing the requested position with
+`_currentCursor` — the **application caret**, which `SetCursor` assigns once per iteration and which
+`SetCursorPositionImpl` never updates. For the whole duration of a frame write it is therefore a
+single stale point, and any move onto that cell is silently dropped no matter how far the write head
+has already advanced; stock `OutputBase.Write` then abandons the remainder of the frame.
+
+Coda does not rely on that decision: `CursorCoalescer` tracks the write head itself and emits
+unconditionally (see `src/Coda.Tui/Ui/Host/`). Item 18 exists to catch a regression in that layer.
+Worth reporting upstream — `SetCursorPositionImpl` should track the write head rather than the caret.
 
 ## Matrix
 
