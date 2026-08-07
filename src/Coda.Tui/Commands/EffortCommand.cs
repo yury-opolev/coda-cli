@@ -52,24 +52,31 @@ public sealed class EffortCommand : ISlashCommand
     public string Summary => "Show or set the reasoning effort level";
 
     public CommandHelp Help => new(
-        "/effort [low|medium|high|max|auto]",
-        Description: "Show or set the reasoning effort level for the current model. Higher effort spends more tokens on reasoning and produces more thorough responses. The setting is persisted per model so switching models restores their individual levels.",
+        "/effort [<level>|auto|current]",
+        Description: "Show or set the reasoning effort level for the CURRENT model. Higher effort spends more tokens on reasoning and produces more thorough responses. The available levels differ per model — run /effort with no arguments to see the ones this model supports. The setting is persisted per model, so switching models restores their individual levels.",
         Options:
         [
-            ("(no args)", "show current effort; open a picker when interactive"),
-            ("low", "quick, straightforward responses with minimal reasoning"),
-            ("medium", "balanced reasoning for most tasks"),
-            ("high", "comprehensive, deeper reasoning"),
-            ("max", "maximum reasoning depth (Opus models only; clamped to high on others)"),
+            ("(no args)", "pick from the levels this model supports; shows the current level when not interactive"),
+            ("current", "show the current level and this model's supported levels"),
+            ("<level>", "set the level (e.g. low, medium, high — a model may also offer minimal, xhigh or max)"),
             ("auto", "use the model's default effort (clears any explicit setting)"),
         ],
-        Examples: ["/effort", "/effort high", "/effort auto", "/effort low"]);
+        Examples: ["/effort", "/effort current", "/effort high", "/effort auto"]);
 
     public async Task<CommandResult> ExecuteAsync(CommandContext context, IReadOnlyList<string> args, CancellationToken cancellationToken = default)
     {
         var capability = await this.ResolveCapabilityAsync(context, cancellationToken).ConfigureAwait(false);
 
-        if (args.Count == 0 || args[0] is "current" or "status")
+        // "current"/"status" ask a question; they must never open a picker and change something.
+        if (args.Count > 0
+            && (string.Equals(args[0], "current", StringComparison.OrdinalIgnoreCase)
+                || string.Equals(args[0], "status", StringComparison.OrdinalIgnoreCase)))
+        {
+            this.ShowCurrent(context, capability);
+            return CommandResult.Continue;
+        }
+
+        if (args.Count == 0)
         {
             return await this.ShowOrPickAsync(context, capability, cancellationToken).ConfigureAwait(false);
         }
@@ -78,6 +85,15 @@ public sealed class EffortCommand : ISlashCommand
 
         if (arg is "auto" or "unset")
         {
+            // Clearing must respect support too: without this, "auto" is the one path that
+            // announces, persists and publishes a change for a model that has no effort at all.
+            if (!capability.Supported)
+            {
+                context.Console.MarkupLine(Theme.WarnMarkup(
+                    $"Reasoning effort is not supported for {context.Session.Model}."));
+                return CommandResult.Continue;
+            }
+
             this.ApplyEffort(context, capability, null);
             context.Console.MarkupLine($"Effort level set to {Theme.AccentMarkup("auto")} {Theme.DimMarkup("(model default)")}.");
             SessionMetadataEvents.Publish(context);
@@ -144,7 +160,7 @@ public sealed class EffortCommand : ISlashCommand
         }
 
         this.ApplyEffort(context, capability, arg);
-        context.Console.MarkupLine($"Effort set to {Theme.AccentMarkup(applied)}: {Theme.DimMarkup(Describe(applied))}");
+        context.Console.MarkupLine($"Effort set to {Theme.AccentMarkup(applied)}{DescribeSuffix(applied)}");
 
         if (!string.Equals(applied, arg, StringComparison.OrdinalIgnoreCase))
         {
@@ -184,21 +200,32 @@ public sealed class EffortCommand : ISlashCommand
 
     private void ShowCurrent(CommandContext context, ReasoningCapability capability)
     {
+        // Raw, not pre-escaped: Theme.AccentMarkup/DimMarkup escape their argument themselves, so
+        // escaping here too would render a model id containing brackets with doubled brackets.
+        var model = context.Session.Model;
+
+        if (!capability.Supported)
+        {
+            context.Console.MarkupLine(Theme.DimMarkup($"Reasoning effort is not supported for {model}."));
+            return;
+        }
+
         var effort = context.Session.Effort;
         if (string.IsNullOrEmpty(effort))
         {
-            context.Console.MarkupLine($"Effort level: {Theme.AccentMarkup("auto")} {Theme.DimMarkup("(model default)")}");
+            context.Console.MarkupLine(
+                $"Effort for {Theme.AccentMarkup(model)}: {Theme.AccentMarkup("auto")} {Theme.DimMarkup("(model default)")}");
         }
         else
         {
-            context.Console.MarkupLine($"Current effort level: {Theme.AccentMarkup(effort)} {Theme.DimMarkup($"({Describe(effort)})")}");
+            context.Console.MarkupLine(
+                $"Effort for {Theme.AccentMarkup(model)}: {Theme.AccentMarkup(effort)}{DescribeSuffix(effort)}");
         }
 
-        if (capability.Supported)
-        {
-            var levels = string.Join(", ", capability.Levels);
-            context.Console.MarkupLine(Theme.DimMarkup($"Supported levels: {levels}, auto"));
-        }
+        // Ordered low -> high, exactly as the model advertises them, so "what can I pick here?" is
+        // answerable without guessing from the generic level names.
+        var levels = string.Join(", ", capability.Levels);
+        context.Console.MarkupLine(Theme.DimMarkup($"Supported by {model}: {levels}, auto"));
     }
 
     private static async Task<string?> PickLevelAsync(
@@ -209,18 +236,27 @@ public sealed class EffortCommand : ISlashCommand
         var current = context.Session.Effort;
         var options = new List<UiPromptOption>();
 
-        // "auto" always appears first.
+        // "auto" always appears first, then the model's OWN levels in its own order (low -> high),
+        // so the list reads as a scale and never offers a level this model cannot do.
         options.Add(new UiPromptOption("auto", "auto", "model default", string.IsNullOrEmpty(current)));
 
         foreach (var level in capability.Levels)
         {
             var isCurrent = string.Equals(level, current, StringComparison.OrdinalIgnoreCase);
-            options.Add(new UiPromptOption(level, level, Describe(level), isCurrent));
+            var description = Describe(level);
+            options.Add(new UiPromptOption(
+                level,
+                level,
+                description.Length == 0 ? null : description,
+                isCurrent));
         }
 
         var defaultValue = string.IsNullOrEmpty(current) ? "auto" : current;
         var response = await context.Prompts.RequestAsync(
-            UiPromptRequest.Select("Choose effort level", options, defaultValue),
+            UiPromptRequest.Select(
+                $"Effort for {context.Session.Model} — faster to smarter",
+                options,
+                defaultValue),
             cancellationToken).ConfigureAwait(false);
 
         if (response.Cancelled || response.SelectedIds.Length == 0)
@@ -338,13 +374,29 @@ public sealed class EffortCommand : ISlashCommand
         return await session.ListModelsAsync(refresh: false, cancellationToken).ConfigureAwait(false);
     }
 
-    private static string Describe(string level) => level switch
+    /// <summary>
+    /// A short gloss for a level, or empty for one we have no wording for. Providers advertise their
+    /// own level names (Copilot models offer <c>none</c>, <c>minimal</c> and <c>xhigh</c> as well as
+    /// the Anthropic set), so an unknown level must produce NO description rather than a confident
+    /// wrong one.
+    /// </summary>
+    private static string Describe(string? level) => (level ?? string.Empty).ToLowerInvariant() switch
     {
+        "none" => "No reasoning",
+        "minimal" => "The least reasoning the model will do",
         "low" => "Quick, straightforward responses with minimal reasoning",
         "medium" => "Balanced reasoning for most tasks",
         "high" => "Comprehensive, deeper reasoning",
-        "max" => "Maximum reasoning depth (Opus only)",
-        _ => "Balanced reasoning for most tasks",
+        "xhigh" => "More reasoning than high",
+        "max" => "Maximum reasoning depth",
+        _ => string.Empty,
     };
+
+    /// <summary>The description in parentheses, or nothing when the level has no known gloss.</summary>
+    private static string DescribeSuffix(string level)
+    {
+        var description = Describe(level);
+        return description.Length == 0 ? string.Empty : $" {Theme.DimMarkup($"({description})")}";
+    }
 }
 
