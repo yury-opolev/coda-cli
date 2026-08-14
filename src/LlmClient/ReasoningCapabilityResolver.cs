@@ -124,6 +124,51 @@ public static class ReasoningCapabilityResolver
         return capability.Levels.Contains(level, StringComparer.OrdinalIgnoreCase) ? level : null;
     }
 
+    /// <summary>
+    /// Resolves a PERSISTED level for a (provider, model) pair, distinguishing "the model's levels
+    /// are not known yet" from "this model does not support effort".
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Copilot/OpenAI models advertise their levels at runtime, so <see cref="Resolve(string, string, IReadOnlyList{string})"/>
+    /// with no <paramref name="reasoningLevels"/> reports them as UNSUPPORTED. Callers that ran
+    /// before any model list was available therefore resolved a perfectly good stored level to
+    /// <c>null</c> — the status bar showed "auto" while the model browser still showed the saved
+    /// level, and nothing was sent to the API.
+    /// </para>
+    /// <para>
+    /// A stored level was validated against the model's advertised levels when it was set, so when
+    /// the capability is INDETERMINATE the stored value is preserved rather than discarded. Once
+    /// levels are known — pass them in — the normal clamp/drop rules apply unchanged.
+    /// </para>
+    /// </remarks>
+    /// <param name="providerId">The provider identifier.</param>
+    /// <param name="model">The model identifier.</param>
+    /// <param name="stored">The persisted level, or null/"auto" for no explicit level.</param>
+    /// <param name="reasoningLevels">Advertised levels when known; null/empty means not yet known.</param>
+    public static string? ResolveStoredLevel(
+        string providerId,
+        string model,
+        string? stored,
+        IReadOnlyList<string>? reasoningLevels = null)
+    {
+        if (string.IsNullOrEmpty(stored) ||
+            string.Equals(stored, "auto", StringComparison.OrdinalIgnoreCase))
+        {
+            return null;
+        }
+
+        // Anthropic capability is static, so it is authoritative even without advertised levels.
+        // Only the runtime-advertised providers can be indeterminate.
+        if (string.Equals(providerId, CopilotProviderId, StringComparison.OrdinalIgnoreCase)
+            && reasoningLevels is not { Count: > 0 })
+        {
+            return stored;
+        }
+
+        return ResolveAppliedLevel(Resolve(providerId, model, reasoningLevels), stored);
+    }
+
     private static ReasoningCapability ResolveCopilot(IReadOnlyList<string>? reasoningLevels)
     {
         if (reasoningLevels is { Count: > 0 })

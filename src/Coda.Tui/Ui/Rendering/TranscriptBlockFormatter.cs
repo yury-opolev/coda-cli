@@ -1578,6 +1578,24 @@ public static class TranscriptBlockFormatter
         return sb.ToString();
     }
 
+    /// <summary>
+    /// The most recently finished call in an activity, or null when none has finished yet. Used to
+    /// keep a detail row visible between batches, when no call is Running.
+    /// </summary>
+    private static ToolActivityCall? LastFinishedCall(ToolActivityTranscriptBlock activity)
+    {
+        for (var index = activity.Calls.Length - 1; index >= 0; index--)
+        {
+            var call = activity.Calls[index];
+            if (call.Status is ToolCallStatus.Succeeded or ToolCallStatus.Failed)
+            {
+                return call;
+            }
+        }
+
+        return null;
+    }
+
     private static void AppendToolActivitySummary(
         List<TranscriptRenderLine> lines,
         ToolActivityTranscriptBlock activity,
@@ -1611,6 +1629,32 @@ public static class TranscriptBlockFormatter
         }
 
         var running = activity.Calls.Where(call => call.Status == ToolCallStatus.Running).ToArray();
+        if (running.Length == 0)
+        {
+            // Between batches nothing is Running. Rendering only running children collapsed the
+            // block to a bare header, so the detail line flickered away and the view lost all trace
+            // of what had just happened. Keep the row, reporting the most recent finished call.
+            var lastFinished = LastFinishedCall(activity);
+            if (lastFinished is null)
+            {
+                return;
+            }
+
+            var outcome = lastFinished.Status == ToolCallStatus.Succeeded ? "done" : "failed";
+            var finishedStart = lines.Count;
+            AppendActivityLine(
+                lines,
+                $"{ToolActivityPreview.Create(lastFinished.ToolName, lastFinished.InputJson)} - {outcome}",
+                width,
+                TranscriptRole.Tool);
+            for (var i = finishedStart; i < lines.Count; i++)
+            {
+                lines[i] = lines[i] with { Gutter = TranscriptGutterKind.LastChild };
+            }
+
+            return;
+        }
+
         if (running.Length <= 5)
         {
             for (var index = 0; index < running.Length; index++)

@@ -99,6 +99,38 @@ public sealed class SessionStateEffortTests
         Assert.Empty(session.EffortByModel);
     }
 
+    [Fact]
+    public void ApplyStartupEffort_preserves_stored_level_for_copilot_when_levels_are_not_yet_known()
+    {
+        // Copilot models advertise their reasoning levels at runtime, so at startup — before any
+        // model list has been fetched — the capability is UNKNOWN, not unsupported. Treating it as
+        // unsupported silently resolved the user's configured level to null, so the status bar
+        // showed "auto" while the model browser still showed the saved level. The stored value was
+        // validated by /effort when it was set, so it must survive an unknown capability.
+        var session = MakeSession("github-copilot", model: "gpt-5.6-sol");
+        var settings = new CodaSettings([], [], [])
+        {
+            EffortByModel = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["github-copilot/gpt-5.6-sol"] = "xhigh",
+            },
+        };
+
+        DefaultInteractiveSessionRunner.ApplyStartupEffort(session, "github-copilot", settings);
+
+        Assert.Equal("xhigh", session.Effort);
+    }
+
+    [Fact]
+    public void ApplyStartupEffort_leaves_Effort_null_for_copilot_when_nothing_is_stored()
+    {
+        var session = MakeSession("github-copilot", model: "gpt-5.6-sol");
+
+        DefaultInteractiveSessionRunner.ApplyStartupEffort(session, "github-copilot", CodaSettings.Empty);
+
+        Assert.Null(session.Effort);
+    }
+
     // ── ModelCommand model-switch restoration ─────────────────────────────────
 
     [Fact]

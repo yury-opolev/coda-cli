@@ -177,7 +177,20 @@ public static class UiReducer
         ToolCallIdentity identity,
         Func<ToolActivityTranscriptBlock?, ToolActivityTranscriptBlock> reduce)
     {
-        var index = ActivityIndex(state.Transcript, identity.RootTurnId, identity.ActivityId);
+        // A status/progress/completion event belongs to the block that already holds that call,
+        // wherever it sits — updating it in place is what keeps an earlier batch's rows correct
+        // (and is what the viewport's interior-replacement path relies on).
+        var owner = CallOwnerIndex(state.Transcript, identity);
+        if (owner >= 0)
+        {
+            var owning = (ToolActivityTranscriptBlock)state.Transcript[owner];
+            return state with { Transcript = state.Transcript.SetItem(owner, reduce(owning)) };
+        }
+
+        // A call not seen before extends the open block only while it is still the LAST block. An
+        // activity spans a whole turn, so reusing it wherever it first appeared meant a tool called
+        // after the assistant had written text kept incrementing a counter far above that text.
+        var index = CurrentActivityIndex(state.Transcript, identity.RootTurnId, identity.ActivityId);
         if (index < 0)
         {
             return Append(state, reduce(null));
@@ -187,19 +200,80 @@ public static class UiReducer
         return state with { Transcript = state.Transcript.SetItem(index, reduce(existing)) };
     }
 
-    private static UiSessionSnapshot FinalizeActivity(UiSessionSnapshot state, ToolActivitySummary summary)
+    /// <summary>
+    /// Index of the activity block that already contains <paramref name="identity"/>'s call, or -1.
+    /// </summary>
+    private static int CallOwnerIndex(ImmutableArray<TranscriptBlock> transcript, ToolCallIdentity identity)
     {
-        var index = ActivityIndex(state.Transcript, summary.RootTurnId, summary.ActivityId);
-        if (index < 0)
+        for (var index = transcript.Length - 1; index >= 0; index--)
         {
-            return state;
+            if (transcript[index] is not ToolActivityTranscriptBlock activity
+                || !string.Equals(activity.RootTurnId, identity.RootTurnId, StringComparison.Ordinal)
+                || !string.Equals(activity.ActivityId, identity.ActivityId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            foreach (var call in activity.Calls)
+            {
+                if (string.Equals(call.CallId, identity.CallId, StringComparison.Ordinal)
+                    && string.Equals(call.SourceId, identity.SourceId, StringComparison.Ordinal))
+                {
+                    return index;
+                }
+            }
         }
 
-        var existing = (ToolActivityTranscriptBlock)state.Transcript[index];
-        var finalized = ToolActivityState.Finalize(existing, summary);
-        return ReferenceEquals(existing, finalized)
-            ? state
-            : state with { Transcript = state.Transcript.SetItem(index, finalized!) };
+        return -1;
+    }
+
+    private static UiSessionSnapshot FinalizeActivity(UiSessionSnapshot state, ToolActivitySummary summary)
+    {
+        // An activity can now span several blocks (text interleaved between tool batches), and the
+        // summary arrives once — so every block it covers must be finalized, or a leftover Active
+        // block keeps rendering as though tools were still running.
+        var transcript = state.Transcript;
+        var changed = false;
+
+        for (var index = 0; index < transcript.Length; index++)
+        {
+            if (transcript[index] is not ToolActivityTranscriptBlock activity
+                || !string.Equals(activity.RootTurnId, summary.RootTurnId, StringComparison.Ordinal)
+                || !string.Equals(activity.ActivityId, summary.ActivityId, StringComparison.Ordinal))
+            {
+                continue;
+            }
+
+            var finalized = ToolActivityState.Finalize(activity, summary);
+            if (!ReferenceEquals(activity, finalized))
+            {
+                transcript = transcript.SetItem(index, finalized!);
+                changed = true;
+            }
+        }
+
+        return changed ? state with { Transcript = transcript } : state;
+    }
+
+    /// <summary>
+    /// Returns the index of the activity block that is still open for new calls: the matching block
+    /// only when it is the LAST transcript block. Anything appended after it (assistant text,
+    /// thinking, a queued prompt) closes it for placement purposes.
+    /// </summary>
+    private static int CurrentActivityIndex(
+        ImmutableArray<TranscriptBlock> transcript, string rootTurnId, string activityId)
+    {
+        if (transcript.Length == 0)
+        {
+            return -1;
+        }
+
+        var last = transcript.Length - 1;
+        return transcript[last] is ToolActivityTranscriptBlock activity
+            && string.Equals(activity.RootTurnId, rootTurnId, StringComparison.Ordinal)
+            && string.Equals(activity.ActivityId, activityId, StringComparison.Ordinal)
+            ? last
+            : -1;
     }
 
     private static int ActivityIndex(ImmutableArray<TranscriptBlock> transcript, string rootTurnId, string activityId)

@@ -458,6 +458,51 @@ public sealed class TranscriptBlockFormatterTests
     }
 
     [Fact]
+    public void Summary_keeps_a_detail_line_for_the_last_finished_tool_when_none_is_running()
+    {
+        // Between batches nothing is Running, and rendering only running children collapsed the
+        // block to a bare "Running N tools..." header — the detail line flickered away and the view
+        // lost all trace of what had just happened. Keep the row, reporting the finished call.
+        var activity = Activity(
+            ToolActivityCompletionState.Active,
+            Call("read_file", """{"path":"first"}""", ToolCallStatus.Succeeded),
+            Call("grep", """{"pattern":"second"}""", ToolCallStatus.Succeeded));
+
+        var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
+
+        Assert.Equal(
+            [" \u25cb Running 2 tools...", "   \u2514 Searching for second - done"],
+            lines.Select(line => line.Text));
+    }
+
+    [Fact]
+    public void Summary_reports_a_failed_last_call_rather_than_claiming_it_finished_cleanly()
+    {
+        var activity = Activity(
+            ToolActivityCompletionState.Active,
+            Call("read_file", """{"path":"first"}""", ToolCallStatus.Failed, error: "denied"));
+
+        var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
+
+        Assert.Equal(
+            [" \u25cb Running 1 tool...", "   \u2514 Reading first - failed"],
+            lines.Select(line => line.Text));
+    }
+
+    [Fact]
+    public void Summary_shows_only_the_header_while_calls_are_still_queued()
+    {
+        // Nothing has run yet, so there is no finished call to report.
+        var activity = Activity(
+            ToolActivityCompletionState.Active,
+            Call("read_file", """{"path":"queued"}""", ToolCallStatus.Pending));
+
+        var lines = TranscriptBlockFormatter.Format(activity, width: 120, ToolDisplayMode.Summary);
+
+        Assert.Equal(" \u25cb Running 1 tool...", Assert.Single(lines).Text);
+    }
+
+    [Fact]
     public void Summary_counts_every_call_but_renders_only_running_children()
     {
         var activity = Activity(

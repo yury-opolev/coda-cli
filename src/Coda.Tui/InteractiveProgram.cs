@@ -844,8 +844,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
         var effortKey = $"{providerId}/{session.Model}";
         if (session.EffortByModel.TryGetValue(effortKey, out var storedEffort))
         {
-            var capability = ReasoningCapabilityResolver.Resolve(providerId, session.Model);
-            session.Effort = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, storedEffort);
+            // ResolveStoredLevel, not Resolve+ResolveAppliedLevel: at startup no model list has
+            // been fetched, so a Copilot model's advertised levels are unknown and the plain
+            // resolver would report it unsupported and silently drop the user's configured level.
+            session.Effort = ReasoningCapabilityResolver.ResolveStoredLevel(
+                providerId, session.Model, storedEffort);
         }
     }
 
