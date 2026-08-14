@@ -213,6 +213,7 @@ public sealed class CliTuiMcpTuiIntegrationTests
         await fixture.Shell.ApplyAsync(state, CancellationToken.None);
 
         state = UiReducer.Reduce(state, new ToolQueuedEvent(first, "run_command", firstInput));
+        state = UiReducer.Reduce(state, new ToolQueuedEvent(second, "grep", secondInput));
         await fixture.Shell.ApplyAsync(state, CancellationToken.None);
         var activity = Assert.Single(state.Transcript.OfType<ToolActivityTranscriptBlock>());
         var activityId = activity.Id;
@@ -232,9 +233,12 @@ public sealed class CliTuiMcpTuiIntegrationTests
         Assert.Equal(1, fixture.Shell.Transcript.UnseenBlocks);
 
         var replaceAtCount = fixture.Shell.Transcript.ReplaceAtCount;
+        // Both events target calls the interior block ALREADY holds, so each is an interior
+        // replacement. (A brand-new call would now open its own block at the bottom — placement
+        // follows the conversation — which is not what this test is about.)
         state = UiReducer.Reduce(state, new ToolStateChangedEvent(first, "run_command", ToolCallStatus.Running));
         await fixture.Shell.ApplyAsync(state, CancellationToken.None);
-        state = UiReducer.Reduce(state, new ToolQueuedEvent(second, "grep", secondInput));
+        state = UiReducer.Reduce(state, new ToolProgressEvent("grep", 42, second));
         await fixture.Shell.ApplyAsync(state, CancellationToken.None);
 
         activity = Assert.Single(state.Transcript.OfType<ToolActivityTranscriptBlock>());

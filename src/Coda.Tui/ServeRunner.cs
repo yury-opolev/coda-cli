@@ -599,7 +599,10 @@ public static class ServeRunner
             return null;
         }
 
-        var capability = ReasoningCapabilityResolver.Resolve(providerId, model);
-        return ReasoningCapabilityResolver.ResolveAppliedLevel(capability, stored);
+        // Serve starts before any model list is fetched, so a Copilot model's advertised levels are
+        // unknown here. ResolveStoredLevel keeps the configured level in that case instead of
+        // dropping it — otherwise every serve-driven session (this is the path cortex uses) silently
+        // ran at the model default no matter what the user configured.
+        return ReasoningCapabilityResolver.ResolveStoredLevel(providerId, model, stored);
     }
 }

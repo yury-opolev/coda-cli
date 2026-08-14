@@ -8,6 +8,83 @@ namespace Coda.Tui.Tests;
 public sealed class ToolActivityReducerTests
 {
     [Fact]
+    public void Tools_called_after_assistant_text_open_a_new_block_below_it()
+    {
+        // One activity spans a whole turn, and the block was updated in place wherever it first
+        // appeared — so once the assistant had written text, later tool calls kept incrementing the
+        // "Running N tools..." counter ABOVE that text, far from where the work was happening.
+        var first = Identity("root", "activity", "call-1", "root");
+        var second = Identity("root", "activity", "call-2", "root");
+
+        var state = Reduce(
+            new ToolStartedEvent("read", "{}", first),
+            new ToolCompletedEvent("read", new ToolResult("ok"), first),
+            new AssistantTextDeltaEvent("Now I will edit the file."),
+            new AssistantTextCompletedEvent(),
+            new ToolStartedEvent("write", "{}", second));
+
+        var activities = state.Transcript.OfType<ToolActivityTranscriptBlock>().ToArray();
+        Assert.Equal(2, activities.Length);
+
+        // The newest block must sit after the assistant text, not before it.
+        var assistantIndex = state.Transcript.ToList().FindIndex(b => b is AssistantTranscriptBlock);
+        var lastActivityIndex = state.Transcript.ToList().FindLastIndex(b => b is ToolActivityTranscriptBlock);
+        Assert.True(assistantIndex >= 0);
+        Assert.True(lastActivityIndex > assistantIndex);
+
+        Assert.Equal(["call-1"], activities[0].Calls.Select(c => c.CallId));
+        Assert.Equal(["call-2"], activities[1].Calls.Select(c => c.CallId));
+    }
+
+    [Fact]
+    public void Finalizing_an_activity_completes_every_block_it_spans()
+    {
+        // The activity summary arrives once, but a turn that interleaved text now has several
+        // blocks — every one of them must leave the Active state or it renders as still running.
+        var first = Identity("root", "activity", "call-1", "root");
+        var second = Identity("root", "activity", "call-2", "root");
+
+        var state = Reduce(
+            new ToolStartedEvent("read", "{}", first),
+            new ToolCompletedEvent("read", new ToolResult("ok"), first),
+            new AssistantTextDeltaEvent("thinking out loud"),
+            new AssistantTextCompletedEvent(),
+            new ToolStartedEvent("write", "{}", second),
+            new ToolCompletedEvent("write", new ToolResult("ok"), second),
+            new ToolActivityCompletedEvent(Summary("root", "activity", totalCalls: 2)));
+
+        var activities = state.Transcript.OfType<ToolActivityTranscriptBlock>().ToArray();
+        Assert.Equal(2, activities.Length);
+        Assert.All(activities, a => Assert.NotEqual(ToolActivityCompletionState.Active, a.CompletionState));
+    }
+
+    [Fact]
+    public void Completing_a_call_from_an_earlier_batch_updates_that_batch_not_a_new_block()
+    {
+        // Placement must only affect NEW calls. A completion arriving for a call that already lives
+        // in an earlier block has to update that block, or the original row stays "running" forever
+        // and a spurious block appears at the bottom holding a single orphaned result.
+        var first = Identity("root", "activity", "call-1", "root");
+        var second = Identity("root", "activity", "call-2", "root");
+
+        var state = Reduce(
+            new ToolStartedEvent("read", "{}", first),
+            new AssistantTextDeltaEvent("some prose"),
+            new AssistantTextCompletedEvent(),
+            new ToolStartedEvent("write", "{}", second),
+            new ToolCompletedEvent("read", new ToolResult("ok"), first));
+
+        var activities = state.Transcript.OfType<ToolActivityTranscriptBlock>().ToArray();
+        Assert.Equal(2, activities.Length);
+
+        var readCall = Assert.Single(activities[0].Calls);
+        Assert.Equal("call-1", readCall.CallId);
+        Assert.Equal(ToolCallStatus.Succeeded, readCall.Status);
+
+        Assert.Equal(["call-2"], activities[1].Calls.Select(c => c.CallId));
+    }
+
+    [Fact]
     public void Later_queued_batches_use_one_stable_activity_block_in_provider_order()
     {
         var first = Identity("root", "activity", "call-1", "root");

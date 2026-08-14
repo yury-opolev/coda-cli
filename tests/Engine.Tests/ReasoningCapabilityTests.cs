@@ -8,6 +8,66 @@ namespace Engine.Tests;
 /// </summary>
 public sealed class ReasoningCapabilityTests
 {
+    // ── ResolveStoredLevel: indeterminate vs unsupported ─────────────────────
+
+    [Fact]
+    public void ResolveStoredLevel_keeps_copilot_level_when_advertised_levels_are_unknown()
+    {
+        // The whole point of the method: at startup no model list exists, so a Copilot model's
+        // levels are INDETERMINATE. Reporting it unsupported (which plain Resolve does) silently
+        // discarded a level the user had explicitly configured and /effort had already validated.
+        var applied = ReasoningCapabilityResolver.ResolveStoredLevel(
+            "github-copilot", "gpt-5.6-sol", "xhigh");
+
+        Assert.Equal("xhigh", applied);
+    }
+
+    [Fact]
+    public void ResolveStoredLevel_applies_normal_rules_once_copilot_levels_are_known()
+    {
+        var applied = ReasoningCapabilityResolver.ResolveStoredLevel(
+            "github-copilot", "gpt-5.6-sol", "xhigh", ["low", "medium", "high", "xhigh"]);
+
+        Assert.Equal("xhigh", applied);
+    }
+
+    [Fact]
+    public void ResolveStoredLevel_drops_a_level_the_model_no_longer_advertises()
+    {
+        // Known levels are authoritative, so a stale stored level is still dropped.
+        var applied = ReasoningCapabilityResolver.ResolveStoredLevel(
+            "github-copilot", "gpt-5.6-sol", "xhigh", ["low", "medium", "high"]);
+
+        Assert.Null(applied);
+    }
+
+    [Theory]
+    [InlineData(null)]
+    [InlineData("")]
+    [InlineData("auto")]
+    [InlineData("AUTO")]
+    public void ResolveStoredLevel_treats_auto_and_blank_as_no_explicit_level(string? stored)
+    {
+        Assert.Null(ReasoningCapabilityResolver.ResolveStoredLevel("github-copilot", "gpt-5.6-sol", stored));
+    }
+
+    [Fact]
+    public void ResolveStoredLevel_still_clamps_anthropic_without_advertised_levels()
+    {
+        // Anthropic rules are static, so they stay authoritative even with no levels supplied —
+        // the indeterminate escape hatch must not weaken them.
+        var applied = ReasoningCapabilityResolver.ResolveStoredLevel(
+            "claude-ai", "claude-sonnet-4-6", "max");
+
+        Assert.Equal("high", applied);
+    }
+
+    [Fact]
+    public void ResolveStoredLevel_still_drops_effort_for_an_unsupported_anthropic_model()
+    {
+        Assert.Null(ReasoningCapabilityResolver.ResolveStoredLevel("claude-ai", "claude-haiku-4-5", "high"));
+    }
+
     // ── Anthropic capability resolution ──────────────────────────────────────
 
     [Theory]
