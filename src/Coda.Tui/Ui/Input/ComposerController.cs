@@ -114,12 +114,13 @@ internal sealed class ComposerController
         {
             case UiAction.Submit:
                 return this.Submit();
-            case UiAction.CompleteAndSubmit:
-                // Enter accepts the highlighted suggestion first. A command accepted at the head of
-                // the draft is an invocation, so it submits in the same press; one accepted mid-draft
-                // is part of a sentence still being written, so the draft is kept for the user to
-                // finish. With no menu open this is an ordinary submission.
-                return this.CompleteSuggestion() is > 0 ? Redraw() : this.Submit();
+            case UiAction.CompleteOrSubmit:
+                // The menu only helps compose the draft; it never dispatches. Enter over an open menu
+                // accepts the highlighted suggestion into the draft and stops there, so a command the
+                // user did not type is never executed in place of what the composer shows. The draft
+                // that results is what the next Enter submits. With no menu open this is an ordinary
+                // submission.
+                return this.CompleteSuggestion() ? Redraw() : this.Submit();
             case UiAction.InsertNewline:
                 this.InsertText("\n");
                 return Redraw();
@@ -214,14 +215,14 @@ internal sealed class ComposerController
     /// Splices the selected suggestion over the slash token under the caret.
     /// </summary>
     /// <returns>
-    /// The draft index the command was spliced at, or <see langword="null"/> when no suggestion was
-    /// accepted. An index of 0 means the command leads the draft and will be dispatched as a command.
+    /// <see langword="true"/> when a suggestion was accepted, <see langword="false"/> when no menu was
+    /// open and the draft is unchanged.
     /// </returns>
-    private int? CompleteSuggestion()
+    private bool CompleteSuggestion()
     {
         if (this.completion.Complete() is not { } accepted)
         {
-            return null;
+            return false;
         }
 
         var draft = this.State.Draft;
@@ -234,8 +235,15 @@ internal sealed class ComposerController
             CursorIndex = start + accepted.Text.Length,
             PreferredDisplayColumn = null,
         };
-        this.RefreshCompletion();
-        return start;
+
+        // Resync the suggestions against the spliced draft *without* reactivating the menu: Complete()
+        // dismissed it, and the ordinary refresh would undo that. It matters when the accepted command is
+        // already followed by a space, because then no separator is appended and the caret stays inside a
+        // token that still resolves to a query — a reactivated menu would reopen on the command it just
+        // accepted and swallow every following Enter, leaving no way to submit. Any later edit or caret
+        // move goes through RefreshCompletion and reopens the menu as usual.
+        this.completion.Update(this.State.Draft, this.State.CursorIndex);
+        return true;
     }
 
     private void HistoryPrevious()

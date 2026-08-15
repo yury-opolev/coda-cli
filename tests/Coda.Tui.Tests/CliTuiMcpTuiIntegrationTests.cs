@@ -80,7 +80,9 @@ public sealed class CliTuiMcpTuiIntegrationTests
         fixture.SeedAndDetachTranscript(blockCount: 50, scrollRows: 10);
         var mcpTop = fixture.Shell.Transcript.TopRow;
 
-        fixture.Shell.Composer.SetDraft("/mcp", 4);
+        // The trailing space keeps the completion menu closed, so Enter submits the command instead of
+        // accepting a suggestion — exactly the composer state a user reaches by accepting one.
+        fixture.Shell.Composer.SetDraft("/mcp ", 5);
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Enter);
         var mcpOverlay = Assert.IsType<McpBrowserOverlay>(fixture.Shell.McpOverlay);
         Assert.True(mcpOverlay.HasFocus);
@@ -93,7 +95,7 @@ public sealed class CliTuiMcpTuiIntegrationTests
 
         fixture.SeedAndDetachTranscript(blockCount: 50, scrollRows: 10);
         var taskTop = fixture.Shell.Transcript.TopRow;
-        fixture.Shell.Composer.SetDraft("/tasks", 6);
+        fixture.Shell.Composer.SetDraft("/tasks ", 7);
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Enter);
         Assert.True(fixture.Shell.TaskOverlay!.HasFocus);
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.End.WithCtrl);
@@ -111,7 +113,7 @@ public sealed class CliTuiMcpTuiIntegrationTests
             TuiRunMode.Fullscreen,
             ToolDisplayMode.Summary);
 
-        fixture.Shell.Composer.SetDraft("/mcp", 4);
+        fixture.Shell.Composer.SetDraft("/mcp ", 5);
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Enter);
 
         var overlay = Assert.IsType<McpBrowserOverlay>(fixture.Shell.McpOverlay);
@@ -155,14 +157,14 @@ public sealed class CliTuiMcpTuiIntegrationTests
         var mcpOverlay = fixture.Shell.McpOverlay!;
         var mcpController = fixture.Shell.McpController!;
 
-        fixture.Shell.Composer.SetDraft("/tasks", 6);
+        fixture.Shell.Composer.SetDraft("/tasks ", 7);
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Enter);
         Assert.True(taskOverlay.IsPumping);
         Assert.Equal(1, taskController.ChangedSubscriberCount);
 
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Esc);
         Assert.True(fixture.Shell.Composer.HasFocus);
-        fixture.Shell.Composer.SetDraft("/mcp", 4);
+        fixture.Shell.Composer.SetDraft("/mcp ", 5);
         fixture.HostApplication.Keyboard.RaiseKeyDownEvent(Key.Enter);
         Assert.False(taskOverlay.Visible);
         Assert.False(taskOverlay.IsPumping);

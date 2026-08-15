@@ -26,7 +26,7 @@ public enum UiAction
     CompletionPrevious,
     CompletionNext,
     CompleteSuggestion,
-    CompleteAndSubmit,
+    CompleteOrSubmit,
     DismissCompletion,
     OpenCommandPalette,
     OpenModelPicker,

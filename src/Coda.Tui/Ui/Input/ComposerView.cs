@@ -558,7 +558,7 @@ internal sealed class ComposerView : TextView
 
         // While a paste is in progress, a stray Enter is text, never a submission (with or without an open
         // completion).
-        if (this.controller.State.PasteActive && action is UiAction.Submit or UiAction.CompleteAndSubmit)
+        if (this.controller.State.PasteActive && action is UiAction.Submit or UiAction.CompleteOrSubmit)
         {
             action = UiAction.InsertNewline;
         }
@@ -889,10 +889,10 @@ internal sealed class ComposerView : TextView
         switch (action)
         {
             case UiAction.Submit:
-            case UiAction.CompleteAndSubmit:
-                // Submit (and, for CompleteAndSubmit, first accept the selected completion) replaces the whole
-                // draft, so re-place the caret and remeasure. Exactly one Submitted fires — CompleteAndSubmit
-                // returns a single submission result, never a separate completion then submission.
+            case UiAction.CompleteOrSubmit:
+                // Submitting replaces the whole draft, so re-place the caret and remeasure.
+                // CompleteOrSubmit accepts an open completion *instead of* submitting, so at most one
+                // Submitted fires — never a completion followed by a submission.
                 var originalDraft = this.controller.State.Draft;
                 var result = this.controller.Apply(action);
                 this.SyncTextView();
