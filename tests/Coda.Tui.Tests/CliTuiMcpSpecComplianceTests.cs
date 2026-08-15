@@ -80,7 +80,10 @@ public sealed class CliTuiMcpSpecComplianceTests
         using var fixture = RetainedShellFixture.CreateWithMcpBrowser(activeWork: true);
         string? submitted = null;
         fixture.Shell.PromptSubmitted += (_, value) => submitted = value;
-        fixture.Shell.Composer.SetDraft(text, text.Length);
+
+        // A trailing space keeps the completion menu closed, so Enter submits rather than accepting a
+        // suggestion — the interception itself is what this asserts.
+        fixture.Shell.Composer.SetDraft(text + " ", text.Length + 1);
         fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
 
         if (opens)

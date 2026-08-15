@@ -13,7 +13,10 @@ public sealed class McpInterceptTests
         using var fixture = RetainedShellFixture.CreateWithMcpBrowser(activeWork: true);
         var dispatched = 0;
         fixture.Shell.PromptSubmitted += (_, _) => dispatched++;
-        fixture.Shell.Composer.SetDraft("/mcp", 4);
+
+        // The trailing space is what the composer holds once the completion menu has been accepted or
+        // dismissed; it keeps the menu closed so this single Enter is a submission, not an acceptance.
+        fixture.Shell.Composer.SetDraft("/mcp ", 5);
 
         fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
 
@@ -21,9 +24,28 @@ public sealed class McpInterceptTests
         Assert.Equal(0, dispatched);
     }
 
+    [Fact]
+    public void Enter_over_the_completion_menu_accepts_the_command_before_it_can_open_the_browser()
+    {
+        using var fixture = RetainedShellFixture.CreateWithMcpBrowser(activeWork: true);
+        var dispatched = 0;
+        fixture.Shell.PromptSubmitted += (_, _) => dispatched++;
+        fixture.Shell.Composer.SetDraft("/mc", 3);
+
+        // The menu owns the first Enter: it only puts the highlighted command in the composer.
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.Equal("/mcp ", fixture.Shell.Composer.GetDraft());
+        Assert.False(fixture.Shell.McpOverlay!.Visible);
+
+        // The second Enter submits what the composer now shows.
+        fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
+        Assert.True(fixture.Shell.McpOverlay!.Visible);
+        Assert.Equal(0, dispatched);
+    }
+
     [Theory]
     [InlineData("/mcp list", "/mcp list")]
-    [InlineData("/MCP", "/mcp ")]
+    [InlineData("/MCP ", "/MCP ")]
     [InlineData("/mcp x", "/mcp x")]
     public void Non_exact_forms_dispatch_normally(string text, string expectedSubmitted)
     {

@@ -171,24 +171,34 @@ public sealed class ComposerControllerTests
         var controller = CreateController(new TestCommand("model", "Model"));
         controller.ReplaceDraft("explain this /mo then stop", "explain this /mo".Length);
 
-        // Enter accepts the suggestion, but the command is part of a sentence rather than an
-        // invocation, so the draft is kept for the user to finish.
-        var result = controller.Apply(UiAction.CompleteAndSubmit);
+        // Enter accepts the suggestion, but the menu never dispatches, so the draft is kept for the
+        // user to finish.
+        var result = controller.Apply(UiAction.CompleteOrSubmit);
 
         Assert.Null(result.SubmittedText);
         Assert.Equal("explain this /model then stop", controller.State.Draft);
         Assert.Equal("explain this /model".Length, controller.State.CursorIndex);
+
+        // The accepted command is already followed by a space, so the caret still sits in a matching
+        // token. The menu stays closed all the same, leaving the next Enter free to submit the sentence.
+        Assert.Empty(controller.Suggestions);
+        Assert.Equal(
+            "explain this /model then stop",
+            controller.Apply(UiAction.CompleteOrSubmit).SubmittedText);
     }
 
     [Fact]
-    public void Completing_a_leading_command_submits_it()
+    public void Completing_a_leading_command_accepts_it_and_leaves_submitting_to_the_next_enter()
     {
         var controller = CreateController(new TestCommand("model", "Model"));
         controller.ReplaceDraft("/mo", 3);
 
-        var result = controller.Apply(UiAction.CompleteAndSubmit);
+        var result = controller.Apply(UiAction.CompleteOrSubmit);
 
-        Assert.Equal("/model", result.SubmittedText?.Trim());
+        Assert.Null(result.SubmittedText);
+        Assert.Equal("/model ", controller.State.Draft);
+
+        Assert.Equal("/model", controller.Apply(UiAction.Submit).SubmittedText?.Trim());
         Assert.Equal(string.Empty, controller.State.Draft);
     }
 
