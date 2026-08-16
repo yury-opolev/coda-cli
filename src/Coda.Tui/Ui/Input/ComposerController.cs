@@ -118,8 +118,18 @@ internal sealed class ComposerController
                 // The menu only helps compose the draft; it never dispatches. Enter over an open menu
                 // accepts the highlighted suggestion into the draft and stops there, so a command the
                 // user did not type is never executed in place of what the composer shows. The draft
-                // that results is what the next Enter submits. With no menu open this is an ordinary
-                // submission.
+                // that results is what the next Enter submits.
+                //
+                // The exception is the case where accepting cannot change which command the draft names,
+                // because the highlight is already spelled out under the caret: there is nothing to show
+                // the user, so swallowing the press would only look like a dead keystroke. A fully typed
+                // command therefore still runs on the first Enter. With no menu open this is an ordinary
+                // submission either way.
+                if (this.completion.SelectionIsFullyTyped)
+                {
+                    return this.Submit();
+                }
+
                 return this.CompleteSuggestion() ? Redraw() : this.Submit();
             case UiAction.InsertNewline:
                 this.InsertText("\n");

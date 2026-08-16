@@ -177,8 +177,9 @@ effective `systemPrompt`; audit data is never a resume source. Forks preserve th
 interactive, headless, and slash-command flows. Export/import carries it as the optional
 `systemPromptOverride` field while keeping the `coda.session/1` bundle schema unchanged.
 
-**Keys (Warm Ember):** `Enter` submits — while the slash-command completion menu is open it accepts the
-highlighted command into the prompt instead, so press it again to send · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
+**Keys (Warm Ember):** `Enter` submits — while the slash-command completion menu is open and the highlighted
+command differs from what you typed, it accepts that command into the prompt instead, so press it again to
+send · `Shift+Enter` (or `Ctrl+Enter`/`Ctrl+J` as terminal-compatible fallbacks) inserts a newline · while an agent is busy, ordinary submissions queue for its next safe boundary · `Up` on an empty first composer line recalls queued messages into the draft (otherwise it navigates history) · `Up`/`Down` move the composer
 cursor between the lines of a multi-line prompt · `Ctrl+Up`/`Ctrl+Down` step through prompt history ·
 `Esc` dismisses the active menu or overlay, or clears a selection, and never exits Coda; pressing `Esc`
 twice within 1.5 s while the agent is working asks to stop the current turn — `Enter` then stops
@@ -194,9 +195,11 @@ above the composer (Up/Down select, Tab or Enter completes, a single Esc dismiss
 at the start of the prompt **or after whitespace**, so a command can be picked mid-sentence — a `/`
 inside a word, such as a path or URL, never opens it. The menu only ever **edits the prompt**: accepting a
 suggestion splices the command name in and sends nothing, so `Enter` over an open menu never runs a command
-you merely highlighted. What runs is always what the composer shows, and the next `Enter` sends it. Only a
-command at the **start** of the prompt is executed as a command; one accepted mid-sentence stays literal
-text and is sent to the model together with the prose around it.
+you merely highlighted. What runs is always what the composer shows, and the next `Enter` sends it. The one
+exception is a highlight you have already typed out in full, where accepting could not change which command
+runs — `/model` then `Enter` submits straight away, while `/mo` or `/MODEL` is completed first so you see the
+command before it runs. Only a command at the **start** of the prompt is executed as a command; one accepted
+mid-sentence stays literal text and is sent to the model together with the prose around it.
 
 **Mouse:** in the **transcript**, **left-drag** selects text; `Ctrl+C` **or a right-click** copies the
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if

@@ -14,9 +14,8 @@ public sealed class McpInterceptTests
         var dispatched = 0;
         fixture.Shell.PromptSubmitted += (_, _) => dispatched++;
 
-        // The trailing space is what the composer holds once the completion menu has been accepted or
-        // dismissed; it keeps the menu closed so this single Enter is a submission, not an acceptance.
-        fixture.Shell.Composer.SetDraft("/mcp ", 5);
+        // The command is fully typed, so the open menu cannot change it and Enter submits straight away.
+        fixture.Shell.Composer.SetDraft("/mcp", 4);
 
         fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
 

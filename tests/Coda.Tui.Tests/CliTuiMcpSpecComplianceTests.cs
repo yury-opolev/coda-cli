@@ -71,7 +71,9 @@ public sealed class CliTuiMcpSpecComplianceTests
     [Theory]
     [InlineData("/mcp", true)]
     [InlineData(" /mcp ", true)]
-    [InlineData("/MCP", false)]
+    // Trailing space: a bare "/MCP" differs from the highlighted command only by case, so the menu would
+    // claim the first Enter to normalise it. The space keeps the case-sensitive interception under test.
+    [InlineData("/MCP ", false)]
     [InlineData("/mcp list", false)]
     public void Mcp_interception_is_exact_and_other_forms_remain_textual(string text, bool opens)
     {
@@ -80,10 +82,7 @@ public sealed class CliTuiMcpSpecComplianceTests
         using var fixture = RetainedShellFixture.CreateWithMcpBrowser(activeWork: true);
         string? submitted = null;
         fixture.Shell.PromptSubmitted += (_, value) => submitted = value;
-
-        // A trailing space keeps the completion menu closed, so Enter submits rather than accepting a
-        // suggestion — the interception itself is what this asserts.
-        fixture.Shell.Composer.SetDraft(text + " ", text.Length + 1);
+        fixture.Shell.Composer.SetDraft(text, text.Length);
         fixture.Shell.Composer.NewKeyDownEvent(Key.Enter);
 
         if (opens)
