@@ -7,8 +7,10 @@ namespace Coda.Tui.Tests;
 /// Coverage for Enter while the slash-command completion menu is visible. The menu is only a helper for
 /// composing the draft, never a dispatcher: Enter accepts the highlighted suggestion into the composer and
 /// stops there, so the command that eventually runs is always the one the composer shows — never one the
-/// user merely highlighted. A second Enter submits that draft. A normal Enter (no completion) and multiline
-/// Ctrl+J are unchanged.
+/// user merely highlighted. A second Enter submits that draft. The one exception is a highlight that is
+/// already spelled out under the caret, where accepting could not change which command runs and swallowing
+/// the press would look like a dead keystroke: a fully typed command still runs on the first Enter. A normal
+/// Enter (no completion) and multiline Ctrl+J are unchanged.
 /// </summary>
 public sealed class CommandCompletionSubmitTests
 {
@@ -76,13 +78,58 @@ public sealed class CommandCompletionSubmitTests
     }
 
     [Fact]
+    public void CompleteOrSubmit_submits_at_once_when_the_highlight_is_already_fully_typed()
+    {
+        // Accepting could only append a separating space here, so swallowing the press would look like a
+        // dead keystroke. A fully typed command still runs on the first Enter.
+        var controller = CreateController(
+            new TestCommand("model", "Pick a model"),
+            new TestCommand("mcp", "Manage MCP model servers"));
+        controller.ReplaceDraft("/model", "/model".Length);
+        Assert.Equal("model", controller.Suggestions[controller.SelectedSuggestionIndex].Name);
+
+        var result = controller.Apply(UiAction.CompleteOrSubmit);
+
+        Assert.Equal("/model", result.SubmittedText);
+        Assert.Equal(string.Empty, controller.State.Draft);
+        Assert.Equal(new[] { "/model" }, controller.State.History);
+    }
+
+    [Fact]
+    public void CompleteOrSubmit_normalises_a_differently_cased_command_before_running_it()
+    {
+        // The draft does change here, so the user gets to see the normalised command before it runs.
+        var controller = CreateController(new TestCommand("model", "Pick a model"));
+        controller.ReplaceDraft("/MODEL", "/MODEL".Length);
+
+        var accepted = controller.Apply(UiAction.CompleteOrSubmit);
+
+        Assert.Null(accepted.SubmittedText);
+        Assert.Equal("/model ", controller.State.Draft);
+
+        Assert.Equal("/model ", controller.Apply(UiAction.CompleteOrSubmit).SubmittedText);
+    }
+
+    [Fact]
+    public void CompleteOrSubmit_submits_the_whole_line_when_a_mid_draft_highlight_is_fully_typed()
+    {
+        var controller = CreateController(new TestCommand("model", "Pick a model"));
+        controller.ReplaceDraft("/model foo", "/model".Length);
+        Assert.NotEmpty(controller.Suggestions);
+
+        var result = controller.Apply(UiAction.CompleteOrSubmit);
+
+        Assert.Equal("/model foo", result.SubmittedText);
+    }
+
+    [Fact]
     public void CompleteOrSubmit_closes_the_menu_when_the_command_is_already_followed_by_a_space()
     {
         // No separator is appended when the token already continues with whitespace, so the caret stays
         // inside a token that still resolves to a query. The menu must not reopen on the command it just
         // accepted — it would swallow every following Enter and the draft could never be submitted.
         var controller = CreateController(new TestCommand("model", "Pick a model"));
-        controller.ReplaceDraft("/model foo", "/model".Length);
+        controller.ReplaceDraft("/mod foo", "/mod".Length);
         Assert.NotEmpty(controller.Suggestions);
 
         var accepted = controller.Apply(UiAction.CompleteOrSubmit);

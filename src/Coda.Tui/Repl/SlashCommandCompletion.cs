@@ -22,6 +22,7 @@ internal sealed class SlashCommandCompletion
     private IReadOnlyList<ISlashCommand> suggestions = [];
     private bool isDismissed;
     private string draft = string.Empty;
+    private string query = string.Empty;
     private int queryStart;
     private int queryEnd;
 
@@ -39,6 +40,16 @@ internal sealed class SlashCommandCompletion
     /// <summary>The draft index of the <c>/</c> that opened the current menu; 0 when none is open.</summary>
     public int QueryStart => this.queryStart;
 
+    /// <summary>
+    /// Whether the token under the caret already spells the highlighted command exactly, so accepting the
+    /// suggestion could only append a separating space and never change which command the draft names.
+    /// A different case (<c>/MODEL</c> against <c>model</c>) does not count: accepting rewrites the draft
+    /// there, and that is a change the user should see before it runs.
+    /// </summary>
+    public bool SelectionIsFullyTyped =>
+        this.IsVisible &&
+        string.Equals(this.suggestions[this.SelectedIndex].Name, this.query, StringComparison.Ordinal);
+
     public void Update(string input, int cursorIndex)
     {
         this.draft = input ?? string.Empty;
@@ -48,11 +59,13 @@ internal sealed class SlashCommandCompletion
         {
             this.suggestions = [];
             this.SelectedIndex = 0;
+            this.query = string.Empty;
             this.queryStart = 0;
             this.isDismissed = false;
             return;
         }
 
+        this.query = query;
         this.queryStart = start;
         var previousName = this.IsVisible ? this.suggestions[this.SelectedIndex].Name : null;
 

@@ -75,8 +75,9 @@ public static class ImmediateCli
         writer.WriteLine("                  forks retain metadata and bundles use optional systemPromptOverride.");
         writer.WriteLine();
         writer.WriteLine("Interactive keys (Warm Ember):");
-        writer.WriteLine("  Enter           Submit the current prompt. With the slash-command completion menu open it");
-        writer.WriteLine("                  accepts the highlighted command into the prompt instead; press Enter again to send.");
+        writer.WriteLine("  Enter           Submit the current prompt. With the slash-command completion menu open it first");
+        writer.WriteLine("                  accepts the highlighted command into the prompt, unless you already typed that");
+        writer.WriteLine("                  command out in full, in which case it submits straight away.");
         writer.WriteLine("  Shift+Enter     Insert a newline without submitting.");
         writer.WriteLine("  Ctrl+Enter      Insert a newline (terminal-compatible fallback).");
         writer.WriteLine("  Ctrl+J          Insert a newline (terminal-compatible fallback).");
