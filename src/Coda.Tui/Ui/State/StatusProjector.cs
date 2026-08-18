@@ -11,11 +11,11 @@ namespace Coda.Tui.Ui.State;
 /// from the end until the line fits the target width (measured in display cells). When even the
 /// model alone is too wide it is truncated with an ellipsis. Frontend-agnostic — no Terminal.Gui types.
 ///
-/// <para>Priority order (highest first): model, permission mode, effective effort, context window,
-/// token usage, cost, MCP services, LSP services, git branch, working directory. Permission is placed
-/// immediately after the model and before effort so the current permission mode survives when
-/// lower-priority fields (cwd, git, services, usage, cost, context, then effort) are shed under
-/// narrow widths.</para>
+/// <para>Priority order (highest first): model, effective effort, permission mode, context window,
+/// token usage, cost, MCP services, LSP services, git branch, working directory. Model and effort
+/// lead because they describe <em>what is answering you</em> and change most often; permission
+/// follows immediately so it still outlives every other field (cwd, git, services, usage, cost,
+/// context) when the line is shed under narrow widths.</para>
 /// </summary>
 public static class StatusProjector
 {
@@ -53,8 +53,8 @@ public static class StatusProjector
         var fields = new List<string>
         {
             snapshot.Model,                            // 1 — model
-            FormatPermission(snapshot.Permission),     // 2 — permission mode (survives before effort)
-            snapshot.EffectiveEffort,                  // 3 — effective effort
+            snapshot.EffectiveEffort,                  // 2 — effective effort
+            FormatPermission(snapshot.Permission),     // 3 — permission mode (outlives everything below)
         };
 
         if (snapshot.Context is { } context)

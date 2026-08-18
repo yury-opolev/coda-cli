@@ -359,9 +359,69 @@ public sealed class McpBrowserControllerTests
         controller.Close();
     }
 
+    /// <summary>
+    /// Ctrl+N must insert directly BELOW the focused row, not at the end of the list. With one row
+    /// per item, appending put the new field rows away from where the user was looking.
+    /// </summary>
     [Fact]
-    public async Task Existing_named_secrets_keep_identity_when_replaced_or_marked_removed()
+    public async Task AddItem_inserts_below_the_focused_row()
     {
+        var controller = NewController(new TestManagementService(), new TestIdleGate());
+        controller.Open();
+        await controller.ExecuteAsync(McpBrowserCommand.BeginAdd, null, CancellationToken.None);
+
+        controller.UpdateEditorDraft(d => d with { Args = ["one", "two", "three"] });
+        controller.UpdateEditorFocusItem(McpEditorField.Arguments, 0, McpEditorItemPart.Value);
+        await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
+
+        var editor = controller.State.Editor!;
+        Assert.Equal(["one", string.Empty, "two", "three"], editor.Draft.Args.ToArray());
+        Assert.Equal(1, editor.SelectedItem);
+        controller.Close();
+    }
+
+    /// <summary>
+    /// Ctrl+N on the editor's always-present virtual row must materialize exactly ONE item.
+    /// Materializing the row AND inserting below it would hand the user two blank fields for a
+    /// single keypress.
+    /// </summary>
+    [Fact]
+    public async Task AddItem_on_the_virtual_row_creates_exactly_one_item()
+    {
+        var controller = NewController(new TestManagementService(), new TestIdleGate());
+        controller.Open();
+        await controller.ExecuteAsync(McpBrowserCommand.BeginAdd, null, CancellationToken.None);
+
+        await SetEditorFieldAsync(controller, McpEditorField.Arguments);
+        await controller.ExecuteAsync(McpBrowserCommand.EditorAddItem, null, CancellationToken.None);
+
+        Assert.Equal(string.Empty, Assert.Single(controller.State.Editor!.Draft.Args));
+        Assert.Equal(0, controller.State.Editor!.SelectedItem);
+        controller.Close();
+    }
+
+    /// <summary>
+    /// Ctrl+R on the LAST remaining item clears the list rather than leaving the field with no row
+    /// at all: the editor always renders one row, so the user keeps an editable, empty text field.
+    /// </summary>
+    [Fact]
+    public async Task RemoveItem_on_the_last_row_clears_it_and_parks_the_cursor_on_row_zero()
+    {
+        var controller = NewController(new TestManagementService(), new TestIdleGate());
+        controller.Open();
+        await controller.ExecuteAsync(McpBrowserCommand.BeginAdd, null, CancellationToken.None);
+
+        controller.UpdateEditorDraft(d => d with { Args = ["only"] });
+        controller.UpdateEditorFocusItem(McpEditorField.Arguments, 0, McpEditorItemPart.Value);
+        await controller.ExecuteAsync(McpBrowserCommand.EditorRemoveItem, null, CancellationToken.None);
+
+        Assert.Empty(controller.State.Editor!.Draft.Args);
+        Assert.Equal(0, controller.State.Editor!.SelectedItem);
+        controller.Close();
+    }
+
+    [Fact]
+    public async Task Existing_named_secrets_keep_identity_when_replaced_or_marked_removed()    {
         var prompts = new RecordingPromptService(
             new UiPromptResponse(false, [], "replacement"),
             new UiPromptResponse(false, [], "replacement"));

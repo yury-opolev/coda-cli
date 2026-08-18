@@ -84,7 +84,7 @@ internal static class McpEditorHints
 
     private static void AddCollectionKeys(List<string> parts)
     {
-        parts.Add("Ctrl+N add");
+        parts.Add("Ctrl+N add below");
         parts.Add("Ctrl+R remove");
         parts.Add("Alt+↑/↓ reorder");
     }

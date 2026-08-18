@@ -1,3 +1,4 @@
+using System.Collections.Immutable;
 using System.Text;
 using Coda.Mcp;
 using Coda.Tui.Mcp;
@@ -49,15 +50,10 @@ internal sealed class McpEditorForm : View
     internal readonly TextField NameField;
     internal readonly OptionSelector TransportSelector;
     internal readonly TextField CommandField;
-    internal readonly Label ArgumentsSummaryLabel;
     internal readonly TextField UrlField;
-    internal readonly Label HeadersSummaryLabel;
     internal readonly OptionSelector AuthModeSelector;
     internal readonly TextField ClientIdField;
-    internal readonly Label ScopesSummaryLabel;
-    internal readonly Label EnvironmentSummaryLabel;
-    internal readonly Label BearerTokenLabel;
-    internal readonly Button SaveButton;
+    internal readonly Label BearerTokenLabel;    internal readonly Button SaveButton;
     internal readonly Button CancelButton;
 
     // ── prefix labels (one per scalar field; always created, shown/hidden by ApplyState) ──────
@@ -124,6 +120,12 @@ internal sealed class McpEditorForm : View
     private readonly List<TextField> scopeItemFields = [];
     private readonly List<MapItemRow> envItemRows = [];
     private readonly List<MapItemRow> headerItemRows = [];
+
+    /// <summary>
+    /// The focusable widgets currently on screen, in the order their rows are DRAWN. Rebuilt by
+    /// every <see cref="ApplyState"/>; drives Tab and ↑/↓ navigation.
+    /// </summary>
+    private readonly List<View> focusOrder = [];
 
     /// <summary>
     /// A single laid-out row in the editor. <see cref="ItemIndex"/> is <c>-1</c> for a scalar field
@@ -236,16 +238,8 @@ internal sealed class McpEditorForm : View
             Visible = false,
         };
 
-        // ── summary labels (placeholder rows for empty lists, and bearer token) ─────────────────
-        // These must be focusable so Tab traversal reaches them and Ctrl+N / Ctrl+R / Alt+Up/Down
-        // can operate on the right field when the focus is on a placeholder. The bearer-token row
-        // also needs focus so Enter triggers the modal secret-replacement prompt.
-        this.ArgumentsSummaryLabel  = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-        this.HeadersSummaryLabel    = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-        this.ScopesSummaryLabel     = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-        this.EnvironmentSummaryLabel = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
-
-        // BearerToken is always a read-only label — never bound to a TextField.
+        // BearerToken is always a read-only label — never bound to a TextField. It must be
+        // focusable so Enter triggers the modal secret-replacement prompt.
         this.BearerTokenLabel = new Label { X = ValueX, Width = Dim.Fill(), Height = 1, Visible = false, CanFocus = true, TabStop = TabBehavior.TabStop };
 
         // ── buttons ───────────────────────────────────────────────────────────
@@ -294,13 +288,9 @@ internal sealed class McpEditorForm : View
             this.NameField,
             this.TransportSelector,
             this.CommandField,
-            this.ArgumentsSummaryLabel,
             this.UrlField,
-            this.HeadersSummaryLabel,
             this.AuthModeSelector,
             this.ClientIdField,
-            this.ScopesSummaryLabel,
-            this.EnvironmentSummaryLabel,
             this.BearerTokenLabel,
             this.SaveButton,
             this.CancelButton);
@@ -536,11 +526,52 @@ internal sealed class McpEditorForm : View
             // widget → controller, so opening the editor left everything unfocused: no option in a
             // selector was marked as the one under the cursor and neither button looked active
             // until the user pressed Tab.
-            this.FocusField(editor.FocusedField);
+            this.RebuildFocusOrder(rows, this.scrollOffset, height);
+            this.FocusField(editor);
         }
         finally
         {
             this.suppressSync = false;
+        }
+    }
+
+    /// <summary>
+    /// Returns the pooled per-item widget that backs row <paramref name="index"/> of a list/map
+    /// <paramref name="field"/>; exposed for unit tests, which cannot reach the pools otherwise.
+    /// </summary>
+    internal View? ItemViewForTest(
+        McpEditorField field,
+        int index,
+        McpEditorItemPart part = McpEditorItemPart.Value) =>
+        this.ViewForRow(new EditorRow(field, index)) switch
+        {
+            MapItemRow mapRow => part == McpEditorItemPart.Name ? mapRow.Name : mapRow.Value,
+            var view => view,
+        };
+
+    /// <summary>
+    /// Rebuilds <see cref="focusOrder"/> from the rows currently on screen.
+    /// </summary>
+    /// <remarks>
+    /// Per-item widgets are pooled and created on demand, so they land at the END of
+    /// <see cref="View.SubViews"/> no matter which row they occupy — walking the view tree would
+    /// take the caret from Command straight past Arguments and Environment to Save, and only reach
+    /// the list rows after Cancel. Terminal.Gui's <c>MoveSubViewToEnd</c> would fix the tree but
+    /// leaves its internal bookkeeping inconsistent (v2.4.17 throws from <c>View.Dispose</c>
+    /// afterwards), so the row order is kept alongside the tree instead of imposed on it.
+    /// Must run AFTER out-of-window views have been hidden, so <c>Visible</c> is final.
+    /// </remarks>
+    private void RebuildFocusOrder(IReadOnlyList<EditorRow> rows, int offset, int height)
+    {
+        this.focusOrder.Clear();
+        for (var i = 0; i < rows.Count; i++)
+        {
+            if (i < offset || i >= offset + height) continue;
+            if (rows[i].ItemIndex == int.MinValue) continue; // separator — no widget
+            if (this.ViewForRow(rows[i]) is { Visible: true, CanFocus: true, Enabled: true } view)
+            {
+                this.focusOrder.Add(view);
+            }
         }
     }
 
@@ -571,9 +602,9 @@ internal sealed class McpEditorForm : View
     /// resulting <c>HasFocusChanged</c> events do not write the focus straight back into the
     /// controller and re-enter this method.
     /// </summary>
-    private void FocusField(McpEditorField field)
+    private void FocusField(McpEditorState editor)
     {
-        if (this.ViewForField(field) is not { Visible: true, CanFocus: true, Enabled: true } view)
+        if (this.FocusTargetFor(editor) is not { Visible: true, CanFocus: true, Enabled: true } view)
         {
             return;
         }
@@ -582,6 +613,35 @@ internal sealed class McpEditorForm : View
         {
             view.SetFocus();
         }
+    }
+
+    /// <summary>
+    /// Resolves the widget that should receive focus for the editor's current cursor.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="ViewForField"/> alone is NOT enough for a list/map field: it returns that field's
+    /// summary <see cref="Label"/>, which is never focusable and — now that every list field
+    /// renders as per-item rows — is never even laid out. Focusing through it silently did nothing,
+    /// so pressing Ctrl+N added an argument row that never received the caret and the previously
+    /// focused widget kept it. Resolve the pooled per-item widget instead, honouring
+    /// <see cref="McpEditorState.SelectedItem"/> and <see cref="McpEditorState.SelectedItemPart"/>.
+    /// </remarks>
+    private View? FocusTargetFor(McpEditorState editor)
+    {
+        var field = editor.FocusedField;
+        if (!IsListField(field))
+        {
+            return this.ViewForField(field);
+        }
+
+        var index = Math.Max(0, editor.SelectedItem);
+        return this.ViewForRow(new EditorRow(field, index)) switch
+        {
+            MapItemRow mapRow => editor.SelectedItemPart == McpEditorItemPart.Name
+                ? mapRow.Name
+                : mapRow.Value,
+            var view => view,
+        };
     }
 
     /// <summary>
@@ -604,13 +664,13 @@ internal sealed class McpEditorForm : View
     {
         if (key == Key.Tab)
         {
-            this.AdvanceFocus(NavigationDirection.Forward, TabBehavior.TabStop);
+            this.MoveTabFocus(NavigationDirection.Forward);
             return true;
         }
 
         if (key == Key.Tab.WithShift)
         {
-            this.AdvanceFocus(NavigationDirection.Backward, TabBehavior.TabStop);
+            this.MoveTabFocus(NavigationDirection.Backward);
             return true;
         }
 
@@ -632,8 +692,9 @@ internal sealed class McpEditorForm : View
     // ── private helpers ───────────────────────────────────────────────────────────
 
     /// <summary>
-    /// Returns the subview that corresponds to <paramref name="field"/>, or <c>null</c> if the
-    /// field has no dedicated subview.
+    /// Returns the subview that corresponds to a SCALAR <paramref name="field"/>, or <c>null</c>
+    /// when the field has no dedicated subview. List/map fields deliberately return <c>null</c>:
+    /// they own no single widget, only pooled per-item rows resolved by <see cref="ViewForRow"/>.
     /// </summary>
     private View? ViewForField(McpEditorField field) => field switch
     {
@@ -641,13 +702,9 @@ internal sealed class McpEditorForm : View
         McpEditorField.Name => this.NameField,
         McpEditorField.Transport => this.TransportSelector,
         McpEditorField.Command => this.CommandField,
-        McpEditorField.Arguments => this.ArgumentsSummaryLabel,
         McpEditorField.Url => this.UrlField,
-        McpEditorField.Headers => this.HeadersSummaryLabel,
         McpEditorField.AuthMode => this.AuthModeSelector,
         McpEditorField.ClientId => this.ClientIdField,
-        McpEditorField.Scopes => this.ScopesSummaryLabel,
-        McpEditorField.Environment => this.EnvironmentSummaryLabel,
         McpEditorField.BearerToken => this.BearerTokenLabel,
         McpEditorField.Save => this.SaveButton,
         McpEditorField.Cancel => this.CancelButton,
@@ -675,18 +732,20 @@ internal sealed class McpEditorForm : View
     };
 
     /// <summary>
-    /// Moves focus to the next or previous DIRECT focusable child of this form without descending
-    /// into any child's internal sub-views (e.g. the CheckBoxes inside an OptionSelector).
+    /// Moves focus to the next or previous ROW in visual order, without descending into any
+    /// child's internal sub-views (e.g. the CheckBoxes inside an OptionSelector).
     /// </summary>
     /// <remarks>
-    /// <see cref="View.AdvanceFocus"/> walks the entire descendant tab-stop tree, so pressing
-    /// CursorDown once while an OptionSelector is focused advances to its next internal CheckBox
-    /// rather than to the next field. This method instead works exclusively with the form's own
-    /// SubViews list, skipping non-focusable and invisible children.
+    /// <see cref="View.AdvanceFocus"/> walks the entire descendant tab-stop tree in VIEW-TREE
+    /// order, which neither matches the drawn row order (pooled per-item widgets are appended last)
+    /// nor moves a single field at a time (one CursorDown would land on an OptionSelector's next
+    /// internal CheckBox). This walks <see cref="focusOrder"/> instead.
     /// </remarks>
     private void MoveFieldFocus(NavigationDirection direction)
     {
-        var children = this.SubViews.Where(v => v.CanFocus && v.Visible).ToList();
+        var children = this.focusOrder.Count > 0
+            ? this.focusOrder.Where(v => v.CanFocus && v.Visible).ToList()
+            : this.SubViews.Where(v => v.CanFocus && v.Visible).ToList();
         if (children.Count == 0) return;
 
         var currentIdx = children.FindIndex(HasFocusInSubtree);
@@ -698,6 +757,46 @@ internal sealed class McpEditorForm : View
 
         children[nextIdx].SetFocus();
     }
+
+    /// <summary>
+    /// Tab/Shift+Tab: steps between the name and value halves of an environment or header row
+    /// before leaving it, and otherwise moves one row in visual order.
+    /// </summary>
+    /// <remarks>
+    /// The two halves are the only place the editor exposes a sub-row cursor, and the footer
+    /// advertises "Tab name/value" for exactly those fields.
+    /// </remarks>
+    private void MoveTabFocus(NavigationDirection direction)
+    {
+        if (this.FocusedMapRow() is { } current)
+        {
+            if (direction == NavigationDirection.Forward && current.Name.HasFocus)
+            {
+                current.Value.SetFocus();
+                return;
+            }
+
+            if (direction == NavigationDirection.Backward && current.Value.HasFocus)
+            {
+                current.Name.SetFocus();
+                return;
+            }
+        }
+
+        this.MoveFieldFocus(direction);
+
+        // Entering a map row backwards lands on its value half, mirroring the forward pass that
+        // enters on the name half; without this, Shift+Tab would skip the value entirely.
+        if (direction == NavigationDirection.Backward && this.FocusedMapRow() is { } entered)
+        {
+            entered.Value.SetFocus();
+        }
+    }
+
+    /// <summary>The visible environment/header row that currently holds focus, if any.</summary>
+    private MapItemRow? FocusedMapRow() =>
+        this.envItemRows.Concat(this.headerItemRows)
+            .FirstOrDefault(row => row.Visible && row.HasFocus);
 
     /// <summary>Returns true if <paramref name="v"/> has focus or has a focused descendant.</summary>
     /// <remarks>
@@ -753,21 +852,29 @@ internal sealed class McpEditorForm : View
     }
 
     /// <summary>
-    /// Expands the ordered scalar field set into concrete rows, splitting each non-empty list/map
-    /// field into one row per item and inserting a blank separator row after each field group.
-    /// An empty list keeps a single placeholder row so the user still has somewhere to press Ctrl+N.
+    /// Expands the ordered scalar field set into concrete rows, splitting each list/map field into
+    /// one row per item and inserting a blank separator row after each field group.
     /// </summary>
+    /// <remarks>
+    /// A list/map field ALWAYS gets at least one row, even when the draft holds no items. That
+    /// first row is "virtual": no draft item backs it yet, but a real, focusable, empty
+    /// <see cref="TextField"/> is rendered there so the user can simply type the first argument.
+    /// The previous design showed a non-focusable <c>(none)</c> summary label and required the user
+    /// to discover Ctrl+N before any input was possible — which read as "arguments are unavailable"
+    /// and pushed people into typing args into the Command box instead.
+    /// Typing into a virtual row materializes the draft item (see <see cref="SetListValue"/>).
+    /// </remarks>
     private static IReadOnlyList<EditorRow> BuildRows(
         IReadOnlyList<McpEditorField> fields,
         McpServerDraft draft)
     {
-        // Pre-size: each field gets its items (or 1 placeholder) plus 1 separator (except Cancel).
+        // Pre-size: each field gets its items (or 1 virtual row) plus 1 separator (except Cancel).
         var rows = new List<EditorRow>(fields.Count * 2);
         foreach (var field in fields)
         {
-            var count = ItemCount(field, draft);
-            if (IsListField(field) && count > 0)
+            if (IsListField(field))
             {
+                var count = Math.Max(1, ItemCount(field, draft));
                 for (var i = 0; i < count; i++)
                 {
                     rows.Add(new EditorRow(field, i));
@@ -972,23 +1079,11 @@ internal sealed class McpEditorForm : View
                     this.CommandField.Visible = true;
                     break;
 
-                case McpEditorField.Arguments:
-                    this.ArgumentsSummaryLabel.Y = row;
-                    this.ArgumentsSummaryLabel.Text = FormatCount(draft.Args.IsDefault ? 0 : draft.Args.Length);
-                    this.ArgumentsSummaryLabel.Visible = true;
-                    break;
-
                 case McpEditorField.Url:
                     this.UrlField.Y = row;
                     this.UrlField.Value = draft.Url ?? string.Empty;
                     this.UrlField.InsertionPoint = this.UrlField.Text?.Length ?? 0;
                     this.UrlField.Visible = true;
-                    break;
-
-                case McpEditorField.Headers:
-                    this.HeadersSummaryLabel.Y = row;
-                    this.HeadersSummaryLabel.Text = FormatCount(draft.Headers.Length);
-                    this.HeadersSummaryLabel.Visible = true;
                     break;
 
                 case McpEditorField.AuthMode:
@@ -1007,18 +1102,6 @@ internal sealed class McpEditorForm : View
                     this.ClientIdField.Value = draft.ClientId ?? string.Empty;
                     this.ClientIdField.InsertionPoint = this.ClientIdField.Text?.Length ?? 0;
                     this.ClientIdField.Visible = true;
-                    break;
-
-                case McpEditorField.Scopes:
-                    this.ScopesSummaryLabel.Y = row;
-                    this.ScopesSummaryLabel.Text = FormatCount(draft.Scopes.Length);
-                    this.ScopesSummaryLabel.Visible = true;
-                    break;
-
-                case McpEditorField.Environment:
-                    this.EnvironmentSummaryLabel.Y = row;
-                    this.EnvironmentSummaryLabel.Text = FormatCount(draft.Environment.Length);
-                    this.EnvironmentSummaryLabel.Visible = true;
                     break;
 
                 case McpEditorField.BearerToken:
@@ -1133,52 +1216,114 @@ internal sealed class McpEditorForm : View
     /// array (<c>ArgumentItems</c>/<c>ScopeItems</c>) aligned so the commit path can still recover
     /// redacted raw values by Guid.
     /// </summary>
+    /// <remarks>
+    /// <paramref name="index"/> may be exactly the current length: that is the "virtual" row every
+    /// list field renders even when the draft is empty (see <see cref="BuildRows"/>). Typing into
+    /// it APPENDS, which is what turns a blank text field into a real argument without the user
+    /// having to press Ctrl+N first.
+    /// </remarks>
     private static McpServerDraft SetListValue(McpServerDraft draft, McpEditorField field, int index, string value)
     {
         if (field == McpEditorField.Arguments)
         {
-            if (draft.Args.IsDefault || index >= draft.Args.Length) return draft;
-            var items = draft.ArgumentItems.IsDefault || index >= draft.ArgumentItems.Length
-                ? draft.ArgumentItems
-                : draft.ArgumentItems.SetItem(index, draft.ArgumentItems[index] with { Value = value });
-            return draft with { Args = draft.Args.SetItem(index, value), ArgumentItems = items };
+            var args = draft.Args.IsDefault ? [] : draft.Args;
+            if (index > args.Length) return draft;
+            var items = draft.ArgumentItems.IsDefault ? default : draft.ArgumentItems;
+            return draft with
+            {
+                Args = index == args.Length ? args.Add(value) : args.SetItem(index, value),
+                ArgumentItems = SetItemValue(items, index, value),
+            };
         }
 
-        if (draft.Scopes.IsDefault || index >= draft.Scopes.Length) return draft;
-        var scopeItems = draft.ScopeItems.IsDefault || index >= draft.ScopeItems.Length
-            ? draft.ScopeItems
-            : draft.ScopeItems.SetItem(index, draft.ScopeItems[index] with { Value = value });
-        return draft with { Scopes = draft.Scopes.SetItem(index, value), ScopeItems = scopeItems };
+        var scopes = draft.Scopes.IsDefault ? [] : draft.Scopes;
+        if (index > scopes.Length) return draft;
+        var scopeItems = draft.ScopeItems.IsDefault ? default : draft.ScopeItems;
+        return draft with
+        {
+            Scopes = index == scopes.Length ? scopes.Add(value) : scopes.SetItem(index, value),
+            ScopeItems = SetItemValue(scopeItems, index, value),
+        };
+    }
+
+    /// <summary>
+    /// Mirrors a list edit into the parallel identity array, appending a fresh identity when the
+    /// edit materializes a virtual row. A default (absent) array stays absent: the commit path
+    /// treats that as "no identities were ever tracked for this draft".
+    /// </summary>
+    private static ImmutableArray<McpDraftListItem> SetItemValue(
+        ImmutableArray<McpDraftListItem> items,
+        int index,
+        string value)
+    {
+        if (items.IsDefault) return items;
+        if (index > items.Length) return items;
+        return index == items.Length
+            ? items.Add(McpDraftListItem.New(value))
+            : items.SetItem(index, items[index] with { Value = value });
     }
 
     private static McpServerDraft SetNamedName(McpServerDraft draft, McpEditorField field, int index, string value)
     {
         if (field == McpEditorField.Environment)
         {
-            if (draft.Environment.IsDefault || index >= draft.Environment.Length) return draft;
-            var item = draft.Environment[index];
+            var env = draft.Environment.IsDefault ? [] : draft.Environment;
+            if (index > env.Length) return draft;
             // Keep Change.Field aligned with the name so normalization validation passes.
-            var change = item.Change with { Field = $"env/{value}" };
-            return draft with { Environment = draft.Environment.SetItem(index, item with { Name = value, Change = change }) };
+            return draft with { Environment = SetNamedItemName(env, index, value, "env") };
         }
 
-        if (draft.Headers.IsDefault || index >= draft.Headers.Length) return draft;
-        var headerItem = draft.Headers[index];
-        var headerChange = headerItem.Change with { Field = $"header/{value}" };
-        return draft with { Headers = draft.Headers.SetItem(index, headerItem with { Name = value, Change = headerChange }) };
+        var headers = draft.Headers.IsDefault ? [] : draft.Headers;
+        if (index > headers.Length) return draft;
+        return draft with { Headers = SetNamedItemName(headers, index, value, "header") };
+    }
+
+    private static ImmutableArray<McpNamedSecretDraft> SetNamedItemName(
+        ImmutableArray<McpNamedSecretDraft> values,
+        int index,
+        string name,
+        string fieldPrefix)
+    {
+        if (index == values.Length)
+        {
+            return values.Add(new McpNamedSecretDraft(
+                name,
+                McpSecretSource.None,
+                new McpSecretChange($"{fieldPrefix}/{name}", McpSecretChangeKind.Unchanged)));
+        }
+
+        var item = values[index];
+        return values.SetItem(
+            index,
+            item with { Name = name, Change = item.Change with { Field = $"{fieldPrefix}/{name}" } });
     }
 
     private static McpServerDraft SetNamedValue(McpServerDraft draft, McpEditorField field, int index, string value)
     {
         if (field == McpEditorField.Environment)
         {
-            if (draft.Environment.IsDefault || index >= draft.Environment.Length) return draft;
-            return draft with { Environment = draft.Environment.SetItem(index, draft.Environment[index] with { Value = value }) };
+            var env = draft.Environment.IsDefault ? [] : draft.Environment;
+            if (index > env.Length) return draft;
+            return draft with { Environment = SetNamedItemValue(env, index, value, "env") };
         }
 
-        if (draft.Headers.IsDefault || index >= draft.Headers.Length) return draft;
-        return draft with { Headers = draft.Headers.SetItem(index, draft.Headers[index] with { Value = value }) };
+        var headers = draft.Headers.IsDefault ? [] : draft.Headers;
+        if (index > headers.Length) return draft;
+        return draft with { Headers = SetNamedItemValue(headers, index, value, "header") };
     }
+
+    private static ImmutableArray<McpNamedSecretDraft> SetNamedItemValue(
+        ImmutableArray<McpNamedSecretDraft> values,
+        int index,
+        string value,
+        string fieldPrefix) =>
+        index == values.Length
+            ? values.Add(new McpNamedSecretDraft(
+                string.Empty,
+                McpSecretSource.None,
+                new McpSecretChange($"{fieldPrefix}/", McpSecretChangeKind.Unchanged),
+                value))
+            : values.SetItem(index, values[index] with { Value = value });
 
     private void WireValueChanged()
     {
@@ -1257,15 +1402,7 @@ internal sealed class McpEditorForm : View
         this.BearerTokenLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.BearerToken); };
         this.SaveButton.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Save); };
         this.CancelButton.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Cancel); };
-        // Placeholder summary rows for empty lists: must update FocusedField so Ctrl+N, Ctrl+R,
-        // and Alt+Up/Down can operate on the right collection when focus is on the placeholder.
-        this.ArgumentsSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Arguments); };
-        this.EnvironmentSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Environment); };
-        this.HeadersSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Headers); };
-        this.ScopesSummaryLabel.HasFocusChanged += (s, _) => { if (!this.suppressSync && s is View v && v.HasFocus) this.controller.UpdateEditorFocus(McpEditorField.Scopes); };
     }
-    private static string FormatCount(int count) =>
-        count == 0 ? "(none) — Ctrl+N to add" : $"{count} item(s)";
 
     /// <summary>
     /// Creates a non-focusable label for the label column (X=<see cref="GutterWidth"/>,
@@ -1325,6 +1462,13 @@ internal sealed class McpEditorForm : View
             this.Width = Dim.Fill();
             this.Height = 1;
             this.Visible = false;
+
+            // A container with CanFocus = false is not descended into by AdvanceFocus, and is
+            // filtered out of MoveFieldFocus's child list — which made the name/value fields of an
+            // environment or header row unreachable by both Tab and ↑/↓. The row must be focusable
+            // for focus to reach the TextFields it exists to hold.
+            this.CanFocus = true;
+            this.TabStop = TabBehavior.TabStop;
 
             this.Name = new TextField
             {

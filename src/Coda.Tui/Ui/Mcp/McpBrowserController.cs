@@ -766,6 +766,21 @@ internal sealed class McpBrowserController
             : state);
     }
 
+    /// <summary>
+    /// Ctrl+N: inserts a new empty item DIRECTLY BELOW the focused one and moves the cursor to it.
+    /// </summary>
+    /// <remarks>
+    /// Appending at the end was disorienting once lists render as one row per item: with the caret
+    /// on argument 1 of 5, the new field appeared four rows away. Inserting below keeps the new
+    /// field where the user is looking.
+    /// <para>
+    /// The focused row may be the VIRTUAL row a list field renders when the draft is still empty
+    /// (see <c>McpEditorForm.BuildRows</c>). That row has no draft item behind it, so it is
+    /// materialized first; otherwise Ctrl+N on an untouched Arguments field would produce a single
+    /// item at index 0 while the caret sat on index 1, and the new row would look like it had
+    /// swallowed the first one.
+    /// </para>
+    /// </remarks>
     private void AddEditorItem(McpBrowserProvider current, long openEpoch) =>
         this.Mutate(current, openEpoch, state =>
         {
@@ -775,53 +790,117 @@ internal sealed class McpBrowserController
             }
 
             var draft = editor.Draft;
-            var itemCount = 0;
-            draft = editor.FocusedField switch
+            var index = Math.Max(0, editor.SelectedItem);
+            int insertAt;
+            switch (editor.FocusedField)
             {
-                McpEditorField.Arguments => draft with
+                case McpEditorField.Arguments:
                 {
-                    Args = draft.Args.Add(string.Empty),
-                    ArgumentItems = AppendItem(draft.ArgumentItems, draft.Args),
-                },
-                McpEditorField.Scopes => draft with
-                {
-                    Scopes = draft.Scopes.Add(string.Empty),
-                    ScopeItems = AppendItem(draft.ScopeItems, draft.Scopes),
-                },
-                McpEditorField.Environment => draft with
-                {
-                    Environment = draft.Environment.Add(NewNamedSecret("env")),
-                },
-                McpEditorField.Headers => draft with
-                {
-                    Headers = draft.Headers.Add(NewNamedSecret("header")),
-                },
-                _ => draft,
-            };
-
-            itemCount = editor.FocusedField switch
-            {
-                McpEditorField.Arguments => draft.Args.Length,
-                McpEditorField.Scopes => draft.Scopes.Length,
-                McpEditorField.Environment => draft.Environment.Length,
-                McpEditorField.Headers => draft.Headers.Length,
-                _ => 0,
-            };
-            return itemCount == 0
-                ? state
-                : state with
-                {
-                    Editor = editor with
+                    insertAt = InsertPosition(index, draft.Args.IsDefault ? 0 : draft.Args.Length);
+                    var args = Materialize(draft.Args, insertAt);
+                    draft = draft with
                     {
-                        Draft = draft,
-                        SelectedItem = itemCount - 1,
-                        SelectedItemPart = editor.FocusedField is McpEditorField.Environment or McpEditorField.Headers
-                            ? McpEditorItemPart.Name
-                            : McpEditorItemPart.Value,
-                    },
-                };
+                        Args = args.Insert(insertAt, string.Empty),
+                        ArgumentItems = InsertItem(draft.ArgumentItems, args, insertAt),
+                    };
+                    break;
+                }
+
+                case McpEditorField.Scopes:
+                {
+                    insertAt = InsertPosition(index, draft.Scopes.IsDefault ? 0 : draft.Scopes.Length);
+                    var scopes = Materialize(draft.Scopes, insertAt);
+                    draft = draft with
+                    {
+                        Scopes = scopes.Insert(insertAt, string.Empty),
+                        ScopeItems = InsertItem(draft.ScopeItems, scopes, insertAt),
+                    };
+                    break;
+                }
+
+                case McpEditorField.Environment:
+                    insertAt = InsertPosition(index, draft.Environment.IsDefault ? 0 : draft.Environment.Length);
+                    draft = draft with
+                    {
+                        Environment = Materialize(draft.Environment, insertAt, () => NewNamedSecret("env"))
+                            .Insert(insertAt, NewNamedSecret("env")),
+                    };
+                    break;
+
+                case McpEditorField.Headers:
+                    insertAt = InsertPosition(index, draft.Headers.IsDefault ? 0 : draft.Headers.Length);
+                    draft = draft with
+                    {
+                        Headers = Materialize(draft.Headers, insertAt, () => NewNamedSecret("header"))
+                            .Insert(insertAt, NewNamedSecret("header")),
+                    };
+                    break;
+
+                default:
+                    return state;
+            }
+
+            return state with
+            {
+                Editor = editor with
+                {
+                    Draft = draft,
+                    SelectedItem = insertAt,
+                    SelectedItemPart = editor.FocusedField is McpEditorField.Environment or McpEditorField.Headers
+                        ? McpEditorItemPart.Name
+                        : McpEditorItemPart.Value,
+                },
+            };
         });
 
+    /// <summary>
+    /// Where Ctrl+N should insert, given the caret's row <paramref name="index"/> and the number of
+    /// items that actually exist in the draft.
+    /// </summary>
+    /// <remarks>
+    /// When the caret sits on a VIRTUAL row (one the editor renders but the draft does not back —
+    /// <paramref name="index"/> at or beyond <paramref name="length"/>), materializing that row is
+    /// itself the new field, so the insert goes at the end. Adding one BELOW it as well would leave
+    /// the user with two blank fields for one keypress. Otherwise insert directly below the caret.
+    /// </remarks>
+    private static int InsertPosition(int index, int length) =>
+        index >= length ? length : index + 1;
+
+    /// <summary>
+    /// Pads <paramref name="values"/> with empty entries until <paramref name="length"/> items
+    /// exist, so an insert at that position is contiguous. This is what turns the editor's virtual
+    /// (not-yet-typed) row into a real draft item.
+    /// </summary>
+    private static ImmutableArray<string> Materialize(ImmutableArray<string> values, int length)
+    {
+        var result = values.IsDefault ? [] : values;
+        while (result.Length < length)
+        {
+            result = result.Add(string.Empty);
+        }
+
+        return result;
+    }
+
+    private static ImmutableArray<McpNamedSecretDraft> Materialize(
+        ImmutableArray<McpNamedSecretDraft> values,
+        int length,
+        Func<McpNamedSecretDraft> factory)
+    {
+        var result = values.IsDefault ? [] : values;
+        while (result.Length < length)
+        {
+            result = result.Add(factory());
+        }
+
+        return result;
+    }
+
+    /// <summary>
+    /// Ctrl+R: removes the focused item. The LAST remaining item is cleared rather than removed, so
+    /// a list field always keeps one editable row and the user is never left facing a field they
+    /// cannot type into.
+    /// </summary>
     private void RemoveEditorItem(McpBrowserProvider current, long openEpoch) =>
         this.Mutate(current, openEpoch, state =>
         {
@@ -836,6 +915,15 @@ internal sealed class McpBrowserController
             switch (editor.FocusedField)
             {
                 case McpEditorField.Arguments when index >= 0 && index < draft.Args.Length:
+                    if (draft.Args.Length == 1)
+                    {
+                        return ClearedSingleton(state, editor, draft with
+                        {
+                            Args = [],
+                            ArgumentItems = draft.ArgumentItems.IsDefault ? default : [],
+                        });
+                    }
+
                     draft = draft with
                     {
                         Args = draft.Args.RemoveAt(index),
@@ -844,6 +932,15 @@ internal sealed class McpBrowserController
                     itemCount = draft.Args.Length;
                     break;
                 case McpEditorField.Scopes when index >= 0 && index < draft.Scopes.Length:
+                    if (draft.Scopes.Length == 1)
+                    {
+                        return ClearedSingleton(state, editor, draft with
+                        {
+                            Scopes = [],
+                            ScopeItems = draft.ScopeItems.IsDefault ? default : [],
+                        });
+                    }
+
                     draft = draft with
                     {
                         Scopes = draft.Scopes.RemoveAt(index),
@@ -880,6 +977,16 @@ internal sealed class McpBrowserController
                 },
             };
         });
+
+    /// <summary>
+    /// Empties a list down to zero draft items and parks the cursor on row 0 — the virtual row the
+    /// editor always renders — so the field still shows one blank, focusable text box.
+    /// </summary>
+    private static McpBrowserState ClearedSingleton(
+        McpBrowserState state,
+        McpEditorState editor,
+        McpServerDraft draft) =>
+        state with { Editor = editor with { Draft = draft, SelectedItem = 0 } };
 
     private void MoveEditorItemPart(McpBrowserProvider current, long openEpoch, int direction) =>
         this.Mutate(current, openEpoch, state => state.Editor is { } editor &&
@@ -1332,12 +1439,28 @@ internal sealed class McpBrowserController
         return values.SetItem(index, item with { Value = change(item.Value) });
     }
 
-    private static ImmutableArray<McpDraftListItem> AppendItem(
+    /// <summary>
+    /// Mirrors an insert into the parallel identity array so <c>Args</c>/<c>ArgumentItems</c> (and
+    /// the scope pair) stay index-aligned — the commit path recovers redacted raw values by Guid,
+    /// and a misaligned pair silently rewrites the wrong argument.
+    /// </summary>
+    /// <param name="values">The already-materialized display values the insert is being applied to.</param>
+    private static ImmutableArray<McpDraftListItem> InsertItem(
         ImmutableArray<McpDraftListItem> items,
-        ImmutableArray<string> previousValues) =>
-        items.IsDefault
-            ? previousValues.Select(McpDraftListItem.New).Append(McpDraftListItem.New(string.Empty)).ToImmutableArray()
-            : items.Add(McpDraftListItem.New(string.Empty));
+        ImmutableArray<string> values,
+        int insertAt)
+    {
+        var result = items.IsDefault
+            ? values.Select(McpDraftListItem.New).ToImmutableArray()
+            : items;
+
+        while (result.Length < insertAt)
+        {
+            result = result.Add(McpDraftListItem.New(string.Empty));
+        }
+
+        return result.Insert(insertAt, McpDraftListItem.New(string.Empty));
+    }
 
     private static ImmutableArray<McpDraftListItem> RemoveItem(
         ImmutableArray<McpDraftListItem> items,

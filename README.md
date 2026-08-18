@@ -120,7 +120,8 @@ virtualized transcript fills the **full
 width** of the screen, an **operational status row** (turn, tool, waiting, approval, and key-hint state) sits
 **directly above** the composer, and a **dynamic composer** starts at **three rows** and grows up to a
 **capped height** as you type while staying pinned near the bottom. A separate, **stable metadata row**
-(model, effort, context, usage, services, git, and cwd) occupies the **final row**. **Focus** stays on the composer while you
+(model, effort, permission mode, context, usage, cost, services, git, and cwd) occupies the **final row**;
+fields are shed from the right as the terminal narrows. **Focus** stays on the composer while you
 type — keyboard shortcuts drive the transcript, overlays, and completion menu without pulling focus away
 from your prompt. **Inline mode** uses the same retained, scrollable layout in the terminal's primary
 buffer and remains available as an **explicit compatibility** choice via `--tui=inline`.
@@ -337,9 +338,11 @@ The **MCP browser** additionally offers `a` add · `e` edit · `Space` enable/di
 re-authenticate · `Delete` remove. Its editor is a real form: `Tab`/`Shift+Tab` and `Up`/`Down` move
 between fields, text fields have a cursor and full editing, fixed-value fields are selectors, and the
 fields shown change with the transport — a stdio server has a command, arguments and environment; an
-HTTP server has a URL, headers and auth. `Ctrl+N` adds a list item, `Ctrl+R` removes one, and
-`Alt+Up`/`Alt+Down` reorder. Secrets are never typed into the form: they are entered through a
-masked prompt and shown only as `*****`.
+HTTP server has a URL, headers and auth. List fields always show at least one empty row, so you can
+type the first argument straight away; `Ctrl+N` adds another row below the current one, `Ctrl+R`
+removes the current row — clearing it rather than removing it when it is the last one — and
+`Alt+Up`/`Alt+Down` reorder. Rows left blank are discarded on save. Secrets are never typed into the
+form: they are entered through a masked prompt and shown only as `*****`.
 
 Changing an existing server's **transport** rewrites it to the other shape and drops the fields that
 do not apply, so saving such a change asks for confirmation first and names what will be lost.
@@ -463,9 +466,10 @@ Effective project entries remain visible alongside the overridden user entry. Li
 `PageUp`/`PageDown`, `Home`/`End`, `Enter` (detail), `a` (add), `e` (edit), `Space` (toggle),
 `u` (reauthenticate), `Delete` (remove), and `Esc` (close). Detail keys scroll with arrows/
 PageUp/PageDown/Home/End and support `e`, `Space`, `u`, `Delete`, and `Esc`. Editor keys are
-`Tab`/`Shift+Tab`, focus-sensitive `Enter`, `Esc`, Backspace/Delete, `Ctrl+N`/`Ctrl+R` for
-collection rows, `Ctrl+Up`/`Ctrl+Down` for item navigation, and `Ctrl+Left`/`Ctrl+Right` for
-item-part navigation; printable action letters insert text in fields.
+`Tab`/`Shift+Tab`, focus-sensitive `Enter`, `Esc`, Backspace/Delete, `Ctrl+N`/`Ctrl+R` to add and
+remove collection rows, and `Alt+Up`/`Alt+Down` to reorder them; `Up`/`Down` move between fields and
+rows, and `Tab` moves between the name and value halves of an environment or header row. Printable
+action letters insert text in fields.
 
 In the browser, add/edit save directly, toggle does not confirm, and delete/reauthenticate prompt
 with a default of No. A newly added server persists enabled but is deliberately not connected until

@@ -830,6 +830,15 @@ internal sealed partial class McpManagementService : IMcpManagementService
         };
     }
 
+    /// <summary>
+    /// Drops blank entries and validates the rest.
+    /// </summary>
+    /// <remarks>
+    /// Blank arguments are DISCARDED rather than persisted. The editor always renders one empty
+    /// argument row (so the field can be typed into without discovering Ctrl+N first), and Ctrl+N
+    /// can leave further untouched rows behind; none of those should reach <c>.mcp.json</c>, where
+    /// an empty argv entry is passed to the server process as a real, meaningless token.
+    /// </remarks>
     private static ImmutableArray<string> NormalizeArgs(ImmutableArray<string> values)
     {
         if (values.IsDefaultOrEmpty)
@@ -845,13 +854,23 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 throw new McpException("MCP arguments cannot be null.");
             }
 
+            if (value.Length == 0)
+            {
+                continue;
+            }
+
             ValidateSafeText(value, "An MCP argument contains unsafe characters.");
             result.Add(value);
         }
 
-        return result.MoveToImmutable();
+        return result.ToImmutable();
     }
 
+    /// <summary>
+    /// Drops blank scopes and validates the rest. Blank entries are discarded for the same reason
+    /// as blank arguments: the editor always offers one empty row, so "left it untouched" must not
+    /// become a save-blocking error.
+    /// </summary>
     private static ImmutableArray<string> NormalizeScopes(ImmutableArray<string> values)
     {
         if (values.IsDefaultOrEmpty)
@@ -864,14 +883,14 @@ internal sealed partial class McpManagementService : IMcpManagementService
         {
             if (string.IsNullOrWhiteSpace(value))
             {
-                throw new McpException("OAuth scopes cannot be blank.");
+                continue;
             }
 
             ValidateSafeText(value, "An OAuth scope contains unsafe characters.");
             result.Add(value);
         }
 
-        return result.MoveToImmutable();
+        return result.ToImmutable();
     }
 
     private static ImmutableArray<McpDraftListItem> NormalizeArgumentItems(
@@ -891,11 +910,18 @@ internal sealed partial class McpManagementService : IMcpManagementService
                 throw new McpException("MCP argument item identities must be unique and valid.");
             }
 
+            // Kept in step with NormalizeArgs: both drop blanks, so the two arrays stay
+            // index-aligned and the commit path still resolves raw values by Guid.
+            if (item.Value.Length == 0)
+            {
+                continue;
+            }
+
             ValidateSafeText(item.Value, "An MCP argument contains unsafe characters.");
             result.Add(item);
         }
 
-        return result.MoveToImmutable();
+        return result.ToImmutable();
     }
 
     private static ImmutableArray<McpDraftListItem> NormalizeScopeItems(
@@ -945,8 +971,22 @@ internal sealed partial class McpManagementService : IMcpManagementService
         var normalized = new List<McpNamedSecretDraft>(values.Length);
         foreach (var named in values)
         {
-            if (named is null || string.IsNullOrWhiteSpace(named.Name))
+            if (named is null)
             {
+                throw new McpException($"{displayName} names cannot be blank.");
+            }
+
+            // An entirely untouched row (the editor always offers one) is dropped rather than
+            // rejected. A row that carries a value or a pending secret change but no name is still
+            // an error: silently discarding it would throw away what the user typed.
+            if (string.IsNullOrWhiteSpace(named.Name))
+            {
+                if (string.IsNullOrEmpty(named.Value)
+                    && named.Change.Kind == McpSecretChangeKind.Unchanged)
+                {
+                    continue;
+                }
+
                 throw new McpException($"{displayName} names cannot be blank.");
             }
 
