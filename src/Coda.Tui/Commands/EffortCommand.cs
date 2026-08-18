@@ -285,6 +285,21 @@ public sealed class EffortCommand : ISlashCommand
     }
 
     /// <summary>
+    /// Reads the model's advertised reasoning levels from the in-session model-list cache
+    /// (populated by <c>/model</c> and <c>/effort</c>). Returns null when the cache holds nothing
+    /// for the active provider — which means "not known yet", NOT "unsupported".
+    /// </summary>
+    internal static IReadOnlyList<string>? CachedReasoningLevels(CommandContext context, string? modelId = null)
+    {
+        var model = modelId ?? context.Session.Model;
+        return context.Session.ModelListCache.TryGetValue(context.ActiveProvider.Id, out var list)
+            ? list.Models
+                .FirstOrDefault(m => string.Equals(m.Id, model, StringComparison.OrdinalIgnoreCase))
+                ?.ReasoningLevels
+            : null;
+    }
+
+    /// <summary>
     /// Resolves the <see cref="ReasoningCapability"/> for a model synchronously, reading only from
     /// the in-session model-list cache (populated by <c>/model</c>). Defaults to the session's
     /// current model.
@@ -299,15 +314,10 @@ public sealed class EffortCommand : ISlashCommand
     internal static ReasoningCapability ResolveCapability(CommandContext context, string? modelId = null)
     {
         var model = modelId ?? context.Session.Model;
-        IReadOnlyList<string>? reasoningLevels = null;
-        if (context.Session.ModelListCache.TryGetValue(context.ActiveProvider.Id, out var list))
-        {
-            reasoningLevels = list.Models
-                .FirstOrDefault(m => string.Equals(m.Id, model, StringComparison.OrdinalIgnoreCase))
-                ?.ReasoningLevels;
-        }
-
-        return ReasoningCapabilityResolver.Resolve(context.ActiveProvider.Id, model, reasoningLevels);
+        return ReasoningCapabilityResolver.Resolve(
+            context.ActiveProvider.Id,
+            model,
+            CachedReasoningLevels(context, modelId));
     }
 
     /// <summary>

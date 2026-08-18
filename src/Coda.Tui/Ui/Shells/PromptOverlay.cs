@@ -27,8 +27,14 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
     /// <summary>Share of the host surface the dialog may occupy before it goes full-screen.</summary>
     private const int MaxHostPercent = 80;
 
-    /// <summary>Rows and columns the rounded border takes off the content area.</summary>
+    /// <summary>Rows the rounded border takes off the content area (top + bottom).</summary>
     private const int Chrome = 2;
+
+    /// <summary>
+    /// Columns the border and its inside padding take off the content area: 2 for the border and
+    /// 2 for the one-column gutter <see cref="Padding"/> puts on each side.
+    /// </summary>
+    private const int HorizontalChrome = 4;
 
     private readonly IUiEventPublisher publisher;
     private TuiTheme theme;
@@ -49,6 +55,10 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
         this.CanFocus = true;
         this.Visible = false;
         this.BorderStyle = LineStyle.Rounded;
+
+        // One blank column inside each side of the border. Without it the longest option label
+        // butts straight up against the box edge, which reads as clipped text.
+        this.Padding.Thickness = new Thickness(1, 0, 1, 0);
 
         this.titleLabel = new Label { X = 0, Y = 0, Width = Dim.Fill(), CanFocus = false };
         this.bodyLabel = new SelectableTextView(app) { X = 0, Y = BodyTop, Width = Dim.Fill(), Height = Dim.Fill() };
@@ -93,7 +103,7 @@ internal sealed class PromptOverlay : View, ISelectableOverlay
         var maxWidth = Math.Min(host.Width * MaxHostPercent / 100, MaxDialogWidth);
         var maxHeight = host.Height * MaxHostPercent / 100;
 
-        var width = Math.Max(MinDialogWidth, Math.Max(titleWidth, bodyWidth) + Chrome);
+        var width = Math.Max(MinDialogWidth, Math.Max(titleWidth, bodyWidth) + HorizontalChrome);
         var height = contentHeight + Chrome;
 
         // Anything that will not fit inside the clamped box takes the whole screen instead of being

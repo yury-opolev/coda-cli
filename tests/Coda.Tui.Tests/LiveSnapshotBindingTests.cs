@@ -1,4 +1,5 @@
 using Coda.Agent;
+using Coda.Sdk;
 using Coda.Tui;
 using Coda.Tui.Commands;
 using Coda.Tui.Repl;
@@ -60,9 +61,48 @@ public sealed class LiveSnapshotBindingTests
         await actorTask;
     }
 
+    /// <summary>
+    /// A Copilot model advertises its reasoning levels at RUNTIME, so before any model list has
+    /// been fetched the capability is indeterminate — not unsupported. Resolving the metadata event
+    /// through the plain capability dropped the configured level, so the status line read "auto"
+    /// while <c>/effort</c> correctly showed "high" and the API correctly received it.
+    /// </summary>
     [Fact]
-    public async Task Bound_provider_tracks_subsequent_live_updates()
+    public void Configured_effort_survives_an_empty_model_list_cache_for_copilot()
     {
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.SetActiveProvider(context.FindProvider("github-copilot")!);
+        context.Session.Model = "claude-opus-5";
+        context.Session.Effort = "high";
+        context.Session.ModelListCache.Clear();
+
+        var metadata = SessionMetadataEvents.Build(context);
+
+        Assert.Equal("high", metadata.RequestedEffort);
+        Assert.Equal("high", metadata.EffectiveEffort);
+    }
+
+    /// <summary>
+    /// Once the levels ARE known, the normal drop rule applies again: a level the model does not
+    /// advertise must not be reported as effective.
+    /// </summary>
+    [Fact]
+    public void Unadvertised_effort_falls_back_to_auto_once_levels_are_known()
+    {
+        var (_, context, _, _) = TestAppBuilder.BuildApp();
+        context.SetActiveProvider(context.FindProvider("github-copilot")!);
+        context.Session.Model = "low-effort-only";
+        context.Session.Effort = "high";
+        context.Session.ModelListCache["github-copilot"] = new ModelListResult(
+            "github-copilot",
+            ModelSource.Live,
+            [new ModelListEntry("low-effort-only", "Low Effort Only", ReasoningLevels: ["low", "medium"])]);
+
+        Assert.Equal("auto", SessionMetadataEvents.Build(context).EffectiveEffort);
+    }
+
+    [Fact]
+    public async Task Bound_provider_tracks_subsequent_live_updates()    {
         var (_, context, _, _) = TestAppBuilder.BuildApp();
 
         using var mailbox = new UiEventMailbox(64);
