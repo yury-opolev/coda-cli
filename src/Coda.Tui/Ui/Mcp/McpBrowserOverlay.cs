@@ -68,6 +68,10 @@ internal sealed class McpBrowserOverlay : View, ISelectableOverlay
         this.Height = Dim.Fill();
         this.BorderStyle = LineStyle.Rounded;
 
+        // One blank column inside each side of the border, so rows never butt up against the box
+        // edge. Padding shrinks the Viewport, so Dim.Fill() children adjust with no other change.
+        this.Padding.Thickness = new Thickness(1, 0, 1, 0);
+
         this.header = new Label
         {
             X = 0,

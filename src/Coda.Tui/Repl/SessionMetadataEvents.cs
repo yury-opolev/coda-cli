@@ -19,10 +19,16 @@ public static class SessionMetadataEvents
         var model = context.Session.Model;
         var requested = context.Session.Effort;
 
-        // Resolve the effective effort using the full capability resolver (handles provider- and
-        // model-specific rules, including the Anthropic max→high clamp for non-Opus models).
-        var capability = EffortCommand.ResolveCapability(context);
-        var effective = ReasoningCapabilityResolver.ResolveAppliedLevel(capability, requested) ?? "auto";
+        // ResolveStoredLevel, not Resolve + ResolveAppliedLevel — the same rule the startup path
+        // follows. A Copilot model advertises its levels at runtime, so until a model list has been
+        // fetched the capability is INDETERMINATE, not unsupported. Resolving through the plain
+        // capability reported it unsupported and dropped the configured level, so the status line
+        // read "auto" while /effort correctly showed (and the API correctly received) "high".
+        var effective = ReasoningCapabilityResolver.ResolveStoredLevel(
+            context.ActiveProvider.Id,
+            model,
+            requested,
+            EffortCommand.CachedReasoningLevels(context)) ?? "auto";
 
         var connected = context.UiSnapshotProvider?.Invoke().Connected ?? false;
 
