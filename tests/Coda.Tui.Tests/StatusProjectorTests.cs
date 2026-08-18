@@ -39,7 +39,7 @@ public sealed class StatusProjectorTests
         };
 
         Assert.Equal(
-            "gpt-5.6-sol | perm ask !1 | high | ctx 42%",
+            "gpt-5.6-sol | high | perm ask !1 | ctx 42%",
             StatusProjector.Project(snapshot, 44));
     }
 
@@ -58,17 +58,17 @@ public sealed class StatusProjectorTests
     }
 
     [Fact]
-    public void Status_field_order_is_model_permission_effort()
+    public void Status_field_order_is_model_effort_permission()
     {
         var line = StatusProjector.Project(Wide(), 200);
 
         var model = line.IndexOf("gpt-5.6-sol", StringComparison.Ordinal);
-        var permission = line.IndexOf("perm ask", StringComparison.Ordinal);
         var effort = line.IndexOf("high", StringComparison.Ordinal);
+        var permission = line.IndexOf("perm ask", StringComparison.Ordinal);
 
         Assert.True(model >= 0 && permission >= 0 && effort >= 0);
-        Assert.True(model < permission, "model must precede permission");
-        Assert.True(permission < effort, "permission must precede effort");
+        Assert.True(model < effort, "model must precede effort");
+        Assert.True(effort < permission, "effort must precede permission");
     }
 
     [Fact]
@@ -83,13 +83,13 @@ public sealed class StatusProjectorTests
     }
 
     [Fact]
-    public void Narrow_width_keeps_permission_and_sheds_effort_when_only_model_and_permission_fit()
+    public void Narrow_width_keeps_effort_and_sheds_permission_when_only_model_and_effort_fit()
     {
         var snapshot = Wide() with { Permission = new PermissionStatus(PermissionMode.Default, 0) };
 
         var line = StatusProjector.Project(snapshot, 25);
 
-        Assert.Equal("gpt-5.6-sol | perm ask", line);
+        Assert.Equal("gpt-5.6-sol | high", line);
     }
 
     [Fact]

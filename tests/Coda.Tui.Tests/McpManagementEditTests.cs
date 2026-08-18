@@ -202,6 +202,44 @@ public sealed class McpManagementEditTests
         Assert.Equal(rawArgs, config.Args);
     }
 
+    /// <summary>
+    /// The editor always renders one empty row per list field, and Ctrl+N can leave further
+    /// untouched rows behind. None of those blanks may reach .mcp.json — an empty argv entry is
+    /// handed to the server process as a real, meaningless token, and a nameless env row is noise.
+    /// </summary>
+    [Fact]
+    public async Task Commit_edit_drops_blank_args_and_untouched_environment_rows()
+    {
+        await using var harness = await McpManagementTestHarness.CreateAsync();
+        harness.WriteProject("""{"mcpServers":{"server":{"command":"node","args":["server.js"]}}}""");
+        var original = new McpServerKey(McpConfigScope.Project, "server");
+        var draft = await harness.Service.CreateEditDraftAsync(original, CancellationToken.None);
+        Assert.NotNull(draft);
+
+        var preview = await harness.Service.PrepareEditAsync(
+            original,
+            draft with
+            {
+                Args = ["server.js", string.Empty, string.Empty],
+                ArgumentItems = default,
+                Environment =
+                [
+                    new McpNamedSecretDraft(
+                        string.Empty,
+                        McpSecretSource.None,
+                        new McpSecretChange("env/", McpSecretChangeKind.Unchanged)),
+                ],
+            },
+            CancellationToken.None);
+        var result = await harness.Service.CommitEditAsync(preview, CancellationToken.None);
+        var config = Assert.IsType<McpStdioServerConfig>(
+            Assert.Single(McpConfig.LoadPhysicalEntries(harness.Project, harness.User)).Config);
+
+        Assert.Equal(McpMutationStatus.Succeeded, result.Status);
+        Assert.Equal(["server.js"], config.Args);
+        Assert.Empty(config.Env);
+    }
+
     [Fact]
     public async Task Commit_edit_preserves_redacted_http_url_when_draft_is_unchanged()
     {

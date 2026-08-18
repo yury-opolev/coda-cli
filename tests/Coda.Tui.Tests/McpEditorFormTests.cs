@@ -339,14 +339,46 @@ public sealed class McpEditorFormTests : IDisposable
     }
 
     /// <summary>
-    /// Real Tab traversal must reach the Arguments and Environment placeholder rows for a stdio
-    /// field set — the user cannot add the first item to an empty list unless Tab lands there.
-    /// This is the test that catches the original bug where those rows were non-focusable Labels.
+    /// Focus navigation must follow the order the rows are DRAWN in. Per-item widgets are pooled
+    /// and created on demand, so they land at the end of the view tree regardless of their row;
+    /// without an explicit reorder the caret jumped from Command past Arguments and Environment
+    /// straight to Save, and only reached the list rows after Cancel.
     /// </summary>
     [Fact]
-    public void Tab_traversal_for_stdio_reaches_arguments_and_environment_placeholders()
+    public void Tab_traversal_for_stdio_follows_visual_row_order()
     {
-        // Empty args and env so the placeholder labels are visible (not per-item rows).
+        this.application.Driver!.SetScreenSize(80, 24);
+        this.application.LayoutAndDraw();
+
+        var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope);
+        this.form.ApplyState(state);
+        this.form.SetFocus();
+        this.application.LayoutAndDraw();
+
+        var visited = CollectTabOrder(this.form, maxSteps: 30);
+
+        int RowOf(View view) => visited.ToList().FindIndex(v => ReferenceEquals(v, view));
+
+        var command = RowOf(this.form.CommandField);
+        var argument = RowOf(this.form.ItemViewForTest(McpEditorField.Arguments, 0)!);
+        var environment = RowOf(this.form.ItemViewForTest(McpEditorField.Environment, 0, McpEditorItemPart.Name)!);
+        var save = RowOf(this.form.SaveButton);
+
+        Assert.True(command >= 0 && argument >= 0 && environment >= 0 && save >= 0);
+        Assert.True(command < argument, "Command must precede Arguments");
+        Assert.True(argument < environment, "Arguments must precede Environment");
+        Assert.True(environment < save, "Environment must precede Save");
+    }
+
+    /// <summary>
+    /// Real Tab traversal must reach the first Arguments and Environment rows for a stdio field
+    /// set — the user cannot add the first item to an empty list unless Tab lands there. Those rows
+    /// are now real, always-present text fields rather than non-focusable summary Labels.
+    /// </summary>
+    [Fact]
+    public void Tab_traversal_for_stdio_reaches_arguments_and_environment_rows()
+    {
+        // Empty args and env, so both fields render only their virtual (not-yet-typed) row.
         var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Scope);
         this.form.ApplyState(state);
         this.form.SetFocus();
@@ -354,8 +386,10 @@ public sealed class McpEditorFormTests : IDisposable
 
         var visited = CollectTabOrder(this.form, maxSteps: 20);
 
-        Assert.Contains(this.form.ArgumentsSummaryLabel, visited);
-        Assert.Contains(this.form.EnvironmentSummaryLabel, visited);
+        Assert.Contains(this.form.ItemViewForTest(McpEditorField.Arguments, 0)!, visited);
+        Assert.Contains(
+            this.form.ItemViewForTest(McpEditorField.Environment, 0, McpEditorItemPart.Name)!,
+            visited);
     }
 
     /// <summary>
@@ -372,19 +406,20 @@ public sealed class McpEditorFormTests : IDisposable
 
         var visited = CollectTabOrder(this.form, maxSteps: 30);
 
-        Assert.Contains(this.form.HeadersSummaryLabel, visited);
-        Assert.Contains(this.form.ScopesSummaryLabel, visited);
+        Assert.Contains(
+            this.form.ItemViewForTest(McpEditorField.Headers, 0, McpEditorItemPart.Name)!,
+            visited);
+        Assert.Contains(this.form.ItemViewForTest(McpEditorField.Scopes, 0)!, visited);
         Assert.Contains(this.form.BearerTokenLabel, visited);
     }
 
     /// <summary>
-    /// Focusing the ArgumentsSummaryLabel (the empty-list placeholder) must update the
-    /// controller's FocusedField to Arguments via the HasFocusChanged wiring. This is the
-    /// prerequisite for Ctrl+N to add the first argument — without it the controller can never
-    /// know which collection to add to.
+    /// Focusing the first Arguments row must update the controller's FocusedField to Arguments via
+    /// the HasFocusChanged wiring. This is the prerequisite for Ctrl+N to add an argument — without
+    /// it the controller can never know which collection to add to.
     /// </summary>
     [Fact]
-    public void CtrlN_on_focused_empty_arguments_placeholder_adds_first_item()
+    public void Focusing_the_empty_arguments_row_sets_the_controller_focus_to_arguments()
     {
         var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Name);
         this.controller.SetStateForTest(McpBrowserState.Empty with
@@ -396,8 +431,8 @@ public sealed class McpEditorFormTests : IDisposable
         this.form.SetFocus();
         this.application.LayoutAndDraw();
 
-        // Move real widget focus to the Arguments placeholder label.
-        this.form.ArgumentsSummaryLabel.SetFocus();
+        // Move real widget focus to the always-present first Arguments row.
+        this.form.ItemViewForTest(McpEditorField.Arguments, 0)!.SetFocus();
         this.application.LayoutAndDraw();
 
         // The controller's FocusedField must now be Arguments via HasFocusChanged wiring.
@@ -623,8 +658,10 @@ public sealed class McpEditorFormTests : IDisposable
         Assert.True(this.form.NameField.Visible, "Name");
         Assert.True(this.form.TransportSelector.Visible, "Transport");
         Assert.True(this.form.CommandField.Visible, "Command");
-        Assert.True(this.form.ArgumentsSummaryLabel.Visible, "Arguments");
-        Assert.True(this.form.EnvironmentSummaryLabel.Visible, "Environment");
+        Assert.True(this.form.ItemViewForTest(McpEditorField.Arguments, 0)!.Visible, "Arguments");
+        Assert.True(
+            this.form.ItemViewForTest(McpEditorField.Environment, 0, McpEditorItemPart.Name)!.Visible,
+            "Environment");
         Assert.True(this.form.SaveButton.Visible, "Save");
         Assert.True(this.form.CancelButton.Visible, "Cancel");
     }
@@ -912,13 +949,18 @@ public sealed class McpEditorFormTests : IDisposable
     /// distinct view that received focus. Stops early when the traversal wraps back to the first
     /// focused widget, so the returned list covers exactly one complete cycle.
     /// </summary>
+    /// <summary>
+    /// Walks the editor's Tab order by raising real Tab key events. It must NOT call
+    /// <c>AdvanceFocus</c> directly: the form deliberately overrides Tab in <c>OnKeyDown</c> so
+    /// focus follows the drawn row order rather than the view-tree order.
+    /// </summary>
     private static IReadOnlyList<View> CollectTabOrder(McpEditorForm form, int maxSteps)
     {
         var result = new List<View>();
         View? first = null;
         for (var i = 0; i < maxSteps; i++)
         {
-            form.AdvanceFocus(NavigationDirection.Forward, TabBehavior.TabStop);
+            form.NewKeyDownEvent(Key.Tab);
             var focused = FindFocused(form);
             if (focused is null) break;
             if (first is null)
@@ -964,13 +1006,13 @@ public sealed class McpEditorFormTests : IDisposable
         McpEditorField.Name => form.NameField,
         McpEditorField.Transport => form.TransportSelector,
         McpEditorField.Command => form.CommandField,
-        McpEditorField.Arguments => form.ArgumentsSummaryLabel,
+        McpEditorField.Arguments => form.ItemViewForTest(McpEditorField.Arguments, 0),
         McpEditorField.Url => form.UrlField,
-        McpEditorField.Headers => form.HeadersSummaryLabel,
+        McpEditorField.Headers => form.ItemViewForTest(McpEditorField.Headers, 0, McpEditorItemPart.Name),
         McpEditorField.AuthMode => form.AuthModeSelector,
         McpEditorField.ClientId => form.ClientIdField,
-        McpEditorField.Scopes => form.ScopesSummaryLabel,
-        McpEditorField.Environment => form.EnvironmentSummaryLabel,
+        McpEditorField.Scopes => form.ItemViewForTest(McpEditorField.Scopes, 0),
+        McpEditorField.Environment => form.ItemViewForTest(McpEditorField.Environment, 0, McpEditorItemPart.Name),
         McpEditorField.BearerToken => form.BearerTokenLabel,
         McpEditorField.Save => form.SaveButton,
         McpEditorField.Cancel => form.CancelButton,
@@ -1113,21 +1155,48 @@ public sealed class McpEditorFormTests : IDisposable
             RenderedOutput.AttributeOf(this.application, "stdio"));
     }
 
-    // ── UX spec: empty placeholder and map row separator ─────────────────────
+    // ── UX spec: always-editable first row and map row separator ─────────────
 
     /// <summary>
-    /// An empty Arguments field must show a placeholder that includes Ctrl+N so the user
-    /// knows how to add the first item without consulting external docs.
+    /// An empty Arguments field must render a real, focusable, empty text field — not a summary
+    /// label. Requiring Ctrl+N before ANY input was possible read as "arguments are unavailable"
+    /// and pushed users into typing arguments into the Command box instead.
     /// </summary>
     [Fact]
-    public void Empty_arguments_placeholder_mentions_ctrl_n()
+    public void Empty_arguments_field_renders_an_editable_empty_row()
     {
         var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Arguments);
         this.form.ApplyState(state);
         this.application.LayoutAndDraw();
 
-        var labelText = this.form.ArgumentsSummaryLabel.Text ?? string.Empty;
-        Assert.Contains("Ctrl+N", labelText, StringComparison.Ordinal);
+        var row = Assert.IsType<TextField>(this.form.ItemViewForTest(McpEditorField.Arguments, 0));
+
+        Assert.True(row.Visible, "the first argument row must be visible");
+        Assert.True(row.CanFocus, "the first argument row must be focusable");
+        Assert.False(row.ReadOnly, "the first argument row must be editable");
+        Assert.True(string.IsNullOrEmpty(row.Text), "the first argument row must start empty");
+    }
+
+    /// <summary>
+    /// Typing into the always-present empty row must create the argument in the draft. Without
+    /// this the row would look editable but silently discard everything typed into it.
+    /// </summary>
+    [Fact]
+    public void Typing_into_the_empty_arguments_row_materializes_the_draft_item()
+    {
+        var state = MakeEditorState(McpTransportKind.Stdio, McpEditorField.Arguments);
+        this.controller.SetStateForTest(McpBrowserState.Empty with
+        {
+            View = McpBrowserView.Editor,
+            Editor = state,
+        });
+        this.form.ApplyState(state);
+        this.application.LayoutAndDraw();
+
+        var row = (TextField)this.form.ItemViewForTest(McpEditorField.Arguments, 0)!;
+        row.Text = "--verbose";
+
+        Assert.Equal("--verbose", Assert.Single(this.controller.State.Editor!.Draft.Args));
     }
 
     /// <summary>
