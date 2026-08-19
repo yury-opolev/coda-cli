@@ -51,6 +51,33 @@ public static class SessionCli
         return stored is null ? null : new ResumeTarget(id, stored.Messages, stored.Metadata);
     }
 
+    /// <summary>
+    /// The message shown when a startup continue/resume/fork intent resolves to nothing, and whether
+    /// it deserves a warning. An explicit id names both the id and the directory it was looked up in:
+    /// sessions are stored per working directory, so the usual cause is launching from somewhere else,
+    /// and a bare "No session to continue." said neither what was missing nor where it looked — the
+    /// session just started empty, which reads exactly like resume being ignored.
+    /// </summary>
+    public static (string Message, bool IsWarning) DescribeMissingTarget(StartupIntent intent, string workingDirectory)
+    {
+        ArgumentNullException.ThrowIfNull(intent);
+
+        if (intent.ResumeId is { } id)
+        {
+            var verb = intent.Fork ? "fork" : "resume";
+            return (
+                $"Session '{id}' not found in {workingDirectory} — nothing to {verb}. "
+                + "Sessions are stored per directory; use --continue for the newest one here, or relaunch from the directory that owns it.",
+                true);
+        }
+
+        return (
+            intent.Fork
+                ? $"No session to fork in {workingDirectory}."
+                : $"No session to continue in {workingDirectory}.",
+            false);
+    }
+
     /// <summary>Apply a resumed root session to the mutable TUI state.</summary>
     public static void ApplyResumeTarget(SessionState session, ResumeTarget target)
     {

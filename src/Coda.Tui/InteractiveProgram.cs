@@ -1023,8 +1023,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             context.Session.WorkingDirectory, startupIntent.ContinueLatest, startupIntent.ResumeId, ct).ConfigureAwait(false);
         if (target is null)
         {
+            var (message, isWarning) = SessionCli.DescribeMissingTarget(startupIntent, context.Session.WorkingDirectory);
             Publish(mailbox, new DiagnosticEvent(
-                "session", startupIntent.Fork ? "No session to fork." : "No session to continue.", UiNotificationLevel.Information));
+                "session",
+                message,
+                isWarning ? UiNotificationLevel.Warning : UiNotificationLevel.Information));
             return;
         }
 
