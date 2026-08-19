@@ -42,6 +42,20 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// can surface it long after the startup log line scrolled away.
     /// </summary>
     private readonly Dictionary<string, string> schemaWarnings = new(StringComparer.Ordinal);
+
+    /// <summary>
+    /// The configuration each server was last connected (or attempted) with, so a restart can
+    /// re-launch exactly what this session is running rather than re-reading a file that may have
+    /// changed underneath it.
+    /// </summary>
+    private readonly Dictionary<string, McpServerConfig> attemptedConfigs = new(StringComparer.Ordinal);
+
+    /// <summary>Per-server lifecycle locks serialising connect/disconnect/restart for one name.</summary>
+    private readonly Dictionary<string, SemaphoreSlim> serverLocks = new(StringComparer.Ordinal);
+
+    /// <summary>Set by <see cref="DisposeAsync"/> so a connect racing shutdown cannot orphan a process.</summary>
+    private bool disposed;
+
     private readonly bool ownsClients;
     private readonly IMcpHttpClientFactory? httpFactory;
 
@@ -139,6 +153,23 @@ public sealed partial class McpClientManager : IAsyncDisposable
         lock (this.gate) { return this.lastConnectionErrors.GetValueOrDefault(serverName); }
     }
 
+    /// <summary>
+    /// True when at least one server failed its last <em>connect</em> and has not succeeded since
+    /// (capability errors recorded against a healthy, connected server do not count). Lets a caller
+    /// keep MCP recovery tooling (see <see cref="RestartMcpServerTool"/>) available in the one
+    /// session shape where no client exists to advertise it: every configured server failed.
+    /// </summary>
+    public bool HasFailedConnections
+    {
+        get
+        {
+            lock (this.gate)
+            {
+                return this.lastConnectionErrorSources.Any(entry => entry.Value == RuntimeErrorSource.Connection);
+            }
+        }
+    }
+
     /// <summary>The connected tools that belong to <paramref name="serverName"/> (empty when not connected).</summary>
     public IReadOnlyList<McpTool> ServerTools(string serverName)
     {
@@ -230,9 +261,116 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<McpConnectResult> ConnectServerAsync(string name, McpServerConfig config, CancellationToken cancellationToken = default)
     {
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var serverLock = this.LockFor(name);
+        await serverLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await this.ConnectServerCoreAsync(name, config, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Stop and start one server again in a single atomic step, reusing the configuration this
+    /// manager last connected (or attempted) it with. Both the <c>/mcp restart</c> command and the
+    /// agent's restart tool go through here so a user restart and a model restart of the same server
+    /// cannot interleave their disconnect/connect halves.
+    /// <para>
+    /// Reusing the recorded configuration is deliberate: a restart re-launches the server the
+    /// session is already running, so it can never become a way to launch a command that was written
+    /// into <c>.mcp.json</c> after startup. Returns null when this manager has never attempted the
+    /// server, so the caller can say so instead of silently starting something new.
+    /// </para>
+    /// </summary>
+    /// <returns>The connect outcome plus whether the server was running beforehand, or null when unknown.</returns>
+    public async Task<(McpConnectResult Result, bool WasRunning)?> RestartServerAsync(string name, CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+
+        var serverLock = this.LockFor(name);
+        await serverLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            McpServerConfig? config;
+            lock (this.gate) { config = this.attemptedConfigs.GetValueOrDefault(name); }
+            if (config is null)
+            {
+                return null;
+            }
+
+            return await this.RestartCoreAsync(name, config, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLock.Release();
+        }
+    }
+
+    /// <summary>
+    /// Stop and start one server again in a single atomic step using an explicitly supplied
+    /// configuration — the <c>/mcp restart</c> path, where the user has just re-read and re-resolved
+    /// <c>.mcp.json</c> and expects their edits to take effect.
+    /// </summary>
+    public async Task<(McpConnectResult Result, bool WasRunning)> RestartServerAsync(
+        string name,
+        McpServerConfig config,
+        CancellationToken cancellationToken = default)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        ArgumentNullException.ThrowIfNull(config);
+
+        var serverLock = this.LockFor(name);
+        await serverLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            return await this.RestartCoreAsync(name, config, cancellationToken).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLock.Release();
+        }
+    }
+
+    private async Task<(McpConnectResult Result, bool WasRunning)> RestartCoreAsync(
+        string name,
+        McpServerConfig config,
+        CancellationToken cancellationToken)
+    {
+        var wasRunning = await this.DisconnectServerCoreAsync(name).ConfigureAwait(false);
+        var result = await this.ConnectServerCoreAsync(name, config, cancellationToken).ConfigureAwait(false);
+        return (result, wasRunning);
+    }
+
+    /// <summary>True when this manager has already tried to connect <paramref name="name"/>, so its
+    /// configuration is recorded and it can be restarted.</summary>
+    public bool IsServerKnown(string name)
+    {
+        ArgumentNullException.ThrowIfNull(name);
+        lock (this.gate) { return this.attemptedConfigs.ContainsKey(name); }
+    }
+
+    private async Task<McpConnectResult> ConnectServerCoreAsync(string name, McpServerConfig config, CancellationToken cancellationToken)
+    {
         if (this.IsServerConnected(name))
         {
             return McpConnectResult.Failure($"'{name}' is already connected.");
+        }
+
+        lock (this.gate)
+        {
+            if (this.disposed)
+            {
+                return McpConnectResult.Failure("the MCP runtime is shutting down.");
+            }
+
+            // Recorded before the attempt so a server that failed at startup is still restartable.
+            this.attemptedConfigs[name] = config;
         }
 
         var client = this.CreateClient(name, config);
@@ -244,6 +382,21 @@ public sealed partial class McpClientManager : IAsyncDisposable
         const string error = "HTTP transport is not available.";
         lock (this.gate) { this.SetLastConnectionError(name, error); }
         return McpConnectResult.Failure(error);
+    }
+
+    /// <summary>The per-server lifecycle lock, created on first use.</summary>
+    private SemaphoreSlim LockFor(string name)
+    {
+        lock (this.gate)
+        {
+            if (!this.serverLocks.TryGetValue(name, out var serverLock))
+            {
+                serverLock = new SemaphoreSlim(1, 1);
+                this.serverLocks[name] = serverLock;
+            }
+
+            return serverLock;
+        }
     }
 
     /// <summary>Initialize a pre-built client and adopt its tools (a test seam + the shared connect core).</summary>
@@ -292,21 +445,43 @@ public sealed partial class McpClientManager : IAsyncDisposable
 
             var callerCanceled = cancellationToken.IsCancellationRequested;
             var timedOut = !callerCanceled && linkedCts.IsCancellationRequested;
-            var error = this.SanitizeRuntimeError(this.ClassifyFailure(ex, client.ServerName, callerCanceled, timedOut));
+            var error = SanitizeRuntimeError(this.ClassifyFailure(ex, client.ServerName, callerCanceled, timedOut));
             lock (this.gate) { this.SetLastConnectionError(client.ServerName, error); }
             return McpConnectResult.Failure(error);
         }
 
         // Atomic adoption: only after initialize and every wrapper succeeded.
         // Hold the lock only for the brief state mutation — not across any await.
+        bool shuttingDown;
         lock (this.gate)
         {
-            this.clients.Add(client);
-            this.tools.AddRange(newTools);
-            this.ClearLastConnectionError(client.ServerName);
-            this.SetSchemaWarning(client.ServerName, schemaWarning);
-            this.version++;
+            shuttingDown = this.disposed;
+            if (!shuttingDown)
+            {
+                this.clients.Add(client);
+                this.tools.AddRange(newTools);
+                this.ClearLastConnectionError(client.ServerName);
+                this.SetSchemaWarning(client.ServerName, schemaWarning);
+                this.version++;
+            }
         }
+
+        // Disposal ran while this connect was in flight; nothing would ever dispose the new client
+        // (and its child process) if it were adopted now.
+        if (shuttingDown)
+        {
+            try
+            {
+                await client.DisposeAsync().ConfigureAwait(false);
+            }
+            catch
+            {
+                // Best-effort teardown of a client that was never adopted.
+            }
+
+            return McpConnectResult.Failure("the MCP runtime is shutting down.");
+        }
+
         return McpConnectResult.Success(serverTools.Count, schemaWarning);
     }
 
@@ -352,6 +527,22 @@ public sealed partial class McpClientManager : IAsyncDisposable
     /// </summary>
     public async Task<bool> DisconnectServerAsync(string name)
     {
+        ArgumentNullException.ThrowIfNull(name);
+
+        var serverLock = this.LockFor(name);
+        await serverLock.WaitAsync().ConfigureAwait(false);
+        try
+        {
+            return await this.DisconnectServerCoreAsync(name).ConfigureAwait(false);
+        }
+        finally
+        {
+            serverLock.Release();
+        }
+    }
+
+    private async Task<bool> DisconnectServerCoreAsync(string name)
+    {
         IMcpClient? client;
         lock (this.gate)
         {
@@ -374,7 +565,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            lock (this.gate) { this.SetLastConnectionError(name, this.SanitizeRuntimeError(ex.Message)); }
+            lock (this.gate) { this.SetLastConnectionError(name, SanitizeRuntimeError(ex.Message)); }
         }
 
         return true;
@@ -467,7 +658,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            lock (this.gate) { this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability); }
+            lock (this.gate) { this.SetLastConnectionError(serverName, SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability); }
             return [];
         }
     }
@@ -514,7 +705,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         }
         catch (Exception ex)
         {
-            lock (this.gate) { this.SetLastConnectionError(serverName, this.SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability); }
+            lock (this.gate) { this.SetLastConnectionError(serverName, SanitizeRuntimeError(ex.Message), RuntimeErrorSource.Capability); }
             return [];
         }
     }
@@ -578,14 +769,16 @@ public sealed partial class McpClientManager : IAsyncDisposable
 
     /// <summary>
     /// Creates a bounded, single-line user-visible error after redacting secrets and removing terminal
-    /// control sequences plus Unicode control and format characters.
+    /// control sequences plus Unicode control and format characters. Shared with
+    /// <see cref="RestartMcpServerTool"/> so every MCP error that reaches a model or a terminal goes
+    /// through one pipeline.
     /// </summary>
     /// <remarks>
     /// URLs are deliberately left intact: an MCP endpoint is configuration, not a secret, and an
     /// error that hides the address it failed to reach is not actionable. Credentials embedded in
     /// one are still caught by the secret-assignment passes above.
     /// </remarks>
-    private string SanitizeRuntimeError(string error)
+    internal static string SanitizeRuntimeError(string error)
     {
         try
         {
@@ -700,6 +893,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         {
             lock (this.gate)
             {
+                this.disposed = true;
                 this.clients.Clear();
                 this.tools.Clear();
             }
@@ -709,6 +903,7 @@ public sealed partial class McpClientManager : IAsyncDisposable
         IReadOnlyList<IMcpClient> toDispose;
         lock (this.gate)
         {
+            this.disposed = true;
             toDispose = [..this.clients];
             this.clients.Clear();
             this.tools.Clear();

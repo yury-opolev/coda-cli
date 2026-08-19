@@ -365,8 +365,19 @@ without ever mutating the on-disk file.
 manages them with `McpClientManager` over `McpStdioClient` + `McpRpcConnection`, and adapts each
 server tool into an `McpTool` (an `ITool`, namespaced `mcp__<server>__<tool>`). Resource and
 prompt access are exposed as additional tools (`ListMcpResourcesTool`, `ReadMcpResourceTool`,
-`ListMcpPromptsTool`, `GetMcpPromptTool`). MCP is wired in the **TUI** composition root; the
-serve/headless paths use the built-in tool set unless extra tools are injected.
+`ListMcpPromptsTool`, `GetMcpPromptTool`). `RestartMcpServerTool` (`restart_mcp_server`) lets the
+model recover a hung or unresponsive server via `McpClientManager.RestartServerAsync`, which holds a
+per-server lifecycle lock so a model restart and a `/mcp restart` cannot interleave their
+disconnect/connect halves. It is read-only (auto-run, no permission prompt) because restarting is
+lifecycle management of an already-approved process, and the failure it repairs surfaces mid-turn. It
+gates on the on-disk configuration — read through `IMcpServerConfigSource` /
+`FileMcpServerConfigSource`, which (unlike `McpConfig.Load`) keeps disabled entries so "not
+configured" and "disabled" stay distinguishable — but relaunches from the config the manager recorded
+at connect time, so it never doubles as "apply my `.mcp.json` edit" (that is `/mcp restart`). MCP is
+wired in the **TUI** composition root (live per-turn via `ExtraToolsProvider`) and in `ServeRunner`
+(live via `McpSessionToolList`, because `SessionOptions.ExtraTools` is captured once but
+re-enumerated every turn); the headless path uses the built-in tool set unless extra tools are
+injected.
 
 ### 4.6 Permissions
 

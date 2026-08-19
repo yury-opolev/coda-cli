@@ -282,12 +282,6 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             mcpHttpFactory,
             schemaPolicy: Coda.Mcp.McpSchemaPolicyFilter.Parse(startupSettings.McpSchemaPolicy));
 
-        Coda.Agent.ITool[] mcpHelperTools =
-        [
-            new Coda.Mcp.ListMcpResourcesTool(mcp), new Coda.Mcp.ReadMcpResourceTool(mcp),
-            new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp),
-        ];
-
         // Construct the plugin state store once — shared across all plugin commands and skill loading.
         var userCodaDir = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
@@ -328,6 +322,17 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
             ? pluginComposition.McpServers.ToDictionary(kvp => kvp.Key, kvp => kvp.Value.Config)
             : (IReadOnlyDictionary<string, Coda.Mcp.McpServerConfig>?)null;
 
+        // Built here rather than next to the manager because the restart tool needs the plugin
+        // layer to resolve the same server set the session connects from.
+        var mcpConfigSource = new Coda.Mcp.FileMcpServerConfigSource(
+            cwd, userMcpDir: null, includeProject: true, pluginServers: pluginMcpServers);
+        Coda.Agent.ITool[] mcpHelperTools =
+        [
+            new Coda.Mcp.ListMcpResourcesTool(mcp), new Coda.Mcp.ReadMcpResourceTool(mcp),
+            new Coda.Mcp.ListMcpPromptsTool(mcp), new Coda.Mcp.GetMcpPromptTool(mcp),
+        ];
+        var mcpRestartTool = new Coda.Mcp.RestartMcpServerTool(mcp, mcpConfigSource);
+
         // Load skills once at session start and build the skill tool (model-invocable skills only).
         // The session state is shared between the skill tool and the reattach callback so compaction
         // re-injects exactly the bodies the model loaded in this session.
@@ -362,9 +367,11 @@ internal sealed class DefaultInteractiveSessionRunner : IInteractiveSessionRunne
 
         Func<IReadOnlyList<Coda.Agent.ITool>> agentToolsProvider = () =>
         {
-            var mcpTools = mcp.Clients.Count > 0
-                ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, .. mcpHelperTools]
-                : [];
+            // When every configured server failed to connect there is no client to carry the MCP
+            // tools, yet that is exactly when the model needs the restart tool — so offer it alone.
+            IReadOnlyList<Coda.Agent.ITool> mcpTools = mcp.Clients.Count > 0
+                ? [.. mcp.Tools, .. mcpHelperTools, mcpRestartTool]
+                : mcp.HasFailedConnections ? [mcpRestartTool] : [];
             return skillTool is not null ? [.. mcpTools, skillTool] : mcpTools;
         };
         context.ExtraToolsProvider = agentToolsProvider;
