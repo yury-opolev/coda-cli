@@ -374,10 +374,10 @@ gates on the on-disk configuration — read through `IMcpServerConfigSource` /
 `FileMcpServerConfigSource`, which (unlike `McpConfig.Load`) keeps disabled entries so "not
 configured" and "disabled" stay distinguishable — but relaunches from the config the manager recorded
 at connect time, so it never doubles as "apply my `.mcp.json` edit" (that is `/mcp restart`). MCP is
-wired in the **TUI** composition root (live per-turn via `ExtraToolsProvider`) and in `ServeRunner`
-(live via `McpSessionToolList`, because `SessionOptions.ExtraTools` is captured once but
-re-enumerated every turn); the headless path uses the built-in tool set unless extra tools are
-injected.
+wired in the **TUI** composition root (live per-turn via `ExtraToolsProvider`), in `ServeRunner`, and
+in `HeadlessRunner` (both live via `McpSessionToolList`, because `SessionOptions.ExtraTools` is
+captured once but re-enumerated every turn). Headless still omits the four resource/prompt helpers
+but does get the restart tool, since an unattended run is where a hung server costs most.
 
 ### 4.6 Permissions
 

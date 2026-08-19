@@ -469,7 +469,8 @@ moment of the call, so a `/mcp disable` or a removal takes effect immediately; a
 reuses the configuration this session already connected that server with, so a restart never doubles
 as "apply my `.mcp.json` edit" (use `/mcp restart` for that). A server this session never started is
 refused (use `/mcp start`). The tool stays available even when every server failed to connect, which
-is when you need it most.
+is when you need it most, and it is present in all three entry points — the TUI, `coda run`, and
+`coda serve`.
 
 The browser lists both physical scopes — user `~/.coda/.mcp.json` and project `<cwd>/.mcp.json` —
 separately. Each list row shows the name, scope, stdio/HTTP transport, enabled/disabled state,

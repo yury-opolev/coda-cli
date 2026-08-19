@@ -43,6 +43,39 @@ public static class HeadlessRunner
         SessionCli.ResumeTarget? target) =>
         options.Fork ? target?.Metadata.SystemPromptOverride : null;
 
+    /// <summary>
+    /// Composes a headless run's extra tools: a LIVE view of the connected MCP servers' tools plus
+    /// the MCP restart tool, then the skill tool. Headless deliberately omits the four
+    /// resource/prompt helpers that the TUI and <c>serve</c> add, but it does get the restart tool —
+    /// an unattended run is where a hung server is most costly and least likely to be noticed.
+    /// <para>
+    /// The view must be live because <see cref="SessionOptions.ExtraTools"/> is captured once here
+    /// but re-enumerated on every turn: a snapshot would keep offering <c>McpTool</c> wrappers bound
+    /// to the client a restart has disposed. <paramref name="configSource"/> is null when this run
+    /// has no MCP servers configured, in which case no MCP tool is added at all.
+    /// </para>
+    /// </summary>
+    internal static IReadOnlyList<Coda.Agent.ITool> BuildExtraTools(
+        McpClientManager mcp,
+        IMcpServerConfigSource? configSource,
+        Coda.Agent.ITool? skillTool)
+    {
+        ArgumentNullException.ThrowIfNull(mcp);
+
+        if (configSource is null)
+        {
+            return skillTool is not null ? [skillTool] : [];
+        }
+
+        List<Coda.Agent.ITool> helpers = [new RestartMcpServerTool(mcp, configSource)];
+        if (skillTool is not null)
+        {
+            helpers.Add(skillTool);
+        }
+
+        return new McpSessionToolList(mcp, helpers);
+    }
+
     public static async Task<int> RunAsync(string[] runArgs, CancellationToken cancellationToken = default)
     {
         if (!HeadlessOptions.TryParse(runArgs, out var options, out var parseError))
@@ -162,9 +195,14 @@ public static class HeadlessRunner
         var skillTool = Coda.Tui.Skills.SkillTool.CreateOrNull(
             Coda.Tui.Skills.SkillLoader.Load(workingDirectory), skillState, workingDirectory,
             originGate: skillOriginGate);
-        var allExtraTools = skillTool is not null
-            ? (IReadOnlyList<Coda.Agent.ITool>)[.. mcp.Tools, skillTool]
-            : mcp.Tools;
+        // An unattended run is exactly where a hung MCP server is most costly, so headless gets the
+        // restart tool (it still omits the resource/prompt helpers).
+        var allExtraTools = BuildExtraTools(
+            mcp,
+            mcpServers.Count > 0
+                ? new FileMcpServerConfigSource(workingDirectory, pluginServers: pluginMcpServers)
+                : null,
+            skillTool);
 
         var sessionOptions = new SessionOptions
         {
