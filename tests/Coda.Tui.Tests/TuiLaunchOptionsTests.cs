@@ -238,4 +238,119 @@ public sealed class LaunchPermissionModeWiringTests
         Assert.Equal("abc123", intent.ResumeId);
         Assert.True(intent.HasIntent);
     }
+
+    // The permission flag TRAILING the session intent — `coda --resume "xxx" --yolo` — is the other
+    // half of the same report, and the ordering most people actually type.
+
+    [Fact]
+    public void Resume_with_id_then_trailing_yolo_keeps_both()
+    {
+        var options = TuiLaunchOptions.Parse(["--resume", "abc123", "--yolo"]);
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", options);
+        var intent = SessionCli.ParseStartupIntent(options.RemainingArgs);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.Equal("abc123", intent.ResumeId);
+        Assert.True(intent.HasIntent);
+    }
+
+    [Fact]
+    public void Resume_with_id_then_trailing_yolo_safe_keeps_the_classifier_too()
+    {
+        var options = TuiLaunchOptions.Parse(["--resume", "abc123", "--yolo-safe"]);
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", options);
+        var intent = SessionCli.ParseStartupIntent(options.RemainingArgs);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.True(session.EnableBypassClassifier);
+        Assert.Equal("abc123", intent.ResumeId);
+    }
+
+    [Fact]
+    public void Continue_then_trailing_yolo_keeps_both()
+    {
+        var options = TuiLaunchOptions.Parse(["--continue", "--yolo"]);
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", options);
+        var intent = SessionCli.ParseStartupIntent(options.RemainingArgs);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.True(intent.ContinueLatest);
+    }
+
+    [Fact]
+    public void Short_resume_with_id_then_trailing_permission_mode_keeps_both()
+    {
+        var options = TuiLaunchOptions.Parse(["-r", "abc123", "--permission-mode", "bypass"]);
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", options);
+        var intent = SessionCli.ParseStartupIntent(options.RemainingArgs);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.Equal("abc123", intent.ResumeId);
+    }
+
+    [Fact]
+    public void Fork_with_id_then_trailing_yolo_keeps_both()
+    {
+        var options = TuiLaunchOptions.Parse(["--fork", "abc123", "--yolo"]);
+        var session = Coda.Tui.DefaultInteractiveSessionRunner.CreateSessionState("anthropic", options);
+        var intent = SessionCli.ParseStartupIntent(options.RemainingArgs);
+
+        Assert.Equal(Coda.Agent.PermissionMode.BypassPermissions, session.PermissionMode);
+        Assert.Equal("abc123", intent.ResumeId);
+        Assert.True(intent.Fork);
+    }
+
+    // A resume that resolves to nothing must SAY so. Starting empty with a vague, information-level
+    // "No session to continue." is indistinguishable from --resume being ignored outright.
+
+    [Fact]
+    public void Missing_resume_id_names_the_id_and_the_directory_and_warns()
+    {
+        var intent = SessionCli.ParseStartupIntent(["--resume", "abc123"]);
+
+        var (message, isWarning) = SessionCli.DescribeMissingTarget(intent, @"C:\work\repo");
+
+        Assert.True(isWarning);
+        Assert.Contains("abc123", message);
+        Assert.Contains(@"C:\work\repo", message);
+        Assert.Contains("not found", message);
+        Assert.Contains("resume", message);
+        Assert.DoesNotContain("No session to continue.", message);
+    }
+
+    [Fact]
+    public void Missing_fork_id_reports_forking_rather_than_resuming()
+    {
+        var intent = SessionCli.ParseStartupIntent(["--fork", "abc123"]);
+
+        var (message, isWarning) = SessionCli.DescribeMissingTarget(intent, @"C:\work\repo");
+
+        Assert.True(isWarning);
+        Assert.Contains("abc123", message);
+        Assert.Contains("fork", message);
+    }
+
+    [Fact]
+    public void Missing_continue_target_stays_informational_and_names_the_directory()
+    {
+        var intent = SessionCli.ParseStartupIntent(["--continue"]);
+
+        var (message, isWarning) = SessionCli.DescribeMissingTarget(intent, @"C:\work\repo");
+
+        // Nothing specific was asked for, so an empty directory is not a warning.
+        Assert.False(isWarning);
+        Assert.Contains("No session to continue", message);
+        Assert.Contains(@"C:\work\repo", message);
+    }
+
+    [Fact]
+    public void Missing_fork_latest_target_reports_forking()
+    {
+        var intent = SessionCli.ParseStartupIntent(["--fork"]);
+
+        var (message, isWarning) = SessionCli.DescribeMissingTarget(intent, @"C:\work\repo");
+
+        Assert.False(isWarning);
+        Assert.Contains("No session to fork", message);
+    }
 }
