@@ -400,6 +400,21 @@ public sealed class ServeRunnerTests
         Assert.Single(tools.OfType<ReadMcpResourceTool>());
         Assert.Single(tools.OfType<ListMcpPromptsTool>());
         Assert.Single(tools.OfType<GetMcpPromptTool>());
+        Assert.Empty(tools.OfType<RestartMcpServerTool>());
+    }
+
+    [Fact]
+    public void BuildMcpExtraTools_adds_the_restart_tool_when_a_config_source_is_supplied()
+    {
+        // The restart tool needs the configuration to verify a server is present and enabled, so it
+        // appears only once a source is available (the serve loader always supplies one).
+        var manager = new McpClientManager();
+        var source = new FileMcpServerConfigSource(AppContext.BaseDirectory);
+
+        var tools = ServeRunner.BuildMcpExtraTools(manager, source);
+
+        Assert.Equal(5, tools.Count);
+        Assert.Single(tools.OfType<RestartMcpServerTool>());
     }
 
     // ── LoadMcpToolsAsync ─────────────────────────────────────────────────
@@ -461,14 +476,16 @@ public sealed class ServeRunnerTests
         Assert.NotNull(manager);
         await using (manager)
         {
-            // The one server tool (mcp__fake__echo) followed by the four resource/prompt helpers.
-            Assert.Equal(5, tools.Count);
+            // The one server tool (mcp__fake__echo), the four resource/prompt helpers, and the
+            // restart tool the loader wires to the on-disk configuration.
+            Assert.Equal(6, tools.Count);
             var serverTool = Assert.Single(tools.OfType<McpTool>());
             Assert.Equal("mcp__fake__echo", serverTool.Name);
             Assert.Single(tools.OfType<ListMcpResourcesTool>());
             Assert.Single(tools.OfType<ReadMcpResourceTool>());
             Assert.Single(tools.OfType<ListMcpPromptsTool>());
             Assert.Single(tools.OfType<GetMcpPromptTool>());
+            Assert.Single(tools.OfType<RestartMcpServerTool>());
         }
     }
 

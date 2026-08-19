@@ -459,6 +459,18 @@ intercepted. When no MCP browser provider exists, bare `/mcp` remains textual. P
 surfaces use the textual list/detail fallback (`/mcp`, `/mcp info <name>`, and the existing add/edit/
 remove/start/stop/restart/enable/disable forms).
 
+**The agent restarts a stuck server itself.** A stdio server that stops responding (its process is
+alive but every call hangs) is usually fixed by a restart, so the model gets a `restart_mcp_server`
+tool and calls it **autonomously, with no permission prompt** — the breakage shows up mid-turn when
+you are not watching, so it disconnects the server (killing its process tree), launches it again and
+retries. Restarting is not a privileged action: it re-launches a process the session already started.
+Two rules keep it to exactly that. The server must be **present in `.mcp.json` and enabled** at the
+moment of the call, so a `/mcp disable` or a removal takes effect immediately; and the relaunch
+reuses the configuration this session already connected that server with, so a restart never doubles
+as "apply my `.mcp.json` edit" (use `/mcp restart` for that). A server this session never started is
+refused (use `/mcp start`). The tool stays available even when every server failed to connect, which
+is when you need it most.
+
 The browser lists both physical scopes — user `~/.coda/.mcp.json` and project `<cwd>/.mcp.json` —
 separately. Each list row shows the name, scope, stdio/HTTP transport, enabled/disabled state,
 connection state, effective/overridden state, and any error; the source path appears in detail.

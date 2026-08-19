@@ -149,24 +149,35 @@ public static class ServeRunner
         => EnvFlags.IsTruthy(disableEnvValue) ? false : parsedEnableProjectMcp;
 
     /// <summary>
-    /// Composes the agent's MCP tool list: the servers' own tools followed by the four
-    /// resource/prompt helper tools. Deliberately mirrors the interactive TUI (<c>Program.cs</c>)
-    /// rather than <c>HeadlessRunner</c> (which omits the helpers): a serve session is long-lived
-    /// and richer like the TUI, and the helper tools are inert unless a server exposes
-    /// resources/prompts. Split out so the composition is unit-testable with an empty
-    /// <see cref="McpClientManager"/>.
+    /// Composes the agent's MCP tool list: a LIVE view of the connected servers' tools followed by
+    /// the four resource/prompt helper tools, plus the restart tool when a
+    /// <paramref name="configSource"/> is supplied (it needs the configuration to verify a server is
+    /// present and enabled). The view is live because <c>SessionOptions.ExtraTools</c> is captured
+    /// once but re-read every turn: after a restart replaces a server's client, a frozen snapshot
+    /// would keep offering wrappers bound to a disposed client. Deliberately mirrors the interactive
+    /// TUI (which uses <c>ExtraToolsProvider</c> for the same reason) rather than
+    /// <c>HeadlessRunner</c> (which omits the helpers): a serve session is long-lived and richer
+    /// like the TUI, and the helper tools are inert unless a server exposes resources/prompts.
     /// </summary>
-    public static IReadOnlyList<ITool> BuildMcpExtraTools(McpClientManager manager)
+    public static IReadOnlyList<ITool> BuildMcpExtraTools(
+        McpClientManager manager,
+        IMcpServerConfigSource? configSource = null)
     {
         ArgumentNullException.ThrowIfNull(manager);
-        return
+        List<ITool> helpers =
         [
-            .. manager.Tools,
             new ListMcpResourcesTool(manager),
             new ReadMcpResourceTool(manager),
             new ListMcpPromptsTool(manager),
             new GetMcpPromptTool(manager),
         ];
+
+        if (configSource is not null)
+        {
+            helpers.Add(new RestartMcpServerTool(manager, configSource));
+        }
+
+        return new McpSessionToolList(manager, helpers);
     }
 
     /// <summary>
@@ -213,7 +224,12 @@ public static class ServeRunner
 
         var manager = new McpClientManager(httpFactory, schemaPolicy: schemaPolicy);
         await manager.ConnectAllAsync(servers, log, cancellationToken).ConfigureAwait(false);
-        return (BuildMcpExtraTools(manager), manager);
+
+        // The restart tool re-reads the configuration itself, so it sees post-startup edits and can
+        // tell a disabled server apart from an unknown one.
+        var configSource = new FileMcpServerConfigSource(
+            workingDirectory, userMcpDir, includeProjectMcp, pluginServers);
+        return (BuildMcpExtraTools(manager, configSource), manager);
     }
 
     /// <summary>

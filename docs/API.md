@@ -316,3 +316,5 @@ The model can call these built-in tools (subject to the permission mode). MCP se
 | `task` | — | delegate a self-contained subtask to a subagent |
 | `lsp` | yes | code intelligence (when language servers are configured) |
 | `mcp__<server>__<tool>` | varies | tools advertised by configured MCP servers |
+| `list_mcp_resources`, `read_mcp_resource`, `list_mcp_prompts`, `get_mcp_prompt` | yes | browse and read resources/prompts exposed by connected MCP servers |
+| `restart_mcp_server` | yes (auto-run) | stop and restart one configured, **enabled** MCP server to recover it when it hangs or stops responding; refuses unknown, disabled, or never-started servers, and relaunches only the configuration this session already connected with |

@@ -390,8 +390,10 @@ internal sealed partial class McpManagementService : IMcpManagementService
             try
             {
                 var config = await McpSecretResolver.ResolveAsync(entry.Config, this.credentials, ct).ConfigureAwait(false);
-                await this.runtime.DisconnectServerAsync(name).ConfigureAwait(false);
-                var result = await this.runtime.ConnectServerAsync(name, config, ct).ConfigureAwait(false);
+
+                // One atomic step in the runtime so a concurrent agent restart_mcp_server call for
+                // the same server cannot interleave its own disconnect/connect halves with these.
+                var (result, _) = await this.runtime.RestartServerAsync(name, config, ct).ConfigureAwait(false);
                 return await this.CreateLifecycleResultAsync(
                     result.Connected ? McpMutationStatus.Succeeded : McpMutationStatus.SavedWithRuntimeError,
                     entry.Key,
