@@ -506,6 +506,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown += this.HandleUnhandledShellKey;
         transcript.CopyRequested += this.HandleTranscriptCopyRequested;
+        transcript.PasteRequested += this.PasteFromPointerOutsideComposer;
         transcript.LinkActivated += this.HandleTranscriptLinkActivated;
         transcript.LinkContextMenuRequested += this.HandleTranscriptLinkContextMenuRequested;
         transcript.HasActiveWork = this.hasActiveWork;
@@ -517,6 +518,7 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
         ArgumentNullException.ThrowIfNull(transcript);
         transcript.UnhandledKeyDown -= this.HandleUnhandledShellKey;
         transcript.CopyRequested -= this.HandleTranscriptCopyRequested;
+        transcript.PasteRequested -= this.PasteFromPointerOutsideComposer;
         transcript.LinkActivated -= this.HandleTranscriptLinkActivated;
         transcript.LinkContextMenuRequested -= this.HandleTranscriptLinkContextMenuRequested;
         transcript.HasActiveWork = null;
@@ -1133,6 +1135,27 @@ internal abstract class TerminalGuiShellBase : Window, IUiFrameSink, ITuiShellHa
     /// same copy path as Ctrl+C.
     /// </summary>
     private void HandleTranscriptCopyRequested() => this.CopyTranscriptSelection();
+
+    /// <summary>
+    /// Pastes the clipboard into the draft for a pointer gesture that landed outside the composer — a
+    /// right-click on the transcript or the header with nothing to copy and no context menu to show. The
+    /// paste target is always the draft, so the gesture does not depend on where the pointer was.
+    /// </summary>
+    /// <remarks>
+    /// Guarded exactly like <see cref="OnComposerPointerActionRequested"/>: a pointer must never reach the
+    /// draft while a modal prompt is up, the composer is startup-disabled, or it is not accepting input.
+    /// The surfaces that raise this stay interactive in all three states, so without the guard the gesture
+    /// would type into a composer the user cannot see or use.
+    /// </remarks>
+    protected void PasteFromPointerOutsideComposer()
+    {
+        if (this.PromptOverlay.Visible || this.composerDisabled || !this.Composer.InputEnabled)
+        {
+            return;
+        }
+
+        this.PasteComposerClipboard();
+    }
 
     // -----------------------------------------------------------------------
     // Link activation (left-click) and context menu (right-click)
