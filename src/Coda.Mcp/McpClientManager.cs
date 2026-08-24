@@ -20,7 +20,7 @@ namespace Coda.Mcp;
 /// perform the async call outside.
 /// </para>
 /// </summary>
-public sealed partial class McpClientManager : IAsyncDisposable
+public sealed partial class McpClientManager : IAsyncDisposable, IMcpClientResolver
 {
     /// <summary>
     /// Phase attributed to a startup failure that cannot be pinned to a single JSON-RPC method
@@ -135,6 +135,36 @@ public sealed partial class McpClientManager : IAsyncDisposable
     public bool IsServerConnected(string serverName)
     {
         lock (this.gate) { return this.clients.Any(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal)); }
+    }
+
+    /// <summary>
+    /// The client currently serving <paramref name="serverName"/>, or null when it is not connected.
+    /// Every <see cref="McpTool"/> routes through this on each call, so a wrapper handed to the model
+    /// before a restart follows the server to its replacement process instead of addressing the one
+    /// that was killed.
+    /// </summary>
+    public IMcpClient? ClientFor(string serverName)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        lock (this.gate) { return this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal)); }
+    }
+
+    /// <summary>
+    /// The metadata the currently connected server advertises for <paramref name="toolName"/>, taken
+    /// from the wrappers built at its last connect, or null when it no longer advertises it.
+    /// </summary>
+    public McpToolInfo? AdvertisedToolFor(string serverName, string toolName)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        ArgumentNullException.ThrowIfNull(toolName);
+        lock (this.gate)
+        {
+            return this.tools
+                .OfType<McpTool>()
+                .FirstOrDefault(t => string.Equals(t.ServerName, serverName, StringComparison.Ordinal)
+                    && string.Equals(t.Info.Name, toolName, StringComparison.Ordinal))
+                ?.Info;
+        }
     }
 
     /// <summary>The identity a connected server reported at initialize, or null when not connected / none.</summary>
@@ -429,7 +459,9 @@ public sealed partial class McpClientManager : IAsyncDisposable
             newTools = new List<ITool>(serverTools.Count);
             foreach (var toolInfo in serverTools)
             {
-                newTools.Add(new McpTool(client, client.ServerName, toolInfo));
+                // Resolved by name on every call (see IMcpClientResolver), so these wrappers keep
+                // working after this client is replaced by a restart.
+                newTools.Add(new McpTool(this, client.ServerName, toolInfo));
             }
         }
         catch (Exception ex)

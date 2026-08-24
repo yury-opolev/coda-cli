@@ -5,10 +5,17 @@ using Coda.Agent;
 namespace Coda.Mcp;
 
 /// <summary>
-/// Agent tool that restarts a single MCP server: disconnect it (which kills a stdio server's whole
-/// process tree) and connect it again. This is the recovery path for the common stdio failure mode
-/// where a server stops responding but its process is still alive, so every tool call against it
-/// hangs or fails until the process is replaced.
+/// Agent tool that restarts a single MCP server: disconnect it and connect it again. This is the
+/// recovery path for the common stdio failure mode where a server stops responding but its process
+/// is still alive, so every tool call against it hangs or fails until the process is replaced.
+/// <para>
+/// The disconnect is a full teardown, deliberately equivalent to what quitting Coda does: in-flight
+/// calls fail at once instead of waiting out the MCP tool timeout, the child's stdin is closed so
+/// anything that inherited it sees EOF, the whole process tree is killed, and the relaunch does not
+/// begin until the OS reports the old process gone. The tools the model is already holding for this
+/// server follow it to the replacement (see <see cref="IMcpClientResolver"/>), so retrying the failed
+/// call works immediately — in the same turn, without waiting for the next one.
+/// </para>
 /// <para>
 /// It runs autonomously (<see cref="IsReadOnly"/> is true, so no permission prompt): a restart is
 /// plain lifecycle management of a process the session already launched, and the breakage it repairs
@@ -59,11 +66,13 @@ public sealed class RestartMcpServerTool : ITool
     public string Name => "restart_mcp_server";
 
     public string Description =>
-        "Restart one MCP server that this session is running: stop it (terminating its process) and start " +
-        "it again. Call this yourself, without asking, as soon as a server looks unresponsive — its tools " +
-        "time out, hang, or stop returning results — then retry the failed call. Fails without side effects " +
-        "when the server is not configured, is disabled, or was never started in this session. If restarting " +
-        "the same server twice does not fix it, stop and tell the user instead of restarting again.";
+        "Restart one MCP server that this session is running: stop it (terminating its process and " +
+        "waiting for it to actually exit) and start it again. Call this yourself, without asking, as " +
+        "soon as a server looks unresponsive — its tools time out, hang, or stop returning results — " +
+        "then retry the failed call straight away: that server's tools work again as soon as this " +
+        "returns, in this same turn. Fails without side effects when the server is not configured, is " +
+        "disabled, or was never started in this session. If restarting the same server twice does not " +
+        "fix it, stop and tell the user instead of restarting again.";
 
     public string InputSchemaJson => schema;
 

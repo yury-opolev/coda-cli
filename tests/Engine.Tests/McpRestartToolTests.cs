@@ -1,3 +1,6 @@
+using System.Diagnostics;
+using System.Net;
+using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Agent;
@@ -420,6 +423,136 @@ public sealed class RestartMcpServerToolTests
         Assert.Single(live);
     }
 
+    // ── Recovery for the tools the running turn already holds ───────────────
+
+    [Fact]
+    public async Task A_tool_wrapper_from_before_the_restart_reaches_the_replacement_client()
+    {
+        var (manager, _) = BuildManager(client => client.Tools = [new McpToolInfo("echo", "d", "{}", true)]);
+        await ConnectAsync(manager, "alpha");
+
+        // What the model is actually holding when it restarts: the registry for the running turn was
+        // built before the restart, so the retry that follows goes through THESE wrappers.
+        var beforeRestart = Assert.Single(manager.ServerTools("alpha"));
+        var firstClient = Assert.IsType<FakeRestartClient>(Assert.Single(manager.Clients));
+
+        Assert.False((await RestartToolFor(manager).ExecuteAsync(Json("""{"server":"alpha"}"""), FakeContext())).IsError);
+
+        var secondClient = Assert.IsType<FakeRestartClient>(Assert.Single(manager.Clients));
+        Assert.NotSame(firstClient, secondClient);
+
+        var result = await beforeRestart.ExecuteAsync(Json("{}"), FakeContext());
+
+        Assert.False(result.IsError);
+        Assert.Equal(secondClient.Identity, result.Content);
+        Assert.Equal(0, firstClient.CallCount);
+    }
+
+    [Fact]
+    public async Task A_tool_wrapper_for_a_stopped_server_reports_it_instead_of_calling_a_dead_client()
+    {
+        var (manager, _) = BuildManager(client => client.Tools = [new McpToolInfo("echo", "d", "{}", true)]);
+        await ConnectAsync(manager, "alpha");
+        var beforeStop = Assert.Single(manager.ServerTools("alpha"));
+        var client = Assert.IsType<FakeRestartClient>(Assert.Single(manager.Clients));
+
+        Assert.True(await manager.DisconnectServerAsync("alpha"));
+
+        var result = await beforeStop.ExecuteAsync(Json("{}"), FakeContext());
+
+        Assert.True(result.IsError);
+        Assert.Contains("alpha", result.Content, StringComparison.Ordinal);
+        Assert.Contains("restart_mcp_server", result.Content, StringComparison.Ordinal);
+        Assert.Equal(0, client.CallCount);
+    }
+
+    [Fact]
+    public async Task A_tool_wrapper_is_not_run_when_the_replacement_classifies_it_differently()
+    {
+        // Read-only decides whether the agent asks permission first, so the classification the
+        // wrapper was approved under must not be carried across to a server that changed it.
+        var readOnly = true;
+        var (manager, _) = BuildManager(client => client.Tools = [new McpToolInfo("echo", "d", "{}", readOnly)]);
+        await ConnectAsync(manager, "alpha");
+        var beforeRestart = Assert.Single(manager.ServerTools("alpha"));
+        Assert.True(beforeRestart.IsReadOnly);
+
+        readOnly = false;
+        Assert.False((await RestartToolFor(manager).ExecuteAsync(Json("""{"server":"alpha"}"""), FakeContext())).IsError);
+
+        var result = await beforeRestart.ExecuteAsync(Json("{}"), FakeContext());
+
+        Assert.True(result.IsError);
+        Assert.Contains("read-only classification", result.Content, StringComparison.Ordinal);
+        Assert.Equal(0, Assert.IsType<FakeRestartClient>(Assert.Single(manager.Clients)).CallCount);
+    }
+
+    [Fact]
+    public async Task A_tool_wrapper_is_not_run_when_the_replacement_dropped_the_tool()
+    {
+        var tools = new List<McpToolInfo> { new("echo", "d", "{}", true) };
+        var (manager, _) = BuildManager(client => client.Tools = [.. tools]);
+        await ConnectAsync(manager, "alpha");
+        var beforeRestart = Assert.Single(manager.ServerTools("alpha"));
+
+        tools.Clear();
+        tools.Add(new McpToolInfo("something-else", "d", "{}", true));
+        Assert.False((await RestartToolFor(manager).ExecuteAsync(Json("""{"server":"alpha"}"""), FakeContext())).IsError);
+
+        var result = await beforeRestart.ExecuteAsync(Json("{}"), FakeContext());
+
+        Assert.True(result.IsError);
+        Assert.Contains("no longer advertises", result.Content, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task A_failed_write_closes_the_connection_instead_of_only_failing_that_call()
+    {
+        var writer = new FailAfterWriter(succeedFirst: 1);
+        var rpc = new McpRpcConnection(writer);
+
+        // Written successfully, so it is registered and waiting for a response.
+        var pending = rpc.SendRequestAsync("first");
+        Assert.False(pending.IsCompleted);
+
+        await Assert.ThrowsAsync<McpException>(() => rpc.SendRequestAsync("second"));
+
+        // A broken pipe means the whole transport is gone, not just the message that hit it.
+        Assert.True(rpc.IsClosed);
+        await Assert.ThrowsAsync<McpException>(() => pending);
+        await Assert.ThrowsAsync<McpException>(() => rpc.SendRequestAsync("third"));
+    }
+
+    [Fact]
+    public async Task A_stopped_http_client_rejects_later_calls_without_reaching_the_network()
+    {
+        var handler = new RecordingHandler();
+        using var http = new HttpClient(handler);
+        var client = new McpHttpClient("alpha", HttpConfig(), http);
+
+        await client.DisposeAsync();
+
+        await Assert.ThrowsAsync<McpException>(() => client.CallToolAsync("echo", Json("{}")));
+        Assert.Equal(0, handler.Sends);
+    }
+
+    [Fact]
+    public async Task Stopping_an_http_client_ends_the_call_it_still_has_in_flight()
+    {
+        var handler = new RecordingHandler { BlockUntilCancelled = true };
+        using var http = new HttpClient(handler);
+        var client = new McpHttpClient("alpha", HttpConfig(), http);
+
+        var call = client.CallToolAsync("echo", Json("{}"));
+        await handler.Started.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        await client.DisposeAsync();
+
+        // Stopping an HTTP server must end its calls the way killing a stdio server's process does,
+        // rather than leaving them running against a session nothing will use again.
+        await Assert.ThrowsAsync<McpException>(() => call);
+    }
+
     // ── Real child process ──────────────────────────────────────────────────
 
     [Fact]
@@ -448,7 +581,107 @@ public sealed class RestartMcpServerToolTests
         Assert.Contains(manager.ServerTools("stdio-srv"), t => t.Name.EndsWith("echo", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task A_real_stdio_tool_from_before_the_restart_runs_against_the_replacement_process()
+    {
+        await using var manager = new McpClientManager();
+        var config = StdioTestServerConfig();
+        Assert.True((await manager.ConnectServerAsync("stdio-srv", config)).Connected);
+
+        // The wrapper the running turn already handed to the model, and the process behind it.
+        var beforeRestart = Assert.Single(manager.ServerTools("stdio-srv"));
+        var firstPid = Assert.IsType<McpStdioClient>(Assert.Single(manager.Clients)).ProcessId;
+        Assert.NotNull(firstPid);
+        Assert.Equal($"pid:{firstPid}", (await beforeRestart.ExecuteAsync(Json("{}"), FakeContext())).Content);
+
+        var source = new StubConfigSource(new Dictionary<string, McpServerConfig>(StringComparer.Ordinal)
+        {
+            ["stdio-srv"] = config,
+        });
+        Assert.False((await new RestartMcpServerTool(manager, source)
+            .ExecuteAsync(Json("""{"server":"stdio-srv"}"""), FakeContext())).IsError);
+
+        var secondPid = Assert.IsType<McpStdioClient>(Assert.Single(manager.Clients)).ProcessId;
+        Assert.NotNull(secondPid);
+        Assert.NotEqual(firstPid, secondPid);
+
+        // Exactly what the model does after restarting: retry through the wrapper it already has.
+        var retry = await beforeRestart.ExecuteAsync(Json("{}"), FakeContext());
+
+        Assert.False(retry.IsError);
+        Assert.Equal($"pid:{secondPid}", retry.Content);
+        Assert.True(HasExited(firstPid.Value));
+    }
+
+    [Fact]
+    public async Task Disposing_a_stdio_client_leaves_no_live_child_behind()
+    {
+        var client = new McpStdioClient("stdio-srv", StdioTestServerConfig());
+        await client.InitializeAndListToolsAsync();
+        var pid = client.ProcessId;
+        Assert.NotNull(pid);
+
+        await client.DisposeAsync();
+
+        // The replacement must never race a child that still holds the old port, lock file or
+        // database — that is what turned a restart into a server that stays broken until Coda exits.
+        Assert.True(HasExited(pid.Value));
+    }
+
+    [Fact]
+    public async Task Calling_a_tool_on_a_disposed_stdio_client_fails_instead_of_hanging()
+    {
+        var client = new McpStdioClient("stdio-srv", StdioTestServerConfig());
+        await client.InitializeAndListToolsAsync();
+        await client.DisposeAsync();
+
+        var call = client.CallToolAsync("echo", Json("{}"));
+        var finished = await Task.WhenAny(call, Task.Delay(TimeSpan.FromSeconds(10)));
+
+        // Writing into the killed child's pipe never gets an answer, so without an explicit closed
+        // state this waits out the whole 10-minute MCP tool timeout.
+        Assert.Same(call, finished);
+        await Assert.ThrowsAsync<McpException>(() => call);
+    }
+
+    [Fact]
+    public async Task Disposing_a_stdio_client_fails_the_calls_that_are_still_in_flight()
+    {
+        // A connection nothing ever answers: the request stays pending until teardown decides its
+        // fate, which is exactly the state a hung server leaves a call in.
+        var client = new McpStdioClient("stdio-srv", new McpRpcConnection(TextWriter.Null));
+
+        var pending = client.CallToolAsync("never-answered", Json("{}"));
+        Assert.False(pending.IsCompleted);
+
+        await client.DisposeAsync();
+
+        var finished = await Task.WhenAny(pending, Task.Delay(TimeSpan.FromSeconds(10)));
+        Assert.Same(pending, finished);
+        await Assert.ThrowsAsync<McpException>(() => pending);
+    }
+
     // ── Helpers ─────────────────────────────────────────────────────────────
+
+    private static bool HasExited(int processId)
+    {
+        try
+        {
+            using var process = Process.GetProcessById(processId);
+            return process.HasExited;
+        }
+        catch (ArgumentException)
+        {
+            // Already reaped by the OS: there is no process with that id any more.
+            return true;
+        }
+    }
+
+    private static RestartMcpServerTool RestartToolFor(McpClientManager manager) =>
+        new(manager, new StubConfigSource(new Dictionary<string, McpServerConfig>(StringComparer.Ordinal)
+        {
+            ["alpha"] = HttpConfig(),
+        }));
 
     private static McpHttpServerConfig HttpConfig() =>
         new(new Uri("https://example.test/mcp"), new Dictionary<string, string>(StringComparer.Ordinal), McpAuthConfig.Default);
@@ -511,8 +744,53 @@ public sealed class RestartMcpServerToolTests
         }
     }
 
+    /// <summary>A writer whose pipe breaks after a set number of successful lines.</summary>
+    private sealed class FailAfterWriter(int succeedFirst) : TextWriter
+    {
+        private int written;
+
+        public override Encoding Encoding => Encoding.UTF8;
+
+        public override Task WriteLineAsync(string? value) =>
+            ++this.written > succeedFirst
+                ? Task.FromException(new IOException("pipe is broken"))
+                : Task.CompletedTask;
+
+        public override Task FlushAsync() => Task.CompletedTask;
+    }
+
+    /// <summary>Counts sends, and optionally holds one open until its request is cancelled.</summary>
+    private sealed class RecordingHandler : HttpMessageHandler
+    {
+        public int Sends { get; private set; }
+
+        public bool BlockUntilCancelled { get; init; }
+
+        public TaskCompletionSource Started { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        protected override async Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            this.Sends++;
+            this.Started.TrySetResult();
+
+            if (this.BlockUntilCancelled)
+            {
+                await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false);
+            }
+
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("""{"jsonrpc":"2.0","id":1,"result":{}}""", Encoding.UTF8, "application/json"),
+            };
+        }
+    }
+
     private sealed class FakeRestartClient(string serverName) : IMcpClient
     {
+        private static int instances;
+
+        private readonly int instance = Interlocked.Increment(ref instances);
+
         public string ServerName => serverName;
 
         public IReadOnlyList<McpToolInfo> Tools { get; set; } = [];
@@ -521,11 +799,19 @@ public sealed class RestartMcpServerToolTests
 
         public bool Disposed { get; private set; }
 
+        /// <summary>Identifies this instance in a call result, so a test can tell which client served it.</summary>
+        public string Identity => $"{serverName}#{this.instance}";
+
+        public int CallCount { get; private set; }
+
         public Task<IReadOnlyList<McpToolInfo>> InitializeAndListToolsAsync(CancellationToken cancellationToken = default) =>
             this.ThrowOnInit is { } message ? throw new McpException(message) : Task.FromResult(this.Tools);
 
-        public Task<(string Text, bool IsError)> CallToolAsync(string toolName, JsonElement arguments, CancellationToken cancellationToken = default) =>
-            Task.FromResult((string.Empty, false));
+        public Task<(string Text, bool IsError)> CallToolAsync(string toolName, JsonElement arguments, CancellationToken cancellationToken = default)
+        {
+            this.CallCount++;
+            return Task.FromResult((this.Identity, false));
+        }
 
         public Task<IReadOnlyList<McpResourceInfo>> ListResourcesAsync(CancellationToken cancellationToken = default) =>
             Task.FromResult<IReadOnlyList<McpResourceInfo>>([]);

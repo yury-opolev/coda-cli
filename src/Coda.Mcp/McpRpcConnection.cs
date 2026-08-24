@@ -16,16 +16,50 @@ public sealed class McpRpcConnection
     private readonly ConcurrentDictionary<long, TaskCompletionSource<JsonElement>> pending = new();
     private long lastId;
 
+    /// <summary>
+    /// Set once the transport is gone (the read loop ended, or the owner tore the connection down).
+    /// Terminal: a closed connection is never reopened, its client is replaced instead. Without it a
+    /// request written into a killed child's pipe is simply never answered, and the caller waits out
+    /// the whole <see cref="McpTool.DefaultTimeout"/> — which is what made a restarted server look
+    /// permanently broken.
+    /// </summary>
+    private McpException? closedReason;
+
     public McpRpcConnection(TextWriter writer)
     {
         this.writer = writer ?? throw new ArgumentNullException(nameof(writer));
     }
 
+    /// <summary>True once <see cref="Close"/> has run or the read loop has ended.</summary>
+    public bool IsClosed => Volatile.Read(ref this.closedReason) is not null;
+
+    /// <summary>
+    /// Put the connection into its terminal state: fail every in-flight request and reject every
+    /// later one with <paramref name="reason"/>. Idempotent — the first reason wins, so a teardown
+    /// racing the read loop's own EOF does not change the message a caller already saw.
+    /// </summary>
+    public void Close(McpException reason)
+    {
+        ArgumentNullException.ThrowIfNull(reason);
+        var effective = Interlocked.CompareExchange(ref this.closedReason, reason, null) ?? reason;
+        this.FaultPending(effective);
+    }
+
     public async Task<JsonElement> SendRequestAsync(string method, JsonNode? parameters = null, CancellationToken cancellationToken = default)
     {
+        this.ThrowIfClosed();
+
         var id = Interlocked.Increment(ref this.lastId);
         var tcs = new TaskCompletionSource<JsonElement>(TaskCreationOptions.RunContinuationsAsynchronously);
         this.pending[id] = tcs;
+
+        // Re-checked after registering: Close faults what it can see, so a request that slipped in
+        // behind it has to fail itself or it would wait for a response that can never arrive.
+        if (this.IsClosed)
+        {
+            this.pending.TryRemove(id, out _);
+            this.ThrowIfClosed();
+        }
 
         var message = new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["method"] = method };
         if (parameters is not null)
@@ -33,7 +67,22 @@ public sealed class McpRpcConnection
             message["params"] = parameters;
         }
 
-        await this.WriteLineAsync(message).ConfigureAwait(false);
+        try
+        {
+            await this.WriteLineAsync(message).ConfigureAwait(false);
+        }
+        catch
+        {
+            // Nothing was sent, so nothing can answer: drop the registration instead of leaving an
+            // entry that only a later Close would ever complete. A write failure closes the
+            // connection, which may already have faulted this registration — take ownership of it
+            // and observe any such fault, or it would surface later on the finalizer thread as an
+            // unobserved task exception, since this caller never awaits the task.
+            this.pending.TryRemove(id, out _);
+            tcs.TrySetCanceled();
+            _ = tcs.Task.Exception;
+            throw;
+        }
 
         using (cancellationToken.Register(() => tcs.TrySetCanceled(cancellationToken)))
         {
@@ -43,6 +92,8 @@ public sealed class McpRpcConnection
 
     public Task SendNotificationAsync(string method, JsonNode? parameters = null)
     {
+        this.ThrowIfClosed();
+
         var message = new JsonObject { ["jsonrpc"] = "2.0", ["method"] = method };
         if (parameters is not null)
         {
@@ -50,6 +101,14 @@ public sealed class McpRpcConnection
         }
 
         return this.WriteLineAsync(message);
+    }
+
+    private void ThrowIfClosed()
+    {
+        if (Volatile.Read(ref this.closedReason) is { } reason)
+        {
+            throw reason;
+        }
     }
 
     /// <summary>Process one incoming JSON-RPC line; completes the matching pending request.</summary>
@@ -109,7 +168,9 @@ public sealed class McpRpcConnection
         }
         finally
         {
-            this.FaultPending(new McpException("MCP connection closed."));
+            // EOF (or a cancelled loop) means nothing will ever answer again: close for good so a
+            // later call fails immediately instead of writing into a pipe with no reader.
+            this.Close(new McpException("MCP connection closed."));
         }
     }
 
@@ -124,7 +185,19 @@ public sealed class McpRpcConnection
 
     private async Task WriteLineAsync(JsonNode message)
     {
-        await this.writer.WriteLineAsync(message.ToJsonString()).ConfigureAwait(false);
-        await this.writer.FlushAsync().ConfigureAwait(false);
+        try
+        {
+            await this.writer.WriteLineAsync(message.ToJsonString()).ConfigureAwait(false);
+            await this.writer.FlushAsync().ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is IOException or ObjectDisposedException)
+        {
+            // A failed write means the transport itself is gone, not just this one message: close so
+            // every other pending request fails now and no later one is accepted, then surface it as
+            // a transport loss rather than a raw I/O exception unwinding the turn.
+            var loss = new McpException("MCP connection closed.", ex);
+            this.Close(loss);
+            throw loss;
+        }
     }
 }

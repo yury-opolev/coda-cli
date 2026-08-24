@@ -85,6 +85,9 @@ static void ServeLoop(Stream stdin, Stream stdout, Encoding encoding)
         var result = method switch
         {
             "tools/list" => """{"tools":[{"name":"echo","description":"Echo tool","inputSchema":{"type":"object"}}]}""",
+            // Identify the answering process so a test can prove which one served the call.
+            "tools/call" => "{\"content\":[{\"type\":\"text\",\"text\":\"pid:"
+                + Environment.ProcessId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "\"}]}",
             _ => """{"serverInfo":{"name":"nobom","version":"1.0"}}""",
         };
         WriteResponse(stdout, encoding, id, result);
