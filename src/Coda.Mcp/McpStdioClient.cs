@@ -23,6 +23,15 @@ public class McpStdioClient : IMcpClient
     private static readonly TimeSpan ExitGracePeriod = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
+    /// How long teardown waits for the killed process tree to actually be gone, and for the reader
+    /// tasks to unwind, before giving up. Restart runs this synchronously before launching the
+    /// replacement, so it is bounded: a child that will not die must not wedge the restart, but
+    /// returning the instant <c>Kill</c> was <em>requested</em> is what let a replacement race the
+    /// old process for the port, lock file or database it still held.
+    /// </summary>
+    private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(10);
+
+    /// <summary>
     /// A single UTF-8 encoding without a byte-order mark, reused for every child's stdin so the
     /// first bytes we write are never <c>EF BB BF</c> (which servers may mis-parse as content).
     /// </summary>
@@ -65,6 +74,7 @@ public class McpStdioClient : IMcpClient
         }
 
         this.process = Process.Start(startInfo) ?? throw new McpException($"Failed to start MCP server '{serverName}'.");
+        this.ProcessId = this.process.Id;
         this.process.StandardInput.NewLine = "\n";
         this.rpc = new McpRpcConnection(this.process.StandardInput);
         this.readLoop = this.rpc.RunReadLoopAsync(this.process.StandardOutput, this.readLoopCts.Token);
@@ -86,6 +96,7 @@ public class McpStdioClient : IMcpClient
         ArgumentNullException.ThrowIfNull(rpc);
         this.ServerName = serverName;
         this.process = null;
+        this.ProcessId = null;
         this.rpc = rpc;
         this.readLoop = Task.CompletedTask;
         this.stderrCts = null;
@@ -94,6 +105,12 @@ public class McpStdioClient : IMcpClient
     }
 
     public string ServerName { get; }
+
+    /// <summary>
+    /// The id of the child process this client owns, or null for the process-less test client.
+    /// Exposed so teardown can be verified to have actually removed the process.
+    /// </summary>
+    internal int? ProcessId { get; }
 
     public McpServerInfo? ServerInfo { get; private set; }
 
@@ -261,17 +278,67 @@ public class McpStdioClient : IMcpClient
         return McpResultParsers.ParsePromptMessages(result);
     }
 
+    /// <summary>
+    /// Tear the connection down completely, so what replaces it starts from the same clean slate a
+    /// freshly launched Coda would: every call fails immediately instead of waiting on a server that
+    /// can no longer answer, the child's stdin is closed so anything that inherited it sees EOF, the
+    /// whole process tree is killed, and — the part that makes a restart trustworthy — this does not
+    /// return until the OS reports the process actually gone (or the bounded wait expires).
+    /// </summary>
     public async ValueTask DisposeAsync()
     {
+        // First, so nothing new is written into a pipe that is about to have no reader, and anything
+        // already in flight fails now rather than waiting out the MCP tool timeout.
+        this.rpc.Close(new McpException($"MCP server '{this.ServerName}' was stopped."));
+
         await this.readLoopCts.CancelAsync().ConfigureAwait(false);
         if (this.stderrCts is not null)
         {
             await this.stderrCts.CancelAsync().ConfigureAwait(false);
         }
 
+        await this.TerminateProcessAsync().ConfigureAwait(false);
+
+        // Bounded: a reader that will not unwind must not wedge a restart, which awaits this while
+        // holding the server's lifecycle lock.
+        await AwaitBoundedAsync(this.readLoop).ConfigureAwait(false);
+        await AwaitBoundedAsync(this.stderrDrain).ConfigureAwait(false);
+
+        this.readLoopCts.Dispose();
+        this.stderrCts?.Dispose();
+        this.process?.Dispose();
+    }
+
+    /// <summary>
+    /// Close stdin, kill the process tree, and wait for the exit to actually happen.
+    /// <para>
+    /// Closing stdin first matters as much as the kill: a stdio MCP server treats stdin EOF as its
+    /// shutdown signal, and <see cref="Process.Close"/> deliberately leaves the redirected streams
+    /// open, so without this a descendant the tree kill could not reach (one that was re-parented,
+    /// say) would keep running with a live stdin — holding whatever single-instance resource the
+    /// replacement then fails to acquire.
+    /// </para>
+    /// </summary>
+    private async Task TerminateProcessAsync()
+    {
+        if (this.process is null)
+        {
+            return;
+        }
+
         try
         {
-            if (this.process is not null && !this.process.HasExited)
+            this.process.StandardInput.Close();
+        }
+        catch
+        {
+            // best-effort: MCP teardown; no logging infra in Coda.Mcp. The stream may already be
+            // closed or broken because the child died first — the kill below is what must happen.
+        }
+
+        try
+        {
+            if (!this.process.HasExited)
             {
                 this.process.Kill(entireProcessTree: true);
             }
@@ -285,26 +352,28 @@ public class McpStdioClient : IMcpClient
 
         try
         {
-            await this.readLoop.ConfigureAwait(false);
+            using var exitCts = new CancellationTokenSource(TerminationTimeout);
+            await this.process.WaitForExitAsync(exitCts.Token).ConfigureAwait(false);
         }
         catch
         {
-            // best-effort: MCP teardown; no logging infra in Coda.Mcp. A faulted read loop on
-            // dispose is the normal consequence of the kill above and carries nothing actionable.
+            // best-effort: the wait timed out or the process was already reaped. Either way there is
+            // nothing further teardown can do, and it must not throw out of DisposeAsync.
         }
+    }
 
+    /// <summary>Await a teardown task, swallowing its failure and never waiting unboundedly.</summary>
+    private static async Task AwaitBoundedAsync(Task task)
+    {
         try
         {
-            await this.stderrDrain.ConfigureAwait(false);
+            await task.WaitAsync(TerminationTimeout).ConfigureAwait(false);
         }
         catch
         {
-            // best-effort: the stderr drain faults on the cancellation/kill above; nothing here is
-            // actionable and teardown errors must never mask an earlier connection failure.
+            // best-effort: MCP teardown; no logging infra in Coda.Mcp. The reader tasks fault or
+            // time out as the normal consequence of the cancellation and kill above, and teardown
+            // errors must never mask an earlier connection failure.
         }
-
-        this.readLoopCts.Dispose();
-        this.stderrCts?.Dispose();
-        this.process?.Dispose();
     }
 }
