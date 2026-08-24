@@ -146,6 +146,7 @@ internal class FullscreenTuiShell(
         this.header.Height = 1;
         this.header.ApplyTheme(this.Theme, this.HostApp.Driver);
         this.header.CopyRequested += this.OnHeaderCopyRequested;
+        this.header.PasteRequested += this.PasteFromPointerOutsideComposer;
 
         this.transcript = new VirtualizedTranscriptView(this.HostApp, transcriptFormatter, glyphs: transcriptGlyphs);
         this.transcript.TranscriptScrolled += this.RefreshHeaderForViewport;
@@ -507,6 +508,7 @@ internal class FullscreenTuiShell(
         {
             this.header.CancelMouseInteraction();
             this.header.CopyRequested -= this.OnHeaderCopyRequested;
+            this.header.PasteRequested -= this.PasteFromPointerOutsideComposer;
         }
 
         if (disposing && this.transcript is not null)

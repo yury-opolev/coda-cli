@@ -139,6 +139,14 @@ internal sealed class SelectableTextView : View
     internal event Action<string>? CopyRequested;
 
     /// <summary>
+    /// Raised when a right-click lands with no selection to copy. Opt-in: a host that leaves this unhandled
+    /// keeps the previous behaviour of ignoring the gesture, which is what the overlay bodies want — their
+    /// composer is behind a modal and must not receive a paste. The shell's own always-visible chrome
+    /// subscribes so right-click means the same thing there as it does over the composer.
+    /// </summary>
+    internal event Action? PasteRequested;
+
+    /// <summary>
     /// Replaces the content with <paramref name="lines"/> and requests a redraw. Each line is sanitized on
     /// the way in so no control or escape sequence can reach the terminal.
     /// </summary>
@@ -290,10 +298,20 @@ internal sealed class SelectableTextView : View
 
         // Right-click while a selection is active: hand the text to the host and consume. The host owns
         // clearing, because it keeps the selection when the clipboard write fails.
-        if (IsRightClick(mouse.Flags) && this.selection.HasSelection)
+        if (IsRightClick(mouse.Flags))
         {
-            this.CopyRequested?.Invoke(this.SelectedText);
-            return true;
+            if (this.selection.HasSelection)
+            {
+                this.CopyRequested?.Invoke(this.SelectedText);
+                return true;
+            }
+
+            // Nothing to copy: fall through to the host's paste when it wants one (see PasteRequested).
+            if (this.PasteRequested is not null)
+            {
+                this.PasteRequested.Invoke();
+                return true;
+            }
         }
 
         // Fresh unshifted left press: clear any existing selection and begin a new one. The !dragging guard

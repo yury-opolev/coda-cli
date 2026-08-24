@@ -131,6 +131,13 @@ internal sealed class VirtualizedTranscriptView : View
     /// </summary>
     internal event Action<LinkSpan, System.Drawing.Point>? LinkContextMenuRequested;
 
+    /// <summary>
+    /// Raised when a right-click has nothing else to do: no selection to copy and no link to open a
+    /// context menu on. The host pastes the clipboard into the composer, so the gesture means the same
+    /// thing over the transcript as it does over the input field instead of silently doing nothing.
+    /// </summary>
+    internal event Action? PasteRequested;
+
     /// <summary>Rows appended while scrolled away that have not been seen.</summary>
     public int UnseenRows => this.viewport.UnseenRows;
 
@@ -870,9 +877,10 @@ internal sealed class VirtualizedTranscriptView : View
             return true;
         }
 
-        // Right-click: when a selection is active, copy it and consume the event regardless of whether the
-        // pointer is over a link — selection takes priority over the link context menu. With no selection,
-        // right-click over a link opens the context menu as before.
+        // Right-click, in precedence order: an active selection copies it and consumes the event regardless
+        // of whether the pointer is over a link — selection takes priority over the link context menu. With
+        // no selection, a link opens the context menu. With neither, the gesture falls through to a paste,
+        // so right-click means the same thing here as it does over the composer.
         if (SelectionGesture.IsRightClick(mouse.Flags))
         {
             if (this.selection.HasSelection)
@@ -890,7 +898,16 @@ internal sealed class VirtualizedTranscriptView : View
                 return true;
             }
 
-            return false;
+            // Only the completion bit gets here — SelectionGesture.IsRightClick ignores the press and the
+            // release — so one physical click pastes exactly once. Unhandled when no host is listening, so
+            // the event keeps travelling as it did before.
+            if (this.PasteRequested is null)
+            {
+                return false;
+            }
+
+            this.PasteRequested.Invoke();
+            return true;
         }
 
         return false;
