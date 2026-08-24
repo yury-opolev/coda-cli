@@ -149,6 +149,24 @@ public sealed partial class McpClientManager : IAsyncDisposable, IMcpClientResol
         lock (this.gate) { return this.clients.FirstOrDefault(c => string.Equals(c.ServerName, serverName, StringComparison.Ordinal)); }
     }
 
+    /// <summary>
+    /// The metadata the currently connected server advertises for <paramref name="toolName"/>, taken
+    /// from the wrappers built at its last connect, or null when it no longer advertises it.
+    /// </summary>
+    public McpToolInfo? AdvertisedToolFor(string serverName, string toolName)
+    {
+        ArgumentNullException.ThrowIfNull(serverName);
+        ArgumentNullException.ThrowIfNull(toolName);
+        lock (this.gate)
+        {
+            return this.tools
+                .OfType<McpTool>()
+                .FirstOrDefault(t => string.Equals(t.ServerName, serverName, StringComparison.Ordinal)
+                    && string.Equals(t.Info.Name, toolName, StringComparison.Ordinal))
+                ?.Info;
+        }
+    }
+
     /// <summary>The identity a connected server reported at initialize, or null when not connected / none.</summary>
     public McpServerInfo? ServerInfoFor(string serverName)
     {

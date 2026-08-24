@@ -21,6 +21,16 @@ public sealed class McpHttpClient : IMcpClient
     private readonly Uri url;
     private readonly IReadOnlyDictionary<string, string> staticHeaders;
     private readonly IMcpAuthProvider? auth;
+
+    /// <summary>
+    /// Cancelled by <see cref="DisposeAsync"/> so stopping this server ends its calls at once, the
+    /// way killing a stdio server's process does. Its token is captured up front because the source
+    /// is disposed during teardown, and an already-cancelled token stays usable afterwards.
+    /// </summary>
+    private readonly CancellationTokenSource lifetime = new();
+
+    private readonly CancellationToken lifetimeToken;
+
     private string? sessionId;
     private long lastId;
 
@@ -33,6 +43,7 @@ public sealed class McpHttpClient : IMcpClient
         this.url = config.Url;
         this.staticHeaders = config.Headers;
         this.auth = auth;
+        this.lifetimeToken = this.lifetime.Token;
     }
 
     public string ServerName { get; }
@@ -119,25 +130,59 @@ public sealed class McpHttpClient : IMcpClient
             message["params"] = parameters;
         }
 
-        using var response = await this.PostAsync(message, cancellationToken).ConfigureAwait(false);
-        this.CaptureSession(response);
-
-        if (!response.IsSuccessStatusCode)
+        using var call = this.BeginCall(cancellationToken);
+        try
         {
-            var error = await response.Content.ReadAsStringAsync(cancellationToken).ConfigureAwait(false);
-            throw new McpException($"HTTP {(int)response.StatusCode} from MCP server '{this.ServerName}': {Truncate(error)}");
-        }
+            using var response = await this.PostAsync(message, call.Token).ConfigureAwait(false);
+            this.CaptureSession(response);
 
-        return await this.ReadResultAsync(response, id, cancellationToken).ConfigureAwait(false);
+            if (!response.IsSuccessStatusCode)
+            {
+                var error = await response.Content.ReadAsStringAsync(call.Token).ConfigureAwait(false);
+                throw new McpException($"HTTP {(int)response.StatusCode} from MCP server '{this.ServerName}': {Truncate(error)}");
+            }
+
+            return await this.ReadResultAsync(response, id, call.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (this.StoppedDuring(cancellationToken))
+        {
+            throw new McpException($"MCP server '{this.ServerName}' was stopped.");
+        }
     }
 
     private async Task SendNotificationAsync(string method, CancellationToken cancellationToken)
     {
         var message = new JsonObject { ["jsonrpc"] = "2.0", ["method"] = method };
-        using var response = await this.PostAsync(message, cancellationToken).ConfigureAwait(false);
-        this.CaptureSession(response);
-        // Notifications expect 202 Accepted (or any 2xx) with no body; nothing to read.
+        using var call = this.BeginCall(cancellationToken);
+        try
+        {
+            using var response = await this.PostAsync(message, call.Token).ConfigureAwait(false);
+            this.CaptureSession(response);
+            // Notifications expect 202 Accepted (or any 2xx) with no body; nothing to read.
+        }
+        catch (OperationCanceledException) when (this.StoppedDuring(cancellationToken))
+        {
+            throw new McpException($"MCP server '{this.ServerName}' was stopped.");
+        }
     }
+
+    /// <summary>
+    /// Scope one exchange to both the caller's cancellation and this client's lifetime, so stopping
+    /// the server ends the call instead of leaving it running against a connection nothing will use.
+    /// </summary>
+    private CancellationTokenSource BeginCall(CancellationToken cancellationToken)
+    {
+        if (this.lifetimeToken.IsCancellationRequested)
+        {
+            throw new McpException($"MCP server '{this.ServerName}' was stopped.");
+        }
+
+        return CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, this.lifetimeToken);
+    }
+
+    /// <summary>True when teardown, and not the caller, cancelled the exchange.</summary>
+    private bool StoppedDuring(CancellationToken cancellationToken) =>
+        this.lifetimeToken.IsCancellationRequested && !cancellationToken.IsCancellationRequested;
 
     /// <summary>POST the message, attaching auth; on a 401, run the auth flow and retry once.</summary>
     private async Task<HttpResponseMessage> PostAsync(JsonNode message, CancellationToken cancellationToken)
@@ -297,7 +342,18 @@ public sealed class McpHttpClient : IMcpClient
 
     public ValueTask DisposeAsync()
     {
-        // The HttpClient is owned by the host/factory, not this client.
+        // Ends the calls this client still has in flight and rejects any later one. The HttpClient
+        // itself is owned by the host/factory, not this client, so it is deliberately left alone.
+        try
+        {
+            this.lifetime.Cancel();
+        }
+        catch (AggregateException)
+        {
+            // A callback registered on the token threw; teardown must not surface it.
+        }
+
+        this.lifetime.Dispose();
         return ValueTask.CompletedTask;
     }
 }

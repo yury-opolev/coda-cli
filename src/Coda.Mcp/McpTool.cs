@@ -47,7 +47,7 @@ public sealed class McpTool : ITool
     /// use the <see cref="IMcpClientResolver"/> overload.
     /// </summary>
     public McpTool(IMcpClient client, string serverName, McpToolInfo info)
-        : this(new FixedClient(client ?? throw new ArgumentNullException(nameof(client))), serverName, info)
+        : this(new FixedClient(client ?? throw new ArgumentNullException(nameof(client)), info), serverName, info)
     {
     }
 
@@ -68,6 +68,9 @@ public sealed class McpTool : ITool
     /// </summary>
     public bool SchemaCoerced => this.info.SchemaCoerced;
 
+    /// <summary>The metadata this wrapper was built from, so the manager can compare it to a replacement's.</summary>
+    internal McpToolInfo Info => this.info;
+
     public bool ShouldDefer => true;
 
     public async Task<ToolResult> ExecuteAsync(JsonElement input, ToolContext context, CancellationToken cancellationToken = default)
@@ -79,6 +82,28 @@ public sealed class McpTool : ITool
             return new ToolResult(
                 $"MCP server '{McpSchemaPolicyFilter.Safe(this.ServerName)}' is not connected, so '{this.info.Name}' " +
                 "cannot run. Restart it with restart_mcp_server and try again.",
+                IsError: true);
+        }
+
+        // Following the server to a replacement must not carry this wrapper's metadata across with
+        // it. IsReadOnly decides whether the agent asks permission before running the tool, so a
+        // replacement that classifies it differently has to be re-approved via the refreshed tool
+        // the next turn hands the model, not silently run under the old classification.
+        var advertised = this.clients.AdvertisedToolFor(this.ServerName, this.info.Name);
+        if (advertised is null)
+        {
+            return new ToolResult(
+                $"MCP server '{McpSchemaPolicyFilter.Safe(this.ServerName)}' no longer advertises a tool called " +
+                $"'{this.info.Name}'. Its tool list changed when it restarted; use the tools it offers now.",
+                IsError: true);
+        }
+
+        if (advertised.ReadOnly != this.info.ReadOnly)
+        {
+            return new ToolResult(
+                $"MCP server '{McpSchemaPolicyFilter.Safe(this.ServerName)}' now advertises '{this.info.Name}' with a " +
+                "different read-only classification than the one this tool was approved under, so it was not run. " +
+                "It will be available again, correctly classified, on the next turn.",
                 IsError: true);
         }
 
@@ -139,8 +164,11 @@ public sealed class McpTool : ITool
     private static string Sanitize(string value) => Regex.Replace(value, "[^a-zA-Z0-9_-]", "_");
 
     /// <summary>Adapts a single owned client to the resolver seam; it is never replaced.</summary>
-    private sealed class FixedClient(IMcpClient client) : IMcpClientResolver
+    private sealed class FixedClient(IMcpClient client, McpToolInfo info) : IMcpClientResolver
     {
         public IMcpClient? ClientFor(string serverName) => client;
+
+        public McpToolInfo? AdvertisedToolFor(string serverName, string toolName) =>
+            string.Equals(toolName, info.Name, StringComparison.Ordinal) ? info : null;
     }
 }

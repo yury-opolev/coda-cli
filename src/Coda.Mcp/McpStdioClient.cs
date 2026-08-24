@@ -23,11 +23,11 @@ public class McpStdioClient : IMcpClient
     private static readonly TimeSpan ExitGracePeriod = TimeSpan.FromMilliseconds(250);
 
     /// <summary>
-    /// How long teardown waits for the killed process tree to actually be gone, and for the reader
-    /// tasks to unwind, before giving up. Restart runs this synchronously before launching the
-    /// replacement, so it is bounded: a child that will not die must not wedge the restart, but
-    /// returning the instant <c>Kill</c> was <em>requested</em> is what let a replacement race the
-    /// old process for the port, lock file or database it still held.
+    /// How long the whole teardown may take: the process-tree kill being confirmed plus the reader
+    /// tasks unwinding, against one shared deadline. Restart runs this synchronously before
+    /// launching the replacement, so it is bounded — a child that will not die must not wedge the
+    /// restart — but returning the instant <c>Kill</c> was <em>requested</em> is what let a
+    /// replacement race the old process for the port, lock file or database it still held.
     /// </summary>
     private static readonly TimeSpan TerminationTimeout = TimeSpan.FromSeconds(10);
 
@@ -297,12 +297,12 @@ public class McpStdioClient : IMcpClient
             await this.stderrCts.CancelAsync().ConfigureAwait(false);
         }
 
-        await this.TerminateProcessAsync().ConfigureAwait(false);
+        // One deadline for the whole teardown, not one per step: a restart awaits this while holding
+        // the server's lifecycle lock, so the caller waits at most TerminationTimeout in total.
+        using var deadline = new CancellationTokenSource(TerminationTimeout);
 
-        // Bounded: a reader that will not unwind must not wedge a restart, which awaits this while
-        // holding the server's lifecycle lock.
-        await AwaitBoundedAsync(this.readLoop).ConfigureAwait(false);
-        await AwaitBoundedAsync(this.stderrDrain).ConfigureAwait(false);
+        await this.TerminateProcessAsync(deadline.Token).ConfigureAwait(false);
+        await AwaitBoundedAsync(Task.WhenAll(this.readLoop, this.stderrDrain), deadline.Token).ConfigureAwait(false);
 
         this.readLoopCts.Dispose();
         this.stderrCts?.Dispose();
@@ -310,16 +310,19 @@ public class McpStdioClient : IMcpClient
     }
 
     /// <summary>
-    /// Close stdin, kill the process tree, and wait for the exit to actually happen.
+    /// Kill the process tree, hand any survivor a stdin EOF, and wait for the exit to actually happen.
     /// <para>
-    /// Closing stdin first matters as much as the kill: a stdio MCP server treats stdin EOF as its
-    /// shutdown signal, and <see cref="Process.Close"/> deliberately leaves the redirected streams
-    /// open, so without this a descendant the tree kill could not reach (one that was re-parented,
-    /// say) would keep running with a live stdin — holding whatever single-instance resource the
-    /// replacement then fails to acquire.
+    /// The order matters. The tree kill goes first because a process's children can only be
+    /// enumerated while it is still alive — closing stdin first can make a well-behaved server exit
+    /// on EOF within that window, and then its children are no longer reachable through it and
+    /// outlive the restart. Closing stdin second still matters, because it is the shutdown signal
+    /// for anything that inherited the pipe and that the tree walk could not reach (a re-parented
+    /// grandchild): <see cref="Process.Close"/> deliberately leaves redirected streams open, so
+    /// without this such a process keeps running — holding whatever single-instance port, lock file
+    /// or database the replacement then fails to acquire.
     /// </para>
     /// </summary>
-    private async Task TerminateProcessAsync()
+    private async Task TerminateProcessAsync(CancellationToken deadline)
     {
         if (this.process is null)
         {
@@ -328,20 +331,7 @@ public class McpStdioClient : IMcpClient
 
         try
         {
-            this.process.StandardInput.Close();
-        }
-        catch
-        {
-            // best-effort: MCP teardown; no logging infra in Coda.Mcp. The stream may already be
-            // closed or broken because the child died first — the kill below is what must happen.
-        }
-
-        try
-        {
-            if (!this.process.HasExited)
-            {
-                this.process.Kill(entireProcessTree: true);
-            }
+            this.process.Kill(entireProcessTree: true);
         }
         catch
         {
@@ -352,22 +342,34 @@ public class McpStdioClient : IMcpClient
 
         try
         {
-            using var exitCts = new CancellationTokenSource(TerminationTimeout);
-            await this.process.WaitForExitAsync(exitCts.Token).ConfigureAwait(false);
+            // The underlying stream, not the writer: StreamWriter.Close() flushes first, and a flush
+            // into the pipe of a process that has just been killed has no reader to drain it.
+            this.process.StandardInput.BaseStream.Dispose();
         }
         catch
         {
-            // best-effort: the wait timed out or the process was already reaped. Either way there is
-            // nothing further teardown can do, and it must not throw out of DisposeAsync.
+            // best-effort: MCP teardown. The stream is already broken once the child is gone, which
+            // is precisely the state this is trying to reach.
+        }
+
+        try
+        {
+            await this.process.WaitForExitAsync(deadline).ConfigureAwait(false);
+        }
+        catch
+        {
+            // best-effort: the wait hit the teardown deadline, or the process was already reaped.
+            // Either way there is nothing further teardown can do, and it must not throw out of
+            // DisposeAsync.
         }
     }
 
-    /// <summary>Await a teardown task, swallowing its failure and never waiting unboundedly.</summary>
-    private static async Task AwaitBoundedAsync(Task task)
+    /// <summary>Await a teardown task, swallowing its failure and never waiting past the deadline.</summary>
+    private static async Task AwaitBoundedAsync(Task task, CancellationToken deadline)
     {
         try
         {
-            await task.WaitAsync(TerminationTimeout).ConfigureAwait(false);
+            await task.WaitAsync(deadline).ConfigureAwait(false);
         }
         catch
         {

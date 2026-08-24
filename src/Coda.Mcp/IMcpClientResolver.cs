@@ -18,4 +18,16 @@ public interface IMcpClientResolver
     /// server is not connected right now (stopped, or a restart that failed to come back).
     /// </summary>
     IMcpClient? ClientFor(string serverName);
+
+    /// <summary>
+    /// The metadata the connected server <em>currently</em> advertises for <paramref name="toolName"/>,
+    /// or <see langword="null"/> when it no longer offers that tool.
+    /// <para>
+    /// A wrapper created before a restart carries the metadata of the server it was built from,
+    /// including <see cref="Coda.Agent.ITool.IsReadOnly"/> — which decides whether the agent asks
+    /// permission before running it. Following the server to a replacement must not also carry that
+    /// classification across, so the caller re-checks it here against what is actually running.
+    /// </para>
+    /// </summary>
+    McpToolInfo? AdvertisedToolFor(string serverName, string toolName);
 }

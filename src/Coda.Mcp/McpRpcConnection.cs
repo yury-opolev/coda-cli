@@ -74,8 +74,13 @@ public sealed class McpRpcConnection
         catch
         {
             // Nothing was sent, so nothing can answer: drop the registration instead of leaving an
-            // entry that only a later Close would ever complete.
+            // entry that only a later Close would ever complete. A write failure closes the
+            // connection, which may already have faulted this registration — take ownership of it
+            // and observe any such fault, or it would surface later on the finalizer thread as an
+            // unobserved task exception, since this caller never awaits the task.
             this.pending.TryRemove(id, out _);
+            tcs.TrySetCanceled();
+            _ = tcs.Task.Exception;
             throw;
         }
 
@@ -187,10 +192,12 @@ public sealed class McpRpcConnection
         }
         catch (Exception ex) when (ex is IOException or ObjectDisposedException)
         {
-            // The pipe went away mid-write (the child died, or teardown closed stdin): surface it as
-            // a transport loss so a tool call fails cleanly instead of a raw I/O exception unwinding
-            // the turn.
-            throw new McpException("MCP connection closed.", ex);
+            // A failed write means the transport itself is gone, not just this one message: close so
+            // every other pending request fails now and no later one is accepted, then surface it as
+            // a transport loss rather than a raw I/O exception unwinding the turn.
+            var loss = new McpException("MCP connection closed.", ex);
+            this.Close(loss);
+            throw loss;
         }
     }
 }
