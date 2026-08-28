@@ -1,0 +1,29 @@
+[package]
+name = "coda-auth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authentication and credential storage for the Coda engine."
+
+[dependencies]
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["sync", "time", "net", "io-util"] }
+async-trait.workspace = true
+reqwest = { workspace = true }
+tracing.workspace = true
+directories.workspace = true
+chrono.workspace = true
+sha2 = "0.10"
+base64 = "0.22"
+rand = { version = "0.8", features = ["getrandom"] }
+aes-gcm = "0.10"
+# Cross-platform OS credential store: Windows Credential Manager, macOS Keychain,
+# Linux Secret Service.  Falls back to encrypted-file store when unavailable.
+keyring = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "io-util", "time", "sync"] }

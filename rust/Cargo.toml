@@ -8,6 +8,7 @@ members = [
     "crates/coda-llm",
     "crates/coda-render",
     "crates/coda-tui",
+    "crates/coda-auth",
 ]
 
 [workspace.package]
