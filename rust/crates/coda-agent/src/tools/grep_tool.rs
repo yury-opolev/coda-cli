@@ -181,6 +181,12 @@ fn collect_files(base_dir: &str, glob_filter: Option<&Regex>) -> Vec<String> {
             let Ok(ftype) = entry.file_type() else { continue };
             if ftype.is_dir() {
                 stack.push(path);
+            } else if ftype.is_symlink() {
+                // Skip symlink-to-file entries.  A repo-supplied symlink that
+                // points outside the sandbox (e.g. `data -> ~/.ssh/id_rsa`)
+                // would otherwise be followed by tokio::fs::read, leaking
+                // confidential file content to the LLM.
+                continue;
             } else {
                 if let Some(filter) = glob_filter {
                     let Ok(rel) = path.strip_prefix(base) else { continue };
@@ -297,6 +303,82 @@ mod tests {
             .join(format!("coda-grep-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // ── HIGH-2 symlink-escape exploit test ───────────────────────────────────
+    //
+    // EXPLOIT (before fix): a symlink inside the sandbox root that points at a
+    // file outside (e.g. a repo-shipped `data -> ~/.ssh/id_rsa`) is silently
+    // followed by tokio::fs::read, leaking confidential file content to the LLM.
+    //
+    // After the fix, collect_files skips any DirEntry whose file_type is_symlink().
+    // On Windows symlink creation may require elevated privileges; if it fails
+    // with PermissionDenied the test is explicitly skipped with a message.
+
+    #[tokio::test]
+    async fn symlink_to_outside_file_is_not_read() {
+        let root = temp_dir();
+        let outside = std::env::temp_dir()
+            .join(format!("coda-grep-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "GREP_SECRET_7x9q").unwrap();
+
+        let link = root.join("link.txt");
+        match make_symlink(&outside.join("secret.txt"), &link) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) /* ERROR_PRIVILEGE_NOT_HELD */ =>
+            {
+                eprintln!(
+                    "SKIP symlink_to_outside_file_is_not_read: \
+                     symlink creation needs elevated privileges ({e})"
+                );
+                std::fs::remove_dir_all(&root).ok();
+                std::fs::remove_dir_all(&outside).ok();
+                return;
+            }
+            Err(e) => panic!("Failed to create test symlink: {e}"),
+            Ok(()) => {}
+        }
+
+        let ctx = ToolContext::new(root.to_string_lossy().as_ref());
+        let result = GrepTool
+            .execute(
+                &serde_json::json!({"pattern": "GREP_SECRET_7x9q"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        // Before fix: grep follows the symlink and exposes the secret.
+        // After fix: the symlink entry is skipped; result is "No matches found."
+        assert!(
+            !result.content.contains("GREP_SECRET_7x9q"),
+            "EXPLOIT: symlink to outside file was read; content: {}",
+            result.content
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Platform-portable symlink creation for tests.
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlinks unsupported on this platform",
+            ))
+        }
     }
 
     // ── sandbox ──────────────────────────────────────────────────────────────

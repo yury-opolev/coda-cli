@@ -331,6 +331,7 @@ dependencies = [
  "coda-llm",
  "coda-proto",
  "futures",
+ "libc",
  "pretty_assertions",
  "regex",
  "reqwest",

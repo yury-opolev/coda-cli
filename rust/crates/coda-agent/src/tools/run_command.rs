@@ -135,8 +135,10 @@ fn shell_args(command: &str) -> Vec<String> {
 /// Kill the process identified by `pid` and its entire descendant tree.
 ///
 /// On Windows, `taskkill /F /T` terminates the job tree reliably.
-/// On Unix, a plain `SIGKILL` to the child is used (best-effort; the tool does
-/// not set up a new process group, which would require `libc`).
+/// On Unix, the child process was placed in its own process group (via
+/// `setpgid(0,0)` in the `pre_exec` hook) so we can signal the whole group
+/// with `kill(-pgid, SIGKILL)`.  Without the process-group signal, grandchildren
+/// spawned by the shell would continue running after timeout or cancellation.
 async fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
@@ -152,10 +154,16 @@ async fn kill_tree(pid: u32) {
     }
     #[cfg(not(windows))]
     {
-        let _ = tokio::process::Command::new("kill")
-            .args(["-9", &pid.to_string()])
-            .status()
-            .await;
+        // The process group ID equals `pid` because pre_exec called setpgid(0,0).
+        // Sending SIGKILL to the negative pgid terminates every member of the
+        // group, including grandchildren.
+        //
+        // Safety: `pid` is a valid PID obtained from `child.id()` before the
+        // child is waited on; the process group is guaranteed to exist at this
+        // point because we're in the timeout/cancel branch before wait returns.
+        unsafe {
+            libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+        }
     }
 }
 
@@ -197,15 +205,27 @@ async fn run_command(
     let program = shell_program();
     let args = shell_args(command);
 
-    let mut child = match tokio::process::Command::new(program)
-        .args(&args)
+    let mut cmd = tokio::process::Command::new(program);
+    cmd.args(&args)
         .current_dir(working_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
-        .kill_on_drop(true) // ensures the child is killed if this future is dropped
-        .spawn()
-    {
+        .kill_on_drop(true); // ensures the child is killed if this future is dropped
+
+    // On Unix, place the child in its own process group so that kill_tree can
+    // signal every grandchild with a single kill(-pgid, SIGKILL).
+    // setpgid(0, 0) sets the child's pgid to its own PID.
+    #[cfg(unix)]
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            libc::setpgid(0, 0);
+            Ok(())
+        });
+    }
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => return ToolResult::error(format!("Failed to start process: {e}")),
     };

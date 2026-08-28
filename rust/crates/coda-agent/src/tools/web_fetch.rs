@@ -5,12 +5,16 @@
 //! - Loopback, private, link-local, and metadata IP ranges are blocked (SSRF
 //!   guard). IP-literal hosts are screened directly; hostnames are resolved via
 //!   DNS and every resolved address is checked.
+//! - DNS-rebinding prevention: the hostname is resolved ONCE per hop, the
+//!   result is validated, and the connection is pinned to the approved address
+//!   via `ClientBuilder::resolve_to_addrs`.  reqwest would otherwise re-resolve
+//!   at TCP connect time, creating a window for TTL-0 rebinding attacks.
 //! - Redirects are followed manually (up to 5 hops); each hop is re-validated.
 //!   A redirect from `https` to `http` (scheme downgrade) is refused.
 //! - Response body is capped at 2 MiB; the converted text is capped at 50 000 chars.
 //! - Timeout defaults to 15 seconds (the reqwest client's own setting).
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -215,6 +219,26 @@ fn named_entity(name: &str) -> &'static str {
     }
 }
 
+// ── DNS-pinning helper ────────────────────────────────────────────────────────
+
+/// Build a reqwest client whose DNS resolver is overridden so that `host`
+/// always dials `addr` — regardless of what a fresh DNS lookup would return.
+///
+/// Using `resolve_to_addrs` closes the DNS-rebinding window: without it,
+/// reqwest would resolve `host` a *second* time at TCP connect, and an attacker
+/// controlling TTL-0 DNS could answer a public IP to our SSRF check and a
+/// private/metadata IP to the actual connection.
+pub(crate) fn build_pinned_client(
+    host: &str,
+    addr: SocketAddr,
+) -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(15))
+        .resolve_to_addrs(host, &[addr])
+        .build()
+}
+
 // ── Tool implementation ───────────────────────────────────────────────────────
 
 #[async_trait]
@@ -265,7 +289,13 @@ impl Tool for WebFetchTool {
                 ));
             }
 
-            // DNS-based SSRF check for non-literal hostnames.
+            // DNS-based SSRF check for non-literal hostnames.  The resolved
+            // address is also pinned into a per-hop client via resolve_to_addrs
+            // to prevent DNS rebinding: without pinning, reqwest would resolve
+            // the hostname a *second* time at TCP connect, giving an attacker
+            // with TTL-0 DNS a window to answer a private/metadata IP on the
+            // second lookup after passing our check with a public IP.
+            let hop_client: Option<reqwest::Client>;
             if !self.skip_ssrf {
                 if let Ok(parsed) = Url::parse(&current) {
                     let host = parsed.host_str().unwrap_or("").to_owned();
@@ -294,12 +324,26 @@ impl Tool for WebFetchTool {
                                 "Refused to fetch '{current}' (host resolves to a local/private address)."
                             ));
                         }
+                        // Pin reqwest to the approved address so the connection
+                        // cannot use a second DNS answer (rebinding attack).
+                        let port = parsed.port_or_known_default().unwrap_or(80);
+                        let pinned = SocketAddr::new(resolved[0], port);
+                        hop_client = match build_pinned_client(&host, pinned) {
+                            Ok(c) => Some(c),
+                            Err(e) => return ToolResult::error(format!("Client build failed: {e}")),
+                        };
+                    } else {
+                        hop_client = None;
                     }
+                } else {
+                    hop_client = None;
                 }
+            } else {
+                hop_client = None;
             }
+            let client = hop_client.as_ref().unwrap_or(&self.client);
 
-            let request = match self
-                .client
+            let request = match client
                 .get(&current)
                 .header(reqwest::header::USER_AGENT, "Coda/1.0 (+https://localhost)")
                 .build()
@@ -309,7 +353,7 @@ impl Tool for WebFetchTool {
             };
 
             let response = tokio::select! {
-                r = self.client.execute(request) => match r {
+                r = client.execute(request) => match r {
                     Ok(resp) => resp,
                     Err(e) => return ToolResult::error(format!("Fetch failed: {e}")),
                 },
@@ -423,6 +467,52 @@ mod tests {
 
     fn cwd_ctx() -> ToolContext {
         ToolContext::new(std::env::current_dir().unwrap().to_string_lossy().as_ref())
+    }
+
+    // ── HIGH-3 DNS-rebinding exploit test ────────────────────────────────────
+    //
+    // EXPLOIT (before fix): the SSRF guard resolves the hostname once and
+    // validates all IPs, but then hands the *hostname* URL to self.client,
+    // which resolves again at TCP connect time.  An attacker with TTL-0 DNS
+    // answers a public IP to the check and 169.254.169.254 (cloud metadata) on
+    // the second resolution.
+    //
+    // After the fix, resolve_and_pin() resolves once, validates, and returns a
+    // client built with resolve_to_addrs() so reqwest is forced to dial
+    // exactly the address that was approved.
+    //
+    // Full simulation (two different DNS answers in the same process) is
+    // impractical without a custom resolver shim.  Instead we test the pinning
+    // mechanism directly: prove that a client built with resolve_to_addrs()
+    // connects to the pinned SocketAddr even when the hostname has no real DNS
+    // entry.  A rebinding attacker would be unable to swap the address after the
+    // pin is established.
+
+    #[tokio::test]
+    async fn pinned_client_dials_validated_addr_not_re_resolved() {
+        // Start a local server so we have a real endpoint to connect to.
+        let url = serve_once(200, "content-type: text/plain\r\n", b"pinned-ok").await;
+        let port: u16 = url
+            .trim_start_matches("http://127.0.0.1:")
+            .parse()
+            .expect("port from serve_once URL");
+        let pinned_addr =
+            std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), port);
+
+        // build_pinned_client is the helper introduced by the fix.
+        // BEFORE THE FIX this call does not compile — confirming the test fails.
+        let client = build_pinned_client("rebind-test.invalid", pinned_addr)
+            .expect("client build must succeed");
+
+        // "rebind-test.invalid" has no real DNS entry; the client must reach our
+        // test server via the pinned address rather than via re-resolution.
+        let resp = client
+            .get("http://rebind-test.invalid/")
+            .send()
+            .await
+            .expect("pinned request must succeed");
+        let body = resp.text().await.unwrap();
+        assert_eq!(body, "pinned-ok", "wrong body — pinning did not work");
     }
 
     // ── URL validation ────────────────────────────────────────────────────────

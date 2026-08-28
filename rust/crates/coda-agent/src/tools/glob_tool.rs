@@ -108,6 +108,10 @@ fn collect_matching_files(base_dir: &str, regex: &regex::Regex) -> Vec<String> {
             let Ok(ftype) = entry.file_type() else { continue };
             if ftype.is_dir() {
                 stack.push(path);
+            } else if ftype.is_symlink() {
+                // Skip symlink-to-file entries to prevent disclosing files
+                // outside the sandbox via a repo-supplied symlink.
+                continue;
             } else {
                 let Ok(rel) = path.strip_prefix(base) else { continue };
                 let rel_str = rel.to_string_lossy().replace('\\', "/");
@@ -133,6 +137,80 @@ mod tests {
             .join(format!("coda-glob-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    // ── HIGH-2 symlink-escape exploit test ───────────────────────────────────
+    //
+    // EXPLOIT (before fix): a symlink inside the sandbox root pointing at a
+    // file outside is returned by collect_matching_files and its relative path
+    // is handed to the LLM, disclosing the existence of the outside file.
+    //
+    // After the fix collect_matching_files skips symlink entries.
+
+    #[tokio::test]
+    async fn symlink_to_outside_file_is_not_listed() {
+        let root = temp_dir();
+        let outside = std::env::temp_dir()
+            .join(format!("coda-glob-outside-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), "").unwrap();
+
+        let link = root.join("link_secret.txt");
+        match make_symlink(&outside.join("secret.txt"), &link) {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::PermissionDenied
+                    || e.raw_os_error() == Some(1314) =>
+            {
+                eprintln!(
+                    "SKIP symlink_to_outside_file_is_not_listed: \
+                     symlink creation needs elevated privileges ({e})"
+                );
+                std::fs::remove_dir_all(&root).ok();
+                std::fs::remove_dir_all(&outside).ok();
+                return;
+            }
+            Err(e) => panic!("Failed to create test symlink: {e}"),
+            Ok(()) => {}
+        }
+
+        let ctx = ToolContext::new(root.to_string_lossy().as_ref());
+        let result = GlobTool
+            .execute(
+                &serde_json::json!({"pattern": "*.txt"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+
+        // Before fix: link_secret.txt appears in the listing.
+        // After fix: symlink entries are skipped.
+        assert!(
+            !result.content.contains("link_secret"),
+            "EXPLOIT: symlink to outside file listed; content: {}",
+            result.content
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Platform-portable symlink creation for tests.
+    fn make_symlink(target: &std::path::Path, link: &std::path::Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, link)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::symlink_file(target, link)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "symlinks unsupported on this platform",
+            ))
+        }
     }
 
     // ── sandbox ──────────────────────────────────────────────────────────────

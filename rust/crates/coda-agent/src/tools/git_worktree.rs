@@ -1,16 +1,17 @@
 //! Manage git worktrees: list existing worktrees, add a new one, or remove one.
 //!
 //! Runs `git worktree <list|add|remove>` with a hard 30-second timeout.
-//! The worktree path for `add` and `remove` is validated through the path
-//! sandbox when it is inside the working directory; paths outside are allowed
-//! only in bypass mode (worktrees are commonly placed next to the repo root).
+//! The worktree path for `add` and `remove` is validated by the path sandbox
+//! (`try_resolve_within_root`) before being handed to git.  A `--` end-of-options
+//! marker is inserted between git's flags and the path so that a path beginning
+//! with `-` cannot be misinterpreted as a git option flag.
 
 use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::{context::try_resolve_within_root, Tool, ToolContext, ToolOutcome, ToolResult};
 
 pub struct GitWorktreeTool;
 
@@ -79,14 +80,17 @@ impl Tool for GitWorktreeTool {
                     Some(p) if !p.trim().is_empty() => p,
                     _ => return ToolResult::error("Missing required 'path' for action 'add'."),
                 };
-                let mut args = vec!["worktree".into(), "add".into(), wt_path.into()];
-                if let Some(b) = branch {
-                    if !b.trim().is_empty() {
-                        args.push("-b".into());
-                        args.push(b.into());
-                    }
-                }
-                args
+                // Validate path stays inside the sandbox before touching disk.
+                let resolved = match try_resolve_within_root(
+                    &ctx.working_directory,
+                    wt_path,
+                    ctx.allow_outside_working_directory,
+                    ctx.granted_directories.as_ref(),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return ToolResult::error(e),
+                };
+                build_git_args("add", &resolved, branch)
             }
 
             "remove" => {
@@ -94,7 +98,17 @@ impl Tool for GitWorktreeTool {
                     Some(p) if !p.trim().is_empty() => p,
                     _ => return ToolResult::error("Missing required 'path' for action 'remove'."),
                 };
-                vec!["worktree".into(), "remove".into(), wt_path.into()]
+                // Validate path stays inside the sandbox before touching disk.
+                let resolved = match try_resolve_within_root(
+                    &ctx.working_directory,
+                    wt_path,
+                    ctx.allow_outside_working_directory,
+                    ctx.granted_directories.as_ref(),
+                ) {
+                    Ok(p) => p,
+                    Err(e) => return ToolResult::error(e),
+                };
+                build_git_args("remove", &resolved, None)
             }
 
             other => {
@@ -105,6 +119,37 @@ impl Tool for GitWorktreeTool {
         };
 
         run_git(&git_args, &ctx.working_directory, cancel).await
+    }
+}
+
+/// Build the git argument list for a worktree add or remove.
+///
+/// `--` is inserted before the path so that a resolved path beginning with `-`
+/// (e.g. after `allow_outside_working_directory` resolves a weird input) is
+/// never misinterpreted by git as an option flag.  Branch flags must come
+/// before `--` because git does not accept them after the end-of-options marker.
+fn build_git_args(action: &str, resolved_path: &str, branch: Option<&str>) -> Vec<String> {
+    match action {
+        "add" => {
+            let mut args = vec!["worktree".to_string(), "add".to_string()];
+            if let Some(b) = branch {
+                if !b.trim().is_empty() {
+                    args.push("-b".to_string());
+                    args.push(b.to_string());
+                }
+            }
+            // `--` ends option processing; path follows as a positional argument.
+            args.push("--".to_string());
+            args.push(resolved_path.to_string());
+            args
+        }
+        "remove" => vec![
+            "worktree".to_string(),
+            "remove".to_string(),
+            "--".to_string(),
+            resolved_path.to_string(),
+        ],
+        other => unreachable!("build_git_args called with invalid action: {other}"),
     }
 }
 
@@ -193,6 +238,113 @@ mod tests {
     }
 
     // ── validation ────────────────────────────────────────────────────────────
+
+    // ── HIGH-1 sandbox-escape exploit tests ──────────────────────────────────
+    //
+    // Before the fix, `path` is passed straight to `git worktree add/remove`
+    // without any sandbox check, so an attacker-controlled path like
+    // `../../../autostart` writes HEAD content anywhere on disk.
+    //
+    // Each test asserts the sandbox error message that appears AFTER the fix;
+    // before the fix the content is a git error (or git output), so the
+    // assertion fails — demonstrating the escape.
+
+    #[tokio::test]
+    async fn add_traversal_path_rejected_by_sandbox() {
+        let root = std::env::current_dir().unwrap();
+        let ctx = ToolContext::new(root.to_string_lossy().as_ref());
+        let result = GitWorktreeTool
+            .execute(
+                &serde_json::json!({"action": "add", "path": "../../sandbox_escape"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("outside the working directory"),
+            "EXPLOIT: traversal path not sandboxed; got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn add_absolute_outside_path_rejected_by_sandbox() {
+        let root = std::env::current_dir().unwrap();
+        let ctx = ToolContext::new(root.to_string_lossy().as_ref());
+        let outside = if cfg!(windows) {
+            r"C:\Windows\Temp\coda_wt_escape"
+        } else {
+            "/tmp/coda_wt_escape"
+        };
+        let result = GitWorktreeTool
+            .execute(
+                &serde_json::json!({"action": "add", "path": outside}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("outside the working directory"),
+            "EXPLOIT: absolute outside path not sandboxed; got: {}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
+    async fn remove_traversal_path_rejected_by_sandbox() {
+        let root = std::env::current_dir().unwrap();
+        let ctx = ToolContext::new(root.to_string_lossy().as_ref());
+        let result = GitWorktreeTool
+            .execute(
+                &serde_json::json!({"action": "remove", "path": "../../etc"}),
+                &ctx,
+                CancellationToken::new(),
+            )
+            .await;
+        assert!(result.is_error);
+        assert!(
+            result.content.contains("outside the working directory"),
+            "EXPLOIT: traversal remove not sandboxed; got: {}",
+            result.content
+        );
+    }
+
+    // build_git_args unit tests — these FAIL TO COMPILE before the fix because
+    // build_git_args does not exist yet.  Compilation failure IS a test failure
+    // in TDD.  After the fix the function exists and the assertions pass.
+    #[test]
+    fn add_args_have_double_dash_before_path() {
+        // `--` MUST precede the path so that a path like `--force` is never
+        // misinterpreted by git as an option flag (option injection).
+        let args = build_git_args("add", "/repo/my-wt", None);
+        let dd = args.iter().position(|a| a == "--")
+            .expect("`--` missing from add args");
+        let path = args.iter().position(|a| a == "/repo/my-wt")
+            .expect("path missing from add args");
+        assert!(dd < path, "`--` must precede the path; args: {:?}", args);
+    }
+
+    #[test]
+    fn add_args_with_branch_still_have_double_dash_before_path() {
+        let args = build_git_args("add", "/repo/my-wt", Some("feat"));
+        let dd = args.iter().position(|a| a == "--")
+            .expect("`--` missing");
+        let path = args.iter().position(|a| a == "/repo/my-wt")
+            .expect("path missing");
+        assert!(dd < path, "args: {:?}", args);
+    }
+
+    #[test]
+    fn remove_args_have_double_dash_before_path() {
+        let args = build_git_args("remove", "/repo/my-wt", None);
+        let dd = args.iter().position(|a| a == "--")
+            .expect("`--` missing from remove args");
+        let path = args.iter().position(|a| a == "/repo/my-wt")
+            .expect("path missing from remove args");
+        assert!(dd < path, "`--` must precede the path; args: {:?}", args);
+    }
 
     #[tokio::test]
     async fn missing_action_returns_error() {
@@ -298,8 +450,8 @@ mod tests {
     async fn add_and_remove_worktree_roundtrip() {
         // Requires git to be installed.
         let repo_dir = temp_dir();
-        let wt_dir = std::env::temp_dir()
-            .join(format!("coda-wt-target-{}", uuid::Uuid::new_v4()));
+        // Place the worktree inside the repo directory so it passes the sandbox.
+        let wt_dir = repo_dir.join("test-wt");
 
         // Init a git repo with an initial commit (required for worktrees).
         let git_init = std::process::Command::new("git")
