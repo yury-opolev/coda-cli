@@ -32,6 +32,10 @@ pub enum LlmError {
         kind: FailureKind,
         /// Honoured from `Retry-After` when the provider sends it.
         retry_after: Option<Duration>,
+        /// Raw response body, preserved so retry-condition detection can inspect
+        /// it without being limited by the 500-char message truncation. Not
+        /// included in `Display` so it never leaks into user-facing text.
+        body: Option<String>,
     },
 
     #[error("the request was cancelled")]
@@ -94,6 +98,7 @@ impl LlmError {
             message,
             kind: classify(status),
             retry_after,
+            body: if body.is_empty() { None } else { Some(body.to_string()) },
         }
     }
 }

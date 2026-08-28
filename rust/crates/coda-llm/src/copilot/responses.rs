@@ -294,6 +294,7 @@ impl ResponsesDecoder {
                     message,
                     kind: FailureKind::Transient,
                     retry_after: None,
+                    body: None,
                 })
             }
 

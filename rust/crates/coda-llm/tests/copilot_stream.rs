@@ -98,6 +98,39 @@ async fn serve_sequence(
     format!("http://127.0.0.1:{port}")
 }
 
+/// N-request server: accepts one TCP connection per entry in `responses`,
+/// sends the corresponding (status, headers, body) for each, then closes.
+async fn serve_n(responses: Vec<(u16, &'static str, Vec<String>)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    tokio::spawn(async move {
+        for (status, headers, body) in responses {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            let mut buf = vec![0u8; 8192];
+            let _ = socket.read(&mut buf).await;
+
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let head = format!("HTTP/1.1 {status} {reason}\r\n{headers}\r\n");
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            for chunk in body {
+                if socket.write_all(chunk.as_bytes()).await.is_err() {
+                    return;
+                }
+                let _ = socket.flush().await;
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
+}
+
 fn sse_headers() -> &'static str {
     "content-type: text/event-stream\r\nconnection: close\r\n"
 }
@@ -500,4 +533,72 @@ async fn lists_models_over_http() {
         coda_llm::copilot::models::resolve_endpoint(&models[0]),
         CopilotEndpoint::Responses
     );
+}
+
+// ─── Endpoint-mismatch retry tests ───────────────────────────────────────────
+
+/// Flow: GET /models → chat-only, POST /chat → 400 mismatch, GET /models →
+/// /responses, POST /responses → SSE. Verifies the retry path routes to the
+/// better endpoint and returns the final text.
+#[tokio::test]
+async fn mismatch_retry_succeeds_on_better_endpoint() {
+    let models_chat_only = serde_json::json!({
+        "data": [{ "id": "gpt-4o", "supported_endpoints": ["/chat/completions"] }]
+    })
+    .to_string();
+
+    let mismatch_400 =
+        r#"{"error":{"message":"The model is not accessible via /chat/completions"}}"#.to_string();
+
+    let models_with_responses = serde_json::json!({
+        "data": [{ "id": "gpt-4o", "supported_endpoints": ["/responses"] }]
+    })
+    .to_string();
+
+    let url = serve_n(vec![
+        (200, json_headers(), vec![models_chat_only]),
+        (400, json_headers(), vec![mismatch_400]),
+        (200, json_headers(), vec![models_with_responses]),
+        (200, sse_headers(), vec![responses_text_delta("retry succeeded"), responses_completed(5, 3)]),
+    ])
+    .await;
+
+    coda_llm::copilot::models::cache_invalidate(&url);
+    let stream = client(url).stream(request()).await.expect("stream");
+    let response = stream.collect().await.expect("complete");
+
+    assert_eq!(response.text, "retry succeeded");
+}
+
+/// Flow: GET /models → chat-only, POST /chat → 400 mismatch, GET /models →
+/// still chat-only. Verifies the client gives up and surfaces the original 400
+/// rather than looping or masking it.
+#[tokio::test]
+async fn mismatch_retry_gives_up_when_re_resolution_still_yields_chat() {
+    let models_chat_only = serde_json::json!({
+        "data": [{ "id": "gpt-4o", "supported_endpoints": ["/chat/completions"] }]
+    })
+    .to_string();
+
+    let mismatch_400 =
+        r#"{"error":{"message":"The model is not accessible via /chat/completions"}}"#.to_string();
+
+    let url = serve_n(vec![
+        (200, json_headers(), vec![models_chat_only.clone()]),
+        (400, json_headers(), vec![mismatch_400]),
+        (200, json_headers(), vec![models_chat_only]),
+    ])
+    .await;
+
+    coda_llm::copilot::models::cache_invalidate(&url);
+    let error = client(url)
+        .stream(request())
+        .await
+        .expect_err("should fail with the original 400");
+
+    assert!(
+        error.to_string().contains("/chat/completions"),
+        "original 400 body must surface, got: {error}"
+    );
+    assert!(!error.is_retryable());
 }

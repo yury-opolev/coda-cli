@@ -7,15 +7,13 @@
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
-use crate::anthropic::{protocol::AnthropicDecoder, request, StreamEvent};
+use crate::anthropic::{protocol::AnthropicDecoder, request};
 use crate::client::{LlmClient, ResponseStream};
 use crate::error::{parse_retry_after, LlmError};
 use crate::message::{ChatRequest, ModelInfo};
 use crate::retry::RetryPolicy;
-use crate::sse::SseDecoder;
 
 /// Anthropic API version header value.
 const API_VERSION: &str = "2023-06-01";
@@ -25,9 +23,6 @@ const BETA_FEATURES: &str = "prompt-caching-2024-07-31,extended-cache-ttl-2025-0
 
 /// How long to wait for the response headers.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-
-/// How long a stream may stall before it is treated as dead.
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Buffer depth for decoded events.
 const CHANNEL_DEPTH: usize = 256;
@@ -174,7 +169,7 @@ impl LlmClient for AnthropicClient {
         let response = self.send_with_retry(&body).await?;
 
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
-        tokio::spawn(pump(response, tx));
+        tokio::spawn(crate::pump::pump(response, AnthropicDecoder::new(), tx));
         Ok(ResponseStream::new(rx))
     }
 
@@ -240,109 +235,6 @@ pub fn parse_models(value: &serde_json::Value) -> Vec<ModelInfo> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Reads the response body, decoding SSE into stream events.
-async fn pump(response: reqwest::Response, tx: mpsc::Sender<Result<StreamEvent, LlmError>>) {
-    let mut body = response.bytes_stream();
-    let mut sse = SseDecoder::new();
-    let mut protocol = AnthropicDecoder::new();
-    // Bytes of an incomplete UTF-8 sequence carried to the next chunk.
-    let mut carry: Vec<u8> = Vec::new();
-
-    loop {
-        // A stalled stream must not hang the agent forever, and a consumer
-        // that went away should wake us immediately rather than after the
-        // idle timeout.
-        let chunk = tokio::select! {
-            biased;
-            _ = tx.closed() => return,
-            next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()) => match next {
-                Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(error))) => {
-                    let _ = tx.send(Err(LlmError::Transport(error.to_string()))).await;
-                    return;
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = tx
-                        .send(Err(LlmError::Transport(format!(
-                            "the stream stalled for {}s",
-                            STREAM_IDLE_TIMEOUT.as_secs()
-                        ))))
-                        .await;
-                    return;
-                }
-            },
-        };
-
-        // Transport chunks split at arbitrary byte offsets, which routinely
-        // lands mid-character for any non-ASCII text. Decode only the valid
-        // prefix and carry the remainder forward.
-        carry.extend_from_slice(&chunk);
-        let text = match std::str::from_utf8(&carry) {
-            Ok(text) => {
-                let text = text.to_string();
-                carry.clear();
-                text
-            }
-            Err(error) if error.error_len().is_none() => {
-                // A truncated trailing sequence: valid so far, more to come.
-                let valid = error.valid_up_to();
-                let text = String::from_utf8_lossy(&carry[..valid]).into_owned();
-                carry.drain(..valid);
-                text
-            }
-            Err(error) => {
-                let _ = tx
-                    .send(Err(LlmError::Protocol(format!("invalid UTF-8: {error}"))))
-                    .await;
-                return;
-            }
-        };
-
-        for event in sse.push(&text) {
-            match protocol.decode(&event.name, &event.data) {
-                Ok(decoded) => {
-                    for event in decoded {
-                        // A closed receiver means the caller cancelled.
-                        if tx.send(Ok(event)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    // Bytes left over at EOF are a genuinely truncated character.
-    if !carry.is_empty() {
-        let _ = tx
-            .send(Err(LlmError::Protocol(
-                "the stream ended mid-character".into(),
-            )))
-            .await;
-        return;
-    }
-
-    // Flush an event left buffered by a stream that ended without a blank line.
-    if let Some(event) = sse.finish() {
-        if let Ok(decoded) = protocol.decode(&event.name, &event.data) {
-            for event in decoded {
-                if tx.send(Ok(event)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-
-    if !protocol.finished() {
-        let _ = tx.send(Err(LlmError::IncompleteStream)).await;
-    }
 }
 
 #[cfg(test)]

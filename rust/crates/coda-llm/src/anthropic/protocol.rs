@@ -135,6 +135,7 @@ impl AnthropicDecoder {
                     message: message.to_string(),
                     kind: crate::error::FailureKind::Transient,
                     retry_after: None,
+                    body: None,
                 })
             }
             // Unknown events are ignored so a newer API cannot break the client.

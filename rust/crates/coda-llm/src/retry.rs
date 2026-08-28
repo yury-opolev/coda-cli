@@ -84,6 +84,7 @@ mod tests {
             message: "overloaded".into(),
             kind: FailureKind::Transient,
             retry_after: None,
+            body: None,
         }
     }
 
@@ -93,6 +94,7 @@ mod tests {
             message: "bad request".into(),
             kind: FailureKind::Permanent,
             retry_after: None,
+            body: None,
         }
     }
 
@@ -102,6 +104,7 @@ mod tests {
             message: "slow down".into(),
             kind: FailureKind::RateLimited,
             retry_after,
+            body: None,
         }
     }
 

@@ -11,6 +11,7 @@ pub mod error;
 pub mod message;
 pub mod retry;
 pub mod sse;
+pub(crate) mod pump;
 
 pub use client::{CompletedResponse, LlmClient, ResponseStream};
 pub use copilot::{CopilotClient, CopilotConfig};

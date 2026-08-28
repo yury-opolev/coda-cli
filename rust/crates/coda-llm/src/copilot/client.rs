@@ -7,7 +7,6 @@
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
 use tokio::sync::mpsc;
 
 use crate::anthropic::protocol::AnthropicDecoder;
@@ -15,8 +14,8 @@ use crate::anthropic::StreamEvent;
 use crate::client::{LlmClient, ResponseStream};
 use crate::error::{parse_retry_after, LlmError};
 use crate::message::{ChatRequest, ModelInfo};
+use crate::pump::ProtocolDecoder;
 use crate::retry::RetryPolicy;
-use crate::sse::SseDecoder;
 
 use super::chat::ChatDecoder;
 use super::models::{self, CopilotEndpoint};
@@ -26,7 +25,6 @@ use super::responses::ResponsesDecoder;
 const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
-const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 const CHANNEL_DEPTH: usize = 256;
 const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -254,7 +252,7 @@ impl LlmClient for CopilotClient {
             CopilotEndpoint::Responses => Decoder::Responses(ResponsesDecoder::new()),
             CopilotEndpoint::Messages => Decoder::Messages(AnthropicDecoder::new()),
         };
-        tokio::spawn(pump(response, tx, decoder));
+        tokio::spawn(crate::pump::pump(response, decoder, tx));
         Ok(ResponseStream::new(rx))
     }
 
@@ -285,14 +283,18 @@ fn is_chat_mismatch(err: &LlmError) -> bool {
     let LlmError::Api {
         status: 400,
         message,
+        body,
         ..
     } = err
     else {
         return false;
     };
-    let msg = message.to_ascii_lowercase();
-    msg.contains("/chat/completions")
-        && (msg.contains("not accessible") || msg.contains("not supported"))
+    // Prefer the raw body so the marker is found even when it sits outside
+    // `error.message` or past the 500-char truncation point.
+    let haystack = body.as_deref().unwrap_or(message.as_str());
+    let haystack_lc = haystack.to_ascii_lowercase();
+    haystack_lc.contains("/chat/completions")
+        && (haystack_lc.contains("not accessible") || haystack_lc.contains("not supported"))
 }
 
 /// Enum dispatch over the three protocol decoders so a single `pump` handles all.
@@ -302,8 +304,8 @@ enum Decoder {
     Messages(AnthropicDecoder),
 }
 
-impl Decoder {
-    fn handle(&mut self, name: &str, data: &str) -> Result<Vec<StreamEvent>, LlmError> {
+impl ProtocolDecoder for Decoder {
+    fn decode(&mut self, name: &str, data: &str) -> Result<Vec<StreamEvent>, LlmError> {
         match self {
             Decoder::Chat(d) => {
                 if data.trim() == "[DONE]" {
@@ -323,103 +325,6 @@ impl Decoder {
             Decoder::Responses(d) => d.finished(),
             Decoder::Messages(d) => d.finished(),
         }
-    }
-}
-
-/// Reads the response body, decoding SSE events through the appropriate decoder.
-///
-/// UTF-8 safety: transport chunks split at arbitrary byte offsets, so a
-/// multi-byte character may be split across two chunks. The `carry` buffer holds
-/// any incomplete trailing sequence until the next chunk completes it.
-async fn pump(
-    response: reqwest::Response,
-    tx: mpsc::Sender<Result<StreamEvent, LlmError>>,
-    mut decoder: Decoder,
-) {
-    let mut body = response.bytes_stream();
-    let mut sse = SseDecoder::new();
-    let mut carry: Vec<u8> = Vec::new();
-
-    loop {
-        let chunk = tokio::select! {
-            biased;
-            _ = tx.closed() => return,
-            next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()) => match next {
-                Ok(Some(Ok(chunk))) => chunk,
-                Ok(Some(Err(e))) => {
-                    let _ = tx.send(Err(LlmError::Transport(e.to_string()))).await;
-                    return;
-                }
-                Ok(None) => break,
-                Err(_) => {
-                    let _ = tx.send(Err(LlmError::Transport(format!(
-                        "the stream stalled for {}s",
-                        STREAM_IDLE_TIMEOUT.as_secs()
-                    )))).await;
-                    return;
-                }
-            },
-        };
-
-        carry.extend_from_slice(&chunk);
-        let text = match std::str::from_utf8(&carry) {
-            Ok(text) => {
-                let text = text.to_string();
-                carry.clear();
-                text
-            }
-            Err(error) if error.error_len().is_none() => {
-                let valid = error.valid_up_to();
-                let text = String::from_utf8_lossy(&carry[..valid]).into_owned();
-                carry.drain(..valid);
-                text
-            }
-            Err(error) => {
-                let _ = tx
-                    .send(Err(LlmError::Protocol(format!("invalid UTF-8: {error}"))))
-                    .await;
-                return;
-            }
-        };
-
-        for event in sse.push(&text) {
-            match decoder.handle(&event.name, &event.data) {
-                Ok(decoded) => {
-                    for e in decoded {
-                        if tx.send(Ok(e)).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = tx.send(Err(error)).await;
-                    return;
-                }
-            }
-        }
-    }
-
-    if !carry.is_empty() {
-        let _ = tx
-            .send(Err(LlmError::Protocol(
-                "the stream ended mid-character".into(),
-            )))
-            .await;
-        return;
-    }
-
-    if let Some(event) = sse.finish() {
-        if let Ok(decoded) = decoder.handle(&event.name, &event.data) {
-            for e in decoded {
-                if tx.send(Ok(e)).await.is_err() {
-                    return;
-                }
-            }
-        }
-    }
-
-    if !decoder.finished() {
-        let _ = tx.send(Err(LlmError::IncompleteStream)).await;
     }
 }
 
@@ -516,6 +421,21 @@ mod tests {
             None,
         );
         assert!(!is_chat_mismatch(&err));
+    }
+
+    #[test]
+    fn is_chat_mismatch_fires_when_marker_is_outside_error_message() {
+        // `extract_message` pulls only `error.message`, which here is generic.
+        // The marker lives in a sibling field that would be invisible if we only
+        // checked the truncated `message`. Detection must use the raw body.
+        let err = LlmError::from_status(
+            400,
+            r#"{"error":{"message":"generic error","detail":"not accessible via /chat/completions"}}"#,
+            None,
+        );
+        let LlmError::Api { message, .. } = &err else { panic!("expected Api error") };
+        assert!(!message.contains("/chat/completions"), "test setup: message must not have the marker");
+        assert!(is_chat_mismatch(&err));
     }
 
     #[test]
