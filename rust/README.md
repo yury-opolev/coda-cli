@@ -97,11 +97,35 @@ Ported and working:
 - transcript rendering: markdown, unified diffs, syntax highlighting for eight
   languages, tool display modes, the warm-ember and cool-dark themes;
 - the state reducer, composer, viewport, keymap and drawing;
-- the application loop, slash commands, and permission/question/plan prompts.
+- the application loop, slash commands, and permission/question/plan prompts;
+- browser overlays for models, schedules, skills, plugins and hooks, on a
+  shared list/detail browser with filtering, paging and reload.
 
 Not yet ported:
 
-- the browser overlays (model, task, MCP, skill, plugin, schedule);
-- session resume and transcript export;
-- the setup/onboarding wizard;
+- the task and MCP browsers. `coda serve` exposes no task-listing method and
+  no MCP management surface, so these need either a protocol addition or a
+  Rust-side reader for `.mcp.json` and the task store;
+- session resume, transcript export/import, and the setup/onboarding wizard;
+- 23 of the 40 slash commands, most of which are local-file or session-state
+  operations rather than engine calls;
+- the 30 FPS frame throttle and the assistant-buffering mode, including its
+  withhold-on-interrupt rule;
 - the engine itself, which still runs as .NET.
+
+### Behaviours worth knowing
+
+Several rules were reconstructed from the C# implementation because the wire
+protocol does not imply them, and getting them wrong is silently wrong:
+
+- A tool batch may only be **extended while it is still the last block**. Text
+  between two tool calls opens a new batch, so a result must be routed back to
+  the batch that owns its `(sourceId, callId)`.
+- Finalising a batch **resolves unfinished calls** (pending becomes skipped,
+  running becomes cancelled), otherwise an interrupted turn shows tools
+  apparently still running.
+- Queued messages still pending when a turn ends **never reached the model**
+  and are removed rather than left in the transcript.
+- Destructive keys are **two-press chords**. `Ctrl+L` is a repaint, not a
+  clear; `Ctrl+D` is deliberately unbound.
+
