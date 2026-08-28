@@ -185,6 +185,7 @@ pub(crate) async fn run_tools(
             task_manager: None,
             schedule_store: None,
             caller_task_id: None,
+            subagent_factory: None,
         };
 
         sink.emit(AgentEvent::ToolStatus {

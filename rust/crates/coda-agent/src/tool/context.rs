@@ -12,10 +12,11 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
-use crate::todos::TodoStore;
 use crate::lsp::LspServerManager;
-use crate::tasks::TaskManager;
 use crate::scheduling::ScheduledTaskStore;
+use crate::subagents::SubagentFactory;
+use crate::tasks::TaskManager;
+use crate::todos::TodoStore;
 
 // ── Interaction seams ─────────────────────────────────────────────────────────
 
@@ -87,6 +88,8 @@ pub struct ToolContext {
     /// `None` means the main agent. Used to enforce depth-based authorization:
     /// a subagent may only manage its own strict descendants.
     pub caller_task_id: Option<String>,
+    /// Subagent factory seam.  `None` means the task tool cannot spawn nested loops.
+    pub subagent_factory: Option<Arc<dyn SubagentFactory>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -103,6 +106,7 @@ impl std::fmt::Debug for ToolContext {
     .field("task_manager", &self.task_manager.is_some())
     .field("schedule_store", &self.schedule_store.is_some())
     .field("caller_task_id", &self.caller_task_id)
+    .field("subagent_factory", &self.subagent_factory.is_some())
     .finish()
     }
 }
@@ -121,6 +125,7 @@ impl ToolContext {
             task_manager: None,
             schedule_store: None,
             caller_task_id: None,
+            subagent_factory: None,
         }
     }
 
@@ -167,6 +172,11 @@ impl ToolContext {
 
     pub fn with_caller_task_id(mut self, task_id: impl Into<String>) -> Self {
         self.caller_task_id = Some(task_id.into());
+        self
+    }
+
+    pub fn with_subagent_factory(mut self, factory: Arc<dyn SubagentFactory>) -> Self {
+        self.subagent_factory = Some(factory);
         self
     }
 }

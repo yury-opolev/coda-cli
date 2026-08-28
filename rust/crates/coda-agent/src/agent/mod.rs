@@ -101,6 +101,9 @@ pub struct AgentLoop {
     steering: Option<Arc<SteeringInbox>>,
     // Seam: user-question prompt (later phase).
     user_question: Option<Arc<dyn UserQuestionPrompt>>,
+    /// Hook runner: fires lifecycle hooks (PreToolUse, PostToolUse, AgentResponse, Stop, …).
+    /// `None` means no hooks are configured for this run.
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
 
     // Configuration.
     model: String,
@@ -228,7 +231,7 @@ impl AgentLoop {
             }
 
             // 7. Stream with retry arms.
-            let mut acc = stream_with_retries(
+            let stream_result = stream_with_retries(
                 &*self.client,
                 &mut request,
                 &self.quarantine,
@@ -238,8 +241,22 @@ impl AgentLoop {
                 None, // compaction seam (later phase)
                 &mut blocked_compaction_at,
             )
-            .await
-            .map_err(|e| {
+            .await;
+
+            // §PRIVACY withhold-on-interrupt (streaming cancel path):
+            // When stream_with_retries returns LlmError::Cancelled, partial text
+            // has already been emitted to the sink but the accumulator is not
+            // returned.  Emit the warning NOW — before propagating — so the sink
+            // always sees the notice when a turn is interrupted mid-stream.
+            if matches!(&stream_result, Err(coda_llm::LlmError::Cancelled)) {
+                sink.emit(AgentEvent::Warning {
+                    message: "[response withheld — turn was interrupted before it completed]"
+                        .into(),
+                });
+                return Err(AgentError::Cancelled);
+            }
+
+            let mut acc = stream_result.map_err(|e| {
                 // Normalise LlmError::Cancelled → AgentError::Cancelled so every
                 // cancel-observing path (retry-loop top, select arm, or this spot)
                 // returns the same variant.  A caller matching AgentError::Cancelled
@@ -273,8 +290,23 @@ impl AgentLoop {
                     assistant_content.push(block);
                 }
             }
-            if !acc.text.is_empty() {
-                assistant_content.push(Content::Text(acc.text.clone()));
+
+            // §PRIVACY withhold-on-interrupt: if the turn was interrupted before
+            // the AgentResponse hook ran, the raw buffered text must NOT be
+            // surfaced.  Replace it with a notice so history stays consistent.
+            let text_to_store = if cancel.is_cancelled() && !acc.text.is_empty() {
+                // Emit a warning so callers can observe the withholding.
+                sink.emit(AgentEvent::Warning {
+                    message: "[response withheld — turn was interrupted before it completed]"
+                        .into(),
+                });
+                String::new()
+            } else {
+                acc.text.clone()
+            };
+
+            if !text_to_store.is_empty() {
+                assistant_content.push(Content::Text(text_to_store.clone()));
             }
             for block in acc.tool_uses.drain(..) {
                 assistant_content.push(block);
@@ -284,8 +316,12 @@ impl AgentLoop {
 
             // §8 item 28: persist after assistant turn commit (seam; no-op here).
 
-            // 9. Fire post-sampling hooks (no-op seam; no tasks spawned here).
-            // Later phase: pending_hook_tasks.extend(hooks.fire_post_sampling(...));
+            // 9. AgentResponse hook (fires after the text is settled, before the
+            //    stop-decision ladder).  Only fires on non-interrupted, tool-free
+            //    turns — the response is only final when the model stopped naturally
+            //    and there are no pending tool calls.
+            //    Fail-open: a broken or timed-out hook leaves the response unchanged.
+            let _ = _pending_hook_tasks; // reserved for future hook background tasks
 
             // 10. Stop decision vs. tool execution.
             // Drive off PRESENCE of tool calls, not stop_reason (§8 item 2).
@@ -298,6 +334,26 @@ impl AgentLoop {
                 .collect();
 
             if tool_uses_in_history.is_empty() {
+                // AgentResponse hook: fires for completed text turns only.
+                if !cancel.is_cancelled() {
+                    if let Some(hr) = &self.hook_runner {
+                        if hr.has_agent_response {
+                            let recent_text = last_assistant_text(history);
+                            let _ar = hr
+                                .run_agent_response(
+                                    &recent_text,
+                                    acc.stop_reason.as_deref(),
+                                    cancel.clone(),
+                                )
+                                .await;
+                            // TODO(phase-6): apply `_ar.modified_response` / `_ar.display_content`
+                            // to history and emit `ResponseRewritten`. For now the hook runs for
+                            // observation/notification purposes; its modification output is accepted
+                            // by the runner but not yet applied here.
+                        }
+                    }
+                }
+
                 // No tool calls → stop-decision ladder (§1.5).
                 let recent_text = last_assistant_text(history);
 
@@ -409,6 +465,7 @@ pub struct AgentLoopBuilder {
     permission_mode_state: Option<Arc<PermissionModeState>>,
     steering: Option<Arc<SteeringInbox>>,
     user_question: Option<Arc<dyn UserQuestionPrompt>>,
+    hook_runner: Option<Arc<crate::hooks::HookRunner>>,
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -438,6 +495,7 @@ impl AgentLoopBuilder {
             permission_mode_state: None,
             steering: None,
             user_question: None,
+            hook_runner: None,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: 4096,
@@ -523,6 +581,11 @@ impl AgentLoopBuilder {
         self
     }
 
+    pub fn with_hook_runner(mut self, hr: Arc<crate::hooks::HookRunner>) -> Self {
+        self.hook_runner = Some(hr);
+        self
+    }
+
     pub fn build(self) -> AgentLoop {
         AgentLoop {
             client: self.client,
@@ -533,6 +596,7 @@ impl AgentLoopBuilder {
             permission_mode_state: self.permission_mode_state,
             steering: self.steering,
             user_question: self.user_question,
+            hook_runner: self.hook_runner,
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,
@@ -1667,5 +1731,68 @@ mod tests {
             steering_in_history,
             "steering message must appear in run-2 history"
         );
+    }
+
+    // ── §PRIVACY withhold-on-interrupt ─────────────────────────────────────
+    //
+    // If a turn is interrupted (cancel fires) AFTER text has been streamed
+    // but before the AgentResponse hook ran, the raw buffered text must NOT
+    // be stored in history or emitted to the sink as the canonical response.
+    // It is replaced by a notice so no partial LLM output leaks.
+    #[tokio::test]
+    async fn withheld_text_is_replaced_with_notice_on_interrupt() {
+        let cancel = CancellationToken::new();
+        let cancel_stream = cancel.clone();
+        let sink = CollectingSink::new();
+
+        // A client whose stream sends text, then cancels the outer token,
+        // and then blocks forever (never sends Done).
+        struct InterruptClient(CancellationToken);
+        #[async_trait]
+        impl coda_llm::LlmClient for InterruptClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let cancel = self.0.clone();
+                let (tx, rx) = tokio::sync::mpsc::channel(16);
+                tokio::spawn(async move {
+                    let _ = tx.send(Ok(StreamEvent::TextDelta("SENSITIVE_DATA".into()))).await;
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    cancel.cancel(); // fire outer cancel mid-stream
+                    // Never send Done — the stream just hangs.
+                    std::future::pending::<()>().await
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(Arc::new(InterruptClient(cancel_stream)), Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("tell me a secret")];
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            agent.run(&mut history, &sink, None, cancel),
+        )
+        .await
+        .expect("agent hung");
+
+        // The run should return Cancelled.
+        assert!(matches!(result, Err(AgentError::Cancelled)));
+
+        // §PRIVACY: SENSITIVE_DATA must NOT appear in history.
+        let sensitive_in_history = history.iter().any(|m| m.text().contains("SENSITIVE_DATA"));
+        assert!(!sensitive_in_history, "§PRIVACY: withheld text must not appear in history");
+
+        // A Warning event must be emitted to signal the withholding.
+        let events = sink.take();
+        let has_warning = events.iter().any(|e| {
+            matches!(e, AgentEvent::Warning { message } if message.contains("withheld"))
+        });
+        assert!(has_warning, "a Warning event must signal the withholding to the sink");
     }
 }

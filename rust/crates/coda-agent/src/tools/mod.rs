@@ -21,6 +21,7 @@ mod run_command;
 mod schedule_create;
 mod schedule_tools;
 mod sleep_tool;
+pub mod task;
 mod task_get;
 mod task_list;
 mod task_peek;
@@ -56,6 +57,7 @@ pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, TIMEOUT_ENV};
 pub use schedule_create::ScheduleCreateTool;
 pub use schedule_tools::{ScheduleDeleteTool, ScheduleListTool};
 pub use sleep_tool::{SleepTool, MAX_DURATION_MS};
+pub use task::TaskTool;
 pub use task_get::TaskGetTool;
 pub use task_list::TaskListTool;
 pub use task_peek::TaskPeekTool;
@@ -123,6 +125,8 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(BackgroundTaskStartTool),
         Arc::new(BackgroundTaskOutputTool),
         Arc::new(BackgroundTaskStopTool),
+        // ── foreground subagent task ───────────────────────────────────────────
+        Arc::new(TaskTool),
         // ── scheduling ─────────────────────────────────────────────────────────
         Arc::new(ScheduleCreateTool),
         Arc::new(ScheduleListTool),

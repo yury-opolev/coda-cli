@@ -151,7 +151,7 @@ pub(crate) async fn stream_with_retries(
     retry_cfg: &RetryConfig,
     // Compaction seam: returns (did_compact, blocked_at) or None when not wired.
     // Phase 3 will provide a real implementation; for now always None.
-    compact: Option<&dyn Fn() -> bool>,
+    compact: Option<&(dyn Fn() -> bool + Send + Sync)>,
     blocked_compaction_at: &mut Option<usize>,
 ) -> Result<StreamAccumulator, LlmError> {
     let mut acc = StreamAccumulator::default();

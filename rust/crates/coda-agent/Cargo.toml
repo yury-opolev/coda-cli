@@ -27,6 +27,7 @@ reqwest.workspace = true
 futures.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
+sha2 = "0.10"
 
 [dev-dependencies]
 pretty_assertions.workspace = true
