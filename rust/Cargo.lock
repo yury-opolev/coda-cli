@@ -323,6 +323,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "coda-llm",
+ "coda-proto",
+ "pretty_assertions",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "coda-client"
 version = "0.1.0"
 dependencies = [
@@ -2768,6 +2787,7 @@ dependencies = [
  "bytes",
  "futures-core",
  "futures-sink",
+ "libc",
  "pin-project-lite",
  "tokio",
 ]

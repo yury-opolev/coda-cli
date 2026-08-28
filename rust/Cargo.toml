@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/coda-proto",
     "crates/coda-client",
+    "crates/coda-agent",
     "crates/coda-llm",
     "crates/coda-render",
     "crates/coda-tui",
@@ -18,6 +19,7 @@ repository = "https://github.com/yury-opolev/coda-cli"
 [workspace.dependencies]
 coda-proto = { path = "crates/coda-proto" }
 coda-client = { path = "crates/coda-client" }
+coda-agent = { path = "crates/coda-agent" }
 coda-llm = { path = "crates/coda-llm" }
 coda-render = { path = "crates/coda-render" }
 
