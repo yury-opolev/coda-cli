@@ -26,6 +26,7 @@ pub mod goal;
 pub mod permission;
 pub mod steering;
 pub mod tool;
+pub mod tools;
 
 // Convenience re-exports — the most frequently used public surface.
 pub use agent::{AgentError, AgentLoop, AgentLoopBuilder};
@@ -40,3 +41,4 @@ pub use permission::{
 };
 pub use steering::{SteeringEntry, SteeringInbox};
 pub use tool::{Tool, ToolContext, ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult};
+pub use tools::built_in_file_tools;

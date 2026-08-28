@@ -21,6 +21,7 @@ tracing.workspace = true
 async-trait = "0.1"
 uuid.workspace = true
 time.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
