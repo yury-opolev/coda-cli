@@ -25,6 +25,8 @@ time.workspace = true
 regex.workspace = true
 reqwest.workspace = true
 futures.workspace = true
+chrono.workspace = true
+chrono-tz.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

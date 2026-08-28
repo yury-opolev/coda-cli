@@ -14,6 +14,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::todos::TodoStore;
 use crate::lsp::LspServerManager;
+use crate::tasks::TaskManager;
+use crate::scheduling::ScheduledTaskStore;
 
 // ── Interaction seams ─────────────────────────────────────────────────────────
 
@@ -77,6 +79,14 @@ pub struct ToolContext {
     pub all_tools: Option<Vec<ToolDescriptor>>,
     /// LSP server manager; `None` when no servers are configured.
     pub lsp_manager: Option<Arc<LspServerManager>>,
+    /// Task manager; `None` when the task runtime is not available.
+    pub task_manager: Option<Arc<TaskManager>>,
+    /// Scheduled task store; `None` when scheduling is not available.
+    pub schedule_store: Option<Arc<ScheduledTaskStore>>,
+    /// Caller's task id (the subagent or shell that is running these tools).
+    /// `None` means the main agent. Used to enforce depth-based authorization:
+    /// a subagent may only manage its own strict descendants.
+    pub caller_task_id: Option<String>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -90,7 +100,10 @@ impl std::fmt::Debug for ToolContext {
             .field("plan_approver", &self.plan_approver.is_some())
             .field("all_tools", &self.all_tools.as_ref().map(|v| v.len()))
             .field("lsp_manager", &self.lsp_manager.is_some())
-            .finish()
+    .field("task_manager", &self.task_manager.is_some())
+    .field("schedule_store", &self.schedule_store.is_some())
+    .field("caller_task_id", &self.caller_task_id)
+    .finish()
     }
 }
 
@@ -105,6 +118,9 @@ impl ToolContext {
             plan_approver: None,
             all_tools: None,
             lsp_manager: None,
+            task_manager: None,
+            schedule_store: None,
+            caller_task_id: None,
         }
     }
 
@@ -136,6 +152,21 @@ impl ToolContext {
 
     pub fn with_lsp_manager(mut self, mgr: Arc<LspServerManager>) -> Self {
         self.lsp_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_task_manager(mut self, mgr: Arc<TaskManager>) -> Self {
+        self.task_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_schedule_store(mut self, store: Arc<ScheduledTaskStore>) -> Self {
+        self.schedule_store = Some(store);
+        self
+    }
+
+    pub fn with_caller_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.caller_task_id = Some(task_id.into());
         self
     }
 }

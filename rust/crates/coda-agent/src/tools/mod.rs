@@ -8,6 +8,7 @@
 //! is active.
 
 mod ask_user_question;
+mod background_task;
 mod edit_file;
 mod exit_plan_mode;
 mod git_worktree;
@@ -17,7 +18,17 @@ mod list_dir;
 mod notebook_edit;
 mod read_file;
 mod run_command;
+mod schedule_create;
+mod schedule_tools;
 mod sleep_tool;
+mod task_get;
+mod task_list;
+mod task_peek;
+mod task_recall;
+mod task_remove;
+mod task_send;
+mod task_stop;
+mod task_wait;
 mod todo_write;
 mod tool_search_tool;
 mod web_fetch;
@@ -32,6 +43,7 @@ use crate::tool::Tool;
 use crate::lsp::LspDiagnosticsTool;
 
 pub use ask_user_question::AskUserQuestionTool;
+pub use background_task::{BackgroundTaskOutputTool, BackgroundTaskStartTool, BackgroundTaskStopTool};
 pub use edit_file::EditTool;
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use git_worktree::GitWorktreeTool;
@@ -41,7 +53,17 @@ pub use list_dir::ListDirTool;
 pub use notebook_edit::NotebookEditTool;
 pub use read_file::ReadFileTool;
 pub use run_command::{RunCommandTool, DEFAULT_TIMEOUT_SECS, TIMEOUT_ENV};
+pub use schedule_create::ScheduleCreateTool;
+pub use schedule_tools::{ScheduleDeleteTool, ScheduleListTool};
 pub use sleep_tool::{SleepTool, MAX_DURATION_MS};
+pub use task_get::TaskGetTool;
+pub use task_list::TaskListTool;
+pub use task_peek::TaskPeekTool;
+pub use task_recall::TaskRecallTool;
+pub use task_remove::TaskRemoveTool;
+pub use task_send::TaskSendTool;
+pub use task_stop::TaskStopTool;
+pub use task_wait::TaskWaitTool;
 pub use todo_write::TodoWriteTool;
 pub use tool_search_tool::ToolSearchTool;
 pub use web_fetch::{WebFetchTool, html_to_text, is_allowed_url};
@@ -89,6 +111,22 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitWorktreeTool),
         // ── LSP ───────────────────────────────────────────────────────────────
         Arc::new(LspDiagnosticsTool),
+        // ── task management ────────────────────────────────────────────────────
+        Arc::new(TaskListTool),
+        Arc::new(TaskGetTool),
+        Arc::new(TaskPeekTool),
+        Arc::new(TaskSendTool),
+        Arc::new(TaskStopTool),
+        Arc::new(TaskWaitTool),
+        Arc::new(TaskRemoveTool),
+        Arc::new(TaskRecallTool),
+        Arc::new(BackgroundTaskStartTool),
+        Arc::new(BackgroundTaskOutputTool),
+        Arc::new(BackgroundTaskStopTool),
+        // ── scheduling ─────────────────────────────────────────────────────────
+        Arc::new(ScheduleCreateTool),
+        Arc::new(ScheduleListTool),
+        Arc::new(ScheduleDeleteTool),
     ]
 }
 
