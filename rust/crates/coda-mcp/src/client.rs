@@ -432,8 +432,11 @@ fn parse_prompt_list(result: &Value) -> Vec<McpPromptInfo> {
 mod tests {
     use super::*;
     use serde_json::json;
-    use tokio::io::{duplex, AsyncWriteExt};
-
+    // Serializes the three env-var tests so they don't race each other.
+    // Concurrent env::set_var / remove_var calls on different tests cause flaky failures.
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    use tokio::io::{duplex, AsyncWriteExt};
     /// A minimal MCP server simulated with an in-memory duplex stream.
     struct FakeServer {
         /// The side the server writes to (client reads from this).
@@ -713,12 +716,14 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_tool_timeout_uses_default_when_env_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var(TOOL_TIMEOUT_ENV);
         assert_eq!(McpClient::resolve_tool_timeout(), DEFAULT_TOOL_TIMEOUT);
     }
 
     #[tokio::test]
     async fn resolve_tool_timeout_zero_means_infinite() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(TOOL_TIMEOUT_ENV, "0");
         let t = McpClient::resolve_tool_timeout();
         assert_eq!(t, Duration::from_secs(u64::MAX));
@@ -727,6 +732,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_tool_timeout_custom_seconds() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var(TOOL_TIMEOUT_ENV, "42");
         let t = McpClient::resolve_tool_timeout();
         assert_eq!(t, Duration::from_secs(42));

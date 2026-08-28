@@ -4,6 +4,7 @@
 //! Ordering and the mid-batch steering/abort semantics depend on sequential
 //! execution; do NOT "optimize" to parallel.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use coda_llm::{Content, Correlation as LlmCorrelation};
@@ -11,9 +12,14 @@ use coda_proto::events::ToolCallStatus;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, AgentSink};
+use crate::lsp::LspServerManager;
 use crate::permission::{PermissionMode, PermissionModeState, PermissionPrompt};
+use crate::scheduling::ScheduledTaskStore;
 use crate::steering::SteeringInbox;
-use crate::tool::{ToolContext, ToolRegistry, ToolResult};
+use crate::subagents::SubagentFactory;
+use crate::tasks::TaskManager;
+use crate::todos::TodoStore;
+use crate::tool::{PlanApprover, ToolContext, ToolDescriptor, ToolRegistry, ToolResult, UserQuestion};
 
 use super::AgentError;
 use super::ToolActivity;
@@ -37,6 +43,20 @@ pub(crate) struct BatchContext<'a> {
     /// Seam for the tool heartbeat (later phase).
     #[allow(dead_code)]
     pub tool_progress_interval: Duration,
+
+    // ── Stateful service handles forwarded into every ToolContext ─────────────
+    // These were all None before CRITICAL 1 was fixed; every stateful built-in
+    // tool (todo_write, task_*, schedule_*, lsp_diagnostics, ask_user_question,
+    // exit_plan_mode, tool_search, task) silently no-opped or returned an
+    // "is not available" error because the loop never wired them.
+    pub todos: Option<Arc<TodoStore>>,
+    pub tool_user_question: Option<Arc<dyn UserQuestion>>,
+    pub plan_approver: Option<Arc<dyn PlanApprover>>,
+    pub lsp_manager: Option<Arc<LspServerManager>>,
+    pub task_manager: Option<Arc<TaskManager>>,
+    pub schedule_store: Option<Arc<ScheduledTaskStore>>,
+    pub caller_task_id: Option<String>,
+    pub subagent_factory: Option<Arc<dyn SubagentFactory>>,
 }
 
 impl<'a> BatchContext<'a> {
@@ -46,6 +66,55 @@ impl<'a> BatchContext<'a> {
 
     fn allow_outside_working_directory(&self) -> bool {
         self.effective_mode() == PermissionMode::BypassPermissions
+    }
+
+    /// Build the per-call ToolContext from batch-constant data.
+    ///
+    /// `all_tools` is derived from the registry so `tool_search` can list
+    /// every registered tool without holding a separate snapshot.
+    /// Engine-specific handles (lsp, tasks, schedule, subagent) are wrapped via
+    /// `ToolContextServiceExt` so `ToolContext` can live in `coda-tool`.
+    fn make_tool_context(&self) -> ToolContext {
+        use crate::tool::ToolContextServiceExt;
+
+        let all_tools: Vec<ToolDescriptor> = self.tools.all().iter()
+            .map(|t| ToolDescriptor {
+                name: t.name().to_owned(),
+                description: t.description().to_owned(),
+                input_schema_json: t.input_schema_json().to_owned(),
+                is_deferred: t.should_defer(),
+                search_hint: t.search_hint().map(str::to_owned),
+            })
+            .collect();
+
+        let mut ctx = ToolContext {
+            working_directory: self.working_directory.to_owned(),
+            allow_outside_working_directory: self.allow_outside_working_directory(),
+            granted_directories: self.granted_directories.cloned(),
+            todos: self.todos.clone(),
+            user_question: self.tool_user_question.clone(),
+            plan_approver: self.plan_approver.clone(),
+            all_tools: Some(all_tools),
+            caller_task_id: self.caller_task_id.clone(),
+            lsp_manager: None,
+            task_manager: None,
+            schedule_store: None,
+            subagent_factory: None,
+        };
+
+        if let Some(mgr) = &self.lsp_manager {
+            ctx = ctx.with_lsp_manager(Arc::clone(mgr));
+        }
+        if let Some(mgr) = &self.task_manager {
+            ctx = ctx.with_task_manager(Arc::clone(mgr));
+        }
+        if let Some(store) = &self.schedule_store {
+            ctx = ctx.with_schedule_store(Arc::clone(store));
+        }
+        if let Some(factory) = &self.subagent_factory {
+            ctx = ctx.with_subagent_factory(Arc::clone(factory));
+        }
+        ctx
     }
 }
 
@@ -173,20 +242,10 @@ pub(crate) async fn run_tools(
             serde_json::from_str(&effective_input).unwrap_or(serde_json::json!({}))
         };
 
-        let tool_ctx = ToolContext {
-            working_directory: ctx.working_directory.to_owned(),
-            allow_outside_working_directory: ctx.allow_outside_working_directory(),
-            granted_directories: ctx.granted_directories.cloned(),
-            todos: None,
-            user_question: None,
-            plan_approver: None,
-            all_tools: None,
-            lsp_manager: None,
-            task_manager: None,
-            schedule_store: None,
-            caller_task_id: None,
-            subagent_factory: None,
-        };
+        // Build the per-call ToolContext from BatchContext.  This is the only
+        // place ToolContext is created for real tool executions; all service
+        // handles were formerly hardcoded to None (CRITICAL 1).
+        let tool_ctx = ctx.make_tool_context();
 
         sink.emit(AgentEvent::ToolStatus {
             tool_name: name.clone(),

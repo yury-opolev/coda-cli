@@ -9,7 +9,7 @@ description = "MCP (Model Context Protocol) client for the Coda agent."
 
 [dependencies]
 coda-proto.workspace = true
-coda-agent.workspace = true
+coda-tool.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true

@@ -33,6 +33,7 @@
 //! - Token refresh is single-flight per provider.
 
 pub mod credential;
+pub mod credential_source;
 pub mod error;
 pub mod loopback;
 pub mod manager;
@@ -43,6 +44,7 @@ pub mod store;
 
 // Re-export the most commonly used types at the crate root.
 pub use credential::{AccountInfo, Credential, CredentialKind};
+pub use credential_source::{CredentialManagerSource, credential_to_auth_headers};
 pub use error::AuthError;
 pub use manager::CredentialManager;
 pub use provider::{AuthProvider, DeviceCodePrompt};

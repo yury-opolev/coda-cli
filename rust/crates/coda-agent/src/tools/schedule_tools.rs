@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::scheduling::ScheduleKind;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 pub struct ScheduleListTool;
 
@@ -28,7 +29,7 @@ impl Tool for ScheduleListTool {
     }
 
     async fn execute(&self, _input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
-        let store = match &ctx.schedule_store {
+        let store = match ctx.get_schedule_store() {
             Some(s) => s,
             None => return ToolResult::error("Schedule store is not available."),
         };
@@ -98,7 +99,7 @@ impl Tool for ScheduleDeleteTool {
             None => return ToolResult::error("Missing required 'scheduleId'."),
         };
 
-        let store = match &ctx.schedule_store {
+        let store = match ctx.get_schedule_store() {
             Some(s) => s,
             None => return ToolResult::error("Schedule store is not available."),
         };
@@ -119,9 +120,7 @@ mod tests {
     use std::time::Duration;
 
     fn ctx(store: Arc<ScheduledTaskStore>) -> ToolContext {
-        let mut c = ToolContext::new(".");
-        c.schedule_store = Some(store);
-        c
+        ToolContext::new(".").with_schedule_store(store)
     }
 
     fn add(store: &Arc<ScheduledTaskStore>) -> String {

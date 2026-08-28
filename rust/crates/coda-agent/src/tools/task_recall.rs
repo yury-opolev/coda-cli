@@ -6,6 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tasks::TaskRunStatus;
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 pub struct TaskRecallTool;
 
@@ -30,7 +31,7 @@ impl Tool for TaskRecallTool {
     }
 
     async fn execute(&self, _input: &Value, ctx: &ToolContext, _cancel: CancellationToken) -> ToolOutcome {
-        let mgr = match &ctx.task_manager {
+        let mgr = match ctx.get_task_manager() {
             Some(m) => m,
             None => return ToolResult::error("Task manager is not available."),
         };
@@ -65,9 +66,7 @@ mod tests {
     use std::sync::Arc;
 
     fn ctx(mgr: Arc<TaskManager>) -> ToolContext {
-        let mut c = ToolContext::new(".");
-        c.task_manager = Some(mgr);
-        c
+        ToolContext::new(".").with_task_manager(mgr)
     }
 
     #[tokio::test]

@@ -607,6 +607,7 @@ dependencies = [
  "coda-client",
  "coda-llm",
  "coda-proto",
+ "coda-tool",
  "futures",
  "libc",
  "pretty_assertions",
@@ -631,6 +632,7 @@ dependencies = [
  "async-trait",
  "base64",
  "chrono",
+ "coda-llm",
  "directories",
  "keyring",
  "rand 0.8.8",
@@ -683,8 +685,8 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
- "coda-agent",
  "coda-proto",
+ "coda-tool",
  "directories",
  "futures",
  "pretty_assertions",
@@ -721,6 +723,17 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "unicode-width",
+]
+
+[[package]]
+name = "coda-tool"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "coda-llm",
+ "serde_json",
+ "tokio",
+ "tokio-util",
 ]
 
 [[package]]

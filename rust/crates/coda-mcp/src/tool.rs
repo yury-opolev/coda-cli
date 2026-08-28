@@ -15,7 +15,7 @@ use async_trait::async_trait;
 use regex::Regex;
 use tokio_util::sync::CancellationToken;
 
-use coda_agent::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use coda_tool::{Tool, ToolContext, ToolOutcome, ToolResult};
 
 use crate::client::McpToolInfo;
 use crate::manager::McpClientManager;

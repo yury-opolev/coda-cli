@@ -10,6 +10,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 pub struct LspDiagnosticsTool;
 
@@ -61,7 +62,7 @@ impl Tool for LspDiagnosticsTool {
             None => return ToolResult::error("Missing required parameter 'file_path'"),
         };
 
-        let lsp = match &ctx.lsp_manager {
+        let lsp = match ctx.get_lsp_manager() {
             Some(m) => m,
             None => {
                 return ToolResult::error(

@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use crate::events::NullSink;
 use crate::subagents::{SubagentRequest, MAX_SUBAGENT_DEPTH};
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task tool
@@ -77,8 +78,8 @@ impl Tool for TaskTool {
             .and_then(Value::as_str)
             .map(str::to_owned);
 
-        let factory = match &ctx.subagent_factory {
-            Some(f) => f.clone(),
+        let factory = match ctx.get_subagent_factory() {
+            Some(f) => f,
             None => {
                 return ToolResult::error(
                     "Subagent factory is not available in this context. \
@@ -100,7 +101,7 @@ impl Tool for TaskTool {
         }
 
         // Generate a task id for this invocation.
-        let task_id = if let Some(mgr) = &ctx.task_manager {
+        let task_id = if let Some(mgr) = ctx.get_task_manager() {
             match mgr.register(
                 crate::tasks::TaskKind::Subagent,
                 &prompt,
@@ -127,13 +128,13 @@ impl Tool for TaskTool {
         match factory.spawn(request, sink, cancel).await {
             Ok(result) => {
                 // Mark the task as completed if we registered it.
-                if let Some(mgr) = &ctx.task_manager {
+                if let Some(mgr) = ctx.get_task_manager() {
                     mgr.complete(&task_id, Some(result.clone()));
                 }
                 ToolResult::ok(result)
             }
             Err(e) => {
-                if let Some(mgr) = &ctx.task_manager {
+                if let Some(mgr) = ctx.get_task_manager() {
                     mgr.fail(&task_id, Some(e.clone()));
                 }
                 ToolResult::error(e)
@@ -150,7 +151,7 @@ fn caller_depth(ctx: &ToolContext) -> u32 {
         Some(id) => id,
         None => return 0,
     };
-    let mgr = match &ctx.task_manager {
+    let mgr = match ctx.get_task_manager() {
         Some(m) => m,
         None => return 0,
     };

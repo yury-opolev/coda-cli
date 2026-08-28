@@ -36,6 +36,9 @@ pub struct CopilotConfig {
     pub retry: RetryPolicy,
     /// Optional editor / plugin identification headers sent with every request.
     pub extra_headers: Vec<(String, String)>,
+    /// Optional dynamic credential source; when present its `Authorization: Bearer`
+    /// header overrides the static `token` field so tokens are always fresh.
+    pub credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
 }
 
 impl CopilotConfig {
@@ -45,6 +48,7 @@ impl CopilotConfig {
             token: token.into(),
             retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
+            credential_source: None,
         }
     }
 
@@ -61,6 +65,16 @@ impl CopilotConfig {
     /// Appends an editor identification header (e.g. `editor-version`).
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.extra_headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Attach a dynamic credential source.  Its `Authorization: Bearer` header
+    /// overrides the static `token` field so refreshed tokens are used immediately.
+    pub fn with_credential_source(
+        mut self,
+        src: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
+    ) -> Self {
+        self.credential_source = Some(src);
         self
     }
 }
@@ -98,30 +112,56 @@ impl CopilotClient {
             .unwrap_or(CopilotEndpoint::ChatCompletions)
     }
 
-    fn auth_post(&self, url: &str) -> reqwest::RequestBuilder {
+    /// Build a POST request applying auth headers.
+    ///
+    /// `dynamic_auth` (from the credential source) overrides the static `token`
+    /// field so refreshed Copilot tokens are used immediately.
+    fn auth_post_with_auth(
+        &self,
+        url: &str,
+        dynamic_auth: Option<&[(String, String)]>,
+    ) -> reqwest::RequestBuilder {
         let mut builder = self
             .http
             .post(url)
-            .header("authorization", format!("Bearer {}", self.config.token))
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
+
+        if let Some(headers) = dynamic_auth {
+            for (name, value) in headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        } else {
+            builder = builder.header("authorization", format!("Bearer {}", self.config.token));
+        }
+
         for (name, value) in &self.config.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
         builder
     }
 
-    fn auth_get(&self, url: &str) -> reqwest::RequestBuilder {
-        let mut builder = self
-            .http
-            .get(url)
-            .header("authorization", format!("Bearer {}", self.config.token));
+    /// Build a GET request applying auth headers (used for model listing).
+    fn auth_get_with_auth(
+        &self,
+        url: &str,
+        dynamic_auth: Option<&[(String, String)]>,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self.http.get(url);
+
+        if let Some(headers) = dynamic_auth {
+            for (name, value) in headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        } else {
+            builder = builder.header("authorization", format!("Bearer {}", self.config.token));
+        }
+
         for (name, value) in &self.config.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
         }
         builder
     }
-
     /// Fetches models from the API and stores them in the cache on success.
     async fn do_list_models(&self) -> Result<Vec<ModelInfo>, LlmError> {
         let url = format!(
@@ -129,7 +169,14 @@ impl CopilotClient {
             self.config.base_url.trim_end_matches('/')
         );
 
-        let response = tokio::time::timeout(MODELS_TIMEOUT, self.auth_get(&url).send())
+        // Use the credential source if configured, same as streaming requests.
+        let dynamic_auth: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
+            src.auth_headers().await
+        } else {
+            None
+        };
+
+        let response = tokio::time::timeout(MODELS_TIMEOUT, self.auth_get_with_auth(&url, dynamic_auth.as_deref()).send())
             .await
             .map_err(|_| LlmError::Transport("listing models timed out".into()))?
             .map_err(|e| LlmError::Transport(e.to_string()))?;
@@ -155,11 +202,12 @@ impl CopilotClient {
         url: &str,
         endpoint: CopilotEndpoint,
         body: &serde_json::Value,
+        dynamic_auth: Option<&[(String, String)]>,
     ) -> Result<reqwest::Response, LlmError> {
         let mut attempt = 1u32;
 
         loop {
-            let mut builder = self.auth_post(url).json(body);
+            let mut builder = self.auth_post_with_auth(url, dynamic_auth).json(body);
             if endpoint == CopilotEndpoint::Messages {
                 builder = builder.header("anthropic-version", ANTHROPIC_API_VERSION);
             }
@@ -202,11 +250,19 @@ impl CopilotClient {
             let _ = self.do_list_models().await;
         }
 
+        // Fetch dynamic auth once per request (before endpoint selection / retry).
+        let dynamic_auth_owned: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
+            src.auth_headers().await
+        } else {
+            None
+        };
+        let dynamic_auth = dynamic_auth_owned.as_deref();
+
         let endpoint = self.endpoint_for(&request.model);
         let url = self.endpoint_url(endpoint);
         let body = build_body(request, endpoint);
 
-        match self.send_with_retry(&url, endpoint, &body).await {
+        match self.send_with_retry(&url, endpoint, &body, dynamic_auth).await {
             Ok(r) => Ok((endpoint, r)),
             Err(err) if endpoint == CopilotEndpoint::ChatCompletions && is_chat_mismatch(&err) => {
                 // The model rejected /chat/completions. Refresh metadata and retry on the
@@ -222,7 +278,7 @@ impl CopilotClient {
 
                 let new_url = self.endpoint_url(new_endpoint);
                 let new_body = build_body(request, new_endpoint);
-                let r = self.send_with_retry(&new_url, new_endpoint, &new_body).await?;
+                let r = self.send_with_retry(&new_url, new_endpoint, &new_body, dynamic_auth).await?;
                 Ok((new_endpoint, r))
             }
             Err(err) => Err(err),

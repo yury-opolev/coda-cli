@@ -10,6 +10,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::tasks::{TaskExecutionMode, TaskKind};
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 pub struct BackgroundTaskStartTool;
 
@@ -50,7 +51,7 @@ impl Tool for BackgroundTaskStartTool {
             .unwrap_or(prompt)
             .to_owned();
 
-        let mgr = match &ctx.task_manager {
+        let mgr = match ctx.get_task_manager() {
             Some(m) => m,
             None => return ToolResult::error("Task manager is not available."),
         };
@@ -123,7 +124,7 @@ impl Tool for BackgroundTaskOutputTool {
             None => return ToolResult::error("Missing required 'taskId'."),
         };
 
-        let mgr = match &ctx.task_manager {
+        let mgr = match ctx.get_task_manager() {
             Some(m) => m,
             None => return ToolResult::error("Task manager is not available."),
         };
@@ -189,7 +190,7 @@ impl Tool for BackgroundTaskStopTool {
             None => return ToolResult::error("Missing required 'taskId'."),
         };
 
-        let mgr = match &ctx.task_manager {
+        let mgr = match ctx.get_task_manager() {
             Some(m) => m,
             None => return ToolResult::error("Task manager is not available."),
         };
@@ -211,9 +212,7 @@ mod tests {
     use std::sync::Arc;
 
     fn ctx(mgr: Arc<TaskManager>) -> ToolContext {
-        let mut c = ToolContext::new(".");
-        c.task_manager = Some(mgr);
-        c
+        ToolContext::new(".").with_task_manager(mgr)
     }
 
     #[tokio::test]

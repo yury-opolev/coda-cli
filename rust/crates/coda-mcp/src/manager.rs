@@ -24,7 +24,7 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
-use coda_agent::tool::Tool;
+use coda_tool::Tool;
 
 use crate::client::{McpClient, McpToolCallError, DEFAULT_CONNECT_TIMEOUT};
 use crate::config::{self, McpConnectable};

@@ -9,6 +9,7 @@ description = "The Coda agent core: the tool-use loop, tool registry, permission
 
 [dependencies]
 coda-llm.workspace = true
+coda-tool.workspace = true
 coda-proto.workspace = true
 coda-client.workspace = true
 

@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Authentication and credential storage for the Coda engine."
 
 [dependencies]
+coda-llm.workspace = true
+
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

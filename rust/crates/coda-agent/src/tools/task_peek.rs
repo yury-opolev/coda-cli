@@ -5,6 +5,7 @@ use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 /// Default number of chars returned when `maxChars` is not specified.
 const DEFAULT_PEEK_CHARS: usize = 4000;
@@ -53,7 +54,7 @@ impl Tool for TaskPeekTool {
             .map(|n| (n as usize).min(MAX_PEEK_CHARS))
             .unwrap_or(DEFAULT_PEEK_CHARS);
 
-        let mgr = match &ctx.task_manager {
+        let mgr = match ctx.get_task_manager() {
             Some(m) => m,
             None => return ToolResult::error("Task manager is not available."),
         };
@@ -73,9 +74,7 @@ mod tests {
     use std::sync::Arc;
 
     fn ctx(mgr: Arc<TaskManager>) -> ToolContext {
-        let mut c = ToolContext::new(".");
-        c.task_manager = Some(mgr);
-        c
+        ToolContext::new(".").with_task_manager(mgr)
     }
 
     #[tokio::test]

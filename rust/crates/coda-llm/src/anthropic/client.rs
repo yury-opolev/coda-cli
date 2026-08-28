@@ -47,6 +47,9 @@ pub struct AnthropicConfig {
     pub retry: RetryPolicy,
     /// Extra headers, used by subscription auth which requires a beta flag.
     pub extra_headers: Vec<(String, String)>,
+    /// Optional dynamic credential source; when present its auth headers
+    /// override the static `auth` field on every request.
+    pub credential_source: Option<std::sync::Arc<dyn crate::credential_source::CredentialSource>>,
 }
 
 impl AnthropicConfig {
@@ -56,6 +59,7 @@ impl AnthropicConfig {
             auth: Auth::ApiKey(key.into()),
             retry: RetryPolicy::default(),
             extra_headers: Vec::new(),
+            credential_source: None,
         }
     }
 
@@ -66,6 +70,16 @@ impl AnthropicConfig {
 
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Attach a dynamic credential source.  Its `auth_headers()` output takes
+    /// priority over the static `auth` field so tokens are always fresh.
+    pub fn with_credential_source(
+        mut self,
+        src: std::sync::Arc<dyn crate::credential_source::CredentialSource>,
+    ) -> Self {
+        self.credential_source = Some(src);
         self
     }
 }
@@ -91,7 +105,15 @@ impl AnthropicClient {
         format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'))
     }
 
-    fn request_builder(&self, url: &str) -> reqwest::RequestBuilder {
+    /// Build a POST request applying auth headers.
+    ///
+    /// `dynamic_auth` (fetched from the credential source before the retry loop)
+    /// overrides the static `auth` field so refreshed tokens are used immediately.
+    fn request_builder_with_auth(
+        &self,
+        url: &str,
+        dynamic_auth: Option<&[(String, String)]>,
+    ) -> reqwest::RequestBuilder {
         let mut builder = self
             .http
             .post(url)
@@ -100,10 +122,17 @@ impl AnthropicClient {
             .header("content-type", "application/json")
             .header("accept", "text/event-stream");
 
-        builder = match &self.config.auth {
-            Auth::ApiKey(key) => builder.header("x-api-key", key.as_str()),
-            Auth::Bearer(token) => builder.header("authorization", format!("Bearer {token}")),
-        };
+        if let Some(headers) = dynamic_auth {
+            // Dynamic credential source wins over static auth.
+            for (name, value) in headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        } else {
+            builder = match &self.config.auth {
+                Auth::ApiKey(key) => builder.header("x-api-key", key.as_str()),
+                Auth::Bearer(token) => builder.header("authorization", format!("Bearer {}", token)),
+            };
+        }
 
         for (name, value) in &self.config.extra_headers {
             builder = builder.header(name.as_str(), value.as_str());
@@ -111,6 +140,29 @@ impl AnthropicClient {
         builder
     }
 
+    /// Build a GET request applying auth headers (used for model listing).
+    fn get_builder_with_auth(
+        &self,
+        url: &str,
+        dynamic_auth: Option<&[(String, String)]>,
+    ) -> reqwest::RequestBuilder {
+        let mut builder = self
+            .http
+            .get(url)
+            .header("anthropic-version", API_VERSION);
+
+        if let Some(headers) = dynamic_auth {
+            for (name, value) in headers {
+                builder = builder.header(name.as_str(), value.as_str());
+            }
+        } else {
+            builder = match &self.config.auth {
+                Auth::ApiKey(key) => builder.header("x-api-key", key.as_str()),
+                Auth::Bearer(token) => builder.header("authorization", format!("Bearer {}", token)),
+            };
+        }
+        builder
+    }
     /// Sends the request, retrying transient failures before any bytes are
     /// streamed.
     ///
@@ -120,8 +172,17 @@ impl AnthropicClient {
         let url = self.endpoint();
         let mut attempt = 1u32;
 
+        // Fetch dynamic auth headers once per request (before the retry loop) so
+        // a refreshed token is used immediately without recreating the client.
+        let dynamic_auth: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
+            src.auth_headers().await
+        } else {
+            None
+        };
+
         loop {
-            let result = self.request_builder(&url).json(body).send().await;
+            let builder = self.request_builder_with_auth(&url, dynamic_auth.as_deref());
+            let result = builder.json(body).send().await;
 
             let error = match result {
                 Ok(response) if response.status().is_success() => return Ok(response),
@@ -177,15 +238,15 @@ impl LlmClient for AnthropicClient {
         // The Messages API exposes a model list, but it needs no streaming and
         // the catalog rarely changes; a plain GET is enough.
         let url = format!("{}/v1/models", self.config.base_url.trim_end_matches('/'));
-        let mut builder = self
-            .http
-            .get(&url)
-            .header("anthropic-version", API_VERSION);
 
-        builder = match &self.config.auth {
-            Auth::ApiKey(key) => builder.header("x-api-key", key.as_str()),
-            Auth::Bearer(token) => builder.header("authorization", format!("Bearer {token}")),
+        // Use the credential source if configured, same as streaming requests.
+        let dynamic_auth: Option<Vec<(String, String)>> = if let Some(src) = &self.config.credential_source {
+            src.auth_headers().await
+        } else {
+            None
         };
+
+        let builder = self.get_builder_with_auth(&url, dynamic_auth.as_deref());
 
         // Unlike streaming, this has no per-chunk idle timeout to fall back
         // on, so a half-open connection would hang it forever.
@@ -205,8 +266,7 @@ impl LlmClient for AnthropicClient {
             .map_err(|_| LlmError::Transport("reading the model list timed out".into()))?
             .map_err(|error| LlmError::Protocol(error.to_string()))?;
 
-        Ok(parse_models(&value))
-    }
+        Ok(parse_models(&value))   }
 }
 
 /// Parses a `/v1/models` payload.

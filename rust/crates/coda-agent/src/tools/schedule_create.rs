@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::scheduling::{CronExpression, ScheduleDefinitionDraft, ScheduleKind};
 use crate::tool::{Tool, ToolContext, ToolOutcome, ToolResult};
+use crate::tool::ToolContextServiceExt as _;
 
 pub struct ScheduleCreateTool;
 
@@ -47,7 +48,7 @@ impl Tool for ScheduleCreateTool {
             _ => return ToolResult::error("Missing required 'prompt'."),
         };
 
-        let store = match &ctx.schedule_store {
+        let store = match ctx.get_schedule_store() {
             Some(s) => s,
             None => return ToolResult::error("Schedule store is not available."),
         };
@@ -206,9 +207,7 @@ mod tests {
     use std::sync::Arc;
 
     fn ctx(store: Arc<ScheduledTaskStore>) -> ToolContext {
-        let mut c = ToolContext::new(".");
-        c.schedule_store = Some(store);
-        c
+        ToolContext::new(".").with_schedule_store(store)
     }
 
     #[tokio::test]

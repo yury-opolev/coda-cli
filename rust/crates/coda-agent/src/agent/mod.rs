@@ -25,9 +25,14 @@ use tokio_util::sync::CancellationToken;
 
 use crate::events::{AgentEvent, AgentSink};
 use crate::goal::{GoalStatus, GoalSupervisor, last_assistant_text};
+use crate::lsp::LspServerManager;
 use crate::permission::{PermissionMode, PermissionModeState, PermissionPrompt};
+use crate::scheduling::ScheduledTaskStore;
 use crate::steering::SteeringInbox;
-use crate::tool::{ToolQuarantine, ToolRegistry};
+use crate::subagents::SubagentFactory;
+use crate::tasks::TaskManager;
+use crate::todos::TodoStore;
+use crate::tool::{PlanApprover, ToolQuarantine, ToolRegistry, UserQuestion};
 
 pub mod stop;
 pub mod stream;
@@ -99,11 +104,31 @@ pub struct AgentLoop {
 
     // Optional services.
     steering: Option<Arc<SteeringInbox>>,
-    // Seam: user-question prompt (later phase).
+    // Seam: user-question prompt for goal escalation (stop-decision ladder).
     user_question: Option<Arc<dyn UserQuestionPrompt>>,
     /// Hook runner: fires lifecycle hooks (PreToolUse, PostToolUse, AgentResponse, Stop, …).
     /// `None` means no hooks are configured for this run.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+
+    // ── Stateful service handles forwarded into ToolContext on every batch ────
+    // Without these the built-in tools that need a store or factory all silently
+    // no-op or return "not available" errors (CRITICAL 1).
+    /// Session todo list; wired via `with_todos`.
+    todos: Option<Arc<TodoStore>>,
+    /// Multiple-choice question seam for the `ask_user_question` tool.
+    tool_user_question: Option<Arc<dyn UserQuestion>>,
+    /// Plan-approval seam for `exit_plan_mode`.
+    plan_approver: Option<Arc<dyn PlanApprover>>,
+    /// LSP server manager for `lsp_diagnostics`.
+    lsp_manager: Option<Arc<LspServerManager>>,
+    /// Task manager for all `task_*` and `background_task_*` tools.
+    task_manager: Option<Arc<TaskManager>>,
+    /// Scheduled task store for `schedule_*` tools.
+    schedule_store: Option<Arc<ScheduledTaskStore>>,
+    /// Id of the owning task (set when this loop runs inside a subagent task).
+    caller_task_id: Option<String>,
+    /// Subagent factory for the `task` tool.
+    subagent_factory: Option<Arc<dyn SubagentFactory>>,
 
     // Configuration.
     model: String,
@@ -403,6 +428,15 @@ impl AgentLoop {
                     granted_directories: self.granted_directories.as_ref(),
                     tool_max_duration: self.tool_max_duration,
                     tool_progress_interval: self.tool_progress_interval,
+                    // Service handles forwarded into every ToolContext (CRITICAL 1).
+                    todos: self.todos.clone(),
+                    tool_user_question: self.tool_user_question.clone(),
+                    plan_approver: self.plan_approver.clone(),
+                    lsp_manager: self.lsp_manager.clone(),
+                    task_manager: self.task_manager.clone(),
+                    schedule_store: self.schedule_store.clone(),
+                    caller_task_id: self.caller_task_id.clone(),
+                    subagent_factory: self.subagent_factory.clone(),
                 };
 
                 let ToolBatchResult { result_blocks, abort_reason } =
@@ -466,6 +500,15 @@ pub struct AgentLoopBuilder {
     steering: Option<Arc<SteeringInbox>>,
     user_question: Option<Arc<dyn UserQuestionPrompt>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    // Service handles for ToolContext (see AgentLoop fields for WHY).
+    todos: Option<Arc<TodoStore>>,
+    tool_user_question: Option<Arc<dyn UserQuestion>>,
+    plan_approver: Option<Arc<dyn PlanApprover>>,
+    lsp_manager: Option<Arc<LspServerManager>>,
+    task_manager: Option<Arc<TaskManager>>,
+    schedule_store: Option<Arc<ScheduledTaskStore>>,
+    caller_task_id: Option<String>,
+    subagent_factory: Option<Arc<dyn SubagentFactory>>,
     model: String,
     system_prompt: Option<String>,
     max_tokens: u32,
@@ -496,6 +539,14 @@ impl AgentLoopBuilder {
             steering: None,
             user_question: None,
             hook_runner: None,
+            todos: None,
+            tool_user_question: None,
+            plan_approver: None,
+            lsp_manager: None,
+            task_manager: None,
+            schedule_store: None,
+            caller_task_id: None,
+            subagent_factory: None,
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: 4096,
@@ -586,6 +637,50 @@ impl AgentLoopBuilder {
         self
     }
 
+    // ── Service handle injectors (wired into ToolContext via BatchContext) ────
+
+    pub fn with_todos(mut self, todos: Arc<TodoStore>) -> Self {
+        self.todos = Some(todos);
+        self
+    }
+
+    /// Multiple-choice question seam for the `ask_user_question` tool.
+    /// Distinct from `with_user_question`, which is for goal-escalation prompts.
+    pub fn with_tool_user_question(mut self, uq: Arc<dyn UserQuestion>) -> Self {
+        self.tool_user_question = Some(uq);
+        self
+    }
+
+    pub fn with_plan_approver(mut self, pa: Arc<dyn PlanApprover>) -> Self {
+        self.plan_approver = Some(pa);
+        self
+    }
+
+    pub fn with_lsp_manager(mut self, mgr: Arc<LspServerManager>) -> Self {
+        self.lsp_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_task_manager(mut self, mgr: Arc<TaskManager>) -> Self {
+        self.task_manager = Some(mgr);
+        self
+    }
+
+    pub fn with_schedule_store(mut self, store: Arc<ScheduledTaskStore>) -> Self {
+        self.schedule_store = Some(store);
+        self
+    }
+
+    pub fn with_caller_task_id(mut self, task_id: impl Into<String>) -> Self {
+        self.caller_task_id = Some(task_id.into());
+        self
+    }
+
+    pub fn with_subagent_factory(mut self, factory: Arc<dyn SubagentFactory>) -> Self {
+        self.subagent_factory = Some(factory);
+        self
+    }
+
     pub fn build(self) -> AgentLoop {
         AgentLoop {
             client: self.client,
@@ -597,6 +692,14 @@ impl AgentLoopBuilder {
             steering: self.steering,
             user_question: self.user_question,
             hook_runner: self.hook_runner,
+            todos: self.todos,
+            tool_user_question: self.tool_user_question,
+            plan_approver: self.plan_approver,
+            lsp_manager: self.lsp_manager,
+            task_manager: self.task_manager,
+            schedule_store: self.schedule_store,
+            caller_task_id: self.caller_task_id,
+            subagent_factory: self.subagent_factory,
             model: self.model,
             system_prompt: self.system_prompt,
             max_tokens: self.max_tokens,
@@ -1794,5 +1897,162 @@ mod tests {
             matches!(e, AgentEvent::Warning { message } if message.contains("withheld"))
         });
         assert!(has_warning, "a Warning event must signal the withholding to the sink");
+    }
+
+    // ── IMPORTANT 3: integration tests — loop + real built-in tools ──────────
+    //
+    // Before CRITICAL 1 was fixed, these tests failed with the symptom described:
+    //   - todo_write: ctx.todos was None → store was never written → items() == 0
+    //   - task_list:  ctx.task_manager was None → returned "Task manager is not available."
+    //   - tool_search: ctx.all_tools was None → search over [] → "No matching tools found."
+    //
+    // After the fix, BatchContext carries the real service handles and
+    // make_tool_context() populates ToolContext from them.
+
+    /// `todo_write` run through AgentLoop persists to the injected TodoStore.
+    #[tokio::test]
+    async fn loop_todo_write_persists_to_store() {
+        use crate::todos::TodoStore;
+        use crate::tools::TodoWriteTool;
+
+        let store = Arc::new(TodoStore::new());
+
+        // The model requests one todo_write call, then stops.
+        let client = MockLlmClient::new(vec![
+            vec![
+                Ok(StreamEvent::ToolUse(Content::ToolUse {
+                    id: "tw1".into(),
+                    name: "todo_write".into(),
+                    input_json: r#"{"todos":[{"content":"Write tests","activeForm":"Writing tests","status":"in_progress"}]}"#.into(),
+                    correlation: coda_llm::Correlation::default(),
+                })),
+                Ok(done()),
+            ],
+            // Second iteration: no tools → natural stop.
+            vec![Ok(StreamEvent::TextDelta("done".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(TodoWriteTool) as Arc<dyn crate::tool::Tool>,
+        ]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_todos(Arc::clone(&store))
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
+
+        // Before CRITICAL 1 fix: store.items().is_empty() → test fails.
+        // After fix: todo_write received a non-None ctx.todos and called store.set().
+        let items = store.items();
+        assert_eq!(items.len(), 1, "todo_write must persist to the injected store; got: {items:?}");
+        assert_eq!(items[0].content, "Write tests");
+    }
+
+    /// `task_list` run through AgentLoop reaches the injected TaskManager (no "not available" error).
+    #[tokio::test]
+    async fn loop_task_list_reaches_task_manager() {
+        use crate::tasks::TaskManager;
+        use crate::tools::TaskListTool;
+
+        let task_mgr = TaskManager::with_defaults("integration-test-session");
+
+        let client = MockLlmClient::new(vec![
+            vec![
+                Ok(StreamEvent::ToolUse(Content::ToolUse {
+                    id: "tl1".into(),
+                    name: "task_list".into(),
+                    input_json: "{}".into(),
+                    correlation: coda_llm::Correlation::default(),
+                })),
+                Ok(done()),
+            ],
+            vec![Ok(StreamEvent::TextDelta("done".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(TaskListTool) as Arc<dyn crate::tool::Tool>,
+        ]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_task_manager(Arc::clone(&task_mgr))
+            .with_tool_max_duration(None)
+            .build();
+
+        let sink = CollectingSink::new();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        // Before CRITICAL 1 fix: ctx.task_manager was None → "Task manager is not available."
+        // After fix: task_list sees the real manager and returns a success result.
+        let events = sink.take();
+        let task_list_result = events.iter().find(|e| {
+            matches!(e, AgentEvent::ToolResult { tool_name, .. } if tool_name == "task_list")
+        });
+        assert!(task_list_result.is_some(), "task_list must produce a result event");
+        if let Some(AgentEvent::ToolResult { content, is_error, .. }) = task_list_result {
+            assert!(
+                !is_error,
+                "task_list must not error when manager is injected; got: {content}"
+            );
+            assert!(
+                !content.contains("not available"),
+                "task_list must not return 'not available' when manager is injected; got: {content}"
+            );
+        }
+    }
+
+    /// `tool_search` run through AgentLoop sees the full registered tool set.
+    #[tokio::test]
+    async fn loop_tool_search_sees_registered_tools() {
+        use crate::tools::ToolSearchTool;
+
+        // Register both tool_search itself and a dummy tool; search for "dummy".
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let client = MockLlmClient::new(vec![
+            vec![
+                Ok(StreamEvent::ToolUse(Content::ToolUse {
+                    id: "ts1".into(),
+                    name: "tool_search".into(),
+                    input_json: r#"{"query":"dummy"}"#.into(),
+                    correlation: coda_llm::Correlation::default(),
+                })),
+                Ok(done()),
+            ],
+            vec![Ok(StreamEvent::TextDelta("done".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(ToolSearchTool) as Arc<dyn crate::tool::Tool>,
+            dyn_tool(MockTool::new("dummy_tool", true, log)),
+        ]));
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+
+        let sink = CollectingSink::new();
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        // Before CRITICAL 1 fix: ctx.all_tools was None → "No matching tools found."
+        // After fix: all_tools is built from the registry → dummy_tool is found.
+        let events = sink.take();
+        let search_result = events.iter().find(|e| {
+            matches!(e, AgentEvent::ToolResult { tool_name, .. } if tool_name == "tool_search")
+        });
+        assert!(search_result.is_some(), "tool_search must produce a result event");
+        if let Some(AgentEvent::ToolResult { content, is_error, .. }) = search_result {
+            assert!(
+                !is_error,
+                "tool_search must not error when all_tools is populated; got: {content}"
+            );
+            assert!(
+                content.contains("dummy_tool"),
+                "tool_search must find registered tools; got: {content}"
+            );
+        }
     }
 }
