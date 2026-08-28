@@ -1,0 +1,39 @@
+[package]
+name = "coda-tui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Coda terminal user interface."
+
+[[bin]]
+name = "coda-tui"
+path = "src/main.rs"
+
+[dependencies]
+coda-proto.workspace = true
+coda-client.workspace = true
+coda-render.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+clap.workspace = true
+directories.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+arboard.workspace = true
+time.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+pretty_assertions.workspace = true
