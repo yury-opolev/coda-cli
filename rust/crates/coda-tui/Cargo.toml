@@ -15,6 +15,7 @@ path = "src/main.rs"
 coda-proto.workspace = true
 coda-client.workspace = true
 coda-render.workspace = true
+futures-lite = "2"
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -37,3 +38,4 @@ uuid.workspace = true
 [dev-dependencies]
 insta.workspace = true
 pretty_assertions.workspace = true
+
