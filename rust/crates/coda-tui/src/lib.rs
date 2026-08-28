@@ -5,6 +5,7 @@ pub mod browsers;
 pub mod cli;
 pub mod commands;
 pub mod composer;
+pub mod config;
 pub mod draw;
 pub mod keymap;
 pub mod overlay;

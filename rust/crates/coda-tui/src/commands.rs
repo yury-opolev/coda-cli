@@ -148,6 +148,20 @@ pub const COMMANDS: &[CommandSpec] = &[
         scope: Scope::Engine,
     },
     CommandSpec {
+        name: "mcp",
+        aliases: &[],
+        args: "",
+        summary: "Browse configured MCP servers.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "tasks",
+        aliases: &[],
+        args: "",
+        summary: "Browse background tasks.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
         name: "version",
         aliases: &[],
         args: "",

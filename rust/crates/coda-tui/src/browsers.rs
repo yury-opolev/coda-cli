@@ -3,10 +3,13 @@
 //! Each function maps a wire result onto columns and rows. Column widths and
 //! footer hints mirror the C# overlays so the layout is familiar.
 
+use std::collections::BTreeMap;
+
 use coda_proto::messages::{
     ScheduledTask, WireHook, WireModel, WirePlugin, WireSkill,
 };
 
+use crate::config::{McpServer, TaskLog};
 use crate::overlay::{Browser, Column, Item};
 
 /// Status glyphs shared across browsers.
@@ -279,6 +282,150 @@ pub fn hooks(hooks: &[WireHook]) -> Browser {
     browser
 }
 
+/// The MCP server browser.
+///
+/// Configuration comes from the local `.mcp.json` files. Live connection
+/// status needs the engine, so the status column reflects configuration only.
+pub fn mcp(servers: &[McpServer]) -> Browser {
+    let mut browser = Browser::new(
+        format!("MCP servers — {}", servers.len()),
+        vec![
+            Column::new("", 1),
+            Column::new("name", 25),
+            Column::new("transport", 9),
+            Column::new("scope", 7),
+            Column::new("target", 40),
+        ],
+    )
+    .with_footer("↑/↓ k/j move · Enter detail · Space toggle · r reload · / filter · Esc q close");
+
+    browser.set_items(
+        servers
+            .iter()
+            .map(|server| {
+                let mut detail = vec![
+                    format!("name       {}", server.name),
+                    format!("scope      {}", server.scope.label()),
+                    format!("transport  {}", server.transport),
+                    format!("enabled    {}", yes_no(server.enabled)),
+                ];
+                if let Some(command) = &server.command {
+                    detail.push(format!("command    {command}"));
+                }
+                if !server.args.is_empty() {
+                    detail.push(format!("arguments  {}", server.args.join(" ")));
+                }
+                if let Some(url) = &server.url {
+                    detail.push(format!("url        {url}"));
+                }
+                if !server.env_keys.is_empty() {
+                    // Names only: values routinely hold tokens.
+                    detail.push(format!("env        {}", server.env_keys.join(", ")));
+                }
+
+                Item::new(
+                    &server.name,
+                    vec![
+                        if server.enabled { glyph::ACTIVE } else { glyph::INACTIVE }.to_string(),
+                        server.name.clone(),
+                        server.transport.to_string(),
+                        server.scope.label().to_string(),
+                        server.target(),
+                    ],
+                )
+                .with_detail(detail)
+            })
+            .collect(),
+    );
+    browser
+}
+
+/// The background task browser.
+///
+/// Tasks are in-process engine state, but the runtime persists a log per task
+/// under `~/.coda/task-logs/<session>/`, and `event/taskCompleted` reports
+/// outcomes live. Together those give a usable listing without the engine
+/// exposing a task-listing method.
+pub fn tasks(logs: &[TaskLog], outcomes: &BTreeMap<String, TaskOutcome>) -> Browser {
+    let mut browser = Browser::new(
+        format!("Tasks — {}", logs.len()),
+        vec![
+            Column::new("", 1),
+            Column::new("id", 16),
+            Column::new("status", 10),
+            Column::new("size", 8),
+            Column::new("description", 44),
+        ],
+    )
+    .with_footer("↑/↓ k/j move · Enter output · r reload · / filter · Esc q close");
+
+    browser.set_items(
+        logs.iter()
+            .map(|log| {
+                let outcome = outcomes.get(&log.id);
+                let status = outcome.map(|o| o.status.as_str()).unwrap_or("");
+                let glyph = match status {
+                    "completed" => glyph::ACTIVE,
+                    "failed" => glyph::BLOCKED,
+                    "stopped" => glyph::OTHER,
+                    _ => glyph::INACTIVE,
+                };
+                let description = outcome.map(|o| o.description.as_str()).unwrap_or("");
+
+                let mut detail = vec![
+                    format!("id          {}", log.id),
+                    format!("session     {}", log.session_id),
+                    format!("status      {}", if status.is_empty() { "unknown" } else { status }),
+                    format!("log         {}", log.path.display()),
+                    format!("size        {}", human_size(log.size_bytes)),
+                ];
+                if let Some(report) = outcome.and_then(|o| o.report.as_deref()) {
+                    detail.push(String::new());
+                    detail.push("report".to_string());
+                    detail.extend(report.lines().map(str::to_string));
+                }
+                detail.push(String::new());
+                detail.push("output (tail)".to_string());
+                detail.extend(crate::config::read_task_log_tail(&log.path, 200));
+
+                // Task ids restart per session, so the row id must include the
+                // session or two rows would be indistinguishable.
+                Item::new(
+                    format!("{}/{}", log.session_id, log.id),
+                    vec![
+                        glyph.to_string(),
+                        log.id.clone(),
+                        if status.is_empty() { "unknown" } else { status }.to_string(),
+                        human_size(log.size_bytes),
+                        description.to_string(),
+                    ],
+                )
+                .with_detail(detail)
+            })
+            .collect(),
+    );
+    browser
+}
+
+/// What the engine reported about a finished task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOutcome {
+    pub status: String,
+    pub description: String,
+    pub report: Option<String>,
+}
+
+/// Formats a byte count for a narrow column.
+fn human_size(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.1}M", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{}K", bytes / 1024)
+    } else {
+        format!("{bytes}B")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,12 +574,163 @@ mod tests {
     }
 
     #[test]
+    fn the_mcp_browser_shows_scope_and_transport() {
+        let servers = vec![
+            McpServer {
+                name: "memory".into(),
+                scope: crate::config::Scope::User,
+                transport: "stdio",
+                command: Some("memory.exe".into()),
+                args: vec![],
+                url: None,
+                enabled: true,
+                env_keys: vec!["DATA".into()],
+            },
+            McpServer {
+                name: "remote".into(),
+                scope: crate::config::Scope::Project,
+                transport: "http",
+                command: None,
+                args: vec![],
+                url: Some("https://example.com".into()),
+                enabled: false,
+                env_keys: vec![],
+            },
+        ];
+
+        let browser = mcp(&servers);
+        let rows = browser.visible_items();
+
+        assert_eq!(rows[0].cells[0], glyph::ACTIVE);
+        assert_eq!(rows[0].cells[2], "stdio");
+        assert_eq!(rows[0].cells[3], "user");
+        assert_eq!(rows[1].cells[0], glyph::INACTIVE);
+        assert_eq!(rows[1].cells[3], "project");
+    }
+
+    #[test]
+    fn the_mcp_detail_lists_env_names_but_not_values() {
+        let servers = vec![McpServer {
+            name: "s".into(),
+            scope: crate::config::Scope::User,
+            transport: "stdio",
+            command: Some("x".into()),
+            args: vec![],
+            url: None,
+            enabled: true,
+            env_keys: vec!["API_TOKEN".into()],
+        }];
+
+        let detail = mcp(&servers).visible_items()[0].detail.join("\n");
+        assert!(detail.contains("API_TOKEN"), "env names should be shown");
+        assert!(
+            !detail.contains("secret") && !detail.contains("value"),
+            "env values must never be rendered"
+        );
+    }
+
+    #[test]
+    fn the_task_browser_maps_outcomes_to_glyphs() {
+        let logs = vec![
+            TaskLog {
+                id: "task-0001".into(),
+                session_id: "s".into(),
+                path: std::path::PathBuf::from("a.log"),
+                size_bytes: 2048,
+            },
+            TaskLog {
+                id: "task-0002".into(),
+                session_id: "s".into(),
+                path: std::path::PathBuf::from("b.log"),
+                size_bytes: 10,
+            },
+        ];
+
+        let mut outcomes = BTreeMap::new();
+        outcomes.insert(
+            "task-0001".to_string(),
+            TaskOutcome {
+                status: "completed".into(),
+                description: "build".into(),
+                report: Some("all good".into()),
+            },
+        );
+        outcomes.insert(
+            "task-0002".to_string(),
+            TaskOutcome {
+                status: "failed".into(),
+                description: "tests".into(),
+                report: None,
+            },
+        );
+
+        let browser = tasks(&logs, &outcomes);
+        let rows = browser.visible_items();
+
+        assert_eq!(rows[0].cells[0], glyph::ACTIVE);
+        assert_eq!(rows[0].cells[2], "completed");
+        assert_eq!(rows[0].cells[3], "2K");
+        assert_eq!(rows[0].cells[4], "build");
+        assert_eq!(rows[1].cells[0], glyph::BLOCKED);
+        assert_eq!(rows[1].cells[2], "failed");
+    }
+
+    #[test]
+    fn task_rows_are_uniquely_keyed_across_sessions() {
+        // Task ids restart per session; two rows must not share an id or the
+        // browser's select-by-id restore would jump between them.
+        let logs = vec![
+            TaskLog {
+                id: "task-0001".into(),
+                session_id: "alpha".into(),
+                path: std::path::PathBuf::from("a.log"),
+                size_bytes: 1,
+            },
+            TaskLog {
+                id: "task-0001".into(),
+                session_id: "beta".into(),
+                path: std::path::PathBuf::from("b.log"),
+                size_bytes: 1,
+            },
+        ];
+
+        let browser = tasks(&logs, &BTreeMap::new());
+        let rows = browser.visible_items();
+        assert_ne!(rows[0].id, rows[1].id);
+        assert_eq!(rows[0].id, "alpha/task-0001");
+        // The displayed id stays short.
+        assert_eq!(rows[0].cells[1], "task-0001");
+    }
+
+    #[test]
+    fn a_task_with_no_reported_outcome_shows_as_unknown() {
+        let logs = vec![TaskLog {
+            id: "t".into(),
+            session_id: "s".into(),
+            path: std::path::PathBuf::from("t.log"),
+            size_bytes: 0,
+        }];
+
+        let browser = tasks(&logs, &BTreeMap::new());
+        assert_eq!(browser.visible_items()[0].cells[2], "unknown");
+    }
+
+    #[test]
+    fn formats_byte_counts_compactly() {
+        assert_eq!(human_size(512), "512B");
+        assert_eq!(human_size(2048), "2K");
+        assert_eq!(human_size(5 * 1024 * 1024), "5.0M");
+    }
+
+    #[test]
     fn every_browser_handles_an_empty_result_without_panicking() {
         assert!(models(&[], None, "live").is_empty());
         assert!(schedules(&[]).is_empty());
         assert!(skills(&[]).is_empty());
         assert!(plugins(&[]).is_empty());
         assert!(hooks(&[]).is_empty());
+        assert!(mcp(&[]).is_empty());
+        assert!(tasks(&[], &BTreeMap::new()).is_empty());
     }
 
     #[test]

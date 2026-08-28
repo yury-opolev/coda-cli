@@ -18,7 +18,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
-use crate::browsers;
+use crate::browsers::{self, TaskOutcome};
+use crate::config::{self, Paths, PluginState, Settings};
 use crate::commands::{self, Scope};
 use crate::composer::{Completion, Composer};
 use crate::draw;
@@ -61,6 +62,14 @@ pub struct App {
     browser: Option<Browser>,
     /// Which browser is open, so reload and actions know what to do.
     browser_kind: Option<BrowserKind>,
+    /// Local Coda file locations for this session.
+    paths: Paths,
+    /// Outcomes reported by `event/taskCompleted`, keyed by task id.
+    task_outcomes: std::collections::BTreeMap<String, TaskOutcome>,
+    /// How the engine was launched, so it can be restarted in place.
+    engine_command: EngineCommand,
+    /// A freshly started engine waiting for the run loop to swap it in.
+    restarted: Option<(Engine, mpsc::UnboundedReceiver<Inbound>)>,
 }
 
 /// Which overlay is on screen.
@@ -71,6 +80,8 @@ enum BrowserKind {
     Skills,
     Plugins,
     Hooks,
+    Mcp,
+    Tasks,
 }
 
 impl App {
@@ -79,7 +90,7 @@ impl App {
         command: EngineCommand,
         theme: Theme,
     ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
-        let (engine, inbound) = Engine::spawn(command).context("failed to start the engine")?;
+        let (engine, inbound) = Engine::spawn(command.clone()).context("failed to start the engine")?;
         let connection = engine.connection();
 
         let params = serde_json::to_value(messages::InitializeParams::new("coda-tui"))?;
@@ -95,6 +106,11 @@ impl App {
             session_id: initialized.session_id,
         });
 
+        let project_root = command
+            .working_dir
+            .clone()
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_default());
+
         let app = Self {
             state,
             composer: Composer::new(),
@@ -109,6 +125,10 @@ impl App {
             armed: None,
             browser: None,
             browser_kind: None,
+            paths: Paths::new(project_root),
+            task_outcomes: std::collections::BTreeMap::new(),
+            engine_command: command,
+            restarted: None,
         };
 
         Ok((app, engine, inbound))
@@ -120,6 +140,9 @@ impl App {
         guard: &mut TerminalGuard,
         mut inbound: mpsc::UnboundedReceiver<Inbound>,
     ) -> Result<()> {
+        // Holds an engine this loop started itself, so it can be shut down
+        // when superseded by another restart.
+        let mut owned_engine: Option<Engine> = None;
         let mut terminal_events = EventStream::new();
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
 
@@ -159,6 +182,16 @@ impl App {
                 }
             }
 
+            // A restart stages a new engine; swap it in between iterations so
+            // the inbound stream is never replaced mid-await.
+            if let Some((engine, next_inbound)) = self.restarted.take() {
+                let previous = std::mem::replace(&mut owned_engine, Some(engine));
+                inbound = next_inbound;
+                if let Some(previous) = previous {
+                    let _ = previous.shutdown(SHUTDOWN_GRACE).await;
+                }
+            }
+
             if self.state.should_quit {
                 break;
             }
@@ -167,6 +200,9 @@ impl App {
             }
         }
 
+        if let Some(engine) = owned_engine {
+            let _ = engine.shutdown(SHUTDOWN_GRACE).await;
+        }
         Ok(())
     }
 
@@ -176,6 +212,22 @@ impl App {
         match message {
             Inbound::Notification { method, params } => {
                 let event = Event::parse(&method, params.as_ref());
+                if let Event::TaskCompleted {
+                    task_id,
+                    status,
+                    description,
+                    report,
+                } = &event
+                {
+                    self.task_outcomes.insert(
+                        task_id.clone(),
+                        TaskOutcome {
+                            status: status.clone(),
+                            description: description.clone(),
+                            report: report.clone(),
+                        },
+                    );
+                }
                 self.apply(UiEvent::Engine(event));
             }
             Inbound::Request {
@@ -446,10 +498,7 @@ impl App {
             Intent::Close => self.close_browser(),
             Intent::Reload => self.reload_browser().await,
             Intent::Activate(id) => self.activate_browser_row(&id).await,
-            Intent::Toggle(id) => self.notice(
-                format!("Toggling {id} is not available over `coda serve`."),
-                NoticeLevel::Warning,
-            ),
+            Intent::Toggle(id) => self.toggle_browser_row(&id).await,
             Intent::Delete(id) => self.delete_browser_row(&id).await,
             Intent::Key(c, id) => self.browser_key_action(c, id).await,
         }
@@ -527,6 +576,22 @@ impl App {
                     Err(error) => return self.browser_failed("hooks", error),
                 }
             }
+            // MCP configuration lives in local JSON, so it needs no engine call.
+            BrowserKind::Mcp => match config::load_mcp_servers(&self.paths) {
+                Ok(servers) => browsers::mcp(&servers),
+                Err(error) => {
+                    return self.notice(
+                        format!("Could not read MCP configuration: {error}"),
+                        NoticeLevel::Error,
+                    )
+                }
+            },
+            // Tasks are engine state, but the runtime persists a log per task
+            // and reports outcomes over the event stream.
+            BrowserKind::Tasks => {
+                let logs = config::list_task_logs(&self.paths, self.state.session_id.as_deref());
+                browsers::tasks(&logs, &self.task_outcomes)
+            }
         };
 
         self.browser = Some(browser);
@@ -558,19 +623,166 @@ impl App {
     /// Handles Enter on a row.
     async fn activate_browser_row(&mut self, id: &str) {
         match self.browser_kind {
-            Some(BrowserKind::Models) => {
-                // The serve protocol has no model-switch method, so report
-                // rather than pretending the selection took effect.
-                self.notice(
-                    format!(
-                        "Switching to {id} is not available over `coda serve`; \
-                         start the engine with the model you want."
-                    ),
-                    NoticeLevel::Warning,
-                );
-                self.close_browser();
-            }
+            Some(BrowserKind::Models) => self.switch_model(id).await,
             _ => self.dirty = true,
+        }
+    }
+
+    /// Switches the active model.
+    ///
+    /// `coda serve` exposes no model-switch method, but the model is read from
+    /// `~/.coda/settings.json` at engine start. Writing the setting and
+    /// restarting the engine against the same session id therefore performs a
+    /// real switch, with the conversation preserved.
+    async fn switch_model(&mut self, model: &str) {
+        let provider = match Settings::load(&self.paths) {
+            Ok(settings) => settings.default_provider().map(str::to_string),
+            Err(error) => {
+                return self.notice(
+                    format!("Could not read settings: {error}"),
+                    NoticeLevel::Error,
+                )
+            }
+        };
+
+        let Some(provider) = provider else {
+            return self.notice(
+                "No default provider is configured; run `coda setup` first.",
+                NoticeLevel::Warning,
+            );
+        };
+
+        let write = || -> Result<(), config::ConfigError> {
+            let mut settings = Settings::load(&self.paths)?;
+            settings.set_model_for(&provider, model);
+            settings.save()
+        };
+
+        if let Err(error) = write() {
+            return self.notice(
+                format!("Could not save the model: {error}"),
+                NoticeLevel::Error,
+            );
+        }
+
+        self.close_browser();
+        self.apply(UiEvent::ModelChanged {
+            id: model.to_string(),
+            context_limit: None,
+        });
+        self.notice(
+            format!("Model set to {model}. Restarting the engine…"),
+            NoticeLevel::Info,
+        );
+        self.restart_engine().await;
+    }
+
+    /// Toggles the selected row where the change can actually be persisted.
+    async fn toggle_browser_row(&mut self, id: &str) {
+        match self.browser_kind {
+            Some(BrowserKind::Plugins) => {
+                let result = (|| -> Result<bool, config::ConfigError> {
+                    let mut state = PluginState::load(&self.paths)?;
+                    let enabled = state.is_disabled(id); // toggling to this
+                    state.set_enabled(id, enabled);
+                    state.save()?;
+                    Ok(enabled)
+                })();
+
+                match result {
+                    Ok(enabled) => {
+                        let word = if enabled { "Enabled" } else { "Disabled" };
+                        self.notice(
+                            format!("{word} plugin {id}. Restart the engine to apply."),
+                            NoticeLevel::Info,
+                        );
+                        self.reload_browser().await;
+                    }
+                    Err(error) => self.notice(
+                        format!("Could not update plugin state: {error}"),
+                        NoticeLevel::Error,
+                    ),
+                }
+            }
+            Some(BrowserKind::Mcp) => match config::set_mcp_enabled(&self.paths, id, {
+                // Flip whatever the current configuration says.
+                config::load_mcp_servers(&self.paths)
+                    .ok()
+                    .and_then(|servers| {
+                        servers.iter().find(|s| s.name == id).map(|s| !s.enabled)
+                    })
+                    .unwrap_or(false)
+            }) {
+                Ok(true) => {
+                    self.notice(
+                        format!("Updated MCP server {id}. Restart the engine to apply."),
+                        NoticeLevel::Info,
+                    );
+                    self.reload_browser().await;
+                }
+                Ok(false) => self.notice(
+                    format!("MCP server {id} is not defined in a local .mcp.json."),
+                    NoticeLevel::Warning,
+                ),
+                Err(error) => self.notice(
+                    format!("Could not update MCP configuration: {error}"),
+                    NoticeLevel::Error,
+                ),
+            },
+            Some(BrowserKind::Skills) => self.notice(
+                "Skills are frontmatter-driven; edit the SKILL.md file to change them.",
+                NoticeLevel::Info,
+            ),
+            _ => self.dirty = true,
+        }
+    }
+
+    /// Restarts the engine in place, resuming the current session.
+    ///
+    /// Settings are read once at engine start, so anything that changes them
+    /// only takes effect across a restart. `initialize` accepts a session id,
+    /// so the conversation survives.
+    async fn restart_engine(&mut self) {
+        let session_id = self.state.session_id.clone();
+
+        let (engine, inbound) = match Engine::spawn(self.engine_command.clone()) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return self.notice(
+                    format!("Could not restart the engine: {error}"),
+                    NoticeLevel::Error,
+                )
+            }
+        };
+
+        let connection = engine.connection();
+        let mut params = messages::InitializeParams::new("coda-tui");
+        if let Some(session_id) = session_id {
+            params = params.resume(session_id);
+        }
+
+        let params = serde_json::to_value(params).unwrap_or_default();
+        match connection.request(method::INITIALIZE, Some(params)).await {
+            Ok(value) => {
+                let initialized: messages::InitializeResult =
+                    serde_json::from_value(value).unwrap_or(messages::InitializeResult {
+                        protocol_version: coda_proto::PROTOCOL_VERSION.to_string(),
+                        session_id: String::new(),
+                        server_info: "coda".into(),
+                        telemetry_log_path: None,
+                    });
+
+                self.connection = connection;
+                self.restarted = Some((engine, inbound));
+                if !initialized.session_id.is_empty() {
+                    self.state.session_id = Some(initialized.session_id);
+                }
+                self.notice("Engine restarted.", NoticeLevel::Info);
+            }
+            Err(error) => self.notice(
+                format!("The restarted engine rejected the handshake: {error}"),
+                NoticeLevel::Error,
+            ),
         }
     }
 
@@ -608,11 +820,58 @@ impl App {
                 "Creating a schedule needs arguments; use /schedule from the composer.",
                 NoticeLevel::Info,
             ),
-            (Some(BrowserKind::Plugins), 'u') => self.notice(
-                "Updating plugins is not available over `coda serve`.",
-                NoticeLevel::Warning,
-            ),
+            (Some(BrowserKind::Plugins), 'u') => match id {
+                Some(id) => self.update_plugin(&id).await,
+                None => self.dirty = false,
+            },
             _ => self.dirty = false,
+        }
+    }
+
+    /// Updates a git-installed plugin by pulling in its directory.
+    ///
+    /// The engine has no update RPC, but plugins live in known directories, so
+    /// the update is a plain `git pull` the front-end can run itself.
+    async fn update_plugin(&mut self, name: &str) {
+        let candidates = [
+            self.paths.project_root.join(".coda").join("plugins").join(name),
+            self.paths.user_root.join("plugins").join(name),
+        ];
+
+        let Some(directory) = candidates.into_iter().find(|p| p.join(".git").is_dir()) else {
+            return self.notice(
+                format!("{name} is not a git-installed plugin, so there is nothing to update."),
+                NoticeLevel::Warning,
+            );
+        };
+
+        let output = tokio::process::Command::new("git")
+            .arg("pull")
+            .arg("--ff-only")
+            .current_dir(&directory)
+            .output()
+            .await;
+
+        match output {
+            Ok(output) if output.status.success() => {
+                let summary = String::from_utf8_lossy(&output.stdout);
+                self.notice(
+                    format!("Updated {name}: {}", summary.trim()),
+                    NoticeLevel::Info,
+                );
+                self.reload_browser().await;
+            }
+            Ok(output) => self.notice(
+                format!(
+                    "Could not update {name}: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+                NoticeLevel::Error,
+            ),
+            Err(error) => self.notice(
+                format!("Could not run git: {error}"),
+                NoticeLevel::Error,
+            ),
         }
     }
 
@@ -777,6 +1036,8 @@ impl App {
             "skills" => self.open_browser(BrowserKind::Skills).await,
             "plugins" => self.open_browser(BrowserKind::Plugins).await,
             "hooks" => self.open_browser(BrowserKind::Hooks).await,
+            "mcp" if invocation.args.is_empty() => self.open_browser(BrowserKind::Mcp).await,
+            "tasks" => self.open_browser(BrowserKind::Tasks).await,
             "version" => self.output(format!(
                 "coda-tui {} (Rust front-end)",
                 env!("CARGO_PKG_VERSION")
