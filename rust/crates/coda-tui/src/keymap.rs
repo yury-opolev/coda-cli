@@ -17,6 +17,22 @@ pub enum Focus {
     Overlay,
 }
 
+/// A destructive action that must be confirmed by pressing the key twice.
+///
+/// The C# shell arms a chord on the first press and fires on the second within
+/// a short window, so a single stray keystroke can never quit the application
+/// or abandon a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Chord {
+    /// `Ctrl+C` pressed once; a second press exits.
+    Exit,
+    /// `Esc` pressed once while busy; a second press interrupts.
+    Interrupt,
+}
+
+/// How long an armed chord stays armed.
+pub const CHORD_WINDOW: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Context that changes how a key is interpreted.
 #[derive(Debug, Clone, Copy)]
 pub struct KeyContext {
@@ -29,6 +45,8 @@ pub struct KeyContext {
     pub on_first_line: bool,
     /// The cursor is on the composer's last line.
     pub on_last_line: bool,
+    /// A chord armed by a previous keystroke and still within its window.
+    pub armed: Option<Chord>,
 }
 
 impl Default for KeyContext {
@@ -39,6 +57,7 @@ impl Default for KeyContext {
             composer_empty: true,
             on_first_line: true,
             on_last_line: true,
+            armed: None,
         }
     }
 }
@@ -87,6 +106,8 @@ pub enum Action {
 
     /// Cancel the running turn.
     Interrupt,
+    /// Arm a two-press chord and tell the user it is armed.
+    Arm(Chord),
     /// Leave the application.
     Quit,
     /// Dismiss an overlay or clear the composer.
@@ -95,6 +116,8 @@ pub enum Action {
     Confirm,
     /// Clear the transcript.
     ClearTranscript,
+    /// Force a full repaint.
+    Repaint,
     /// Copy the transcript selection.
     Copy,
     /// Paste from the clipboard.
@@ -118,16 +141,21 @@ pub fn resolve(key: KeyEvent, context: KeyContext) -> Action {
 
     // Bindings that apply regardless of focus.
     match key.code {
+        // Ctrl+C never acts on a single press: it arms, and a second press
+        // within the chord window confirms. A stray keystroke must not be able
+        // to quit or abandon a running turn.
         KeyCode::Char('c') if ctrl => {
-            return if context.busy {
-                Action::Interrupt
-            } else {
-                Action::Quit
+            return match context.armed {
+                Some(Chord::Exit) if context.busy => Action::Interrupt,
+                Some(Chord::Exit) => Action::Quit,
+                _ => Action::Arm(Chord::Exit),
             }
         }
-        KeyCode::Char('d') if ctrl && context.composer_empty => return Action::Quit,
         KeyCode::End if ctrl => return Action::ScrollBottom,
         KeyCode::Home if ctrl => return Action::ScrollTop,
+        // Ctrl+L means "redraw" in every other terminal program; it must never
+        // destroy the transcript.
+        KeyCode::Char('l') if ctrl => return Action::Repaint,
         _ => {}
     }
 
@@ -172,8 +200,9 @@ fn resolve_composer(
 ) -> Action {
     match key.code {
         // Enter submits; every modified Enter inserts a newline instead. Not
-        // all terminals report Shift+Enter, hence three accepted chords.
+        // all terminals report Shift+Enter, hence the several accepted chords.
         KeyCode::Enter if shift || ctrl || alt => Action::Newline,
+        KeyCode::Char('j') if ctrl => Action::Newline,
         KeyCode::Enter => Action::Submit,
 
         KeyCode::Backspace if ctrl || alt => Action::DeleteWordBack,
@@ -183,11 +212,15 @@ fn resolve_composer(
         KeyCode::Char('w') if ctrl => Action::DeleteWordBack,
         KeyCode::Char('u') if ctrl => Action::DeleteToLineStart,
         KeyCode::Char('k') if ctrl => Action::DeleteToLineEnd,
-        KeyCode::Char('l') if ctrl => Action::ClearTranscript,
-        KeyCode::Char('v') if ctrl => Action::Paste,
+        KeyCode::Char('v') if ctrl || alt => Action::Paste,
         KeyCode::Char('y') if ctrl => Action::Copy,
         KeyCode::Char('a') if ctrl => Action::MoveLineStart,
         KeyCode::Char('e') if ctrl => Action::MoveLineEnd,
+
+        // Ctrl+arrow forces history navigation from anywhere in a multi-line
+        // draft, where a bare Up/Down would move the cursor instead.
+        KeyCode::Up if ctrl => Action::HistoryPrevious,
+        KeyCode::Down if ctrl => Action::HistoryNext,
 
         KeyCode::Left if ctrl || alt => Action::MoveWordLeft,
         KeyCode::Right if ctrl || alt => Action::MoveWordRight,
@@ -207,6 +240,13 @@ fn resolve_composer(
         KeyCode::PageDown => Action::PageDown,
 
         KeyCode::Tab => Action::CompletionRequest,
+
+        // While a turn is running Esc arms an interrupt rather than firing one,
+        // so a reflexive press cannot throw away work in progress.
+        KeyCode::Esc if context.busy => match context.armed {
+            Some(Chord::Interrupt) => Action::Interrupt,
+            _ => Action::Arm(Chord::Interrupt),
+        },
         KeyCode::Esc => Action::Cancel,
 
         KeyCode::Char(c) if !ctrl => Action::Insert(c),
@@ -237,6 +277,7 @@ mod tests {
         }
     }
 
+    #[allow(dead_code)]
     fn typing() -> KeyContext {
         KeyContext {
             composer_empty: false,
@@ -280,31 +321,79 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_c_interrupts_a_running_turn() {
+    fn a_single_ctrl_c_only_arms_and_never_quits() {
         assert_eq!(
-            resolve(with(KeyCode::Char('c'), KeyModifiers::CONTROL), busy()),
+            resolve(with(KeyCode::Char('c'), KeyModifiers::CONTROL), composing()),
+            Action::Arm(Chord::Exit),
+            "a stray Ctrl+C must not be able to quit"
+        );
+    }
+
+    #[test]
+    fn a_second_ctrl_c_quits_when_idle() {
+        let armed = KeyContext { armed: Some(Chord::Exit), ..composing() };
+        assert_eq!(
+            resolve(with(KeyCode::Char('c'), KeyModifiers::CONTROL), armed),
+            Action::Quit
+        );
+    }
+
+    #[test]
+    fn a_second_ctrl_c_interrupts_while_busy_rather_than_quitting() {
+        let armed = KeyContext { armed: Some(Chord::Exit), ..busy() };
+        assert_eq!(
+            resolve(with(KeyCode::Char('c'), KeyModifiers::CONTROL), armed),
             Action::Interrupt
         );
     }
 
     #[test]
-    fn ctrl_c_quits_when_idle() {
+    fn ctrl_l_repaints_and_never_clears_the_transcript() {
+        let action = resolve(with(KeyCode::Char('l'), KeyModifiers::CONTROL), composing());
+        assert_eq!(action, Action::Repaint);
+        assert_ne!(action, Action::ClearTranscript, "Ctrl+L must not be destructive");
+    }
+
+    #[test]
+    fn a_single_escape_only_arms_an_interrupt_while_busy() {
         assert_eq!(
-            resolve(with(KeyCode::Char('c'), KeyModifiers::CONTROL), composing()),
-            Action::Quit
+            resolve(key(KeyCode::Esc), busy()),
+            Action::Arm(Chord::Interrupt)
         );
     }
 
     #[test]
-    fn ctrl_d_quits_only_on_an_empty_composer() {
+    fn a_second_escape_interrupts() {
+        let armed = KeyContext { armed: Some(Chord::Interrupt), ..busy() };
+        assert_eq!(resolve(key(KeyCode::Esc), armed), Action::Interrupt);
+    }
+
+    #[test]
+    fn ctrl_j_inserts_a_newline_for_terminals_without_shift_enter() {
         assert_eq!(
-            resolve(with(KeyCode::Char('d'), KeyModifiers::CONTROL), composing()),
-            Action::Quit
+            resolve(with(KeyCode::Char('j'), KeyModifiers::CONTROL), composing()),
+            Action::Newline
         );
-        // With text in the buffer it must not quit and lose the draft.
-        assert_ne!(
-            resolve(with(KeyCode::Char('d'), KeyModifiers::CONTROL), typing()),
-            Action::Quit
+    }
+
+    #[test]
+    fn ctrl_arrows_force_history_from_anywhere_in_a_draft() {
+        let interior = KeyContext { on_first_line: false, on_last_line: false, ..composing() };
+        assert_eq!(
+            resolve(with(KeyCode::Up, KeyModifiers::CONTROL), interior),
+            Action::HistoryPrevious
+        );
+        assert_eq!(
+            resolve(with(KeyCode::Down, KeyModifiers::CONTROL), interior),
+            Action::HistoryNext
+        );
+    }
+
+    #[test]
+    fn alt_v_pastes_for_terminals_that_swallow_ctrl_v() {
+        assert_eq!(
+            resolve(with(KeyCode::Char('v'), KeyModifiers::ALT), composing()),
+            Action::Paste
         );
     }
 
@@ -505,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn escape_cancels_while_composing() {
+    fn escape_cancels_while_composing_and_idle() {
         assert_eq!(resolve(key(KeyCode::Esc), composing()), Action::Cancel);
     }
 

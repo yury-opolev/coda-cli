@@ -120,8 +120,8 @@ pub const COMMANDS: &[CommandSpec] = &[
         scope: Scope::Engine,
     },
     CommandSpec {
-        name: "schedules",
-        aliases: &["schedule"],
+        name: "schedule",
+        aliases: &["schedules"],
         args: "",
         summary: "List scheduled tasks.",
         scope: Scope::Engine,
@@ -146,6 +146,27 @@ pub const COMMANDS: &[CommandSpec] = &[
         args: "",
         summary: "List configured hooks.",
         scope: Scope::Engine,
+    },
+    CommandSpec {
+        name: "version",
+        aliases: &[],
+        args: "",
+        summary: "Show the Coda version.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "doctor",
+        aliases: &[],
+        args: "",
+        summary: "Print diagnostic information.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "cost",
+        aliases: &[],
+        args: "",
+        summary: "Show token usage for this session.",
+        scope: Scope::Local,
     },
 ];
 

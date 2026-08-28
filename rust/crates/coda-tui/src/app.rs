@@ -53,6 +53,8 @@ pub struct App {
     turn: Option<oneshot::Receiver<Result<Value, coda_proto::ResponseError>>>,
     /// The responder for a prompt the user has not answered yet.
     pending_responder: Option<Responder>,
+    /// A two-press chord armed by the previous keystroke, and when.
+    armed: Option<(keymap::Chord, std::time::Instant)>,
 }
 
 impl App {
@@ -88,6 +90,7 @@ impl App {
             dirty: true,
             turn: None,
             pending_responder: None,
+            armed: None,
         };
 
         Ok((app, engine, inbound))
@@ -295,6 +298,12 @@ impl App {
         let action = keymap::resolve(key, self.key_context());
         self.dirty = true;
 
+        // Any other keystroke disarms, so a chord only ever fires on two
+        // consecutive presses of the same key.
+        if !matches!(action, Action::Arm(_)) {
+            self.armed = None;
+        }
+
         match action {
             Action::Insert(c) => {
                 self.composer.insert_char(c);
@@ -367,8 +376,26 @@ impl App {
             Action::ScrollTop => self.viewport.scroll_to_top(),
             Action::ScrollBottom => self.viewport.scroll_to_bottom(),
 
-            Action::Interrupt => self.interrupt(),
+            Action::Interrupt => {
+                self.armed = None;
+                self.interrupt();
+            }
+            Action::Arm(chord) => {
+                self.armed = Some((chord, std::time::Instant::now()));
+                let hint = match chord {
+                    keymap::Chord::Exit if self.state.is_busy() => {
+                        "Press Ctrl+C again to stop the turn."
+                    }
+                    keymap::Chord::Exit => "Press Ctrl+C again to exit.",
+                    keymap::Chord::Interrupt => "Press Esc again to stop the turn.",
+                };
+                self.notice(hint, NoticeLevel::Info);
+            }
             Action::Quit => self.state.should_quit = true,
+            Action::Repaint => {
+                // Force a relayout without touching the transcript.
+                self.laid_out_width = 0;
+            }
             Action::Cancel => {
                 if self.composer.completion().is_active() {
                     self.composer.clear_completions();
@@ -522,6 +549,12 @@ impl App {
             },
             "status" => self.output(self.status_text()),
             "context" => self.output(self.context_text()),
+            "cost" => self.output(self.cost_text()),
+            "version" => self.output(format!(
+                "coda-tui {} (Rust front-end)",
+                env!("CARGO_PKG_VERSION")
+            )),
+            "doctor" => self.output(self.doctor_text()),
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),
@@ -642,6 +675,44 @@ impl App {
         out
     }
 
+    fn cost_text(&self) -> String {
+        let usage = self.state.usage;
+        format!(
+            "Token usage\n  input   {}\n  output  {}\n  total   {}",
+            usage.input_tokens,
+            usage.output_tokens,
+            usage.input_tokens + usage.output_tokens
+        )
+    }
+
+    fn doctor_text(&self) -> String {
+        let mut out = String::from("Diagnostics\n");
+        out.push_str(&format!(
+            "  front-end   coda-tui {}\n",
+            env!("CARGO_PKG_VERSION")
+        ));
+        out.push_str(&format!(
+            "  session     {}\n",
+            self.state.session_id.as_deref().unwrap_or("(none)")
+        ));
+        out.push_str(&format!(
+            "  connected   {}\n",
+            if self.connection.is_closed() {
+                "no"
+            } else {
+                "yes"
+            }
+        ));
+        out.push_str(&format!(
+            "  cwd         {}\n",
+            std::env::current_dir()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|_| "(unknown)".into())
+        ));
+        out.push_str(&format!("  commands    {}", commands::COMMANDS.len()));
+        out
+    }
+
     // -- Helpers ------------------------------------------------------------
 
     fn key_context(&self) -> KeyContext {
@@ -658,6 +729,12 @@ impl App {
             composer_empty: self.composer.is_empty(),
             on_first_line: line == 0,
             on_last_line: line + 1 >= self.composer.line_count(),
+            // An armed chord expires, so a press now and a press a minute later
+            // are two separate first presses rather than a confirmation.
+            armed: self
+                .armed
+                .filter(|(_, at)| at.elapsed() < keymap::CHORD_WINDOW)
+                .map(|(chord, _)| chord),
         }
     }
 
