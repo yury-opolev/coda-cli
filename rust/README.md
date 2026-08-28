@@ -98,20 +98,39 @@ Ported and working:
   languages, tool display modes, the warm-ember and cool-dark themes;
 - the state reducer, composer, viewport, keymap and drawing;
 - the application loop, slash commands, and permission/question/plan prompts;
-- browser overlays for models, schedules, skills, plugins and hooks, on a
-  shared list/detail browser with filtering, paging and reload.
+- browser overlays for models, schedules, skills, plugins, hooks, MCP servers
+  and background tasks, on a shared list/detail browser with filtering, paging
+  and reload;
+- switching model, and toggling or updating plugins and MCP servers.
 
 Not yet ported:
 
-- the task and MCP browsers. `coda serve` exposes no task-listing method and
-  no MCP management surface, so these need either a protocol addition or a
-  Rust-side reader for `.mcp.json` and the task store;
 - session resume, transcript export/import, and the setup/onboarding wizard;
-- 23 of the 40 slash commands, most of which are local-file or session-state
-  operations rather than engine calls;
+- around 20 of the 40 slash commands, most of which are local-file or
+  session-state operations rather than engine calls;
 - the 30 FPS frame throttle and the assistant-buffering mode, including its
   withhold-on-interrupt rule;
 - the engine itself, which still runs as .NET.
+
+## The two seams
+
+`coda serve` is not the only interface to the engine. Much of what the TUI
+needs also lives in JSON under `~/.coda` that both processes share, and using
+both seams is what makes the front-end genuinely useful rather than read-only:
+
+| Seam | Used for |
+|---|---|
+| `serve` JSON-RPC | turns, streaming, tool events, prompts, models, schedules, skills, plugins, hooks |
+| Local files | MCP configuration, task logs, settings, plugin state |
+
+Settings are read once at engine start, so changing one only takes effect
+across a restart. `initialize` accepts a session id, so the front-end restarts
+the engine in place and resumes the same conversation — which is how switching
+model works without a protocol addition.
+
+Writers preserve keys they do not model. The engine stores settings this
+front-end knows nothing about, and a round-trip through a typed struct would
+silently delete them.
 
 ### Behaviours worth knowing
 
