@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Coda.Common;
 
 namespace Coda.Agent.Hooks;
 
@@ -164,9 +165,7 @@ public sealed class HookTrustStore : IHookTrustStore
             }
 
             var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-            var tmp = Path.Combine(dir ?? ".", $".hook-trust.{Guid.NewGuid():N}.tmp");
-            File.WriteAllText(tmp, json);
-            File.Move(tmp, path, overwrite: true);
+            AtomicFile.WriteAllText(path, json);
         }
     }
 }

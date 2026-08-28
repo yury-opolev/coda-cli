@@ -2,6 +2,7 @@ using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Coda.Common;
 
 namespace Coda.Tui.Plugins;
 
@@ -229,9 +230,7 @@ public sealed class PluginTrustStore
             }
 
             var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-            var tmp = Path.Combine(dir ?? ".", $".plugin-trust.{Guid.NewGuid():N}.tmp");
-            File.WriteAllText(tmp, json);
-            File.Move(tmp, path, overwrite: true);
+            AtomicFile.WriteAllText(path, json);
         }
     }
 }
