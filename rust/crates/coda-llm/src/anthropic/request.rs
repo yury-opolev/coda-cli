@@ -12,7 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::message::{ChatRequest, Content, Effort, Message};
+use crate::message::{ChatRequest, Content, Effort, Role};
 
 /// Anthropic allows at most four cache breakpoints per request.
 pub const MAX_BREAKPOINTS: usize = 4;
@@ -39,15 +39,16 @@ pub fn build(request: &ChatRequest) -> Value {
         body.insert("tool_choice".into(), json!({ "type": choice }));
     }
 
+    // Extended thinking is expressed as a token budget, not a level. Below the
+    // provider's 1024 minimum there is no room for both reasoning and an
+    // answer, so the feature is omitted rather than requested invalidly.
     if let Some(effort) = request.effort {
-        // Extended thinking is expressed as a token budget, not a level.
-        body.insert(
-            "thinking".into(),
-            json!({
-                "type": "enabled",
-                "budget_tokens": thinking_budget(effort, request.max_tokens),
-            }),
-        );
+        if let Some(budget) = thinking_budget(effort, request.max_tokens) {
+            body.insert(
+                "thinking".into(),
+                json!({ "type": "enabled", "budget_tokens": budget }),
+            );
+        }
     }
 
     body.insert("messages".into(), build_messages(request));
@@ -58,12 +59,24 @@ pub fn build(request: &ChatRequest) -> Value {
 fn build_system(system: &str, request: &ChatRequest) -> Value {
     let mut block = json!({ "type": "text", "text": system });
 
-    // A volatile tool list invalidates any prefix that precedes it, so caching
-    // the system prompt would never hit.
-    if system.len() >= MIN_CACHEABLE_CHARS && !request.tools_volatile {
+    if system.len() >= MIN_CACHEABLE_CHARS && !prefix_is_volatile(request) {
         block["cache_control"] = cache_control(request.use_one_hour_ttl);
     }
-    Value::Array(vec![block])
+    Value::Array(block_array(block))
+}
+
+fn block_array(block: Value) -> Vec<Value> {
+    vec![block]
+}
+
+/// Whether anything ahead of a breakpoint changes every turn.
+///
+/// Anthropic caches by prefix in the order tools, system, messages, so a tool
+/// list that changes each turn invalidates every marker after it. Placing one
+/// anyway still bills a cache *write* on the whole prefix that can never be
+/// read, which is a pure loss.
+fn prefix_is_volatile(request: &ChatRequest) -> bool {
+    request.tools_volatile && !request.tools.is_empty()
 }
 
 /// The tool list, with a trailing cache marker when stable.
@@ -105,26 +118,30 @@ fn cache_control(one_hour: bool) -> Value {
 
 /// Reasoning budget for an effort level, bounded by the response limit.
 ///
-/// The budget must leave room for the answer itself, so it is capped below
-/// `max_tokens` rather than allowed to consume all of it.
-fn thinking_budget(effort: Effort, max_tokens: u32) -> u32 {
+/// The budget must leave room for the answer itself and the provider requires
+/// at least 1024 tokens, so a response limit too small to satisfy both yields
+/// no budget at all.
+fn thinking_budget(effort: Effort, max_tokens: u32) -> Option<u32> {
+    const MINIMUM: u32 = 1024;
+
     let requested = match effort {
         Effort::Low => 2_048,
         Effort::Medium => 8_192,
         Effort::High => 16_384,
         Effort::Max => 32_768,
     };
-    // Anthropic requires a minimum of 1024, and the budget must be strictly
-    // less than max_tokens.
-    requested.min(max_tokens.saturating_sub(1024).max(1024))
+
+    // Strictly below max_tokens, so the answer always has room.
+    let ceiling = max_tokens.saturating_sub(MINIMUM);
+    if ceiling < MINIMUM {
+        return None;
+    }
+    Some(requested.min(ceiling))
 }
 
-/// Serialises the conversation, placing the final cache marker.
+/// Serialises the conversation, placing the final cache markers.
 fn build_messages(request: &ChatRequest) -> Value {
-    // The last message is always changing, so the cacheable prefix ends before
-    // it. Marking the last *stable* message keeps the growing conversation
-    // mostly cached across turns.
-    let breakpoint = cache_breakpoint(&request.messages);
+    let breakpoints = cache_breakpoints(request);
 
     let messages: Vec<Value> = request
         .messages
@@ -132,7 +149,7 @@ fn build_messages(request: &ChatRequest) -> Value {
         .enumerate()
         .map(|(index, message)| {
             let mut blocks = build_content(&message.content);
-            if Some(index) == breakpoint {
+            if breakpoints.contains(&index) {
                 mark_last_block(&mut blocks, request.use_one_hour_ttl);
             }
             json!({ "role": message.role.as_str(), "content": blocks })
@@ -142,24 +159,46 @@ fn build_messages(request: &ChatRequest) -> Value {
     Value::Array(messages)
 }
 
-/// Index of the message that should carry the conversation cache marker.
+/// Messages that should carry a conversation cache marker.
 ///
-/// Returns `None` when the conversation is too short for caching to pay off.
-fn cache_breakpoint(messages: &[Message]) -> Option<usize> {
-    if messages.len() < 3 {
-        return None;
+/// Two markers are placed, not one: an anchor on the previous user message and
+/// a rolling write on the newest. The provider only looks back a bounded number
+/// of content blocks from a marker when testing for a cache hit, and an agent
+/// turn can append many `tool_result` blocks at once — enough to push a single
+/// anchor out of that window and miss the cache entirely. Breakpoints are free,
+/// so the rolling pair costs nothing and keeps the prefix reachable.
+fn cache_breakpoints(request: &ChatRequest) -> Vec<usize> {
+    if prefix_is_volatile(request) || request.messages.len() < 3 {
+        return Vec::new();
     }
 
-    // Everything except the final exchange is stable.
-    let candidate = messages.len() - 2;
+    let user_indices: Vec<usize> = request
+        .messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == Role::User)
+        .map(|(index, _)| index)
+        .collect();
 
-    let prefix_size: usize = messages[..=candidate]
+    // The newest user message and the one before it.
+    let mut chosen: Vec<usize> = user_indices.iter().rev().take(2).copied().collect();
+    chosen.sort_unstable();
+
+    let Some(&newest) = chosen.last() else {
+        return Vec::new();
+    };
+
+    // Caching only pays off once the prefix it would cover is substantial.
+    let prefix_size: usize = request.messages[..=newest]
         .iter()
         .flat_map(|message| &message.content)
         .map(content_size)
         .sum();
 
-    (prefix_size >= MIN_CACHEABLE_CHARS).then_some(candidate)
+    if prefix_size < MIN_CACHEABLE_CHARS {
+        return Vec::new();
+    }
+    chosen
 }
 
 fn content_size(block: &Content) -> usize {
@@ -186,9 +225,14 @@ fn mark_last_block(blocks: &mut Value, one_hour: bool) {
 }
 
 /// Serialises one message's content blocks.
+///
+/// A thinking block with no signature is dropped rather than serialised: the
+/// provider rejects it, and because it lives in history that rejection would
+/// repeat on every subsequent turn until someone removed it by hand.
 fn build_content(content: &[Content]) -> Value {
     let blocks: Vec<Value> = content
         .iter()
+        .filter(|block| !matches!(block, Content::Thinking { signature: None, .. }))
         .map(|block| match block {
             Content::Text(text) => json!({ "type": "text", "text": text }),
             Content::ToolUse {
@@ -265,7 +309,7 @@ pub fn count_breakpoints(body: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::message::{Correlation, Role, ToolDefinition};
+    use crate::message::{Correlation, Message, ToolDefinition};
 
     fn long_text(chars: usize) -> String {
         "x".repeat(chars)
@@ -395,16 +439,24 @@ mod tests {
     }
 
     #[test]
-    fn omits_the_signature_when_there_was_none() {
+    fn drops_a_thinking_block_that_has_no_signature() {
+        // The provider rejects an unsigned thinking block. Because it lives in
+        // history, serialising it would fail every subsequent turn too.
         let message = Message::new(
             Role::Assistant,
-            vec![Content::Thinking {
-                text: "reasoning".into(),
-                signature: None,
-            }],
+            vec![
+                Content::Thinking {
+                    text: "unsigned".into(),
+                    signature: None,
+                },
+                Content::text("the answer"),
+            ],
         );
         let body = build(&request_with(vec![message]));
-        assert!(body["messages"][0]["content"][0].get("signature").is_none());
+        let blocks = body["messages"][0]["content"].as_array().expect("blocks");
+
+        assert_eq!(blocks.len(), 1, "the unsigned block should be dropped");
+        assert_eq!(blocks[0]["text"], "the answer");
     }
 
     #[test]
@@ -446,6 +498,7 @@ mod tests {
     #[test]
     fn does_not_cache_when_the_tool_list_is_volatile() {
         let mut request = request_with(vec![Message::user("hi")]).with_system(long_text(4000));
+        request.tools = vec![ToolDefinition::new("t", "d", "{}")];
         request.tools_volatile = true;
         let body = build(&request);
 
@@ -453,6 +506,33 @@ mod tests {
             body["system"][0].get("cache_control").is_none(),
             "a volatile tool list invalidates the prefix, so the marker would never hit"
         );
+    }
+
+    #[test]
+    fn a_volatile_tool_list_suppresses_the_conversation_marker_too() {
+        // Messages sit after tools in the cache prefix, so a marker here would
+        // bill a write on the whole conversation that can never be read.
+        let mut request = request_with(vec![
+            Message::user(long_text(2000)),
+            Message::assistant(long_text(2000)),
+            Message::user("next"),
+        ]);
+        request.tools = vec![ToolDefinition::new("t", "d", "{}")];
+        request.tools_volatile = true;
+        let body = build(&request);
+
+        assert_eq!(count_breakpoints(&body), 0);
+    }
+
+    #[test]
+    fn a_stable_system_prompt_is_cached_when_there_are_no_tools_at_all() {
+        // With no tools there is nothing ahead of the system prompt to
+        // invalidate it, whatever the volatility flag says.
+        let mut request = request_with(vec![Message::user("hi")]).with_system(long_text(4000));
+        request.tools_volatile = true;
+        let body = build(&request);
+
+        assert!(body["system"][0].get("cache_control").is_some());
     }
 
     #[test]
@@ -470,7 +550,9 @@ mod tests {
     }
 
     #[test]
-    fn caches_the_conversation_prefix_but_not_the_last_message() {
+    fn marks_the_two_most_recent_user_messages() {
+        // A rolling anchor plus write: a turn that appends many tool results
+        // can push a single anchor out of the provider's lookback window.
         let messages = vec![
             Message::user(long_text(1500)),
             Message::assistant(long_text(1500)),
@@ -479,17 +561,36 @@ mod tests {
         let body = build(&request_with(messages));
 
         assert!(
-            body["messages"][1]["content"][0]
+            body["messages"][0]["content"][0]
                 .get("cache_control")
                 .is_some(),
-            "the last stable message should carry the marker"
+            "the previous user message should anchor the cache"
         );
         assert!(
             body["messages"][2]["content"][0]
                 .get("cache_control")
-                .is_none(),
-            "the newest message changes every turn and must not be marked"
+                .is_some(),
+            "the newest user message should carry the rolling write"
         );
+        assert_eq!(count_breakpoints(&body), 2);
+    }
+
+    #[test]
+    fn conversation_markers_land_on_user_messages_not_assistant_ones() {
+        let messages = vec![
+            Message::user(long_text(1500)),
+            Message::assistant(long_text(1500)),
+            Message::user("next"),
+            Message::assistant("reply"),
+        ];
+        let body = build(&request_with(messages));
+
+        for (index, message) in body["messages"].as_array().unwrap().iter().enumerate() {
+            let marked = message["content"][0].get("cache_control").is_some();
+            if marked {
+                assert_eq!(message["role"], "user", "message {index} is not a user message");
+            }
+        }
     }
 
     #[test]
@@ -581,6 +682,43 @@ mod tests {
             "a budget of {budget} would leave no room for the response"
         );
         assert!(budget >= 1024, "the provider requires at least 1024");
+    }
+
+    #[test]
+    fn omits_thinking_when_the_response_limit_is_too_small_to_allow_it() {
+        // Below twice the 1024 minimum there is no room for both reasoning and
+        // an answer, and asking anyway is a 400.
+        for max_tokens in [200u32, 1024, 2047] {
+            let request = request_with(vec![Message::user("hi")])
+                .with_max_tokens(max_tokens)
+                .with_effort(Some(Effort::High));
+            let body = build(&request);
+
+            assert!(
+                body.get("thinking").is_none(),
+                "max_tokens {max_tokens} should not request thinking"
+            );
+        }
+    }
+
+    #[test]
+    fn a_requested_thinking_budget_is_always_below_the_response_limit() {
+        for max_tokens in [2048u32, 4096, 8192, 64_000] {
+            for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Max] {
+                let request = request_with(vec![Message::user("hi")])
+                    .with_max_tokens(max_tokens)
+                    .with_effort(Some(effort));
+                let body = build(&request);
+
+                if let Some(budget) = body.get("thinking").map(|t| t["budget_tokens"].as_u64().unwrap()) {
+                    assert!(
+                        budget < max_tokens as u64,
+                        "{effort:?} with max_tokens {max_tokens} asked for {budget}"
+                    );
+                    assert!(budget >= 1024);
+                }
+            }
+        }
     }
 
     #[test]

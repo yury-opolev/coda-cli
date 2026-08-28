@@ -32,6 +32,9 @@ const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Buffer depth for decoded events.
 const CHANNEL_DEPTH: usize = 256;
 
+/// Overall bound on the non-streaming model listing.
+const MODELS_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// How the client authenticates.
 #[derive(Debug, Clone)]
 pub enum Auth {
@@ -189,9 +192,11 @@ impl LlmClient for AnthropicClient {
             Auth::Bearer(token) => builder.header("authorization", format!("Bearer {token}")),
         };
 
-        let response = builder
-            .send()
+        // Unlike streaming, this has no per-chunk idle timeout to fall back
+        // on, so a half-open connection would hang it forever.
+        let response = tokio::time::timeout(MODELS_TIMEOUT, builder.send())
             .await
+            .map_err(|_| LlmError::Transport("listing models timed out".into()))?
             .map_err(|error| LlmError::Transport(error.to_string()))?;
 
         if !response.status().is_success() {
@@ -200,9 +205,9 @@ impl LlmClient for AnthropicClient {
             return Err(LlmError::from_status(status, &body, None));
         }
 
-        let value: serde_json::Value = response
-            .json()
+        let value: serde_json::Value = tokio::time::timeout(MODELS_TIMEOUT, response.json())
             .await
+            .map_err(|_| LlmError::Transport("reading the model list timed out".into()))?
             .map_err(|error| LlmError::Protocol(error.to_string()))?;
 
         Ok(parse_models(&value))
@@ -238,36 +243,56 @@ pub fn parse_models(value: &serde_json::Value) -> Vec<ModelInfo> {
 }
 
 /// Reads the response body, decoding SSE into stream events.
-async fn pump(
-    response: reqwest::Response,
-    tx: mpsc::Sender<Result<StreamEvent, LlmError>>,
-) {
+async fn pump(response: reqwest::Response, tx: mpsc::Sender<Result<StreamEvent, LlmError>>) {
     let mut body = response.bytes_stream();
     let mut sse = SseDecoder::new();
     let mut protocol = AnthropicDecoder::new();
+    // Bytes of an incomplete UTF-8 sequence carried to the next chunk.
+    let mut carry: Vec<u8> = Vec::new();
 
     loop {
-        // A stalled stream must not hang the agent forever.
-        let chunk = match tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()).await {
-            Ok(Some(Ok(chunk))) => chunk,
-            Ok(Some(Err(error))) => {
-                let _ = tx.send(Err(LlmError::Transport(error.to_string()))).await;
-                return;
-            }
-            Ok(None) => break,
-            Err(_) => {
-                let _ = tx
-                    .send(Err(LlmError::Transport(format!(
-                        "the stream stalled for {}s",
-                        STREAM_IDLE_TIMEOUT.as_secs()
-                    ))))
-                    .await;
-                return;
-            }
+        // A stalled stream must not hang the agent forever, and a consumer
+        // that went away should wake us immediately rather than after the
+        // idle timeout.
+        let chunk = tokio::select! {
+            biased;
+            _ = tx.closed() => return,
+            next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, body.next()) => match next {
+                Ok(Some(Ok(chunk))) => chunk,
+                Ok(Some(Err(error))) => {
+                    let _ = tx.send(Err(LlmError::Transport(error.to_string()))).await;
+                    return;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    let _ = tx
+                        .send(Err(LlmError::Transport(format!(
+                            "the stream stalled for {}s",
+                            STREAM_IDLE_TIMEOUT.as_secs()
+                        ))))
+                        .await;
+                    return;
+                }
+            },
         };
 
-        let text = match std::str::from_utf8(&chunk) {
-            Ok(text) => text,
+        // Transport chunks split at arbitrary byte offsets, which routinely
+        // lands mid-character for any non-ASCII text. Decode only the valid
+        // prefix and carry the remainder forward.
+        carry.extend_from_slice(&chunk);
+        let text = match std::str::from_utf8(&carry) {
+            Ok(text) => {
+                let text = text.to_string();
+                carry.clear();
+                text
+            }
+            Err(error) if error.error_len().is_none() => {
+                // A truncated trailing sequence: valid so far, more to come.
+                let valid = error.valid_up_to();
+                let text = String::from_utf8_lossy(&carry[..valid]).into_owned();
+                carry.drain(..valid);
+                text
+            }
             Err(error) => {
                 let _ = tx
                     .send(Err(LlmError::Protocol(format!("invalid UTF-8: {error}"))))
@@ -276,7 +301,7 @@ async fn pump(
             }
         };
 
-        for event in sse.push(text) {
+        for event in sse.push(&text) {
             match protocol.decode(&event.name, &event.data) {
                 Ok(decoded) => {
                     for event in decoded {
@@ -292,6 +317,16 @@ async fn pump(
                 }
             }
         }
+    }
+
+    // Bytes left over at EOF are a genuinely truncated character.
+    if !carry.is_empty() {
+        let _ = tx
+            .send(Err(LlmError::Protocol(
+                "the stream ended mid-character".into(),
+            )))
+            .await;
+        return;
     }
 
     // Flush an event left buffered by a stream that ended without a blank line.

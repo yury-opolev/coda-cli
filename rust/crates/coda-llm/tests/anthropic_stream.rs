@@ -15,7 +15,12 @@ use tokio::net::TcpListener;
 /// A one-shot HTTP server that replays a canned response.
 ///
 /// Returns the base URL to point a client at.
-async fn serve(status: u16, headers: &str, body: Vec<String>) -> String {
+async fn serve_text(status: u16, headers: &str, body: Vec<String>) -> String {
+    serve(status, headers, body.into_iter().map(String::into_bytes).collect()).await
+}
+
+/// A one-shot HTTP server that replays a canned byte stream.
+async fn serve(status: u16, headers: &str, body: Vec<Vec<u8>>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let port = listener.local_addr().expect("addr").port();
     let headers = headers.to_string();
@@ -38,7 +43,7 @@ async fn serve(status: u16, headers: &str, body: Vec<String>) -> String {
         // Write the body in chunks so the client sees a genuinely incremental
         // stream rather than one buffered blob.
         for chunk in body {
-            if socket.write_all(chunk.as_bytes()).await.is_err() {
+            if socket.write_all(&chunk).await.is_err() {
                 return;
             }
             let _ = socket.flush().await;
@@ -114,7 +119,7 @@ async fn streams_a_text_response_end_to_end() {
         message_stop(),
     ];
 
-    let url = serve(200, sse_headers(), body).await;
+    let url = serve_text(200, sse_headers(), body).await;
     let stream = client(url).stream(request()).await.expect("stream");
     let response = stream.collect().await.expect("complete");
 
@@ -150,7 +155,7 @@ async fn streams_a_tool_call_end_to_end() {
         message_stop(),
     ];
 
-    let url = serve(200, sse_headers(), body).await;
+    let url = serve_text(200, sse_headers(), body).await;
     let stream = client(url).stream(request()).await.expect("stream");
     let response = stream.collect().await.expect("complete");
 
@@ -179,7 +184,7 @@ async fn events_arrive_incrementally_rather_than_all_at_once() {
         message_stop(),
     ];
 
-    let url = serve(200, sse_headers(), body).await;
+    let url = serve_text(200, sse_headers(), body).await;
     let mut stream = client(url).stream(request()).await.expect("stream");
 
     let first = stream.next().await.expect("an event").expect("no error");
@@ -198,7 +203,7 @@ async fn decodes_events_split_across_transport_chunks() {
         "it\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n".to_string(),
     ];
 
-    let url = serve(200, sse_headers(), body).await;
+    let url = serve_text(200, sse_headers(), body).await;
     let stream = client(url).stream(request()).await.expect("stream");
     let response = stream.collect().await.expect("complete");
 
@@ -210,7 +215,7 @@ async fn a_truncated_stream_is_reported_rather_than_silently_short() {
     // No message_stop: the connection just closes.
     let body = vec![start_text_block(), text_delta("partial")];
 
-    let url = serve(200, sse_headers(), body).await;
+    let url = serve_text(200, sse_headers(), body).await;
     let stream = client(url).stream(request()).await.expect("stream");
 
     let error = stream
@@ -226,7 +231,7 @@ async fn surfaces_a_provider_error_body() {
         r#"{"type":"error","error":{"type":"invalid_request_error","message":"model not found"}}"#
             .to_string(),
     ];
-    let url = serve(400, json_headers(), body).await;
+    let url = serve_text(400, json_headers(), body).await;
 
     let error = client(url)
         .stream(request())
@@ -239,7 +244,7 @@ async fn surfaces_a_provider_error_body() {
 #[tokio::test]
 async fn an_authentication_failure_is_not_retried() {
     let body = vec![r#"{"error":{"message":"invalid x-api-key"}}"#.to_string()];
-    let url = serve(401, json_headers(), body).await;
+    let url = serve_text(401, json_headers(), body).await;
 
     let error = client(url).stream(request()).await.expect_err("should fail");
     assert!(matches!(error, LlmError::Unauthorized(_)));
@@ -256,7 +261,7 @@ async fn an_inline_error_event_fails_the_stream() {
         ),
     ];
 
-    let url = serve(200, sse_headers(), body).await;
+    let url = serve_text(200, sse_headers(), body).await;
     let stream = client(url).stream(request()).await.expect("stream");
 
     let error = stream.collect().await.expect_err("should fail");
@@ -265,18 +270,78 @@ async fn an_inline_error_event_fails_the_stream() {
 }
 
 #[tokio::test]
-async fn dropping_the_stream_cancels_the_request() {
-    let body = vec![start_text_block(), text_delta("first"), message_stop()];
+async fn dropping_the_stream_stops_the_pump_promptly() {
+    // The server sends one event and then holds the connection open forever.
+    // A pump that only noticed cancellation on its next send would sit here
+    // until the idle timeout, so this asserts it wakes on the dropped consumer.
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
 
-    let url = serve(200, sse_headers(), body).await;
+    tokio::spawn(async move {
+        let Ok((mut socket, _)) = listener.accept().await else {
+            return;
+        };
+        let mut buffer = vec![0u8; 8192];
+        let _ = socket.read(&mut buffer).await;
+
+        let head = format!("HTTP/1.1 200 OK\r\n{}\r\n", sse_headers());
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(start_text_block().as_bytes()).await;
+        let _ = socket.write_all(text_delta("first").as_bytes()).await;
+        let _ = socket.flush().await;
+
+        // Block until the client goes away, then report it.
+        let mut sink = vec![0u8; 1024];
+        let _ = socket.read(&mut sink).await;
+        let _ = closed_tx.send(());
+    });
+
+    let url = format!("http://127.0.0.1:{port}");
     let mut stream = client(url).stream(request()).await.expect("stream");
+    assert_eq!(
+        stream.next().await.expect("an event").expect("no error"),
+        StreamEvent::TextDelta("first".into())
+    );
 
-    let _ = stream.next().await;
     drop(stream);
 
-    // The pump task must exit rather than leak; the test passing without
-    // hanging is the assertion.
-    tokio::time::sleep(Duration::from_millis(50)).await;
+    // The connection must close well within the 120s idle timeout.
+    tokio::time::timeout(Duration::from_secs(5), closed_rx)
+        .await
+        .expect("the pump did not release the connection after the consumer was dropped")
+        .expect("server task should report closure");
+}
+
+#[tokio::test]
+async fn decodes_multibyte_text_split_across_transport_chunks() {
+    // Transport chunks split at arbitrary byte offsets, which routinely lands
+    // mid-character for non-ASCII content. Splitting the body at every byte
+    // proves no boundary can break the decoder.
+    let full = format!(
+        "{}{}{}",
+        start_text_block(),
+        text_delta("café ☕ 日本語 🚀"),
+        message_stop()
+    );
+    let bytes = full.as_bytes();
+
+    for split in 1..bytes.len() {
+        // Split the raw bytes, so a chunk can legitimately end mid-character.
+        let body = vec![bytes[..split].to_vec(), bytes[split..].to_vec()];
+
+        let url = serve(200, sse_headers(), body).await;
+        let stream = client(url).stream(request()).await.expect("stream");
+        let response = stream
+            .collect()
+            .await
+            .unwrap_or_else(|error| panic!("split at byte {split} failed: {error}"));
+
+        assert_eq!(
+            response.text, "café ☕ 日本語 🚀",
+            "split at byte {split} corrupted the text"
+        );
+    }
 }
 
 #[tokio::test]
@@ -287,7 +352,7 @@ async fn lists_models_over_http() {
         ]
     })
     .to_string()];
-    let url = serve(200, json_headers(), body).await;
+    let url = serve_text(200, json_headers(), body).await;
 
     let models = client(url).list_models().await.expect("models");
     assert_eq!(models.len(), 1);
