@@ -29,6 +29,7 @@
 pub mod agent;
 pub mod events;
 pub mod goal;
+pub mod lsp;
 pub mod permission;
 pub mod steering;
 pub mod todos;

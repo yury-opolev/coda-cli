@@ -29,6 +29,7 @@ use std::sync::Arc;
 use regex::Regex;
 
 use crate::tool::Tool;
+use crate::lsp::LspDiagnosticsTool;
 
 pub use ask_user_question::AskUserQuestionTool;
 pub use edit_file::EditTool;
@@ -86,6 +87,8 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(SleepTool),
         Arc::new(ToolSearchTool),
         Arc::new(GitWorktreeTool),
+        // ── LSP ───────────────────────────────────────────────────────────────
+        Arc::new(LspDiagnosticsTool),
     ]
 }
 
@@ -192,6 +195,7 @@ mod tests {
             "sleep",
             "tool_search",
             "git_worktree",
+            "lsp_diagnostics",
         ] {
             assert!(names.contains(expected), "missing tool: {expected}");
         }

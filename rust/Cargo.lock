@@ -328,6 +328,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "coda-client",
  "coda-llm",
  "coda-proto",
  "futures",
@@ -379,6 +380,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-mcp"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "coda-agent",
+ "coda-proto",
+ "directories",
+ "futures",
+ "pretty_assertions",
+ "regex",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "coda-proto"
 version = "0.1.0"
 dependencies = [
@@ -412,6 +434,7 @@ dependencies = [
  "arboard",
  "clap",
  "coda-client",
+ "coda-mcp",
  "coda-proto",
  "coda-render",
  "crossterm",

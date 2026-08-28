@@ -181,6 +181,7 @@ pub(crate) async fn run_tools(
             user_question: None,
             plan_approver: None,
             all_tools: None,
+            lsp_manager: None,
         };
 
         sink.emit(AgentEvent::ToolStatus {

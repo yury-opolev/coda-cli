@@ -1,16 +1,15 @@
 [package]
-name = "coda-agent"
+name = "coda-mcp"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "The Coda agent core: the tool-use loop, tool registry, permissions and goals."
+description = "MCP (Model Context Protocol) client for the Coda agent."
 
 [dependencies]
-coda-llm.workspace = true
 coda-proto.workspace = true
-coda-client.workspace = true
+coda-agent.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -18,17 +17,13 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+futures.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
-uuid.workspace = true
-time.workspace = true
 regex.workspace = true
-reqwest.workspace = true
-futures.workspace = true
+directories.workspace = true
+bytes.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio = { workspace = true, features = ["rt", "macros"] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"

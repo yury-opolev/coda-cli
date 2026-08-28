@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use tokio_util::sync::CancellationToken;
 
 use crate::todos::TodoStore;
+use crate::lsp::LspServerManager;
 
 // ── Interaction seams ─────────────────────────────────────────────────────────
 
@@ -74,6 +75,8 @@ pub struct ToolContext {
     pub plan_approver: Option<Arc<dyn PlanApprover>>,
     /// Full registry of tools in descriptor form, used by `tool_search`.
     pub all_tools: Option<Vec<ToolDescriptor>>,
+    /// LSP server manager; `None` when no servers are configured.
+    pub lsp_manager: Option<Arc<LspServerManager>>,
 }
 
 impl std::fmt::Debug for ToolContext {
@@ -86,6 +89,7 @@ impl std::fmt::Debug for ToolContext {
             .field("user_question", &self.user_question.is_some())
             .field("plan_approver", &self.plan_approver.is_some())
             .field("all_tools", &self.all_tools.as_ref().map(|v| v.len()))
+            .field("lsp_manager", &self.lsp_manager.is_some())
             .finish()
     }
 }
@@ -100,6 +104,7 @@ impl ToolContext {
             user_question: None,
             plan_approver: None,
             all_tools: None,
+            lsp_manager: None,
         }
     }
 
@@ -126,6 +131,11 @@ impl ToolContext {
 
     pub fn with_all_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {
         self.all_tools = Some(tools);
+        self
+    }
+
+    pub fn with_lsp_manager(mut self, mgr: Arc<LspServerManager>) -> Self {
+        self.lsp_manager = Some(mgr);
         self
     }
 }

@@ -9,10 +9,8 @@
 //! settings this front-end knows nothing about, and a naive round-trip through
 //! a typed struct would silently delete them.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Locations of the files the TUI shares with the engine.
@@ -333,6 +331,9 @@ impl PluginState {
 // ---------------------------------------------------------------------------
 
 /// Where an MCP server definition came from.
+///
+/// Mirrors `coda_mcp::config::McpScope`; kept as a separate type so the TUI
+/// API is not coupled to the coda-mcp crate's internal shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Project,
@@ -348,12 +349,16 @@ impl Scope {
     }
 }
 
-/// One configured MCP server.
+/// One configured MCP server — a display-only view.
+///
+/// Actual `env` values are intentionally absent so the TUI never stores
+/// or displays secrets. The parsing is delegated to `coda_mcp::config` so
+/// the file-format logic lives in exactly one place.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServer {
     pub name: String,
     pub scope: Scope,
-    /// `stdio` when a command is set, otherwise `http`.
+    /// `"stdio"` or `"http"`.
     pub transport: &'static str,
     pub command: Option<String>,
     pub args: Vec<String>,
@@ -380,76 +385,34 @@ impl McpServer {
     }
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
-struct McpDocument {
-    #[serde(rename = "mcpServers", default)]
-    servers: BTreeMap<String, Value>,
-    #[serde(flatten)]
-    other: Map<String, Value>,
-}
-
 /// Reads MCP servers from the project and user configuration files.
 ///
-/// A project definition shadows a user definition of the same name, matching
-/// how the engine resolves them.
+/// Delegates the file-format parsing to `coda_mcp::config::load_all` so the
+/// JSON parsing logic lives in one place. Project definitions shadow user
+/// definitions of the same name.
 pub fn load_mcp_servers(paths: &Paths) -> Result<Vec<McpServer>, ConfigError> {
-    let mut servers: Vec<McpServer> = Vec::new();
-
-    for (path, scope) in [
-        (paths.project_mcp(), Scope::Project),
-        (paths.user_mcp(), Scope::User),
-    ] {
-        let document = read_json(&path)?;
-        let Some(entries) = document.get("mcpServers").and_then(Value::as_object) else {
-            continue;
-        };
-
-        for (name, definition) in entries {
-            if servers.iter().any(|s| s.name == *name) {
-                continue; // already defined at project scope
-            }
-            servers.push(parse_server(name, definition, scope));
-        }
-    }
-
+    let raw = coda_mcp::config::load_all(&paths.user_mcp(), &paths.project_mcp());
+    let mut servers: Vec<McpServer> = raw.into_iter().map(raw_to_display).collect();
     servers.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(servers)
 }
 
-fn parse_server(name: &str, definition: &Value, scope: Scope) -> McpServer {
-    let string = |key: &str| definition.get(key).and_then(Value::as_str).map(str::to_string);
-
-    let command = string("command");
-    let url = string("url");
-    let args = definition
-        .get("args")
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default();
-    let env_keys = definition
-        .get("env")
-        .and_then(Value::as_object)
-        .map(|env| env.keys().cloned().collect())
-        .unwrap_or_default();
-
+fn raw_to_display(raw: coda_mcp::config::McpRawServer) -> McpServer {
+    let scope = match raw.scope {
+        coda_mcp::config::McpScope::Project => Scope::Project,
+        coda_mcp::config::McpScope::User => Scope::User,
+    };
+    let transport = raw.transport(); // call before moving fields
+    let mut env_keys: Vec<String> = raw.env.into_keys().collect();
+    env_keys.sort(); // stable order for tests that check exact equality
     McpServer {
-        name: name.to_string(),
+        name: raw.name,
         scope,
-        transport: if command.is_some() { "stdio" } else { "http" },
-        command,
-        args,
-        url,
-        // A server is enabled unless explicitly disabled.
-        enabled: definition
-            .get("enabled")
-            .and_then(Value::as_bool)
-            .unwrap_or(true),
+        transport,
+        command: raw.command,
+        args: raw.args,
+        url: raw.url,
+        enabled: !raw.disabled,
         env_keys,
     }
 }
