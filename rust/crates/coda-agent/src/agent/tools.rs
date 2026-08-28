@@ -216,6 +216,12 @@ async fn execute_with_ceiling(
     tool_name: &str,
 ) -> Result<ToolResult, AgentError> {
     let tool_cancel = cancel.child_token();
+    // Retain a handle so we can explicitly cancel the child token when the
+    // ceiling fires.  Dropping the future only drops the token clone that was
+    // moved into execute(); background tasks the tool spawned (holding their
+    // own clone) would keep running indefinitely without this explicit cancel
+    // (C# uses CancelAfter on the tool's own token — §MINOR 3).
+    let tool_cancel_handle = tool_cancel.clone();
 
     let outcome = if let Some(max_dur) = max_duration {
         tokio::select! {
@@ -226,6 +232,10 @@ async fn execute_with_ceiling(
                         o
                     }
                     Err(_) => {
+                        // Cancel the tool's own token so background work it
+                        // spawned (e.g. subprocesses, spawned tasks) learns
+                        // it was killed rather than waiting indefinitely.
+                        tool_cancel_handle.cancel();
                         if cancel.is_cancelled() { return Err(AgentError::Cancelled); }
                         ToolResult::error(format!(
                             "Tool '{}' exceeded the {}s maximum run time and was terminated.",
@@ -283,8 +293,13 @@ mod tests {
 
     #[test]
     fn status_strings_are_stable() {
+        // All 7 variants must be covered so removing any branch breaks this test.
+        assert_eq!(status_str(ToolCallStatus::Pending), "Pending");
+        assert_eq!(status_str(ToolCallStatus::AwaitingApproval), "AwaitingApproval");
+        assert_eq!(status_str(ToolCallStatus::Running), "Running");
         assert_eq!(status_str(ToolCallStatus::Succeeded), "Succeeded");
         assert_eq!(status_str(ToolCallStatus::Failed), "Failed");
+        assert_eq!(status_str(ToolCallStatus::Cancelled), "Cancelled");
         assert_eq!(status_str(ToolCallStatus::Skipped), "Skipped");
     }
 }

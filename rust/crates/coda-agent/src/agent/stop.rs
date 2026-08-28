@@ -52,8 +52,8 @@ pub(crate) async fn decide_stop(
     if let Some(goal) = goal {
         let verdict = goal.evaluate(last_assistant_text, cancel.clone()).await;
 
-        return match verdict {
-            GoalVerdict::Continue { nudge } => Ok(StopAction::Continue { nudge }),
+        match verdict {
+            GoalVerdict::Continue { nudge } => return Ok(StopAction::Continue { nudge }),
 
             GoalVerdict::Escalate { question, .. } => {
                 // Ask the operator — headless (user_question = None) → stop unmet.
@@ -83,17 +83,22 @@ pub(crate) async fn decide_stop(
                     });
                 }
                 // Headless, explicit stop, or extension spent → stop unmet.
+                // Fall through to the steering-seal check below so a racing
+                // operator message is not silently lost.
                 goal.mark_stopped_unmet();
-                Ok(StopAction::Stop)
             }
 
-            GoalVerdict::Stop { .. } => Ok(StopAction::Stop),
-        };
+            // Goal met or budget exhausted — fall through to the steering-seal
+            // check below.  A message that raced the goal completion must not be
+            // silently discarded (C# AgentLoop.cs:959 runs the seal for both paths).
+            GoalVerdict::Stop { .. } => {}
+        }
     }
 
     // --- Generic stop hooks (§1.5, no-op seam, later phase) ---
-    // When a goal IS active the goal path above already returned, so these
-    // hooks are only consulted when no goal is wired (§8 item 21).
+    // When a goal IS active the goal path above already returned for Continue/
+    // Escalate-continue; these hooks are only reached when the goal verdict is
+    // Stop (or when no goal is wired).
 
     // --- Steering seal (§1.5) ---
     // A racing operator message prevents the natural stop and forces one more

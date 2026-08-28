@@ -137,6 +137,14 @@ impl AgentLoop {
         goal: Option<GoalSupervisor>,
         cancel: CancellationToken,
     ) -> Result<GoalStatus, AgentError> {
+        // Reopen the steering inbox so messages enqueued between runs (or
+        // concurrently during this run) are accepted.  A prior natural stop
+        // will have sealed it via try_seal_empty; without this call a second
+        // run on the same Arc<SteeringInbox> starts sealed and all steering
+        // is silently dropped (§MINOR 4).
+        if let Some(steering) = &self.steering {
+            steering.open_for_turn();
+        }
         // Pending post-sampling hook tasks — drained on EVERY exit path
         // (§8 item 27).  The inner function returns via the single exit point
         // below, which always drains before returning.
@@ -168,6 +176,14 @@ impl AgentLoop {
         };
 
         for iteration in 0_usize.. {
+            // Honour caller cancel before any work this iteration.  This
+            // catches cancels that arrived between iterations (e.g. after a
+            // tool batch but before the next model call) and ensures the loop
+            // never starts new work after a cancel.
+            if cancel.is_cancelled() {
+                return Err(AgentError::Cancelled);
+            }
+
             // 1. Cooperative pause gate (no-op seam; later phase adds the gate).
 
             // 2. Iteration bound check (non-goal only, §1.2).
@@ -223,7 +239,17 @@ impl AgentLoop {
                 &mut blocked_compaction_at,
             )
             .await
-            .map_err(AgentError::Llm)?;
+            .map_err(|e| {
+                // Normalise LlmError::Cancelled → AgentError::Cancelled so every
+                // cancel-observing path (retry-loop top, select arm, or this spot)
+                // returns the same variant.  A caller matching AgentError::Cancelled
+                // would otherwise miss the streaming case where the token was seen
+                // by stream_with_retries rather than the tool path (§CRITICAL 1c).
+                match e {
+                    coda_llm::LlmError::Cancelled => AgentError::Cancelled,
+                    other => AgentError::Llm(other),
+                }
+            })?;
 
             // 8. Stamp correlation on tool_use blocks, then assemble assistant message.
             if !acc.tool_uses.is_empty() {
@@ -1150,21 +1176,12 @@ mod tests {
     }
 
     // ── §8 item 27: pending hook tasks drained on every exit path ───────────
-
-    #[tokio::test]
-    async fn pending_tasks_are_drained_on_normal_exit() {
-        // With no hooks implemented, pending_hook_tasks is always empty.
-        // This test verifies the loop completes without panic.
-        let client = MockLlmClient::new(vec![vec![
-            Ok(StreamEvent::TextDelta("done".into())),
-            Ok(done()),
-        ]]);
-        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
-        let agent = make_loop(client, Arc::new(AllowAll), tools);
-        let mut history = vec![Message::user("hi")];
-        // Just verifying it returns OK (drain path exercised).
-        agent.run(&mut history, &NullSink, None, CancellationToken::new()).await.unwrap();
-    }
+    //
+    // With no hooks wired, pending_hook_tasks is always empty.  The previous
+    // test only verified the loop returned Ok without panicking — that asserts
+    // nothing about the drain logic (deleting the drain loop would not break
+    // it).  Deleted; the drain path is covered by the cancellation tests below,
+    // which exercise all exit paths.
 
     // ── §8 item 22: steering injection in iteration ──────────────────────────
 
@@ -1266,5 +1283,389 @@ mod tests {
             matches!(e, AgentEvent::ToolResult { status: ToolCallStatus::Skipped, .. })
         }).count();
         assert_eq!(skipped, 1, "tool_b should have exactly one Skipped result");
+    }
+
+    // ── CRITICAL 1: cancellation tests ──────────────────────────────────────
+    //
+    // Three defects, one root cause:
+    //  (a) no cancel check at the top of each execute_loop iteration,
+    //  (b) drive_stream has no cancel arm — cancel during streaming is ignored,
+    //  (c) LlmError::Cancelled is mapped to AgentError::Llm(Cancelled) not
+    //      AgentError::Cancelled, so callers matching the latter miss it.
+
+    // (b) cancel DURING a text-only turn (stream never completes).
+    // Before fix: drive_stream blocks on stream.next() forever — the tokio::time::timeout
+    // in the test fires and panics rather than returning Cancelled.
+    // After fix: the select!() cancel arm drops the stream and returns Cancelled.
+    #[tokio::test]
+    async fn cancel_during_text_turn_yields_cancelled() {
+        let cancel = CancellationToken::new();
+        let cancel_for_spawn = cancel.clone();
+
+        // A client whose stream sends one delta and then hangs indefinitely
+        // (no Done event).  Without a cancel arm in drive_stream the loop
+        // blocks on stream.next() until the test timeout fires.
+        struct HangingClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for HangingClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    let _ = tx.send(Ok(StreamEvent::TextDelta("partial".into()))).await;
+                    // Block forever so the stream never completes.
+                    std::future::pending::<()>().await
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        // Cancel after a brief pause to let the stream start.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_for_spawn.cancel();
+        });
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(Arc::new(HangingClient), Arc::new(AllowAll), tools)
+            .with_tool_max_duration(None)
+            .build();
+        let mut history = vec![Message::user("go")];
+
+        // If drive_stream has no cancel arm the agent hangs; the 2 s wall-clock
+        // ceiling turns the hang into a panic so the test fails clearly.
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            agent.run(&mut history, &NullSink, None, cancel),
+        )
+        .await
+        .expect("agent hung instead of observing the cancel token — drive_stream needs a cancel select arm");
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "cancel during a text-only turn must yield Cancelled, got: {result:?}"
+        );
+    }
+
+    // (c) pre-cancelled token returns the wrong variant.
+    // Before fix: stream_with_retries returns LlmError::Cancelled, mapped by
+    //   map_err(AgentError::Llm) to AgentError::Llm(LlmError::Cancelled).
+    //   The test checks AgentError::Cancelled → fails.
+    // After fix (c) or (a): AgentError::Cancelled → passes.
+    #[tokio::test]
+    async fn pre_cancelled_token_yields_cancelled() {
+        let cancel = CancellationToken::new();
+        cancel.cancel(); // cancel before the run starts
+
+        // The model must never be called; MockLlmClient with empty sequences
+        // panics if stream() is called.
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(
+            MockLlmClient::new(vec![]),
+            Arc::new(AllowAll),
+            tools,
+        )
+        .with_tool_max_duration(None)
+        .build();
+
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, cancel).await;
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "pre-cancelled token must yield AgentError::Cancelled, got: {result:?}"
+        );
+    }
+
+    // (a) cancel between iterations (after a tool batch, before the next model call).
+    // Before fix: the cancel is caught by stream_with_retries (LlmError::Cancelled)
+    //   then mapped to AgentError::Llm(Cancelled) — wrong variant — test fails.
+    // After fix (a) or (c): correctly yields AgentError::Cancelled.
+    #[tokio::test]
+    async fn cancel_between_iterations_yields_cancelled() {
+        let cancel = CancellationToken::new();
+        let cancel_for_tool = cancel.clone();
+
+        // A tool that fires the outer cancel token when it executes, so the
+        // cancel lands AFTER the first tool batch but BEFORE the second model call.
+        struct CancelTool(CancellationToken);
+        #[async_trait]
+        impl crate::tool::Tool for CancelTool {
+            fn name(&self) -> &str { "cancel_tool" }
+            fn description(&self) -> &str { "fires outer cancel" }
+            fn input_schema_json(&self) -> &str { "{}" }
+            fn is_read_only(&self) -> bool { true }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                _: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                self.0.cancel();
+                ToolResult::ok("done")
+            }
+        }
+
+        let client = MockLlmClient::new(vec![
+            // Iteration 0: tool call; tool fires cancel.
+            vec![Ok(tool_use_event("t1", "cancel_tool")), Ok(done())],
+            // Iteration 1: must never be reached.
+            vec![Ok(StreamEvent::TextDelta("unreachable".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(CancelTool(cancel_for_tool)) as Arc<dyn crate::tool::Tool>,
+        ]));
+        let agent = make_loop(client, Arc::new(AllowAll), tools);
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, cancel).await;
+
+        assert!(
+            matches!(result, Err(AgentError::Cancelled)),
+            "cancel between iterations must yield Cancelled, got: {result:?}"
+        );
+    }
+
+    // ── IMPORTANT 2: goal-stop falls through to steering seal ───────────────
+    //
+    // When a goal is active, the original code `return`ed from the goal path
+    // before running try_seal_empty().  A steering message that raced the goal
+    // completion was accepted by enqueue (inbox unsealed) but never delivered.
+    //
+    // Fix: fall through to the seal check for BOTH goal and no-goal stop paths.
+    #[tokio::test]
+    async fn goal_stop_with_racing_message_delivers_steering() {
+        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        use coda_llm::Message as LlmMessage;
+
+        let steering = Arc::new(SteeringInbox::new());
+        let sink = CollectingSink::new();
+
+        // A judge that also enqueues a steering message on every call, simulating
+        // a concurrent operator message that races the goal completing.
+        struct EnqueueOnDoneJudge {
+            inbox: Arc<SteeringInbox>,
+            enqueued: std::sync::atomic::AtomicBool,
+        }
+        #[async_trait]
+        impl ForkedAgent for EnqueueOnDoneJudge {
+            async fn run(
+                &self,
+                _: &str,
+                _: Vec<LlmMessage>,
+                _: CancellationToken,
+            ) -> anyhow::Result<String> {
+                // Enqueue once, simulating the race: an operator message arrives
+                // while the goal judge is deciding to stop.
+                if !self.enqueued.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let _ = self.inbox.enqueue("racing steering after goal");
+                }
+                Ok("DONE".to_owned())
+            }
+        }
+
+        let client = MockLlmClient::new(vec![
+            // Iteration 0: text-only turn (no tools) → triggers goal stop decision.
+            vec![Ok(StreamEvent::TextDelta("goal achieved".into())), Ok(done())],
+            // Iteration 1: delivered after steering is picked up.
+            vec![Ok(StreamEvent::TextDelta("continuing after steering".into())), Ok(done())],
+        ]);
+
+        let goal = GoalSupervisor::new(
+            Box::new(EnqueueOnDoneJudge {
+                inbox: steering.clone(),
+                enqueued: std::sync::atomic::AtomicBool::new(false),
+            }),
+            "test goal",
+            GoalBudget::new(Duration::MAX, 5, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_steering(steering.clone())
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, Some(goal), CancellationToken::new()).await.unwrap();
+
+        // Without fix: goal path returns early before try_seal_empty; the racing
+        // message is never delivered.
+        // With fix: seal check runs, inbox not empty → StopAction::Continue →
+        //   message delivered in the next iteration.
+        let steering_in_history = history.iter().any(|m| {
+            m.role == Role::User && m.text().contains("racing steering after goal")
+        });
+        assert!(
+            steering_in_history,
+            "a steering message that races goal completion must be delivered before the loop exits"
+        );
+
+        let events = sink.take();
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::SteeringDelivered { .. })),
+            "SteeringDelivered event must be emitted"
+        );
+    }
+
+    // ── MINOR 3: tool ceiling cancels the tool's own token ───────────────────
+    //
+    // execute_with_ceiling drops the tool future on timeout but never calls
+    // tool_cancel.cancel(), so background tasks the tool spawned (holding
+    // a clone of tool_cancel) never learn they were killed.
+    #[tokio::test]
+    async fn tool_ceiling_cancels_tool_token() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let cancel_observed = Arc::new(AtomicBool::new(false));
+        let co_clone = cancel_observed.clone();
+
+        // A tool that spawns a background task holding a clone of its token.
+        // The task blocks until the token fires, then sets the flag.
+        struct BackgroundWorkTool {
+            cancel_observed: Arc<AtomicBool>,
+        }
+        #[async_trait]
+        impl crate::tool::Tool for BackgroundWorkTool {
+            fn name(&self) -> &str { "bg_tool" }
+            fn description(&self) -> &str { "spawns background work" }
+            fn input_schema_json(&self) -> &str { "{}" }
+            fn is_read_only(&self) -> bool { true }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                _: &ToolContext,
+                cancel: CancellationToken,
+            ) -> ToolOutcome {
+                let observed = self.cancel_observed.clone();
+                // Spawn background work that holds a copy of the tool token.
+                tokio::spawn(async move {
+                    cancel.cancelled().await;
+                    observed.store(true, Ordering::SeqCst);
+                });
+                // Block forever — the ceiling will kill this future.
+                std::future::pending::<ToolOutcome>().await
+            }
+        }
+
+        let client = MockLlmClient::new(vec![
+            vec![Ok(tool_use_event("t1", "bg_tool")), Ok(done())],
+            vec![Ok(StreamEvent::TextDelta("session survived".into())), Ok(done())],
+        ]);
+
+        let tools = Arc::new(ToolRegistry::new([
+            Arc::new(BackgroundWorkTool { cancel_observed: co_clone }) as Arc<dyn crate::tool::Tool>,
+        ]));
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            // Short ceiling: fires before the tool's infinite sleep.
+            .with_tool_max_duration(Some(Duration::from_millis(50)))
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        let result = agent.run(&mut history, &NullSink, None, CancellationToken::new()).await;
+        assert!(result.is_ok(), "session must survive a ceiling timeout");
+
+        // Give the background task a moment to react to the cancellation signal.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        // Without fix: tool_cancel is only dropped (not cancelled), so the
+        //   background task keeps waiting → flag stays false → test fails.
+        // With fix: tool_cancel_handle.cancel() is called on ceiling →
+        //   background task fires → flag set → test passes.
+        assert!(
+            cancel_observed.load(Ordering::SeqCst),
+            "the tool's child cancellation token must be cancelled when the ceiling fires"
+        );
+    }
+
+    // ── MINOR 4: steering inbox is reopened at the start of each run ─────────
+    //
+    // A natural stop seals the inbox via try_seal_empty().  Without
+    // open_for_turn() at the start of run(), a second run starts sealed and all
+    // operator steering is silently dropped forever after.
+    #[tokio::test]
+    async fn second_run_on_same_inbox_delivers_steering() {
+        let steering = Arc::new(SteeringInbox::new());
+        let sink = CollectingSink::new();
+
+        // ── Run 1 ────────────────────────────────────────────────────────────
+        let client1 = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("run1".into())),
+            Ok(done()),
+        ]]);
+        let tools1 = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let agent1 = AgentLoopBuilder::new(client1, Arc::new(AllowAll), tools1)
+            .with_steering(steering.clone())
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history1 = vec![Message::user("go")];
+        agent1.run(&mut history1, &sink, None, CancellationToken::new()).await.unwrap();
+        sink.take(); // discard run-1 events
+
+        // After run 1 the inbox is sealed (try_seal_empty succeeded).
+        assert!(
+            steering.enqueue("just-after-run1").is_none(),
+            "inbox must be sealed after a completed run"
+        );
+
+        // ── Run 2 ────────────────────────────────────────────────────────────
+        // A tool that enqueues a steering message; simulates an operator message
+        // that arrives AFTER open_for_turn has unsealed the inbox.
+        struct EnqueueTool(Arc<SteeringInbox>);
+        #[async_trait]
+        impl crate::tool::Tool for EnqueueTool {
+            fn name(&self) -> &str { "enqueue_tool" }
+            fn description(&self) -> &str { "enqueues steering" }
+            fn input_schema_json(&self) -> &str { "{}" }
+            fn is_read_only(&self) -> bool { true }
+            async fn execute(
+                &self,
+                _: &serde_json::Value,
+                _: &ToolContext,
+                _: CancellationToken,
+            ) -> ToolOutcome {
+                // Without fix: inbox is still sealed → enqueue returns None → nothing injected.
+                // With fix: open_for_turn at run start reopens the inbox → enqueue succeeds.
+                let _ = self.0.enqueue("steer during run2");
+                ToolResult::ok("done")
+            }
+        }
+
+        let client2 = MockLlmClient::new(vec![
+            // Iteration 0: tool call (enqueues steering).
+            vec![Ok(tool_use_event("t1", "enqueue_tool")), Ok(done())],
+            // Iteration 1: steering injected at 4b, then final text.
+            vec![Ok(StreamEvent::TextDelta("run2 done".into())), Ok(done())],
+        ]);
+        let tools2 = Arc::new(ToolRegistry::new([
+            Arc::new(EnqueueTool(steering.clone())) as Arc<dyn crate::tool::Tool>,
+        ]));
+        let agent2 = AgentLoopBuilder::new(client2, Arc::new(AllowAll), tools2)
+            .with_steering(steering.clone())
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history2 = vec![Message::user("go again")];
+        agent2.run(&mut history2, &sink, None, CancellationToken::new()).await.unwrap();
+
+        let events = sink.take();
+        // Without fix: enqueue in the tool returned None (inbox sealed) → no delivery.
+        // With fix: inbox was reopened → steering is delivered in iteration 1.
+        assert!(
+            events.iter().any(|e| matches!(e, AgentEvent::SteeringDelivered { .. })),
+            "steering must be delivered in the second run; inbox must be reopened by open_for_turn"
+        );
+        let steering_in_history = history2
+            .iter()
+            .any(|m| m.role == Role::User && m.text().contains("steer during run2"));
+        assert!(
+            steering_in_history,
+            "steering message must appear in run-2 history"
+        );
     }
 }

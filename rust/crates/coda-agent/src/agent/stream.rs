@@ -57,6 +57,10 @@ impl StreamAccumulator {
 /// Drive a `ResponseStream` to completion, accumulating events and emitting
 /// to `sink`.  Returns `Err` on any stream error; the accumulator may be
 /// partially filled on error (retry callers should call `acc.clear()`).
+///
+/// Cancellation is handled by the caller via a wrapping `tokio::select!`
+/// in `stream_with_retries`; dropping this future drops the stream, which
+/// signals the transport to abort the in-flight request.
 pub(crate) async fn drive_stream(
     mut stream: ResponseStream,
     sink: &dyn AgentSink,
@@ -162,7 +166,16 @@ pub(crate) async fn stream_with_retries(
         }
 
         let stream = client.stream(request.clone()).await?;
-        match drive_stream(stream, sink, &mut acc).await {
+
+        // Race the stream against caller cancel.  Cancellation works by DROPPING
+        // the ResponseStream: the transport layer sees the receiver disappear and
+        // aborts the in-flight HTTP request.
+        let drive_result = tokio::select! {
+            r = drive_stream(stream, sink, &mut acc) => r,
+            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+        };
+
+        match drive_result {
             Ok(()) => {
                 // Close any burst the provider did not explicitly close.
                 if acc.thinking_burst_open {
@@ -177,15 +190,24 @@ pub(crate) async fn stream_with_retries(
                         thinking_tokens: None,
                     });
                 }
+                // Final cancel check: if the caller cancelled during the last
+                // few events of a text-only turn, surface Cancelled rather than Ok.
+                if cancel.is_cancelled() {
+                    return Err(LlmError::Cancelled);
+                }
                 sink.emit(AgentEvent::AssistantTextComplete);
                 return Ok(acc);
             }
 
             // --- arm 1: context-overflow compaction retry ---
+            // §MINOR5: acc.is_empty() guard mirrors arms 2 and 3 — a retry is
+            // only safe when nothing has been emitted; without it a partial
+            // response would be duplicated after compaction.
             Err(err)
                 if !overflow_retried
                     && compact.is_some()
                     && !cancel.is_cancelled()
+                    && acc.is_empty()
                     && is_context_overflow_error(&err)
                     && !is_compaction_suppressed(*blocked_compaction_at, request) =>
             {
@@ -396,18 +418,145 @@ mod tests {
         );
     }
 
-    // §8 item 5: transport retry — nothing emitted ⇒ safe to retry.
-    #[tokio::test]
-    async fn nothing_emitted_guard_is_empty() {
-        let acc = StreamAccumulator::default();
-        assert!(acc.is_empty());
-    }
-
     #[tokio::test]
     async fn partial_text_breaks_empty_guard() {
         let mut acc = StreamAccumulator::default();
         acc.text.push_str("hello");
         assert!(!acc.is_empty());
+    }
+
+    // ── Finding 6: is_empty component tests ─────────────────────────────────
+    // Each test verifies that a specific accumulator component makes is_empty()
+    // return false.  Removing that component from is_empty() would break the test.
+
+    #[tokio::test]
+    async fn thinking_burst_open_breaks_empty_guard() {
+        use crate::events::NullSink;
+        // ThinkingDelta sets thinking_burst_open = true.  If is_empty() omitted
+        // !thinking_burst_open, this would still return true (false signal for retry safety).
+        let stream = make_stream(vec![
+            Ok(StreamEvent::ThinkingDelta("partial reasoning".into())),
+            // No ThinkingDone — burst stays open; transport error interrupts.
+            Err(coda_llm::LlmError::Transport("reset".into())),
+        ]);
+        let mut acc = StreamAccumulator::default();
+        let _ = drive_stream(stream, &NullSink, &mut acc).await; // error expected
+        assert!(
+            !acc.is_empty(),
+            "acc with an open thinking burst must not be considered empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_breaks_empty_guard() {
+        use crate::events::NullSink;
+        // Done event with non-zero usage sets acc.usage.
+        let stream = make_stream(vec![Ok(StreamEvent::Done {
+            stop_reason: None,
+            usage: coda_llm::Usage { input_tokens: 5, ..coda_llm::Usage::ZERO },
+        })]);
+        let mut acc = StreamAccumulator::default();
+        drive_stream(stream, &NullSink, &mut acc).await.unwrap();
+        assert!(!acc.is_empty(), "acc with usage set must not be considered empty");
+    }
+
+    #[tokio::test]
+    async fn stop_reason_breaks_empty_guard() {
+        use crate::events::NullSink;
+        // Done with zero usage leaves only stop_reason set.
+        let stream =
+            make_stream(vec![Ok(StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO })]);
+        let mut acc = StreamAccumulator::default();
+        drive_stream(stream, &NullSink, &mut acc).await.unwrap();
+        assert!(!acc.is_empty(), "acc with stop_reason set must not be considered empty");
+    }
+
+    // ── MINOR 5: overflow arm must not replay after partial emission ─────────
+    //
+    // Arm 1 (context-overflow) lacked the acc.is_empty() guard present in arms
+    // 2 and 3.  Without the guard, a context-overflow error that arrives after
+    // the model already emitted partial text would clear the accumulator and
+    // retry, duplicating the emitted text.  With the guard the error surfaces.
+
+    #[tokio::test]
+    async fn overflow_arm_does_not_replay_after_partial_emission() {
+        use std::sync::Mutex;
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+
+        struct TwoCallClient {
+            calls: Mutex<usize>,
+        }
+        #[async_trait]
+        impl coda_llm::LlmClient for TwoCallClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let n = {
+                    let mut g = self.calls.lock().unwrap();
+                    *g += 1;
+                    *g
+                };
+                let events: Vec<Result<StreamEvent, coda_llm::LlmError>> = match n {
+                    1 => vec![
+                        // Partial text emitted before the overflow error.
+                        Ok(StreamEvent::TextDelta("partial".into())),
+                        Err(coda_llm::LlmError::Api {
+                            status: 400,
+                            message: "context length exceeded".into(),
+                            kind: coda_llm::FailureKind::Permanent,
+                            retry_after: None,
+                            body: None,
+                        }),
+                    ],
+                    // Without the guard arm 1 fires and a retry is attempted.
+                    // With the guard the error propagates and this call never happens.
+                    _ => vec![
+                        Ok(StreamEvent::TextDelta("duplicate".into())),
+                        Ok(done_event()),
+                    ],
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for ev in events { let _ = tx.send(ev).await; }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let client = TwoCallClient { calls: Mutex::new(0) };
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let result = stream_with_retries(
+            &client,
+            &mut request,
+            &quarantine,
+            &NullSink,
+            cancel,
+            &retry_cfg,
+            Some(&|| false), // compact enabled so arm 1 can be reached
+            &mut blocked,
+        )
+        .await;
+
+        // Without the acc.is_empty() guard on arm 1: retry fires, second call
+        // succeeds → Ok.  Test fails.
+        // With the guard: error propagates → Err.  Test passes.
+        assert!(
+            result.is_err(),
+            "context-overflow after partial emission must surface as an error, not trigger a replay"
+        );
+        assert!(
+            matches!(result, Err(coda_llm::LlmError::Api { status: 400, .. })),
+            "error must be the original context-overflow Api error"
+        );
     }
 
     // §8 item 7: schema eviction identifies tool by name.
