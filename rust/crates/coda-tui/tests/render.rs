@@ -32,7 +32,7 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
     viewport.update(rows.len(), regions.transcript.height as usize);
 
     terminal
-        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme))
+        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme, None))
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -326,4 +326,87 @@ fn renders_a_diff_tool_result_in_full_mode() {
     );
     assert!(rows.iter().any(|r| r.contains("+ new line")));
     assert!(rows.iter().any(|r| r.contains("- old line")));
+}
+
+/// Renders an overlay over a session, returning the visible rows.
+fn render_with_browser(browser: &coda_tui::overlay::Browser, width: u16, height: u16) -> Vec<String> {
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let state = session();
+    let composer = Composer::new();
+    let mut viewport = Viewport::new();
+    viewport.update(0, 1);
+
+    terminal
+        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &[], &theme, Some(browser)))
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn renders_a_model_browser_overlay() {
+    let models: Vec<coda_proto::messages::WireModel> = serde_json::from_value(serde_json::json!([
+        { "id": "claude-opus-5", "displayName": "Claude Opus 5", "contextLimit": 200000 },
+        { "id": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "contextLimit": 400000 }
+    ]))
+    .expect("models");
+
+    let browser = coda_tui::browsers::models(&models, Some("claude-opus-5"), "live");
+    let rows = render_with_browser(&browser, 90, 20);
+    let screen = rows.join("\n");
+
+    assert!(screen.contains("Models"), "no title in\n{screen}");
+    assert!(screen.contains("claude-opus-5"), "no rows in\n{screen}");
+    assert!(screen.contains("200K"), "no context size in\n{screen}");
+    assert!(screen.contains("Esc q close"), "no footer in\n{screen}");
+}
+
+#[test]
+fn renders_a_browser_detail_pane() {
+    let skills: Vec<coda_proto::messages::WireSkill> = serde_json::from_value(serde_json::json!([
+        { "name": "pdf", "description": "PDF tools", "enabled": true, "userInvocable": true }
+    ]))
+    .expect("skills");
+
+    let mut browser = coda_tui::browsers::skills(&skills);
+    browser.handle(crossterm::event::KeyEvent::new(
+        crossterm::event::KeyCode::Enter,
+        crossterm::event::KeyModifiers::NONE,
+    ));
+
+    let screen = render_with_browser(&browser, 90, 20).join("\n");
+    assert!(screen.contains("user-invocable yes"), "no detail in\n{screen}");
+}
+
+#[test]
+fn an_overlay_renders_at_every_reasonable_size() {
+    let skills: Vec<coda_proto::messages::WireSkill> = serde_json::from_value(serde_json::json!([
+        { "name": "a", "description": "first", "enabled": true },
+        { "name": "b", "description": "second", "enabled": false }
+    ]))
+    .expect("skills");
+    let browser = coda_tui::browsers::skills(&skills);
+
+    for width in [20u16, 40, 90, 200] {
+        for height in [6u16, 12, 40] {
+            let rows = render_with_browser(&browser, width, height);
+            assert_eq!(rows.len(), height as usize);
+            for row in &rows {
+                assert!(
+                    row.chars().count() <= width as usize,
+                    "overlay row overflows at {width}x{height}: {row:?}"
+                );
+            }
+        }
+    }
 }

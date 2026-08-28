@@ -18,10 +18,12 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+use crate::browsers;
 use crate::commands::{self, Scope};
 use crate::composer::{Completion, Composer};
 use crate::draw;
 use crate::keymap::{self, Action, Focus, KeyContext};
+use crate::overlay::{Browser, Intent};
 use crate::state::{PendingPrompt, UiEvent, UiState};
 use crate::terminal::TerminalGuard;
 use crate::transcript::NoticeLevel;
@@ -55,6 +57,20 @@ pub struct App {
     pending_responder: Option<Responder>,
     /// A two-press chord armed by the previous keystroke, and when.
     armed: Option<(keymap::Chord, std::time::Instant)>,
+    /// The open browser overlay, if any.
+    browser: Option<Browser>,
+    /// Which browser is open, so reload and actions know what to do.
+    browser_kind: Option<BrowserKind>,
+}
+
+/// Which overlay is on screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BrowserKind {
+    Models,
+    Schedules,
+    Skills,
+    Plugins,
+    Hooks,
 }
 
 impl App {
@@ -91,6 +107,8 @@ impl App {
             turn: None,
             pending_responder: None,
             armed: None,
+            browser: None,
+            browser_kind: None,
         };
 
         Ok((app, engine, inbound))
@@ -295,6 +313,12 @@ impl App {
             return;
         }
 
+        // An open overlay owns the keyboard next.
+        if self.browser.is_some() {
+            self.on_browser_key(key).await;
+            return;
+        }
+
         let action = keymap::resolve(key, self.key_context());
         self.dirty = true;
 
@@ -408,9 +432,202 @@ impl App {
         }
     }
 
+    /// Routes a key to the open overlay and performs whatever it asks for.
+    async fn on_browser_key(&mut self, key: KeyEvent) {
+        let Some(browser) = self.browser.as_mut() else {
+            return;
+        };
+        let intent = browser.handle(key);
+        self.dirty = true;
+
+        match intent {
+            Intent::Redraw => {}
+            Intent::Ignored => self.dirty = false,
+            Intent::Close => self.close_browser(),
+            Intent::Reload => self.reload_browser().await,
+            Intent::Activate(id) => self.activate_browser_row(&id).await,
+            Intent::Toggle(id) => self.notice(
+                format!("Toggling {id} is not available over `coda serve`."),
+                NoticeLevel::Warning,
+            ),
+            Intent::Delete(id) => self.delete_browser_row(&id).await,
+            Intent::Key(c, id) => self.browser_key_action(c, id).await,
+        }
+    }
+
+    fn close_browser(&mut self) {
+        self.browser = None;
+        self.browser_kind = None;
+    }
+
+    /// Opens a browser, fetching its data from the engine.
+    async fn open_browser(&mut self, kind: BrowserKind) {
+        let browser = match kind {
+            BrowserKind::Models => {
+                match self
+                    .fetch::<messages::ModelsResult>(
+                        method::MODELS,
+                        Some(serde_json::json!({ "refresh": false })),
+                    )
+                    .await
+                {
+                    Ok(result) => browsers::models(
+                        &result.models,
+                        self.state.model.as_deref(),
+                        &result.source,
+                    ),
+                    Err(error) => return self.browser_failed("models", error),
+                }
+            }
+            BrowserKind::Schedules => {
+                match self
+                    .fetch::<messages::ScheduleListResult>(
+                        method::SCHEDULE_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => browsers::schedules(&result.schedules),
+                    Err(error) => return self.browser_failed("schedules", error),
+                }
+            }
+            BrowserKind::Skills => {
+                match self
+                    .fetch::<messages::SkillsListResult>(
+                        method::SKILLS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => browsers::skills(&result.skills),
+                    Err(error) => return self.browser_failed("skills", error),
+                }
+            }
+            BrowserKind::Plugins => {
+                match self
+                    .fetch::<messages::PluginsListResult>(
+                        method::PLUGINS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => browsers::plugins(&result.plugins),
+                    Err(error) => return self.browser_failed("plugins", error),
+                }
+            }
+            BrowserKind::Hooks => {
+                match self
+                    .fetch::<messages::HooksListResult>(
+                        method::HOOKS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => browsers::hooks(&result.hooks),
+                    Err(error) => return self.browser_failed("hooks", error),
+                }
+            }
+        };
+
+        self.browser = Some(browser);
+        self.browser_kind = Some(kind);
+        self.dirty = true;
+    }
+
+    fn browser_failed(&mut self, what: &str, error: ClientError) {
+        self.notice(
+            format!("Could not load {what}: {error}"),
+            NoticeLevel::Error,
+        );
+    }
+
+    async fn reload_browser(&mut self) {
+        if let Some(kind) = self.browser_kind {
+            // Rebuilding preserves the selected row by id.
+            let selected = self
+                .browser
+                .as_ref()
+                .and_then(|b| b.selected_id().map(str::to_string));
+            self.open_browser(kind).await;
+            if let (Some(browser), Some(_)) = (self.browser.as_mut(), selected) {
+                browser.set_status("reloaded");
+            }
+        }
+    }
+
+    /// Handles Enter on a row.
+    async fn activate_browser_row(&mut self, id: &str) {
+        match self.browser_kind {
+            Some(BrowserKind::Models) => {
+                // The serve protocol has no model-switch method, so report
+                // rather than pretending the selection took effect.
+                self.notice(
+                    format!(
+                        "Switching to {id} is not available over `coda serve`; \
+                         start the engine with the model you want."
+                    ),
+                    NoticeLevel::Warning,
+                );
+                self.close_browser();
+            }
+            _ => self.dirty = true,
+        }
+    }
+
+    async fn delete_browser_row(&mut self, id: &str) {
+        if self.browser_kind != Some(BrowserKind::Schedules) {
+            return;
+        }
+        match self
+            .connection
+            .request(
+                method::SCHEDULE_DELETE,
+                Some(serde_json::json!({ "id": id })),
+            )
+            .await
+        {
+            Ok(_) => {
+                self.notice(format!("Deleted schedule {id}."), NoticeLevel::Info);
+                self.reload_browser().await;
+            }
+            Err(error) => self.notice(
+                format!("Could not delete {id}: {error}"),
+                NoticeLevel::Error,
+            ),
+        }
+    }
+
+    async fn browser_key_action(&mut self, key: char, id: Option<String>) {
+        match (self.browser_kind, key) {
+            (Some(BrowserKind::Schedules), 'd') => {
+                if let Some(id) = id {
+                    self.delete_browser_row(&id).await;
+                }
+            }
+            (Some(BrowserKind::Schedules), 'n') => self.notice(
+                "Creating a schedule needs arguments; use /schedule from the composer.",
+                NoticeLevel::Info,
+            ),
+            (Some(BrowserKind::Plugins), 'u') => self.notice(
+                "Updating plugins is not available over `coda serve`.",
+                NoticeLevel::Warning,
+            ),
+            _ => self.dirty = false,
+        }
+    }
+
+    /// Issues a request and deserialises its result.
+    async fn fetch<T: serde::de::DeserializeOwned>(
+        &self,
+        rpc_method: &str,
+        params: Option<Value>,
+    ) -> Result<T, ClientError> {
+        let value = self.connection.request(rpc_method, params).await?;
+        serde_json::from_value(value).map_err(ClientError::Serde)
+    }
+
     /// Answers an open prompt.
-    fn on_prompt_key(&mut self, key: KeyEvent) {
-        let Some(prompt) = self.state.prompt.clone() else {
+    fn on_prompt_key(&mut self, key: KeyEvent) {        let Some(prompt) = self.state.prompt.clone() else {
             return;
         };
         self.dirty = true;
@@ -550,6 +767,16 @@ impl App {
             "status" => self.output(self.status_text()),
             "context" => self.output(self.context_text()),
             "cost" => self.output(self.cost_text()),
+            // Bare invocations open a browser; arguments keep the text path.
+            "model" | "models" if invocation.args.is_empty() => {
+                self.open_browser(BrowserKind::Models).await
+            }
+            "schedule" if invocation.args.is_empty() => {
+                self.open_browser(BrowserKind::Schedules).await
+            }
+            "skills" => self.open_browser(BrowserKind::Skills).await,
+            "plugins" => self.open_browser(BrowserKind::Plugins).await,
+            "hooks" => self.open_browser(BrowserKind::Hooks).await,
             "version" => self.output(format!(
                 "coda-tui {} (Rust front-end)",
                 env!("CARGO_PKG_VERSION")
@@ -802,9 +1029,10 @@ impl App {
         let viewport = &self.viewport;
         let rows = &self.rows;
         let theme = &self.theme;
+        let browser = self.browser.as_ref();
 
         guard.terminal().draw(|frame| {
-            draw::draw(frame, state, composer, viewport, rows, theme);
+            draw::draw(frame, state, composer, viewport, rows, theme, browser);
         })?;
 
         self.dirty = false;

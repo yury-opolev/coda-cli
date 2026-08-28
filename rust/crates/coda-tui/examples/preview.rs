@@ -36,7 +36,16 @@ fn main() {
     let rows = state.transcript.render(regions.transcript.width as usize, state.display_mode);
     let mut viewport = Viewport::new();
     viewport.update(rows.len(), regions.transcript.height as usize);
-    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme)).unwrap();
+    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme, None)).unwrap();
+
+    let models: Vec<coda_proto::messages::WireModel> = serde_json::from_value(serde_json::json!([
+        { "id": "claude-opus-5", "displayName": "Claude Opus 5", "contextLimit": 200000 },
+        { "id": "gpt-5.6-sol", "displayName": "GPT-5.6 Sol", "contextLimit": 400000 },
+        { "id": "gemini-3.1-pro", "displayName": "Gemini 3.1 Pro", "contextLimit": 1000000 }
+    ])).unwrap();
+    let mut mb = coda_tui::browsers::models(&models, Some("claude-opus-5"), "live");
+    mb.handle(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE));
+    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme, Some(&mb))).unwrap();
 
     let buffer = terminal.backend().buffer().clone();
     println!("{}", "-".repeat(width as usize));
