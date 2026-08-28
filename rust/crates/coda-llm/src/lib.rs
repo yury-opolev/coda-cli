@@ -6,12 +6,14 @@
 
 pub mod anthropic;
 pub mod client;
+pub mod copilot;
 pub mod error;
 pub mod message;
 pub mod retry;
 pub mod sse;
 
 pub use client::{CompletedResponse, LlmClient, ResponseStream};
+pub use copilot::{CopilotClient, CopilotConfig};
 pub use error::{FailureKind, LlmError};
 pub use retry::RetryPolicy;
 pub use message::{
