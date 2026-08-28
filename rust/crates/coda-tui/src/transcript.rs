@@ -4,10 +4,39 @@
 //! of tool calls). Blocks are rendered to rows on demand, because the row count
 //! depends on the viewport width and must be recomputed on resize.
 
+use coda_proto::Correlation;
 use coda_render::text;
 use coda_render::theme::Role;
-use coda_render::tool::{ToolActivity, ToolDisplayMode};
+use coda_render::tool::{CallStatus, ToolActivity, ToolDisplayMode};
 use coda_render::{markdown, Gutter, RenderLine, MARKER_CELLS};
+
+/// Identifies a batch of tool calls within a turn.
+///
+/// Both components are optional because the engine may omit them; two batches
+/// with no ids at all are treated as the same batch, which matches the
+/// single-threaded case where that is the only sensible reading.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityKey {
+    pub root_turn_id: Option<String>,
+    pub activity_id: Option<String>,
+}
+
+impl ActivityKey {
+    pub fn from_correlation(correlation: &Correlation) -> Self {
+        Self {
+            root_turn_id: correlation.root_turn_id.clone(),
+            activity_id: correlation.activity_id.clone(),
+        }
+    }
+}
+
+/// Whether two correlations name the same individual call.
+///
+/// Requires a `call_id`: without one there is nothing to distinguish two calls
+/// to the same tool, so callers must fall back to a positional match.
+pub fn same_call(a: &Correlation, b: &Correlation) -> bool {
+    a.call_id.is_some() && a.call_id == b.call_id && a.source_id == b.source_id
+}
 
 /// Severity of a notice block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +74,8 @@ pub enum Block {
         timestamp: String,
         /// Queued but not yet delivered to the engine.
         pending: bool,
+        /// Steering queue id, used to match a delivery notification exactly.
+        queue_id: Option<String>,
     },
     /// Assistant prose, rendered as markdown.
     Assistant { text: String, complete: bool },
@@ -55,8 +86,18 @@ pub enum Block {
         tokens: Option<i32>,
         complete: bool,
     },
-    /// A batch of tool calls.
-    Tools(ToolActivity),
+    /// A batch of tool calls made in one agent step.
+    ///
+    /// A turn can produce several batches: once assistant text or another block
+    /// follows, later calls open a new batch rather than reopening this one.
+    /// The correlation ids identify which batch owns a given result.
+    Tools {
+        activity: ToolActivity,
+        /// Identifies the batch, from the engine's correlation ids.
+        key: ActivityKey,
+        /// Correlation of each call, parallel to `activity.calls`.
+        calls: Vec<Correlation>,
+    },
     /// A status or error line.
     Notice { text: String, level: NoticeLevel },
     /// A permission request and its outcome.
@@ -82,7 +123,7 @@ impl Block {
         match self {
             Block::Assistant { complete, .. } => !complete,
             Block::Thinking { complete, .. } => !complete,
-            Block::Tools(activity) => !activity.complete,
+            Block::Tools { activity, .. } => !activity.complete,
             _ => false,
         }
     }
@@ -95,6 +136,7 @@ impl Block {
                 text,
                 timestamp,
                 pending,
+                ..
             } => render_user(text, timestamp, *pending, width),
             Block::Assistant { text, complete } => render_assistant(text, *complete, width),
             Block::Thinking {
@@ -103,7 +145,7 @@ impl Block {
                 tokens,
                 complete,
             } => render_thinking(text, *elapsed_ms, *tokens, *complete, width, mode),
-            Block::Tools(activity) => activity.render(mode, width),
+            Block::Tools { activity, .. } => activity.render(mode, width),
             Block::Notice { text, level } => text::wrap(text, width)
                 .into_iter()
                 .map(|chunk| RenderLine::new(chunk, level.role()))
@@ -301,6 +343,18 @@ pub struct Transcript {
     blocks: Vec<Block>,
 }
 
+/// Resolves a batch's unfinished calls when it ends.
+fn finalize_activity(activity: &mut ToolActivity) {
+    for call in &mut activity.calls {
+        call.status = match call.status {
+            CallStatus::Pending => CallStatus::Skipped,
+            CallStatus::Running | CallStatus::AwaitingApproval => CallStatus::Cancelled,
+            settled => settled,
+        };
+    }
+    activity.complete = true;
+}
+
 impl Transcript {
     pub fn new() -> Self {
         Self::default()
@@ -343,15 +397,67 @@ impl Transcript {
     }
 
     /// Closes any open block, used when a turn ends or is interrupted.
+    ///
+    /// Finalising a tool batch also resolves calls that never reported a
+    /// result: a queued call becomes skipped and a running one cancelled, so
+    /// an interrupted turn never leaves tools apparently still running.
     pub fn close_open(&mut self) {
         if let Some(block) = self.blocks.last_mut() {
             match block {
                 Block::Assistant { complete, .. } => *complete = true,
                 Block::Thinking { complete, .. } => *complete = true,
-                Block::Tools(activity) => activity.complete = true,
+                Block::Tools { activity, .. } => finalize_activity(activity),
                 _ => {}
             }
         }
+    }
+
+    /// Finalises every batch belonging to a turn, not just the trailing one.
+    ///
+    /// A turn can leave several batches open when assistant text interleaves
+    /// with tool calls, and all of them end together.
+    pub fn finalize_activities(&mut self, root_turn_id: Option<&str>) {
+        for block in &mut self.blocks {
+            if let Block::Tools { activity, key, .. } = block {
+                let ours = root_turn_id.is_none()
+                    || key.root_turn_id.is_none()
+                    || key.root_turn_id.as_deref() == root_turn_id;
+                if ours && !activity.complete {
+                    finalize_activity(activity);
+                }
+            }
+        }
+    }
+
+    /// Drops queued messages that were never delivered.
+    ///
+    /// Anything still pending when a turn ends did not reach the model, so
+    /// leaving it in the transcript would misrepresent what was sent.
+    pub fn remove_pending_user(&mut self) {
+        self.blocks
+            .retain(|block| !matches!(block, Block::User { pending: true, .. }));
+    }
+
+    /// Marks queued messages as delivered by their steering queue id.
+    ///
+    /// Returns how many blocks were promoted.
+    pub fn mark_delivered(&mut self, ids: &[String]) -> usize {
+        let mut promoted = 0;
+        for block in &mut self.blocks {
+            if let Block::User {
+                pending, queue_id, ..
+            } = block
+            {
+                let matched = queue_id
+                    .as_ref()
+                    .is_some_and(|id| ids.iter().any(|candidate| candidate == id));
+                if *pending && matched {
+                    *pending = false;
+                    promoted += 1;
+                }
+            }
+        }
+        promoted
     }
 
     /// Renders every block to rows, inserting a blank separator between them.
@@ -383,6 +489,7 @@ mod tests {
             text: text.to_string(),
             timestamp: "09:41".to_string(),
             pending: false,
+            queue_id: None,
         }
     }
 
@@ -409,6 +516,7 @@ mod tests {
             text: long,
             timestamp: "09:41".to_string(),
             pending: false,
+            queue_id: None,
         }
         .render(30, ToolDisplayMode::Summary);
 
@@ -423,6 +531,7 @@ mod tests {
             text: "later".to_string(),
             timestamp: String::new(),
             pending: true,
+            queue_id: None,
         }
         .render(80, ToolDisplayMode::Summary);
 
@@ -641,13 +750,17 @@ mod tests {
     #[test]
     fn closing_completes_an_open_tool_batch() {
         let mut transcript = Transcript::new();
-        transcript.push(Block::Tools(ToolActivity {
-            calls: vec![ToolCall::new("read_file", "{}")],
-            complete: false,
-        }));
+        transcript.push(Block::Tools {
+            activity: ToolActivity {
+                calls: vec![ToolCall::new("read_file", "{}")],
+                complete: false,
+            },
+            key: ActivityKey::default(),
+            calls: Vec::new(),
+        });
         transcript.close_open();
 
-        let Some(Block::Tools(activity)) = transcript.blocks().last() else {
+        let Some(Block::Tools { activity, .. }) = transcript.blocks().last() else {
             panic!("expected a tool block");
         };
         assert!(activity.complete);
@@ -670,10 +783,14 @@ mod tests {
     #[test]
     fn a_block_that_renders_nothing_gets_no_separator() {
         let mut transcript = Transcript::new();
-        transcript.push(Block::Tools(ToolActivity {
-            calls: vec![ToolCall::new("read_file", "{}")],
-            complete: true,
-        }));
+        transcript.push(Block::Tools {
+            activity: ToolActivity {
+                calls: vec![ToolCall::new("read_file", "{}")],
+                complete: true,
+            },
+            key: ActivityKey::default(),
+            calls: Vec::new(),
+        });
         assert!(transcript
             .render(80, ToolDisplayMode::Hidden)
             .is_empty());
@@ -693,13 +810,17 @@ mod tests {
             tokens: Some(40),
             complete: true,
         });
-        transcript.push(Block::Tools(ToolActivity {
-            calls: vec![ToolCall {
-                status: CallStatus::Succeeded,
-                ..ToolCall::new("run_command", r#"{"command":"cargo test --all"}"#)
-            }],
-            complete: true,
-        }));
+        transcript.push(Block::Tools {
+            activity: ToolActivity {
+                calls: vec![ToolCall {
+                    status: CallStatus::Succeeded,
+                    ..ToolCall::new("run_command", r#"{"command":"cargo test --all"}"#)
+                }],
+                complete: true,
+            },
+            key: ActivityKey::default(),
+            calls: Vec::new(),
+        });
         transcript.push(Block::Notice {
             text: "a notice that is long enough to wrap across lines".to_string(),
             level: NoticeLevel::Warning,
@@ -722,3 +843,4 @@ mod tests {
         }
     }
 }
+

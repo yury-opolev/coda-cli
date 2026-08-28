@@ -8,7 +8,7 @@ use coda_proto::events::ToolCallStatus;
 use coda_proto::{Correlation, Event};
 use coda_render::tool::{CallStatus, ToolActivity, ToolCall, ToolDisplayMode};
 
-use crate::transcript::{Block, NoticeLevel, PermissionDecision, Transcript};
+use crate::transcript::{same_call, ActivityKey, Block, NoticeLevel, PermissionDecision, Transcript};
 
 /// What the agent is currently doing, shown in the status line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -140,8 +140,6 @@ pub struct UiState {
     pub should_quit: bool,
     /// Set while an interrupt has been requested but not yet acknowledged.
     pub interrupting: bool,
-    /// Correlation ids of tool calls, parallel to the calls in the open batch.
-    open_calls: Vec<Correlation>,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
 }
@@ -165,7 +163,7 @@ impl UiState {
             prompt: None,
             should_quit: false,
             interrupting: false,
-            open_calls: Vec::new(),
+
             clock: default_timestamp,
         }
     }
@@ -200,27 +198,32 @@ impl UiState {
                     text,
                     timestamp: (self.clock)(),
                     pending: false,
+                    queue_id: None,
                 });
                 self.activity = Activity::Working;
                 self.interrupting = false;
             }
             UiEvent::Queued { text, id } => {
                 self.queued.push(QueuedMessage {
-                    id,
+                    id: id.clone(),
                     text: text.clone(),
                 });
                 self.transcript.push(Block::User {
                     text,
                     timestamp: (self.clock)(),
                     pending: true,
+                    queue_id: id,
                 });
             }
             UiEvent::TurnFinished { interrupted, error } => {
                 self.transcript.close_open();
+                self.transcript.finalize_activities(None);
+                // Anything still queued never reached the model.
+                self.transcript.remove_pending_user();
+                self.queued.clear();
                 self.activity = Activity::Ready;
                 self.interrupting = false;
                 self.prompt = None;
-                self.open_calls.clear();
 
                 if interrupted {
                     self.notice("Interrupted.", NoticeLevel::Warning);
@@ -277,7 +280,6 @@ impl UiState {
             UiEvent::Cleared => {
                 self.transcript.clear();
                 self.queued.clear();
-                self.open_calls.clear();
             }
             UiEvent::ModelChanged { id, context_limit } => {
                 self.model = Some(id);
@@ -350,20 +352,25 @@ impl UiState {
                 correlation,
             } => {
                 self.activity = Activity::Working;
-                self.ensure_open_batch();
-                if let Some(Block::Tools(activity)) = self.transcript.open_tail() {
+                let key = ActivityKey::from_correlation(&correlation);
+                let index = self.batch_for_new_call(&key);
+                if let Some(Block::Tools { activity, calls, .. }) =
+                    self.transcript.blocks_mut().get_mut(index)
+                {
                     activity.calls.push(ToolCall::new(tool_name, input_json));
-                    self.open_calls.push(correlation);
+                    calls.push(correlation);
                 }
             }
             Event::ToolProgress {
+                tool_name,
                 elapsed_ms,
                 correlation,
-                ..
             } => {
-                if let Some(index) = self.find_call(&correlation, None) {
-                    if let Some(Block::Tools(activity)) = self.transcript.open_tail() {
-                        if let Some(call) = activity.calls.get_mut(index) {
+                if let Some((block, call)) = self.locate_call(&correlation, &tool_name) {
+                    if let Some(Block::Tools { activity, .. }) =
+                        self.transcript.blocks_mut().get_mut(block)
+                    {
+                        if let Some(call) = activity.calls.get_mut(call) {
                             call.elapsed_ms = Some(elapsed_ms);
                         }
                     }
@@ -376,26 +383,47 @@ impl UiState {
                 status,
                 correlation,
             } => {
-                let index = self.find_call(&correlation, Some(&tool_name));
-                if let Some(Block::Tools(activity)) = self.transcript.open_tail() {
-                    let call = match index.and_then(|i| activity.calls.get_mut(i)) {
-                        Some(call) => call,
-                        None => {
-                            // A result with no matching call still deserves to
-                            // be shown rather than silently dropped.
-                            activity.calls.push(ToolCall::new(&tool_name, "{}"));
-                            self.open_calls.push(correlation);
-                            activity.calls.last_mut().expect("just pushed")
+                let status = map_status(status, is_error);
+                match self.locate_call(&correlation, &tool_name) {
+                    Some((block, call)) => {
+                        if let Some(Block::Tools { activity, .. }) =
+                            self.transcript.blocks_mut().get_mut(block)
+                        {
+                            if let Some(call) = activity.calls.get_mut(call) {
+                                call.result = Some(content);
+                                call.is_error = is_error;
+                                call.status = status;
+                            }
                         }
-                    };
-                    call.result = Some(content);
-                    call.is_error = is_error;
-                    call.status = map_status(status, is_error);
+                    }
+                    None => {
+                        // A result with no matching call still deserves to be
+                        // shown rather than silently dropped.
+                        let key = ActivityKey::from_correlation(&correlation);
+                        let index = self.batch_for_new_call(&key);
+                        if let Some(Block::Tools { activity, calls, .. }) =
+                            self.transcript.blocks_mut().get_mut(index)
+                        {
+                            let mut call = ToolCall::new(&tool_name, "{}");
+                            call.result = Some(content);
+                            call.is_error = is_error;
+                            call.status = status;
+                            activity.calls.push(call);
+                            calls.push(correlation);
+                        }
+                    }
                 }
             }
-            Event::TurnComplete { interrupted, .. } => {
+            Event::TurnComplete {
+                interrupted,
+                root_turn_id,
+                ..
+            } => {
                 self.transcript.close_open();
-                self.open_calls.clear();
+                self.transcript.finalize_activities(root_turn_id.as_deref());
+                // Anything still queued never reached the model.
+                self.transcript.remove_pending_user();
+                self.queued.clear();
                 self.activity = Activity::Ready;
                 self.interrupting = false;
                 if interrupted {
@@ -421,7 +449,7 @@ impl UiState {
                 // Delivered messages stop being "pending" in the transcript.
                 self.queued
                     .retain(|m| !m.id.as_ref().is_some_and(|id| message_ids.contains(id)));
-                self.mark_delivered(&message_ids);
+                self.transcript.mark_delivered(&message_ids);
             }
             Event::TaskCompleted {
                 description,
@@ -469,58 +497,70 @@ impl UiState {
         }
     }
 
-    /// Opens a tool batch if the tail is not already one.
-    fn ensure_open_batch(&mut self) {
-        if matches!(self.transcript.open_tail(), Some(Block::Tools(_))) {
-            return;
-        }
-        self.transcript.close_open();
-        self.transcript.push(Block::Tools(ToolActivity::default()));
-        self.open_calls.clear();
-    }
-
-    /// Locates a call within the open batch.
+    /// Chooses the batch a newly seen call belongs to.
     ///
-    /// Exact correlation is preferred. When the engine omitted ids, falls back
-    /// to the most recent unfinished call with the same tool name, which is the
-    /// best available guess and matches how a single-threaded turn behaves.
-    fn find_call(&self, correlation: &Correlation, tool_name: Option<&str>) -> Option<usize> {
-        if correlation.call_id.is_some() {
-            if let Some(index) = self
-                .open_calls
-                .iter()
-                .position(|c| c.call_id == correlation.call_id)
-            {
-                return Some(index);
+    /// A batch may only be extended while it is still the last block: once
+    /// assistant text or anything else follows, later calls open a new batch,
+    /// which is what keeps interleaved text and tools in the right order.
+    fn batch_for_new_call(&mut self, key: &ActivityKey) -> usize {
+        if let Some(Block::Tools {
+            activity,
+            key: existing,
+            ..
+        }) = self.transcript.blocks().last()
+        {
+            if !activity.complete && existing == key {
+                return self.transcript.len() - 1;
             }
         }
 
-        let Some(Block::Tools(activity)) = self.transcript.blocks().last() else {
-            return None;
-        };
-        let name = tool_name?;
-        activity
-            .calls
-            .iter()
-            .rposition(|c| c.name == name && !c.status.is_terminal())
+        self.transcript.close_open();
+        self.transcript.push(Block::Tools {
+            activity: ToolActivity::default(),
+            key: key.clone(),
+            calls: Vec::new(),
+        });
+        self.transcript.len() - 1
     }
 
-    /// Drops the `[pending]` marker from delivered queued messages.
-    fn mark_delivered(&mut self, _ids: &[String]) {
-        // The transcript keeps queued messages in submission order, so the
-        // oldest pending blocks are the ones that were just delivered.
-        let mut remaining = _ids.len();
-        for block in self.transcript.blocks_mut() {
-            if remaining == 0 {
-                break;
-            }
-            if let Block::User { pending, .. } = block {
-                if *pending {
-                    *pending = false;
-                    remaining -= 1;
+    /// Finds the block and call index a correlation refers to.
+    ///
+    /// Scans backwards for the batch that already owns this exact call, so a
+    /// result still lands correctly when assistant text has since opened a new
+    /// batch. Falls back to the most recent unfinished call of the same name
+    /// when the engine omitted correlation ids.
+    fn locate_call(&self, correlation: &Correlation, tool_name: &str) -> Option<(usize, usize)> {
+        let blocks = self.transcript.blocks();
+
+        if correlation.call_id.is_some() {
+            for (block_index, block) in blocks.iter().enumerate().rev() {
+                let Block::Tools { calls, .. } = block else {
+                    continue;
+                };
+                if let Some(call_index) =
+                    calls.iter().position(|known| same_call(known, correlation))
+                {
+                    return Some((block_index, call_index));
                 }
             }
+            return None;
         }
+
+        // No id to match on: the newest unfinished call of this name is the
+        // only defensible guess, and matches a single-threaded turn.
+        for (block_index, block) in blocks.iter().enumerate().rev() {
+            let Block::Tools { activity, .. } = block else {
+                continue;
+            };
+            if let Some(call_index) = activity
+                .calls
+                .iter()
+                .rposition(|call| call.name == tool_name && !call.status.is_terminal())
+            {
+                return Some((block_index, call_index));
+            }
+        }
+        None
     }
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
@@ -583,7 +623,7 @@ mod tests {
 
     fn tools(state: &UiState) -> Option<&ToolActivity> {
         state.transcript.blocks().iter().find_map(|b| match b {
-            Block::Tools(activity) => Some(activity),
+            Block::Tools { activity, .. } => Some(activity),
             _ => None,
         })
     }
@@ -616,6 +656,7 @@ mod tests {
                 text,
                 timestamp,
                 pending,
+                ..
             } => {
                 assert_eq!(text, "hi");
                 assert_eq!(timestamp, "09:41");
@@ -1088,8 +1129,221 @@ mod tests {
     }
 
     #[test]
-    fn a_full_turn_produces_the_expected_block_sequence() {
+    fn a_result_still_lands_after_text_opened_a_new_batch() {
+        // Interleaved text is common; the result for an earlier call must be
+        // routed back to the batch that owns it, not appended to the new one.
         let mut state = state();
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "read_file".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c1"),
+        }));
+        state.apply(UiEvent::Engine(Event::AssistantText {
+            delta: "thinking about it".into(),
+        }));
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "grep".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c2"),
+        }));
+
+        // The late result for the *first* call arrives now.
+        state.apply(UiEvent::Engine(Event::ToolResult {
+            tool_name: "read_file".into(),
+            content: "file body".into(),
+            is_error: false,
+            status: Some(ToolCallStatus::Succeeded),
+            correlation: correlation("c1"),
+        }));
+
+        let batches: Vec<&ToolActivity> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Tools { activity, .. } => Some(activity),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(batches.len(), 2, "text should have opened a second batch");
+        assert_eq!(batches[0].calls.len(), 1, "no orphan was appended");
+        assert_eq!(
+            batches[0].calls[0].result.as_deref(),
+            Some("file body"),
+            "the result did not reach the batch that owns the call"
+        );
+        assert_eq!(batches[1].calls.len(), 1);
+        assert!(batches[1].calls[0].result.is_none());
+    }
+
+    #[test]
+    fn interleaved_text_and_tools_keep_their_transcript_order() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "read_file".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c1"),
+        }));
+        state.apply(UiEvent::Engine(Event::AssistantText {
+            delta: "between".into(),
+        }));
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "grep".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c2"),
+        }));
+
+        let kinds: Vec<&str> = state
+            .transcript
+            .blocks()
+            .iter()
+            .map(|b| match b {
+                Block::Tools { .. } => "tools",
+                Block::Assistant { .. } => "assistant",
+                _ => "other",
+            })
+            .collect();
+
+        assert_eq!(kinds, vec!["tools", "assistant", "tools"]);
+    }
+
+    #[test]
+    fn an_interrupted_batch_resolves_its_unfinished_calls() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "run_command".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c1"),
+        }));
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: None,
+            interrupted: true,
+            root_turn_id: Some("t1".into()),
+            activity_id: None,
+        }));
+
+        let calls = &tools(&state).expect("a batch").calls;
+        assert_eq!(
+            calls[0].status,
+            CallStatus::Cancelled,
+            "a running call must not stay running after the turn ends"
+        );
+    }
+
+    #[test]
+    fn finalising_resolves_every_open_batch_not_just_the_last() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "a".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c1"),
+        }));
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "x".into() }));
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: "b".into(),
+            input_json: "{}".into(),
+            correlation: correlation("c2"),
+        }));
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: None,
+            interrupted: true,
+            root_turn_id: Some("t1".into()),
+            activity_id: None,
+        }));
+
+        for block in state.transcript.blocks() {
+            if let Block::Tools { activity, .. } = block {
+                assert!(activity.complete, "a batch was left open");
+                for call in &activity.calls {
+                    assert!(
+                        call.status.is_terminal(),
+                        "call {:?} was left unresolved",
+                        call.name
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn undelivered_queued_messages_are_dropped_when_the_turn_ends() {
+        let mut state = state();
+        state.apply(UiEvent::Submitted { text: "go".into() });
+        state.apply(UiEvent::Queued {
+            text: "never delivered".into(),
+            id: Some("s1".into()),
+        });
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: Some("end_turn".into()),
+            interrupted: false,
+            root_turn_id: None,
+            activity_id: None,
+        }));
+
+        assert!(state.queued.is_empty());
+        assert!(
+            !state
+                .transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::User { pending: true, .. })),
+            "an undelivered message was left in the transcript"
+        );
+    }
+
+    #[test]
+    fn steering_delivery_matches_by_id_not_position() {
+        let mut state = state();
+        state.apply(UiEvent::Submitted { text: "go".into() });
+        for id in ["s1", "s2", "s3"] {
+            state.apply(UiEvent::Queued {
+                text: id.to_string(),
+                id: Some(id.to_string()),
+            });
+        }
+
+        // Only the middle one is delivered.
+        state.apply(UiEvent::Engine(Event::SteeringDelivered {
+            message_ids: vec!["s2".into()],
+        }));
+
+        let pending: Vec<&str> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::User {
+                    text,
+                    pending: true,
+                    ..
+                } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(pending, vec!["s1", "s3"], "the wrong message was promoted");
+    }
+
+    #[test]
+    fn a_delivery_for_an_unknown_id_promotes_nothing() {
+        let mut state = state();
+        state.apply(UiEvent::Queued {
+            text: "queued".into(),
+            id: Some("s1".into()),
+        });
+        state.apply(UiEvent::Engine(Event::SteeringDelivered {
+            message_ids: vec!["other".into()],
+        }));
+
+        assert!(matches!(
+            state.transcript.blocks().last(),
+            Some(Block::User { pending: true, .. })
+        ));
+    }
+
+    #[test]
+    fn a_full_turn_produces_the_expected_block_sequence() {        let mut state = state();
         state.apply(UiEvent::Connected {
             session_id: "s1".into(),
         });
@@ -1126,7 +1380,7 @@ mod tests {
             .map(|b| match b {
                 Block::User { .. } => "user",
                 Block::Assistant { .. } => "assistant",
-                Block::Tools(_) => "tools",
+                Block::Tools { .. } => "tools",
                 Block::Notice { .. } => "notice",
                 _ => "other",
             })
@@ -1137,3 +1391,5 @@ mod tests {
         assert!(!state.is_busy());
     }
 }
+
+
