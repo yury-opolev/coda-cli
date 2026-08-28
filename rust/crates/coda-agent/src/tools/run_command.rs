@@ -140,7 +140,12 @@ fn shell_args(command: &str) -> Vec<String> {
 async fn kill_tree(pid: u32) {
     #[cfg(windows)]
     {
+        // The child often exits on its own first, and taskkill then writes a
+        // "process not found" line straight to our console. That is expected,
+        // so its output is discarded rather than shown to the user.
         let _ = tokio::process::Command::new("taskkill")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .args(["/F", "/T", "/PID", &pid.to_string()])
             .status()
             .await;
