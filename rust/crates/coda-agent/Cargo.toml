@@ -22,6 +22,8 @@ async-trait = "0.1"
 uuid.workspace = true
 time.workspace = true
 regex.workspace = true
+reqwest.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

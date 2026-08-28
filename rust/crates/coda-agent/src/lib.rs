@@ -19,12 +19,19 @@
 //! - **`events`**: `AgentEvent`, `AgentSink`, `ProtoAdapter`, `NullSink`,
 //!   `CollectingSink`, `ToolCallStatus`.
 //! - **`agent`**: `AgentLoop`, `AgentLoopBuilder`, `AgentError`.
+//!
+//! ## Phase 3 — Built-in tools
+//!
+//! - **`todos`**: `TodoItem`, `TodoStatus`, `TodoStore`.
+//! - **`tools`**: all built-in tools; `built_in_tools()` returns the full set,
+//!   `built_in_file_tools()` returns the Phase-2 subset.
 
 pub mod agent;
 pub mod events;
 pub mod goal;
 pub mod permission;
 pub mod steering;
+pub mod todos;
 pub mod tool;
 pub mod tools;
 
@@ -40,5 +47,9 @@ pub use permission::{
     PermissionRuleStore,
 };
 pub use steering::{SteeringEntry, SteeringInbox};
-pub use tool::{Tool, ToolContext, ToolNameFilter, ToolOutcome, ToolQuarantine, ToolRegistry, ToolResult};
-pub use tools::built_in_file_tools;
+pub use todos::{TodoItem, TodoStatus, TodoStore};
+pub use tool::{
+    PlanApprover, Tool, ToolContext, ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine,
+    ToolRegistry, ToolResult, UserQuestion,
+};
+pub use tools::{built_in_file_tools, built_in_tools};

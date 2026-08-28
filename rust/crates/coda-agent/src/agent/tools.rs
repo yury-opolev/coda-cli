@@ -177,6 +177,10 @@ pub(crate) async fn run_tools(
             working_directory: ctx.working_directory.to_owned(),
             allow_outside_working_directory: ctx.allow_outside_working_directory(),
             granted_directories: ctx.granted_directories.cloned(),
+            todos: None,
+            user_question: None,
+            plan_approver: None,
+            all_tools: None,
         };
 
         sink.emit(AgentEvent::ToolStatus {

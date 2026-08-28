@@ -7,13 +7,53 @@
 
 use std::collections::HashSet;
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
+
+use crate::todos::TodoStore;
+
+// ── Interaction seams ─────────────────────────────────────────────────────────
+
+/// Seam for surfacing a multiple-choice question to the user and receiving an answer.
+/// The loop wires a concrete implementation; `None` in `ToolContext` signals headless mode.
+#[async_trait]
+pub trait UserQuestion: Send + Sync {
+    async fn ask(
+        &self,
+        question: &str,
+        options: &[String],
+        multi_select: bool,
+        cancel: CancellationToken,
+    ) -> String;
+}
+
+/// Seam for presenting a plan to the user and receiving an approval decision.
+/// The loop wires a concrete implementation; `None` in `ToolContext` signals headless mode.
+#[async_trait]
+pub trait PlanApprover: Send + Sync {
+    async fn approve(&self, plan: &str, cancel: CancellationToken) -> bool;
+}
+
+/// Lightweight description of a registered tool, used by `tool_search` to query
+/// the tool list without holding `Arc<dyn Tool>` in the context (which would be
+/// a circular dependency: `Tool::execute` takes `&ToolContext`).
+#[derive(Debug, Clone)]
+pub struct ToolDescriptor {
+    pub name: String,
+    pub description: String,
+    pub input_schema_json: String,
+    pub is_deferred: bool,
+    pub search_hint: Option<String>,
+}
+
+// ── ToolContext ───────────────────────────────────────────────────────────────
 
 /// Context passed to a tool during execution.
 ///
 /// All service handles are `None` for tools run in isolation (tests, early specs).
-/// The loop populates them when the full stack is wired. Additional service
-/// handles (subagents, todos, LSP, etc.) will be added here as those specs land.
-#[derive(Debug)]
+/// The loop populates them when the full stack is wired.
 pub struct ToolContext {
     /// Root directory the agent was started in; the default sandbox boundary.
     pub working_directory: String,
@@ -23,6 +63,31 @@ pub struct ToolContext {
     /// Additional roots (e.g. skill directories the user consented to) that
     /// file tools may access beyond `working_directory`.
     pub granted_directories: Option<HashSet<String>>,
+
+    // ── Optional service handles ──────────────────────────────────────────────
+    /// Session todo list; `None` means the store is not available (tool still works,
+    /// it just cannot persist the todo state).
+    pub todos: Option<Arc<TodoStore>>,
+    /// User-question seam; `None` means headless (no interactive user).
+    pub user_question: Option<Arc<dyn UserQuestion>>,
+    /// Plan-approval seam; `None` means headless.
+    pub plan_approver: Option<Arc<dyn PlanApprover>>,
+    /// Full registry of tools in descriptor form, used by `tool_search`.
+    pub all_tools: Option<Vec<ToolDescriptor>>,
+}
+
+impl std::fmt::Debug for ToolContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ToolContext")
+            .field("working_directory", &self.working_directory)
+            .field("allow_outside_working_directory", &self.allow_outside_working_directory)
+            .field("granted_directories", &self.granted_directories)
+            .field("todos", &self.todos.is_some())
+            .field("user_question", &self.user_question.is_some())
+            .field("plan_approver", &self.plan_approver.is_some())
+            .field("all_tools", &self.all_tools.as_ref().map(|v| v.len()))
+            .finish()
+    }
 }
 
 impl ToolContext {
@@ -31,12 +96,36 @@ impl ToolContext {
             working_directory: working_directory.into(),
             allow_outside_working_directory: false,
             granted_directories: None,
+            todos: None,
+            user_question: None,
+            plan_approver: None,
+            all_tools: None,
         }
     }
 
     /// Enables bypass mode (no path sandbox).
     pub fn with_bypass(mut self) -> Self {
         self.allow_outside_working_directory = true;
+        self
+    }
+
+    pub fn with_todos(mut self, todos: Arc<TodoStore>) -> Self {
+        self.todos = Some(todos);
+        self
+    }
+
+    pub fn with_user_question(mut self, uq: Arc<dyn UserQuestion>) -> Self {
+        self.user_question = Some(uq);
+        self
+    }
+
+    pub fn with_plan_approver(mut self, pa: Arc<dyn PlanApprover>) -> Self {
+        self.plan_approver = Some(pa);
+        self
+    }
+
+    pub fn with_all_tools(mut self, tools: Vec<ToolDescriptor>) -> Self {
+        self.all_tools = Some(tools);
         self
     }
 }

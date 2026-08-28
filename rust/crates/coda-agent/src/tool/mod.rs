@@ -9,7 +9,7 @@ pub mod name_filter;
 pub mod quarantine;
 pub mod registry;
 
-pub use context::ToolContext;
+pub use context::{PlanApprover, ToolContext, ToolDescriptor, UserQuestion};
 pub use name_filter::ToolNameFilter;
 pub use quarantine::ToolQuarantine;
 pub use registry::ToolRegistry;
