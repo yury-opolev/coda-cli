@@ -120,12 +120,24 @@ fn resolve_final_target(path: &Path) -> PathBuf {
 }
 
 /// Normalize a path (collapse `..` and `.`) without requiring existence.
+///
+/// `..` is clamped at the root rather than allowed to pop past it. Popping the
+/// prefix would silently turn an absolute path into a relative one, and any
+/// caller that later resolved it against the working directory would land
+/// somewhere entirely different from what was checked.
 fn normalize_path(path: &Path) -> PathBuf {
     let mut components: Vec<Component<'_>> = Vec::new();
     for component in path.components() {
         match component {
             Component::ParentDir => {
-                components.pop();
+                // Never pop the prefix or root: `C:\a\..\..` is `C:\`, not `..`.
+                let poppable = !matches!(
+                    components.last(),
+                    None | Some(Component::Prefix(_)) | Some(Component::RootDir)
+                );
+                if poppable {
+                    components.pop();
+                }
             }
             Component::CurDir => {}
             c => components.push(c),
@@ -163,15 +175,96 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_blocks_escape() {
-        // Use a path that definitely won't be inside a project root.
-        let root = std::env::temp_dir().to_string_lossy().into_owned();
-        let outside = resolve_path(&root, "../../some_file");
-        // after normalization this may or may not escape, but confirm the API behaves
-        let result = try_resolve_within_root(&root, &outside, false, None);
-        // Either it's within root (normalization collapsed the traversal) or it's blocked.
-        // We just verify the function returns without panicking.
-        let _ = result;
+    fn sandbox_blocks_traversal_out_of_the_root() {
+        let root = std::env::current_dir().unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+
+        for escape in [
+            "../../../../../../etc/passwd",
+            "../outside.txt",
+            "subdir/../../outside.txt",
+        ] {
+            assert!(
+                try_resolve_within_root(&root_str, escape, false, None).is_err(),
+                "{escape} escaped the sandbox"
+            );
+        }
+    }
+
+    #[test]
+    fn sandbox_blocks_an_absolute_path_outside_the_root() {
+        let root = std::env::current_dir().unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        let outside = if cfg!(windows) {
+            r"C:\Windows\System32\drivers\etc\hosts"
+        } else {
+            "/etc/passwd"
+        };
+
+        assert!(try_resolve_within_root(&root_str, outside, false, None).is_err());
+    }
+
+    #[test]
+    fn containment_is_checked_at_a_path_boundary_not_by_prefix() {
+        // `/projevil` must not pass a `/proj` check just because the string
+        // starts with it.
+        let root = std::env::temp_dir().join("coda-sandbox-proj");
+        let sibling = std::env::temp_dir().join("coda-sandbox-projevil");
+
+        assert!(!is_within_root(
+            &root.to_string_lossy(),
+            &sibling.to_string_lossy()
+        ));
+        assert!(is_within_root(
+            &root.to_string_lossy(),
+            &root.join("inner/file.txt").to_string_lossy()
+        ));
+    }
+
+    #[test]
+    fn a_granted_directory_widens_the_sandbox_only_to_itself() {
+        let root = std::env::temp_dir().join("coda-sandbox-root");
+        let granted = std::env::temp_dir().join("coda-sandbox-granted");
+        let elsewhere = std::env::temp_dir().join("coda-sandbox-elsewhere");
+        let granted_list: std::collections::HashSet<String> =
+            [granted.to_string_lossy().into_owned()].into_iter().collect();
+
+        let root_str = root.to_string_lossy().into_owned();
+        assert!(try_resolve_within_root(
+            &root_str,
+            &granted.join("file.txt").to_string_lossy(),
+            false,
+            Some(&granted_list),
+        )
+        .is_ok());
+
+        assert!(
+            try_resolve_within_root(
+                &root_str,
+                &elsewhere.join("file.txt").to_string_lossy(),
+                false,
+                Some(&granted_list),
+            )
+            .is_err(),
+            "a granted directory must not open unrelated paths"
+        );
+    }
+
+    #[test]
+    fn excess_parent_segments_clamp_at_the_root_instead_of_going_relative() {
+        // Popping past the root would turn an absolute path into a relative
+        // one, which a later join would resolve somewhere unchecked.
+        let normalized = normalize_path(Path::new(if cfg!(windows) {
+            r"C:\a\..\..\..\b"
+        } else {
+            "/a/../../../b"
+        }));
+
+        assert!(
+            normalized.is_absolute(),
+            "{} lost its root",
+            normalized.display()
+        );
     }
 
     #[test]
