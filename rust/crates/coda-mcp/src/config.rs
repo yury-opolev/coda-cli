@@ -244,15 +244,24 @@ mod tests {
     use super::*;
     struct TempDir(PathBuf);
 
+    /// Guarantees a distinct directory per instance.
+    ///
+    /// Neither the wall clock nor `subsec_nanos` is sufficient on its own:
+    /// Windows advances the clock on a ~15 ms tick and `subsec_nanos` wraps
+    /// every second, so parallel tests can land on the same path — and
+    /// whichever finishes first deletes the directory the other is using.
+    static TEMP_DIR_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
     impl TempDir {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!(
-                "coda-mcp-config-test-{}-{}",
+                "coda-mcp-config-test-{}-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
-                    .subsec_nanos()
+                    .as_nanos(),
+                TEMP_DIR_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             ));
             std::fs::create_dir_all(&path).expect("temp dir");
             Self(path)

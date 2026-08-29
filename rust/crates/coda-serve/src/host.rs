@@ -21,8 +21,9 @@ use coda_auth::{
 };
 use coda_auth::provider::copilot::CopilotConfig as AuthCopilotConfig;
 use coda_auth::store::{CredentialStore, KeyringStore, EncryptedFileStore};
+use coda_llm::anthropic::{AnthropicClient, AnthropicConfig};
 use coda_llm::{
-    AnthropicClient, AnthropicConfig, ChatRequest, Content, CopilotClient, CopilotConfig,
+    ChatRequest, Content, CopilotClient, CopilotConfig,
     CredentialSource, Effort, LlmClient, Message, Role,
 };
 use coda_proto::messages::PROTOCOL_VERSION;

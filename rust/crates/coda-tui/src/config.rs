@@ -681,18 +681,28 @@ mod tests {
     /// A minimal scoped temporary directory, to avoid a dev-dependency.
     mod tempdir {
         use std::path::{Path, PathBuf};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        /// Guarantees a distinct directory per instance.
+        ///
+        /// The wall clock alone is not enough: Windows updates it on a ~15 ms
+        /// tick, so two tests constructed inside the same tick collide, and
+        /// whichever finishes first deletes the directory the other is still
+        /// using — a failure that only shows up under parallel execution.
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
 
         pub struct TempDir(PathBuf);
 
         impl TempDir {
             pub fn new() -> Self {
                 let base = std::env::temp_dir().join(format!(
-                    "coda-tui-test-{}-{:?}",
+                    "coda-tui-test-{}-{}-{}",
                     std::process::id(),
                     std::time::SystemTime::now()
                         .duration_since(std::time::UNIX_EPOCH)
                         .map(|d| d.as_nanos())
-                        .unwrap_or(0)
+                        .unwrap_or(0),
+                    COUNTER.fetch_add(1, Ordering::Relaxed)
                 ));
                 std::fs::create_dir_all(&base).expect("temp dir");
                 Self(base)

@@ -824,4 +824,176 @@ mod tests {
             "expected InvalidUrl, got {err:?}"
         );
     }
+
+    // ── auth header includes GitHub API version ────────────────────────────────
+
+    #[test]
+    fn auth_headers_include_github_api_version() {
+        let cred = Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("bearer_token".into())),
+            refresh_token: None,
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        let headers = p.auth_headers(&cred).expect("headers");
+        let header_map: std::collections::HashMap<_, _> = headers.into_iter().collect();
+        assert_eq!(
+            header_map.get("x-github-api-version").map(String::as_str),
+            Some(GITHUB_API_VERSION),
+            "x-github-api-version header must match the declared constant"
+        );
+    }
+
+    // ── raw-token self-heal ────────────────────────────────────────────────────
+
+    /// When the exchange URL is configured AND the stored credential holds a
+    /// raw GitHub OAuth token (identifiable by its prefix), `needs_refresh`
+    /// must return `true` so the token is immediately re-exchanged for a
+    /// full-entitlement Copilot token.  This "self-heal" is crucial for
+    /// credentials stored before the exchange endpoint existed.
+    #[test]
+    fn needs_refresh_is_true_for_raw_github_token_with_exchange_configured() {
+        let raw_prefixes = [
+            "ghu_RawDeviceFlowToken",
+            "gho_RawOAuthToken",
+            "ghp_PersonalAccessToken",
+            "ghs_ServerToken",
+            "ghr_RunnerToken",
+            "ghe_EnterpriseToken",
+            "github_pat_FinegrainedPat",
+        ];
+        // default_public() has copilot_token_url = Some(...)  → UseExchange=true equivalent
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+
+        for raw_token in raw_prefixes {
+            let cred = Credential {
+                provider_id: PROVIDER_ID.into(),
+                kind: CredentialKind::OAuth,
+                access_token: Some(Secret::new(raw_token.into())),
+                refresh_token: Some(Secret::new(raw_token.into())),
+                api_key: None,
+                // Null ExpiresAt is the fingerprint of a build_direct_credential result.
+                expires_at: None,
+                scopes: Vec::new(),
+                account: None,
+            };
+            assert!(
+                p.needs_refresh(&cred),
+                "raw token '{raw_token}' with exchange configured must trigger refresh"
+            );
+        }
+    }
+
+    /// When the exchange URL is NOT configured (copilot_token_url = None),
+    /// a raw GitHub token with null ExpiresAt represents a legitimate long-lived
+    /// credential and must NOT trigger a refresh.
+    #[test]
+    fn needs_refresh_is_false_for_raw_token_when_no_exchange_configured() {
+        let config = CopilotConfig {
+            copilot_token_url: None, // UseExchange=false equivalent
+            ..CopilotConfig::default_public()
+        };
+        let p = CopilotProvider::new(config);
+        let cred = Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("ghu_RawToken".into())),
+            refresh_token: Some(Secret::new("ghu_RawToken".into())),
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        assert!(
+            !p.needs_refresh(&cred),
+            "raw token without exchange configured must NOT trigger refresh"
+        );
+    }
+
+    /// An already-exchanged token that happens to have null ExpiresAt (unusual
+    /// but possible) must NOT be flagged as needing self-heal, since its
+    /// access_token doesn't start with a known raw-token prefix.
+    #[test]
+    fn needs_refresh_is_false_for_already_exchanged_token_with_null_expiry() {
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        let cred = Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            // "tid=…" is the Copilot-exchanged token format — not a raw prefix.
+            access_token: Some(Secret::new(
+                "tid=abc;exp=123;sku=copilot_enterprise_seat_quota".into(),
+            )),
+            refresh_token: Some(Secret::new("ghu_underlying_github_token".into())),
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        assert!(
+            !p.needs_refresh(&cred),
+            "already-exchanged token must not be mistaken for a raw token"
+        );
+    }
+
+    // ── access denied during device login ────────────────────────────────────
+
+    /// When the user denies consent in the browser, the token endpoint returns
+    /// `"error":"access_denied"`.  The provider must surface this as
+    /// `AuthError::LoginCancelled` rather than retrying indefinitely or panicking.
+    #[tokio::test]
+    async fn device_login_access_denied_throws_login_cancelled() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break };
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 4096];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..n]);
+
+                    let body = if request.contains("device") {
+                        // Device-code endpoint: return a valid code.
+                        r#"{"device_code":"DC","user_code":"AAAA-BBBB","verification_uri":"http://gh","expires_in":900,"interval":0}"#
+                    } else {
+                        // Token endpoint: deny consent.
+                        r#"{"error":"access_denied"}"#
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let config = CopilotConfig {
+            client_id: "id".into(),
+            device_code_url: format!("{base_url}/device"),
+            token_url: format!("{base_url}/token"),
+            copilot_token_url: None,
+            scope: "read:user".into(),
+            editor_version: "v".into(),
+            editor_plugin_version: "p".into(),
+            integration_id: "i".into(),
+            user_agent: "u".into(),
+        };
+
+        let p = CopilotProvider::new(config);
+        let result = p.login_with_device_code(|_| async { Ok(()) }).await;
+
+        assert!(
+            matches!(result, Err(AuthError::LoginCancelled(_))),
+            "access_denied must surface as AuthError::LoginCancelled, got {result:?}"
+        );
+    }
 }

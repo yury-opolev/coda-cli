@@ -36,6 +36,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
 }
 
 /// Runs the engine on the given reader/writer pair.
+#[cfg(test)]
 pub(crate) async fn serve<R, W>(reader: R, writer: W) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -49,6 +50,7 @@ where
 
 /// Runs the engine with a pre-built client (used by integration tests so
 /// the LLM call never touches the network).
+#[cfg(test)]
 pub(crate) async fn serve_with_client<R, W>(
     reader: R,
     writer: W,
@@ -461,9 +463,9 @@ mod tests {
     // (with built-in tools, real history accumulation, real event emission)
     // but never touches the network.
 
-    use coda_agent::tools::built_in_tools;
+    use coda_agent::tools::built_in_tools as _;
     use coda_llm::{
-        ChatRequest, Content, Correlation, LlmClient, Message, ModelInfo,
+        ChatRequest, Content, Correlation, LlmClient,
         ResponseStream, Usage,
     };
     use coda_llm::anthropic::StreamEvent;
@@ -512,7 +514,7 @@ mod tests {
     impl LlmClient for ErrorLlmClient {
         fn provider_id(&self) -> &str { "error-fake" }
         async fn stream(&self, _req: ChatRequest) -> Result<ResponseStream, LlmError> {
-            Err(LlmError::Auth("simulated auth failure".into()))
+            Err(LlmError::Unauthorized("simulated auth failure".into()))
         }
     }
 
@@ -543,7 +545,9 @@ mod tests {
         let (server_read, server_write) = split(server_end);
         let (client_read, client_write) = split(client_end);
         let wd = working_dir.to_string();
-        tokio::spawn(serve_with_client(server_read, server_write, client, &wd));
+        tokio::spawn(async move {
+            let _ = serve_with_client(server_read, server_write, client, &wd).await;
+        });
         (client_write, TestReader::new(client_read))
     }
 
@@ -575,7 +579,7 @@ mod tests {
         std::fs::write(&file, "hello from the test file").unwrap();
         let file_path = file.to_str().unwrap().replace('\\', "/");
 
-        let client = Arc::new(FakeLlmClient::new(vec![
+        let client: Arc<dyn LlmClient> = Arc::new(FakeLlmClient::new(vec![
             // Turn 1: model asks to read_file
             vec![
                 StreamEvent::ToolUse(Content::ToolUse {
@@ -669,7 +673,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_interrupt_yields_interrupted_true() {
-        let client = Arc::new(BlockingLlmClient);
+        let client: Arc<dyn LlmClient> = Arc::new(BlockingLlmClient);
         let (mut cw, mut cr) = make_fake_harness(Arc::clone(&client), ".");
         do_initialize(&mut cw, &mut cr).await;
 
@@ -715,7 +719,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failing_model_returns_ok_false_with_error_not_a_panic() {
-        let client = Arc::new(ErrorLlmClient);
+        let client: Arc<dyn LlmClient> = Arc::new(ErrorLlmClient);
         let (mut cw, mut cr) = make_fake_harness(Arc::clone(&client), ".");
         do_initialize(&mut cw, &mut cr).await;
 

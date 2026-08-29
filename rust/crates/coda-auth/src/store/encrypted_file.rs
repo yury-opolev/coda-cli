@@ -311,4 +311,106 @@ mod tests {
         tokio::fs::write(&path, b"this is garbage").await.expect("write");
         assert_eq!(store.get("corrupt").await.expect("get"), None);
     }
+
+    // ── additional behaviours from the C# FileTokenStoreTests spec ────────────
+
+    /// A second `EncryptedFileStore` opened over the same directory must reload
+    /// the persisted AES key and successfully decrypt what the first instance
+    /// wrote.  This is the core "process restart" scenario.
+    #[tokio::test]
+    async fn second_instance_reads_data_written_by_first_instance() {
+        let dir = tempdir();
+
+        let store1 = EncryptedFileStore::new(dir.clone()).expect("store1");
+        store1.set("llmauth:persist-check", "persisted-value").await.expect("set");
+        drop(store1); // make the first instance go away
+
+        let store2 = EncryptedFileStore::new(dir).expect("store2");
+        let result = store2.get("llmauth:persist-check").await.expect("get");
+        assert_eq!(result.as_deref(), Some("persisted-value"));
+    }
+
+    /// A second write to the same key must silently replace the previous value.
+    #[tokio::test]
+    async fn overwrite_returns_latest_value() {
+        let store = temp_store();
+        store.set("llmauth:overwrite", "a").await.expect("set a");
+        store.set("llmauth:overwrite", "b").await.expect("set b");
+        let result = store.get("llmauth:overwrite").await.expect("get");
+        assert_eq!(result.as_deref(), Some("b"));
+    }
+
+    /// Keys must be isolated from each other: writing one key must not clobber
+    /// a different key, and both must be independently readable.
+    #[tokio::test]
+    async fn multiple_keys_are_isolated() {
+        let store = temp_store();
+        store.set("llmauth:key1", "value-one").await.expect("set1");
+        store.set("llmauth:key2", "value-two").await.expect("set2");
+        assert_eq!(
+            store.get("llmauth:key1").await.expect("get1").as_deref(),
+            Some("value-one")
+        );
+        assert_eq!(
+            store.get("llmauth:key2").await.expect("get2").as_deref(),
+            Some("value-two")
+        );
+    }
+
+    /// Keys containing colons (our standard `"llmauth:<provider>"` format) and
+    /// other characters that would be invalid in file names must be sanitised to
+    /// a safe filename without losing uniqueness.
+    #[tokio::test]
+    async fn key_containing_colon_maps_to_a_safe_filename() {
+        let store = temp_store();
+        store
+            .set("llmauth:claude-ai", "token-value-for-claude")
+            .await
+            .expect("set");
+
+        // The credential file must exist but must not contain a colon in its name.
+        let path = store.path_for("llmauth:claude-ai");
+        assert!(
+            path.exists(),
+            "credential file must be created for a colon-containing key"
+        );
+        let filename = path.file_name().unwrap().to_string_lossy();
+        assert!(
+            !filename.contains(':'),
+            "filename must not contain a colon; got '{filename}'"
+        );
+
+        // And the value must still round-trip correctly.
+        let got = store.get("llmauth:claude-ai").await.expect("get");
+        assert_eq!(got.as_deref(), Some("token-value-for-claude"));
+    }
+
+    /// A `key.bin` that is corrupt (wrong length or invalid content) must be
+    /// silently regenerated so the store is usable after construction.  Any
+    /// previously encrypted credentials will be unreadable (wrong key), but the
+    /// store itself must not panic or return an error during `new()`.
+    #[tokio::test]
+    async fn corrupt_key_file_is_regenerated_and_store_still_works() {
+        let dir = tempdir();
+        let key_path = dir.join(KEY_FILE);
+
+        // Write a key.bin that is neither a valid 32-byte raw key nor a valid
+        // DPAPI-wrapped blob: just five garbage bytes.
+        std::fs::write(&key_path, &[1u8, 2, 3, 4, 5]).expect("write corrupt key");
+
+        // Construction must not panic — the corrupt key must be regenerated.
+        let store = EncryptedFileStore::new(dir.clone()).expect("store must not fail on corrupt key");
+
+        // The regenerated store must be fully functional: set and get must work.
+        store
+            .set("llmauth:copilot", "secret-value")
+            .await
+            .expect("set after key regen");
+
+        // A second instance over the same directory reads the key that was
+        // regenerated above (not the original corrupt bytes).
+        let store2 = EncryptedFileStore::new(dir).expect("store2");
+        let got = store2.get("llmauth:copilot").await.expect("get");
+        assert_eq!(got.as_deref(), Some("secret-value"));
+    }
 }
