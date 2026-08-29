@@ -1,0 +1,17 @@
+[package]
+name = "coda-proto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Wire types and Content-Length framing for the Coda `serve` JSON-RPC 2.0 protocol."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

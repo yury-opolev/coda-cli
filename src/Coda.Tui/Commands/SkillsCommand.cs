@@ -206,9 +206,7 @@ public sealed class SkillsCommand : ISlashCommand
             // Atomic write: write to a sibling temp file then rename so a crash mid-write
             // never leaves the skill file truncated.
             var dir = Path.GetDirectoryName(Path.GetFullPath(sourcePath))!;
-            var tmp = Path.Combine(dir, $".skill-{Guid.NewGuid():N}.tmp");
-            File.WriteAllText(tmp, updated);
-            File.Move(tmp, sourcePath, overwrite: true);
+            AtomicFile.WriteAllText(sourcePath, updated);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {

@@ -1,0 +1,22 @@
+[package]
+name = "coda-render"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Markdown, unified-diff and syntax rendering into ratatui text, plus the Coda theme."
+
+[dependencies]
+ratatui.workspace = true
+pulldown-cmark.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+once_cell.workspace = true
+
+[dev-dependencies]
+insta.workspace = true
+pretty_assertions.workspace = true
+

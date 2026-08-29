@@ -1,5 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using Coda.Common;
 
 namespace Coda.Tui.Plugins;
 
@@ -289,9 +290,7 @@ public sealed class PluginStateStore
         root["pluginConfig"] = configObj;
 
         var json = root.ToJsonString(WriteOptions);
-        var tmp = Path.Combine(this.codaDir, $".plugin-state.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, this.filePath, overwrite: true);
+        AtomicFile.WriteAllText(this.filePath, json);
     }
 
     private sealed class StateDocument

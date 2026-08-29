@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using Coda.Agent.Permissions;
 using Microsoft.Extensions.Logging;
+using Coda.Common;
 
 namespace Coda.Agent.Settings;
 
@@ -40,9 +41,7 @@ public static class SettingsWriter
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
 
     /// <summary>
@@ -76,9 +75,7 @@ public static class SettingsWriter
         // A crash or concurrent writer can't truncate settings.json (which also holds
         // the user's permissions/hooks/lspServers).
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
 
     /// <summary>
@@ -114,9 +111,7 @@ public static class SettingsWriter
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
     public static void SetUserModelForProvider(string providerId, string model, string? userSettingsDir = null)
     {
@@ -145,9 +140,7 @@ public static class SettingsWriter
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
 
     /// <summary>
@@ -181,9 +174,7 @@ public static class SettingsWriter
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
 
     /// <summary>
@@ -236,9 +227,7 @@ public static class SettingsWriter
             }
 
             var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-            var tmp = Path.Combine(dir ?? ".", $".settings.{Guid.NewGuid():N}.tmp");
-            File.WriteAllText(tmp, json);
-            File.Move(tmp, settingsFilePath, overwrite: true);
+            AtomicFile.WriteAllText(settingsFilePath, json);
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or NotSupportedException or ArgumentException)
         {
@@ -350,9 +339,7 @@ public static class SettingsWriter
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
 
     /// <summary>
@@ -405,9 +392,7 @@ public static class SettingsWriter
 
         Directory.CreateDirectory(dir);
         var json = root.ToJsonString(new JsonSerializerOptions { WriteIndented = true });
-        var tmp = Path.Combine(dir, $".settings.{Guid.NewGuid():N}.tmp");
-        File.WriteAllText(tmp, json);
-        File.Move(tmp, file, overwrite: true);
+        AtomicFile.WriteAllText(file, json);
     }
 
     private static void ApplyKey(JsonObject root, string key, string? value)

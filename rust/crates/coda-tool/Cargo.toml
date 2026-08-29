@@ -1,0 +1,17 @@
+[package]
+name = "coda-tool"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Tool trait, ToolContext, ToolResult, path sandbox — shared by coda-agent and coda-mcp."
+
+[dependencies]
+coda-llm.workspace = true
+async-trait.workspace = true
+tokio-util = { workspace = true }
+serde_json.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }

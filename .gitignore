@@ -36,3 +36,7 @@ TestResults/
 
 # BenchmarkDotNet output
 BenchmarkDotNet.Artifacts/
+
+# Rust build output
+rust/target/
+**/*.rs.bk

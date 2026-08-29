@@ -2,6 +2,7 @@ using System.Text.Json;
 using System.Text.Json.Nodes;
 using LlmClient;
 using Microsoft.Extensions.Logging;
+using Coda.Common;
 
 namespace Coda.Sdk;
 
@@ -94,9 +95,7 @@ public sealed partial class SessionTranscriptStore(string workingDirectory, ILog
         // Atomic write: serialize to a temp file, then rename over the target. A hard kill mid-write
         // (exactly what the Bridge watchdog does) then leaves the previous transcript intact instead
         // of a truncated, unparseable file — the failure mode "record on the go" exists to avoid.
-        var tempPath = filePath + ".tmp";
-        await File.WriteAllTextAsync(tempPath, root.ToJsonString(JsonOptions), ct).ConfigureAwait(false);
-        File.Move(tempPath, filePath, overwrite: true);
+        await AtomicFile.WriteAllTextAsync(filePath, root.ToJsonString(JsonOptions), ct).ConfigureAwait(false);
     }
 
     /// <summary>
