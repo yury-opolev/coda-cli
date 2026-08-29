@@ -230,4 +230,40 @@ mod tests {
         assert!(!guard.can_run(&hook)); // now untrusted
         assert!(!store.is_trusted("/project", &hash));
     }
+
+    // SECURITY — TOCTOU: editing a trusted hook's command changes its hash and
+    // must trigger a fresh prompt.  Without this, a user could trust hook A,
+    // then silently replace it with a malicious hook B and it would run trusted.
+    //
+    // Mirrors C# `Editing_trusted_hook_command_requires_reprompt`.
+    #[test]
+    fn editing_trusted_hook_command_requires_reprompt() {
+        let store = Arc::new(InMemoryHookTrustStore::new());
+        let prompt_count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let pc = prompt_count.clone();
+
+        let cb: Arc<dyn Fn(&UserHook) -> bool + Send + Sync> = Arc::new(move |_| {
+            pc.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            true // always approve
+        });
+        let guard = HookTrustGuard::new(store.clone(), "/project", Some(cb));
+
+        let original = make_project_hook("original.sh");
+        assert!(guard.can_run(&original), "original hook must be approved");
+        assert_eq!(
+            prompt_count.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "first approval must prompt once"
+        );
+
+        // Editing the command changes the hash — must re-prompt rather than
+        // silently reusing the trust cached for the old command.
+        let edited = make_project_hook("changed.sh");
+        assert!(guard.can_run(&edited), "edited hook must be re-approved");
+        assert_eq!(
+            prompt_count.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "a changed command must require a second prompt, not reuse old trust"
+        );
+    }
 }

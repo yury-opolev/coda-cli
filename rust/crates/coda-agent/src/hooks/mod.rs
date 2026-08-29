@@ -35,7 +35,7 @@ pub use matcher::HookMatcher;
 pub use output::{
     AgentResponseResult, HookOutput, PermissionRequestResult, PostToolUseResult,
     PreCompactResult, PostCompactResult, SubagentStartResult, SubagentStopResult,
-    UserHookResult,
+    UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 pub use policy::HookEventPolicy;
 pub use runner::HookRunner;

@@ -24,7 +24,7 @@ use super::matcher::HookMatcher;
 use super::output::{
     AgentResponseResult, HookOutput, PermissionDecision, PermissionRequestResult,
     PostToolUseResult, PreCompactResult, PostCompactResult, SubagentStartResult,
-    SubagentStopResult, UserHookResult,
+    SubagentStopResult, UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 use super::policy::HookEventPolicy;
 use super::trust_guard::HookTrustGuard;
@@ -332,6 +332,34 @@ impl HookRunner {
             Ok(outputs) => merge_post_compact(outputs),
             Err(_) => PostCompactResult::NO_CHANGE,
         }
+    }
+
+    /// Runs all `UserPromptSubmit` hooks.  **Fail-closed** — a timeout or error
+    /// must block the prompt, not silently allow it through.
+    ///
+    /// # Security note
+    /// This is the primary gate for prompt-level policy.  `allowedTools` from
+    /// multiple hooks is **intersected** (most restrictive wins); using union
+    /// here would allow tools that any one hook intended to restrict.
+    pub async fn run_user_prompt_submit(
+        &self,
+        prompt: &str,
+        attachments: &[String],
+        history_length: usize,
+        model: &str,
+        permission_mode: &str,
+        depth: u32,
+        cancel: CancellationToken,
+    ) -> UserPromptSubmitResult {
+        let matching = self.matching("UserPromptSubmit", None);
+        if matching.is_empty() {
+            return UserPromptSubmitResult::ALLOW;
+        }
+        let payload = build_user_prompt_submit_payload(
+            prompt, attachments, history_length, model, permission_mode, depth,
+        );
+        let pairs = self.run_with_pairs(&matching, "UserPromptSubmit", &payload, cancel).await;
+        merge_user_prompt_submit(pairs)
     }
 
     // ── Internal helpers ─────────────────────────────────────────────────────
@@ -656,6 +684,28 @@ fn build_post_compact_payload(
     .unwrap_or_default()
 }
 
+fn build_user_prompt_submit_payload(
+    prompt: &str,
+    attachments: &[String],
+    history_length: usize,
+    model: &str,
+    permission_mode: &str,
+    depth: u32,
+) -> String {
+    use chrono::Utc;
+    serde_json::to_string(&serde_json::json!({
+        "event": "UserPromptSubmit",
+        "prompt": prompt,
+        "historyLength": history_length,
+        "model": model,
+        "permissionMode": permission_mode,
+        "attachments": attachments,
+        "timestamp": Utc::now().to_rfc3339(),
+        "depth": depth,
+    }))
+    .unwrap_or_default()
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Output mergers
 // ─────────────────────────────────────────────────────────────────────────────
@@ -809,6 +859,139 @@ fn merge_post_compact(outputs: Vec<HookOutput>) -> PostCompactResult {
         }
     }
     result
+}
+
+/// Merge outputs from multiple `UserPromptSubmit` hooks.
+///
+/// # Field-level combination rules
+/// - **block / reason**: first blocking hook wins; all others are ignored.
+/// - **modifiedPrompt**: last writer wins (later hooks override earlier ones).
+/// - **additionalContext**: concatenated with `"\n\n"` between non-empty values.
+/// - **appendSystemPrompt**: concatenated the same way.
+/// - **allowedTools**: intersected across hooks that express an opinion.
+///   A hook with no `allowedTools` field has "no opinion" and does not narrow
+///   the set.  Only hooks that explicitly list tools participate in the
+///   intersection.  If *no* hook expresses an opinion, the result is `None`
+///   (default tool set applies).  Getting this wrong — using union instead of
+///   intersection — would allow tools any individual hook intended to block.
+/// - **deniedTools**: unioned across all hooks.
+/// - **systemPrompt**: last writer wins, but ONLY when the emitting hook has
+///   `allow_system_prompt_replace = true`.
+/// - **model / effort / toolChoice**: last writer wins.
+fn merge_user_prompt_submit(pairs: Vec<(&UserHook, HookOutput)>) -> UserPromptSubmitResult {
+    // First blocking hook short-circuits everything.
+    for (hook, out) in &pairs {
+        if out.is_blocking() {
+            return UserPromptSubmitResult {
+                block: true,
+                reason: out.reason.clone(),
+                by_hook_command: Some(HookContentHash::hook_id(hook)),
+                modified_prompt: None,
+                additional_context: None,
+                shape: None,
+            };
+        }
+    }
+
+    let mut modified_prompt: Option<String> = None;
+    let mut modified_by: Option<String> = None;
+    let mut additional_context_parts: Vec<String> = Vec::new();
+    let mut shape = UserPromptSubmitShape::default();
+
+    for (hook, out) in &pairs {
+        let spec = match &out.specific {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // modifiedPrompt: last writer wins.
+        if let Some(mp) = spec.get("modifiedPrompt").and_then(|v| v.as_str()) {
+            modified_prompt = Some(mp.to_owned());
+            modified_by = Some(HookContentHash::hook_id(hook));
+        }
+
+        // additionalContext: concatenated.
+        if let Some(ac) = spec.get("additionalContext").and_then(|v| v.as_str()) {
+            if !ac.is_empty() {
+                additional_context_parts.push(ac.to_owned());
+            }
+        }
+
+        // appendSystemPrompt: concatenated.
+        if let Some(asp) = spec.get("appendSystemPrompt").and_then(|v| v.as_str()) {
+            if !asp.is_empty() {
+                let existing = shape.append_system_prompt.get_or_insert_with(String::new);
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(asp);
+            }
+        }
+
+        // allowedTools: intersect across opinionated hooks.
+        // A null/absent list means "no opinion" — it does NOT set the allowed
+        // set to empty.  Only an explicit list participates in the intersection.
+        if let Some(at) = spec.get("allowedTools").and_then(|v| v.as_array()) {
+            let hook_set: Vec<String> = at
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_lowercase))
+                .collect();
+            shape.allowed_tools = Some(match shape.allowed_tools.take() {
+                None => hook_set,
+                Some(existing) => {
+                    // Intersection: keep only tools present in both sets.
+                    let hook_set_lower: std::collections::HashSet<String> =
+                        hook_set.into_iter().collect();
+                    existing.into_iter().filter(|t| hook_set_lower.contains(t)).collect()
+                }
+            });
+        }
+
+        // deniedTools: union.
+        if let Some(dt) = spec.get("deniedTools").and_then(|v| v.as_array()) {
+            for tool in dt.iter().filter_map(|v| v.as_str()) {
+                let lower = tool.to_lowercase();
+                if !shape.denied_tools.contains(&lower) {
+                    shape.denied_tools.push(lower);
+                }
+            }
+        }
+
+        // systemPrompt: last writer wins, gated by allow_system_prompt_replace.
+        if hook.allow_system_prompt_replace {
+            if let Some(sp) = spec.get("systemPrompt").and_then(|v| v.as_str()) {
+                shape.system_prompt = Some(sp.to_owned());
+            }
+        }
+
+        // model, effort, toolChoice: last writer wins.
+        if let Some(m) = spec.get("model").and_then(|v| v.as_str()) {
+            shape.model = Some(m.to_owned());
+        }
+        if let Some(e) = spec.get("effort").and_then(|v| v.as_str()) {
+            shape.effort = Some(e.to_owned());
+        }
+        if let Some(tc) = spec.get("toolChoice").and_then(|v| v.as_str()) {
+            shape.tool_choice = Some(tc.to_owned());
+        }
+    }
+
+    let additional_context = if additional_context_parts.is_empty() {
+        None
+    } else {
+        Some(additional_context_parts.join("\n\n"))
+    };
+
+    let shape_opt = if shape.is_empty() { None } else { Some(shape) };
+
+    UserPromptSubmitResult {
+        block: false,
+        reason: None,
+        by_hook_command: modified_by,
+        modified_prompt,
+        additional_context,
+        shape: shape_opt,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1110,4 +1293,258 @@ mod tests {
         assert!(!runner.has_post_tool_use);
         assert!(!runner.has_agent_response);
     }
+
+    // ── UserPromptSubmit tests ─────────────────────────────────────────────────
+
+    async fn run_ups(runner: &HookRunner, prompt: &str) -> UserPromptSubmitResult {
+        runner
+            .run_user_prompt_submit(
+                prompt,
+                &[],
+                0,
+                "model",
+                "default",
+                0,
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// No hooks configured → allow with no modifications.
+    /// Mirrors C# `No_matching_hooks_returns_allow_with_no_modifications`.
+    #[tokio::test]
+    async fn user_prompt_submit_allows_when_no_hooks_are_configured() {
+        let runner = HookRunner::new(vec![]);
+        let result = run_ups(&runner, "hi").await;
+        assert!(!result.block);
+        assert!(result.modified_prompt.is_none());
+        assert!(result.additional_context.is_none());
+        assert!(result.shape.is_none());
+    }
+
+    /// A blocking hook blocks the prompt.
+    #[tokio::test]
+    async fn user_prompt_submit_blocks_on_block_decision() {
+        let exec = MockExecutor::new(vec![(0, r#"{"decision":"block","reason":"policy denied"}"#)]);
+        let runner = HookRunner::with_executor(vec![hook("UserPromptSubmit", "gate.sh")], exec);
+        let result = run_ups(&runner, "hello").await;
+        assert!(result.block, "hook with decision:block must block the prompt");
+        assert_eq!(result.reason.as_deref(), Some("policy denied"));
+    }
+
+    /// A timeout is fail-closed for UserPromptSubmit.
+    /// Mirrors C# `Timeout_blocks_fail_closed_for_UserPromptSubmit`.
+    #[tokio::test]
+    async fn user_prompt_submit_timeout_is_fail_closed() {
+        let exec = MockExecutor::with_delay(vec![], 2000);
+        let h = hook_with_timeout("UserPromptSubmit", "slow.sh", 0);
+        let runner = HookRunner::with_executor(vec![h], exec);
+        let result = run_ups(&runner, "hi").await;
+        assert!(
+            result.block,
+            "a timed-out UserPromptSubmit hook must block (fail-closed)"
+        );
+    }
+
+    /// A null-command hook must not panic; on a fail-closed event it must block.
+    /// Mirrors C# `HookBus_null_command_hook_does_not_throw_nre`.
+    #[tokio::test]
+    async fn null_command_hook_blocks_on_fail_closed_event_without_panicking() {
+        let mut h = hook("UserPromptSubmit", "unused");
+        h.command = None; // explicit null command
+        h.handler_type = Some("command".into());
+        let runner = HookRunner::with_executor(vec![h], MockExecutor::new(vec![]));
+        // Must not panic; must block because UserPromptSubmit is fail-closed.
+        let result = run_ups(&runner, "hi").await;
+        assert!(
+            result.block,
+            "a command hook with no command must block on a fail-closed event"
+        );
+    }
+
+    // ── allowedTools intersection (SECURITY CRITICAL) ─────────────────────────
+
+    /// When two hooks both express `allowedTools`, the result is the
+    /// **intersection** — only tools approved by EVERY hook are kept.
+    /// Using union here would allow tools that any individual hook intended
+    /// to restrict.
+    ///
+    /// Mirrors C# `AllowedTools_from_two_hooks_are_intersected`.
+    #[tokio::test]
+    async fn allowed_tools_from_two_hooks_are_intersected() {
+        // Hook A approves [tool_a, tool_b]; Hook B approves [tool_b, tool_c].
+        // Intersection = [tool_b] only.
+        let out_a = r#"{"hookSpecificOutput":{"allowedTools":["tool_a","tool_b"]}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"allowedTools":["tool_b","tool_c"]}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![
+                hook("UserPromptSubmit", "hook_a.sh"),
+                hook("UserPromptSubmit", "hook_b.sh"),
+            ],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        assert!(!result.block);
+        let allowed = result
+            .shape
+            .as_ref()
+            .and_then(|s| s.allowed_tools.as_deref())
+            .expect("shape.allowed_tools must be present");
+        assert_eq!(allowed.len(), 1, "intersection of [a,b] and [b,c] must yield exactly 1 tool");
+        assert!(
+            allowed.iter().any(|t| t.eq_ignore_ascii_case("tool_b")),
+            "only 'tool_b' is in both lists"
+        );
+    }
+
+    /// A hook that returns no `allowedTools` has "no opinion" — it must NOT
+    /// act as "deny all".  The null hook's absence must not empty the set.
+    ///
+    /// Mirrors C# `Null_allowed_list_from_first_hook_does_not_intersect_to_empty`.
+    #[tokio::test]
+    async fn null_allowed_list_does_not_intersect_to_empty() {
+        // Hook A: no allowedTools field (null opinion).
+        // Hook B: allowedTools = [tool_a].
+        // Result must be [tool_a], not empty.
+        let out_a = r#"{}"#; // no hookSpecificOutput, no opinion
+        let out_b = r#"{"hookSpecificOutput":{"allowedTools":["tool_a"]}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![
+                hook("UserPromptSubmit", "no_opinion.sh"),
+                hook("UserPromptSubmit", "has_opinion.sh"),
+            ],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let allowed = result
+            .shape
+            .as_ref()
+            .and_then(|s| s.allowed_tools.as_deref())
+            .expect("hook B's allowedTools must survive");
+        assert_eq!(allowed.len(), 1);
+        assert!(allowed.iter().any(|t| t.eq_ignore_ascii_case("tool_a")));
+    }
+
+    /// When NO hook sets allowedTools, the result shape.allowed_tools is None.
+    ///
+    /// Mirrors C# `Null_allowed_list_from_both_hooks_leaves_shape_AllowedTools_null`.
+    #[tokio::test]
+    async fn null_allowed_list_from_all_hooks_leaves_allowed_tools_as_none() {
+        let exec = MockExecutor::new(vec![(0, "{}"), (0, "{}")]);
+        let runner = HookRunner::with_executor(
+            vec![
+                hook("UserPromptSubmit", "hook_a.sh"),
+                hook("UserPromptSubmit", "hook_b.sh"),
+            ],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let allowed_is_none = result
+            .shape
+            .as_ref()
+            .map_or(true, |s| s.allowed_tools.is_none());
+        assert!(
+            allowed_is_none,
+            "both hooks returning no allowedTools must leave allowed_tools as None"
+        );
+    }
+
+    // ── deniedTools union ─────────────────────────────────────────────────────
+
+    /// `deniedTools` from multiple hooks are **unioned** (deny-any semantics).
+    ///
+    /// Mirrors C# `DeniedTools_from_two_hooks_are_unioned`.
+    #[tokio::test]
+    async fn denied_tools_from_two_hooks_are_unioned() {
+        let out_a = r#"{"hookSpecificOutput":{"deniedTools":["tool_a"]}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"deniedTools":["tool_b"]}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let denied = &result
+            .shape
+            .expect("shape must be present")
+            .denied_tools;
+        assert_eq!(denied.len(), 2, "union of [tool_a] and [tool_b] must have 2 entries");
+        assert!(denied.iter().any(|t| t.eq_ignore_ascii_case("tool_a")));
+        assert!(denied.iter().any(|t| t.eq_ignore_ascii_case("tool_b")));
+    }
+
+    // ── additionalContext concatenation ────────────────────────────────────────
+
+    /// `additionalContext` from multiple hooks is **concatenated**.
+    ///
+    /// Mirrors C# `AdditionalContext_from_two_hooks_is_concatenated`.
+    #[tokio::test]
+    async fn additional_context_from_two_hooks_is_concatenated() {
+        let out_a = r#"{"hookSpecificOutput":{"additionalContext":"first context"}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"additionalContext":"second context"}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let ac = result.additional_context.expect("additional_context must be set");
+        assert!(
+            ac.contains("first context"),
+            "first hook's context must appear in result"
+        );
+        assert!(
+            ac.contains("second context"),
+            "second hook's context must appear in result"
+        );
+    }
+
+    // ── appendSystemPrompt concatenation ──────────────────────────────────────
+
+    /// `appendSystemPrompt` from multiple hooks is **concatenated**.
+    ///
+    /// Mirrors C# `AppendSystemPrompt_from_two_hooks_is_concatenated`.
+    #[tokio::test]
+    async fn append_system_prompt_from_two_hooks_is_concatenated() {
+        let out_a = r#"{"hookSpecificOutput":{"appendSystemPrompt":"instruction A"}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"appendSystemPrompt":"instruction B"}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let asp = result
+            .shape
+            .expect("shape must be present")
+            .append_system_prompt
+            .expect("append_system_prompt must be set");
+        assert!(asp.contains("instruction A"));
+        assert!(asp.contains("instruction B"));
+    }
+
+    // ── modifiedPrompt last-writer-wins ────────────────────────────────────────
+
+    /// When two hooks both set `modifiedPrompt`, the last one wins.
+    ///
+    /// Mirrors C# `Last_writer_wins_on_modifiedPrompt_and_override_is_logged`.
+    #[tokio::test]
+    async fn modified_prompt_last_writer_wins() {
+        let out_a = r#"{"hookSpecificOutput":{"modifiedPrompt":"first version"}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"modifiedPrompt":"second version"}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "original").await;
+        assert_eq!(
+            result.modified_prompt.as_deref(),
+            Some("second version"),
+            "last writer must win for modifiedPrompt"
+        );
+    }
 }
+
