@@ -943,43 +943,35 @@ mod tests {
     // ── access denied during device login ────────────────────────────────────
 
     /// When the user denies consent in the browser, the token endpoint returns
-    /// `"error":"access_denied"`.  The provider must surface this as
+    /// `"error":"access_denied"`.  The polling loop must surface this as
     /// `AuthError::LoginCancelled` rather than retrying indefinitely or panicking.
+    /// Mirrors C# `DeviceLogin_AccessDenied_Throws`.
     #[tokio::test]
     async fn device_login_access_denied_throws_login_cancelled() {
+        // We test the polling phase directly (same pattern as the other polling
+        // tests) because the mock HTTP infrastructure used for the device-code
+        // phase would add complexity without covering new code paths.
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
         let port = listener.local_addr().expect("addr").port();
-        let base_url = format!("http://127.0.0.1:{port}");
 
         tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else { break };
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; 4096];
-                    let n = socket.read(&mut buf).await.unwrap_or(0);
-                    let request = String::from_utf8_lossy(&buf[..n]);
-
-                    let body = if request.contains("device") {
-                        // Device-code endpoint: return a valid code.
-                        r#"{"device_code":"DC","user_code":"AAAA-BBBB","verification_uri":"http://gh","expires_in":900,"interval":0}"#
-                    } else {
-                        // Token endpoint: deny consent.
-                        r#"{"error":"access_denied"}"#
-                    };
-                    let resp = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                        body.len(),
-                        body
-                    );
-                    let _ = socket.write_all(resp.as_bytes()).await;
-                });
-            }
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"error":"access_denied"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
         });
 
+        let token_url = format!("http://127.0.0.1:{port}");
         let config = CopilotConfig {
             client_id: "id".into(),
-            device_code_url: format!("{base_url}/device"),
-            token_url: format!("{base_url}/token"),
+            device_code_url: "http://unused/device".into(),
+            token_url,
             copilot_token_url: None,
             scope: "read:user".into(),
             editor_version: "v".into(),
@@ -988,12 +980,31 @@ mod tests {
             user_agent: "u".into(),
         };
 
+        let device = DeviceCodeResponse {
+            device_code: Some("dc".into()),
+            user_code: Some("AAAA-BBBB".into()),
+            verification_uri: Some("http://gh".into()),
+            verification_uri_complete: None,
+            expires_in: 900,
+            interval: 0, // → max(0,1)=1 s sleep before the one poll
+        };
+
         let p = CopilotProvider::new(config);
-        let result = p.login_with_device_code(|_| async { Ok(()) }).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            p.poll_for_github_token(&device),
+        )
+        .await
+        .expect("test must not timeout")
+        .expect_err("access_denied must produce an error");
 
         assert!(
-            matches!(result, Err(AuthError::LoginCancelled(_))),
+            matches!(result, AuthError::LoginCancelled(_)),
             "access_denied must surface as AuthError::LoginCancelled, got {result:?}"
         );
     }
 }
+
+
+
+

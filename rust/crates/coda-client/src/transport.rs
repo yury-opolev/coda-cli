@@ -629,25 +629,27 @@ mod tests {
     /// dropping the message.
     #[tokio::test]
     async fn sending_request_after_engine_disconnects_returns_connection_closed() {
-        let (connection, _inbound, engine_out, mut engine_in) = harness();
+        // Close the engine's read side so the very next write will fail, causing
+        // the write loop to exit and close the outgoing channel.
+        let (connection, _inbound, _engine_out, engine_in) = harness();
+        drop(engine_in); // client's writes now go nowhere
 
-        // Read one frame so the engine's reader task is running, then close
-        // the engine-side write end to force EOF on the client reader.
-        let pending = connection.send_request("session/prompt", None).expect("first send");
-        let _ = engine_in.read_frame().await;
-        drop(engine_out); // close the engine's write pipe → EOF on client reader
+        // Queue a notification: the write loop will attempt to flush it and fail.
+        let _ = connection.notify("ping", None);
 
-        // Wait for the pending request to be faulted (connection closed).
-        let _ = pending.await;
+        // Let the write loop observe the broken pipe and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-        // The outgoing channel is now also closed because the write loop
-        // terminates when the underlying writer closes.  A subsequent send
-        // must return ClientError::ConnectionClosed.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let result = connection.request("noop", None).await;
+        // With the write loop gone, the outgoing receiver is dropped; the sender
+        // detects this as "closed".
         assert!(
-            matches!(result, Err(ClientError::ConnectionClosed) | Err(ClientError::Rpc(_))),
-            "expected ConnectionClosed or Rpc error, got {result:?}"
+            connection.is_closed(),
+            "connection must report closed after the write loop exits"
+        );
+        let err = connection.notify("gone", None).expect_err("must fail");
+        assert!(
+            matches!(err, ClientError::ConnectionClosed),
+            "expected ConnectionClosed, got {err:?}"
         );
     }
 }

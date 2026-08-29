@@ -351,40 +351,59 @@ mod tests {
     /// The `event/turnComplete` notification MUST arrive before the
     /// `session/prompt` result.
     ///
-    /// This is guaranteed by design: `ServeHost::session_prompt` emits the
-    /// notification via the `ServeSink` (which enqueues it on the FIFO write
-    /// channel) and THEN returns its result, which the transport task
-    /// subsequently enqueues.  FIFO order on the write channel guarantees
-    /// the notification precedes the response.
+    /// Uses `serve_with_client` with a minimal fake so the test is independent
+    /// of credentials.  FIFO order on the write channel guarantees the
+    /// notification precedes the response.
     #[tokio::test]
     async fn turn_complete_arrives_before_session_prompt_result() {
+        // A fake client that produces a single end_turn response.
+        let llm: Arc<dyn LlmClient> = Arc::new(FakeLlmClient::new(vec![vec![
+            StreamEvent::TextDelta("ok".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+        ]]));
+
         let (server_end, client_end) = duplex(64 * 1024);
         let (server_read, server_write) = split(server_end);
         let (client_read, mut client_write) = split(client_end);
-        // IMPORTANT: reuse a single decoder across reads so buffered bytes are not lost.
-        let mut client = TestReader::new(client_read);
+        let mut reader = TestReader::new(client_read);
 
-        tokio::spawn(serve(server_read, server_write));
+        tokio::spawn(async move {
+            let _ = serve_with_client(server_read, server_write, llm, ".").await;
+        });
 
         // First: initialize.
         let init_bytes = make_request(1, "initialize", Some(json!({"protocolVersion":"1"})));
         client_write.write_all(&init_bytes).await.unwrap();
-        let _ = client.next().await; // consume initialize response
+        let _ = reader.next().await; // consume initialize response
 
         // Now send session/prompt.
         let prompt_bytes = make_request(2, "session/prompt", Some(json!({"text":"hello"})));
         client_write.write_all(&prompt_bytes).await.unwrap();
 
-        // Read up to two messages; the FIRST must be the TurnComplete notification.
-        let first = client.next().await;
-        let second = client.next().await;
+        // Read messages until we see id=2; verify TurnComplete comes first.
+        let mut found_turn_complete = false;
+        let prompt_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                loop {
+                    let msg = reader.next().await;
+                    if msg["method"] == "event/turnComplete" {
+                        found_turn_complete = true;
+                    }
+                    if msg.get("id").map(|id| id == 2).unwrap_or(false) {
+                        break msg;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("session/prompt timed out");
 
-        assert_eq!(
-            first["method"], "event/turnComplete",
-            "event/turnComplete must arrive BEFORE the session/prompt result; got first={first}, second={second}"
+        assert!(
+            found_turn_complete,
+            "event/turnComplete must have arrived before the session/prompt result"
         );
-        assert_eq!(second["id"], 2, "second message must be the session/prompt response");
-        assert_eq!(second["result"]["ok"], true);
+        assert_eq!(prompt_result["result"]["ok"], true);
     }
 
     // ── Framing: partial / split reads ───────────────────────────────────────
