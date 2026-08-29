@@ -29,10 +29,20 @@ pub fn is_within_root(root: &str, full_path: &str) -> bool {
     let root_resolved = resolve_final_target(Path::new(root));
     let path_resolved = resolve_final_target(Path::new(full_path));
 
-    // Case-insensitive comparison matches Windows filesystem semantics.
-    let root_str = root_resolved.to_string_lossy().to_lowercase();
+    let root_raw = root_resolved.to_string_lossy().into_owned();
+    let path_raw = path_resolved.to_string_lossy().into_owned();
+
+    // Case-fold only on case-insensitive filesystems (Windows, macOS).
+    // On a case-sensitive filesystem (e.g. Linux ext4) lowercasing would
+    // incorrectly equate a different-case sibling path with the root, treating
+    // it as inside the sandbox when it is actually a distinct directory.
+    let (root_str, path_str) = if cfg!(any(windows, target_os = "macos")) {
+        (root_raw.to_lowercase(), path_raw.to_lowercase())
+    } else {
+        (root_raw, path_raw)
+    };
+
     let root_str = root_str.trim_end_matches(['/', '\\']).to_string();
-    let path_str = path_resolved.to_string_lossy().to_lowercase();
 
     path_str == root_str
         || path_str.starts_with(&format!("{root_str}\\"))
@@ -239,5 +249,26 @@ mod tests {
         let inside = format!("{root}/subdir/file.txt");
         let result = try_resolve_within_root(&root, &inside, false, None);
         assert!(result.is_ok());
+    }
+
+    // On a case-sensitive filesystem (Linux) a case-variant sibling of the
+    // root must NOT be treated as inside it. The old unconditional to_lowercase
+    // would collapse `/project/Foo` and `/project/foo`, making a sibling appear
+    // to be inside the sandbox.
+    //
+    // Gated to non-Windows/macOS: those platforms have case-insensitive
+    // filesystems where `/project/Foo` and `/project/foo` are the same path,
+    // so the test would give a false result.
+    #[cfg(not(any(windows, target_os = "macos")))]
+    #[test]
+    fn case_variant_sibling_not_considered_inside_root_on_case_sensitive_fs() {
+        assert!(
+            !is_within_root("/project/foo", "/project/Foo/file.txt"),
+            "upper-case sibling must not be inside lower-case root"
+        );
+        assert!(
+            !is_within_root("/project/Foo", "/project/foo/file.txt"),
+            "lower-case sibling must not be inside upper-case root"
+        );
     }
 }

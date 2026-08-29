@@ -401,6 +401,14 @@ impl Renderer {
     }
 
     fn emit_wrapped(&mut self, text: &str, links: Vec<(usize, usize, Role)>) {
+        // Sanitize prose text before wrapping. Model output can contain
+        // adversarial control characters and ANSI escape sequences; the draw
+        // layer must never receive them. Code blocks are already sanitized in
+        // flush_code_block(); this closes the same gap for all inline prose
+        // that flows through flush_inline → emit_wrapped.
+        let sanitized = text::sanitize(text);
+        let text = sanitized.as_str();
+
         let marker = self.pending_marker.take();
         let marker_width = marker.as_deref().map(text::width).unwrap_or(0);
         let budget = self.available_width().saturating_sub(marker_width).max(1);
@@ -827,5 +835,34 @@ mod tests {
                 let _ = render(sample, width);
             }
         }
+    }
+
+    // Control characters in assistant prose must not survive into rendered output.
+    // Adversarial model responses could contain bytes that corrupt the terminal.
+    #[test]
+    fn control_character_in_prose_is_stripped() {
+        // U+0007 (BEL) and U+0001 (SOH) are control characters that must be stripped.
+        let rows = non_blank("hello\u{0007}world", 40);
+        let combined: String = rows.join("");
+        assert!(
+            !combined.contains('\u{0007}'),
+            "BEL must be stripped from prose; got {combined:?}"
+        );
+        assert!(combined.contains("hello"), "prose text must survive; got {combined:?}");
+        assert!(combined.contains("world"), "prose text must survive; got {combined:?}");
+    }
+
+    // ANSI escape sequences in assistant prose must not survive into rendered output.
+    #[test]
+    fn ansi_escape_in_prose_is_stripped() {
+        // ESC [ 3 2 m is the "set foreground green" ANSI sequence.
+        let rows = non_blank("before\u{1b}[32mafter", 40);
+        let combined: String = rows.join("");
+        assert!(
+            !combined.contains('\u{1b}'),
+            "ANSI escape must be stripped from prose; got {combined:?}"
+        );
+        assert!(combined.contains("before"), "text before escape must survive");
+        assert!(combined.contains("after"), "text after escape must survive");
     }
 }

@@ -58,7 +58,11 @@ pub enum HookScope {
 
 impl Default for HookScope {
     fn default() -> Self {
-        HookScope::User
+        // Fail-safe: if scope is ever constructed without an explicit assignment
+        // (e.g. the field is skipped during deserialization), default to the
+        // *untrusted* scope. Defaulting to User would silently grant implicit
+        // trust to any hook whose scope was not explicitly stamped by the loader.
+        HookScope::Project
     }
 }
 
@@ -111,8 +115,12 @@ pub struct UserHook {
     #[serde(default = "default_true")]
     pub enabled: bool,
 
-    /// Scope of this hook.
-    #[serde(default)]
+    /// Scope of this hook. Never read from JSON: the loader stamps it by
+    /// source file after deserialization, mirroring C# SettingsLoader which
+    /// force-overwrites scope based on which file it came from. Using
+    /// `serde(skip)` ensures a hostile repository cannot claim user scope
+    /// (implicitly trusted, no prompt) in its `.coda/settings.json`.
+    #[serde(skip)]
     pub scope: HookScope,
 
     /// Plugin origin (name + version).  `None` for user-authored hooks.
@@ -132,5 +140,54 @@ impl UserHook {
             None if self.hook_prompt.is_some() => "prompt",
             _ => "command",
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The default scope must be the fail-safe (untrusted) one so that any hook
+    // whose scope is not explicitly stamped by the loader cannot gain implicit trust.
+    #[test]
+    fn default_scope_is_project_not_user() {
+        assert_eq!(
+            HookScope::default(),
+            HookScope::Project,
+            "default scope must be Project (untrusted), not User (implicitly trusted)"
+        );
+    }
+
+    // A JSON payload claiming "scope":"user" must NOT produce a trusted scope
+    // because the field is serde(skip): the loader must stamp it by source file.
+    #[test]
+    fn json_with_explicit_user_scope_is_ignored() {
+        let json = r#"{
+            "event": "PreToolUse",
+            "command": "evil.sh",
+            "scope": "user"
+        }"#;
+        let hook: UserHook = serde_json::from_str(json).expect("must parse");
+        assert_eq!(
+            hook.scope,
+            HookScope::Project,
+            "scope from JSON must be ignored; hook must default to untrusted Project scope"
+        );
+    }
+
+    // A JSON payload omitting scope must also not produce a trusted hook.
+    #[test]
+    fn json_omitting_scope_defaults_to_untrusted() {
+        let json = r#"{"event":"SessionStart","command":"./setup.sh"}"#;
+        let hook: UserHook = serde_json::from_str(json).expect("must parse");
+        assert_eq!(
+            hook.scope,
+            HookScope::Project,
+            "missing scope field must default to Project (untrusted), not User"
+        );
     }
 }
