@@ -1,7 +1,8 @@
-# Coda — Rust front-end
+# Coda — Rust port
 
-A Rust rewrite of the Coda TUI, built on [ratatui](https://ratatui.rs) and
-[crossterm](https://github.com/crossterm-rs/crossterm).
+A Rust rewrite of Coda: the TUI, built on [ratatui](https://ratatui.rs) and
+[crossterm](https://github.com/crossterm-rs/crossterm), plus the engine
+subsystems beneath it.
 
 ## Approach
 
@@ -35,10 +36,17 @@ That means:
 | `coda-client` | Engine process supervision, duplex transport, request correlation, drop-safe responders. |
 | `coda-render` | Text measurement, the theme, markdown, unified diffs, syntax highlighting, tool display modes. Terminal-agnostic. |
 | `coda-tui` | State reducer, composer, viewport, keymap, drawing and the application loop. |
+| `coda-tool` | Leaf crate: the `Tool` trait, `ToolContext` and the path sandbox. Depends on nothing, so tool hosts need not pull in the engine. |
+| `coda-llm` | Neutral chat model, SSE decoding, Anthropic and Copilot clients, retry policy, and the `CredentialSource` seam. |
+| `coda-agent` | The agent loop, 30 built-in tools, permissions, tasks, scheduling, hooks, subagents, compaction and the LSP client. |
+| `coda-mcp` | MCP stdio client, server manager, and the shared `.mcp.json` config. |
+| `coda-auth` | OAuth/PKCE and device-code flows, keyring storage with an encrypted-file fallback, single-flight refresh. |
 
 The dependency direction is strictly one way: `coda-tui → coda-render`,
-`coda-tui → coda-client → coda-proto`. Nothing below `coda-tui` knows about
-application state, and nothing below `coda-client` performs I/O.
+`coda-tui → coda-client → coda-proto`, and `coda-agent → {coda-llm, coda-mcp}
+→ coda-tool`. Nothing below `coda-tui` knows about application state, nothing
+below `coda-client` performs I/O, and `coda-tool` is a leaf so that hosting a
+tool never drags in the agent.
 
 ## Building and testing
 
@@ -91,7 +99,11 @@ binding has a test.
 
 ## Status
 
-Ported and working:
+**The TUI ships and works.** It is the binary you run, and it drives the .NET
+engine over `serve`. The engine crates are complete, tested libraries but are
+not yet wired to a Rust `serve` entrypoint — see "What remains" below.
+
+Ported and working, in the shipping TUI:
 
 - the wire protocol, transport and engine supervision;
 - transcript rendering: markdown, unified diffs, syntax highlighting for eight
@@ -103,14 +115,30 @@ Ported and working:
   and reload;
 - switching model, and toggling or updating plugins and MCP servers.
 
-Not yet ported:
+Ported as libraries, complete with tests, not yet hosted by a Rust binary:
 
+- **providers** (`coda-llm`): the neutral chat model, streaming, Anthropic and
+  Copilot clients;
+- **agent core** (`coda-agent`): the loop, goals, events, tool contract and
+  permission gates;
+- **tools** (`coda-agent`): the 30 built-in file, search, shell, web and agent
+  tools, over the `coda-tool` sandbox;
+- **integrations** (`coda-mcp`): MCP client and manager, and the LSP client;
+- **runtime** (`coda-agent`): tasks, scheduling, subagents, hooks, compaction
+  and output styles;
+- **auth** (`coda-auth`): OAuth/PKCE, device code and credential storage.
+
+### What remains
+
+- **A Rust `serve` binary.** The engine crates are not yet mounted behind the
+  JSON-RPC surface, so the shipping TUI still spawns the .NET engine. This is
+  the natural next phase: the crates exist, the protocol types exist, and the
+  contract tests already pin the surface they must satisfy.
 - session resume, transcript export/import, and the setup/onboarding wizard;
 - around 20 of the 40 slash commands, most of which are local-file or
   session-state operations rather than engine calls;
 - the 30 FPS frame throttle and the assistant-buffering mode, including its
-  withhold-on-interrupt rule;
-- the engine itself, which still runs as .NET.
+  withhold-on-interrupt rule.
 
 ## The two seams
 
@@ -147,4 +175,32 @@ protocol does not imply them, and getting them wrong is silently wrong:
   and are removed rather than left in the transcript.
 - Destructive keys are **two-press chords**. `Ctrl+L` is a repaint, not a
   clear; `Ctrl+D` is deliberately unbound.
+- Assistant text arrives **only as coalesced deltas**; there is no full-text
+  event to fall back on.
+- Thinking blocks without signatures are **dropped, not serialised**. Sending
+  them back earns a provider 400, and once one is in the history every later
+  turn fails too.
+
+### Security invariants
+
+These are load-bearing. Each is pinned by a test, and each was chosen because
+the obvious alternative is exploitable:
+
+- **A hook's scope is stamped by the loader, never read from JSON.** Scope
+  decides whether a hook's shell command runs without a prompt, so a hostile
+  repository must not be able to claim a trusted scope in its own
+  `.coda/settings.json`. The field is `#[serde(skip)]`, and `Default` is the
+  *untrusted* scope so an unstamped value fails safe. This mirrors C#
+  `SettingsLoader`, which force-overwrites scope by source file.
+- **An MCP server cannot waive its own approval.** `readOnlyHint` comes from
+  the server, and read-only tools skip the permission chain, so trusting it
+  would let a server mark a destructive tool read-only and execute unprompted.
+  `McpTool::is_read_only()` is always `false`; the hint is display metadata.
+- **Permission gates fail closed.** Only post-hoc hooks, which cannot prevent
+  anything, fail open.
+- **Sandbox containment folds case only on case-insensitive platforms.**
+  Folding unconditionally would treat a case-variant sibling as inside the
+  root on a case-sensitive filesystem.
+- **Everything rendered from an untrusted source is sanitized** — model prose
+  as well as code blocks, tool output, diffs and command output.
 
