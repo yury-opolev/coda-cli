@@ -2291,13 +2291,74 @@ fn list_local_skill_names(paths: &config::Paths) -> Vec<String> {
     names
 }
 
-/// Substitutes `$1`, `$2`, and `$ARGUMENTS` placeholders in a skill body.
-fn bind_skill_args(body: &str, args: &[&str]) -> String {
-    let mut result = body.replace("$ARGUMENTS", &args.join(" "));
-    for (i, arg) in args.iter().enumerate() {
-        result = result.replace(&format!("${}", i + 1), arg);
+/// Substitutes skill argument placeholders in a single pass, preventing
+/// re-expansion of substituted values.
+///
+/// Rules (matching C# `SkillArgumentBinder`):
+/// - `$$`         → literal `$`
+/// - `$ARGUMENTS` → all positional args joined by a single space (case-sensitive)
+/// - `$N` (N ≥ 1) → the N-th positional arg, or empty if out of range
+/// - `$identifier` → empty (named args from frontmatter; treated as unknown
+///                   here because the Rust TUI does not parse frontmatter)
+/// - bare `$`     → kept as-is
+pub fn bind_skill_args(body: &str, args: &[&str]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.peek() {
+            Some((_, '$')) => {
+                // $$ → literal $
+                chars.next();
+                out.push('$');
+            }
+            Some((_, d)) if d.is_ascii_digit() => {
+                let d = *d;
+                let mut num_str = String::new();
+                num_str.push(d);
+                chars.next();
+                while let Some(&(_, nd)) = chars.peek() {
+                    if nd.is_ascii_digit() {
+                        num_str.push(nd);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let n: usize = num_str.parse().unwrap_or(0);
+                if n >= 1 && n <= args.len() {
+                    out.push_str(args[n - 1]);
+                }
+                // $0 or out-of-range → push nothing (renders as empty)
+            }
+            Some((_, d)) if d.is_alphabetic() || *d == '_' => {
+                let mut name = String::new();
+                while let Some(&(_, nc)) = chars.peek() {
+                    if nc.is_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if name == "ARGUMENTS" {
+                    out.push_str(&args.join(" "));
+                }
+                // Any other named identifier → empty (unknown; no frontmatter)
+            }
+            _ => {
+                // Bare `$` not followed by a recognisable pattern → keep.
+                out.push('$');
+            }
+        }
     }
-    result
+
+    out
 }
 
 /// Renders transcript blocks as a Markdown document for `/export`.
@@ -2582,10 +2643,43 @@ mod tests {
 
     #[test]
     fn bind_skill_args_handles_missing_args_gracefully() {
-        // Placeholders with no corresponding args are left as-is.
-        let body = "Do $1 and $2";
-        let result = bind_skill_args(body, &["first"]);
-        assert_eq!(result, "Do first and $2");
+        // Out-of-range positionals render as empty (not left as literal `$3`).
+        let result = bind_skill_args("Do $1 and $3", &["first"]);
+        assert_eq!(result, "Do first and ");
+    }
+
+    #[test]
+    fn bind_skill_args_double_dollar_produces_a_literal_dollar() {
+        assert_eq!(bind_skill_args("Cost: $$10", &[]), "Cost: $10");
+    }
+
+    #[test]
+    fn bind_skill_args_double_dollar_is_not_re_expanded() {
+        // $$ → $, then $1 on the next pass must NOT be expanded.
+        assert_eq!(bind_skill_args("$$1", &["ignored"]), "$1");
+    }
+
+    #[test]
+    fn bind_skill_args_substituted_value_is_not_re_expanded() {
+        // The value "$ARGUMENTS" inserted for $1 must not trigger a second pass.
+        assert_eq!(bind_skill_args("$1", &["$ARGUMENTS"]), "$ARGUMENTS");
+    }
+
+    #[test]
+    fn bind_skill_args_positional_zero_renders_empty() {
+        assert_eq!(bind_skill_args("$0", &["a"]), "");
+    }
+
+    #[test]
+    fn bind_skill_args_unknown_identifier_renders_empty() {
+        // $nonexistent is not $ARGUMENTS and not positional → empty.
+        assert_eq!(bind_skill_args("$nonexistent", &["val"]), "");
+    }
+
+    #[test]
+    fn bind_skill_args_arguments_is_case_sensitive() {
+        // $arguments (lowercase) is NOT the special $ARGUMENTS token → empty.
+        assert_eq!(bind_skill_args("$arguments", &["val"]), "");
     }
 
     #[test]

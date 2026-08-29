@@ -321,21 +321,11 @@ impl ServeBackend for ServeHost {
         if p.session_id.is_some() {
             return Err(RpcError::session_not_found());
         }
-        {
-            let mut guard = self.client.lock().await;
-            // apiKey param overrides any existing client.
-            if let Some(ref key) = p.api_key {
-                if let Some(c) = build_anthropic(key) {
-                    *guard = Some(c);
-                }
-            }
-            if guard.is_none() {
-                *guard = try_build_client(None).await;
-            }
-            if guard.is_none() {
-                return Err(RpcError::unauthorized(
-                    "no credentials; provide apiKey or set ANTHROPIC_API_KEY",
-                ));
+        // Wire an explicitly provided API key; otherwise leave client as-is
+        // (lazy credential lookup happens on first session/prompt).
+        if let Some(ref key) = p.api_key {
+            if let Some(c) = build_anthropic(key) {
+                *self.client.lock().await = Some(c);
             }
         }
         let resp = InitializeResponse {
@@ -355,11 +345,20 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_prompt(&self, p: PromptParams) -> Result<Value, RpcError> {
+        // Lazy credential lookup on first use — env var only (fast path).
+        // Keyring is checked once at process startup in serve_stdio().
+        {
+            let mut guard = self.client.lock().await;
+            if guard.is_none() {
+                *guard = try_build_from_env();
+            }
+        }
+
         // Require a wired client.
         let client = {
             let g = self.client.lock().await;
             g.clone()
-                .ok_or_else(|| RpcError::unauthorized("call initialize before session/prompt"))?
+                .ok_or_else(|| RpcError::unauthorized("no credentials; set ANTHROPIC_API_KEY or provide apiKey in initialize"))?
         };
 
         // Flush steering messages parked while idle.
@@ -642,12 +641,20 @@ pub(crate) async fn try_build_client(api_key: Option<&str>) -> Option<Arc<dyn Ll
             return build_anthropic(key);
         }
     }
+    if let Some(c) = try_build_from_env() {
+        return Some(c);
+    }
+    try_build_copilot_from_keyring().await
+}
+
+/// Fast env-variable-only lookup (no I/O, no keyring).
+pub(crate) fn try_build_from_env() -> Option<Arc<dyn LlmClient>> {
     if let Ok(key) = std::env::var("ANTHROPIC_API_KEY") {
         if !key.trim().is_empty() {
             return build_anthropic(&key);
         }
     }
-    try_build_copilot_from_keyring().await
+    None
 }
 
 pub(crate) fn build_anthropic(key: &str) -> Option<Arc<dyn LlmClient>> {
@@ -786,25 +793,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_with_api_key_omits_telemetry() {
+    async fn initialize_always_succeeds() {
+        // initialize must succeed even without credentials (engine_contract test
+        // calls it without an apiKey).
         let host = make_host();
-        let result = host
-            .initialize(InitParams {
-                protocol_version: "1".into(),
-                api_key: Some("sk-ant-test-key".into()),
-                session_id: None,
-                client_info: None,
-            })
-            .await
-            .unwrap();
+        let result = host.initialize(InitParams::default()).await.unwrap();
         assert_eq!(result["protocolVersion"], "1");
         assert!(result["sessionId"].is_string());
         assert!(result.get("telemetryLogPath").is_none(), "must omit absent telemetryLogPath");
     }
 
     #[tokio::test]
-    async fn session_prompt_without_client_returns_32001() {
+    async fn session_prompt_without_credentials_returns_32001() {
         let host = make_host();
+        // No client wired, no ANTHROPIC_API_KEY env (in the test environment).
+        // Since lazy lookup also finds nothing, session/prompt returns -32001.
+        // Skip this test if ANTHROPIC_API_KEY is set (it would find a real client).
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            return;
+        }
         let err = host
             .session_prompt(PromptParams { text: Some("hi".into()), images: None })
             .await

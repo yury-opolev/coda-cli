@@ -32,7 +32,9 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let working_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    serve_inner(tokio::io::stdin(), tokio::io::stdout(), None, working_dir).await
+    // Full credential probe at startup (env + keyring).
+    let client = crate::host::try_build_client(None).await;
+    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir).await
 }
 
 /// Runs the engine on the given reader/writer pair.
@@ -463,7 +465,7 @@ mod tests {
     // (with built-in tools, real history accumulation, real event emission)
     // but never touches the network.
 
-    use coda_agent::tools::built_in_tools as _;
+    use coda_agent as _;
     use coda_llm::{
         ChatRequest, Content, Correlation, LlmClient,
         ResponseStream, Usage,
@@ -555,12 +557,17 @@ mod tests {
         client_write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
         reader: &mut TestReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
     ) {
+        // NOTE: serve_with_client pre-wires the client, so initialize here
+        // just completes the handshake without any credential lookup.
         client_write
             .write_all(&make_request(1, "initialize", Some(json!({"protocolVersion":"1"}))))
             .await
             .unwrap();
         let init = reader.next().await;
-        assert_eq!(init["result"]["protocolVersion"], "1", "initialize must succeed");
+        assert!(
+            init["result"]["sessionId"].is_string(),
+            "initialize must succeed: {init}"
+        );
     }
 
     // ── Test 1: Real turn with tool call + tool execution + text reply ─────────

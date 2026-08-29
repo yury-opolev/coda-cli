@@ -1430,5 +1430,76 @@ mod tests {
             "expected a Diff block"
         );
     }
+
+    #[test]
+    fn thinking_complete_without_prior_delta_is_a_no_op() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 500,
+            thinking_tokens: None,
+        }));
+        assert!(
+            state.transcript.is_empty(),
+            "a ThinkingComplete with no preceding delta must not create a block"
+        );
+    }
+
+    #[test]
+    fn a_second_thinking_burst_does_not_append_to_the_completed_first_burst() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "first".into() }));
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 100,
+            thinking_tokens: None,
+        }));
+        // Second burst starts a new block, not an append.
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "second".into() }));
+        assert_eq!(state.transcript.len(), 2, "expected two separate thinking blocks");
+        match &state.transcript.blocks()[1] {
+            Block::Thinking { text, complete, .. } => {
+                assert_eq!(text, "second");
+                assert!(!complete, "second burst should still be open");
+            }
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_finished_finalizes_an_open_thinking_block() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "reasoning".into() }));
+        // Turn ends without an explicit ThinkingComplete.
+        state.apply(UiEvent::TurnFinished {
+            interrupted: false,
+            error: None,
+        });
+        match &state.transcript.blocks()[0] {
+            Block::Thinking { complete, .. } => {
+                assert!(complete, "thinking block must be marked complete when the turn ends");
+            }
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn already_complete_thinking_block_elapsed_ms_is_not_clobbered_by_turn_finish() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "reasoning".into() }));
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 1000,
+            thinking_tokens: Some(42),
+        }));
+        state.apply(UiEvent::TurnFinished {
+            interrupted: false,
+            error: None,
+        });
+        match &state.transcript.blocks()[0] {
+            Block::Thinking { elapsed_ms, tokens, .. } => {
+                assert_eq!(*elapsed_ms, 1000, "frozen elapsed_ms must not be clobbered");
+                assert_eq!(*tokens, Some(42), "frozen tokens must not be clobbered");
+            }
+            other => panic!("expected Thinking block, got {other:?}"),
+        }
+    }
 }
 

@@ -175,9 +175,20 @@ impl Block {
             Block::Diff { raw } => {
                 let diff = coda_render::diff::parse(raw);
                 if diff.is_empty() {
-                    return text::wrap("No changes.", width)
-                        .into_iter()
-                        .map(|chunk| RenderLine::new(chunk, Role::Notification))
+                    if raw.trim().is_empty() {
+                        return text::wrap("No changes.", width)
+                            .into_iter()
+                            .map(|chunk| RenderLine::new(chunk, Role::Notification))
+                            .collect();
+                    }
+                    // Unparseable but non-empty: render the raw text flat so the
+                    // user can still read it (matches the C# legacy fallback).
+                    return raw
+                        .lines()
+                        .flat_map(|line| {
+                            text::wrap_preformatted(&text::sanitize(line), width)
+                        })
+                        .map(|chunk| RenderLine::new(chunk, Role::Code))
                         .collect();
                 }
                 coda_render::diff::render(&diff, width, false)
@@ -878,6 +889,22 @@ mod tests {
         let rows = Block::Diff { raw: String::new() }.render(80, ToolDisplayMode::Summary);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].text.contains("No changes."));
+    }
+
+    #[test]
+    fn a_diff_block_with_unparseable_non_empty_content_renders_flat_lines() {
+        // Input that has no recognisable diff structure (no @@ hunks) must not
+        // show "No changes." — the content should still be visible.
+        let raw = "-old line\n+new line\n";
+        let rows = Block::Diff { raw: raw.to_string() }.render(80, ToolDisplayMode::Summary);
+        assert!(!rows.is_empty(), "expected at least one row");
+        assert!(
+            rows.iter().any(|r| r.text.contains("old line") || r.text.contains("new line")),
+            "raw content should be visible; rows: {:?}",
+            rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        // Must not claim "no changes" when there IS content.
+        assert!(!rows.iter().any(|r| r.text.contains("No changes.")));
     }
 
     #[test]
