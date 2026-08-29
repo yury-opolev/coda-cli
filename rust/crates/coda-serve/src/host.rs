@@ -331,7 +331,9 @@ impl ServeBackend for ServeHost {
         let resp = InitializeResponse {
             protocol_version: PROTOCOL_VERSION.into(),
             session_id: self.session.session_id.clone(),
-            server_info: "coda-serve".into(),
+            // Must match the C# engine verbatim: clients key off this string,
+            // so reporting the crate name here would be a silent parity break.
+            server_info: "coda".into(),
             telemetry_log_path: None,
         };
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))

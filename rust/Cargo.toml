@@ -11,6 +11,7 @@ members = [
     "crates/coda-tui",
     "crates/coda-auth",
     "crates/coda-serve",
+    "crates/coda",
 ]
 
 [workspace.package]
@@ -30,6 +31,7 @@ coda-llm = { path = "crates/coda-llm" }
 coda-render = { path = "crates/coda-render" }
 coda-auth = { path = "crates/coda-auth" }
 coda-serve = { path = "crates/coda-serve" }
+coda-tui = { path = "crates/coda-tui" }
 
 anyhow = "1"
 thiserror = "2"

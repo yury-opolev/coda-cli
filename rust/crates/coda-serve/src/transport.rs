@@ -282,7 +282,9 @@ mod tests {
         assert_eq!(result["protocolVersion"], "1");
         assert!(result["sessionId"].is_string());
         assert!(!result["sessionId"].as_str().unwrap().is_empty());
-        assert_eq!(result["serverInfo"], "coda-serve");
+        // Must be "coda", matching the C# engine verbatim — clients key off
+        // this string, so the crate name here would be a silent parity break.
+        assert_eq!(result["serverInfo"], "coda");
         assert!(result.get("telemetryLogPath").is_none(), "must omit telemetryLogPath");
     }
 

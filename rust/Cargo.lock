@@ -597,6 +597,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "coda-client",
+ "coda-proto",
+ "coda-render",
+ "coda-serve",
+ "coda-tui",
+ "serde_json",
+ "tokio",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "coda-agent"
 version = "0.1.0"
 dependencies = [
