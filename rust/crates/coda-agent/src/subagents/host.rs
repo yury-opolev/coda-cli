@@ -105,16 +105,23 @@ impl SubagentHost {
         )
     }
 
-    /// Run a subagent synchronously (foreground).
-    ///
-    /// Returns the subagent's accumulated text output, or an error string.
+    /// Refuse if the concurrency slot cannot be taken immediately.
+    fn try_acquire_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, String> {
+        self.semaphore.try_acquire().map_err(|_| {
+            "All subagent concurrency slots are taken; try again later.".to_owned()
+        })
+    }
+
+    /// Run a subagent synchronously (foreground), acquiring and releasing a
+    /// concurrency slot.  Returns immediately with an error when all slots are
+    /// taken (try-acquire semantics — never blocks the caller indefinitely).
     async fn run_foreground(
         &self,
         request: SubagentRequest,
         sink: Arc<dyn AgentSink>,
         cancel: CancellationToken,
     ) -> Result<String, String> {
-        // Depth check before registering any task.
+        // Depth check before consuming any slot.
         if request.depth > MAX_SUBAGENT_DEPTH {
             return Err(format!(
                 "Subagent nesting depth {} exceeds the maximum of {}; cannot spawn further.",
@@ -122,13 +129,23 @@ impl SubagentHost {
             ));
         }
 
-        // Acquire concurrency semaphore.
-        let _permit = self
-            .semaphore
-            .acquire()
-            .await
-            .map_err(|_| "Semaphore closed — session is shutting down.".to_owned())?;
+        // Immediate refusal when all slots are taken (matching C# behaviour).
+        let _permit = self.try_acquire_slot()?;
 
+        self.run_inner(request, sink, cancel).await
+    }
+
+    /// Core run logic (no depth check, no semaphore management).
+    ///
+    /// Called by both the foreground path (which holds a `SemaphorePermit`)
+    /// and the background spawn (which holds an `OwnedSemaphorePermit` for the
+    /// full lifetime of the background task).
+    async fn run_inner(
+        &self,
+        request: SubagentRequest,
+        sink: Arc<dyn AgentSink>,
+        cancel: CancellationToken,
+    ) -> Result<String, String> {
         let definition = BuiltInAgents::resolve(Some(&request.agent_type));
 
         // Determine the model to use.
@@ -278,13 +295,25 @@ impl SubagentFactory for SubagentHost {
         if request.foreground {
             self.run_foreground(request, sink, cancel).await
         } else {
-            // Background: register a task, spawn it, and return the task id.
+            // Background: acquire a slot FIRST, then register the task.
+            // This matches the C# invariant: when all slots are taken the call
+            // fails immediately and nothing is registered in the task manager.
             if request.depth > MAX_SUBAGENT_DEPTH {
                 return Err(format!(
                     "Subagent nesting depth {} exceeds the maximum of {}.",
                     request.depth, MAX_SUBAGENT_DEPTH
                 ));
             }
+            // Owned permit so it can be moved into the spawned future and held
+            // for the full lifetime of the background work.
+            let permit = Arc::clone(&self.semaphore)
+                .try_acquire_owned()
+                .map_err(|_| {
+                    "All subagent concurrency slots are taken; try again later.".to_owned()
+                })?;
+
+            // Register AFTER acquiring the slot so the task manager never sees
+            // a task that cannot start.
             let task = self.task_manager.register(
                 TaskKind::Subagent,
                 &request.prompt,
@@ -301,7 +330,10 @@ impl SubagentFactory for SubagentHost {
             let tid2 = task_id.clone();
 
             tokio::spawn(async move {
-                match self_arc.run_foreground(req2, sink2, cancel2).await {
+                // Drop the permit only when this future completes (success or
+                // failure), so the slot stays occupied for the full run.
+                let _permit = permit;
+                match self_arc.run_inner(req2, sink2, cancel2).await {
                     Ok(report) => { mgr.complete(&tid2, Some(report)); }
                     Err(e) => { mgr.fail(&tid2, Some(e)); }
                 }
@@ -534,39 +566,179 @@ mod tests {
         assert!(result.unwrap_err().contains("exceeds the maximum"));
     }
 
-    /// Concurrency limit test: acquiring beyond the semaphore capacity blocks.
+    /// Concurrency limit: try_acquire refuses the (N+1)th request immediately
+    /// when all N slots are occupied, and at most N work items run at once.
     #[tokio::test]
     async fn semaphore_limits_concurrency() {
-        use std::sync::atomic::{AtomicU32, Ordering};
-
+        // The slot limit is 2; attempt 3 concurrent try_acquire calls.
+        // Two succeed, one fails immediately.
         let sem = Arc::new(Semaphore::new(2));
-        let active = Arc::new(AtomicU32::new(0));
-        let max_observed = Arc::new(AtomicU32::new(0));
 
-        let mut handles = Vec::new();
-        for _ in 0..5 {
-            let sem = sem.clone();
-            let active = active.clone();
-            let max_obs = max_observed.clone();
-            handles.push(tokio::spawn(async move {
-                let _permit = sem.acquire().await.unwrap();
-                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                let mut prev = max_obs.load(Ordering::SeqCst);
-                loop {
-                    if current <= prev { break; }
-                    match max_obs.compare_exchange(prev, current, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => break,
-                        Err(x) => prev = x,
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                active.fetch_sub(1, Ordering::SeqCst);
-            }));
-        }
-        for h in handles { h.await.unwrap(); }
+        let p1 = sem.try_acquire().expect("first slot must succeed");
+        let p2 = sem.try_acquire().expect("second slot must succeed");
+        let p3 = sem.try_acquire();
         assert!(
-            max_observed.load(Ordering::SeqCst) <= 2,
-            "Concurrency must not exceed semaphore limit of 2"
+            p3.is_err(),
+            "third try_acquire must fail immediately when all slots are taken"
+        );
+
+        // Releasing a slot makes room for the next attempt.
+        drop(p1);
+        let p4 = sem.try_acquire().expect("slot released; next acquire must succeed");
+        drop(p2);
+        drop(p4);
+    }
+
+    /// Foreground subagent immediately refuses (error, not panic/hang) when
+    /// every concurrency slot is taken and registers nothing.
+    ///
+    /// Mutation-verified: if `try_acquire_slot` were removed or replaced with
+    /// a blocking `acquire().await`, this test would time-out instead of
+    /// returning `Err`.
+    #[tokio::test]
+    async fn foreground_refuses_immediately_when_all_slots_taken() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Usage, LlmError};
+        use async_trait::async_trait as at;
+
+        // A mock client that returns a valid text turn so the subagent can complete.
+        struct OkClient;
+        #[at]
+        impl coda_llm::LlmClient for OkClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, _: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        use crate::permission::PermissionPrompt;
+        struct AllowAll;
+        #[at]
+        impl PermissionPrompt for AllowAll {
+            async fn request(&self, _: &dyn crate::tool::Tool, _: &str, _: CancellationToken) -> bool { true }
+        }
+
+        let mgr = crate::tasks::TaskManager::new(
+            "test-session",
+            Some(std::env::temp_dir().join("coda-host-tests")),
+            4096,
+            10,
+        );
+        let host = SubagentHost::new(
+            Arc::new(OkClient),
+            Arc::new(AllowAll),
+            Arc::new(crate::tool::ToolRegistry::new(
+                [] as [Arc<dyn crate::tool::Tool>; 0],
+            )),
+            Arc::new(crate::tool::ToolQuarantine::new()),
+            mgr.clone(),
+            "model",
+            256,
+            5,
+            ".",
+            None,
+            /* max_concurrent = */ 1,
+        );
+
+        // Exhaust the single slot by holding a permit externally.
+        let _held = host.semaphore.try_acquire().expect("initial slot must be free");
+
+        let request = SubagentRequest::foreground("general-purpose", "go", "t1", 1);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            host.run_foreground(request, Arc::new(crate::events::NullSink), CancellationToken::new()),
+        )
+        .await
+        .expect("run_foreground must not block — should return immediately");
+
+        assert!(result.is_err(), "must refuse when all slots are taken");
+        assert!(
+            result.unwrap_err().contains("slots are taken"),
+            "error must explain that slots are exhausted"
+        );
+        // Nothing should have been registered in the task manager.
+        assert_eq!(mgr.list().len(), 0, "no task must be registered when refused");
+    }
+
+    /// Background subagent: when all slots are taken, spawn returns an error
+    /// immediately and does NOT register any task in the task manager.
+    ///
+    /// Mutation-verified: if the slot acquisition were moved after registration
+    /// (the original bug), a task would appear in the list as Running.
+    #[tokio::test]
+    async fn background_refuses_and_registers_nothing_when_all_slots_taken() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Usage, LlmError};
+        use async_trait::async_trait as at;
+        use crate::permission::PermissionPrompt;
+
+        struct OkClient;
+        #[at]
+        impl coda_llm::LlmClient for OkClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, _: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, LlmError> {
+                let events = vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        struct AllowAll;
+        #[at]
+        impl PermissionPrompt for AllowAll {
+            async fn request(&self, _: &dyn crate::tool::Tool, _: &str, _: CancellationToken) -> bool { true }
+        }
+
+        let mgr = crate::tasks::TaskManager::new(
+            "test-session",
+            Some(std::env::temp_dir().join("coda-host-bg-tests")),
+            4096,
+            10,
+        );
+        let host = SubagentHost::new(
+            Arc::new(OkClient),
+            Arc::new(AllowAll),
+            Arc::new(crate::tool::ToolRegistry::new(
+                [] as [Arc<dyn crate::tool::Tool>; 0],
+            )),
+            Arc::new(crate::tool::ToolQuarantine::new()),
+            mgr.clone(),
+            "model",
+            256,
+            5,
+            ".",
+            None,
+            /* max_concurrent = */ 1,
+        );
+
+        // Exhaust the single slot.
+        let _held = host.semaphore.try_acquire().expect("initial slot must be free");
+
+        let mut bg_request = SubagentRequest::foreground("general-purpose", "go", "t1", 1);
+        bg_request.foreground = false;
+
+        let result = host.spawn(bg_request, Arc::new(crate::events::NullSink), CancellationToken::new()).await;
+
+        assert!(result.is_err(), "must refuse when all slots are taken");
+        assert!(
+            result.unwrap_err().contains("slots are taken"),
+            "error must explain slots exhausted"
+        );
+        // The critical invariant: nothing registered.
+        assert_eq!(
+            mgr.list().len(),
+            0,
+            "no task must be registered in the task manager when the slot is unavailable"
         );
     }
 }

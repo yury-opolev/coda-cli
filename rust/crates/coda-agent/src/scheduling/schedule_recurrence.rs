@@ -287,4 +287,89 @@ mod tests {
         // 09:00 Eastern on 2024-01-01 is 14:00 UTC.
         assert_eq!(result, utc(2024, 1, 1, 14, 0));
     }
+
+    // ── DST boundary tests ────────────────────────────────────────────────────
+
+    /// Spring-forward (US/Eastern 2024-03-10 at 2:00 AM → 3:00 AM):
+    /// 2:30 AM on that day does not exist in local time.  The cron must skip
+    /// that local minute (LocalResult::None) and fire at 2:30 AM on the next
+    /// day instead.
+    ///
+    /// Mutation-verified: comment out the `LocalResult::None` skip arm in
+    /// `next_cron_occurrence` and this test will panic or return a wrong time.
+    #[test]
+    fn cron_spring_forward_missing_minute_is_skipped() {
+        // "30 2 * * *" = daily at 02:30 local time.
+        let cron = CronExpression::parse("30 2 * * *").unwrap();
+        let tz: Tz = "America/New_York".parse().unwrap();
+
+        // Ask for the next occurrence strictly after midnight on spring-forward
+        // day (2024-03-10).  02:30 ET does not exist that day.
+        let after = utc(2024, 3, 10, 0, 0); // 2024-03-10 00:00 UTC = 2024-03-09 19:00 ET (EST)
+
+        let result = next_cron_occurrence(&cron, after, tz).unwrap();
+
+        // 2024-03-11 02:30 EDT = 2024-03-11 06:30 UTC (UTC-4 after DST started)
+        assert_eq!(
+            result,
+            utc(2024, 3, 11, 6, 30),
+            "spring-forward gap must be skipped; next fire is the following day"
+        );
+    }
+
+    /// Fall-back (US/Eastern 2024-11-03 at 2:00 AM → 1:00 AM):
+    /// 1:30 AM appears twice in local time.  The cron must fire exactly once,
+    /// at the *earlier* UTC instant (the EDT occurrence, not the EST one),
+    /// matching the C# `NextCronOccurrence_fall_back_fires_once_at_earlier_utc`.
+    ///
+    /// Mutation-verified: swap `earlier` for `later` in the
+    /// `LocalResult::Ambiguous` arm and this test fails with the wrong UTC.
+    #[test]
+    fn cron_fall_back_fires_at_earlier_utc() {
+        // "30 1 * * *" = daily at 01:30 local time.
+        let cron = CronExpression::parse("30 1 * * *").unwrap();
+        let tz: Tz = "America/New_York".parse().unwrap();
+
+        // Ask for the occurrence on fall-back day (2024-11-03), starting from
+        // just before the ambiguous window.
+        // Before fall-back (clocks still at EDT = UTC-4) 01:00 AM ET = 05:00 UTC.
+        let after = utc(2024, 11, 3, 4, 0); // just before 01:30 EDT (05:30 UTC)
+
+        let result = next_cron_occurrence(&cron, after, tz).unwrap();
+
+        // 2024-11-03 01:30 AM EDT (UTC-4) = 2024-11-03 05:30 UTC  ← earlier UTC
+        // 2024-11-03 01:30 AM EST (UTC-5) = 2024-11-03 06:30 UTC  ← later UTC
+        // Expected: earlier UTC (05:30), i.e. the first occurrence.
+        assert_eq!(
+            result,
+            utc(2024, 11, 3, 5, 30),
+            "fall-back ambiguity must resolve to the earlier UTC (larger offset)"
+        );
+    }
+
+    /// `ScheduleKind::At` (one-shot) returns the persisted `next_run_utc`
+    /// unchanged — the stored instant is authoritative for one-shots.
+    #[test]
+    fn at_rule_returns_stored_next_run_utc() {
+        use super::super::scheduled_task::{ScheduledTask, ScheduleKind};
+        let stored = utc(2025, 6, 15, 9, 0);
+        let def = ScheduledTask {
+            schema_version: 2,
+            id: "one-shot".into(),
+            name: None,
+            kind: ScheduleKind::At,
+            prompt: "run once".into(),
+            interval: None,
+            at_utc: Some(stored),
+            cron: None,
+            time_zone_id: "UTC".into(),
+            next_run_utc: stored,
+            created_at_utc: stored,
+            updated_at_utc: stored,
+            last_terminal_outcome: None,
+        };
+        // `now` is irrelevant for At — the persisted instant is returned as-is.
+        let result = ScheduleRecurrence::advance_recurring_past(&def, utc(2025, 1, 1, 0, 0)).unwrap();
+        assert_eq!(result, stored, "At rule must return the stored next_run_utc unchanged");
+    }
 }
