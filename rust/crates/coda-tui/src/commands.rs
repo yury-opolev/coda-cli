@@ -273,6 +273,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Show uncommitted git changes in the working directory.",
         scope: Scope::Local,
     },
+    CommandSpec {
+        name: "image",
+        aliases: &[],
+        args: "<path>",
+        summary: "Attach an image to the next message.",
+        scope: Scope::Local,
+    },
 ];
 
 impl CommandSpec {
@@ -607,7 +614,7 @@ mod tests {
     fn all_new_commands_are_local_scope() {
         let new_names = [
             "init", "memory", "output-style", "permissions", "yolo", "provider",
-            "headers", "log", "marketplace", "plugin", "skill", "export", "diff",
+            "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
         ];
         for name in new_names {
             let spec = lookup(name).unwrap_or_else(|| panic!("/{name} not found"));
@@ -624,7 +631,7 @@ mod tests {
         let text = help(None);
         let new_names = [
             "init", "memory", "output-style", "permissions", "yolo", "provider",
-            "headers", "log", "marketplace", "plugin", "skill", "export", "diff",
+            "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
         ];
         for name in new_names {
             assert!(text.contains(name), "/{name} missing from help output");

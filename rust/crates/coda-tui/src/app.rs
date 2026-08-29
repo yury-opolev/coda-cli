@@ -71,6 +71,8 @@ pub struct App {
     engine_command: EngineCommand,
     /// A freshly started engine waiting for the run loop to swap it in.
     restarted: Option<(Engine, mpsc::UnboundedReceiver<Inbound>)>,
+    /// Images staged by `/image` to be sent with the next user turn.
+    staged_images: Vec<messages::WireImage>,
 }
 
 /// Which overlay is on screen.
@@ -130,6 +132,7 @@ impl App {
             task_outcomes: std::collections::BTreeMap::new(),
             engine_command: command,
             restarted: None,
+            staged_images: Vec::new(),
         };
 
         Ok((app, engine, inbound))
@@ -983,11 +986,15 @@ impl App {
 
     async fn submit(&mut self) {
         let text = self.composer.take_submission();
-        if text.trim().is_empty() {
+        // A prompt needs text, staged images, or both.
+        let has_content = !text.trim().is_empty() || !self.staged_images.is_empty();
+        if !has_content {
             return;
         }
 
         if let Some(invocation) = commands::parse(&text) {
+            // Commands are dispatched without consuming staged images; the images
+            // remain for the next real user turn.
             self.run_command(invocation).await;
             return;
         }
@@ -999,9 +1006,20 @@ impl App {
             return;
         }
 
-        self.apply(UiEvent::Submitted { text: text.clone() });
+        // Use the text as the displayed turn label; blank text with images
+        // still needs something in the transcript.
+        let display = if text.is_empty() {
+            "[image]".to_string()
+        } else {
+            text.clone()
+        };
+        self.apply(UiEvent::Submitted { text: display });
 
-        let params = serde_json::to_value(messages::PromptParams::text(text)).unwrap_or_default();
+        let params = serde_json::to_value(messages::PromptParams {
+            text: if text.is_empty() { None } else { Some(text) },
+            images: std::mem::take(&mut self.staged_images),
+        })
+        .unwrap_or_default();
         match self.connection.send_request(method::PROMPT, Some(params)) {
             Ok(receiver) => self.turn = Some(receiver),
             Err(error) => self.apply(UiEvent::TurnFinished {
@@ -1063,7 +1081,10 @@ impl App {
 
         match spec.name {
             "help" => self.output(commands::help(invocation.first())),
-            "clear" => self.apply(UiEvent::Cleared),
+            "clear" => {
+                self.staged_images.clear();
+                self.apply(UiEvent::Cleared);
+            }
             "exit" => self.state.should_quit = true,
             "interrupt" => self.interrupt(),
             "theme" => self.set_theme(invocation.first()),
@@ -1110,6 +1131,7 @@ impl App {
             "skill" => self.cmd_skill(&invocation).await,
             "export" => self.cmd_export(&invocation).await,
             "diff" => self.cmd_diff().await,
+            "image" => self.cmd_image(&invocation).await,
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),
@@ -2104,11 +2126,109 @@ impl App {
             Err(e) => self.notice(format!("Could not run git: {e}"), NoticeLevel::Error),
         }
     }
+
+    /// `/image <path>` — base64-encode an image and stage it for the next turn.
+    ///
+    /// Maximum size is 5 MB. Accepted formats: .png .jpg/.jpeg .gif .webp.
+    async fn cmd_image(&mut self, invocation: &commands::Invocation) {
+        let Some(path_str) = invocation.first() else {
+            self.notice(
+                "Usage: /image <path>  — attaches an image to the next turn.",
+                NoticeLevel::Warning,
+            );
+            return;
+        };
+
+        let path = std::path::PathBuf::from(path_str);
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("image")
+            .to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let media_type = image_media_type(ext).ok_or_else(|| {
+                format!(
+                    "File type not supported: '.{ext}'. Supported: .png, .jpg, .jpeg, .gif, .webp"
+                )
+            })?;
+
+            if !path.exists() {
+                return Err(format!("File not found: {}", path.display()));
+            }
+
+            let metadata = std::fs::metadata(&path)
+                .map_err(|e| format!("Could not read file: {e}"))?;
+            const MAX_BYTES: u64 = 5 * 1024 * 1024;
+            if metadata.len() > MAX_BYTES {
+                let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+                return Err(format!(
+                    "File too large ({size_mb:.1} MB). Maximum size is 5 MB."
+                ));
+            }
+
+            let bytes = std::fs::read(&path).map_err(|e| format!("Could not read image: {e}"))?;
+            Ok((media_type.to_string(), bytes))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((media_type, bytes))) => {
+                let label = self.staged_images.len() + 1;
+                self.staged_images.push(messages::WireImage {
+                    media_type,
+                    base64: base64_encode(&bytes),
+                });
+                // Insert the label token into the composer so the user can see
+                // where the attachment sits in the composed message.
+                let token = format!("[Image {label}]");
+                if !self.composer.is_empty() {
+                    self.composer.insert(" ");
+                }
+                self.composer.insert(&token);
+
+                let size_kb = bytes.len() as f64 / 1024.0;
+                self.notice(
+                    format!(
+                        "Attached {file_name} as {token} ({size_kb:.1} KB). It will be sent with your next message."
+                    ),
+                    NoticeLevel::Info,
+                );
+            }
+            Ok(Err(msg)) => self.notice(msg, NoticeLevel::Error),
+            Err(_) => self.notice("Could not read the image file.", NoticeLevel::Error),
+        }
+    }
 }
 
-// ---------------------------------------------------------------------------
-// Free helpers (pure / free functions, no engine access)
-// ---------------------------------------------------------------------------
+/// Returns the MIME type for a supported image extension, case-insensitively.
+fn image_media_type(extension: &str) -> Option<&'static str> {
+    match extension.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Encodes bytes as standard (RFC 4648) base64 with `=` padding.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
 
 /// Parses a permission-mode name into its canonical form, case-insensitively.
 ///
@@ -2373,6 +2493,135 @@ mod tests {
     fn tolerates_a_result_missing_its_optional_fields() {
         let text = format_result("models", &json!({ "models": [{ "id": "a" }] }));
         assert!(text.contains("  a"), "got {text:?}");
+    }
+
+    #[test]
+    fn base64_encodes_rfc_4648_test_vectors() {
+        // RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encodes_a_longer_string() {
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+    }
+
+    #[test]
+    fn image_media_type_maps_supported_extensions() {
+        assert_eq!(image_media_type("png"), Some("image/png"));
+        assert_eq!(image_media_type("jpg"), Some("image/jpeg"));
+        assert_eq!(image_media_type("jpeg"), Some("image/jpeg"));
+        assert_eq!(image_media_type("gif"), Some("image/gif"));
+        assert_eq!(image_media_type("webp"), Some("image/webp"));
+    }
+
+    #[test]
+    fn image_media_type_is_case_insensitive() {
+        assert_eq!(image_media_type("PNG"), Some("image/png"));
+        assert_eq!(image_media_type("JPG"), Some("image/jpeg"));
+        assert_eq!(image_media_type("WEBP"), Some("image/webp"));
+    }
+
+    #[test]
+    fn image_media_type_rejects_unsupported_extensions() {
+        assert_eq!(image_media_type("bmp"), None);
+        assert_eq!(image_media_type("svg"), None);
+        assert_eq!(image_media_type("tiff"), None);
+        assert_eq!(image_media_type(""), None);
+    }
+
+    #[test]
+    fn parse_permission_mode_accepts_canonical_names() {
+        assert_eq!(parse_permission_mode("default"), Some("default"));
+        assert_eq!(parse_permission_mode("acceptEdits"), Some("acceptEdits"));
+        assert_eq!(parse_permission_mode("plan"), Some("plan"));
+        assert_eq!(parse_permission_mode("bypass"), Some("bypass"));
+    }
+
+    #[test]
+    fn parse_permission_mode_accepts_aliases() {
+        assert_eq!(parse_permission_mode("edits"), Some("acceptEdits"));
+        assert_eq!(parse_permission_mode("accept-edits"), Some("acceptEdits"));
+        assert_eq!(parse_permission_mode("yolo"), Some("bypass"));
+        assert_eq!(parse_permission_mode("bypassPermissions"), Some("bypass"));
+    }
+
+    #[test]
+    fn parse_permission_mode_is_case_insensitive() {
+        assert_eq!(parse_permission_mode("DEFAULT"), Some("default"));
+        assert_eq!(parse_permission_mode("BYPASS"), Some("bypass"));
+        assert_eq!(parse_permission_mode("YOLO"), Some("bypass"));
+    }
+
+    #[test]
+    fn parse_permission_mode_rejects_unknown_names() {
+        assert_eq!(parse_permission_mode("admin"), None);
+        assert_eq!(parse_permission_mode(""), None);
+    }
+
+    #[test]
+    fn marketplace_name_strips_extension_and_uses_last_segment() {
+        assert_eq!(marketplace_name_from_source("https://example.com/plugins.json"), "plugins");
+        assert_eq!(marketplace_name_from_source("https://example.com/my-marketplace"), "my-marketplace");
+        assert_eq!(marketplace_name_from_source("git@github.com:org/repo.git"), "repo");
+        assert_eq!(marketplace_name_from_source("/local/path/plugins/"), "plugins");
+    }
+
+    #[test]
+    fn bind_skill_args_substitutes_positional_placeholders() {
+        let body = "Translate to $1: $ARGUMENTS";
+        let result = bind_skill_args(body, &["French", "Hello world"]);
+        assert_eq!(result, "Translate to French: French Hello world");
+    }
+
+    #[test]
+    fn bind_skill_args_handles_missing_args_gracefully() {
+        // Placeholders with no corresponding args are left as-is.
+        let body = "Do $1 and $2";
+        let result = bind_skill_args(body, &["first"]);
+        assert_eq!(result, "Do first and $2");
+    }
+
+    #[test]
+    fn build_markdown_export_includes_user_and_assistant_turns() {
+        use crate::transcript::Block;
+        let blocks = vec![
+            Block::User {
+                text: "Hello".to_string(),
+                timestamp: "09:41".to_string(),
+                pending: false,
+                queue_id: None,
+            },
+            Block::Assistant {
+                text: "World".to_string(),
+                complete: true,
+            },
+        ];
+        let md = build_markdown_export(&blocks);
+        assert!(md.contains("## User"));
+        assert!(md.contains("Hello"));
+        assert!(md.contains("## Assistant"));
+        assert!(md.contains("World"));
+    }
+
+    #[test]
+    fn build_markdown_export_is_empty_for_no_content_blocks() {
+        use crate::transcript::Block;
+        // Notice blocks are not exported.
+        let blocks = vec![Block::Notice {
+            text: "internal notice".to_string(),
+            level: crate::transcript::NoticeLevel::Info,
+        }];
+        let md = build_markdown_export(&blocks);
+        // Only the header line; no turns.
+        assert!(!md.contains("## User"));
+        assert!(!md.contains("## Assistant"));
     }
 }
 
