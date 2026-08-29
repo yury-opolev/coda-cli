@@ -281,7 +281,7 @@ async fn run_command(
     }
 }
 
-/// Truncate a string to at most `MAX_CHARS` characters, appending a note when
+/// Truncate a string to at most `MAX_CHARS` characters, appending a notice when
 /// truncation occurs.
 fn cap_chars(s: String) -> String {
     if s.chars().count() <= MAX_CHARS {
@@ -292,7 +292,7 @@ fn cap_chars(s: String) -> String {
         .nth(MAX_CHARS)
         .map(|(i, _)| i)
         .unwrap_or(s.len());
-    format!("{}\n… [truncated, {} chars total]", &s[..cutoff], s.chars().count())
+    format!("{}\n{}", &s[..cutoff], super::OUTPUT_TRUNCATED)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

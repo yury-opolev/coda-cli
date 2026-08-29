@@ -165,6 +165,13 @@ pub enum Event {
         task_id: String,
         reason: String,
     },
+    /// The C# engine ran a hook that modified the result of a finished subagent.
+    SubagentResultModified {
+        hook_command: String,
+        task_id: String,
+        original_result: String,
+        modified_result: String,
+    },
     /// An event this build does not model. Kept so newer engines still work.
     Unknown { method: String, params: Option<Value> },
 }
@@ -389,6 +396,19 @@ struct SubagentBlockedPayload {
     reason: String,
 }
 
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SubagentResultModifiedPayload {
+    #[serde(default)]
+    hook_command: String,
+    #[serde(default)]
+    task_id: String,
+    #[serde(default)]
+    original_result: String,
+    #[serde(default)]
+    modified_result: String,
+}
+
 impl Event {
     /// Converts a raw notification into a typed event.
     pub fn parse(method: &str, params: Option<&Value>) -> Event {
@@ -548,6 +568,15 @@ impl Event {
                     hook_command: p.hook_command,
                     task_id: p.task_id,
                     reason: p.reason,
+                }
+            }
+            m::SUBAGENT_RESULT_MODIFIED => {
+                let p: SubagentResultModifiedPayload = parse(params);
+                Event::SubagentResultModified {
+                    hook_command: p.hook_command,
+                    task_id: p.task_id,
+                    original_result: p.original_result,
+                    modified_result: p.modified_result,
                 }
             }
             other => Event::Unknown {
@@ -771,5 +800,32 @@ mod tests {
         ] {
             assert!(!status.is_terminal(), "{status:?} should not be terminal");
         }
+    }
+
+    #[test]
+    fn parses_subagent_result_modified() {
+        // MINOR 8: was previously unhandled; the C# engine emits this event.
+        let event = parse_event(
+            event_method::SUBAGENT_RESULT_MODIFIED,
+            json!({
+                "hookCommand": "hook.sh",
+                "taskId": "task-0001",
+                "originalResult": "orig",
+                "modifiedResult": "new"
+            }),
+        );
+        let Event::SubagentResultModified {
+            hook_command,
+            task_id,
+            original_result,
+            modified_result,
+        } = event
+        else {
+            panic!("expected SubagentResultModified, got {event:?}");
+        };
+        assert_eq!(hook_command, "hook.sh");
+        assert_eq!(task_id, "task-0001");
+        assert_eq!(original_result, "orig");
+        assert_eq!(modified_result, "new");
     }
 }

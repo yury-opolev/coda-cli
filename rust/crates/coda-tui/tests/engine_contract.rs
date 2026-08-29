@@ -12,7 +12,6 @@ use std::time::Duration;
 use coda_client::{Engine, EngineCommand, Inbound};
 use coda_proto::messages::{method, HistoryResult, InitializeParams, InitializeResult, ModelsResult, OkResult};
 use serde_json::json;
-
 /// Locates an engine, or returns `None` so the test can skip.
 fn engine_command() -> Option<EngineCommand> {
     let program = std::env::var("CODA_ENGINE").unwrap_or_else(|_| "coda".to_string());
@@ -175,6 +174,68 @@ async fn interrupt_is_accepted_with_no_turn_running() {
 
     let result: OkResult = serde_json::from_value(value).expect("parse interrupt");
     assert!(result.ok);
+
+    engine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+}
+
+/// MINOR 6: the main path — a full streaming prompt turn — previously had no
+/// live coverage in the contract suite.  This test sends a prompt, collects
+/// at least one event, and verifies `event/turnComplete` arrives, which is the
+/// signal that makes the TUI transition from "working" back to "ready".
+#[tokio::test]
+async fn streaming_prompt_turn_receives_turn_complete() {
+    let Some((engine, connection, mut inbound, _)) = connect().await else {
+        eprintln!("skipping: no `coda` engine on PATH");
+        return;
+    };
+
+    // Send a minimal prompt.  We do not care about credentials or a real model;
+    // we only assert on the wire contract, so any engine response is fine.
+    let params = serde_json::to_value(coda_proto::messages::PromptParams::text(
+        "reply with the single word DONE".to_string(),
+    ))
+    .expect("serialise");
+
+    let prompt_result = tokio::time::timeout(
+        Duration::from_secs(10),
+        connection.request(method::PROMPT, Some(params)),
+    )
+    .await;
+
+    // The engine may reject the prompt (e.g. no credentials), which is
+    // acceptable here — what we need to verify is that an error does NOT
+    // silently hang the inbound stream, and that if the engine accepts it the
+    // turnComplete event eventually arrives.
+    match prompt_result {
+        Err(_) | Ok(Err(_)) => {
+            // Prompt was rejected or timed out — engine may lack credentials.
+            // Skip without failing: the protocol contract for this path requires
+            // a live, authenticated engine.
+            eprintln!("skipping streaming turn: engine rejected or timed out");
+            engine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
+            return;
+        }
+        Ok(Ok(_)) => {}
+    }
+
+    // Drain events until we see turnComplete or the engine gives up.
+    let turn_complete = tokio::time::timeout(Duration::from_secs(120), async {
+        while let Some(msg) = inbound.recv().await {
+            if let coda_client::Inbound::Notification { ref method, .. } = msg {
+                if method == coda_proto::events::event_method::TURN_COMPLETE {
+                    return true;
+                }
+            }
+        }
+        false
+    })
+    .await
+    .unwrap_or(false);
+
+    assert!(
+        turn_complete,
+        "event/turnComplete must arrive after a streaming prompt turn"
+    );
 
     engine.shutdown(Duration::from_secs(5)).await.expect("shutdown");
 }

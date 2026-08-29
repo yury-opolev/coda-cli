@@ -142,10 +142,19 @@ impl CredentialStore for EncryptedFileStore {
         }
 
         let bytes = tokio::fs::read(&path).await?;
-        let plaintext = self.decrypt(&bytes).ok_or_else(|| {
-            // Could be a corrupt file or a key mismatch — treat as missing.
-            AuthError::store(format!("failed to decrypt credential at '{}'", path.display()))
-        })?;
+        let plaintext = match self.decrypt(&bytes) {
+            Some(p) => p,
+            // Treat a corrupt file or a rotated key as missing rather than
+            // failing hard: the user is prompted to re-login instead of being
+            // locked out of every credential read.
+            None => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to decrypt credential; treating as missing (corrupt file or rotated key)"
+                );
+                return Ok(None);
+            }
+        };
 
         Ok(Some(
             String::from_utf8(plaintext)
@@ -273,19 +282,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wrong_key_yields_error() {
+    async fn wrong_key_returns_none_instead_of_erroring() {
+        // MINOR 9: a corrupt file or rotated key must degrade to Ok(None) so
+        // the caller is prompted to re-login rather than failing hard.
         let dir = tempdir();
         let store1 = EncryptedFileStore::new(dir.clone()).expect("store1");
         store1.set("k", "v").await.expect("set");
 
-        // Overwrite the key file to simulate a different installation.
+        // Overwrite the key file to simulate a rotated key.
         let key_path = dir.join(KEY_FILE);
         let mut new_key = [0u8; KEY_LEN];
         OsRng.fill_bytes(&mut new_key);
         std::fs::write(&key_path, &new_key).expect("overwrite key");
 
         let store2 = EncryptedFileStore::new(dir).expect("store2");
-        // Should return an error (decrypt fails), not a corrupt string.
-        assert!(store2.get("k").await.is_err());
+        // Must return Ok(None) — treating the corrupt credential as missing —
+        // not an Err that would propagate to the user as a hard failure.
+        assert_eq!(store2.get("k").await.expect("get"), None);
+    }
+
+    #[tokio::test]
+    async fn corrupt_file_returns_none() {
+        // Any file short enough to fail the nonce+tag length check or that
+        // contains random bytes must degrade to Ok(None), not a hard Err.
+        let store = temp_store();
+        let path = store.path_for("corrupt");
+        // Write random garbage that is too short to even parse as nonce||tag||ct.
+        tokio::fs::write(&path, b"this is garbage").await.expect("write");
+        assert_eq!(store.get("corrupt").await.expect("get"), None);
     }
 }

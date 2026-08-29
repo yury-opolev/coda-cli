@@ -20,7 +20,6 @@
 //! | `ToolInputModified` | `ToolInputModified{hook_command, tool_name}` | Before/after payloads dropped. |
 //! | `ToolResultModified` | `ToolResultModified{hook_command, tool_name}` | Before/after payloads dropped. |
 //! | `ThinkingComplete` | `ThinkingComplete{elapsed_ms, thinking_tokens}` | `thinking_tokens` always `None`; Rust stream carries no per-burst token count. |
-
 use coda_llm::Usage;
 use coda_llm::Correlation as LlmCorrelation;
 use coda_proto::events::{Event as ProtoEvent};
@@ -262,8 +261,17 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
                 reason: reason.clone(),
             })
         }
-        // Gap: SubagentResultModified — no matching proto variant in the read range.
-        AgentEvent::SubagentResultModified { .. } => None,
+        AgentEvent::SubagentResultModified {
+            hook_command,
+            task_id,
+            original_result,
+            modified_result,
+        } => Some(ProtoEvent::SubagentResultModified {
+            hook_command: hook_command.clone(),
+            task_id: task_id.clone(),
+            original_result: original_result.clone(),
+            modified_result: modified_result.clone(),
+        }),
         // Gaps: no proto events for these.
         AgentEvent::CompactionCancelled { .. }
         | AgentEvent::PostCompactContextInjected { .. }
@@ -438,5 +446,35 @@ mod tests {
         assert!(matches!(&events[1], AgentEvent::AssistantText { delta } if delta == "b"));
         // take drains the buffer.
         assert!(sink.take().is_empty());
+    }
+
+    #[test]
+    fn subagent_result_modified_maps_to_proto() {
+        // MINOR 8: SubagentResultModified was previously a gap (mapped to None).
+        // The C# engine emits this event, so it must now be forwarded on the wire.
+        let received = std::sync::Arc::new(std::sync::Mutex::new(None::<ProtoEvent>));
+        let r = received.clone();
+        let sink = ProtoAdapter::new(move |e| *r.lock().unwrap() = Some(e));
+        sink.emit(AgentEvent::SubagentResultModified {
+            hook_command: "cmd".into(),
+            task_id: "task-0001".into(),
+            original_result: "original".into(),
+            modified_result: "modified".into(),
+        });
+        let guard = received.lock().unwrap();
+        match guard.as_ref().unwrap() {
+            ProtoEvent::SubagentResultModified {
+                hook_command,
+                task_id,
+                original_result,
+                modified_result,
+            } => {
+                assert_eq!(hook_command, "cmd");
+                assert_eq!(task_id, "task-0001");
+                assert_eq!(original_result, "original");
+                assert_eq!(modified_result, "modified");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

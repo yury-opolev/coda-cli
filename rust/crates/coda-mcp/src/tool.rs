@@ -21,6 +21,12 @@ use crate::client::McpToolInfo;
 use crate::manager::McpClientManager;
 use crate::MAX_TOOL_OUTPUT_CHARS;
 
+/// Canonical truncation notice appended to capped MCP tool outputs.
+///
+/// Matches `coda-agent`'s `OUTPUT_TRUNCATED` constant so the model sees the
+/// same wording regardless of which tool capped its output.
+const OUTPUT_TRUNCATED: &str = "… [output truncated]";
+
 /// The namespace prefix used for all MCP tool names.
 ///
 /// Guarantees no collision with built-in tool names (which never start with
@@ -117,7 +123,7 @@ impl Tool for McpTool {
                 // the model context.
                 if text.chars().count() > MAX_TOOL_OUTPUT_CHARS {
                     text = text.chars().take(MAX_TOOL_OUTPUT_CHARS).collect::<String>();
-                    text.push_str("\n[output truncated]");
+                    text.push_str(&format!("\n{OUTPUT_TRUNCATED}"));
                 }
                 ToolResult { content: text, is_error }
             }
@@ -177,10 +183,9 @@ mod tests {
         let long_text: String = "x".repeat(MAX_TOOL_OUTPUT_CHARS + 100);
         let char_count = long_text.chars().count();
         let mut capped: String = long_text.chars().take(MAX_TOOL_OUTPUT_CHARS).collect();
-        capped.push_str("\n[output truncated]");
+        capped.push_str(&format!("\n{OUTPUT_TRUNCATED}"));
 
         assert!(char_count > MAX_TOOL_OUTPUT_CHARS);
-        assert!(capped.len() > MAX_TOOL_OUTPUT_CHARS); // bytes > chars for safety check
-        assert!(capped.ends_with("[output truncated]"));
+        assert!(capped.ends_with(OUTPUT_TRUNCATED));
     }
 }

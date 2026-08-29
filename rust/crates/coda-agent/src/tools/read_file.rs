@@ -107,7 +107,7 @@ impl Tool for ReadFileTool {
 }
 
 /// Truncate `s` to at most `MAX_CHARS` bytes (aligned to a char boundary) and
-/// append a note so the model knows the file was longer.
+/// append a canonical notice so the model knows the file was longer.
 fn cap_at_max_chars(s: String) -> String {
     if s.len() <= MAX_CHARS {
         return s;
@@ -117,7 +117,7 @@ fn cap_at_max_chars(s: String) -> String {
     while cutoff > 0 && !s.is_char_boundary(cutoff) {
         cutoff -= 1;
     }
-    format!("{}\n… [truncated, {} bytes total]", &s[..cutoff], s.len())
+    format!("{}\n{}", &s[..cutoff], super::OUTPUT_TRUNCATED)
 }
 
 #[cfg(test)]

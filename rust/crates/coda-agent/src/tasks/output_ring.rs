@@ -218,25 +218,9 @@ fn trim_newest_if_oversized(s: &mut RingState, max_bytes: u64) {
 /// in `max_bytes`, cut on a code-point boundary. Returns 0 if even the last
 /// code point alone exceeds the cap (retain the whole string — mirrors C#).
 fn suffix_start_fitting(s: &str, max_bytes: usize) -> usize {
-    let mut bytes: usize = 0;
-    let mut result = s.len(); // default: trim everything (start at end)
-
-    // Walk code points from the back, accumulating byte counts.
-    for (byte_idx, ch) in s.char_indices().rev() {
-        let cp_bytes = ch.len_utf8();
-        if bytes + cp_bytes > max_bytes {
-            // This code point would push us over.
-            if result == s.len() {
-                // The very last rune alone exceeds the cap — retain it anyway.
-                result = byte_idx;
-            }
-            break;
-        }
-        bytes += cp_bytes;
-        result = byte_idx;
-    }
-
-    result
+    // Delegate to the shared implementation so log_writer and output_ring do
+    // not duplicate this byte-cap-on-codepoint-boundary algorithm.
+    super::suffix_start_within_cap(s, max_bytes)
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

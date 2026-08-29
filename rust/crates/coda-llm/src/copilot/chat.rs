@@ -174,6 +174,12 @@ impl ChatDecoder {
 
     /// Decodes one SSE data payload (the string after `data:`, never `[DONE]`).
     pub fn decode(&mut self, data: &str) -> Result<Vec<StreamEvent>, LlmError> {
+        // Silently drop trailing data after we have already emitted Done (e.g.
+        // a [DONE] sentinel that arrives after an early flush on finish_reason).
+        if self.finished {
+            return Ok(Vec::new());
+        }
+
         let value: Value = serde_json::from_str(data)
             .map_err(|e| LlmError::Protocol(format!("invalid JSON in chat chunk: {e}")))?;
 
@@ -189,40 +195,51 @@ impl ChatDecoder {
             return Ok(Vec::new());
         };
 
-        if let Some(reason) = choice
-            .get("finish_reason")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            self.stop_reason = Some(map_finish_reason(reason));
-        }
-
-        let Some(delta) = choice.get("delta") else {
-            return Ok(Vec::new());
-        };
+        // Record finish_reason before checking delta so it is never missed.
+        let has_finish_reason =
+            if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+                self.stop_reason = Some(map_finish_reason(reason));
+                true
+            } else {
+                false
+            };
 
         let mut events = Vec::new();
 
-        if let Some(text) = delta
-            .get("content")
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        {
-            events.push(StreamEvent::TextDelta(text.to_string()));
+        if let Some(delta) = choice.get("delta") {
+            if let Some(text) = delta
+                .get("content")
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+            {
+                events.push(StreamEvent::TextDelta(text.to_string()));
+            }
+
+            if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
+                for tc in tcs {
+                    self.accumulate(tc);
+                }
+            }
         }
 
-        if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
-            for tc in tcs {
-                self.accumulate(tc);
-            }
+        // When finish_reason is present, flush accumulated tool calls immediately.
+        // An OpenAI-compatible proxy may close the stream without [DONE]; flushing
+        // here ensures tool calls are delivered and `finished()` returns true so
+        // the pump does not report IncompleteStream.
+        if has_finish_reason {
+            events.extend(self.flush());
         }
 
         Ok(events)
     }
 
     /// Called when `[DONE]` is received — flushes accumulated tool calls and
-    /// emits `Done`.
+    /// emits `Done`. Idempotent: returns empty when already called on `finish_reason`.
     pub fn flush(&mut self) -> Vec<StreamEvent> {
+        // Guard against double-flush: finish_reason may have already called us.
+        if self.finished {
+            return Vec::new();
+        }
         self.finished = true;
 
         let mut events: Vec<StreamEvent> = self
@@ -600,5 +617,46 @@ mod tests {
         let payload = json!({ "id": "cmpl-123" }).to_string();
         let events = ChatDecoder::new().decode(&payload).expect("decode");
         assert!(events.is_empty());
+    }
+
+    // ── LOW: flush on non-empty finish_reason ──────────────────────────────────
+
+    #[test]
+    fn flush_on_finish_reason_delivers_tool_calls_without_done_sentinel() {
+        // An OpenAI-compatible proxy may end the stream with finish_reason="tool_calls"
+        // but omit the trailing [DONE]. Tool calls must still be delivered.
+        let tool_chunk = json!({ "choices": [{ "delta": { "tool_calls": [
+            { "index": 0, "id": "call_1", "function": { "name": "read_file", "arguments": "{}" } }
+        ] } }] }).to_string();
+        // The last chunk carries finish_reason but no [DONE] follows.
+        let last_chunk = json!({ "choices": [{ "delta": {}, "finish_reason": "tool_calls" }] }).to_string();
+
+        let mut decoder = ChatDecoder::new();
+        decoder.decode(&tool_chunk).expect("decode tool chunk");
+        let events = decoder.decode(&last_chunk).expect("decode finish chunk");
+
+        // The decoder must have flushed tool calls inline when it saw finish_reason.
+        assert!(decoder.finished(), "decoder must be finished after seeing finish_reason");
+        let tool_events: Vec<_> = events.iter().filter(|e| matches!(e, StreamEvent::ToolUse(_))).collect();
+        assert_eq!(tool_events.len(), 1, "exactly one tool call must be emitted");
+        let done_events: Vec<_> = events.iter().filter(|e| matches!(e, StreamEvent::Done { .. })).collect();
+        assert_eq!(done_events.len(), 1, "Done must be emitted alongside the tool call");
+    }
+
+    #[test]
+    fn flush_is_idempotent_when_done_follows_finish_reason() {
+        // If [DONE] arrives after a finish_reason that already flushed, the second
+        // flush must return nothing — no duplicate Done events.
+        let last_chunk = json!({ "choices": [{ "delta": {}, "finish_reason": "stop" }] }).to_string();
+
+        let mut decoder = ChatDecoder::new();
+        let first = decoder.decode(&last_chunk).expect("decode");
+        assert!(decoder.finished());
+        // First flush (via finish_reason) must have emitted Done.
+        assert!(first.iter().any(|e| matches!(e, StreamEvent::Done { .. })));
+
+        // Second flush (via [DONE]) must be a no-op.
+        let second = decoder.flush();
+        assert!(second.is_empty(), "second flush must be empty; got {second:?}");
     }
 }

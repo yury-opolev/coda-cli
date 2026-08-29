@@ -749,6 +749,7 @@ dependencies = [
  "coda-render",
  "crossterm",
  "directories",
+ "futures",
  "futures-lite 2.6.1",
  "insta",
  "pretty_assertions",

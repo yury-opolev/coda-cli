@@ -12,7 +12,7 @@ use tokio::sync::mpsc;
 use crate::anthropic::protocol::AnthropicDecoder;
 use crate::anthropic::StreamEvent;
 use crate::client::{LlmClient, ResponseStream};
-use crate::error::{parse_retry_after, LlmError};
+use crate::error::LlmError;
 use crate::message::{ChatRequest, ModelInfo};
 use crate::pump::ProtocolDecoder;
 use crate::retry::RetryPolicy;
@@ -204,39 +204,16 @@ impl CopilotClient {
         body: &serde_json::Value,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> Result<reqwest::Response, LlmError> {
-        let mut attempt = 1u32;
-
-        loop {
+        // Delegate to the shared retry loop so the Anthropic and Copilot clients
+        // do not duplicate the retry-after parsing, backoff and tracing logic.
+        crate::retry::send_with_retry(&self.config.retry, "copilot", || {
             let mut builder = self.auth_post_with_auth(url, dynamic_auth).json(body);
             if endpoint == CopilotEndpoint::Messages {
                 builder = builder.header("anthropic-version", ANTHROPIC_API_VERSION);
             }
-
-            let error = match builder.send().await {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|v| v.to_str().ok())
-                        .and_then(parse_retry_after);
-                    let body = response.text().await.unwrap_or_default();
-                    LlmError::from_status(status, &body, retry_after)
-                }
-                Err(e) if e.is_timeout() => LlmError::Transport(format!("request timed out: {e}")),
-                Err(e) => LlmError::Transport(e.to_string()),
-            };
-
-            match self.config.retry.delay_before(attempt + 1, &error) {
-                Some(delay) => {
-                    tracing::warn!(attempt, ?delay, %error, "copilot request failed; retrying");
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                None => return Err(error),
-            }
-        }
+            builder
+        })
+        .await
     }
 
     /// Selects the endpoint, sends the request, and handles the chat-completions

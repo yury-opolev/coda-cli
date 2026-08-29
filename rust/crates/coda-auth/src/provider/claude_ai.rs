@@ -306,8 +306,16 @@ fn token_response_to_credential(
     resp: OAuthTokenResponse,
     fallback_refresh: Option<Secret<String>>,
 ) -> Credential {
-    let expires_at = resp.expires_in.map(|secs| {
-        chrono::Utc::now() + chrono::Duration::seconds(secs)
+    // Maximum safe value for chrono::Duration::seconds (≈ 292 years).
+    // Values beyond this panic chrono; clamp to 100 years (semantically
+    // "permanent") so an attacker-controlled expires_in cannot cause a panic.
+    const MAX_EXPIRES_SECS: i64 = 100 * 365 * 24 * 3600;
+
+    let expires_at = resp.expires_in.and_then(|secs| {
+        // Clamp first, then use checked_add_signed so both chrono internal
+        // panics and DateTime overflow are guarded with a single pattern.
+        let clamped = secs.clamp(0, MAX_EXPIRES_SECS);
+        chrono::Utc::now().checked_add_signed(chrono::Duration::seconds(clamped))
     });
 
     let scopes = resp
@@ -605,5 +613,83 @@ mod tests {
             .block_on(listener.wait_for_callback(StdDuration::from_millis(50)))
             .unwrap_err();
         assert!(matches!(err, AuthError::LoginCancelled(_)));
+    }
+
+    // ── MINOR 7: needs_refresh boundary tests ─────────────────────────────────
+
+    fn cred_expiring_in(secs: i64) -> Credential {
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(secs))
+            .expect("test expiry must be representable");
+        Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("tok".into())),
+            refresh_token: Some(Secret::new("ref".into())),
+            api_key: None,
+            expires_at: Some(expires_at),
+            scopes: Vec::new(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn needs_refresh_is_true_exactly_at_the_buffer_boundary() {
+        // At exactly REFRESH_BUFFER seconds remaining, now + REFRESH_BUFFER >= exp,
+        // so the token MUST be refreshed (>=, not >).
+        let at_boundary = cred_expiring_in(REFRESH_BUFFER.as_secs() as i64);
+        let p = provider("http://unused");
+        assert!(
+            p.needs_refresh(&at_boundary),
+            "token exactly at the refresh boundary must trigger refresh"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_is_true_one_second_inside_the_buffer() {
+        let one_second_inside = cred_expiring_in(REFRESH_BUFFER.as_secs() as i64 - 1);
+        let p = provider("http://unused");
+        assert!(
+            p.needs_refresh(&one_second_inside),
+            "token one second inside the refresh window must trigger refresh"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_is_false_one_second_outside_the_buffer() {
+        // One second BEYOND the buffer → now + REFRESH_BUFFER < exp → no refresh.
+        let one_second_outside = cred_expiring_in(REFRESH_BUFFER.as_secs() as i64 + 1);
+        let p = provider("http://unused");
+        assert!(
+            !p.needs_refresh(&one_second_outside),
+            "token one second outside the refresh window must not trigger refresh"
+        );
+    }
+
+    // ── LOW: expires_in overflow ──────────────────────────────────────────────
+
+    #[test]
+    fn token_response_with_i64_max_expires_in_does_not_panic() {
+        // An attacker-controlled expires_in of i64::MAX must not overflow or panic
+        // chrono::Duration::seconds. The value is clamped to MAX_EXPIRES_SECS before
+        // the Duration is constructed, so we get a far-future expiry (not None).
+        let resp = OAuthTokenResponse {
+            access_token: Some("tok".into()),
+            refresh_token: None,
+            expires_in: Some(i64::MAX),
+            scope: None,
+            account: None,
+            organization: None,
+        };
+        let cred = token_response_to_credential(resp, None);
+        // Must not panic; the expiry is clamped to a safe far-future date.
+        assert!(
+            cred.expires_at.is_some(),
+            "clamped value must produce a valid expiry, not overflow"
+        );
+        assert!(
+            cred.expires_at.unwrap() > chrono::Utc::now(),
+            "clamped expiry must be in the future"
+        );
     }
 }

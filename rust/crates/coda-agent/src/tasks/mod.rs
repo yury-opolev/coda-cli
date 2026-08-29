@@ -27,3 +27,35 @@ pub use task_manager::{
     DEFAULT_SHUTDOWN_BUDGET,
 };
 pub use task_subscription::{TaskChange, TaskChangeKind, TaskSubscription};
+
+// ── Shared byte-cap utility ────────────────────────────────────────────────────
+
+/// Returns the byte index at which the newest suffix of `s` begins, where the
+/// suffix's UTF-8 encoding fits in `max_bytes` and the cut falls on a
+/// code-point boundary.
+///
+/// When even the last code point alone exceeds `max_bytes`, its byte index is
+/// still returned so callers can retain at least one character (C# behaviour).
+/// Returns `s.len()` when `s` is empty (no suffix to keep).
+///
+/// Both [`log_writer::newest_suffix_within_cap`] and
+/// [`output_ring`]'s internal trimmer call this to avoid duplicating the logic.
+pub(super) fn suffix_start_within_cap(s: &str, max_bytes: usize) -> usize {
+    let mut bytes: usize = 0;
+    let mut start = s.len();
+
+    for (byte_idx, ch) in s.char_indices().rev() {
+        let cp_bytes = ch.len_utf8();
+        if bytes + cp_bytes > max_bytes {
+            if start == s.len() {
+                // Last code point alone exceeds cap — retain it anyway.
+                start = byte_idx;
+            }
+            break;
+        }
+        bytes += cp_bytes;
+        start = byte_idx;
+    }
+
+    start
+}

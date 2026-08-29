@@ -485,6 +485,11 @@ impl UiState {
             Event::SubagentBlocked { reason, .. } => {
                 self.notice(format!("Subagent blocked: {reason}"), NoticeLevel::Warning);
             }
+            Event::SubagentResultModified { .. } => {
+                // MINOR 8: SubagentResultModified is an informational hook event;
+                // the TUI has no UI to display hook payloads, so it is silently
+                // accepted (like ToolInputModified and ToolResultModified).
+            }
             // Informational events with no transcript representation.
             Event::Stop { .. }
             | Event::StreamProgress { .. }

@@ -601,6 +601,56 @@ mod tests {
         assert!(!header_map["editor-version"].is_empty());
     }
 
+    // ── MINOR 7: needs_refresh boundary tests ─────────────────────────────────
+
+    fn cred_expiring_in(secs: i64) -> Credential {
+        let expires_at = chrono::Utc::now()
+            .checked_add_signed(chrono::Duration::seconds(secs))
+            .expect("test expiry must be representable");
+        Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("tok".into())),
+            refresh_token: None,
+            api_key: None,
+            expires_at: Some(expires_at),
+            scopes: Vec::new(),
+            account: None,
+        }
+    }
+
+    #[test]
+    fn needs_refresh_is_true_exactly_at_the_buffer_boundary() {
+        // At exactly REFRESH_BUFFER seconds remaining, now + REFRESH_BUFFER >= exp,
+        // so the token MUST be refreshed (>= not >).
+        let at_boundary = cred_expiring_in(REFRESH_BUFFER.as_secs() as i64);
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        assert!(
+            p.needs_refresh(&at_boundary),
+            "token exactly at the refresh boundary must trigger refresh"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_is_true_one_second_inside_the_buffer() {
+        let one_in = cred_expiring_in(REFRESH_BUFFER.as_secs() as i64 - 1);
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        assert!(
+            p.needs_refresh(&one_in),
+            "token one second inside the refresh window must trigger refresh"
+        );
+    }
+
+    #[test]
+    fn needs_refresh_is_false_one_second_outside_the_buffer() {
+        let one_out = cred_expiring_in(REFRESH_BUFFER.as_secs() as i64 + 1);
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        assert!(
+            !p.needs_refresh(&one_out),
+            "token one second outside the refresh window must not trigger refresh"
+        );
+    }
+
     #[tokio::test]
     async fn polling_returns_on_authorization_pending_then_success() {
         // A server that first returns authorization_pending, then a token.

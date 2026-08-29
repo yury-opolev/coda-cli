@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use coda_proto::error_codes;
+use coda_proto::{Notification, Request};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
@@ -72,11 +73,8 @@ impl Connection {
         method: impl Into<String>,
         params: Option<Value>,
     ) -> Result<(), McpTransportError> {
-        let mut msg = serde_json::json!({ "jsonrpc": "2.0", "method": method.into() });
-        if let Some(p) = params {
-            msg["params"] = p;
-        }
-        let line = serde_json::to_string(&msg).map_err(McpTransportError::Json)?;
+        let notification = Notification::new(method, params);
+        let line = serde_json::to_string(&notification).map_err(McpTransportError::Json)?;
         self.outgoing
             .send(line)
             .map_err(|_| McpTransportError::ConnectionClosed)
@@ -93,15 +91,8 @@ impl Connection {
         params: Option<Value>,
     ) -> Result<oneshot::Receiver<Result<Value, ResponseError>>, McpTransportError> {
         let id = RequestId::Number(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let mut msg = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": id,
-            "method": method.into(),
-        });
-        if let Some(p) = params {
-            msg["params"] = p;
-        }
-        let line = serde_json::to_string(&msg).map_err(McpTransportError::Json)?;
+        let request = Request::new(id.clone(), method, params);
+        let line = serde_json::to_string(&request).map_err(McpTransportError::Json)?;
 
         let (tx, rx) = oneshot::channel();
         self.pending

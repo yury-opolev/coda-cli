@@ -74,6 +74,61 @@ impl RetryPolicy {
     }
 }
 
+/// The shared HTTP retry loop, parameterised by the request builder.
+///
+/// Both provider clients (Anthropic and Copilot) use the same pattern: build a
+/// request, send it, classify the response, and retry on transient errors.
+/// The only difference is how the request is built (which headers, URL, body),
+/// so the policy + error handling lives here and the builder is a closure.
+///
+/// `make_builder` is called fresh on every attempt because `reqwest::RequestBuilder`
+/// is not `Clone`; the URL, body, and auth headers must all be captured by the
+/// closure.
+///
+/// The `provider` label is used only in tracing — pass a short identifier such
+/// as `"anthropic"` or `"copilot"`.
+pub(crate) async fn send_with_retry<F>(
+    policy: &RetryPolicy,
+    provider: &str,
+    mut make_builder: F,
+) -> Result<reqwest::Response, LlmError>
+where
+    F: FnMut() -> reqwest::RequestBuilder,
+{
+    let mut attempt = 1u32;
+    loop {
+        let error = match make_builder().send().await {
+            Ok(response) if response.status().is_success() => return Ok(response),
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let retry_after = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(crate::error::parse_retry_after);
+                let body = response.text().await.unwrap_or_default();
+                LlmError::from_status(status, &body, retry_after)
+            }
+            Err(e) if e.is_timeout() => LlmError::Transport(format!("request timed out: {e}")),
+            Err(e) => LlmError::Transport(e.to_string()),
+        };
+
+        match policy.delay_before(attempt + 1, &error) {
+            Some(delay) => {
+                tracing::warn!(
+                    attempt,
+                    ?delay,
+                    %error,
+                    "{provider} request failed; retrying"
+                );
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            None => return Err(error),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

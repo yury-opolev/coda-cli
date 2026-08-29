@@ -43,6 +43,13 @@ use regex::Regex;
 use crate::tool::Tool;
 use crate::lsp::LspDiagnosticsTool;
 
+/// Canonical truncation notice appended to capped tool outputs.
+///
+/// Using a single constant keeps the text consistent across all tools —
+/// `run_command`, `read_file`, and `coda-mcp` — so the model sees the
+/// same wording regardless of which tool truncated.
+pub(super) const OUTPUT_TRUNCATED: &str = "… [output truncated]";
+
 pub use ask_user_question::AskUserQuestionTool;
 pub use background_task::{BackgroundTaskOutputTool, BackgroundTaskStartTool, BackgroundTaskStopTool};
 pub use edit_file::EditTool;

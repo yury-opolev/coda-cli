@@ -13,6 +13,7 @@ use coda_proto::messages::{self, method, server_method};
 use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
 use crossterm::event::{Event as TerminalEvent, EventStream, KeyCode, KeyEvent, MouseEventKind};
+use futures::future::OptionFuture;
 use futures_lite::StreamExt;
 use serde_json::Value;
 use tokio::sync::mpsc;
@@ -168,17 +169,25 @@ impl App {
                     None => break,
                 },
 
-                // A turn finished.
+                // A turn finished (delivered via the mpsc relay from the turn branch below).
                 Some(outcome) = turn_rx.recv() => self.on_turn_finished(outcome),
-            }
 
-            // Poll the outstanding turn without blocking the loop.
-            if let Some(receiver) = &mut self.turn {
-                if let Ok(result) = receiver.try_recv() {
+                // The outstanding session/prompt oneshot resolves.
+                //
+                // OptionFuture is Pending when self.turn is None, so this branch
+                // only competes when a turn is actually in flight.  Without this
+                // branch the oneshot would only be polled via try_recv() AFTER
+                // another branch woke the loop, which could leave the TUI stuck
+                // in the "working" state if the engine responded but no other
+                // event arrived.
+                Some(result) = OptionFuture::from(self.turn.as_mut()) => {
                     self.turn = None;
-                    let _ = turn_tx.send(TurnOutcome {
-                        result: result.map_err(ClientError::Rpc),
-                    });
+                    // result: Result<Result<Value,ResponseError>, RecvError>.
+                    // Flatten into Result<Value, ClientError>.
+                    let outcome = result
+                        .map_err(|_| ClientError::ConnectionClosed)
+                        .and_then(|r| r.map_err(ClientError::Rpc));
+                    let _ = turn_tx.send(TurnOutcome { result: outcome });
                 }
             }
 
@@ -635,14 +644,18 @@ impl App {
     /// restarting the engine against the same session id therefore performs a
     /// real switch, with the conversation preserved.
     async fn switch_model(&mut self, model: &str) {
-        let provider = match Settings::load(&self.paths) {
-            Ok(settings) => settings.default_provider().map(str::to_string),
-            Err(error) => {
+        // Read the configured provider (blocking I/O wrapped in spawn_blocking so
+        // it cannot block the async runtime).
+        let paths = self.paths.clone();
+        let provider = match tokio::task::spawn_blocking(move || Settings::load(&paths)).await {
+            Ok(Ok(settings)) => settings.default_provider().map(str::to_string),
+            Ok(Err(error)) => {
                 return self.notice(
                     format!("Could not read settings: {error}"),
                     NoticeLevel::Error,
                 )
             }
+            Err(_) => return self.notice("Settings read was interrupted.", NoticeLevel::Error),
         };
 
         let Some(provider) = provider else {
@@ -652,17 +665,25 @@ impl App {
             );
         };
 
-        let write = || -> Result<(), config::ConfigError> {
-            let mut settings = Settings::load(&self.paths)?;
-            settings.set_model_for(&provider, model);
+        // Write the new model choice (also blocking I/O).
+        let paths = self.paths.clone();
+        let model_str = model.to_string();
+        let write_result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+            let mut settings = Settings::load(&paths)?;
+            settings.set_model_for(&provider, &model_str);
             settings.save()
-        };
+        })
+        .await;
 
-        if let Err(error) = write() {
-            return self.notice(
-                format!("Could not save the model: {error}"),
-                NoticeLevel::Error,
-            );
+        match write_result {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return self.notice(
+                    format!("Could not save the model: {error}"),
+                    NoticeLevel::Error,
+                )
+            }
+            Err(_) => return self.notice("Settings write was interrupted.", NoticeLevel::Error),
         }
 
         self.close_browser();
@@ -681,16 +702,21 @@ impl App {
     async fn toggle_browser_row(&mut self, id: &str) {
         match self.browser_kind {
             Some(BrowserKind::Plugins) => {
-                let result = (|| -> Result<bool, config::ConfigError> {
-                    let mut state = PluginState::load(&self.paths)?;
-                    let enabled = state.is_disabled(id); // toggling to this
-                    state.set_enabled(id, enabled);
+                // Plugin state lives in a JSON file; read and write are blocking
+                // I/O that must not block the async runtime.
+                let paths = self.paths.clone();
+                let id_owned = id.to_string();
+                let result = tokio::task::spawn_blocking(move || -> Result<bool, config::ConfigError> {
+                    let mut state = PluginState::load(&paths)?;
+                    let enabled = state.is_disabled(&id_owned); // toggling to this
+                    state.set_enabled(&id_owned, enabled);
                     state.save()?;
                     Ok(enabled)
-                })();
+                })
+                .await;
 
                 match result {
-                    Ok(enabled) => {
+                    Ok(Ok(enabled)) => {
                         let word = if enabled { "Enabled" } else { "Disabled" };
                         self.notice(
                             format!("{word} plugin {id}. Restart the engine to apply."),
@@ -698,37 +724,47 @@ impl App {
                         );
                         self.reload_browser().await;
                     }
-                    Err(error) => self.notice(
+                    Ok(Err(error)) => self.notice(
                         format!("Could not update plugin state: {error}"),
                         NoticeLevel::Error,
                     ),
+                    Err(_) => self.notice("Plugin state write was interrupted.", NoticeLevel::Error),
                 }
             }
-            Some(BrowserKind::Mcp) => match config::set_mcp_enabled(&self.paths, id, {
-                // Flip whatever the current configuration says.
-                config::load_mcp_servers(&self.paths)
-                    .ok()
-                    .and_then(|servers| {
-                        servers.iter().find(|s| s.name == id).map(|s| !s.enabled)
-                    })
-                    .unwrap_or(false)
-            }) {
-                Ok(true) => {
-                    self.notice(
-                        format!("Updated MCP server {id}. Restart the engine to apply."),
-                        NoticeLevel::Info,
-                    );
-                    self.reload_browser().await;
+            Some(BrowserKind::Mcp) => {
+                // Load + mutate MCP config; both are blocking.
+                let paths = self.paths.clone();
+                let id_owned = id.to_string();
+                let enable_result = tokio::task::spawn_blocking(move || {
+                    let enabled = config::load_mcp_servers(&paths)
+                        .ok()
+                        .and_then(|servers| {
+                            servers.iter().find(|s| s.name == id_owned).map(|s| !s.enabled)
+                        })
+                        .unwrap_or(false);
+                    config::set_mcp_enabled(&paths, &id_owned, enabled).map(|ok| (ok, enabled))
+                })
+                .await;
+
+                match enable_result {
+                    Ok(Ok((true, _))) => {
+                        self.notice(
+                            format!("Updated MCP server {id}. Restart the engine to apply."),
+                            NoticeLevel::Info,
+                        );
+                        self.reload_browser().await;
+                    }
+                    Ok(Ok((false, _))) => self.notice(
+                        format!("MCP server {id} is not defined in a local .mcp.json."),
+                        NoticeLevel::Warning,
+                    ),
+                    Ok(Err(error)) => self.notice(
+                        format!("Could not update MCP configuration: {error}"),
+                        NoticeLevel::Error,
+                    ),
+                    Err(_) => self.notice("MCP config write was interrupted.", NoticeLevel::Error),
                 }
-                Ok(false) => self.notice(
-                    format!("MCP server {id} is not defined in a local .mcp.json."),
-                    NoticeLevel::Warning,
-                ),
-                Err(error) => self.notice(
-                    format!("Could not update MCP configuration: {error}"),
-                    NoticeLevel::Error,
-                ),
-            },
+            }
             Some(BrowserKind::Skills) => self.notice(
                 "Skills are frontmatter-driven; edit the SKILL.md file to change them.",
                 NoticeLevel::Info,
@@ -979,13 +1015,31 @@ impl App {
         let params = serde_json::to_value(messages::SteerParams { text: text.clone() }).ok();
         let response = self.connection.request(method::STEER, params).await;
 
-        let id = response
+        let result = response
             .ok()
-            .and_then(|value| serde_json::from_value::<messages::SteerResult>(value).ok())
-            .filter(|result| result.ok)
-            .and_then(|result| result.message_id);
+            .and_then(|value| serde_json::from_value::<messages::SteerResult>(value).ok());
 
-        self.apply(UiEvent::Queued { text, id });
+        match result {
+            Some(r) if r.ok => {
+                self.apply(UiEvent::Queued { text, id: r.message_id });
+            }
+            Some(_) => {
+                // Engine accepted the call but rejected the steer (ok:false).
+                // Showing the message as "queued" would be misleading because it
+                // will never be delivered; surface a warning instead.
+                self.notice(
+                    "The engine could not queue the message right now.",
+                    NoticeLevel::Warning,
+                );
+            }
+            None => {
+                // RPC error or unexpected response shape — message not delivered.
+                self.notice(
+                    "Failed to deliver the steering message to the engine.",
+                    NoticeLevel::Error,
+                );
+            }
+        }
     }
 
     fn interrupt(&mut self) {

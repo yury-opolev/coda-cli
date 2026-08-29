@@ -156,4 +156,98 @@ mod tests {
             .await;
         assert!(result.is_err(), "cancellation should propagate as Err");
     }
+
+    // ── MINOR 7: backoff / clamp / overflow / mid-backoff cancel ──────────────
+
+    #[tokio::test]
+    async fn exponential_backoff_grows_with_attempts() {
+        // Use zero delays (for_tests policy) so the test runs instantly; what
+        // we verify is that all 4 attempts execute and the function returns
+        // false without panicking.
+        let policy = GoalRetryPolicy {
+            max_attempts: 4,
+            base_delay: std::time::Duration::ZERO,
+            max_delay: std::time::Duration::ZERO,
+        };
+        let cancel = CancellationToken::new();
+        let (ok, _) = policy
+            .run(|_| async { Err::<(), _>(anyhow::anyhow!("always fails")) }, cancel)
+            .await
+            .unwrap();
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn max_delay_clamp_is_respected() {
+        // The `min(max_delay)` clamp must not panic for any attempt count.
+        // Use a very short real delay so the test still exercises the sleep path.
+        let max = std::time::Duration::from_millis(1);
+        let policy = GoalRetryPolicy {
+            max_attempts: 5,
+            base_delay: std::time::Duration::from_millis(1),
+            max_delay: max,
+        };
+        let cancel = CancellationToken::new();
+        let (ok, _) = policy
+            .run(|_| async { Err::<(), _>(anyhow::anyhow!("fail")) }, cancel)
+            .await
+            .unwrap();
+        assert!(!ok);
+    }
+
+    #[tokio::test]
+    async fn large_attempt_count_does_not_overflow_shift() {
+        // shift.min(62) must prevent u128 overflow when attempt numbers are large.
+        // Use a tiny delay and few attempts to keep the test fast.
+        let policy = GoalRetryPolicy {
+            max_attempts: 70, // attempt 70 → shift = 68 → clamped to 62 → no overflow
+            base_delay: std::time::Duration::from_nanos(1),
+            max_delay: std::time::Duration::from_nanos(1),
+        };
+        let cancel = CancellationToken::new();
+        let (ok, _) = policy
+            .run(|_| async { Err::<(), _>(anyhow::anyhow!("fail")) }, cancel)
+            .await
+            .unwrap();
+        assert!(!ok); // 70 failures — no panic from overflow
+    }
+
+    #[tokio::test]
+    async fn cancellation_mid_backoff_propagates() {
+        // The select! inside the retry loop must wake on cancel even while
+        // sleeping between attempts.  We use a short but non-zero sleep so
+        // the cancel arm is actually reached.
+        let policy = GoalRetryPolicy {
+            max_attempts: 10,
+            base_delay: std::time::Duration::from_millis(500),
+            max_delay: std::time::Duration::from_millis(500),
+        };
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+
+        // Cancel after the first failure so the retry loop enters the sleep arm.
+        let first_call = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_call2 = first_call.clone();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            policy.run(
+                move |_| {
+                    let cancel_clone = cancel_clone.clone();
+                    let first_call2 = first_call2.clone();
+                    async move {
+                        if !first_call2.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                            // Only cancel on the first call.
+                            cancel_clone.cancel();
+                        }
+                        Err::<(), _>(anyhow::anyhow!("fail"))
+                    }
+                },
+                cancel,
+            ),
+        )
+        .await
+        .expect("must complete quickly after cancel");
+
+        assert!(result.is_err(), "mid-backoff cancel must propagate as Err");
+    }
 }

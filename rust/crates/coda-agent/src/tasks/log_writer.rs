@@ -270,23 +270,7 @@ pub fn newest_suffix_within_cap(s: &str, max_bytes: usize) -> &str {
     if max_bytes == 0 || s.is_empty() {
         return "";
     }
-    let mut bytes: usize = 0;
-    let mut start = s.len(); // byte index of the kept suffix
-
-    for (byte_idx, ch) in s.char_indices().rev() {
-        let cp_bytes = ch.len_utf8();
-        if bytes + cp_bytes > max_bytes {
-            if start == s.len() {
-                // Last rune alone exceeds cap — retain it anyway.
-                start = byte_idx;
-            }
-            break;
-        }
-        bytes += cp_bytes;
-        start = byte_idx;
-    }
-
-    &s[start..]
+    &s[super::suffix_start_within_cap(s, max_bytes)..]
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

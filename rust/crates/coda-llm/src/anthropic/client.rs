@@ -11,7 +11,7 @@ use tokio::sync::mpsc;
 
 use crate::anthropic::{protocol::AnthropicDecoder, request};
 use crate::client::{LlmClient, ResponseStream};
-use crate::error::{parse_retry_after, LlmError};
+use crate::error::LlmError;
 use crate::message::{ChatRequest, ModelInfo};
 use crate::retry::RetryPolicy;
 
@@ -168,9 +168,11 @@ impl AnthropicClient {
     ///
     /// Retrying only happens here: once events have been emitted the caller has
     /// already seen partial output, and replaying would duplicate it.
+    ///
+    /// The shared `crate::retry::send_with_retry` handles the retry loop so the
+    /// Anthropic and Copilot clients do not duplicate that logic.
     async fn send_with_retry(&self, body: &serde_json::Value) -> Result<reqwest::Response, LlmError> {
         let url = self.endpoint();
-        let mut attempt = 1u32;
 
         // Fetch dynamic auth headers once per request (before the retry loop) so
         // a refreshed token is used immediately without recreating the client.
@@ -180,42 +182,10 @@ impl AnthropicClient {
             None
         };
 
-        loop {
-            let builder = self.request_builder_with_auth(&url, dynamic_auth.as_deref());
-            let result = builder.json(body).send().await;
-
-            let error = match result {
-                Ok(response) if response.status().is_success() => return Ok(response),
-                Ok(response) => {
-                    let status = response.status().as_u16();
-                    let retry_after = response
-                        .headers()
-                        .get("retry-after")
-                        .and_then(|value| value.to_str().ok())
-                        .and_then(parse_retry_after);
-                    let body = response.text().await.unwrap_or_default();
-                    LlmError::from_status(status, &body, retry_after)
-                }
-                Err(error) if error.is_timeout() => {
-                    LlmError::Transport(format!("request timed out: {error}"))
-                }
-                Err(error) => LlmError::Transport(error.to_string()),
-            };
-
-            match self.config.retry.delay_before(attempt + 1, &error) {
-                Some(delay) => {
-                    tracing::warn!(
-                        attempt,
-                        ?delay,
-                        %error,
-                        "provider request failed; retrying"
-                    );
-                    tokio::time::sleep(delay).await;
-                    attempt += 1;
-                }
-                None => return Err(error),
-            }
-        }
+        crate::retry::send_with_retry(&self.config.retry, "anthropic", || {
+            self.request_builder_with_auth(&url, dynamic_auth.as_deref()).json(body)
+        })
+        .await
     }
 }
 

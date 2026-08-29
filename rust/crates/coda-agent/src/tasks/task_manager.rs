@@ -899,4 +899,36 @@ mod tests {
         assert_eq!(first.len(), 1);
         assert!(second.is_empty());
     }
+
+    // ── MINOR 7: cancel() ─────────────────────────────────────────────────────
+
+    #[test]
+    fn cancel_fires_the_cancellation_token_without_changing_status() {
+        // cancel() is the risk-critical path: it triggers orderly shutdown of the
+        // task's async work but leaves status transitions to the task itself.
+        let m = mgr();
+        let t = m
+            .register(TaskKind::Subagent, "work", None, TaskExecutionMode::Background)
+            .unwrap();
+
+        assert_eq!(t.status(), TaskRunStatus::Running);
+        // The cancel token must not be fired before cancel() is called.
+        assert!(!t.cancel.is_cancelled(), "token should not be cancelled before cancel()");
+
+        m.cancel(&t.id);
+
+        // Status is still Running — the task itself transitions to a terminal state
+        // when it observes the token.
+        assert_eq!(t.status(), TaskRunStatus::Running, "cancel() must not change status");
+        // The underlying token MUST be fired so the task's work can stop.
+        assert!(t.cancel.is_cancelled(), "cancel() must fire the cancellation token");
+    }
+
+    #[test]
+    fn cancel_unknown_id_is_a_no_op() {
+        // cancel() for an unknown id must not panic — the task may have already
+        // been removed or was never registered.
+        let m = mgr();
+        m.cancel("task-9999"); // must not panic
+    }
 }

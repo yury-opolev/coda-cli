@@ -16,6 +16,7 @@ coda-proto.workspace = true
 coda-client.workspace = true
 coda-render.workspace = true
 coda-mcp.workspace = true
+futures.workspace = true
 futures-lite = "2"
 
 anyhow.workspace = true
