@@ -71,10 +71,21 @@ pub struct Response {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ResponseError {
+    /// Per JSON-RPC 2.0 spec `code` is required, but some servers omit it.
+    /// Default to -1 (unknown) so a malformed error still faults the caller
+    /// rather than being silently dropped as an unparsable frame.
+    #[serde(default = "default_error_code")]
     pub code: i64,
+    /// Per spec `message` is required; default to empty string for the same
+    /// reason as `code`.
+    #[serde(default)]
     pub message: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub data: Option<Value>,
+}
+
+fn default_error_code() -> i64 {
+    -1
 }
 
 impl std::fmt::Display for ResponseError {
@@ -299,5 +310,40 @@ mod tests {
             "jsonrpc": "1.0", "id": 1, "method": "x"
         }));
         assert!(err.is_err());
+    }
+
+    /// A non-conformant server that sends `"error": {}` (missing `code` and
+    /// `message`) must still fault the caller rather than being dropped as an
+    /// unparsable frame.  Callers get code=-1 and an empty message rather than
+    /// waiting forever for a response that will never arrive.
+    #[test]
+    fn error_response_with_missing_code_and_message_uses_defaults() {
+        let message = parse(json!({
+            "jsonrpc": "2.0",
+            "id": 42,
+            "error": {}
+        }));
+        let Message::Response(response) = message else {
+            panic!("expected a response");
+        };
+        let error = response.into_result().expect_err("expected an error");
+        assert_eq!(error.code, -1, "missing code should default to -1");
+        assert_eq!(error.message, "", "missing message should default to empty string");
+    }
+
+    /// Same as above but only `code` is present — `message` defaults to empty.
+    #[test]
+    fn error_response_with_missing_message_uses_empty_string() {
+        let message = parse(json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "error": { "code": -32601 }
+        }));
+        let Message::Response(response) = message else {
+            panic!("expected a response");
+        };
+        let error = response.into_result().expect_err("expected an error");
+        assert_eq!(error.code, error_codes::METHOD_NOT_FOUND);
+        assert_eq!(error.message, "");
     }
 }

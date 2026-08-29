@@ -1097,6 +1097,19 @@ impl App {
                 env!("CARGO_PKG_VERSION")
             )),
             "doctor" => self.output(self.doctor_text()),
+            "init" => self.cmd_init().await,
+            "memory" => self.cmd_memory(),
+            "output-style" => self.cmd_output_style(&invocation).await,
+            "permissions" => self.cmd_permissions(&invocation).await,
+            "yolo" => self.cmd_yolo().await,
+            "provider" => self.cmd_provider(&invocation).await,
+            "headers" => self.cmd_headers(&invocation).await,
+            "log" => self.cmd_log(&invocation).await,
+            "marketplace" => self.cmd_marketplace(&invocation).await,
+            "plugin" => self.cmd_plugin(&invocation).await,
+            "skill" => self.cmd_skill(&invocation).await,
+            "export" => self.cmd_export(&invocation).await,
+            "diff" => self.cmd_diff().await,
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),
@@ -1368,6 +1381,847 @@ impl App {
             .await;
         let _ = engine.shutdown(SHUTDOWN_GRACE).await;
     }
+
+    // -- Slash command handlers (local / config scope) -----------------------
+
+    /// Submits a programmatic prompt to the engine on behalf of a command.
+    ///
+    /// Used by `/init` and `/skill` to inject model-directed work into the
+    /// running session without touching the composer.
+    async fn submit_programmatic(&mut self, text: String) {
+        if self.state.is_busy() {
+            self.notice("A turn is already running; try again when ready.", NoticeLevel::Warning);
+            return;
+        }
+        self.apply(UiEvent::Submitted { text: text.clone() });
+        let params = serde_json::to_value(messages::PromptParams::text(text)).unwrap_or_default();
+        match self.connection.send_request(method::PROMPT, Some(params)) {
+            Ok(receiver) => self.turn = Some(receiver),
+            Err(error) => self.apply(UiEvent::TurnFinished {
+                interrupted: false,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+
+    /// `/init` — ask the agent to generate a CLAUDE.md for this project.
+    async fn cmd_init(&mut self) {
+        let claude_md = self.paths.project_root.join("CLAUDE.md");
+        if claude_md.exists() {
+            self.notice(
+                "CLAUDE.md already exists; not overwriting. Use /memory to view it.",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+        let prompt = concat!(
+            "Analyze this codebase and write a concise CLAUDE.md that captures: ",
+            "the project purpose, key architecture decisions, important conventions, ",
+            "build/test commands, and any gotchas worth knowing. ",
+            "Write ONLY the raw Markdown content to CLAUDE.md using the write_file tool — ",
+            "no additional commentary, no code fences around the file content."
+        );
+        self.notice("Sending analysis request to agent…", NoticeLevel::Info);
+        self.submit_programmatic(prompt.to_string()).await;
+    }
+
+    /// `/memory` — display CLAUDE.md if it exists.
+    fn cmd_memory(&mut self) {
+        let claude_md = self.paths.project_root.join("CLAUDE.md");
+        self.output(format!("CLAUDE.md path: {}", claude_md.display()));
+        match std::fs::read_to_string(&claude_md) {
+            Ok(contents) => self.output(contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.notice(
+                "CLAUDE.md not found. Run /init to generate one for this project.",
+                NoticeLevel::Warning,
+            ),
+            Err(e) => self.notice(format!("Could not read CLAUDE.md: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/output-style [<style>]` — show or set the response style persona.
+    async fn cmd_output_style(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let paths = self.paths.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+
+            if let Some(ref style_name) = arg {
+                if !coda_agent::BuiltInOutputStyles::is_known(Some(style_name)) {
+                    let names: Vec<&str> =
+                        coda_agent::BuiltInOutputStyles::all().iter().map(|s| s.name).collect();
+                    return Ok(format!(
+                        "Unknown style '{style_name}'. Available: {}",
+                        names.join(", ")
+                    ));
+                }
+                settings.set_output_style(style_name);
+                settings.save()?;
+                return Ok(format!(
+                    "Output style set to {style_name}. Restart the engine to apply."
+                ));
+            }
+
+            let current = settings.output_style().unwrap_or("default");
+            let mut out = format!("Current style: {current}\n");
+            for s in coda_agent::BuiltInOutputStyles::all() {
+                let marker = if s.name.eq_ignore_ascii_case(current) { " (active)" } else { "" };
+                out.push_str(&format!("  {}{marker} — {}\n", s.name, s.description));
+            }
+            Ok(out.trim_end().to_string())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/permissions [<mode>]` — show or set the tool-permission mode.
+    async fn cmd_permissions(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let paths = self.paths.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+
+            if let Some(ref raw) = arg {
+                match parse_permission_mode(raw) {
+                    Some(canonical) => {
+                        settings.set_permission_mode(canonical);
+                        settings.save()?;
+                        let note = if canonical == "bypass" {
+                            " (YOLO — tools run without asking)"
+                        } else {
+                            ""
+                        };
+                        Ok(format!("Permission mode set to {canonical}{note}. Restart the engine to apply."))
+                    }
+                    None => Ok(format!(
+                        "Unknown mode '{raw}'. Use: default | acceptEdits | plan | bypass"
+                    )),
+                }
+            } else {
+                let current = settings.permission_mode().unwrap_or("default");
+                Ok(format!(
+                    "Permission mode: {current}\nModes: default (ask), acceptEdits (auto-edit), plan (read-only), bypass (yolo: allow all)"
+                ))
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/yolo` — grant bypass-permissions mode. Explicit, loud, and impossible to miss.
+    async fn cmd_yolo(&mut self) {
+        let paths = self.paths.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            settings.set_permission_mode("bypass");
+            settings.save()
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                // The warning appears first in the transcript to make the state
+                // change impossible to overlook before the confirmation notice.
+                self.notice(
+                    "⚠  YOLO mode: tools will run without asking for permission.",
+                    NoticeLevel::Warning,
+                );
+                self.notice(
+                    "Restart the engine to apply. Use /permissions default to revert.",
+                    NoticeLevel::Info,
+                );
+            }
+            Ok(Err(e)) => self.notice(format!("Could not save setting: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings write was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/provider [<id>]` — show the configured provider or switch to a different one.
+    async fn cmd_provider(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let paths = self.paths.clone();
+
+        if let Some(new_provider) = arg {
+            // Write the new provider and restart so the engine picks it up.
+            let success_msg = format!("Provider set to {new_provider}. Restarting engine…");
+            let write_result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+                let mut settings = config::Settings::load(&paths)?;
+                settings.set_default_provider(&new_provider);
+                settings.save()
+            })
+            .await;
+
+            match write_result {
+                Ok(Ok(())) => {
+                    self.notice(success_msg, NoticeLevel::Info);
+                    self.restart_engine().await;
+                }
+                Ok(Err(e)) => self.notice(format!("Could not save provider: {e}"), NoticeLevel::Error),
+                Err(_) => self.notice("Settings write was interrupted.", NoticeLevel::Error),
+            }
+            return;
+        }
+
+        // No argument — display the configured provider and any model-by-provider entries.
+        let read_result = tokio::task::spawn_blocking(move || config::Settings::load(&paths)).await;
+        match read_result {
+            Ok(Ok(settings)) => {
+                let provider = settings.default_provider().unwrap_or("(none)");
+                let mut out = format!("Active provider: {provider}\n");
+                let providers_seen: Vec<String> = settings
+                    .raw()
+                    .get("modelByProvider")
+                    .and_then(|m| m.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_default();
+                if !providers_seen.is_empty() {
+                    out.push_str("Configured providers:");
+                    for p in &providers_seen {
+                        let mark = if p == provider { " (active)" } else { "" };
+                        out.push_str(&format!("\n  {p}{mark}"));
+                    }
+                } else {
+                    out.push_str("Use /provider <id> to switch (e.g. github-copilot, claude-ai).");
+                }
+                self.output(out);
+            }
+            Ok(Err(e)) => self.notice(format!("Could not read settings: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/headers [--set <name> <value> | --remove <name>]` — manage custom HTTP headers.
+    async fn cmd_headers(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+        let paths = self.paths.clone();
+
+        // Collect the operation before spawning so we don't capture `words` (non-Send).
+        enum HeaderOp {
+            Show,
+            Set(String, String),
+            Remove(String),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] => HeaderOp::Show,
+            ["--set", name, value] => HeaderOp::Set((*name).to_string(), (*value).to_string()),
+            ["--remove", name] => HeaderOp::Remove((*name).to_string()),
+            _ => HeaderOp::BadUsage,
+        };
+
+        if matches!(op, HeaderOp::BadUsage) {
+            self.notice(
+                "Usage: /headers | /headers --set <name> <value> | /headers --remove <name>",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            match op {
+                HeaderOp::Show => {
+                    let headers = settings.custom_headers();
+                    if headers.is_empty() {
+                        return Ok("No custom headers configured.\nAuth headers are managed by the engine.".to_string());
+                    }
+                    let mut out = String::from("Custom headers:\n");
+                    for (k, v) in &headers {
+                        out.push_str(&format!("  {k}: {v}\n"));
+                    }
+                    out.push_str("Auth headers are managed by the engine.");
+                    Ok(out.trim_end().to_string())
+                }
+                HeaderOp::Set(name, value) => {
+                    settings.set_custom_header(&name, &value);
+                    settings.save()?;
+                    Ok(format!("Custom header set: {name}: {value}"))
+                }
+                HeaderOp::Remove(name) => {
+                    settings.remove_custom_header(&name);
+                    settings.save()?;
+                    Ok(format!("Custom header removed: {name}"))
+                }
+                HeaderOp::BadUsage => unreachable!(),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/log [<level> | stderr on|off | off]` — show or change telemetry logging.
+    async fn cmd_log(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+        let paths = self.paths.clone();
+
+        enum LogOp {
+            Show,
+            SetLevel(String),
+            Disable,
+            Stderr(bool),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] => LogOp::Show,
+            ["off"] => LogOp::Disable,
+            ["stderr", "on"] => LogOp::Stderr(true),
+            ["stderr", "off"] => LogOp::Stderr(false),
+            ["stderr", ..] => LogOp::BadUsage,
+            [level] => {
+                let lc = level.to_lowercase();
+                if ["trace", "debug", "info", "warn", "error"].contains(&lc.as_str()) {
+                    LogOp::SetLevel(lc)
+                } else {
+                    LogOp::BadUsage
+                }
+            }
+            _ => LogOp::BadUsage,
+        };
+
+        if matches!(op, LogOp::BadUsage) {
+            self.notice(
+                "Usage: /log | /log <level> | /log off | /log stderr on|off  (levels: trace debug info warn error)",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        let log_dir = self.paths.logs();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            match op {
+                LogOp::Show => {
+                    let dir = settings
+                        .log_directory_override()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| log_dir.display().to_string());
+                    Ok(format!(
+                        "Telemetry: {}\nLog level:  {}\nStderr:     {}\nLog dir:    {}\nChanges apply to the next session.",
+                        if settings.log_enabled() { "enabled" } else { "disabled" },
+                        settings.log_level(),
+                        if settings.log_to_stderr() { "on" } else { "off" },
+                        dir
+                    ))
+                }
+                LogOp::SetLevel(level) => {
+                    let stderr = settings.log_to_stderr();
+                    settings.set_telemetry(true, &level, stderr);
+                    let dir = settings
+                        .log_directory_override()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| log_dir.display().to_string());
+                    settings.save()?;
+                    Ok(format!(
+                        "Telemetry enabled at {level}. Logs: {dir}. Applies to the next session."
+                    ))
+                }
+                LogOp::Disable => {
+                    let level = settings.log_level().to_string();
+                    let stderr = settings.log_to_stderr();
+                    settings.set_telemetry(false, &level, stderr);
+                    settings.save()?;
+                    Ok("Telemetry disabled. Applies to the next session.".to_string())
+                }
+                LogOp::Stderr(on) => {
+                    let enabled = settings.log_enabled();
+                    let level = settings.log_level().to_string();
+                    settings.set_telemetry(enabled, &level, on);
+                    settings.save()?;
+                    Ok(format!(
+                        "Stderr logging: {}. Applies to the next session.",
+                        if on { "on" } else { "off" }
+                    ))
+                }
+                LogOp::BadUsage => unreachable!(),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/marketplace [list | add <source> | remove <name>]`.
+    async fn cmd_marketplace(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+        let paths = self.paths.clone();
+
+        enum MktOp {
+            List,
+            Add(String),
+            Remove(String),
+            Unsupported(String),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] | ["list"] => MktOp::List,
+            ["add", source] => MktOp::Add((*source).to_string()),
+            ["remove", name] => MktOp::Remove((*name).to_string()),
+            [sub, ..] if ["browse", "install", "search", "refresh"].contains(sub) => {
+                MktOp::Unsupported((*sub).to_string())
+            }
+            _ => MktOp::BadUsage,
+        };
+
+        if let MktOp::Unsupported(sub) = op {
+            self.notice(
+                format!("/{sub} is not yet available in the Rust front-end. Use the C# coda tool."),
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        if matches!(op, MktOp::BadUsage) {
+            self.notice(
+                "Usage: /marketplace [list | add <source> | remove <name>]",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            match op {
+                MktOp::List => {
+                    let markets = settings.marketplaces();
+                    if markets.is_empty() {
+                        return Ok("No marketplaces configured. Use /marketplace add <source> to register one.".to_string());
+                    }
+                    let mut out = String::from("Marketplaces\n");
+                    for (name, source) in &markets {
+                        out.push_str(&format!("  {name}  {source}\n"));
+                    }
+                    Ok(out.trim_end().to_string())
+                }
+                MktOp::Add(source) => {
+                    // Derive a name from the last URL segment or filename.
+                    let name = marketplace_name_from_source(&source);
+                    settings.add_marketplace(&name, &source);
+                    settings.save()?;
+                    Ok(format!("Registered marketplace '{name}' ({source})."))
+                }
+                MktOp::Remove(name) => {
+                    if settings.remove_marketplace(&name) {
+                        settings.save()?;
+                        Ok(format!("Removed marketplace '{name}'."))
+                    } else {
+                        Ok(format!("No marketplace named '{name}'."))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/plugin [list | info <name> | enable <name> | disable <name>]`.
+    async fn cmd_plugin(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+
+        enum PluginOp {
+            List,
+            Info(String),
+            SetEnabled(String, bool),
+            Unsupported(String),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] | ["list"] => PluginOp::List,
+            ["info", name] => PluginOp::Info((*name).to_string()),
+            ["enable", name] => PluginOp::SetEnabled((*name).to_string(), true),
+            ["disable", name] => PluginOp::SetEnabled((*name).to_string(), false),
+            [sub, ..] if ["install", "remove", "update", "prune", "approve", "validate", "new"].contains(sub) => {
+                PluginOp::Unsupported((*sub).to_string())
+            }
+            _ => PluginOp::BadUsage,
+        };
+
+        if let PluginOp::Unsupported(sub) = op {
+            self.notice(
+                format!("plugin {sub} is not yet available in the Rust front-end. Use the C# coda tool or /plugins browser."),
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        match op {
+            PluginOp::List => {
+                // Delegate to the engine for the definitive plugin list.
+                match self
+                    .fetch::<messages::PluginsListResult>(
+                        method::PLUGINS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        let text = if result.plugins.is_empty() {
+                            "No plugins installed.".to_string()
+                        } else {
+                            let mut out = String::from("Plugins\n");
+                            for p in &result.plugins {
+                                out.push_str(&format!(
+                                    "  {} {}\n",
+                                    p.name,
+                                    p.version.as_deref().unwrap_or("")
+                                ));
+                            }
+                            out.trim_end().to_string()
+                        };
+                        self.output(text);
+                    }
+                    Err(e) => self.notice(format!("Could not list plugins: {e}"), NoticeLevel::Error),
+                }
+            }
+            PluginOp::Info(name) => {
+                match self
+                    .fetch::<messages::PluginsListResult>(
+                        method::PLUGINS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        if let Some(plugin) = result.plugins.iter().find(|p| p.name.eq_ignore_ascii_case(&name)) {
+                            let version = plugin.version.as_deref().unwrap_or("(unknown)");
+                            self.output(format!("Plugin: {}\nVersion: {version}", plugin.name));
+                        } else {
+                            self.notice(format!("Plugin '{name}' not found."), NoticeLevel::Warning);
+                        }
+                    }
+                    Err(e) => self.notice(format!("Could not fetch plugins: {e}"), NoticeLevel::Error),
+                }
+            }
+            PluginOp::SetEnabled(name, enabled) => {
+                let paths = self.paths.clone();
+                let result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+                    let mut state = config::PluginState::load(&paths)?;
+                    state.set_enabled(&name, enabled);
+                    state.save()
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        let word = if enabled { "Enabled" } else { "Disabled" };
+                        self.notice(format!("{word} plugin. Restart the engine to apply."), NoticeLevel::Info);
+                    }
+                    Ok(Err(e)) => self.notice(format!("Could not update plugin state: {e}"), NoticeLevel::Error),
+                    Err(_) => self.notice("Plugin state write was interrupted.", NoticeLevel::Error),
+                }
+            }
+            PluginOp::BadUsage => self.notice(
+                "Usage: /plugin [list | info <name> | enable <name> | disable <name>]",
+                NoticeLevel::Warning,
+            ),
+            _ => {}
+        }
+    }
+
+    /// `/skill [<name> [args...]]` — list skills or run one by name.
+    async fn cmd_skill(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+
+        if words.is_empty() {
+            // No arguments: list available skills via the engine.
+            match self
+                .fetch::<messages::SkillsListResult>(
+                    method::SKILLS_LIST,
+                    Some(serde_json::json!({})),
+                )
+                .await
+            {
+                    Ok(result) => {
+                        let text = if result.skills.is_empty() {
+                            "No skills available.".to_string()
+                        } else {
+                            let mut out = String::from("Skills\n");
+                            for s in &result.skills {
+                                let mark = if s.enabled { "*" } else { " " };
+                                out.push_str(&format!(
+                                    "  {mark} {}  {}\n",
+                                    s.name,
+                                    s.description.as_deref().unwrap_or("")
+                                ));
+                            }
+                            out.trim_end().to_string()
+                        };
+                        self.output(text);
+                    }
+                    Err(e) => self.notice(format!("Could not list skills: {e}"), NoticeLevel::Error),
+                }
+                return;
+            }
+
+        let name = words[0];
+        let args: Vec<&str> = words[1..].to_vec();
+
+        // Look up the SKILL.md in project-local and user-scoped dirs.
+        let body = find_local_skill_body(&self.paths, name, &args);
+        match body {
+            Some(text) => {
+                self.notice(format!("Running skill '{name}'…"), NoticeLevel::Info);
+                self.submit_programmatic(text).await;
+            }
+            None => {
+                // Report what IS available to help the user.
+                let available = list_local_skill_names(&self.paths);
+                let list = if available.is_empty() {
+                    "(none found locally)".to_string()
+                } else {
+                    available.join(", ")
+                };
+                self.notice(
+                    format!("Skill '{name}' not found. Available locally: {list}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    /// `/export [<path>]` — write the current conversation to a Markdown file.
+    async fn cmd_export(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let project_root = self.paths.project_root.clone();
+
+        // Capture the transcript before spawning; the transcript is !Send.
+        let markdown = build_markdown_export(self.state.transcript.blocks());
+
+        if markdown.trim().is_empty() {
+            self.notice("Nothing to export yet.", NoticeLevel::Info);
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::path::PathBuf> {
+            let path = match arg {
+                Some(ref provided) if !provided.is_empty() => {
+                    let p = std::path::Path::new(provided);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        project_root.join(p)
+                    }
+                }
+                _ => {
+                    use time::OffsetDateTime;
+                    let now = OffsetDateTime::now_utc();
+                    let ts = format!(
+                        "{}{:02}{:02}-{:02}{:02}{:02}",
+                        now.year(),
+                        u8::from(now.month()),
+                        now.day(),
+                        now.hour(),
+                        now.minute(),
+                        now.second()
+                    );
+                    project_root.join(format!("coda-conversation-{ts}.md"))
+                }
+            };
+
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, markdown.as_bytes())?;
+            Ok(path)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(path)) => self.notice(format!("Conversation exported to {}", path.display()), NoticeLevel::Info),
+            Ok(Err(e)) => self.notice(format!("Export failed: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Export was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/diff` — run `git diff` and render the result with syntax colouring.
+    async fn cmd_diff(&mut self) {
+        let cwd = self.paths.project_root.clone();
+        let output = tokio::process::Command::new("git")
+            .arg("diff")
+            .current_dir(&cwd)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !out.status.success() || stderr.contains("not a git repository") {
+                    let msg = if stderr.trim().is_empty() {
+                        "git exited with a non-zero status. Is this directory a git repository?"
+                            .to_string()
+                    } else {
+                        coda_render::text::sanitize(stderr.trim())
+                    };
+                    self.notice(msg, NoticeLevel::Error);
+                    return;
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                if stdout.trim().is_empty() {
+                    self.notice("No uncommitted changes.", NoticeLevel::Info);
+                } else {
+                    // Sanitize before storage: strips ANSI escapes from coloured git output.
+                    let sanitized = coda_render::text::sanitize(&stdout);
+                    self.apply(UiEvent::DiffOutput { text: sanitized });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.notice(
+                    "git not found. Make sure git is installed and on your PATH.",
+                    NoticeLevel::Warning,
+                );
+            }
+            Err(e) => self.notice(format!("Could not run git: {e}"), NoticeLevel::Error),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Free helpers (pure / free functions, no engine access)
+// ---------------------------------------------------------------------------
+
+/// Parses a permission-mode name into its canonical form, case-insensitively.
+///
+/// Accepts the same set of aliases as the C# `PermissionsCommand.TryParseMode`.
+fn parse_permission_mode(value: &str) -> Option<&'static str> {
+    match value.to_lowercase().as_str() {
+        "default" => Some("default"),
+        "acceptedits" | "accept-edits" | "edits" => Some("acceptEdits"),
+        "plan" => Some("plan"),
+        "bypass" | "bypasspermissions" | "yolo" => Some("bypass"),
+        _ => None,
+    }
+}
+
+/// Derives a marketplace name from a source URL or path.
+fn marketplace_name_from_source(source: &str) -> String {
+    // Use the last non-empty path segment, stripping common extensions.
+    source
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(source)
+        .trim_end_matches(".json")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+/// Reads a skill body from local SKILL.md files, binding positional args.
+///
+/// Searches project-scoped then user-scoped skill directories. Returns the
+/// bound body, or `None` when no matching skill is found.
+fn find_local_skill_body(paths: &config::Paths, name: &str, args: &[&str]) -> Option<String> {
+    for dir in [paths.skills_project(), paths.skills_user()] {
+        let skill_md = dir.join(name).join("SKILL.md");
+        if let Ok(body) = std::fs::read_to_string(&skill_md) {
+            return Some(bind_skill_args(&body, args));
+        }
+    }
+    None
+}
+
+/// Lists the names of locally available skills.
+fn list_local_skill_names(paths: &config::Paths) -> Vec<String> {
+    let mut names = Vec::new();
+    for dir in [paths.skills_project(), paths.skills_user()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().join("SKILL.md").is_file() {
+                if let Some(n) = entry.file_name().to_str() {
+                    if !names.iter().any(|e: &String| e.eq_ignore_ascii_case(n)) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Substitutes `$1`, `$2`, and `$ARGUMENTS` placeholders in a skill body.
+fn bind_skill_args(body: &str, args: &[&str]) -> String {
+    let mut result = body.replace("$ARGUMENTS", &args.join(" "));
+    for (i, arg) in args.iter().enumerate() {
+        result = result.replace(&format!("${}", i + 1), arg);
+    }
+    result
+}
+
+/// Renders transcript blocks as a Markdown document for `/export`.
+pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
+    use crate::transcript::Block;
+    let mut out = String::from("# Coda Conversation Export\n\n");
+    for block in blocks {
+        match block {
+            Block::User { text, .. } => {
+                out.push_str("## User\n\n");
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+            Block::Assistant { text, .. } => {
+                out.push_str("## Assistant\n\n");
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+            Block::Tools { activity, .. } => {
+                for call in &activity.calls {
+                    out.push_str(&format!("- tool call: {}\n", call.name));
+                    if let Some(result) = &call.result {
+                        out.push_str(&format!("- tool result: {}\n", result.chars().take(200).collect::<String>()));
+                    }
+                }
+                if !activity.calls.is_empty() {
+                    out.push('\n');
+                }
+            }
+            Block::Diff { raw } => {
+                out.push_str("```diff\n");
+                out.push_str(raw);
+                out.push_str("```\n\n");
+            }
+            // Skip non-content blocks in the export.
+            Block::Notice { .. }
+            | Block::Permission { .. }
+            | Block::Question { .. }
+            | Block::CommandOutput { .. }
+            | Block::Thinking { .. }
+            | Block::SessionBoundary { .. } => {}
+        }
+    }
+    out
 }
 
 /// Formats an engine response for display.

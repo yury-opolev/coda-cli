@@ -40,6 +40,9 @@ const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// and may be absent; bound the probe so it does not stall the whole login.
 const EXCHANGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Minimum GitHub REST API version for all requests.
+const GITHUB_API_VERSION: &str = "2026-06-01";
+
 /// GitHub Copilot provider configuration.
 #[derive(Debug, Clone)]
 pub struct CopilotConfig {
@@ -359,7 +362,27 @@ impl AuthProvider for CopilotProvider {
         if credential.kind != CredentialKind::OAuth {
             return false;
         }
-        // Refresh when approaching expiry.
+
+        // Self-heal: if the exchange URL is configured AND the stored access
+        // token is a raw GitHub OAuth/device-flow/PAT token (identifiable by
+        // its prefix), force a refresh so the token is exchanged for a full-
+        // entitlement Copilot token.  ExpiresAt is null on direct credentials
+        // built without the exchange (BuildDirectCredential never sets it).
+        //
+        // This covers the "stale credential" scenario where the user logged in
+        // before the exchange endpoint existed and has a raw ghu_/gho_/ghe_…
+        // token stored.  Without this check, the null ExpiresAt would cause
+        // needs_refresh to return false forever, permanently denying the user
+        // full model entitlement without prompting a re-login.
+        if self.config.copilot_token_url.is_some() {
+            if let Some(token) = &credential.access_token {
+                if is_raw_github_token(token.expose()) && credential.expires_at.is_none() {
+                    return true;
+                }
+            }
+        }
+
+        // Normal path: refresh when the token is within the 5-minute buffer.
         credential
             .expires_at
             .map(|exp| chrono::Utc::now() + chrono::Duration::from_std(REFRESH_BUFFER).unwrap() >= exp)
@@ -410,6 +433,7 @@ impl AuthProvider for CopilotProvider {
             ("copilot-integration-id".into(), self.config.integration_id.clone()),
             ("user-agent".into(), self.config.user_agent.clone()),
             ("x-initiator".into(), "user".into()),
+            ("x-github-api-version".into(), GITHUB_API_VERSION.into()),
         ])
     }
 }
@@ -435,6 +459,22 @@ fn build_direct_credential(github_token: &str) -> Credential {
 /// failing the entire login.
 fn is_exchange_absent_status(status: u16) -> bool {
     matches!(status, 404 | 501 | 502 | 503 | 504)
+}
+
+/// Returns `true` for raw GitHub OAuth / device-flow / PAT tokens that carry
+/// no Copilot entitlement and must be exchanged before use.
+///
+/// These prefixes are part of the GitHub token format spec; a token matching
+/// any of them has never passed through the Copilot exchange endpoint and will
+/// result in reduced model access if used as-is.
+fn is_raw_github_token(token: &str) -> bool {
+    token.starts_with("ghu_")
+        || token.starts_with("gho_")
+        || token.starts_with("ghp_")
+        || token.starts_with("ghs_")
+        || token.starts_with("ghr_")
+        || token.starts_with("ghe_")
+        || token.starts_with("github_pat_")
 }
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────

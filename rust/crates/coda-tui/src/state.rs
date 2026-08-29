@@ -113,6 +113,8 @@ pub enum UiEvent {
     PromptAnswered { allowed: bool, answer: Option<String> },
     /// Output produced locally by a slash command.
     CommandOutput { text: String },
+    /// A git diff to display with syntax colouring.
+    DiffOutput { text: String },
     /// A local status or error line.
     Notice { text: String, level: NoticeLevel },
     /// The transcript was cleared.
@@ -275,6 +277,10 @@ impl UiState {
             UiEvent::CommandOutput { text } => {
                 self.transcript.close_open();
                 self.transcript.push(Block::CommandOutput { text });
+            }
+            UiEvent::DiffOutput { text } => {
+                self.transcript.close_open();
+                self.transcript.push(Block::Diff { raw: text });
             }
             UiEvent::Notice { text, level } => self.notice(text, level),
             UiEvent::Cleared => {
@@ -1408,6 +1414,21 @@ mod tests {
         assert_eq!(state.activity, Activity::Ready);
         assert!(!state.is_busy());
     }
-}
 
+    #[test]
+    fn diff_output_event_adds_a_diff_block_to_the_transcript() {
+        let raw = "diff --git a/foo.rs b/foo.rs\n\
+            --- a/foo.rs\n\
+            +++ b/foo.rs\n\
+            @@ -1 +1 @@\n\
+            -old\n\
+            +new\n";
+        let mut state = state();
+        state.apply(UiEvent::DiffOutput { text: raw.to_string() });
+        assert!(
+            matches!(state.transcript.blocks().last(), Some(Block::Diff { .. })),
+            "expected a Diff block"
+        );
+    }
+}
 

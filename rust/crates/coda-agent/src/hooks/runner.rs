@@ -450,6 +450,25 @@ impl HookRunner {
             // checks the cancel token and will exit before acting on it).
             Err(ExecError::Cancelled) => HookOutput::no_op(),
 
+            // A handler type this build cannot dispatch has NOT approved
+            // anything, so it must take the event's fail-open policy rather
+            // than parsing as a silent success.  Treating it as a no-op would
+            // turn a fail-closed gate into an allow.
+            Err(ExecError::Unsupported(kind)) => {
+                if fail_open {
+                    HookOutput::no_op()
+                } else {
+                    HookOutput {
+                        decision: Some("block".into()),
+                        reason: Some(format!(
+                            "hook handler type '{kind}' is not supported by this build"
+                        )),
+                        continue_execution: false,
+                        specific: None,
+                    }
+                }
+            }
+
             // Any other error.
             Err(ExecError::Other(msg)) => {
                 if fail_open {
@@ -508,10 +527,11 @@ impl HookRunner {
                     }
                 }
             }
-            // HTTP and other handler types are not yet dispatched in Rust —
-            // apply the event's fail-open policy (unsupported → no-op if fail-open,
-            // or block if fail-closed).
-            _ => Ok(String::new()),
+            // HTTP and agent handler types are not dispatched by this build.
+            // Report that explicitly so the caller can apply the event's
+            // fail-open policy; returning Ok("") here would parse as a no-op
+            // and silently approve a fail-closed gate.
+            other => Err(ExecError::Unsupported(other.to_string())),
         }
     }
 }
@@ -523,6 +543,8 @@ impl HookRunner {
 enum ExecError {
     Timeout,
     Cancelled,
+    /// The hook declares a handler type this build cannot run.
+    Unsupported(String),
     Other(String),
 }
 
@@ -970,6 +992,41 @@ mod tests {
             .await;
         assert!(result.modified_result.is_none(), "fail-open: no modification");
         assert!(result.block_reason.is_none(), "fail-open: no block");
+    }
+
+    /// CRITICAL: a handler type this build cannot dispatch must obey the
+    /// event's fail-open policy, not silently succeed.
+    ///
+    /// Only `command` hooks are dispatched today.  Returning an empty stdout
+    /// for `agent`/`http` parses as a no-op, which on a fail-closed event
+    /// (PreToolUse) reads as "the hook approved this" — so a user who
+    /// installed an agent hook precisely to gate tool calls would get a
+    /// silent allow.  An undispatchable hook has not approved anything.
+    #[tokio::test]
+    async fn undispatchable_handler_blocks_on_a_fail_closed_event() {
+        let mut h = hook("PreToolUse", "unused.sh");
+        h.handler_type = Some("agent".into());
+        let runner = HookRunner::with_executor(vec![h], MockExecutor::new(vec![]));
+        let result = runner
+            .run_pre_tool_use("bash", "{}", CancellationToken::new())
+            .await;
+        assert!(
+            result.block,
+            "an agent hook this build cannot run must block a fail-closed event, not allow it"
+        );
+    }
+
+    /// The same undispatchable hook on a fail-open event stays a no-op.
+    #[tokio::test]
+    async fn undispatchable_handler_is_a_no_op_on_a_fail_open_event() {
+        let mut h = hook("PostToolUse", "unused.sh");
+        h.handler_type = Some("http".into());
+        let runner = HookRunner::with_executor(vec![h], MockExecutor::new(vec![]));
+        let result = runner
+            .run_post_tool_use("bash", "{}", "output", None, CancellationToken::new())
+            .await;
+        assert!(result.block_reason.is_none(), "fail-open event must not block");
+        assert!(result.modified_result.is_none(), "fail-open event must not modify");
     }
 
     /// An untrusted project hook must not run (fail-closed for PreToolUse).

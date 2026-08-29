@@ -731,7 +731,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "chrono",
  "coda-agent",
+ "coda-auth",
+ "coda-llm",
  "coda-proto",
  "coda-tool",
  "serde",
@@ -761,6 +764,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "clap",
+ "coda-agent",
  "coda-client",
  "coda-mcp",
  "coda-proto",

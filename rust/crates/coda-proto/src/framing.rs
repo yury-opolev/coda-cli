@@ -292,4 +292,19 @@ mod tests {
             Some(b"{\"a\":12345".to_vec())
         );
     }
+
+    /// A header block containing bytes that are not valid UTF-8 must be
+    /// rejected rather than interpreted as garbled text.  This guards against
+    /// a peer that accidentally sends binary data on the wire.
+    #[test]
+    fn non_utf8_bytes_in_header_produce_error() {
+        let mut decoder = FrameDecoder::new();
+        // 0xFF 0xFE are not valid UTF-8 byte sequences; insert them inside a
+        // header line (before the \r\n\r\n terminator).
+        decoder.feed(b"Content-Length: \xFF\xFE\r\n\r\n");
+        assert!(
+            matches!(decoder.next_frame(), Err(FramingError::HeaderNotUtf8)),
+            "non-UTF-8 header bytes must return HeaderNotUtf8"
+        );
+    }
 }

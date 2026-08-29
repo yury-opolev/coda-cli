@@ -182,6 +182,97 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Show token usage for this session.",
         scope: Scope::Local,
     },
+    CommandSpec {
+        name: "init",
+        aliases: &[],
+        args: "",
+        summary: "Generate a CLAUDE.md memory file for this project.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "memory",
+        aliases: &[],
+        args: "",
+        summary: "Show the project CLAUDE.md memory file.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "output-style",
+        aliases: &["style"],
+        args: "[<style>]",
+        summary: "Show or set the output style (default, concise, explanatory, code-reviewer).",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "permissions",
+        aliases: &["mode"],
+        args: "[<mode>]",
+        summary: "Show or set the tool-permission mode.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "yolo",
+        aliases: &[],
+        args: "",
+        summary: "Allow all tools without asking (bypass permissions).",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "provider",
+        aliases: &[],
+        args: "[<id>]",
+        summary: "Show the active provider, or connect to a different one.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "headers",
+        aliases: &[],
+        args: "[--set <name> <value> | --remove <name>]",
+        summary: "Show or edit custom outgoing HTTP headers.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "log",
+        aliases: &[],
+        args: "[<level> | stderr on|off | off]",
+        summary: "Show or set telemetry logging level.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "marketplace",
+        aliases: &[],
+        args: "[list | add <source> | remove <name>]",
+        summary: "Manage plugin marketplaces.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "plugin",
+        aliases: &[],
+        args: "[list | info <name> | enable <name> | disable <name>]",
+        summary: "Manage plugins: list, enable, disable.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "skill",
+        aliases: &[],
+        args: "[<name> [args...]]",
+        summary: "Run a skill by name, or list skills if no name is given.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "export",
+        aliases: &[],
+        args: "[<path>]",
+        summary: "Export the conversation to a Markdown file.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "diff",
+        aliases: &[],
+        args: "",
+        summary: "Show uncommitted git changes in the working directory.",
+        scope: Scope::Local,
+    },
 ];
 
 impl CommandSpec {
@@ -393,7 +484,7 @@ mod tests {
 
     #[test]
     fn completes_by_prefix() {
-        let names: Vec<&str> = complete("mod").iter().map(|s| s.name).collect();
+        let names: Vec<&str> = complete("model").iter().map(|s| s.name).collect();
         assert_eq!(names, vec!["model", "models"]);
     }
 
@@ -497,6 +588,46 @@ mod tests {
             for alias in spec.aliases {
                 assert!(lookup(alias).is_some(), "/{alias} not found");
             }
+        }
+    }
+
+    #[test]
+    fn output_style_resolves_via_its_style_alias() {
+        let spec = lookup("style").expect("style alias");
+        assert_eq!(spec.name, "output-style");
+    }
+
+    #[test]
+    fn permissions_resolves_via_its_mode_alias() {
+        let spec = lookup("mode").expect("mode alias");
+        assert_eq!(spec.name, "permissions");
+    }
+
+    #[test]
+    fn all_new_commands_are_local_scope() {
+        let new_names = [
+            "init", "memory", "output-style", "permissions", "yolo", "provider",
+            "headers", "log", "marketplace", "plugin", "skill", "export", "diff",
+        ];
+        for name in new_names {
+            let spec = lookup(name).unwrap_or_else(|| panic!("/{name} not found"));
+            assert_eq!(
+                spec.scope,
+                Scope::Local,
+                "/{name} should be Local scope"
+            );
+        }
+    }
+
+    #[test]
+    fn help_text_includes_every_new_command() {
+        let text = help(None);
+        let new_names = [
+            "init", "memory", "output-style", "permissions", "yolo", "provider",
+            "headers", "log", "marketplace", "plugin", "skill", "export", "diff",
+        ];
+        for name in new_names {
+            assert!(text.contains(name), "/{name} missing from help output");
         }
     }
 }

@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use coda_llm::LlmClient;
 use coda_proto::{FrameDecoder, Message, Response, RequestId, encode_frame};
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -28,21 +29,57 @@ use crate::sink::ServeSink;
 
 /// Runs the engine on process stdin/stdout until the connection is closed.
 pub async fn serve_stdio() -> anyhow::Result<()> {
-    serve(tokio::io::stdin(), tokio::io::stdout()).await
+    let working_dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".into());
+    serve_inner(tokio::io::stdin(), tokio::io::stdout(), None, working_dir).await
 }
 
-/// Runs the engine on the given reader/writer pair.  Useful for tests that
-/// inject an in-memory duplex stream.
+/// Runs the engine on the given reader/writer pair.
 pub(crate) async fn serve<R, W>(reader: R, writer: W) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let working_dir = std::env::current_dir()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| ".".into());
+    serve_inner(reader, writer, None, working_dir).await
+}
 
+/// Runs the engine with a pre-built client (used by integration tests so
+/// the LLM call never touches the network).
+pub(crate) async fn serve_with_client<R, W>(
+    reader: R,
+    writer: W,
+    client: Arc<dyn LlmClient>,
+    working_dir: &str,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    serve_inner(reader, writer, Some(client), working_dir.to_string()).await
+}
+
+async fn serve_inner<R, W>(
+    reader: R,
+    writer: W,
+    client: Option<Arc<dyn LlmClient>>,
+    working_dir: String,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (outgoing_tx, outgoing_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let prompt_channel = Arc::new(PromptChannel::new(outgoing_tx.clone()));
     let sink = Arc::new(ServeSink::new(outgoing_tx.clone()));
-    let backend = ServeHost::new(sink);
+
+    let backend = match client {
+        Some(c) => ServeHost::new_with_client(c, sink, Arc::clone(&prompt_channel), working_dir),
+        None => ServeHost::new(sink, Arc::clone(&prompt_channel), working_dir),
+    };
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
 
@@ -416,5 +453,303 @@ mod tests {
 
         let msg = client.next().await;
         assert_eq!(msg["id"], 3);
+    }
+
+    // ── End-to-end tests with a fake LLM client ───────────────────────────────
+    //
+    // These tests inject a fake `LlmClient` so the agent runs a real turn
+    // (with built-in tools, real history accumulation, real event emission)
+    // but never touches the network.
+
+    use coda_agent::tools::built_in_tools;
+    use coda_llm::{
+        ChatRequest, Content, Correlation, LlmClient, Message, ModelInfo,
+        ResponseStream, Usage,
+    };
+    use coda_llm::anthropic::StreamEvent;
+    use coda_llm::error::LlmError;
+    use std::collections::VecDeque;
+
+    /// A fake LLM client that replays preset streams, one per `stream()` call.
+    struct FakeLlmClient {
+        turns: std::sync::Mutex<VecDeque<Vec<StreamEvent>>>,
+    }
+
+    impl FakeLlmClient {
+        fn new(turns: Vec<Vec<StreamEvent>>) -> Self {
+            Self { turns: std::sync::Mutex::new(turns.into()) }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for FakeLlmClient {
+        fn provider_id(&self) -> &str { "fake" }
+
+        async fn stream(&self, _req: ChatRequest) -> Result<ResponseStream, LlmError> {
+            let events = self
+                .turns
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| vec![
+                    StreamEvent::TextDelta("(no more turns)".into()),
+                    StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+                ]);
+            let (tx, rx) = tokio::sync::mpsc::channel(32);
+            tokio::spawn(async move {
+                for event in events {
+                    let _ = tx.send(Ok(event)).await;
+                }
+            });
+            Ok(ResponseStream::new(rx))
+        }
+    }
+
+    /// A fake client that always returns an auth error (non-retried).
+    struct ErrorLlmClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for ErrorLlmClient {
+        fn provider_id(&self) -> &str { "error-fake" }
+        async fn stream(&self, _req: ChatRequest) -> Result<ResponseStream, LlmError> {
+            Err(LlmError::Auth("simulated auth failure".into()))
+        }
+    }
+
+    /// A fake client whose stream never produces a `Done` event (blocks until dropped).
+    struct BlockingLlmClient;
+
+    #[async_trait::async_trait]
+    impl LlmClient for BlockingLlmClient {
+        fn provider_id(&self) -> &str { "blocking-fake" }
+        async fn stream(&self, _req: ChatRequest) -> Result<ResponseStream, LlmError> {
+            // The sender is held by the spawned task which sleeps forever.
+            // When the receiver is dropped (agent cancelled), the task is aborted.
+            let (tx, rx) = tokio::sync::mpsc::channel::<Result<StreamEvent, LlmError>>(1);
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+                drop(tx);
+            });
+            Ok(ResponseStream::new(rx))
+        }
+    }
+
+    // Helpers shared by integration tests
+    fn make_fake_harness(client: Arc<dyn LlmClient>, working_dir: &str) -> (
+        tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        TestReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) {
+        let (server_end, client_end) = duplex(256 * 1024);
+        let (server_read, server_write) = split(server_end);
+        let (client_read, client_write) = split(client_end);
+        let wd = working_dir.to_string();
+        tokio::spawn(serve_with_client(server_read, server_write, client, &wd));
+        (client_write, TestReader::new(client_read))
+    }
+
+    async fn do_initialize(
+        client_write: &mut tokio::io::WriteHalf<tokio::io::DuplexStream>,
+        reader: &mut TestReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>,
+    ) {
+        client_write
+            .write_all(&make_request(1, "initialize", Some(json!({"protocolVersion":"1"}))))
+            .await
+            .unwrap();
+        let init = reader.next().await;
+        assert_eq!(init["result"]["protocolVersion"], "1", "initialize must succeed");
+    }
+
+    // ── Test 1: Real turn with tool call + tool execution + text reply ─────────
+
+    /// A `session/prompt` that triggers a `read_file` tool call, asserts:
+    /// - event stream contains `event/toolCall`, `event/toolResult`,
+    ///   assistant text, `event/turnComplete` (in order, TurnComplete last)
+    /// - the tool actually executed: the file contents appear in `event/toolResult`
+    /// - history contains user message + assistant tool call + tool result + reply
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn full_turn_runs_tool_call_then_text_and_updates_history() {
+        // Write a temp file with known contents.
+        let dir = std::path::PathBuf::from(std::env::temp_dir()).join("coda-serve-e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("hello.txt");
+        std::fs::write(&file, "hello from the test file").unwrap();
+        let file_path = file.to_str().unwrap().replace('\\', "/");
+
+        let client = Arc::new(FakeLlmClient::new(vec![
+            // Turn 1: model asks to read_file
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: "call_1".into(),
+                    name: "read_file".into(),
+                    input_json: format!(r#"{{"path":"{file_path}"}}"#),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done {
+                    stop_reason: Some("tool_use".into()),
+                    usage: Usage::ZERO,
+                },
+            ],
+            // Turn 2: model produces a text reply
+            vec![
+                StreamEvent::TextDelta("I read the file.".into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ],
+        ]));
+
+        let (mut cw, mut cr) = make_fake_harness(Arc::clone(&client), dir.to_str().unwrap());
+        do_initialize(&mut cw, &mut cr).await;
+
+        // Send session/prompt
+        cw.write_all(&make_request(2, "session/prompt", Some(json!({"text":"read the file"}))))
+            .await
+            .unwrap();
+
+        // Collect all messages until the session/prompt result (id=2)
+        let mut notifications: Vec<serde_json::Value> = Vec::new();
+        let prompt_result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            async {
+                loop {
+                    let msg = cr.next().await;
+                    if msg.get("id").map(|id| id == 2).unwrap_or(false) {
+                        break msg;
+                    }
+                    notifications.push(msg);
+                }
+            },
+        )
+        .await
+        .expect("session/prompt timed out after 30s");
+
+        let methods: Vec<&str> =
+            notifications.iter().map(|m| m["method"].as_str().unwrap_or("")).collect();
+
+        // Verify event order
+        assert!(methods.contains(&"event/toolCall"), "missing event/toolCall; got: {methods:?}");
+        assert!(
+            methods.contains(&"event/toolResult"),
+            "missing event/toolResult; got: {methods:?}"
+        );
+        assert_eq!(
+            *methods.last().unwrap(),
+            "event/turnComplete",
+            "event/turnComplete must be the last notification before the result"
+        );
+
+        // Verify tool actually ran: file contents in toolResult
+        let tool_result_evt = notifications
+            .iter()
+            .find(|m| m["method"] == "event/toolResult")
+            .expect("no event/toolResult found");
+        let result_content = tool_result_evt["params"]["content"].as_str().unwrap_or("");
+        assert!(
+            result_content.contains("hello from the test file"),
+            "tool must have read the real file; got content: {result_content}"
+        );
+
+        // Verify prompt response
+        assert_eq!(prompt_result["result"]["ok"], true);
+        assert_eq!(prompt_result["result"]["interrupted"], false);
+
+        // Verify history
+        cw.write_all(&make_request(3, "session/history", None)).await.unwrap();
+        let hist = cr.next().await;
+        let msgs = hist["result"]["messages"].as_array().expect("messages array");
+        let user: Vec<_> = msgs.iter().filter(|m| m["role"] == "user").collect();
+        let asst: Vec<_> = msgs.iter().filter(|m| m["role"] == "assistant").collect();
+        assert!(!user.is_empty(), "must have user messages");
+        let asst_with_text: Vec<_> =
+            asst.iter().filter(|m| !m["content"].as_str().unwrap_or("").is_empty()).collect();
+        assert!(!asst_with_text.is_empty(), "must have assistant messages with text content");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Test 2: session/interrupt yields interrupted:true ─────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn session_interrupt_yields_interrupted_true() {
+        let client = Arc::new(BlockingLlmClient);
+        let (mut cw, mut cr) = make_fake_harness(Arc::clone(&client), ".");
+        do_initialize(&mut cw, &mut cr).await;
+
+        // Send session/prompt (will block indefinitely without interrupt)
+        cw.write_all(&make_request(2, "session/prompt", Some(json!({"text":"do something"}))))
+            .await
+            .unwrap();
+
+        // Give the agent loop a moment to start.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send interrupt
+        cw.write_all(&make_request(3, "session/interrupt", None)).await.unwrap();
+
+        // Drain messages until we see the session/prompt result.
+        let mut found_turn_complete = false;
+        let prompt_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                loop {
+                    let msg = cr.next().await;
+                    if msg["method"] == "event/turnComplete" {
+                        found_turn_complete = true;
+                    }
+                    if msg.get("id").map(|id| id == 2).unwrap_or(false) {
+                        break msg;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("interrupt did not complete in 10s");
+
+        assert!(found_turn_complete, "event/turnComplete must be emitted on interrupt");
+        assert_eq!(
+            prompt_result["result"]["interrupted"], true,
+            "session/prompt must report interrupted:true after cancel"
+        );
+        assert_eq!(prompt_result["result"]["ok"], true);
+    }
+
+    // ── Test 3: Failing model returns ok:false with error ─────────────────────
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failing_model_returns_ok_false_with_error_not_a_panic() {
+        let client = Arc::new(ErrorLlmClient);
+        let (mut cw, mut cr) = make_fake_harness(Arc::clone(&client), ".");
+        do_initialize(&mut cw, &mut cr).await;
+
+        cw.write_all(&make_request(2, "session/prompt", Some(json!({"text":"do it"}))))
+            .await
+            .unwrap();
+
+        // Drain until we see id=2
+        let prompt_result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                loop {
+                    let msg = cr.next().await;
+                    if msg.get("id").map(|id| id == 2).unwrap_or(false) {
+                        break msg;
+                    }
+                }
+            },
+        )
+        .await
+        .expect("did not get session/prompt response in 10s");
+
+        assert_eq!(
+            prompt_result["result"]["ok"], false,
+            "a failing model must produce ok:false"
+        );
+        assert!(
+            prompt_result["result"].get("error").is_some()
+                && !prompt_result["result"]["error"].as_str().unwrap_or("").is_empty(),
+            "a failing model must include a non-empty error field"
+        );
+        assert_eq!(
+            prompt_result["result"]["interrupted"], false,
+            "a model error is not an interrupt"
+        );
     }
 }

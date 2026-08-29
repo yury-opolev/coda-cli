@@ -113,6 +113,8 @@ pub enum Block {
     },
     /// Output from a slash command.
     CommandOutput { text: String },
+    /// A git diff requested via `/diff`.
+    Diff { raw: String },
     /// A marker separating resumed sessions.
     SessionBoundary { id: String },
 }
@@ -170,6 +172,16 @@ impl Block {
                 .flat_map(|line| text::wrap_preformatted(&text::sanitize(line), width))
                 .map(|chunk| RenderLine::new(chunk, Role::Code))
                 .collect(),
+            Block::Diff { raw } => {
+                let diff = coda_render::diff::parse(raw);
+                if diff.is_empty() {
+                    return text::wrap("No changes.", width)
+                        .into_iter()
+                        .map(|chunk| RenderLine::new(chunk, Role::Notification))
+                        .collect();
+                }
+                coda_render::diff::render(&diff, width, false)
+            }
             Block::SessionBoundary { id } => {
                 let label = format!("\u{2500}\u{2500} session {id} \u{2500}\u{2500}");
                 text::wrap(&label, width)
@@ -841,6 +853,36 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_diff_block_renders_file_path_and_change_lines() {
+        let raw = "diff --git a/foo.rs b/foo.rs\n\
+            --- a/foo.rs\n\
+            +++ b/foo.rs\n\
+            @@ -1,1 +1,1 @@\n\
+            -old line\n\
+            +new line\n";
+        let rows = Block::Diff { raw: raw.to_string() }.render(80, ToolDisplayMode::Summary);
+        assert!(
+            rows.iter().any(|r| r.text.contains("foo.rs")),
+            "expected filename in rows: {:?}",
+            rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|r| r.text.contains("old line")));
+        assert!(rows.iter().any(|r| r.text.contains("new line")));
+    }
+
+    #[test]
+    fn an_empty_diff_block_says_no_changes() {
+        let rows = Block::Diff { raw: String::new() }.render(80, ToolDisplayMode::Summary);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.contains("No changes."));
+    }
+
+    #[test]
+    fn a_diff_block_is_never_open() {
+        assert!(!Block::Diff { raw: String::new() }.is_open());
     }
 }
 

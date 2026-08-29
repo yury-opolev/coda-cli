@@ -9,6 +9,8 @@ license.workspace = true
 coda-proto = { workspace = true }
 coda-agent = { workspace = true }
 coda-tool = { workspace = true }
+coda-llm = { workspace = true }
+coda-auth = { workspace = true }
 
 tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }
@@ -19,3 +21,4 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 uuid = { workspace = true }
 tracing = { workspace = true }
+chrono = { workspace = true }

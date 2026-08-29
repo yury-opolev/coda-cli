@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 coda-proto.workspace = true
 coda-client.workspace = true
+coda-agent.workspace = true
 coda-render.workspace = true
 coda-mcp.workspace = true
 futures.workspace = true

@@ -61,6 +61,21 @@ impl Paths {
     pub fn task_logs(&self) -> PathBuf {
         self.user_root.join("task-logs")
     }
+
+    /// `~/.coda/logs` — default location for tracing log files.
+    pub fn logs(&self) -> PathBuf {
+        self.user_root.join("logs")
+    }
+
+    /// Project-scoped skills directory (`.coda/skills/<name>/`).
+    pub fn skills_project(&self) -> PathBuf {
+        self.project_root.join(".coda").join("skills")
+    }
+
+    /// User-scoped skills directory (`~/.coda/skills/<name>/`).
+    pub fn skills_user(&self) -> PathBuf {
+        self.user_root.join("skills")
+    }
 }
 
 fn dirs_home() -> Option<PathBuf> {
@@ -246,6 +261,137 @@ impl Settings {
             .as_object_mut()
             .expect("object")
             .insert("toolDisplayMode".into(), Value::String(mode.to_string()));
+    }
+
+    pub fn output_style(&self) -> Option<&str> {
+        self.root.get("outputStyle")?.as_str()
+    }
+
+    pub fn set_output_style(&mut self, style: &str) {
+        self.root
+            .as_object_mut()
+            .expect("object")
+            .insert("outputStyle".into(), Value::String(style.to_string()));
+    }
+
+    pub fn permission_mode(&self) -> Option<&str> {
+        self.root.get("permissionMode")?.as_str()
+    }
+
+    pub fn set_permission_mode(&mut self, mode: &str) {
+        self.root
+            .as_object_mut()
+            .expect("object")
+            .insert("permissionMode".into(), Value::String(mode.to_string()));
+    }
+
+    pub fn set_default_provider(&mut self, provider: &str) {
+        self.root
+            .as_object_mut()
+            .expect("object")
+            .insert("defaultProvider".into(), Value::String(provider.to_string()));
+    }
+
+    /// All custom HTTP headers as (name, value) pairs; values are opaque strings.
+    pub fn custom_headers(&self) -> Vec<(String, String)> {
+        self.root
+            .get("customHeaders")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_custom_header(&mut self, name: &str, value: &str) {
+        self.object_mut("customHeaders")
+            .insert(name.to_string(), Value::String(value.to_string()));
+    }
+
+    pub fn remove_custom_header(&mut self, name: &str) {
+        if let Some(headers) = self
+            .root
+            .as_object_mut()
+            .and_then(|obj| obj.get_mut("customHeaders"))
+            .and_then(Value::as_object_mut)
+        {
+            headers.remove(name);
+        }
+    }
+
+    // -- Telemetry -----------------------------------------------------------
+
+    fn telemetry_val(&self) -> Option<&Value> {
+        self.root.get("telemetry")
+    }
+
+    pub fn log_enabled(&self) -> bool {
+        self.telemetry_val()
+            .and_then(|t| t.get("enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn log_level(&self) -> &str {
+        self.telemetry_val()
+            .and_then(|t| t.get("minLevel"))
+            .and_then(Value::as_str)
+            .unwrap_or("info")
+    }
+
+    pub fn log_to_stderr(&self) -> bool {
+        self.telemetry_val()
+            .and_then(|t| t.get("logToStderr"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn log_directory_override(&self) -> Option<&str> {
+        self.telemetry_val()
+            .and_then(|t| t.get("directoryOverride"))
+            .and_then(Value::as_str)
+    }
+
+    pub fn set_telemetry(&mut self, enabled: bool, level: &str, stderr: bool) {
+        let telemetry = self.object_mut("telemetry");
+        telemetry.insert("enabled".into(), Value::Bool(enabled));
+        telemetry.insert("minLevel".into(), Value::String(level.to_string()));
+        telemetry.insert("logToStderr".into(), Value::Bool(stderr));
+    }
+
+    // -- Marketplaces --------------------------------------------------------
+
+    /// Registered marketplace registries as (name, source-URL-or-path) pairs.
+    pub fn marketplaces(&self) -> Vec<(String, String)> {
+        self.root
+            .get("marketplaces")
+            .and_then(Value::as_object)
+            .map(|obj| {
+                obj.iter()
+                    .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn add_marketplace(&mut self, name: &str, source: &str) {
+        self.object_mut("marketplaces")
+            .insert(name.to_string(), Value::String(source.to_string()));
+    }
+
+    pub fn remove_marketplace(&mut self, name: &str) -> bool {
+        if let Some(obj) = self
+            .root
+            .as_object_mut()
+            .and_then(|obj| obj.get_mut("marketplaces"))
+            .and_then(Value::as_object_mut)
+        {
+            obj.remove(name).is_some()
+        } else {
+            false
+        }
     }
 
     /// The raw document, for diagnostics.
@@ -897,5 +1043,122 @@ mod tests {
     #[test]
     fn reading_a_missing_log_yields_nothing() {
         assert!(read_task_log_tail(Path::new("does-not-exist.log"), 10).is_empty());
+    }
+
+    #[test]
+    fn output_style_round_trips_through_settings() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        assert!(settings.output_style().is_none());
+        settings.set_output_style("concise");
+        settings.save().expect("save");
+        let reloaded = Settings::load(&paths).expect("reload");
+        assert_eq!(reloaded.output_style(), Some("concise"));
+    }
+
+    #[test]
+    fn permission_mode_round_trips_through_settings() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        assert!(settings.permission_mode().is_none());
+        settings.set_permission_mode("bypass");
+        settings.save().expect("save");
+        let reloaded = Settings::load(&paths).expect("reload");
+        assert_eq!(reloaded.permission_mode(), Some("bypass"));
+    }
+
+    #[test]
+    fn custom_headers_can_be_set_and_read() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        assert!(settings.custom_headers().is_empty());
+        settings.set_custom_header("X-Org", "my-org");
+        settings.set_custom_header("X-Role", "admin");
+        settings.save().expect("save");
+        let reloaded = Settings::load(&paths).expect("reload");
+        let headers = reloaded.custom_headers();
+        assert!(headers.iter().any(|(k, v)| k == "X-Org" && v == "my-org"));
+        assert!(headers.iter().any(|(k, v)| k == "X-Role" && v == "admin"));
+    }
+
+    #[test]
+    fn removing_a_custom_header_leaves_others_intact() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        settings.set_custom_header("X-A", "1");
+        settings.set_custom_header("X-B", "2");
+        settings.remove_custom_header("X-A");
+        settings.save().expect("save");
+        let reloaded = Settings::load(&paths).expect("reload");
+        let headers = reloaded.custom_headers();
+        assert!(headers.iter().all(|(k, _)| k != "X-A"));
+        assert!(headers.iter().any(|(k, _)| k == "X-B"));
+    }
+
+    #[test]
+    fn telemetry_settings_round_trip() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        assert!(!settings.log_enabled());
+        settings.set_telemetry(true, "debug", true);
+        settings.save().expect("save");
+        let reloaded = Settings::load(&paths).expect("reload");
+        assert!(reloaded.log_enabled());
+        assert_eq!(reloaded.log_level(), "debug");
+        assert!(reloaded.log_to_stderr());
+    }
+
+    #[test]
+    fn disabling_telemetry_is_persisted() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        settings.set_telemetry(true, "debug", false);
+        settings.set_telemetry(false, "debug", false);
+        settings.save().expect("save");
+        assert!(!Settings::load(&paths).expect("reload").log_enabled());
+    }
+
+    #[test]
+    fn marketplace_add_and_remove_round_trip() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        assert!(settings.marketplaces().is_empty());
+        settings.add_marketplace("community", "https://example.com/plugins.json");
+        settings.save().expect("save");
+        let reloaded = Settings::load(&paths).expect("reload");
+        let markets = reloaded.marketplaces();
+        assert_eq!(markets.len(), 1);
+        assert_eq!(markets[0].0, "community");
+        assert_eq!(markets[0].1, "https://example.com/plugins.json");
+    }
+
+    #[test]
+    fn removing_a_marketplace_returns_whether_it_existed() {
+        let (_dir, paths) = temp_paths();
+        let mut settings = Settings::load(&paths).expect("load");
+        settings.add_marketplace("a", "src://a");
+        assert!(settings.remove_marketplace("a"));
+        assert!(!settings.remove_marketplace("nope"));
+    }
+
+    #[test]
+    fn paths_logs_is_under_user_root() {
+        let (_dir, paths) = temp_paths();
+        assert_eq!(paths.logs(), paths.user_root.join("logs"));
+    }
+
+    #[test]
+    fn paths_skills_project_is_under_project_root() {
+        let (_dir, paths) = temp_paths();
+        assert_eq!(
+            paths.skills_project(),
+            paths.project_root.join(".coda").join("skills")
+        );
+    }
+
+    #[test]
+    fn paths_skills_user_is_under_user_root() {
+        let (_dir, paths) = temp_paths();
+        assert_eq!(paths.skills_user(), paths.user_root.join("skills"));
     }
 }
