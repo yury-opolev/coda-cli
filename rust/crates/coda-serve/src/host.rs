@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use coda_agent::{
-    AgentError, AgentLoopBuilder, GoalBudget, GoalOutcome, GoalStatus, GoalSupervisor,
-    TodoStore, ToolRegistry,
+    AgentError, AgentLoopBuilder, CompactionService, GoalBudget, GoalOutcome, GoalStatus,
+    GoalSupervisor, TodoStore, TokenEstimator, ToolRegistry,
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
@@ -33,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::dispatch::{
-    HooksInfoParams, HooksTrustParams, InitParams, MessagesParams, ModelsParams,
+    CompactParams, HooksInfoParams, HooksTrustParams, InitParams, MessagesParams, ModelsParams,
     PromptParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams, ServeBackend,
     SetEffortParams, SetGoalParams, SteerParams,
 };
@@ -122,6 +122,20 @@ struct SetEffortResponse {
     applied: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     note: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactResponse {
+    ok: bool,
+    messages_before: i64,
+    messages_after: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_before: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens_after: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -228,8 +242,8 @@ pub struct ServeHost {
     effort: Mutex<Option<Effort>>,
     goal_params: Mutex<GoalParams>,
     current_cancel: Mutex<Option<CancellationToken>>,
-    /// Steering messages parked while the inbox was sealed (between turns).
-    pending_steers: Mutex<Vec<(String, String, String)>>,
+    /// `true` while a `session/prompt` or `session/compact` is running.
+    turn_active: Mutex<bool>,
 }
 
 impl ServeHost {
@@ -278,7 +292,7 @@ impl ServeHost {
             effort: Mutex::new(None),
             goal_params: Mutex::new(GoalParams::default()),
             current_cancel: Mutex::new(None),
-            pending_steers: Mutex::new(Vec::new()),
+            turn_active: Mutex::new(false),
         })
     }
 
@@ -300,12 +314,41 @@ impl ServeHost {
         Some(GoalSupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
     }
 
-    fn flush_pending_steers(&self) {
-        let pending: Vec<_> = std::mem::take(
-            &mut *self.pending_steers.lock().expect("pending steers poisoned")
-        );
-        for (text, _, _) in pending {
-            self.session.steering.enqueue(&text);
+    /// Attempt to atomically claim the turn slot.
+    ///
+    /// Returns a guard on success, or `None` if another prompt or compact is
+    /// already running.
+    ///
+    /// The guard releases on drop rather than at an explicit call site. That
+    /// matters because a serve task can be *cancelled* — if the client
+    /// disconnects mid-turn the future is dropped, and a release that only
+    /// runs on the `Ok`/`Err` paths would never execute. The slot would stay
+    /// claimed for the life of the process and every later prompt would be
+    /// refused as busy, with no way to recover short of a restart.
+    fn try_claim_turn(&self) -> Option<TurnGuard<'_>> {
+        let mut busy = self.turn_active.lock().expect("turn_active poisoned");
+        if *busy {
+            None
+        } else {
+            *busy = true;
+            drop(busy);
+            Some(TurnGuard { flag: &self.turn_active })
+        }
+    }
+}
+
+/// Releases the turn slot when dropped, including on cancellation or panic.
+struct TurnGuard<'a> {
+    flag: &'a std::sync::Mutex<bool>,
+}
+
+impl Drop for TurnGuard<'_> {
+    fn drop(&mut self) {
+        // A poisoned lock still has to release the slot, otherwise one panic
+        // would wedge the session permanently.
+        match self.flag.lock() {
+            Ok(mut busy) => *busy = false,
+            Err(poisoned) => *poisoned.into_inner() = false,
         }
     }
 }
@@ -347,87 +390,37 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_prompt(&self, p: PromptParams) -> Result<Value, RpcError> {
-        // Lazy credential lookup on first use — env var only (fast path).
-        // Keyring is checked once at process startup in serve_stdio().
-        {
-            let mut guard = self.client.lock().await;
-            if guard.is_none() {
-                *guard = try_build_from_env();
+        // Validate images BEFORE claiming the turn slot so a bad image
+        // never leaves the host stuck in "busy" state.
+        if let Some(images) = p.images.as_deref() {
+            for img in images {
+                let media_type = img["mediaType"].as_str().unwrap_or("");
+                match media_type {
+                    "image/png" | "image/jpeg" | "image/gif" | "image/webp" => {}
+                    other => {
+                        return Err(RpcError::invalid_params(format!(
+                            "unsupported image media type: {other}"
+                        )));
+                    }
+                }
+                let b64 = img["base64"].as_str().unwrap_or("");
+                if let Err(e) = validate_base64(b64) {
+                    return Err(RpcError::invalid_params(format!(
+                        "invalid base64 encoding: {e}"
+                    )));
+                }
             }
         }
 
-        // Require a wired client.
-        let client = {
-            let g = self.client.lock().await;
-            g.clone()
-                .ok_or_else(|| RpcError::unauthorized("no credentials; set ANTHROPIC_API_KEY or provide apiKey in initialize"))?
+        // Claim the turn slot; the guard releases it on every exit path,
+        // including cancellation.
+        let Some(_turn) = self.try_claim_turn() else {
+            return Err(RpcError::internal(
+                "another prompt is already in progress; busy",
+            ));
         };
 
-        // Flush steering messages parked while idle.
-        self.flush_pending_steers();
-
-        // Append user message to a local copy of history.
-        let user_msg = build_user_message(&p);
-        let mut history = self.session.history.lock().expect("history poisoned").clone();
-        if !user_msg.content.is_empty() {
-            history.push(user_msg);
-        }
-
-        // Per-turn cancel token.
-        let cancel = CancellationToken::new();
-        *self.current_cancel.lock().expect("cancel poisoned") = Some(cancel.clone());
-
-        // Optional goal supervisor.
-        let goal = self.build_goal_supervisor(Arc::clone(&client));
-
-        // Build the agent loop.
-        let uq_goal = Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>;
-        let uq_tool = Arc::clone(&self.user_question) as Arc<dyn UserQuestion>;
-        let pa = Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>;
-
-        let agent = AgentLoopBuilder::new(
-            Arc::clone(&client),
-            Arc::clone(&self.permission_prompt),
-            Arc::clone(&self.tools),
-        )
-        .with_model(self.current_model())
-        .with_working_directory(&self.working_dir)
-        .with_effort(self.current_effort())
-        .with_steering(Arc::clone(&self.session.steering))
-        .with_user_question(uq_goal)
-        .with_tool_user_question(uq_tool)
-        .with_plan_approver(pa)
-        .with_todos(Arc::clone(&self.todos))
-        .build();
-
-        // Run through TurnSink to capture stop_reason.
-        let turn_sink = TurnSink::new(Arc::clone(&self.sink));
-        let run_result = agent.run(&mut history, turn_sink.as_ref(), goal, cancel).await;
-        let stop_reason = turn_sink.take_stop_reason();
-
-        // Clear cancel token.
-        *self.current_cancel.lock().expect("cancel poisoned") = None;
-
-        // Persist updated history.
-        *self.session.history.lock().expect("history poisoned") = history;
-
-        // Map result to wire fields.
-        let (ok, interrupted, goal_status, error) = match &run_result {
-            Ok(gs) => (true, false, wire_goal_status(gs), None),
-            Err(AgentError::Cancelled) => (true, true, None, None),
-            Err(e) => (false, false, None, Some(e.to_string())),
-        };
-
-        // Emit TurnComplete BEFORE the response is sent (ordering guarantee).
-        self.sink.emit(AgentEvent::TurnComplete {
-            stop_reason: stop_reason.clone(),
-            interrupted,
-            root_turn_id: None,
-            activity_id: None,
-        });
-
-        let resp = PromptResponse { ok, stop_reason, interrupted, goal_status, error };
-        serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+        self.run_prompt_inner(p).await
     }
 
     async fn session_interrupt(&self) -> Result<Value, RpcError> {
@@ -438,19 +431,20 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_steer(&self, p: SteerParams) -> Result<Value, RpcError> {
-        let now = now_rfc3339();
-        let id = match self.session.steering.enqueue(&p.text) {
-            Some(entry) => entry.id.clone(),
-            None => {
-                // Inbox sealed — park for next turn start.
-                let id = Uuid::new_v4().to_string();
-                self.pending_steers
-                    .lock()
-                    .expect("pending steers poisoned")
-                    .push((p.text.clone(), id.clone(), now.clone()));
-                id
-            }
+        // Steer is only valid for a turn in flight. Check turn_active first;
+        // the inbox may be open even when no turn is running (it starts open).
+        let is_busy = *self.turn_active.lock().expect("turn_active poisoned");
+        if !is_busy {
+            return serde_json::to_value(&SteerResponse { ok: false, message_id: None })
+                .map_err(|e| RpcError::internal(e.to_string()));
+        }
+        // Attempt to enqueue; the inbox may have been sealed racing the turn end.
+        let Some(entry) = self.session.steering.enqueue(&p.text) else {
+            return serde_json::to_value(&SteerResponse { ok: false, message_id: None })
+                .map_err(|e| RpcError::internal(e.to_string()));
         };
+        let id = entry.id.clone();
+        let now = now_rfc3339();
         self.session
             .steering_log
             .lock()
@@ -517,6 +511,14 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_set_goal(&self, p: SetGoalParams) -> Result<Value, RpcError> {
+        // Validate maxDuration before storing — return -32602 for unrecognised formats.
+        if let Some(ref dur) = p.max_duration {
+            if parse_duration(Some(dur.as_str())).is_none() {
+                return Err(RpcError::invalid_params(format!(
+                    "invalid maxDuration: {dur:?} — expected e.g. \"30m\", \"2h\", \"90s\""
+                )));
+            }
+        }
         {
             let mut s = self.goal_params.lock().expect("goal poisoned");
             s.goal = p.goal.clone();
@@ -629,6 +631,206 @@ impl ServeBackend for ServeHost {
 
     async fn plugins_list(&self) -> Result<Value, RpcError> {
         Ok(json!({ "plugins": [] }))
+    }
+
+    async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError> {
+        // Require credentials (same guard as session/prompt).
+        {
+            let mut guard = self.client.lock().await;
+            if guard.is_none() {
+                *guard = try_build_from_env();
+            }
+        }
+        let client = {
+            let g = self.client.lock().await;
+            g.clone().ok_or_else(|| {
+                RpcError::unauthorized(
+                    "no credentials; set ANTHROPIC_API_KEY or provide apiKey in initialize",
+                )
+            })?
+        };
+
+        // Claim the turn slot so a concurrent prompt is blocked; the guard
+        // releases it on every exit path, including cancellation.
+        let Some(_turn) = self.try_claim_turn() else {
+            return Err(RpcError::internal(
+                "another prompt is already in progress; busy",
+            ));
+        };
+
+        self.run_compact_inner(client, p).await
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ServeHost private helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl ServeHost {
+    /// Inner implementation of the prompt turn — called after the turn slot is claimed
+    /// and image validation has passed.
+    async fn run_prompt_inner(&self, p: PromptParams) -> Result<Value, RpcError> {
+        // Lazy credential lookup on first use — env var only (fast path).
+        // Keyring is checked once at process startup in serve_stdio().
+        {
+            let mut guard = self.client.lock().await;
+            if guard.is_none() {
+                *guard = try_build_from_env();
+            }
+        }
+
+        // Require a wired client.
+        let client = {
+            let g = self.client.lock().await;
+            g.clone().ok_or_else(|| {
+                RpcError::unauthorized(
+                    "no credentials; set ANTHROPIC_API_KEY or provide apiKey in initialize",
+                )
+            })?
+        };
+
+        // Append user message to a local copy of history.
+        let user_msg = build_user_message(&p);
+        let mut history = self.session.history.lock().expect("history poisoned").clone();
+        if !user_msg.content.is_empty() {
+            history.push(user_msg);
+        }
+
+        // Per-turn cancel token.
+        let cancel = CancellationToken::new();
+        *self.current_cancel.lock().expect("cancel poisoned") = Some(cancel.clone());
+
+        // Optional goal supervisor.
+        let goal = self.build_goal_supervisor(Arc::clone(&client));
+
+        // Build the agent loop.
+        let uq_goal = Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>;
+        let uq_tool = Arc::clone(&self.user_question) as Arc<dyn UserQuestion>;
+        let pa = Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>;
+
+        let agent = AgentLoopBuilder::new(
+            Arc::clone(&client),
+            Arc::clone(&self.permission_prompt),
+            Arc::clone(&self.tools),
+        )
+        .with_model(self.current_model())
+        .with_working_directory(&self.working_dir)
+        .with_effort(self.current_effort())
+        .with_steering(Arc::clone(&self.session.steering))
+        .with_user_question(uq_goal)
+        .with_tool_user_question(uq_tool)
+        .with_plan_approver(pa)
+        .with_todos(Arc::clone(&self.todos))
+        .build();
+
+        // Run through TurnSink to capture stop_reason.
+        let turn_sink = TurnSink::new(Arc::clone(&self.sink));
+        let run_result = agent.run(&mut history, turn_sink.as_ref(), goal, cancel).await;
+        let stop_reason = turn_sink.take_stop_reason();
+
+        // Clear cancel token.
+        *self.current_cancel.lock().expect("cancel poisoned") = None;
+
+        // Persist updated history.
+        *self.session.history.lock().expect("history poisoned") = history;
+
+        // Map result to wire fields.
+        let (ok, interrupted, goal_status, error) = match &run_result {
+            Ok(gs) => (true, false, wire_goal_status(gs), None),
+            Err(AgentError::Cancelled) => (true, true, None, None),
+            Err(e) => (false, false, None, Some(e.to_string())),
+        };
+
+        // Emit TurnComplete BEFORE the response is sent (ordering guarantee).
+        self.sink.emit(AgentEvent::TurnComplete {
+            stop_reason: stop_reason.clone(),
+            interrupted,
+            root_turn_id: None,
+            activity_id: None,
+        });
+
+        let resp = PromptResponse { ok, stop_reason, interrupted, goal_status, error };
+        serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn run_compact_inner(
+        &self,
+        client: Arc<dyn LlmClient>,
+        p: CompactParams,
+    ) -> Result<Value, RpcError> {
+        // Snapshot current history without holding the lock.
+        let history = self.session.history.lock().expect("history poisoned").clone();
+        let messages_before = history.len() as i64;
+
+        if history.is_empty() {
+            return serde_json::to_value(&CompactResponse {
+                ok: true,
+                messages_before: 0,
+                messages_after: 0,
+                tokens_before: None,
+                tokens_after: None,
+                error: None,
+            })
+            .map_err(|e| RpcError::internal(e.to_string()));
+        }
+
+        let tokens_before = TokenEstimator::estimate(&history) as i64;
+
+        // Per-operation cancel token — wired so session/interrupt cancels this too.
+        let cancel = CancellationToken::new();
+        *self.current_cancel.lock().expect("cancel poisoned") = Some(cancel.clone());
+
+        let fork: Arc<dyn ForkedAgent> =
+            Arc::new(LlmForkedAgent { client, model: self.current_model() });
+        let service = CompactionService::new(fork);
+
+        let (compacted, summary) =
+            service.compact(&history, p.instructions.as_deref(), cancel.clone()).await;
+
+        *self.current_cancel.lock().expect("cancel poisoned") = None;
+
+        let was_cancelled = cancel.is_cancelled();
+
+        if was_cancelled {
+            // Emit the cancellation event; history is unchanged.
+            self.sink.emit(AgentEvent::CompactionCancelled {
+                hook_command: String::new(),
+                trigger: "cancelled".into(),
+            });
+            return Err(RpcError::cancelled());
+        }
+
+        match summary {
+            Some(_) => {
+                // Compaction succeeded — atomically replace history.
+                let messages_after = compacted.len() as i64;
+                let tokens_after = TokenEstimator::estimate(&compacted) as i64;
+                *self.session.history.lock().expect("history poisoned") = compacted;
+                serde_json::to_value(&CompactResponse {
+                    ok: true,
+                    messages_before,
+                    messages_after,
+                    tokens_before: Some(tokens_before),
+                    tokens_after: Some(tokens_after),
+                    error: None,
+                })
+                .map_err(|e| RpcError::internal(e.to_string()))
+            }
+            None => {
+                // Summariser returned empty — original history preserved.
+                serde_json::to_value(&CompactResponse {
+                    ok: true,
+                    messages_before,
+                    messages_after: messages_before,
+                    tokens_before: Some(tokens_before),
+                    tokens_after: None,
+                    error: Some(
+                        "summariser returned empty response; history unchanged".into(),
+                    ),
+                })
+                .map_err(|e| RpcError::internal(e.to_string()))
+            }
+        }
     }
 }
 
@@ -763,6 +965,39 @@ fn parse_duration(s: Option<&str>) -> Option<Duration> {
     None
 }
 
+/// Lightweight base64 character-set + length validator.
+///
+/// Does not actually decode; just checks that all characters are in the
+/// standard base64 alphabet and that the string is a multiple of 4 bytes
+/// (which rules out truncated/corrupted inputs like `"not valid base64!!"`).
+fn validate_base64(s: &str) -> Result<(), String> {
+    if s.is_empty() {
+        return Ok(());
+    }
+    let bytes = s.as_bytes();
+    // Find where padding starts.
+    let content_end = bytes.iter().rposition(|&b| b != b'=').map(|i| i + 1).unwrap_or(0);
+    // Content bytes must all be standard base64 characters.
+    for &b in &bytes[..content_end] {
+        if !matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'+' | b'/') {
+            return Err(format!("non-base64 character 0x{b:02x} in image data"));
+        }
+    }
+    // Total length must be a multiple of 4.
+    if bytes.len() % 4 != 0 {
+        return Err(format!(
+            "base64 length {} is not a multiple of 4",
+            bytes.len()
+        ));
+    }
+    // At most 2 padding bytes.
+    let padding = bytes.len() - content_end;
+    if padding > 2 {
+        return Err("excessive padding in base64 data".into());
+    }
+    Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
@@ -777,6 +1012,41 @@ mod tests {
         let sink = Arc::new(ServeSink::new(tx.clone()));
         let ch = Arc::new(PromptChannel::new(tx));
         ServeHost::new(sink, ch, ".".into())
+    }
+
+    /// The turn slot must survive a cancelled turn.
+    ///
+    /// A serve task is cancellable: if the client disconnects mid-prompt the
+    /// future is simply dropped, and neither the `Ok` nor the `Err` arm runs.
+    /// Releasing only at those call sites would leave the slot claimed for the
+    /// life of the process, so every later prompt would be refused as busy
+    /// with no recovery short of a restart.
+    #[tokio::test]
+    async fn a_dropped_turn_releases_the_slot() {
+        let host = make_host();
+        {
+            let _turn = host.try_claim_turn().expect("first claim succeeds");
+            assert!(
+                host.try_claim_turn().is_none(),
+                "the slot must be held while a turn is in flight"
+            );
+        } // guard dropped here, as it would be on cancellation
+
+        assert!(
+            host.try_claim_turn().is_some(),
+            "dropping the turn must release the slot, or the session wedges forever"
+        );
+    }
+
+    /// Two concurrent prompts must not both run: the loser is refused rather
+    /// than interleaving writes into the same history.
+    #[tokio::test]
+    async fn a_second_concurrent_claim_is_refused() {
+        let host = make_host();
+        let first = host.try_claim_turn().expect("first claim succeeds");
+        assert!(host.try_claim_turn().is_none(), "second concurrent claim must be refused");
+        drop(first);
+        assert!(host.try_claim_turn().is_some(), "the slot is reusable once released");
     }
 
     #[tokio::test]
@@ -918,5 +1188,142 @@ mod tests {
         assert_eq!(parse_duration(Some("30s")), Some(Duration::from_secs(30)));
         assert!(parse_duration(Some("bad")).is_none());
         assert!(parse_duration(None).is_none());
+    }
+
+    // ── Bug-fix: set_goal with invalid maxDuration returns -32602 ────────────
+
+    #[tokio::test]
+    async fn set_goal_with_invalid_max_duration_returns_32602() {
+        let host = make_host();
+        let err = host
+            .session_set_goal(SetGoalParams {
+                goal: Some("do it".into()),
+                max_duration: Some("not-a-duration".into()),
+                max_continuations: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code, -32602,
+            "invalid maxDuration must return -32602, not a success"
+        );
+        assert!(
+            err.message.to_lowercase().contains("maxduration"),
+            "error message must mention maxDuration: {}", err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn set_goal_with_valid_max_duration_is_accepted() {
+        let host = make_host();
+        let r = host
+            .session_set_goal(SetGoalParams {
+                goal: Some("ship it".into()),
+                max_duration: Some("30m".into()),
+                max_continuations: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["maxDuration"], "30m");
+    }
+
+    // ── Bug-fix: steer when no turn running returns ok:false ─────────────────
+
+    #[tokio::test]
+    async fn steer_when_no_turn_running_returns_ok_false() {
+        let host = make_host();
+        // Steering inbox is sealed when no turn is running.
+        let r = host
+            .session_steer(SteerParams { text: "steer without a turn".into() })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], false, "steer with no turn running must return ok:false");
+        assert!(
+            r.get("messageId").is_none(),
+            "rejected steer must not produce a messageId"
+        );
+    }
+
+    // ── Bug-fix: concurrent prompt claim rejected ────────────────────────────
+
+    #[tokio::test]
+    async fn session_compact_without_credentials_returns_32001() {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            return;
+        }
+        let host = make_host();
+        let err = host
+            .session_compact(CompactParams { instructions: None })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32001);
+    }
+
+    // ── validate_base64 unit tests ────────────────────────────────────────────
+
+    #[test]
+    fn validate_base64_accepts_valid_input() {
+        // A tiny real PNG's base64
+        let png_b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
+        assert!(validate_base64(png_b64).is_ok());
+        assert!(validate_base64("").is_ok());
+        assert!(validate_base64("AAAA").is_ok());
+        assert!(validate_base64("AAA=").is_ok());
+        assert!(validate_base64("AA==").is_ok());
+    }
+
+    #[test]
+    fn validate_base64_rejects_invalid_characters() {
+        // "!" is not a valid base64 character
+        assert!(validate_base64("not valid base64!!").is_err());
+        // Spaces are not valid
+        assert!(validate_base64("AA AA").is_err());
+    }
+
+    // ── image media type validation ───────────────────────────────────────────
+
+    #[tokio::test]
+    async fn session_prompt_rejects_unsupported_image_media_type() {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            return;
+        }
+        let host = make_host();
+        use serde_json::json;
+        let err = host
+            .session_prompt(PromptParams {
+                text: Some("hi".into()),
+                images: Some(vec![json!({"mediaType":"image/bmp","base64":"AAAA"})]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.to_lowercase().contains("unsupported image media type"),
+            "error must mention unsupported media type: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn session_prompt_rejects_invalid_base64_in_image() {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            return;
+        }
+        let host = make_host();
+        use serde_json::json;
+        let err = host
+            .session_prompt(PromptParams {
+                text: Some("hi".into()),
+                images: Some(vec![json!({"mediaType":"image/png","base64":"not valid base64!!"})]),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(
+            err.message.to_lowercase().contains("base64"),
+            "error must mention base64: {}",
+            err.message
+        );
     }
 }

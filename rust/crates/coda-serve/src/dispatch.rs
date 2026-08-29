@@ -156,6 +156,14 @@ pub struct HooksTrustParams {
     pub hook_hash: Option<String>,
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactParams {
+    /// Optional override for the summarisation system prompt.
+    #[serde(default)]
+    pub instructions: Option<String>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ServeBackend trait — one method per protocol operation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -189,6 +197,7 @@ pub trait ServeBackend: Send + Sync {
     async fn hooks_trust(&self, p: HooksTrustParams) -> Result<Value, RpcError>;
     async fn skills_list(&self) -> Result<Value, RpcError>;
     async fn plugins_list(&self) -> Result<Value, RpcError>;
+    async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -241,6 +250,7 @@ pub async fn dispatch(
             Err(RpcError::skills_trust_refused())
         }
         "plugins/list" => backend.plugins_list().await,
+        "session/compact" => backend.session_compact(optional(params)).await,
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -337,6 +347,9 @@ mod tests {
         }
         async fn plugins_list(&self) -> Result<Value, RpcError> {
             Ok(json!({ "plugins": [] }))
+        }
+        async fn session_compact(&self, _p: CompactParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "messagesBefore": 4, "messagesAfter": 2 }))
         }
     }
 
@@ -659,6 +672,9 @@ mod tests {
         async fn plugins_list(&self) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
+        async fn session_compact(&self, _p: CompactParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
     }
 
     #[tokio::test]
@@ -680,5 +696,33 @@ mod tests {
         let b = ErrorBackend(-32603, "internal");
         let err = dispatch("shutdown", None, &b).await.unwrap_err();
         assert_eq!(err.code, -32603);
+    }
+
+    // ── session/compact dispatch tests ─────────────────────────────────────
+
+    #[tokio::test]
+    async fn dispatches_session_compact_no_params() {
+        let r = dispatch("session/compact", None, &FakeBackend).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["messagesBefore"].is_number());
+        assert!(r["messagesAfter"].is_number());
+    }
+
+    #[tokio::test]
+    async fn dispatches_session_compact_with_instructions() {
+        let r = dispatch(
+            "session/compact",
+            Some(json!({"instructions": "be brief"})),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn session_compact_empty_params_object_is_ok() {
+        let r = dispatch("session/compact", Some(json!({})), &FakeBackend).await.unwrap();
+        assert_eq!(r["ok"], true);
     }
 }
