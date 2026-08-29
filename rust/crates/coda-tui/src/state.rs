@@ -490,6 +490,19 @@ impl UiState {
                 // the TUI has no UI to display hook payloads, so it is silently
                 // accepted (like ToolInputModified and ToolResultModified).
             }
+            Event::CompactionCancelled { hook_command, .. } => {
+                // Worth surfacing: the user asked for compaction (or it was
+                // triggered automatically) and a hook prevented it, so the
+                // context is still full and the next turn may hit the limit.
+                self.notice(
+                    format!("Compaction cancelled by hook: {hook_command}"),
+                    NoticeLevel::Warning,
+                );
+            }
+            Event::PostCompactContextInjected { .. } => {
+                // Informational: a hook added context after compaction. The
+                // content lands in the history rather than the transcript.
+            }
             // Informational events with no transcript representation.
             Event::Stop { .. }
             | Event::StreamProgress { .. }

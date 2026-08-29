@@ -12,13 +12,8 @@
 //! |---|---|---|
 //! | `ToolQueued` | — | No proto event; silently dropped by the adapter. |
 //! | `ToolStatus` | — | No dedicated proto event; status rides on `ToolResult`. |
-//! | `CompactionCancelled` | — | No proto event; silently dropped. |
-//! | `PostCompactContextInjected` | — | No proto event; silently dropped. |
 //! | `Warning` | — | No proto event; silently dropped. |
-//! | `Usage` | `Usage{input_tokens, output_tokens}` | Cache fields dropped. |
-//! | `ResponseRewritten` | `ResponseRewritten{hook_command, display_content}` | Before/after payloads dropped. |
-//! | `ToolInputModified` | `ToolInputModified{hook_command, tool_name}` | Before/after payloads dropped. |
-//! | `ToolResultModified` | `ToolResultModified{hook_command, tool_name}` | Before/after payloads dropped. |
+//! | `Usage` | `Usage{input_tokens, output_tokens}` | Cache fields dropped — the C# `event/usage` carries only these two, so this is parity, not loss. |
 //! | `ThinkingComplete` | `ThinkingComplete{elapsed_ms, thinking_tokens}` | `thinking_tokens` always `None`; Rust stream carries no per-burst token count. |
 use coda_llm::Usage;
 use coda_llm::Correlation as LlmCorrelation;
@@ -216,26 +211,39 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
             })
         }
         // Mismatch: proto ResponseRewritten drops original_response / modified_response.
-        AgentEvent::ResponseRewritten { hook_command, display_content, .. } => {
-            Some(ProtoEvent::ResponseRewritten {
-                hook_command: hook_command.clone(),
-                display_content: display_content.clone(),
-            })
-        }
-        // Mismatch: proto ToolInputModified drops before/after payloads.
-        AgentEvent::ToolInputModified { hook_command, tool_name, .. } => {
-            Some(ProtoEvent::ToolInputModified {
-                hook_command: hook_command.clone(),
-                tool_name: tool_name.clone(),
-            })
-        }
-        // Mismatch: proto ToolResultModified drops before/after payloads.
-        AgentEvent::ToolResultModified { hook_command, tool_name, .. } => {
-            Some(ProtoEvent::ToolResultModified {
-                hook_command: hook_command.clone(),
-                tool_name: tool_name.clone(),
-            })
-        }
+        AgentEvent::ResponseRewritten {
+            hook_command,
+            original_response,
+            display_content,
+            modified_response,
+        } => Some(ProtoEvent::ResponseRewritten {
+            hook_command: hook_command.clone(),
+            original_response: original_response.clone(),
+            display_content: display_content.clone(),
+            modified_response: modified_response.clone(),
+        }),
+        AgentEvent::ToolInputModified {
+            hook_command,
+            tool_name,
+            original_input,
+            modified_input,
+        } => Some(ProtoEvent::ToolInputModified {
+            hook_command: hook_command.clone(),
+            tool_name: tool_name.clone(),
+            original_input: original_input.clone(),
+            modified_input: modified_input.clone(),
+        }),
+        AgentEvent::ToolResultModified {
+            hook_command,
+            tool_name,
+            original_result,
+            modified_result,
+        } => Some(ProtoEvent::ToolResultModified {
+            hook_command: hook_command.clone(),
+            tool_name: tool_name.clone(),
+            original_result: original_result.clone(),
+            modified_result: modified_result.clone(),
+        }),
         AgentEvent::PermissionDecided { hook_command, tool_name, decision } => {
             Some(ProtoEvent::PermissionDecided {
                 hook_command: hook_command.clone(),
@@ -273,9 +281,18 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
             modified_result: modified_result.clone(),
         }),
         // Gaps: no proto events for these.
-        AgentEvent::CompactionCancelled { .. }
-        | AgentEvent::PostCompactContextInjected { .. }
-        | AgentEvent::Warning { .. } => None,
+        AgentEvent::CompactionCancelled { hook_command, trigger } => {
+            Some(ProtoEvent::CompactionCancelled {
+                hook_command: hook_command.clone(),
+                trigger: trigger.clone(),
+            })
+        }
+        AgentEvent::PostCompactContextInjected { context } => {
+            Some(ProtoEvent::PostCompactContextInjected {
+                additional_context: context.clone(),
+            })
+        }
+        AgentEvent::Warning { .. } => None,
     }
 }
 
@@ -408,7 +425,7 @@ mod tests {
         });
         let guard = received.lock().unwrap();
         match guard.as_ref().unwrap() {
-            ProtoEvent::ResponseRewritten { hook_command, display_content } => {
+            ProtoEvent::ResponseRewritten { hook_command, display_content, .. } => {
                 assert_eq!(hook_command, "cmd");
                 assert_eq!(display_content, "display");
             }
