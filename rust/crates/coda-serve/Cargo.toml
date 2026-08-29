@@ -1,0 +1,21 @@
+[package]
+name = "coda-serve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+coda-proto = { workspace = true }
+coda-agent = { workspace = true }
+coda-tool = { workspace = true }
+
+tokio = { workspace = true, features = ["io-std"] }
+tokio-util = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+async-trait = { workspace = true }
+uuid = { workspace = true }
+tracing = { workspace = true }
