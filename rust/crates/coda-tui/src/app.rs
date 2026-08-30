@@ -12,7 +12,9 @@ use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound, Respo
 use coda_proto::messages::{self, method, server_method};
 use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
-use crossterm::event::{Event as TerminalEvent, EventStream, KeyCode, KeyEvent, MouseEventKind};
+use crossterm::event::{
+    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, MouseEventKind,
+};
 use futures::future::OptionFuture;
 use futures_lite::StreamExt;
 use serde_json::Value;
@@ -46,9 +48,15 @@ struct TurnOutcome {
 }
 
 /// The running application.
+/// What the startup banner needs before the UI takes over the terminal.
+#[derive(Debug, Clone, Default)]
+pub struct SessionSnapshot {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
 pub struct App {
-    state: UiState,
-    composer: Composer,
+    state: UiState,    composer: Composer,
     viewport: Viewport,
     theme: Theme,
     connection: Connection,
@@ -167,11 +175,16 @@ impl App {
     }
 
     /// Runs until the user quits or the engine disconnects.
+    /// Runs the UI loop, returning the summary the caller prints on exit.
+    ///
+    /// The summary is produced here rather than by the caller because the loop
+    /// consumes `self`: usage and session id are only final once it returns.
     pub async fn run(
         mut self,
         guard: &mut TerminalGuard,
         mut inbound: mpsc::UnboundedReceiver<Inbound>,
-    ) -> Result<()> {
+        started_at: std::time::Instant,
+    ) -> Result<crate::branding::ExitSummary> {
         // Holds an engine this loop started itself, so it can be shut down
         // when superseded by another restart.
         let mut owned_engine: Option<Engine> = None;
@@ -256,7 +269,7 @@ impl App {
         if let Some(engine) = owned_engine {
             let _ = engine.shutdown(SHUTDOWN_GRACE).await;
         }
-        Ok(())
+        Ok(self.exit_summary(started_at.elapsed()))
     }
 
     // -- Engine -------------------------------------------------------------
@@ -384,7 +397,18 @@ impl App {
         guard: &mut TerminalGuard,
     ) -> Result<()> {
         match event {
-            TerminalEvent::Key(key) => self.on_key(key).await,
+            // Windows reports key *release* (and repeat) events as well as
+            // presses. Acting on a release is wrong for every binding, but it
+            // is actively broken for the two-press chords: the release of the
+            // first Ctrl+C disarms the chord immediately, so the second press
+            // only ever re-arms and the app can never be exited from the
+            // keyboard. Repeats are kept so held keys still autorepeat.
+            TerminalEvent::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                self.on_key(key).await
+            }
+            TerminalEvent::Key(_) => {}
             TerminalEvent::Paste(text) => {
                 self.composer.insert(&text);
                 self.dirty = true;
@@ -1374,8 +1398,50 @@ impl App {
 
     // -- Helpers ------------------------------------------------------------
 
-    fn key_context(&self) -> KeyContext {
-        let (line, _) = self.composer.cursor_position();
+    /// What the startup banner needs to know before the UI takes the terminal.
+    ///
+    /// Provider and model come from settings rather than the engine, because
+    /// the banner is printed before the first turn and there is nothing to ask
+    /// yet — and because naming the wrong provider is exactly the mistake the
+    /// banner exists to prevent.
+    pub fn session_snapshot(&self) -> SessionSnapshot {
+        let settings = Settings::load(&self.paths).ok();
+        let provider = settings
+            .as_ref()
+            .and_then(|s| s.default_provider().map(str::to_owned));
+        let model = self.state.model.clone().or_else(|| {
+            let settings = settings.as_ref()?;
+            let provider = provider.as_deref()?;
+            settings.model_for(provider).map(str::to_owned)
+        });
+        SessionSnapshot { provider, model }
+    }
+
+    /// Builds the exit summary from the session's final state.
+    pub fn exit_summary(&self, duration: std::time::Duration) -> crate::branding::ExitSummary {
+        let snapshot = self.session_snapshot();
+        let settings = Settings::load(&self.paths).ok();
+        let effort = match (&snapshot.provider, &snapshot.model) {
+            (Some(p), Some(m)) => settings
+                .as_ref()
+                .and_then(|s| s.effort_for(p, m).map(str::to_owned)),
+            _ => None,
+        };
+
+        crate::branding::ExitSummary {
+            duration,
+            message_count: self.state.transcript.blocks().len(),
+            provider_id: snapshot.provider.unwrap_or_else(|| "—".into()),
+            model: snapshot.model.unwrap_or_else(|| "—".into()),
+            effort,
+            input_tokens: self.state.usage.input_tokens.max(0) as u64,
+            output_tokens: self.state.usage.output_tokens.max(0) as u64,
+            session_id: self.state.session_id.clone(),
+            working_directory: self.paths.project_root.to_string_lossy().into_owned(),
+        }
+    }
+
+    fn key_context(&self) -> KeyContext {        let (line, _) = self.composer.cursor_position();
         KeyContext {
             focus: if self.state.prompt.is_some() {
                 Focus::Overlay

@@ -170,17 +170,39 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
     // instead of a blank alternate screen.
     let (app, engine_process, inbound) = App::connect(command, theme).await?;
 
+    // The banner goes out before the alternate screen is entered, so it stays
+    // in the scrollback the way the C# build's does rather than being wiped on
+    // exit. It names the provider and model, which is the only pre-flight
+    // signal that you are about to spend money against the wrong one.
+    let session = app.session_snapshot();
+    coda_tui::branding::print_startup(
+        &working_dir.to_string_lossy(),
+        session.provider.as_deref(),
+        session.model.as_deref(),
+    );
+
     install_panic_hook();
+    let started_at = std::time::Instant::now();
     let mut guard = TerminalGuard::enter(!args.no_mouse).context("failed to set up the terminal")?;
 
-    let result = app.run(&mut guard, inbound).await;
+    let result = app.run(&mut guard, inbound, started_at).await;
 
     // Restore the terminal before shutting the engine down so any engine
     // diagnostics land on a normal screen.
     drop(guard);
+
+    // The summary is written after the alternate screen is released, so it
+    // survives in the scrollback. It reports what the session cost and how to
+    // get back to it — both lost entirely if it is skipped.
+    match &result {
+        Ok(summary) => coda_tui::branding::print_exit(summary),
+        // A failed run has no meaningful summary; the error is the message.
+        Err(_) => {}
+    }
+
     let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
 
-    result
+    result.map(|_| ())
 }
 
 /// Runs a single task without a terminal UI and returns the process exit code.
