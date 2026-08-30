@@ -291,7 +291,7 @@ impl ServeHost {
             plan_approver,
             todos: Arc::new(TodoStore::new()),
             working_dir,
-            model: Mutex::new("claude-opus-4-5".into()),
+            model: Mutex::new(crate::settings::resolve().model),
             effort: Mutex::new(None),
             goal_params: Mutex::new(GoalParams::default()),
             current_cancel: Mutex::new(None),
@@ -574,7 +574,34 @@ impl ServeBackend for ServeHost {
     // ── Stubs ─────────────────────────────────────────────────────────────────
 
     async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {
-        Ok(json!({ "supported": false, "levels": [], "supportsAuto": false }))
+        // Copilot models advertise their levels at runtime, so consult the
+        // model listing; Anthropic models resolve from static rules on the id.
+        // Passing the advertised list is what makes this correct for Copilot —
+        // resolving without it reports every such model unsupported and
+        // silently discards the user's configured effort.
+        let model = self.current_model();
+        let advertised: Option<Vec<String>> = match self.client.lock().await.clone() {
+            Some(client) => client.list_models().await.ok().and_then(|models| {
+                models
+                    .into_iter()
+                    .find(|m| m.id.eq_ignore_ascii_case(&model))
+                    .map(|m| m.reasoning_levels)
+            }),
+            None => None,
+        };
+
+        let capability = coda_llm::resolve_reasoning(
+            &crate::settings::resolve().provider_id,
+            &model,
+            advertised.as_deref(),
+        );
+        Ok(json!({
+            "supported": capability.supported,
+            // The C# sends an empty list when unsupported rather than the
+            // levels it would otherwise have reported.
+            "levels": if capability.supported { capability.levels } else { Vec::new() },
+            "supportsAuto": capability.supports_auto,
+        }))
     }
 
     async fn session_schedule_list(&self) -> Result<Value, RpcError> {
@@ -633,7 +660,9 @@ impl ServeBackend for ServeHost {
     }
 
     async fn skills_list(&self) -> Result<Value, RpcError> {
-        Ok(json!({ "skills": [] }))
+        let found = crate::skills::discover(std::path::Path::new(&self.working_dir));
+        serde_json::to_value(serde_json::json!({ "skills": found }))
+            .map_err(|e| RpcError::internal(e.to_string()))
     }
 
     async fn plugins_list(&self) -> Result<Value, RpcError> {

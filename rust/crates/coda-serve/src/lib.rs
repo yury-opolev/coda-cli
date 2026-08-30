@@ -16,7 +16,9 @@ pub mod dispatch;
 pub mod host;
 pub mod prompts;
 pub mod session;
+pub mod settings;
 pub mod sink;
+pub mod skills;
 pub mod transport;
 
 pub use dispatch::{dispatch, RpcError, ServeBackend};

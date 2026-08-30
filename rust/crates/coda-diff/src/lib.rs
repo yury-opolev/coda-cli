@@ -204,16 +204,7 @@ pub async fn compare(
 /// **This list must shrink to empty before the C# engine is removed.** When a
 /// gap is closed, the harness fails until its entry is deleted — which keeps
 /// the list honest rather than letting it rot into a permanent excuse.
-pub const KNOWN_GAPS: &[(&str, &str)] = &[
-    (
-        "model/reasoningCapability",
-        "the Rust engine has no per-model metadata, so it reports no reasoning support",
-    ),
-    (
-        "skills/list",
-        "the Rust engine has no skill registry wired, so it returns an empty list",
-    ),
-];
+pub const KNOWN_GAPS: &[(&str, &str)] = &[];
 
 /// The deterministic scenario: everything that does not need a live model.
 pub fn deterministic_scenario() -> Vec<Step> {    use coda_proto::messages::method;

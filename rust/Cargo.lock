@@ -766,6 +766,7 @@ dependencies = [
  "coda-llm",
  "coda-proto",
  "coda-tool",
+ "directories",
  "serde",
  "serde_json",
  "thiserror 2.0.20",

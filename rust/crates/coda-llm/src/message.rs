@@ -297,6 +297,15 @@ pub struct ModelInfo {
     pub context_limit: Option<u32>,
     /// Endpoints the model supports, when the provider advertises them.
     pub supported_endpoints: Vec<String>,
+    /// Reasoning-effort levels the model advertises, lowest to highest.
+    ///
+    /// Copilot/OpenAI models declare these at runtime under
+    /// `capabilities.supports.reasoning_effort`; Anthropic models do not, and
+    /// their capability is derived from static rules instead. Empty means the
+    /// provider said nothing, which is *not* the same as "unsupported" — a
+    /// caller must not conclude a model lacks reasoning purely from this being
+    /// empty.
+    pub reasoning_levels: Vec<String>,
 }
 
 impl ModelInfo {
@@ -306,6 +315,7 @@ impl ModelInfo {
             display_name: None,
             context_limit: None,
             supported_endpoints: Vec::new(),
+            reasoning_levels: Vec::new(),
         }
     }
 
