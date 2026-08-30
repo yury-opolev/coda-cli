@@ -120,8 +120,11 @@ struct SetEffortResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     applied: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    note: Option<String>,
+    /// Always present. The C# host emits `note: ""` on success rather than
+    /// omitting it — only *null* properties are dropped, and an empty string
+    /// is not null. A client that distinguishes "absent" from "empty" would
+    /// see two different engines here, so this field is not optional.
+    note: String,
 }
 
 #[derive(Serialize)]
@@ -538,8 +541,12 @@ impl ServeBackend for ServeHost {
         match p.effort.as_deref() {
             None => {
                 *self.effort.lock().expect("effort poisoned") = None;
-                serde_json::to_value(&SetEffortResponse { ok: true, applied: None, note: None })
-                    .map_err(|e| RpcError::internal(e.to_string()))
+                serde_json::to_value(&SetEffortResponse {
+                    ok: true,
+                    applied: None,
+                    note: String::new(),
+                })
+                .map_err(|e| RpcError::internal(e.to_string()))
             }
             Some(raw) => match Effort::parse(raw) {
                 Some(e) => {
@@ -547,7 +554,7 @@ impl ServeBackend for ServeHost {
                     let resp = SetEffortResponse {
                         ok: true,
                         applied: Some(e.as_str().into()),
-                        note: None,
+                        note: String::new(),
                     };
                     serde_json::to_value(&resp).map_err(|err| RpcError::internal(err.to_string()))
                 }
@@ -556,7 +563,7 @@ impl ServeBackend for ServeHost {
                     let resp = SetEffortResponse {
                         ok: false,
                         applied: None,
-                        note: Some(format!("unsupported effort: {raw}")),
+                        note: format!("unsupported effort: {raw}"),
                     };
                     serde_json::to_value(&resp).map_err(|err| RpcError::internal(err.to_string()))
                 }
@@ -1134,7 +1141,11 @@ mod tests {
             .unwrap();
         assert_eq!(r["ok"], true);
         assert_eq!(r["applied"], "high");
-        assert!(r.get("note").is_none());
+        // The C# host emits note:"" rather than omitting it — only null
+        // properties are dropped, and an empty string is not null. This test
+        // previously asserted the field was absent, which agreed with a real
+        // parity bug the differential harness caught.
+        assert_eq!(r["note"], "", "note must be present and empty, matching the C# engine");
     }
 
     #[tokio::test]

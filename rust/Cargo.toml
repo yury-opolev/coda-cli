@@ -12,6 +12,7 @@ members = [
     "crates/coda-auth",
     "crates/coda-serve",
     "crates/coda",
+    "crates/coda-diff",
 ]
 
 [workspace.package]

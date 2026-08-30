@@ -678,6 +678,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "coda-diff"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "coda-client",
+ "coda-proto",
+ "pretty_assertions",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "coda-llm"
 version = "0.1.0"
 dependencies = [
