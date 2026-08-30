@@ -120,6 +120,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitWorktreeTool),
         // ── LSP ───────────────────────────────────────────────────────────────
         Arc::new(LspDiagnosticsTool),
+        Arc::new(crate::lsp::LspTool),
         // ── task management ────────────────────────────────────────────────────
         Arc::new(TaskListTool),
         Arc::new(TaskGetTool),
