@@ -280,6 +280,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Attach an image to the next message.",
         scope: Scope::Local,
     },
+    CommandSpec {
+        name: "setup",
+        aliases: &[],
+        args: "",
+        summary: "Run the setup wizard to connect to a provider.",
+        scope: Scope::Local,
+    },
 ];
 
 impl CommandSpec {

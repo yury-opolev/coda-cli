@@ -496,6 +496,36 @@ impl Transcript {
         }
         out
     }
+
+    /// Renders all blocks and returns both the flat row list and a per-block
+    /// start-row table.
+    ///
+    /// `block_starts[i]` is the index of the first row of block `i` in the
+    /// returned `Vec<RenderLine>`.  Blocks that render to zero rows have a
+    /// start equal to the next non-empty block's start.  A sentinel entry
+    /// equal to `rows.len()` is appended so callers can use adjacent pairs for
+    /// a range without bounds-checking.
+    ///
+    /// This is the Rust equivalent of `TranscriptLayoutIndex`'s prefix-sum
+    /// array, computed in a single O(n) pass to avoid rendering blocks twice.
+    pub fn render_with_block_starts(
+        &self,
+        width: usize,
+        mode: ToolDisplayMode,
+    ) -> (Vec<RenderLine>, Vec<usize>) {
+        let mut rows: Vec<RenderLine> = Vec::new();
+        let mut starts: Vec<usize> = Vec::with_capacity(self.blocks.len() + 1);
+        for block in &self.blocks {
+            starts.push(rows.len());
+            let block_rows = block.render(width, mode);
+            if !block_rows.is_empty() {
+                rows.extend(block_rows);
+                rows.push(RenderLine::separator());
+            }
+        }
+        starts.push(rows.len()); // sentinel
+        (rows, starts)
+    }
 }
 
 #[cfg(test)]
@@ -910,6 +940,53 @@ mod tests {
     #[test]
     fn a_diff_block_is_never_open() {
         assert!(!Block::Diff { raw: String::new() }.is_open());
+    }
+
+    #[test]
+    fn render_with_block_starts_matches_render_rows() {
+        let mut transcript = Transcript::new();
+        transcript.push(user("hello"));
+        transcript.push(Block::Assistant {
+            text: "world".to_string(),
+            complete: true,
+        });
+        let width = 80;
+        let mode = ToolDisplayMode::Summary;
+
+        let expected_rows = transcript.render(width, mode);
+        let (rows, starts) = transcript.render_with_block_starts(width, mode);
+
+        assert_eq!(rows.len(), expected_rows.len(), "row counts must match");
+        // starts has one sentinel past the end
+        assert_eq!(starts.len(), transcript.len() + 1);
+    }
+
+    #[test]
+    fn block_starts_sentinel_equals_total_row_count() {
+        let mut transcript = Transcript::new();
+        transcript.push(user("a"));
+        transcript.push(Block::Assistant { text: "b".to_string(), complete: true });
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        assert_eq!(*starts.last().unwrap(), rows.len());
+    }
+
+    #[test]
+    fn block_starts_are_strictly_increasing_for_non_empty_blocks() {
+        let mut transcript = Transcript::new();
+        for i in 0..5 {
+            transcript.push(Block::Notice {
+                text: format!("notice {i}"),
+                level: NoticeLevel::Info,
+            });
+        }
+        let (_, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        let content_starts: Vec<usize> = starts[..5].to_vec();
+        for window in content_starts.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "block starts must be strictly increasing: {content_starts:?}"
+            );
+        }
     }
 }
 

@@ -291,7 +291,7 @@ fn parse_tools_list(result: &Value) -> Vec<McpToolInfo> {
     arr.iter().filter_map(parse_one_tool).collect()
 }
 
-fn parse_one_tool(tool: &Value) -> Option<McpToolInfo> {
+pub(crate) fn parse_one_tool(tool: &Value) -> Option<McpToolInfo> {
     let name = tool.get("name").and_then(Value::as_str)?.to_string();
     if name.is_empty() {
         return None;
@@ -347,7 +347,7 @@ fn normalize_schema(tool: &Value) -> (String, bool) {
 
 /// Parses the `content` array of a `tools/call` result into plain text and
 /// error flag. Mirrors `McpToolInfo.FormatCallResult` from C#.
-fn format_call_result(result: &Value) -> (String, bool) {
+pub(crate) fn format_call_result(result: &Value) -> (String, bool) {
     let is_error = result
         .get("isError")
         .and_then(Value::as_bool)
@@ -381,7 +381,7 @@ fn format_call_result(result: &Value) -> (String, bool) {
     )
 }
 
-fn parse_resource_list(result: &Value) -> Vec<McpResourceInfo> {
+pub(crate) fn parse_resource_list(result: &Value) -> Vec<McpResourceInfo> {
     result
         .get("resources")
         .and_then(Value::as_array)
@@ -404,7 +404,7 @@ fn parse_resource_list(result: &Value) -> Vec<McpResourceInfo> {
         .unwrap_or_default()
 }
 
-fn parse_prompt_list(result: &Value) -> Vec<McpPromptInfo> {
+pub(crate) fn parse_prompt_list(result: &Value) -> Vec<McpPromptInfo> {
     result
         .get("prompts")
         .and_then(Value::as_array)

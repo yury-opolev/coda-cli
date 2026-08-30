@@ -3,9 +3,9 @@
 //!
 //! # Design
 //!
-//! Each server gets its own `McpClient` (and child process). The manager
-//! runs all connects concurrently; a server that fails to start is logged and
-//! skipped without blocking the others or crashing the session.
+//! Each server gets its own `McpClient` (stdio) or `McpHttpClient` (HTTP).
+//! The manager runs all connects concurrently; a server that fails to start
+//! is logged and skipped without blocking the others or crashing the session.
 //!
 //! Tools are namespaced `mcp__{server}__{tool}` to guarantee no collision
 //! with built-in names, and are returned as `Arc<dyn Tool>` ready for
@@ -26,19 +26,64 @@ use tokio::sync::RwLock;
 
 use coda_tool::Tool;
 
-use crate::client::{McpClient, McpToolCallError, DEFAULT_CONNECT_TIMEOUT};
-use crate::config::{self, McpConnectable};
+use crate::client::{McpClient, McpServerInfo, McpToolCallError, McpToolInfo, DEFAULT_CONNECT_TIMEOUT};
+use crate::config::{self, McpConnectable, McpHttpConnectable};
 use crate::error::{McpConnectError, McpError};
+use crate::http_client::{McpHttpClient, DEFAULT_HTTP_CONNECT_TIMEOUT};
 use crate::process::McpProcess;
 use crate::tool::McpTool;
 
 /// Default shutdown grace period when the manager is dropped.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// Unified client handle: either a stdio or HTTP MCP client.
+enum AnyClient {
+    Stdio(McpClient),
+    Http(McpHttpClient),
+}
+
+impl AnyClient {
+    fn server_info(&self) -> &McpServerInfo {
+        match self {
+            Self::Stdio(c) => &c.server_info,
+            Self::Http(c) => &c.server_info,
+        }
+    }
+
+    fn tools(&self) -> &[McpToolInfo] {
+        match self {
+            Self::Stdio(c) => &c.tools,
+            Self::Http(c) => &c.tools,
+        }
+    }
+
+    async fn call_tool(
+        &self,
+        name: &str,
+        arguments: &serde_json::Value,
+    ) -> Result<(String, bool), McpToolCallError> {
+        match self {
+            Self::Stdio(c) => c.call_tool(name, arguments).await,
+            Self::Http(c) => c.call_tool(name, arguments).await.map_err(|e| {
+                // Map the HTTP-specific error string into a Transport variant so
+                // the manager's unified error path produces a good message.
+                McpToolCallError::Transport(crate::error::McpTransportError::Other(e))
+            }),
+        }
+    }
+
+    async fn shutdown(self) {
+        match self {
+            Self::Stdio(c) => c.shutdown().await,
+            Self::Http(c) => c.shutdown().await,
+        }
+    }
+}
+
 /// Per-server state held by the manager.
 struct ServerEntry {
-    client: McpClient,
-    /// Child process kept alive as long as the entry exists; drop kills it.
+    client: AnyClient,
+    /// Child process kept alive as long as the entry exists; `None` for HTTP.
     _process: Option<McpProcess>,
 }
 
@@ -56,7 +101,7 @@ impl McpClientManager {
         Self { servers: RwLock::new(HashMap::new()), tool_timeout: McpClient::resolve_tool_timeout() }
     }
 
-    /// Connect all enabled stdio servers from the given `.mcp.json` paths.
+    /// Connect all enabled stdio and HTTP servers from the given `.mcp.json` paths.
     ///
     /// Servers are connected concurrently. Failures are collected and returned
     /// alongside the successfully connected servers; each failure is already
@@ -70,7 +115,10 @@ impl McpClientManager {
         project_mcp: &Path,
     ) -> Vec<McpConnectError> {
         let connectable = config::load_connectable(user_mcp, project_mcp);
-        self.connect_many(connectable, None).await
+        let http_connectable = config::load_http_connectable(user_mcp, project_mcp);
+        let mut errors = self.connect_many(connectable, None).await;
+        errors.extend(self.connect_http_many(http_connectable, None).await);
+        errors
     }
 
     /// Connect all servers from a supplied list, optionally overriding the
@@ -83,41 +131,82 @@ impl McpClientManager {
         let connect_timeout = connect_timeout_override.unwrap_or(DEFAULT_CONNECT_TIMEOUT);
         let tool_timeout = self.tool_timeout;
 
-        // Launch all connects concurrently.
         let futures: Vec<_> = servers
             .into_iter()
             .map(|cfg| {
                 let name = cfg.name.clone();
                 async move {
-                    let result = connect_one(&cfg, connect_timeout, tool_timeout).await;
-                    (name, cfg, result)
+                    let result = connect_one_stdio(&cfg, connect_timeout, tool_timeout).await;
+                    (name, result)
                 }
             })
             .collect();
 
         let results = futures::future::join_all(futures).await;
-
         let mut errors = Vec::new();
         let mut guard = self.servers.write().await;
 
-        for (name, _cfg, result) in results {
+        for (name, result) in results {
             match result {
                 Ok(entry) => {
                     tracing::info!(
                         server = %name,
-                        server_info = %entry.client.server_info.name,
-                        tools = entry.client.tools.len(),
-                        "MCP server connected"
+                        server_info = %entry.client.server_info().name,
+                        tools = entry.client.tools().len(),
+                        "MCP stdio server connected"
                     );
                     guard.insert(name, entry);
                 }
                 Err(error) => {
-                    tracing::warn!(server = %name, %error, "MCP server failed to start");
+                    tracing::warn!(server = %name, %error, "MCP stdio server failed to start");
                     errors.push(McpConnectError { server_name: name, error });
                 }
             }
         }
+        errors
+    }
 
+    /// Connect HTTP servers from a supplied list.
+    pub async fn connect_http_many(
+        &self,
+        servers: Vec<McpHttpConnectable>,
+        connect_timeout_override: Option<Duration>,
+    ) -> Vec<McpConnectError> {
+        let connect_timeout = connect_timeout_override.unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT);
+        let tool_timeout = self.tool_timeout;
+
+        let futures: Vec<_> = servers
+            .into_iter()
+            .map(|cfg| {
+                let name = cfg.name.clone();
+                async move {
+                    let result = connect_one_http(&cfg, connect_timeout, tool_timeout).await;
+                    (name, result)
+                }
+            })
+            .collect();
+
+        let results = futures::future::join_all(futures).await;
+        let mut errors = Vec::new();
+        let mut guard = self.servers.write().await;
+
+        for (name, result) in results {
+            match result {
+                Ok(entry) => {
+                    tracing::info!(
+                        server = %name,
+                        server_info = %entry.client.server_info().name,
+                        tools = entry.client.tools().len(),
+                        "MCP HTTP server connected"
+                    );
+                    guard.insert(name, entry);
+                }
+                Err(error) => {
+                    tracing::warn!(server = %name, %error, "MCP HTTP server failed to start");
+                    errors.push(McpConnectError { server_name: name, error });
+                }
+            }
+        }
         errors
     }
 
@@ -130,7 +219,7 @@ impl McpClientManager {
         guard
             .iter()
             .flat_map(|(server_name, entry)| {
-                entry.client.tools.iter().map(|info| {
+                entry.client.tools().iter().map(|info| {
                     let tool: Arc<dyn Tool> = Arc::new(McpTool::new(
                         server_name.clone(),
                         info.clone(),
@@ -199,14 +288,31 @@ impl Default for McpClientManager {
     }
 }
 
-async fn connect_one(
+async fn connect_one_stdio(
     config: &McpConnectable,
     connect_timeout: Duration,
     tool_timeout: Duration,
 ) -> Result<ServerEntry, McpError> {
     let (proc, stdin, stdout) = McpProcess::spawn(config)?;
     let client = McpClient::connect(stdout, stdin, connect_timeout, tool_timeout).await?;
-    Ok(ServerEntry { client, _process: Some(proc) })
+    Ok(ServerEntry { client: AnyClient::Stdio(client), _process: Some(proc) })
+}
+
+async fn connect_one_http(
+    config: &McpHttpConnectable,
+    connect_timeout: Duration,
+    tool_timeout: Duration,
+) -> Result<ServerEntry, McpError> {
+    let client = McpHttpClient::connect(
+        &config.name,
+        &config.url,
+        &config.headers,
+        None, // auth provider would be injected by the caller in a future PR
+        connect_timeout,
+        tool_timeout,
+    )
+    .await?;
+    Ok(ServerEntry { client: AnyClient::Http(client), _process: None })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -230,7 +336,10 @@ mod tests {
         client: McpClient,
     ) {
         let mut guard = manager.servers.write().await;
-        guard.insert(server_name.to_string(), ServerEntry { client, _process: None });
+        guard.insert(
+            server_name.to_string(),
+            ServerEntry { client: AnyClient::Stdio(client), _process: None },
+        );
     }
 
     /// Builds a minimal McpClient from in-memory streams with the given tools.

@@ -23,3 +23,7 @@ uuid = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
 directories = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tempfile = "3"

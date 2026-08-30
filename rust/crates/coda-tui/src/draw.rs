@@ -175,6 +175,23 @@ pub fn draw(
     theme: &Theme,
     browser: Option<&Browser>,
 ) {
+    draw_with_pin(frame, state, composer, viewport, rows, theme, browser, None);
+}
+
+/// Draws the whole screen, optionally showing a pin row at the top of the
+/// transcript when the active user prompt has scrolled out of view.
+///
+/// The `pin_text` is pre-composed by `App` so that draw logic stays pure.
+pub fn draw_with_pin(
+    frame: &mut Frame,
+    state: &UiState,
+    composer: &Composer,
+    viewport: &Viewport,
+    rows: &[RenderLine],
+    theme: &Theme,
+    browser: Option<&Browser>,
+    pin_text: Option<&str>,
+) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(theme.surface()),
@@ -183,7 +200,7 @@ pub fn draw(
 
     let regions = layout(area, composer.line_count(), viewport.is_scrollable());
 
-    draw_transcript(frame, regions.transcript, viewport, rows, theme);
+    draw_transcript_with_pin(frame, regions.transcript, viewport, rows, theme, pin_text);
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
     }
@@ -200,22 +217,58 @@ pub fn draw(
     }
 }
 
-fn draw_transcript(
+fn draw_transcript_with_pin(
+    frame: &mut Frame,
+    area: Rect,
+    viewport: &Viewport,
+    rows: &[RenderLine],
+    theme: &Theme,
+    pin_text: Option<&str>,
+) {
+    let width = area.width as usize;
+
+    // When a pin is active, it occupies the top row of the transcript area and
+    // the remaining rows show one fewer scroll line.
+    let (pin_area, content_area) = if pin_text.is_some() && area.height > 1 {
+        let top = Rect::new(area.x, area.y, area.width, 1);
+        let rest = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+        (Some(top), rest)
+    } else {
+        (None, area)
+    };
+
+    // Draw the pin row.
+    if let (Some(pin_area), Some(text)) = (pin_area, pin_text) {
+        let style = theme.style(Role::User);
+        let line = Line::from(Span::styled(text.to_string(), style));
+        frame.render_widget(Paragraph::new(vec![line]), pin_area);
+    }
+
+    // Draw the transcript rows.
+    let content_height = content_area.height as usize;
+    let visible = viewport.visible_range();
+    // Clamp to what the content area can show.
+    let take = visible.len().min(content_height);
+    let lines: Vec<Line> = rows
+        .get(visible.clone())
+        .unwrap_or(&[])
+        .iter()
+        .take(take)
+        .map(|row| to_line(row, theme, width))
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines).style(theme.surface()), content_area);
+}
+
+/// `draw_transcript` kept for tests that call it directly.
+pub fn draw_transcript(
     frame: &mut Frame,
     area: Rect,
     viewport: &Viewport,
     rows: &[RenderLine],
     theme: &Theme,
 ) {
-    let width = area.width as usize;
-    let lines: Vec<Line> = rows
-        .get(viewport.visible_range())
-        .unwrap_or(&[])
-        .iter()
-        .map(|row| to_line(row, theme, width))
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines).style(theme.surface()), area);
+    draw_transcript_with_pin(frame, area, viewport, rows, theme, None);
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Theme) {

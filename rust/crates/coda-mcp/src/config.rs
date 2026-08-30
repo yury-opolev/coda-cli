@@ -77,6 +77,17 @@ pub struct McpConnectable {
     pub env: HashMap<String, String>,
 }
 
+/// An enabled HTTP MCP server that the manager can connect to.
+#[derive(Debug, Clone)]
+pub struct McpHttpConnectable {
+    pub name: String,
+    pub url: String,
+    /// Static headers sent on every request.
+    pub headers: HashMap<String, String>,
+    /// Authentication configuration.
+    pub auth: crate::auth::types::McpAuthConfig,
+}
+
 // ── Public API ────────────────────────────────────────────────────────────────
 
 /// Load all servers from both files, project shadowing user, including
@@ -113,6 +124,140 @@ pub fn load_connectable(user_mcp: &Path, project_mcp: &Path) -> Vec<McpConnectab
             })
         })
         .collect()
+}
+
+/// Load only enabled HTTP servers, project shadowing user.
+///
+/// Used by `McpClientManager` to connect HTTP MCP servers at startup.
+pub fn load_http_connectable(user_mcp: &Path, project_mcp: &Path) -> Vec<McpHttpConnectable> {
+    load_http_all(user_mcp, project_mcp)
+        .into_iter()
+        .filter(|s| !s.disabled)
+        .map(|s| McpHttpConnectable {
+            name: s.name,
+            url: s.url,
+            headers: s.headers,
+            auth: s.auth,
+        })
+        .collect()
+}
+
+// ── Internal HTTP server storage ──────────────────────────────────────────────
+
+/// All HTTP server definitions, including disabled ones (for /mcp list).
+fn load_http_all(user_mcp: &Path, project_mcp: &Path) -> Vec<RawHttpEntry> {
+    let user = load_http_file(user_mcp);
+    let project = load_http_file(project_mcp);
+
+    let mut result: Vec<RawHttpEntry> = user
+        .into_iter()
+        .filter(|u| !project.iter().any(|p| p.name == u.name))
+        .collect();
+    result.extend(project);
+    result
+}
+
+/// A parsed HTTP server entry (internal to config loading).
+struct RawHttpEntry {
+    name: String,
+    url: String,
+    headers: HashMap<String, String>,
+    auth: crate::auth::types::McpAuthConfig,
+    disabled: bool,
+}
+
+fn load_http_file(path: &Path) -> Vec<RawHttpEntry> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let doc: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let servers = match doc.get("mcpServers").and_then(Value::as_object) {
+        Some(s) => s,
+        None => return Vec::new(),
+    };
+    servers
+        .iter()
+        .filter_map(|(name, def)| parse_http_entry(name, def))
+        .collect()
+}
+
+fn parse_http_entry(name: &str, def: &Value) -> Option<RawHttpEntry> {
+    let type_ = def.get("type").and_then(Value::as_str);
+    let is_http = matches!(type_, Some("http") | Some("streamable-http"));
+    // Also accept URL-only entries with no command as HTTP.
+    let has_command = def.get("command").is_some();
+    let has_url = def.get("url").is_some();
+    if !is_http && (has_command || !has_url) {
+        return None;
+    }
+
+    let url = def.get("url").and_then(Value::as_str)?.to_owned();
+    let disabled_flag = def.get("disabled").and_then(Value::as_bool).unwrap_or(false);
+    let enabled_flag = def.get("enabled").and_then(Value::as_bool).unwrap_or(true);
+    let disabled = disabled_flag || !enabled_flag;
+
+    Some(RawHttpEntry {
+        name: name.to_owned(),
+        url,
+        headers: string_map(def, "headers"),
+        auth: parse_auth_config(def),
+        disabled,
+    })
+}
+
+impl From<RawHttpEntry> for McpHttpConnectable {
+    fn from(e: RawHttpEntry) -> Self {
+        McpHttpConnectable { name: e.name, url: e.url, headers: e.headers, auth: e.auth }
+    }
+}
+
+/// Parse the `auth` block of an HTTP server entry.
+pub(crate) fn parse_auth_config(def: &Value) -> crate::auth::types::McpAuthConfig {
+    use crate::auth::types::{McpAuthConfig, McpAuthMode};
+    use coda_auth::secret::Secret;
+
+    let Some(auth) = def.get("auth") else {
+        return McpAuthConfig::oauth_default();
+    };
+    if !auth.is_object() {
+        return McpAuthConfig::oauth_default();
+    }
+
+    let mode = auth.get("mode").and_then(Value::as_str);
+    let parsed_mode = match mode.map(|m| m.to_ascii_lowercase()).as_deref() {
+        Some("none") => McpAuthMode::None,
+        Some("bearer") => McpAuthMode::Bearer,
+        _ => McpAuthMode::OAuth,
+    };
+
+    let client_id = auth
+        .get("clientId")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+
+    let scopes = auth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let bearer_token = auth
+        .get("token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(|s| Secret::new(s.to_owned()));
+
+    McpAuthConfig { mode: parsed_mode, client_id, scopes, bearer_token }
 }
 
 /// Resolve the standard `.mcp.json` paths from a project root.

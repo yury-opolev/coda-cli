@@ -164,6 +164,22 @@ pub struct CompactParams {
     pub instructions: Option<String>,
 }
 
+/// `session/rewind` — remove the last `n` user exchanges from history.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct RewindParams {
+    /// Number of exchanges to remove.  Defaults to 1 when absent or 0.
+    #[serde(default)]
+    pub n: Option<u32>,
+}
+
+/// `session/fork` — clone the current session into a new id.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkParams {
+    // No additional parameters needed; reserved for future use.
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ServeBackend trait — one method per protocol operation
 // ─────────────────────────────────────────────────────────────────────────────
@@ -198,6 +214,8 @@ pub trait ServeBackend: Send + Sync {
     async fn skills_list(&self) -> Result<Value, RpcError>;
     async fn plugins_list(&self) -> Result<Value, RpcError>;
     async fn session_compact(&self, p: CompactParams) -> Result<Value, RpcError>;
+    async fn session_fork(&self, p: ForkParams) -> Result<Value, RpcError>;
+    async fn session_rewind(&self, p: RewindParams) -> Result<Value, RpcError>;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -251,6 +269,8 @@ pub async fn dispatch(
         }
         "plugins/list" => backend.plugins_list().await,
         "session/compact" => backend.session_compact(optional(params)).await,
+        "session/fork" => backend.session_fork(optional(params)).await,
+        "session/rewind" => backend.session_rewind(optional(params)).await,
         _ => Err(RpcError::method_not_found(method)),
     }
 }
@@ -350,6 +370,12 @@ mod tests {
         }
         async fn session_compact(&self, _p: CompactParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true, "messagesBefore": 4, "messagesAfter": 2 }))
+        }
+        async fn session_fork(&self, _p: ForkParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "newSessionId": "forked0000000" }))
+        }
+        async fn session_rewind(&self, _p: RewindParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true, "removed": 1, "remaining": 2 }))
         }
     }
 
@@ -675,6 +701,12 @@ mod tests {
         async fn session_compact(&self, _p: CompactParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
+        async fn session_fork(&self, _p: ForkParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn session_rewind(&self, _p: RewindParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
     }
 
     #[tokio::test]
@@ -723,6 +755,34 @@ mod tests {
     #[tokio::test]
     async fn session_compact_empty_params_object_is_ok() {
         let r = dispatch("session/compact", Some(json!({})), &FakeBackend).await.unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    // ── session/fork + session/rewind dispatch tests ─────────────────────────
+
+    #[tokio::test]
+    async fn dispatches_session_fork() {
+        let r = dispatch("session/fork", None, &FakeBackend).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r["newSessionId"].is_string());
+    }
+
+    #[tokio::test]
+    async fn dispatches_session_fork_with_empty_params() {
+        let r = dispatch("session/fork", Some(json!({})), &FakeBackend).await.unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn dispatches_session_rewind_defaults() {
+        let r = dispatch("session/rewind", None, &FakeBackend).await.unwrap();
+        assert_eq!(r["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn dispatches_session_rewind_with_n() {
+        let r =
+            dispatch("session/rewind", Some(json!({"n": 3})), &FakeBackend).await.unwrap();
         assert_eq!(r["ok"], true);
     }
 }

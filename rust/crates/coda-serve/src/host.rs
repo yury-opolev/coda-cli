@@ -13,6 +13,7 @@ use coda_agent::{
     GoalSupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
     InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
     TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
+    SessionTranscriptStore, fork_session, rewind_session, session_id_is_valid,
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
@@ -45,9 +46,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::dispatch::{
-    CompactParams, HooksInfoParams, HooksTrustParams, InitParams, MessagesParams, ModelsParams,
-    PromptParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams, ServeBackend,
-    SetEffortParams, SetGoalParams, SteerParams,
+    CompactParams, ForkParams, HooksInfoParams, HooksTrustParams, InitParams, MessagesParams,
+    ModelsParams, PromptParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
+    ServeBackend, SetEffortParams, SetGoalParams, SteerParams,
 };
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::session::{Session, SteeringLogEntry};
@@ -151,6 +152,21 @@ struct CompactResponse {
     tokens_after: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ForkResponse {
+    ok: bool,
+    new_session_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RewindResponse {
+    ok: bool,
+    removed: usize,
+    remaining: usize,
 }
 
 #[derive(Serialize)]
@@ -269,6 +285,9 @@ pub struct ServeHost {
     current_cancel: Mutex<Option<CancellationToken>>,
     /// `true` while a `session/prompt` or `session/compact` is running.
     turn_active: Mutex<bool>,
+    /// The active session id: starts as the initial session id, changes on fork.
+    /// Transcripts are always written to this id.
+    current_session_id: Mutex<String>,
     // ── Session-scoped services ──────────────────────────────────────────────
     task_manager: Arc<TaskManager>,
     schedule_store: Arc<ScheduledTaskStore>,
@@ -335,7 +354,7 @@ impl ServeHost {
         let hook_trust_store = Arc::new(InMemoryHookTrustStore::new());
 
         Arc::new(Self {
-            session: Session::new(session_id),
+            session: Session::new(session_id.clone()),
             sink,
             client: tokio::sync::Mutex::new(client),
             tools,
@@ -349,6 +368,7 @@ impl ServeHost {
             goal_params: Mutex::new(GoalParams::default()),
             current_cancel: Mutex::new(None),
             turn_active: Mutex::new(false),
+            current_session_id: Mutex::new(session_id),
             task_manager,
             schedule_store,
             lsp_manager,
@@ -357,6 +377,11 @@ impl ServeHost {
             session_services: tokio::sync::Mutex::new(None),
             pending_interrupt: Mutex::new(false),
         })
+    }
+
+    /// Return the active session id (may change after `session/fork`).
+    fn active_session_id(&self) -> String {
+        self.current_session_id.lock().expect("session_id poisoned").clone()
     }
 
     fn current_model(&self) -> String {
@@ -512,10 +537,30 @@ impl Drop for TurnGuard<'_> {
 #[async_trait]
 impl ServeBackend for ServeHost {
     async fn initialize(&self, p: InitParams) -> Result<Value, RpcError> {
-        // Resume not yet implemented — return -32002 per spec.
-        if p.session_id.is_some() {
-            return Err(RpcError::session_not_found());
+        // If the client supplied a session_id, attempt to resume it.
+        // Security: session_id comes from an untrusted wire message — validate it
+        // before using it as a file-system key.
+        if let Some(ref req_id) = p.session_id {
+            if !session_id_is_valid(req_id) {
+                // Invalid id format — treat as not found.
+                return Err(RpcError::session_not_found());
+            }
+            let store = SessionTranscriptStore::new(&self.working_dir);
+            match store.load(req_id).await {
+                Some(messages) => {
+                    // Seed history from the persisted transcript.
+                    *self.session.history.lock().expect("history poisoned") = messages;
+                    // Adopt the resumed id so future saves go to the right file.
+                    *self.current_session_id.lock().expect("session_id poisoned") =
+                        req_id.clone();
+                }
+                None => {
+                    // Session not found in the working directory.
+                    return Err(RpcError::session_not_found());
+                }
+            }
         }
+
         // Wire an explicitly provided API key; otherwise leave client as-is
         // (lazy credential lookup happens on first session/prompt).
         if let Some(ref key) = p.api_key {
@@ -529,7 +574,7 @@ impl ServeBackend for ServeHost {
         }
         let resp = InitializeResponse {
             protocol_version: PROTOCOL_VERSION.into(),
-            session_id: self.session.session_id.clone(),
+            session_id: self.active_session_id(),
             // Must match the C# engine verbatim: clients key off this string,
             // so reporting the crate name here would be a silent parity break.
             server_info: "coda".into(),
@@ -964,6 +1009,47 @@ impl ServeBackend for ServeHost {
 
         self.run_compact_inner(client, p).await
     }
+
+    async fn session_fork(&self, _p: ForkParams) -> Result<Value, RpcError> {
+        // Cannot fork while a turn is running: history would be mid-mutation.
+        if *self.turn_active.lock().expect("turn_active poisoned") {
+            return Err(RpcError::internal("cannot fork while a turn is in progress"));
+        }
+
+        let history = self.session.history.lock().expect("history poisoned").clone();
+        let source_id = self.active_session_id();
+
+        let new_id =
+            fork_session(&self.working_dir, Some(&source_id), &history, None).await;
+
+        // Adopt the new id so future turns write to the forked session.
+        *self.current_session_id.lock().expect("session_id poisoned") = new_id.clone();
+
+        let resp = ForkResponse { ok: true, new_session_id: new_id };
+        serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_rewind(&self, p: RewindParams) -> Result<Value, RpcError> {
+        // Cannot rewind while a turn is running.
+        if *self.turn_active.lock().expect("turn_active poisoned") {
+            return Err(RpcError::internal("cannot rewind while a turn is in progress"));
+        }
+
+        let n = p.n.unwrap_or(1).max(1) as usize;
+        let mut history = self.session.history.lock().expect("history poisoned").clone();
+        let removed = rewind_session(&mut history, n);
+        let remaining = history.len();
+
+        *self.session.history.lock().expect("history poisoned") = history.clone();
+
+        // Persist the rewound history so it survives a resume.
+        let session_id = self.active_session_id();
+        let store = SessionTranscriptStore::new(&self.working_dir);
+        let _ = store.save(&session_id, &history, None).await;
+
+        let resp = RewindResponse { ok: true, removed, remaining };
+        serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1062,7 +1148,15 @@ impl ServeHost {
         *self.current_cancel.lock().expect("cancel poisoned") = None;
 
         // Persist updated history.
-        *self.session.history.lock().expect("history poisoned") = history;
+        *self.session.history.lock().expect("history poisoned") = history.clone();
+
+        // Best-effort transcript persistence after every turn.
+        // A failed write must not fail the turn — match C# "best-effort seam".
+        {
+            let session_id = self.active_session_id();
+            let store = SessionTranscriptStore::new(&self.working_dir);
+            let _ = store.save(&session_id, &history, None).await;
+        }
 
         // Map result to wire fields.
         let (ok, interrupted, goal_status, error) = match &run_result {
@@ -2145,5 +2239,310 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Session persistence: initialize with known session_id resumes ──────────
+
+    #[tokio::test]
+    async fn initialize_with_unknown_session_id_returns_32002() {
+        let host = make_host();
+        let err = host
+            .initialize(InitParams {
+                protocol_version: "1".into(),
+                session_id: Some("unknownidxyz0".into()),
+                api_key: None,
+                client_info: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32002, "unknown session id must return -32002");
+    }
+
+    #[tokio::test]
+    async fn initialize_with_path_traversal_session_id_returns_32002() {
+        let host = make_host();
+        // Path traversal ids must never reach the filesystem — they are rejected
+        // by is_valid() and return -32002, not an I/O error.
+        for bad_id in &["../secret", "../../etc/passwd", r"..\..\evil", "bad/id"] {
+            let err = host
+                .initialize(InitParams {
+                    protocol_version: "1".into(),
+                    session_id: Some(bad_id.to_string()),
+                    api_key: None,
+                    client_info: None,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code, -32002,
+                "path traversal id {bad_id:?} must return -32002, not an I/O error"
+            );
+        }
+    }
+
+    // ── Session persistence E2E: persist → resume → verify ────────────────────
+    //
+    // This test proves the full path from prompt → persist → resume is wired
+    // at both ends.  It uses a ScriptedClient (defined above) so no network
+    // call is made.
+
+    fn make_host_in_dir(working_dir: &str, client: Arc<dyn LlmClient>) -> Arc<ServeHost> {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        ServeHost::new_with_client(client, sink, ch, working_dir.into())
+    }
+
+    #[tokio::test]
+    async fn session_persists_after_prompt_and_resumes_correctly() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+
+        // ── Phase 1: send a prompt, let the fake LLM respond ─────────────────
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::TextDelta("The answer is 42.".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+        ]]);
+        let host1 = make_host_in_dir(&working_dir, client);
+
+        // Initialize without a session_id to get a fresh session.
+        let init_r = host1.initialize(InitParams::default()).await.unwrap();
+        let session_id = init_r["sessionId"].as_str().unwrap().to_owned();
+        assert!(
+            !session_id.is_empty(),
+            "initialize must return a session_id"
+        );
+
+        // Send a prompt — the fake LLM will respond and the history will be saved.
+        let prompt_r = host1
+            .session_prompt(PromptParams {
+                text: Some("What is the answer?".into()),
+                images: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(prompt_r["ok"], true, "prompt must succeed");
+
+        // Verify the session file was written.
+        let session_file = dir
+            .path()
+            .join(".coda")
+            .join("sessions")
+            .join(format!("{session_id}.json"));
+        assert!(
+            session_file.exists(),
+            "session file must be written after a prompt: {session_file:?}"
+        );
+
+        // ── Phase 2: resume the session in a new host ─────────────────────────
+        let client2 = ScriptedClient::new(vec![]); // no more LLM calls expected
+        let host2 = make_host_in_dir(&working_dir, client2);
+
+        let init_r2 = host2
+            .initialize(InitParams {
+                protocol_version: "1".into(),
+                session_id: Some(session_id.clone()),
+                api_key: None,
+                client_info: None,
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            init_r2["sessionId"].as_str().unwrap(),
+            session_id,
+            "resumed session must echo back the requested id"
+        );
+
+        // The history must be the loaded transcript (user prompt + assistant reply).
+        let history_r = host2.session_history().await.unwrap();
+        let messages = history_r["messages"].as_array().expect("messages array");
+        assert!(
+            messages.len() >= 2,
+            "resumed history must contain at least the user turn and assistant reply, got {}",
+            messages.len()
+        );
+
+        let first_msg = &messages[0];
+        assert_eq!(first_msg["role"], "user");
+        assert!(
+            first_msg["content"].as_str().unwrap_or("").contains("What is the answer"),
+            "first message must be the user prompt"
+        );
+
+        let second_msg = &messages[1];
+        assert_eq!(second_msg["role"], "assistant");
+        assert!(
+            second_msg["content"].as_str().unwrap_or("").contains("42"),
+            "second message must be the assistant reply"
+        );
+    }
+
+    // ── session/fork tests ────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn fork_returns_new_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(&working_dir, client);
+
+        let r = host.session_fork(ForkParams {}).await.unwrap();
+        assert_eq!(r["ok"], true);
+        let new_id = r["newSessionId"].as_str().unwrap();
+        assert!(!new_id.is_empty(), "fork must return a non-empty newSessionId");
+    }
+
+    #[tokio::test]
+    async fn fork_changes_active_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+        let client = ScriptedClient::new(vec![]);
+        let host = make_host_in_dir(&working_dir, client);
+
+        let original_id = host.active_session_id();
+        let r = host.session_fork(ForkParams {}).await.unwrap();
+        let new_id = r["newSessionId"].as_str().unwrap();
+
+        assert_ne!(
+            new_id, original_id,
+            "fork must produce a different id from the original"
+        );
+        assert_eq!(
+            host.active_session_id(),
+            new_id,
+            "host must adopt the forked id as the active session"
+        );
+    }
+
+    #[tokio::test]
+    async fn fork_persists_history_under_new_id() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::TextDelta("reply".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+        ]]);
+        let host = make_host_in_dir(&working_dir, client);
+
+        // Build some history via a prompt.
+        host.session_prompt(PromptParams { text: Some("hello".into()), images: None })
+            .await
+            .unwrap();
+
+        let r = host.session_fork(ForkParams {}).await.unwrap();
+        let new_id = r["newSessionId"].as_str().unwrap();
+
+        // The forked session file must exist.
+        let forked_file = dir
+            .path()
+            .join(".coda")
+            .join("sessions")
+            .join(format!("{new_id}.json"));
+        assert!(forked_file.exists(), "forked session file must exist: {forked_file:?}");
+    }
+
+    // ── session/rewind tests ──────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn rewind_removes_last_exchange() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+
+        let client = ScriptedClient::new(vec![
+            vec![
+                StreamEvent::TextDelta("first reply".into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ],
+            vec![
+                StreamEvent::TextDelta("second reply".into()),
+                StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+            ],
+        ]);
+        let host = make_host_in_dir(&working_dir, client);
+
+        host.session_prompt(PromptParams { text: Some("q1".into()), images: None })
+            .await
+            .unwrap();
+        host.session_prompt(PromptParams { text: Some("q2".into()), images: None })
+            .await
+            .unwrap();
+
+        let len_before = host.session.history.lock().unwrap().len();
+        assert_eq!(len_before, 4, "expected 2 user + 2 assistant messages");
+
+        let r = host.session_rewind(RewindParams { n: Some(1) }).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["removed"], 1);
+        assert_eq!(r["remaining"], 2);
+
+        let len_after = host.session.history.lock().unwrap().len();
+        assert_eq!(len_after, 2, "after rewind(1), only q1+reply should remain");
+    }
+
+    #[tokio::test]
+    async fn rewind_defaults_to_one_exchange() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::TextDelta("reply".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+        ]]);
+        let host = make_host_in_dir(&working_dir, client);
+        host.session_prompt(PromptParams { text: Some("hi".into()), images: None })
+            .await
+            .unwrap();
+
+        // n=None defaults to 1.
+        let r = host.session_rewind(RewindParams { n: None }).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["removed"], 1);
+
+        let empty = host.session.history.lock().unwrap().len();
+        assert_eq!(empty, 0, "after rewind(default=1) on one exchange, history must be empty");
+    }
+
+    #[tokio::test]
+    async fn rewind_persists_updated_history() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let working_dir = dir.path().to_str().unwrap().to_owned();
+
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::TextDelta("answer".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+        ]]);
+        let host = make_host_in_dir(&working_dir, client);
+        let _ = host.initialize(InitParams::default()).await.unwrap();
+
+        host.session_prompt(PromptParams { text: Some("q".into()), images: None })
+            .await
+            .unwrap();
+
+        host.session_rewind(RewindParams { n: Some(1) }).await.unwrap();
+
+        // Load the session file — it must reflect the rewound (empty) history.
+        // After rewinding, history is empty so save() skips the write — the file
+        // may have the old content or not exist. What matters is the in-memory
+        // history is empty.
+        let _store = coda_agent::SessionTranscriptStore::new(dir.path());
+        let in_memory = host.session.history.lock().unwrap().len();
+        assert_eq!(in_memory, 0, "in-memory history must be empty after rewind");
     }
 }

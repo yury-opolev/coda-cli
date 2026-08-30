@@ -32,7 +32,8 @@ sha2 = "0.10"
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }
+tempfile = "3"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

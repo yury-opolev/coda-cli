@@ -29,12 +29,16 @@ use crate::overlay::{Browser, Intent};
 use crate::state::{PendingPrompt, UiEvent, UiState};
 use crate::terminal::TerminalGuard;
 use crate::transcript::NoticeLevel;
-use crate::viewport::Viewport;
+use crate::viewport::{Viewport, ViewportAnchor};
 
 /// How long a turn may take before we stop waiting on shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Rows scrolled per mouse wheel notch.
 const WHEEL_ROWS: usize = 3;
+/// Minimum interval between streaming (non-critical) frames — 30 FPS.
+///
+/// Matches C# `UiActor.MinStreamingFrameIntervalMs = 33`.
+const MIN_STREAMING_FRAME_MS: u64 = 33;
 
 /// Outcome of an in-flight `session/prompt`.
 struct TurnOutcome {
@@ -50,9 +54,27 @@ pub struct App {
     connection: Connection,
     /// Cached rendered rows, invalidated whenever state or width changes.
     rows: Vec<RenderLine>,
+    /// Per-block start-row table, parallel to `state.transcript.blocks()`.
+    ///
+    /// `block_starts[i]` is the index into `rows` where block `i` begins.  A
+    /// sentinel entry equal to `rows.len()` is appended.  Rebuilt together
+    /// with `rows` whenever the layout is invalidated.
+    block_starts: Vec<usize>,
     /// Width the cached rows were laid out for.
     laid_out_width: usize,
     dirty: bool,
+    /// Set when a critical event arrived since the last frame.  Critical frames
+    /// are not throttled.  Matches C# `UiActor.IsCritical`.
+    critical_dirty: bool,
+    /// When `Some`, a non-critical frame is deferred until this instant.
+    frame_deadline: Option<tokio::time::Instant>,
+    /// When the most recent frame was drawn (wall-clock monotonic).
+    last_frame_at: Option<std::time::Instant>,
+    /// Stable position anchor captured when the viewport detaches.
+    ///
+    /// Resolved to a new global row on every reflow (width change) so the
+    /// user's reading position stays stable while the model is typing.
+    detached_anchor: Option<ViewportAnchor>,
     /// Set while a `session/prompt` is outstanding.
     turn: Option<oneshot::Receiver<Result<Value, coda_proto::ResponseError>>>,
     /// The responder for a prompt the user has not answered yet.
@@ -121,8 +143,13 @@ impl App {
             theme,
             connection,
             rows: Vec::new(),
+            block_starts: Vec::new(),
             laid_out_width: 0,
             dirty: true,
+            critical_dirty: false,
+            frame_deadline: None,
+            last_frame_at: None,
+            detached_anchor: None,
             turn: None,
             pending_responder: None,
             armed: None,
@@ -151,9 +178,18 @@ impl App {
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
 
         self.load_models().await;
+        // Show the setup wizard welcome on first run.
+        self.check_first_run();
         self.redraw(guard)?;
 
         loop {
+            // Compute the frame deadline for the timer branch.  When no
+            // deferred frame is pending, a far-future deadline is used so the
+            // branch competes but never wins before being explicitly armed.
+            let frame_deadline = self.frame_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_secs(86400)
+            });
+
             tokio::select! {
                 // Engine notifications and server-initiated requests.
                 message = inbound.recv() => match message {
@@ -192,6 +228,12 @@ impl App {
                         .and_then(|r| r.map_err(ClientError::Rpc));
                     let _ = turn_tx.send(TurnOutcome { result: outcome });
                 }
+
+                // A deferred streaming frame is due.
+                _ = tokio::time::sleep_until(frame_deadline), if self.frame_deadline.is_some() => {
+                    self.frame_deadline = None;
+                    // Fall through to the redraw logic below.
+                }
             }
 
             // A restart stages a new engine; swap it in between iterations so
@@ -207,9 +249,7 @@ impl App {
             if self.state.should_quit {
                 break;
             }
-            if self.dirty {
-                self.redraw(guard)?;
-            }
+            self.maybe_redraw(guard)?;
         }
 
         if let Some(engine) = owned_engine {
@@ -356,6 +396,7 @@ impl App {
             }
             TerminalEvent::Mouse(mouse) => match mouse.kind {
                 MouseEventKind::ScrollUp => {
+                    self.capture_anchor_if_following();
                     self.viewport.scroll_up(WHEEL_ROWS);
                     self.dirty = true;
                 }
@@ -457,12 +498,24 @@ impl App {
             }
             Action::CompletionCancel => self.composer.clear_completions(),
 
-            Action::ScrollUp => self.viewport.scroll_up(1),
+            Action::ScrollUp => {
+                self.capture_anchor_if_following();
+                self.viewport.scroll_up(1);
+            }
             Action::ScrollDown => self.viewport.scroll_down(1),
-            Action::PageUp => self.viewport.page_up(),
+            Action::PageUp => {
+                self.capture_anchor_if_following();
+                self.viewport.page_up();
+            }
             Action::PageDown => self.viewport.page_down(),
-            Action::ScrollTop => self.viewport.scroll_to_top(),
-            Action::ScrollBottom => self.viewport.scroll_to_bottom(),
+            Action::ScrollTop => {
+                self.capture_anchor_if_following();
+                self.viewport.scroll_to_top();
+            }
+            Action::ScrollBottom => {
+                self.detached_anchor = None;
+                self.viewport.scroll_to_bottom();
+            }
 
             Action::Interrupt => {
                 self.armed = None;
@@ -492,7 +545,8 @@ impl App {
                 }
             }
             Action::ClearTranscript => self.apply(UiEvent::Cleared),
-            Action::Copy | Action::Paste | Action::Confirm | Action::None => self.dirty = false,
+            Action::Copy => self.copy_to_clipboard(),
+            Action::Paste | Action::Confirm | Action::None => self.dirty = false,
         }
     }
 
@@ -1132,6 +1186,7 @@ impl App {
             "export" => self.cmd_export(&invocation).await,
             "diff" => self.cmd_diff().await,
             "image" => self.cmd_image(&invocation).await,
+            "setup" => self.cmd_setup(),
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),
@@ -1342,9 +1397,13 @@ impl App {
     }
 
     fn apply(&mut self, event: UiEvent) {
+        if is_critical_event(&event) {
+            self.critical_dirty = true;
+        } else {
+            self.dirty = true;
+        }
         self.state.apply(event);
         self.laid_out_width = 0;
-        self.dirty = true;
     }
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
@@ -1358,6 +1417,46 @@ impl App {
         self.apply(UiEvent::CommandOutput { text: text.into() });
     }
 
+    /// Redraws immediately if warranted, or schedules a deferred frame.
+    ///
+    /// Critical events bypass the 30 FPS throttle (C# `UiActor.IsCritical`).
+    /// Streaming events defer to the deadline so a burst of deltas at >30 FPS
+    /// does not cause 60+ redraws per second, while the deferred timer
+    /// guarantees the last frame is drawn even if no further events arrive.
+    fn maybe_redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
+        let has_work = self.dirty || self.critical_dirty;
+        if !has_work {
+            return Ok(());
+        }
+
+        if self.critical_dirty {
+            self.critical_dirty = false;
+            self.dirty = false;
+            self.frame_deadline = None;
+            return self.redraw(guard);
+        }
+
+        // Non-critical: honour the 30 FPS cap.
+        let min_interval = Duration::from_millis(MIN_STREAMING_FRAME_MS);
+        let elapsed = self
+            .last_frame_at
+            .map(|t| t.elapsed())
+            .unwrap_or(min_interval);
+
+        if elapsed >= min_interval {
+            self.dirty = false;
+            self.frame_deadline = None;
+            self.redraw(guard)
+        } else {
+            // Defer: arm the timer for the remaining slice.
+            if self.frame_deadline.is_none() {
+                let remaining = min_interval - elapsed;
+                self.frame_deadline = Some(tokio::time::Instant::now() + remaining);
+            }
+            Ok(())
+        }
+    }
+
     fn redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
         let size = guard.terminal().size()?;
         let regions = draw::layout(
@@ -1366,13 +1465,38 @@ impl App {
             self.viewport.is_scrollable(),
         );
         let width = regions.transcript.width as usize;
+        let height = regions.transcript.height as usize;
 
         if width != self.laid_out_width {
-            self.rows = self.state.transcript.render(width, self.state.display_mode);
+            let was_following = self.viewport.is_following();
+            let (rows, starts) = self
+                .state
+                .transcript
+                .render_with_block_starts(width, self.state.display_mode);
+            self.rows = rows;
+            self.block_starts = starts;
             self.laid_out_width = width;
+
+            // Anchor-aware reflow: restore the detached position rather than
+            // clamping, so the user's reading position survives a resize or
+            // streaming growth above the viewport.
+            if was_following {
+                self.viewport.update(self.rows.len(), height);
+            } else {
+                let anchor_row = self.detached_anchor.and_then(|a| {
+                    self.block_starts
+                        .get(a.block_index)
+                        .map(|&s| s + a.row_within_block)
+                });
+                self.viewport
+                    .update_with_anchor(self.rows.len(), height, anchor_row.unwrap_or(0));
+            }
+        } else {
+            self.viewport.update(self.rows.len(), height);
         }
-        self.viewport
-            .update(self.rows.len(), regions.transcript.height as usize);
+
+        // Compose the pin row when the user prompt has scrolled out of view.
+        let pin_text = self.compose_pin(width);
 
         let state = &self.state;
         let composer = &self.composer;
@@ -1380,13 +1504,112 @@ impl App {
         let rows = &self.rows;
         let theme = &self.theme;
         let browser = self.browser.as_ref();
+        let pin = pin_text.as_deref();
 
         guard.terminal().draw(|frame| {
-            draw::draw(frame, state, composer, viewport, rows, theme, browser);
+            draw::draw_with_pin(frame, state, composer, viewport, rows, theme, browser, pin);
         })?;
 
+        self.last_frame_at = Some(std::time::Instant::now());
         self.dirty = false;
+        self.critical_dirty = false;
         Ok(())
+    }
+
+    /// Computes the pin text for the current frame, or `None` when the pin
+    /// should not be shown.
+    fn compose_pin(&self, width: usize) -> Option<String> {
+        if !self.state.is_busy() {
+            return None;
+        }
+        // Find the last non-pending user block.
+        let (block_idx, user_text) = self
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, b)| {
+                if let crate::transcript::Block::User { text, pending: false, .. } = b {
+                    Some((i, text.as_str()))
+                } else {
+                    None
+                }
+            })?;
+
+        let block_start = self.block_starts.get(block_idx).copied()?;
+        let block_end = self.block_starts.get(block_idx + 1).copied().unwrap_or(block_start);
+
+        if !crate::pin::should_show(
+            true,
+            Some(block_start),
+            block_end,
+            self.viewport.offset(),
+            self.viewport.height(),
+        ) {
+            return None;
+        }
+
+        crate::pin::compose(user_text, width)
+    }
+
+    /// Captures a viewport anchor from the current offset if the viewport is
+    /// currently following (about to be detached by a scroll).
+    fn capture_anchor_if_following(&mut self) {
+        if !self.viewport.is_following() {
+            return;
+        }
+        self.detached_anchor = self.compute_anchor();
+    }
+
+    /// Computes a `ViewportAnchor` from the current viewport offset and block layout.
+    fn compute_anchor(&self) -> Option<ViewportAnchor> {
+        if self.block_starts.is_empty() {
+            return None;
+        }
+        let offset = self.viewport.offset();
+        // Binary search: find the last block whose start <= offset.
+        let i = self.block_starts.partition_point(|&s| s <= offset);
+        let block_index = i.saturating_sub(1);
+        let row_within_block = offset.saturating_sub(
+            self.block_starts.get(block_index).copied().unwrap_or(0),
+        );
+        Some(ViewportAnchor {
+            block_index,
+            row_within_block,
+        })
+    }
+
+    /// Copies the visible transcript to the clipboard (Ctrl+Y).
+    ///
+    /// If nothing is visible, the call is a no-op.  A failure to access the
+    /// clipboard (e.g. no display server) is reported as a notice rather than
+    /// crashing the application.
+    fn copy_to_clipboard(&mut self) {
+        let text = crate::selection::copy_visible_text(&self.rows, self.viewport.visible_range());
+        if text.is_empty() {
+            self.dirty = false;
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
+            Ok(()) => {
+                self.notice("Copied transcript to clipboard.", NoticeLevel::Info);
+            }
+            Err(err) => {
+                self.notice(
+                    format!("Could not access the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    /// Checks for a first run and surfaces the setup wizard notice.
+    fn check_first_run(&mut self) {
+        if crate::setup::is_first_run(&self.paths) {
+            self.notice(crate::setup::WELCOME_TEXT, NoticeLevel::Info);
+        }
     }
 
     /// Closes the engine down cleanly.
@@ -1402,6 +1625,24 @@ impl App {
             .request(method::SHUTDOWN, Some(serde_json::json!({})))
             .await;
         let _ = engine.shutdown(SHUTDOWN_GRACE).await;
+    }
+
+    /// `/setup` — re-run the setup wizard.
+    fn cmd_setup(&mut self) {
+        use crate::setup;
+        let providers = setup::provider_selection_prompt();
+        self.output(format!(
+            "Setup wizard\n\
+             \n\
+             {providers}\n\
+             \n\
+             Choose a provider and run /login <id> to authenticate.\n\
+             \n\
+             {}",
+            "[SEAM: OAuth login handoff requires coda-auth login RPCs, \
+             being added by another agent.  Once available, /login will \
+             complete the authentication flow interactively.]"
+        ));
     }
 
     // -- Slash command handlers (local / config scope) -----------------------
@@ -2481,6 +2722,46 @@ fn format_result(command: &str, value: &Value) -> String {
 
 fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// Returns `true` for events that bypass the 30 FPS streaming throttle.
+///
+/// Mirrors `UiActor.IsCritical` in C#: turn boundaries, errors, prompts,
+/// session lifecycle, and mode changes all get immediate frames.
+fn is_critical_event(event: &UiEvent) -> bool {
+    use coda_proto::Event;
+    match event {
+        UiEvent::TurnFinished { .. }
+        | UiEvent::Connected { .. }
+        | UiEvent::PromptRequested(_)
+        | UiEvent::PromptAnswered { .. }
+        | UiEvent::Notice { .. }
+        | UiEvent::Cleared
+        | UiEvent::ModelChanged { .. }
+        | UiEvent::DisplayModeChanged(_)
+        | UiEvent::Submitted { .. }
+        | UiEvent::Queued { .. }
+        | UiEvent::InterruptRequested => true,
+        UiEvent::Engine(inner) => match inner {
+            Event::TurnComplete { .. }
+            | Event::Error { .. }
+            | Event::LimitReached { .. }
+            | Event::AssistantTextComplete
+            | Event::ThinkingComplete { .. }
+            | Event::PermissionDecided { .. }
+            | Event::SteeringDelivered { .. } => true,
+            // Streaming events: subject to throttle.
+            Event::AssistantText { .. }
+            | Event::Thinking { .. }
+            | Event::ToolProgress { .. }
+            | Event::Usage { .. }
+            | Event::StreamProgress { .. } => false,
+            _ => true,
+        },
+        // The buffering activation seam is rare and user-visible.
+        UiEvent::EnableAssistantBuffering => true,
+        UiEvent::CommandOutput { .. } | UiEvent::DiffOutput { .. } => true,
+    }
 }
 
 #[cfg(test)]

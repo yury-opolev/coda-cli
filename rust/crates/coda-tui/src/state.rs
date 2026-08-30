@@ -123,6 +123,14 @@ pub enum UiEvent {
     ModelChanged { id: String, context_limit: Option<i64> },
     /// The tool display mode changed.
     DisplayModeChanged(ToolDisplayMode),
+    /// Activates assistant-text buffering for the current and future turns.
+    ///
+    /// **Seam**: this event is emitted by the hook system when an `AgentResponse`
+    /// redaction hook is configured.  It is never emitted by the current Rust
+    /// front-end because the hook engine lives in `coda-agent` (another agent
+    /// is porting that).  The full reducer logic is implemented here so it is
+    /// correct and tested, ready for when the hook seam closes.
+    EnableAssistantBuffering,
 }
 
 /// Everything the UI draws from.
@@ -142,6 +150,14 @@ pub struct UiState {
     pub should_quit: bool,
     /// Set while an interrupt has been requested but not yet acknowledged.
     pub interrupting: bool,
+    /// When `Some`, assistant text is buffered here instead of being streamed
+    /// to the transcript.  Activated by `UiEvent::EnableAssistantBuffering`
+    /// (the seam for hook-phase-3 buffering).  Flushed as a completed block on
+    /// turn success; withheld on interruption if the hook never rewrote it.
+    pub assistant_buffer: Option<String>,
+    /// Set when a `ResponseRewritten` engine event replaces the buffer's
+    /// contents.  Determines whether to flush or withhold on interruption.
+    pub buffer_rewritten_by_hook: bool,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
 }
@@ -165,6 +181,8 @@ impl UiState {
             prompt: None,
             should_quit: false,
             interrupting: false,
+            assistant_buffer: None,
+            buffer_rewritten_by_hook: false,
 
             clock: default_timestamp,
         }
@@ -294,6 +312,13 @@ impl UiState {
                 }
             }
             UiEvent::DisplayModeChanged(mode) => self.display_mode = mode,
+            UiEvent::EnableAssistantBuffering => {
+                // Activate buffering; an empty buffer means "buffering on, no text yet".
+                if self.assistant_buffer.is_none() {
+                    self.assistant_buffer = Some(String::new());
+                    self.buffer_rewritten_by_hook = false;
+                }
+            }
         }
     }
 
@@ -304,6 +329,11 @@ impl UiState {
                     return;
                 }
                 self.activity = Activity::Working;
+                // Buffering mode: accumulate instead of streaming to the transcript.
+                if let Some(buf) = self.assistant_buffer.as_mut() {
+                    buf.push_str(&delta);
+                    return;
+                }
                 match self.transcript.open_tail() {
                     Some(Block::Assistant { text, .. }) => text.push_str(&delta),
                     _ => {
@@ -316,11 +346,18 @@ impl UiState {
                 }
             }
             Event::AssistantTextComplete => {
-                if let Some(Block::Assistant { complete, .. }) = self.transcript.open_tail() {
-                    *complete = true;
+                // While buffering, the buffer is flushed on TurnComplete, not here.
+                if self.assistant_buffer.is_none() {
+                    if let Some(Block::Assistant { complete, .. }) = self.transcript.open_tail() {
+                        *complete = true;
+                    }
                 }
             }
             Event::Thinking { delta } => {
+                // Suppress thinking display during a buffered turn (C# rule).
+                if self.assistant_buffer.is_some() {
+                    return;
+                }
                 self.activity = Activity::Thinking;
                 match self.transcript.open_tail() {
                     Some(Block::Thinking { text, .. }) => text.push_str(&delta),
@@ -339,6 +376,10 @@ impl UiState {
                 elapsed_ms,
                 thinking_tokens,
             } => {
+                // Suppress during buffered turn.
+                if self.assistant_buffer.is_some() {
+                    return;
+                }
                 if let Some(Block::Thinking {
                     elapsed_ms: elapsed,
                     tokens,
@@ -430,6 +471,20 @@ impl UiState {
                 // Anything still queued never reached the model.
                 self.transcript.remove_pending_user();
                 self.queued.clear();
+
+                // Flush or withhold the assistant buffer.
+                // Rule (from C# UiReducer.HandleTurnCompleted / HandleTurnInterrupted):
+                // - success → always flush (show the buffered text as a completed block)
+                // - interrupted → flush only if the hook already ran (buffer was rewritten);
+                //   otherwise withhold to avoid surfacing raw unreviewed model output.
+                if interrupted {
+                    self.flush_or_withhold_buffer();
+                } else {
+                    self.flush_buffer();
+                }
+                self.assistant_buffer = None;
+                self.buffer_rewritten_by_hook = false;
+
                 self.activity = Activity::Ready;
                 self.interrupting = false;
                 if interrupted {
@@ -513,11 +568,21 @@ impl UiState {
             Event::Stop { .. }
             | Event::StreamProgress { .. }
             | Event::ScheduleLifecycle { .. }
-            | Event::ResponseRewritten { .. }
             | Event::ToolInputModified { .. }
             | Event::ToolResultModified { .. }
             | Event::PermissionsUpdated { .. }
             | Event::Unknown { .. } => {}
+            // When a display-mutating AgentResponse hook rewrites the assistant
+            // response, replace the buffer with the hook's display content so
+            // the final render uses the cleaned output.  When buffering is off,
+            // the text was already streamed to the transcript — this is a no-op.
+            // Rule from C# UiReducer: ResponseRewrittenEvent.
+            Event::ResponseRewritten { display_content, .. } => {
+                if self.assistant_buffer.is_some() {
+                    self.assistant_buffer = Some(display_content);
+                    self.buffer_rewritten_by_hook = true;
+                }
+            }
         }
     }
 
@@ -592,6 +657,53 @@ impl UiState {
             text: text.into(),
             level,
         });
+    }
+
+    /// Flushes the assistant buffer as a completed block when non-empty.
+    ///
+    /// An empty buffer produces no block (a turn with only tool calls should
+    /// not leave an empty assistant block behind).  No-op when not buffering.
+    fn flush_buffer(&mut self) {
+        if let Some(buf) = self.assistant_buffer.take() {
+            if !buf.is_empty() {
+                self.transcript.push(Block::Assistant {
+                    text: buf,
+                    complete: true,
+                });
+            }
+        }
+        self.assistant_buffer = None;
+        self.buffer_rewritten_by_hook = false;
+    }
+
+    /// On interruption or error: flushes the buffer only if the hook already
+    /// ran and rewrote the content; otherwise withholds the raw model text and
+    /// adds a notice.
+    ///
+    /// Prevents surfacing unreviewed model output when an AgentResponse
+    /// redaction hook was supposed to inspect it but the turn ended first.
+    /// Rule from C# `UiReducer.FlushOrWithholdAssistantBuffer`.
+    fn flush_or_withhold_buffer(&mut self) {
+        let Some(buf) = self.assistant_buffer.take() else {
+            return;
+        };
+        if !self.buffer_rewritten_by_hook && !buf.is_empty() {
+            // Withhold: show a notice instead of the raw text.
+            self.notice(
+                "[response withheld \u{2014} interrupted before the redaction hook ran]",
+                NoticeLevel::Warning,
+            );
+        } else {
+            // Hook ran (or buffer is empty): show what the hook put in.
+            if !buf.is_empty() {
+                self.transcript.push(Block::Assistant {
+                    text: buf,
+                    complete: true,
+                });
+            }
+        }
+        self.assistant_buffer = None;
+        self.buffer_rewritten_by_hook = false;
     }
 }
 
@@ -1500,6 +1612,175 @@ mod tests {
             }
             other => panic!("expected Thinking block, got {other:?}"),
         }
+    }
+
+    // ---- assistant buffering (withhold-on-interrupt) --------------------
+
+    fn start_buffered_turn(state: &mut UiState) {
+        state.apply(UiEvent::EnableAssistantBuffering);
+        state.apply(UiEvent::Submitted { text: "go".into() });
+    }
+
+    #[test]
+    fn enable_buffering_sets_the_buffer_to_empty_string() {
+        let mut state = state();
+        state.apply(UiEvent::EnableAssistantBuffering);
+        assert!(state.assistant_buffer.is_some());
+        assert_eq!(state.assistant_buffer.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn assistant_deltas_accumulate_in_buffer_when_buffering() {
+        let mut state = state();
+        start_buffered_turn(&mut state);
+        for delta in ["Hel", "lo", " world"] {
+            state.apply(UiEvent::Engine(Event::AssistantText { delta: delta.into() }));
+        }
+        // Nothing in the transcript yet.
+        assert!(assistant_text(&state).is_none());
+        assert_eq!(state.assistant_buffer.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn thinking_is_suppressed_during_buffered_turn() {
+        let mut state = state();
+        start_buffered_turn(&mut state);
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "reasoning".into() }));
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 100,
+            thinking_tokens: None,
+        }));
+        assert!(
+            !state.transcript.blocks().iter().any(|b| matches!(b, Block::Thinking { .. })),
+            "thinking blocks must be suppressed during buffered turns"
+        );
+    }
+
+    #[test]
+    fn buffer_is_flushed_as_complete_block_on_successful_turn() {
+        let mut state = state();
+        start_buffered_turn(&mut state);
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }));
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: Some("end_turn".into()),
+            interrupted: false,
+            root_turn_id: None,
+            activity_id: None,
+        }));
+        assert!(state.assistant_buffer.is_none(), "buffer must be cleared after flush");
+        assert_eq!(
+            assistant_text(&state),
+            Some("answer"),
+            "buffered text must appear in the transcript on success"
+        );
+        match state.transcript.blocks().iter().find(|b| matches!(b, Block::Assistant { .. })) {
+            Some(Block::Assistant { complete, .. }) => assert!(*complete, "flushed block must be complete"),
+            _ => panic!("no assistant block found"),
+        }
+    }
+
+    #[test]
+    fn empty_buffer_on_success_produces_no_assistant_block() {
+        let mut state = state();
+        start_buffered_turn(&mut state);
+        // No deltas — turn ends immediately.
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: Some("end_turn".into()),
+            interrupted: false,
+            root_turn_id: None,
+            activity_id: None,
+        }));
+        assert!(
+            !state.transcript.blocks().iter().any(|b| matches!(b, Block::Assistant { .. })),
+            "an empty buffer must not produce an assistant block"
+        );
+    }
+
+    #[test]
+    fn buffer_is_withheld_on_interrupt_when_hook_never_ran() {
+        let mut state = state();
+        start_buffered_turn(&mut state);
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "secret".into() }));
+        // Turn interrupted, hook never ran.
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: None,
+            interrupted: true,
+            root_turn_id: None,
+            activity_id: None,
+        }));
+        assert!(state.assistant_buffer.is_none());
+        // Raw text must NOT appear.
+        assert!(
+            assistant_text(&state).is_none(),
+            "withheld buffer must not show raw model text"
+        );
+        // Instead a warning notice.
+        assert!(
+            state.transcript.blocks().iter().any(|b| {
+                matches!(b, Block::Notice { level: NoticeLevel::Warning, text }
+                    if text.contains("withheld"))
+            }),
+            "expected a 'withheld' notice"
+        );
+    }
+
+    #[test]
+    fn buffer_is_flushed_on_interrupt_when_hook_already_rewrote_it() {
+        let mut state = state();
+        start_buffered_turn(&mut state);
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "raw".into() }));
+        // Hook rewrites the buffer.
+        state.apply(UiEvent::Engine(Event::ResponseRewritten {
+            hook_command: "redact".into(),
+            original_response: "raw".into(),
+            display_content: "sanitized".into(),
+            modified_response: None,
+        }));
+        assert!(state.buffer_rewritten_by_hook);
+        // Now interrupt.
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: None,
+            interrupted: true,
+            root_turn_id: None,
+            activity_id: None,
+        }));
+        // Hook's version must appear.
+        assert_eq!(
+            assistant_text(&state),
+            Some("sanitized"),
+            "hook-rewritten buffer must be flushed even on interrupt"
+        );
+        assert!(state.assistant_buffer.is_none());
+        assert!(!state.buffer_rewritten_by_hook);
+    }
+
+    #[test]
+    fn response_rewritten_while_not_buffering_is_a_noop() {
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "normal".into() }));
+        // No buffering active; ResponseRewritten must not change anything.
+        state.apply(UiEvent::Engine(Event::ResponseRewritten {
+            hook_command: "redact".into(),
+            original_response: "normal".into(),
+            display_content: "changed".into(),
+            modified_response: None,
+        }));
+        assert!(state.assistant_buffer.is_none());
+        assert_eq!(assistant_text(&state), Some("normal"));
+    }
+
+    #[test]
+    fn enable_buffering_is_idempotent() {
+        let mut state = state();
+        state.apply(UiEvent::EnableAssistantBuffering);
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "first".into() }));
+        // Second enable must not reset the buffer.
+        state.apply(UiEvent::EnableAssistantBuffering);
+        assert_eq!(
+            state.assistant_buffer.as_deref(),
+            Some("first"),
+            "second EnableAssistantBuffering must not clear accumulated text"
+        );
     }
 }
 
