@@ -287,6 +287,34 @@ pub const COMMANDS: &[CommandSpec] = &[
         summary: "Run the setup wizard to connect to a provider.",
         scope: Scope::Local,
     },
+    CommandSpec {
+        name: "compact",
+        aliases: &[],
+        args: "",
+        summary: "Summarize the conversation to free up context.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "resume",
+        aliases: &[],
+        args: "[<id>]",
+        summary: "List or resume a past session.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "fork",
+        aliases: &[],
+        args: "",
+        summary: "Branch the live conversation into a new session.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
+        name: "rewind",
+        aliases: &[],
+        args: "[<n>]",
+        summary: "Remove the last exchange(s) from the conversation.",
+        scope: Scope::Local,
+    },
 ];
 
 impl CommandSpec {
@@ -622,6 +650,7 @@ mod tests {
         let new_names = [
             "init", "memory", "output-style", "permissions", "yolo", "provider",
             "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
+            "compact", "resume", "fork", "rewind",
         ];
         for name in new_names {
             let spec = lookup(name).unwrap_or_else(|| panic!("/{name} not found"));
@@ -639,6 +668,7 @@ mod tests {
         let new_names = [
             "init", "memory", "output-style", "permissions", "yolo", "provider",
             "headers", "log", "marketplace", "plugin", "skill", "export", "diff", "image",
+            "compact", "resume", "fork", "rewind",
         ];
         for name in new_names {
             assert!(text.contains(name), "/{name} missing from help output");

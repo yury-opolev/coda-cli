@@ -5,6 +5,8 @@
 
 use std::collections::BTreeMap;
 
+use chrono::{DateTime, Utc};
+use coda_agent::SessionSummary;
 use coda_proto::messages::{
     ScheduledTask, WireHook, WireModel, WirePlugin, WireSkill,
 };
@@ -407,6 +409,70 @@ pub fn tasks(logs: &[TaskLog], outcomes: &BTreeMap<String, TaskOutcome>) -> Brow
     browser
 }
 
+/// The session picker for `/resume`.
+///
+/// Sessions are listed newest-first (the order `SessionTranscriptStore::list`
+/// returns them).  Each row shows a 1-based index, the session id, message
+/// count, age, and a short preview of the first user message.  Enter on a
+/// row fires `Intent::Activate(session_id)` which the host uses to resume.
+pub fn sessions(summaries: &[SessionSummary]) -> Browser {
+    let mut browser = Browser::new(
+        format!("Sessions — {}", summaries.len()),
+        vec![
+            Column::new("#", 3),
+            Column::new("id", 14),
+            Column::new("msgs", 4),
+            Column::new("age", 8),
+            Column::new("preview", 60),
+        ],
+    )
+    .with_footer("↑/↓ k/j move · Enter resume · / filter · Esc q close")
+    .without_detail();
+
+    browser.set_items(
+        summaries
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                let age = format_session_age(s.created_utc);
+                let preview = if s.preview.len() > 60 {
+                    format!("{}…", &s.preview[..60])
+                } else {
+                    s.preview.clone()
+                };
+                Item::new(
+                    &s.id,
+                    vec![
+                        (i + 1).to_string(),
+                        s.id.clone(),
+                        s.message_count.to_string(),
+                        age,
+                        preview,
+                    ],
+                )
+            })
+            .collect(),
+    );
+    browser
+}
+
+/// Formats the age of a session relative to now.
+///
+/// Mirrors C# `ResumeCommand.FormatAge`: "just now" / "Nm ago" / "Nh ago" / "Nd ago".
+pub fn format_session_age(created_utc: DateTime<Utc>) -> String {
+    let age = Utc::now() - created_utc;
+    let secs = age.num_seconds().max(0);
+    if secs < 60 {
+        "just now".to_string()
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86400)
+    }
+}
+
 /// What the engine reported about a finished task.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskOutcome {
@@ -731,7 +797,67 @@ mod tests {
         assert!(hooks(&[]).is_empty());
         assert!(mcp(&[]).is_empty());
         assert!(tasks(&[], &BTreeMap::new()).is_empty());
+        assert!(sessions(&[]).is_empty());
     }
+
+    #[test]
+    fn sessions_browser_activates_on_enter_without_detail() {
+        use chrono::Utc;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let summaries = vec![SessionSummary {
+            id: "abc123456789".into(),
+            created_utc: Utc::now(),
+            message_count: 4,
+            preview: "hello".into(),
+        }];
+        let mut browser = sessions(&summaries);
+        // Enter must fire Activate (not open a detail pane) for a no-detail browser.
+        let intent = browser.handle(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(intent, crate::overlay::Intent::Activate("abc123456789".into()));
+    }
+
+    #[test]
+    fn sessions_browser_shows_count_and_index() {
+        use chrono::Utc;
+        let summaries = vec![
+            SessionSummary { id: "aaa".into(), created_utc: Utc::now(), message_count: 3, preview: "first".into() },
+            SessionSummary { id: "bbb".into(), created_utc: Utc::now(), message_count: 7, preview: "second".into() },
+        ];
+        let browser = sessions(&summaries);
+        assert!(browser.title().contains("2"));
+        let rows = browser.visible_items();
+        // First column is the 1-based index.
+        assert_eq!(rows[0].cells[0], "1");
+        assert_eq!(rows[1].cells[0], "2");
+        // Message counts.
+        assert_eq!(rows[0].cells[2], "3");
+        assert_eq!(rows[1].cells[2], "7");
+    }
+
+    #[test]
+    fn format_session_age_just_now() {
+        let t = Utc::now();
+        assert_eq!(format_session_age(t), "just now");
+    }
+
+    #[test]
+    fn format_session_age_minutes() {
+        let t = Utc::now() - chrono::Duration::seconds(90);
+        assert_eq!(format_session_age(t), "1m ago");
+    }
+
+    #[test]
+    fn format_session_age_hours() {
+        let t = Utc::now() - chrono::Duration::seconds(7200);
+        assert_eq!(format_session_age(t), "2h ago");
+    }
+
+    #[test]
+    fn format_session_age_days() {
+        let t = Utc::now() - chrono::Duration::seconds(86400 * 3);
+        assert_eq!(format_session_age(t), "3d ago");
+    }
+
 
     #[test]
     fn every_browser_truncates_rows_to_its_column_widths() {

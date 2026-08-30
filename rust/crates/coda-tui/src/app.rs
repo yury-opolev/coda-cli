@@ -107,6 +107,7 @@ enum BrowserKind {
     Hooks,
     Mcp,
     Tasks,
+    Sessions,
 }
 
 impl App {
@@ -658,6 +659,27 @@ impl App {
                 let logs = config::list_task_logs(&self.paths, self.state.session_id.as_deref());
                 browsers::tasks(&logs, &self.task_outcomes)
             }
+            // Sessions are read from disk; there is no engine RPC for listing them.
+            BrowserKind::Sessions => {
+                let project_root = self.paths.project_root.clone();
+                let summaries = match tokio::task::spawn_blocking(move || {
+                    coda_agent::SessionTranscriptStore::new(&project_root).list()
+                })
+                .await
+                {
+                    Ok(list) => list,
+                    Err(_) => {
+                        return self.notice("Could not load sessions.", NoticeLevel::Error)
+                    }
+                };
+                if summaries.is_empty() {
+                    return self.notice(
+                        "No sessions found. Start a conversation to create one.",
+                        NoticeLevel::Info,
+                    );
+                }
+                browsers::sessions(&summaries)
+            }
         };
 
         self.browser = Some(browser);
@@ -690,6 +712,7 @@ impl App {
     async fn activate_browser_row(&mut self, id: &str) {
         match self.browser_kind {
             Some(BrowserKind::Models) => self.switch_model(id).await,
+            Some(BrowserKind::Sessions) => self.resume_to_session(id.to_string()).await,
             _ => self.dirty = true,
         }
     }
@@ -1187,6 +1210,10 @@ impl App {
             "diff" => self.cmd_diff().await,
             "image" => self.cmd_image(&invocation).await,
             "setup" => self.cmd_setup(),
+            "compact" => self.cmd_compact().await,
+            "resume" => self.cmd_resume(&invocation).await,
+            "fork" => self.cmd_fork().await,
+            "rewind" => self.cmd_rewind(&invocation).await,
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),
@@ -2441,6 +2468,240 @@ impl App {
             Err(_) => self.notice("Could not read the image file.", NoticeLevel::Error),
         }
     }
+
+    // -- Session management commands -----------------------------------------
+
+    /// `/compact` — ask the engine to summarise the conversation.
+    ///
+    /// Mirrors C# `CompactCommand`: empty history → "Nothing to compact yet.";
+    /// success → "Conversation compacted (N messages kept).";
+    /// summariser error → warning with detail.
+    async fn cmd_compact(&mut self) {
+        let result = self
+            .fetch::<messages::CompactResult>(
+                method::COMPACT,
+                Some(serde_json::json!({})),
+            )
+            .await;
+
+        match result {
+            Ok(r) if r.messages_before == 0 => {
+                self.notice("Nothing to compact yet.", NoticeLevel::Info);
+            }
+            Ok(r) if r.error.is_some() => {
+                let detail = r.error.unwrap_or_default();
+                self.notice(
+                    format!("Compaction warning: {detail}"),
+                    NoticeLevel::Warning,
+                );
+            }
+            Ok(r) => {
+                self.notice(
+                    format!(
+                        "Conversation compacted ({} messages kept).",
+                        r.messages_after
+                    ),
+                    NoticeLevel::Info,
+                );
+            }
+            Err(e) => self.notice(format!("Compaction failed: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/resume [<id>]` — list or resume a past session.
+    ///
+    /// No arg → open the sessions browser picker (mirrors C#
+    /// `ResumeCommand.HandleNoArgsAsync`). A positive integer N → use the
+    /// N-th newest session (1-based). Any other string → treat as a literal
+    /// session id.
+    async fn cmd_resume(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+
+        if let Some(arg) = arg {
+            let session_id = self.resolve_resume_target(&arg).await;
+            self.resume_to_session(session_id).await;
+        } else {
+            self.open_browser(BrowserKind::Sessions).await;
+        }
+    }
+
+    /// Resolves a `/resume` argument to a session id.
+    ///
+    /// A bare positive integer selects the N-th newest session (1-based); any
+    /// other string is returned as-is. Mirrors C# `ResolveTargetIdAsync`.
+    async fn resolve_resume_target(&self, arg: &str) -> String {
+        if let Ok(n) = arg.parse::<usize>() {
+            if n >= 1 {
+                let project_root = self.paths.project_root.clone();
+                if let Ok(summaries) = tokio::task::spawn_blocking(move || {
+                    coda_agent::SessionTranscriptStore::new(&project_root).list()
+                })
+                .await
+                {
+                    if n <= summaries.len() {
+                        return summaries[n - 1].id.clone();
+                    }
+                }
+            }
+        }
+        arg.to_string()
+    }
+
+    /// Restarts the engine loading `session_id` from disk, clearing the
+    /// current transcript.
+    ///
+    /// Pre-checks that the session exists on disk so the user gets a clear
+    /// "not found" message instead of an engine handshake error.  Mirrors C#
+    /// `ResumeCommand.ResumeSessionAsync`.
+    async fn resume_to_session(&mut self, session_id: String) {
+        // Pre-check: verify the session exists and get its message count.
+        let project_root = self.paths.project_root.clone();
+        let sid = session_id.clone();
+        let summary = match tokio::task::spawn_blocking(move || {
+            coda_agent::SessionTranscriptStore::new(&project_root)
+                .list()
+                .into_iter()
+                .find(|s| s.id == sid)
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                self.notice("Could not read session store.", NoticeLevel::Error);
+                return;
+            }
+        };
+
+        let Some(summary) = summary else {
+            let escaped = coda_render::text::sanitize(&session_id);
+            self.notice(
+                format!("Session '{escaped}' not found."),
+                NoticeLevel::Warning,
+            );
+            return;
+        };
+        let count = summary.message_count;
+
+        self.close_browser();
+        // Clear the current transcript — we are switching sessions.
+        self.apply(UiEvent::Cleared);
+
+        // Restart with the target session id; initialize loads the history.
+        let (engine, inbound) = match Engine::spawn(self.engine_command.clone()) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return self.notice(
+                    format!("Could not restart the engine: {error}"),
+                    NoticeLevel::Error,
+                )
+            }
+        };
+
+        let connection = engine.connection();
+        let params =
+            serde_json::to_value(messages::InitializeParams::new("coda-tui").resume(&session_id))
+                .unwrap_or_default();
+
+        match connection.request(method::INITIALIZE, Some(params)).await {
+            Ok(value) => {
+                let initialized: messages::InitializeResult =
+                    serde_json::from_value(value).unwrap_or(messages::InitializeResult {
+                        protocol_version: coda_proto::PROTOCOL_VERSION.to_string(),
+                        session_id: session_id.clone(),
+                        server_info: "coda".into(),
+                        telemetry_log_path: None,
+                    });
+
+                self.connection = connection;
+                self.restarted = Some((engine, inbound));
+
+                let actual_id = if initialized.session_id.is_empty() {
+                    session_id.clone()
+                } else {
+                    initialized.session_id.clone()
+                };
+                self.state.session_id = Some(actual_id.clone());
+
+                let escaped = coda_render::text::sanitize(&actual_id);
+                self.notice(
+                    format!("Resumed session {escaped} ({count} messages)."),
+                    NoticeLevel::Info,
+                );
+            }
+            Err(error) => {
+                self.notice(
+                    format!("The restarted engine rejected the handshake: {error}"),
+                    NoticeLevel::Error,
+                );
+            }
+        }
+    }
+
+    /// `/fork` — branch the live conversation into a new session.
+    ///
+    /// Calls `session/fork`; the engine persists the current history under a
+    /// fresh id and switches to it.  Mirrors C# `ForkCommand`.
+    async fn cmd_fork(&mut self) {
+        match self
+            .connection
+            .request("session/fork", Some(serde_json::json!({})))
+            .await
+        {
+            Ok(value) => {
+                if let Some(new_id) = value.get("newSessionId").and_then(Value::as_str) {
+                    let new_id = new_id.to_string();
+                    let escaped = coda_render::text::sanitize(&new_id);
+                    // Reflect the engine's new session id in the TUI state.
+                    self.state.session_id = Some(new_id);
+                    self.notice(
+                        format!("Forked into a new session {escaped} (original frozen)."),
+                        NoticeLevel::Info,
+                    );
+                } else {
+                    self.notice("Fork completed (session ID unknown).", NoticeLevel::Info);
+                }
+            }
+            Err(e) => self.notice(format!("Fork failed: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/rewind [<n>]` — remove the last N user exchanges from the conversation.
+    ///
+    /// Default n = 1.  Mirrors C# `RewindCommand`: validates n, calls
+    /// `session/rewind`, then reports how many exchanges were removed.
+    async fn cmd_rewind(&mut self, invocation: &commands::Invocation) {
+        let n = match parse_rewind_n(invocation.first()) {
+            Ok(n) => n,
+            Err(msg) => {
+                self.notice(msg, NoticeLevel::Warning);
+                return;
+            }
+        };
+
+        match self
+            .connection
+            .request("session/rewind", Some(serde_json::json!({ "n": n })))
+            .await
+        {
+            Ok(value) => {
+                let removed =
+                    value.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let remaining =
+                    value.get("remaining").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if removed == 0 {
+                    self.notice("Nothing to rewind.", NoticeLevel::Info);
+                } else {
+                    self.notice(
+                        format!(
+                            "Rewound {removed} exchange(s). {remaining} message(s) remain."
+                        ),
+                        NoticeLevel::Info,
+                    );
+                }
+            }
+            Err(e) => self.notice(format!("Rewind failed: {e}"), NoticeLevel::Error),
+        }
+    }
 }
 
 /// Returns the MIME type for a supported image extension, case-insensitively.
@@ -2451,6 +2712,22 @@ fn image_media_type(extension: &str) -> Option<&'static str> {
         "gif" => Some("image/gif"),
         "webp" => Some("image/webp"),
         _ => None,
+    }
+}
+
+/// Parses the `n` argument of `/rewind`, returning `Ok(n)` for a valid
+/// positive integer or `Err` with a usage hint.
+///
+/// Mirrors C# `RewindCommand`: defaults to 1 when absent; rejects zero and
+/// non-integers with the same usage message.
+fn parse_rewind_n(arg: Option<&str>) -> Result<u32, &'static str> {
+    match arg {
+        None => Ok(1),
+        Some(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|&v| v >= 1)
+            .ok_or("Usage: /rewind [n] where n is a positive integer."),
     }
 }
 
@@ -2997,6 +3274,48 @@ mod tests {
         // Only the header line; no turns.
         assert!(!md.contains("## User"));
         assert!(!md.contains("## Assistant"));
+    }
+
+    // -- /rewind argument parsing -----------------------------------------------
+
+    #[test]
+    fn rewind_n_defaults_to_one_when_no_arg() {
+        assert_eq!(parse_rewind_n(None), Ok(1));
+    }
+
+    #[test]
+    fn rewind_n_parses_a_valid_positive_integer() {
+        assert_eq!(parse_rewind_n(Some("3")), Ok(3));
+        assert_eq!(parse_rewind_n(Some("1")), Ok(1));
+        assert_eq!(parse_rewind_n(Some("100")), Ok(100));
+    }
+
+    #[test]
+    fn rewind_n_rejects_zero() {
+        assert!(parse_rewind_n(Some("0")).is_err());
+    }
+
+    #[test]
+    fn rewind_n_rejects_non_integer() {
+        assert!(parse_rewind_n(Some("abc")).is_err());
+        assert!(parse_rewind_n(Some("1.5")).is_err());
+        assert!(parse_rewind_n(Some("")).is_err());
+    }
+
+    #[test]
+    fn rewind_n_rejects_negative_integers() {
+        // u32 parse rejects negative strings.
+        assert!(parse_rewind_n(Some("-1")).is_err());
+        assert!(parse_rewind_n(Some("-100")).is_err());
+    }
+
+    #[test]
+    fn rewind_n_error_message_matches_c_sharp() {
+        let err = parse_rewind_n(Some("0")).unwrap_err();
+        assert!(
+            err.contains("positive integer"),
+            "error must mention 'positive integer', got: {err}"
+        );
     }
 }
 
