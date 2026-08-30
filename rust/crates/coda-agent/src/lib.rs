@@ -71,7 +71,7 @@ pub use permission::{
     PermissionRuleStore,
 };
 pub use steering::{SteeringEntry, SteeringInbox};
-pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest};
+pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest, SubagentRegistry, PluginAgentLoader};
 pub use todos::{TodoItem, TodoStatus, TodoStore};
 pub use tool::{
     PlanApprover, Tool, ToolContext, ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine,

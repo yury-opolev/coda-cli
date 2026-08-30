@@ -317,7 +317,7 @@ impl SubagentFactory for SubagentHost {
             let task = self.task_manager.register(
                 TaskKind::Subagent,
                 &request.prompt,
-                None,
+                request.caller_task_id.as_deref(),
                 TaskExecutionMode::Background,
             ).map_err(|e| e)?;
 
@@ -339,7 +339,8 @@ impl SubagentFactory for SubagentHost {
                 }
             });
 
-            Ok(format!("Background subagent started: {task_id}"))
+            // Return just the task id so the calling tool can format its own message.
+            Ok(task_id)
         }
     }
 }
@@ -560,6 +561,7 @@ mod tests {
             depth: MAX_SUBAGENT_DEPTH + 1,
             model: None,
             foreground: true,
+            caller_task_id: None,
         };
         let result = factory.spawn(bad_request, Arc::new(crate::events::NullSink), CancellationToken::new()).await;
         assert!(result.is_err(), "depth > MAX must be rejected");

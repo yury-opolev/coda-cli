@@ -122,6 +122,7 @@ impl Tool for TaskTool {
             depth: child_depth,
             model,
             foreground: true,
+            caller_task_id: ctx.caller_task_id.clone(),
         };
 
         let sink = std::sync::Arc::new(NullSink);

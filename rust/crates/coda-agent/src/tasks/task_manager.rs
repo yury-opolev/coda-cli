@@ -350,6 +350,89 @@ impl TaskManager {
         TaskActionResult::Ok
     }
 
+    // ── Authorization helpers ──────────────────────────────────────────────────
+
+    /// Returns `true` when `caller_task_id` is authorized to read or stop `target_id`.
+    ///
+    /// The main agent (`None` caller) has full authority over the whole session.
+    /// A subagent has authority only over its strict descendants.
+    ///
+    /// Mirrors C# `TaskManager.IsAuthorizedCaller`.
+    pub fn is_authorized_caller(&self, target_id: &str, caller_task_id: Option<&str>) -> bool {
+        let Some(caller_id) = caller_task_id else { return true; };
+
+        let target = match self.find_task(target_id) {
+            Some(t) => t,
+            None => return false,
+        };
+
+        // Walk strict ancestors of the target. Defensive cap at 64.
+        let mut parent_id = target.parent_id.clone();
+        let mut guard: u32 = 0;
+        while let Some(pid) = parent_id {
+            if pid == caller_id {
+                return true;
+            }
+            if guard > 64 {
+                return false;
+            }
+            guard += 1;
+            parent_id = self.find_task(&pid).and_then(|p| p.parent_id.clone());
+        }
+        false
+    }
+
+    /// Reads incremental output with authorization check.
+    ///
+    /// Returns `(found=false, ...)` when the id is unknown OR the caller is unauthorized
+    /// so a subagent cannot probe the existence of tasks it does not own.
+    ///
+    /// Mirrors C# `TaskManager.ReadOutput`.
+    pub fn read_output(
+        &self,
+        id: &str,
+        caller_task_id: Option<&str>,
+    ) -> (bool, String, bool, TaskRunStatus) {
+        let task = match self.find_task(id) {
+            Some(t) => t,
+            None => return (false, String::new(), false, TaskRunStatus::Running),
+        };
+        if !self.is_authorized_caller(id, caller_task_id) {
+            return (false, String::new(), false, TaskRunStatus::Running);
+        }
+        let consumer_id = caller_task_id.unwrap_or(MAIN_CONSUMER_ID);
+        let (text, truncated, status) = task.read_from_cursor(consumer_id);
+        (true, text, truncated, status)
+    }
+
+    /// Requests cancellation of a running task with authorization check.
+    ///
+    /// Authorization is checked BEFORE any state inspection so an unauthorized caller
+    /// cannot probe whether a task exists or is running.
+    ///
+    /// Returns:
+    /// - `NotFound` when the id is unknown,
+    /// - `Denied` when the caller is unauthorized (tools must use the same "not found"
+    ///   wording as `NotFound` to prevent existence probing),
+    /// - `InvalidState` when the task is already terminal,
+    /// - `Ok` on success.
+    ///
+    /// Mirrors C# `TaskManager.RequestStop`.
+    pub fn request_stop(&self, id: &str, caller_task_id: Option<&str>) -> TaskActionResult {
+        let task = match self.find_task(id) {
+            Some(t) => t,
+            None => return TaskActionResult::NotFound,
+        };
+        if !self.is_authorized_caller(id, caller_task_id) {
+            return TaskActionResult::Denied;
+        }
+        if task.status() != TaskRunStatus::Running {
+            return TaskActionResult::InvalidState;
+        }
+        task.cancel_task();
+        TaskActionResult::Ok
+    }
+
     // ── Subscriptions ─────────────────────────────────────────────────────────
 
     /// Create a subscription seeded with the current task list.
@@ -931,4 +1014,160 @@ mod tests {
         let m = mgr();
         m.cancel("task-9999"); // must not panic
     }
+
+    // ── is_authorized_caller ──────────────────────────────────────────────────
+
+    #[test]
+    fn main_agent_caller_has_full_authority() {
+        let m = mgr();
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        assert!(m.is_authorized_caller(&t.id, None), "main agent must have full authority");
+    }
+
+    #[test]
+    fn parent_is_authorized_over_child() {
+        let m = mgr();
+        let parent = m
+            .register(TaskKind::Subagent, "parent", None, TaskExecutionMode::Background)
+            .unwrap();
+        let child = m
+            .register(TaskKind::Subagent, "child", Some(&parent.id), TaskExecutionMode::Background)
+            .unwrap();
+        assert!(
+            m.is_authorized_caller(&child.id, Some(&parent.id)),
+            "parent must be authorized over child"
+        );
+    }
+
+    #[test]
+    fn sibling_is_not_authorized() {
+        let m = mgr();
+        let a = m
+            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .unwrap();
+        let b = m
+            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .unwrap();
+        assert!(
+            !m.is_authorized_caller(&b.id, Some(&a.id)),
+            "sibling must not be authorized"
+        );
+    }
+
+    #[test]
+    fn task_is_not_authorized_over_itself() {
+        let m = mgr();
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        assert!(
+            !m.is_authorized_caller(&t.id, Some(&t.id)),
+            "task must not be authorized over itself"
+        );
+    }
+
+    #[test]
+    fn unknown_target_is_not_authorized() {
+        let m = mgr();
+        // Caller = main agent always succeeds — test with a subagent caller instead.
+        let caller = m
+            .register(TaskKind::Subagent, "caller", None, TaskExecutionMode::Background)
+            .unwrap();
+        assert!(
+            !m.is_authorized_caller("task-9999", Some(&caller.id)),
+            "unknown target must be unauthorized for subagent caller"
+        );
+    }
+
+    // ── request_stop ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn request_stop_running_task_ok() {
+        let m = mgr();
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        let result = m.request_stop(&t.id, None);
+        assert_eq!(result, TaskActionResult::Ok);
+        assert!(t.cancel.is_cancelled(), "cancel token must be fired");
+    }
+
+    #[test]
+    fn request_stop_terminal_task_invalid_state() {
+        let m = mgr();
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.complete(&t.id, None);
+        let result = m.request_stop(&t.id, None);
+        assert_eq!(result, TaskActionResult::InvalidState);
+    }
+
+    #[test]
+    fn request_stop_unknown_id_not_found() {
+        let m = mgr();
+        assert_eq!(m.request_stop("task-9999", None), TaskActionResult::NotFound);
+    }
+
+    #[test]
+    fn request_stop_denied_for_unauthorized_caller() {
+        let m = mgr();
+        let a = m
+            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .unwrap();
+        let b = m
+            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .unwrap();
+        // "a" tries to stop unrelated "b"
+        let result = m.request_stop(&b.id, Some(&a.id));
+        assert_eq!(result, TaskActionResult::Denied, "sibling stop must be denied");
+        assert!(!b.cancel.is_cancelled(), "b token must not be cancelled");
+    }
+
+    // ── read_output ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn read_output_main_agent_reads_any_task() {
+        let m = mgr();
+        let t = m
+            .register(TaskKind::Subagent, "t", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.append_output(&t.id, "hello");
+        let (found, text, _truncated, _status) = m.read_output(&t.id, None);
+        assert!(found);
+        assert_eq!(text, "hello");
+    }
+
+    #[test]
+    fn read_output_unauthorized_returns_not_found() {
+        let m = mgr();
+        let a = m
+            .register(TaskKind::Subagent, "a", None, TaskExecutionMode::Background)
+            .unwrap();
+        let b = m
+            .register(TaskKind::Subagent, "b", None, TaskExecutionMode::Background)
+            .unwrap();
+        m.append_output(&b.id, "secret");
+        let (found, text, _, _) = m.read_output(&b.id, Some(&a.id));
+        assert!(!found, "sibling must be unauthorized");
+        assert!(!text.contains("secret"), "secret output must not be leaked");
+    }
+
+    #[test]
+    fn read_output_parent_can_read_child() {
+        let m = mgr();
+        let parent = m
+            .register(TaskKind::Subagent, "p", None, TaskExecutionMode::Background)
+            .unwrap();
+        let child = m
+            .register(TaskKind::Subagent, "c", Some(&parent.id), TaskExecutionMode::Background)
+            .unwrap();
+        m.append_output(&child.id, "child output");
+        let (found, text, _, _) = m.read_output(&child.id, Some(&parent.id));
+        assert!(found);
+        assert_eq!(text, "child output");
+    }
 }
+
