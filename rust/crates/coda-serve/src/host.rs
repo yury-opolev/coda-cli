@@ -20,7 +20,7 @@ use coda_auth::{
     provider::{AuthProvider, CopilotProvider},
 };
 use coda_auth::provider::copilot::CopilotConfig as AuthCopilotConfig;
-use coda_auth::store::{CredentialStore, KeyringStore, EncryptedFileStore};
+use coda_auth::store::{CredentialStore, DpapiStore, KeyringStore, EncryptedFileStore};
 use coda_llm::anthropic::{AnthropicClient, AnthropicConfig};
 use coda_llm::{
     ChatRequest, Content, CopilotClient, CopilotConfig,
@@ -874,24 +874,61 @@ pub(crate) fn build_anthropic(key: &str) -> Option<Arc<dyn LlmClient>> {
         .map(|c| Arc::new(c) as Arc<dyn LlmClient>)
 }
 
-async fn try_build_copilot_from_keyring() -> Option<Arc<dyn LlmClient>> {
-    let store: Arc<dyn CredentialStore> = match KeyringStore::probe() {
+/// Chooses a credential backend, preferring the one the C# build already uses.
+///
+/// On Windows the C# store is DPAPI files under `~/.coda/credentials`, keyed
+/// `llmauth:<provider>` — the same key this crate uses. Reading it first means
+/// an existing installation keeps working when the engine is swapped for the
+/// Rust one; probing the OS keyring first would find nothing and silently log
+/// every current user out.
+///
+/// The keyring and encrypted-file stores remain as fallbacks for credentials
+/// written by the Rust build itself, and for non-Windows hosts.
+fn credential_store() -> Arc<dyn CredentialStore> {
+    #[cfg(windows)]
+    {
+        let dpapi = DpapiStore::default_location();
+        if dpapi.contains("llmauth:github-copilot") {
+            return Arc::new(dpapi);
+        }
+    }
+    match KeyringStore::probe() {
         Ok(()) => Arc::new(KeyringStore::new()),
         Err(_) => Arc::new(EncryptedFileStore::default()),
-    };
+    }
+}
+
+async fn try_build_copilot_from_keyring() -> Option<Arc<dyn LlmClient>> {
+    let store = credential_store();
     let manager = Arc::new(CredentialManager::new(
         store,
         [Arc::new(CopilotProvider::new(AuthCopilotConfig::default_public()))
             as Arc<dyn AuthProvider>],
     ));
-    if manager.get_credential("github-copilot").await.ok().flatten().is_none() {
-        return None;
+    match manager.get_credential("github-copilot").await {
+        Ok(Some(_)) => {}
+        // Absent credentials are the normal "not logged in" case, and a failed
+        // lookup is usually an expired refresh — neither is worth writing to
+        // stderr on every startup, since the caller falls back cleanly.
+        Ok(None) | Err(_) => return None,
     }
     let source: Arc<dyn CredentialSource> =
         Arc::new(CredentialManagerSource::new(Arc::clone(&manager), "github-copilot"));
-    CopilotClient::new(CopilotConfig::with_token("").with_credential_source(source))
-        .ok()
-        .map(|c| Arc::new(c) as Arc<dyn LlmClient>)
+
+    // The credential source supplies only Authorization; editor identity comes
+    // from the config by design. Without these the API rejects every request
+    // with "missing Editor-Version header for IDE auth", so the engine appears
+    // to have no models at all.
+    let auth_config = AuthCopilotConfig::default_public();
+    let config = CopilotConfig::with_token("")
+        .with_credential_source(source)
+        .with_header("editor-version", auth_config.editor_version.clone())
+        .with_header("editor-plugin-version", auth_config.editor_plugin_version.clone())
+        .with_header("copilot-integration-id", auth_config.integration_id.clone())
+        .with_header("user-agent", auth_config.user_agent.clone())
+        .with_header("x-github-api-version", "2026-06-01");
+
+    CopilotClient::new(config).ok().map(|c| Arc::new(c) as Arc<dyn LlmClient>)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1054,6 +1091,41 @@ mod tests {
         assert!(host.try_claim_turn().is_none(), "second concurrent claim must be refused");
         drop(first);
         assert!(host.try_claim_turn().is_some(), "the slot is reusable once released");
+    }
+
+    /// Diagnostic: does the engine find a usable provider on this machine?
+    ///
+    /// Touches the credential store and may perform a token exchange, so it is
+    /// ignored by default. Run explicitly with:
+    /// `cargo test -p coda-serve credential_diagnostic -- --ignored --nocapture`
+    #[ignore]
+    #[tokio::test]
+    async fn credential_diagnostic() {
+        let store = credential_store();
+        match store.get("llmauth:github-copilot").await {
+            Ok(Some(v)) => eprintln!("raw credential read: {} bytes", v.len()),
+            Ok(None) => eprintln!("raw credential: NOT FOUND"),
+            Err(e) => eprintln!("raw credential read failed: {e}"),
+        }
+
+        let manager = Arc::new(CredentialManager::new(
+            credential_store(),
+            [Arc::new(CopilotProvider::new(AuthCopilotConfig::default_public()))
+                as Arc<dyn AuthProvider>],
+        ));
+        match manager.get_credential("github-copilot").await {
+            Ok(Some(_)) => eprintln!("manager: credential OK"),
+            Ok(None) => eprintln!("manager: NONE"),
+            Err(e) => eprintln!("manager: ERROR {e}"),
+        }
+
+        match try_build_client(None).await {
+            Some(client) => match client.list_models().await {
+                Ok(m) => eprintln!("client built; models: {}", m.len()),
+                Err(e) => eprintln!("client built; list_models failed: {e}"),
+            },
+            None => eprintln!("client: NOT BUILT"),
+        }
     }
 
     #[tokio::test]

@@ -206,10 +206,6 @@ pub async fn compare(
 /// the list honest rather than letting it rot into a permanent excuse.
 pub const KNOWN_GAPS: &[(&str, &str)] = &[
     (
-        "session/models",
-        "the Rust engine has no provider/credential stack wired, so it returns the builtin (empty) catalogue",
-    ),
-    (
         "model/reasoningCapability",
         "the Rust engine has no per-model metadata, so it reports no reasoning support",
     ),

@@ -75,6 +75,15 @@ pub enum AgentEvent {
         description: String,
         report: Option<String>,
     },
+    ScheduleLifecycle {
+        definition_id: String,
+        definition_name: Option<String>,
+        task_id: Option<String>,
+        /// `"started"`, `"completed"`, `"failed"`, or `"stopped"`.
+        state: String,
+        timestamp: Option<String>,
+        summary: Option<String>,
+    },
     PromptRewritten {
         hook_command: String,
         original_prompt: String,
@@ -203,6 +212,16 @@ pub fn to_proto_event(event: &AgentEvent) -> Option<ProtoEvent> {
                 report: report.clone(),
             })
         }
+        AgentEvent::ScheduleLifecycle {
+            definition_id, definition_name, task_id, state, timestamp, summary,
+        } => Some(ProtoEvent::ScheduleLifecycle {
+            definition_id: definition_id.clone(),
+            definition_name: definition_name.clone(),
+            task_id: task_id.clone(),
+            state: state.clone(),
+            timestamp: timestamp.clone(),
+            summary: summary.clone(),
+        }),
         AgentEvent::PromptRewritten { hook_command, original_prompt, modified_prompt } => {
             Some(ProtoEvent::PromptRewritten {
                 hook_command: hook_command.clone(),

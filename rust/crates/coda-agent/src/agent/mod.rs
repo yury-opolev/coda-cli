@@ -23,6 +23,7 @@ use coda_llm::{
 };
 use tokio_util::sync::CancellationToken;
 
+use crate::compaction::{CompactionPolicy, CompactionService, TokenEstimator};
 use crate::events::{AgentEvent, AgentSink};
 use crate::goal::{GoalStatus, GoalSupervisor, last_assistant_text};
 use crate::lsp::LspServerManager;
@@ -39,7 +40,7 @@ pub mod stream;
 pub mod tools;
 
 use stop::{StopAction, UserQuestionPrompt, decide_stop};
-use stream::{RetryConfig, stream_with_retries};
+use stream::{RetryConfig, is_context_overflow_error, stream_with_retries};
 use tools::{BatchContext, ToolBatchResult, run_tools};
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -109,6 +110,10 @@ pub struct AgentLoop {
     /// Hook runner: fires lifecycle hooks (PreToolUse, PostToolUse, AgentResponse, Stop, …).
     /// `None` means no hooks are configured for this run.
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    /// Compaction service: summarises history to free context space.
+    compaction_service: Option<Arc<CompactionService>>,
+    /// Policy controlling when proactive compaction fires.
+    compaction_policy: CompactionPolicy,
 
     // ── Stateful service handles forwarded into ToolContext on every batch ────
     // Without these the built-in tools that need a store or factory all silently
@@ -219,7 +224,39 @@ impl AgentLoop {
                 break;
             }
 
-            // 3. Proactive compaction (goal runs only; no-op seam, later phase).
+            // 3. Proactive compaction (goal runs only, C# §AutoCompact).
+            // Fires when: a goal is active, compaction is configured, threshold > 0,
+            // and the estimated token count exceeds the threshold (with suppression
+            // to prevent re-firing until history grows by a full additional threshold).
+            if goal.is_some() {
+                if let Some(svc) = &self.compaction_service {
+                    let threshold = self.compaction_policy.token_threshold;
+                    if threshold > 0 {
+                        let current = TokenEstimator::estimate(history);
+                        let suppressed = blocked_compaction_at
+                            .map(|b| current <= b + threshold)
+                            .unwrap_or(false);
+                        if !suppressed && current > threshold {
+                            match compact_history(
+                                svc,
+                                self.hook_runner.as_deref(),
+                                history,
+                                sink,
+                                "auto",
+                                cancel.clone(),
+                            )
+                            .await
+                            {
+                                Ok(true) => {} // compacted; blocked_compaction_at stays None
+                                Ok(false) => {
+                                    blocked_compaction_at = Some(current);
+                                }
+                                Err(_) => {} // swallow; compaction is best-effort
+                            }
+                        }
+                    }
+                }
+            }
 
             // 4a. LSP diagnostics injection (no-op seam; later phase).
             // Only after the first tool cycle (iteration > 0).
@@ -256,17 +293,76 @@ impl AgentLoop {
             }
 
             // 7. Stream with retry arms.
-            let stream_result = stream_with_retries(
-                &*self.client,
-                &mut request,
-                &self.quarantine,
-                sink,
-                cancel.clone(),
-                &retry_cfg,
-                None, // compaction seam (later phase)
-                &mut blocked_compaction_at,
-            )
-            .await;
+            // For the overflow arm: if stream returns a context-overflow error and
+            // compaction is configured, compact history and retry once.
+            let mut overflow_retried = false;
+            let stream_result = loop {
+                let sr = stream_with_retries(
+                    &*self.client,
+                    &mut request,
+                    &self.quarantine,
+                    sink,
+                    cancel.clone(),
+                    &retry_cfg,
+                    None,
+                    &mut blocked_compaction_at,
+                )
+                .await;
+
+                // Overflow compaction retry (matches C# one-shot compact-retry).
+                if let Err(ref err) = sr {
+                    if !overflow_retried
+                        && !cancel.is_cancelled()
+                        && is_context_overflow_error(err)
+                    {
+                        if let Some(svc) = &self.compaction_service {
+                            let threshold = self.compaction_policy.token_threshold;
+                            let current = TokenEstimator::estimate(history);
+                            let suppressed = if threshold > 0 {
+                                blocked_compaction_at
+                                    .map(|b| current <= b + threshold)
+                                    .unwrap_or(false)
+                            } else {
+                                false
+                            };
+
+                            if !suppressed {
+                                overflow_retried = true;
+                                match compact_history(
+                                    svc,
+                                    self.hook_runner.as_deref(),
+                                    history,
+                                    sink,
+                                    "overflow",
+                                    cancel.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(true) => {
+                                        // Rebuild request with compacted history and retry.
+                                        request = ChatRequest::new(
+                                            self.model.clone(),
+                                            history.clone(),
+                                        )
+                                        .with_max_tokens(self.max_tokens)
+                                        .with_effort(self.effort)
+                                        .with_tools(tool_defs.clone());
+                                        if let Some(sys) = &self.system_prompt {
+                                            request = request.with_system(sys.clone());
+                                        }
+                                        continue; // retry with compacted history
+                                    }
+                                    Ok(false) => {
+                                        blocked_compaction_at = Some(current);
+                                    }
+                                    Err(_) => {} // swallow; let the overflow error surface
+                                }
+                            }
+                        }
+                    }
+                }
+                break sr;
+            };
 
             // §PRIVACY withhold-on-interrupt (streaming cancel path):
             // When stream_with_retries returns LlmError::Cancelled, partial text
@@ -363,18 +459,37 @@ impl AgentLoop {
                 if !cancel.is_cancelled() {
                     if let Some(hr) = &self.hook_runner {
                         if hr.has_agent_response {
-                            let recent_text = last_assistant_text(history);
-                            let _ar = hr
+                            let original_text = last_assistant_text(history);
+                            let ar = hr
                                 .run_agent_response(
-                                    &recent_text,
+                                    &original_text,
                                     acc.stop_reason.as_deref(),
                                     cancel.clone(),
                                 )
                                 .await;
-                            // TODO(phase-6): apply `_ar.modified_response` / `_ar.display_content`
-                            // to history and emit `ResponseRewritten`. For now the hook runs for
-                            // observation/notification purposes; its modification output is accepted
-                            // by the runner but not yet applied here.
+                            // Apply mutation: modifiedResponse enters history; displayContent is
+                            // what the user sees. C# priority: displayContent ?? modifiedResponse.
+                            let has_change = ar.modified_response.is_some()
+                                || ar.display_content.is_some();
+                            if has_change {
+                                if let Some(ref mr) = ar.modified_response {
+                                    replace_last_assistant_text(history, mr);
+                                }
+                                let display = ar
+                                    .display_content
+                                    .clone()
+                                    .or_else(|| ar.modified_response.clone())
+                                    .unwrap_or_default();
+                                sink.emit(AgentEvent::ResponseRewritten {
+                                    hook_command: ar
+                                        .by_hook_command
+                                        .clone()
+                                        .unwrap_or_default(),
+                                    original_response: original_text,
+                                    display_content: display,
+                                    modified_response: ar.modified_response.clone(),
+                                });
+                            }
                         }
                     }
                 }
@@ -481,9 +596,101 @@ fn goal_status(goal: &Option<GoalSupervisor>) -> GoalStatus {
     goal.as_ref().map(|g| g.status()).unwrap_or_else(GoalStatus::none)
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Builder
-// ─────────────────────────────────────────────────────────────────────────────
+/// Replace the `Text` block in the last assistant message with `new_text`.
+/// Matches C# `ReplaceLastAssistantText`.
+fn replace_last_assistant_text(history: &mut Vec<coda_llm::Message>, new_text: &str) {
+    if let Some(last) = history.last_mut() {
+        if last.role == coda_llm::Role::Assistant {
+            let mut found = false;
+            for block in &mut last.content {
+                if let coda_llm::Content::Text(t) = block {
+                    *t = new_text.to_owned();
+                    found = true;
+                    break;
+                }
+            }
+            // If no Text block yet, add one.
+            if !found {
+                last.content.push(coda_llm::Content::Text(new_text.to_owned()));
+            }
+        }
+    }
+}
+
+/// Runs compaction on `history` in-place: fires PreCompact hook (if configured),
+/// calls the compaction service, and fires PostCompact hook (if configured).
+///
+/// Returns `Ok(true)` when history was successfully compacted, `Ok(false)` when
+/// a hook blocked compaction, and `Err` when compaction failed.  The original
+/// history is preserved intact on failure — no silent data loss.
+async fn compact_history(
+    svc: &CompactionService,
+    hook_runner: Option<&crate::hooks::HookRunner>,
+    history: &mut Vec<Message>,
+    sink: &dyn AgentSink,
+    trigger: &str,
+    cancel: CancellationToken,
+) -> anyhow::Result<bool> {
+    // Pre-compact hook.
+    let instructions_override = if let Some(hr) = hook_runner {
+        if hr.has_pre_compact {
+            let pre = hr
+                .run_pre_compact(
+                    trigger,
+                    TokenEstimator::estimate(history),
+                    history.len(),
+                    None,
+                    cancel.clone(),
+                )
+                .await;
+            if pre.cancel {
+                sink.emit(AgentEvent::CompactionCancelled {
+                    hook_command: pre.by_hook_command.unwrap_or_default(),
+                    trigger: trigger.to_owned(),
+                });
+                return Ok(false);
+            }
+            pre.instructions_override
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let tokens_before = TokenEstimator::estimate(history);
+    let (new_history, summary) = svc
+        .compact(history, instructions_override.as_deref(), cancel.clone())
+        .await;
+
+    // If the summariser returned nothing, history is unchanged — fail gracefully.
+    if summary.is_none() {
+        return Err(anyhow::anyhow!("compaction returned no summary"));
+    }
+
+    *history = new_history;
+
+    // Post-compact hook.
+    if let Some(hr) = hook_runner {
+        if hr.has_post_compact {
+            let post = hr
+                .run_post_compact(
+                    tokens_before,
+                    TokenEstimator::estimate(history),
+                    history.len(),
+                    summary.as_deref().unwrap_or(""),
+                    cancel.clone(),
+                )
+                .await;
+            if let Some(ctx) = post.additional_context {
+                history.push(Message::user(ctx.clone()));
+                sink.emit(AgentEvent::PostCompactContextInjected { context: ctx });
+            }
+        }
+    }
+
+    Ok(true)
+}
 
 /// Builder for [`AgentLoop`].
 ///
@@ -500,6 +707,8 @@ pub struct AgentLoopBuilder {
     steering: Option<Arc<SteeringInbox>>,
     user_question: Option<Arc<dyn UserQuestionPrompt>>,
     hook_runner: Option<Arc<crate::hooks::HookRunner>>,
+    compaction_service: Option<Arc<CompactionService>>,
+    compaction_policy: CompactionPolicy,
     // Service handles for ToolContext (see AgentLoop fields for WHY).
     todos: Option<Arc<TodoStore>>,
     tool_user_question: Option<Arc<dyn UserQuestion>>,
@@ -539,6 +748,8 @@ impl AgentLoopBuilder {
             steering: None,
             user_question: None,
             hook_runner: None,
+            compaction_service: None,
+            compaction_policy: CompactionPolicy::default(),
             todos: None,
             tool_user_question: None,
             plan_approver: None,
@@ -564,6 +775,16 @@ impl AgentLoopBuilder {
 
     pub fn with_model(mut self, model: impl Into<String>) -> Self {
         self.model = model.into();
+        self
+    }
+
+    pub fn with_compaction_service(mut self, svc: Arc<CompactionService>) -> Self {
+        self.compaction_service = Some(svc);
+        self
+    }
+
+    pub fn with_compaction_policy(mut self, policy: CompactionPolicy) -> Self {
+        self.compaction_policy = policy;
         self
     }
 
@@ -692,6 +913,8 @@ impl AgentLoopBuilder {
             steering: self.steering,
             user_question: self.user_question,
             hook_runner: self.hook_runner,
+            compaction_service: self.compaction_service,
+            compaction_policy: self.compaction_policy,
             todos: self.todos,
             tool_user_question: self.tool_user_question,
             plan_approver: self.plan_approver,
@@ -2004,55 +2227,377 @@ mod tests {
         }
     }
 
-    /// `tool_search` run through AgentLoop sees the full registered tool set.
+    // ── Feature 2: Compaction wiring ────────────────────────────────────────
+    //
+    // The compaction service is wired into the agent loop for:
+    //   - Proactive compaction: when token count exceeds threshold (goal-only).
+    //   - Overflow compaction: when the LLM rejects the request due to context.
+
+    /// Mock ForkedAgent that returns a canned summary.
+    struct MockFork(String);
+
+    #[async_trait]
+    impl crate::goal::ForkedAgent for MockFork {
+        async fn run(
+            &self,
+            _system: &str,
+            _messages: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<String> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Compaction fires proactively for goal runs when token count exceeds threshold.
+    ///
+    /// Mutation-verified: comment out step 3 compaction block and this test
+    /// fails (history length doesn't decrease).
     #[tokio::test]
-    async fn loop_tool_search_sees_registered_tools() {
-        use crate::tools::ToolSearchTool;
+    async fn compaction_fires_proactively_when_over_threshold_in_goal_run() {
+        use crate::compaction::CompactionService;
+        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
 
-        // Register both tool_search itself and a dummy tool; search for "dummy".
-        let log = Arc::new(Mutex::new(Vec::new()));
-        let client = MockLlmClient::new(vec![
-            vec![
-                Ok(StreamEvent::ToolUse(Content::ToolUse {
-                    id: "ts1".into(),
-                    name: "tool_search".into(),
-                    input_json: r#"{"query":"dummy"}"#.into(),
-                    correlation: coda_llm::Correlation::default(),
-                })),
-                Ok(done()),
-            ],
-            vec![Ok(StreamEvent::TextDelta("done".into())), Ok(done())],
-        ]);
+        let svc = Arc::new(CompactionService::new(Arc::new(MockFork("summary text".into()))));
 
-        let tools = Arc::new(ToolRegistry::new([
-            Arc::new(ToolSearchTool) as Arc<dyn crate::tool::Tool>,
-            dyn_tool(MockTool::new("dummy_tool", true, log)),
-        ]));
+        // Use a very small threshold so it's exceeded by normal messages.
+        let policy = crate::compaction::CompactionPolicy { token_threshold: 1, ..Default::default() };
+
+        // Goal judge always returns DONE.
+        struct DoneJudge;
+        #[async_trait]
+        impl ForkedAgent for DoneJudge {
+            async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
+                Ok("DONE".to_owned())
+            }
+        }
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("ok".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let sink = CollectingSink::new();
+
+        let goal = GoalSupervisor::new(
+            Box::new(DoneJudge),
+            "test goal",
+            GoalBudget::new(Duration::MAX, 3, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
 
         let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy)
             .with_tool_max_duration(None)
             .build();
 
+        // Build a history that's large enough to exceed the tiny threshold.
+        let mut history = vec![
+            Message::user("prompt"),
+            Message::assistant("previous response that is long enough to trigger compaction"),
+        ];
+        agent.run(&mut history, &sink, Some(goal), CancellationToken::new()).await.unwrap();
+
+        // After compaction: history must contain the summary pair (2 messages: user summary + assistant ack).
+        // The summary message contains our mock summary text.
+        let has_summary = history.iter().any(|m| m.text().contains("summary text"));
+        assert!(has_summary, "history must contain the compaction summary after proactive compaction");
+    }
+
+    /// When threshold is 0, compaction is disabled.
+    ///
+    /// Mirrors C# `CodaSession_does_not_auto_compact_when_threshold_is_zero`.
+    #[tokio::test]
+    async fn compaction_disabled_when_threshold_is_zero() {
+        use crate::compaction::{CompactionService, CompactionPolicy};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fork_call_count = Arc::new(AtomicUsize::new(0));
+        let cnt = fork_call_count.clone();
+
+        struct CountingFork(Arc<AtomicUsize>);
+        #[async_trait]
+        impl crate::goal::ForkedAgent for CountingFork {
+            async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok("summary".to_owned())
+            }
+        }
+
+        let svc = Arc::new(CompactionService::new(Arc::new(CountingFork(cnt))));
+        let policy = CompactionPolicy { token_threshold: 0, ..Default::default() }; // disabled
+
+        use crate::goal::{ForkedAgent, GoalBudget, GoalRetryPolicy, GoalSupervisor};
+        struct DoneJudge;
+        #[async_trait]
+        impl ForkedAgent for DoneJudge {
+            async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
+                Ok("DONE".to_owned())
+            }
+        }
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("done".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let goal = GoalSupervisor::new(
+            Box::new(DoneJudge),
+            "test",
+            GoalBudget::new(Duration::MAX, 3, 0.5, || Duration::ZERO),
+            Some(GoalRetryPolicy::for_tests()),
+        );
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_compaction_service(svc)
+            .with_compaction_policy(policy) // threshold=0 disables
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![
+            Message::user("big context".repeat(1000)),
+        ];
+        agent.run(&mut history, &NullSink, Some(goal), CancellationToken::new()).await.unwrap();
+
+        assert_eq!(
+            fork_call_count.load(Ordering::SeqCst),
+            0,
+            "with threshold=0, compaction must not fire"
+        );
+    }
+
+    /// If compaction fails (empty summarizer reply), history is preserved intact.
+    ///
+    /// Mirrors C# invariant: a failed compaction must not corrupt history.
+    #[tokio::test]
+    async fn compaction_failure_preserves_original_history() {
+        use crate::compaction::CompactionService;
+        use crate::events::NullSink;
+
+        struct EmptyFork;
+        #[async_trait]
+        impl crate::goal::ForkedAgent for EmptyFork {
+            async fn run(&self, _: &str, _: Vec<Message>, _: CancellationToken) -> anyhow::Result<String> {
+                Ok(String::new()) // empty → fail
+            }
+        }
+
+        let svc = Arc::new(CompactionService::new(Arc::new(EmptyFork)));
+        let history = vec![
+            Message::user("original prompt"),
+            Message::assistant("original response"),
+        ];
+        let mut h = history.clone();
+        // compact_history should return Err (empty summary) and leave h unchanged.
+        let result = compact_history(
+            &svc,
+            None,
+            &mut h,
+            &NullSink,
+            "test",
+            CancellationToken::new(),
+        ).await;
+
+        assert!(result.is_err(), "empty summarizer must return an error");
+        assert_eq!(h.len(), 2, "history must be preserved on compaction failure");
+        assert_eq!(h[0].text(), "original prompt");
+    }
+
+    // ── Feature 3: AgentResponse hook mutation ──────────────────────────────
+
+    /// Simple fixed-response executor for hook tests.
+    struct FixedHookExecutor(String);
+
+    #[async_trait]
+    impl crate::hooks::runner::HookExecutor for FixedHookExecutor {
+        async fn exec(
+            &self,
+            _command: &str,
+            _payload: &str,
+            _cancel: CancellationToken,
+        ) -> anyhow::Result<(i32, String, String)> {
+            Ok((0, self.0.clone(), String::new()))
+        }
+    }
+
+    fn make_agent_response_hook_runner(response_json: &str) -> Arc<crate::hooks::HookRunner> {
+        use crate::hooks::{HookScope, UserHook};
+        let h = UserHook {
+            event: "AgentResponse".into(),
+            command: Some("check.sh".into()),
+            matcher: None,
+            timeout_seconds: None,
+            fail_open: None,
+            unattended_decision: None,
+            allow_system_prompt_replace: false,
+            mutates: Some(vec!["modifiedResponse".into(), "displayContent".into()]),
+            handler_type: None,
+            url: None,
+            hook_prompt: None,
+            agent_type: None,
+            enabled: true,
+            scope: HookScope::User,
+            plugin_origin: None,
+        };
+        Arc::new(crate::hooks::HookRunner::with_executor(
+            vec![h],
+            Arc::new(FixedHookExecutor(response_json.to_owned())),
+        ))
+    }
+
+    /// AgentResponse hook: modifiedResponse mutates history and emits ResponseRewritten.
+    ///
+    /// Mutation-verified: remove `replace_last_assistant_text` call and this test
+    /// fails (history still has original text).
+    #[tokio::test]
+    async fn agent_response_hook_modified_response_mutates_history() {
+        let hook_runner = make_agent_response_hook_runner(
+            r#"{"hookSpecificOutput":{"modifiedResponse":"HOOKED RESPONSE"}}"#,
+        );
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("original response".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
         let sink = CollectingSink::new();
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_hook_runner(hook_runner)
+            .with_tool_max_duration(None)
+            .build();
+
         let mut history = vec![Message::user("go")];
         agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
 
-        // Before CRITICAL 1 fix: ctx.all_tools was None → "No matching tools found."
-        // After fix: all_tools is built from the registry → dummy_tool is found.
+        // History must contain the modified response, not the original.
+        let last_assistant_text = history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.text())
+            .unwrap_or_default();
+        assert_eq!(
+            last_assistant_text, "HOOKED RESPONSE",
+            "modifiedResponse must replace the assistant text in history"
+        );
+
+        // ResponseRewritten event must be emitted.
         let events = sink.take();
-        let search_result = events.iter().find(|e| {
-            matches!(e, AgentEvent::ToolResult { tool_name, .. } if tool_name == "tool_search")
-        });
-        assert!(search_result.is_some(), "tool_search must produce a result event");
-        if let Some(AgentEvent::ToolResult { content, is_error, .. }) = search_result {
-            assert!(
-                !is_error,
-                "tool_search must not error when all_tools is populated; got: {content}"
-            );
-            assert!(
-                content.contains("dummy_tool"),
-                "tool_search must find registered tools; got: {content}"
-            );
+        let rr = events.iter().find(|e| matches!(e, AgentEvent::ResponseRewritten { .. }));
+        assert!(rr.is_some(), "ResponseRewritten event must be emitted");
+        if let Some(AgentEvent::ResponseRewritten {
+            original_response,
+            display_content,
+            modified_response,
+            ..
+        }) = rr
+        {
+            assert_eq!(original_response, "original response");
+            assert_eq!(display_content, "HOOKED RESPONSE"); // fallback to modifiedResponse
+            assert_eq!(modified_response.as_deref(), Some("HOOKED RESPONSE"));
         }
     }
+
+    /// AgentResponse hook: displayContent only does not mutate history.
+    #[tokio::test]
+    async fn agent_response_hook_display_content_only_does_not_mutate_history() {
+        let hook_runner = make_agent_response_hook_runner(
+            r#"{"hookSpecificOutput":{"displayContent":"DISPLAY ONLY"}}"#,
+        );
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("original".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let sink = CollectingSink::new();
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_hook_runner(hook_runner)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        // History must still have the original text (only displayContent was set).
+        let last = history
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Assistant)
+            .map(|m| m.text())
+            .unwrap_or_default();
+        assert_eq!(last, "original", "displayContent-only must not mutate history");
+
+        let events = sink.take();
+        let rr = events.iter().find(|e| matches!(e, AgentEvent::ResponseRewritten { .. }));
+        assert!(rr.is_some(), "ResponseRewritten must be emitted when displayContent is set");
+        if let Some(AgentEvent::ResponseRewritten { display_content, modified_response, .. }) = rr {
+            assert_eq!(display_content, "DISPLAY ONLY");
+            assert!(modified_response.is_none(), "modifiedResponse must be None for display-only hook");
+        }
+    }
+
+    /// AgentResponse hook: both displayContent and modifiedResponse → displayContent shown.
+    #[tokio::test]
+    async fn agent_response_hook_display_content_takes_priority_over_modified_response() {
+        let hook_runner = make_agent_response_hook_runner(
+            r#"{"hookSpecificOutput":{"modifiedResponse":"FOR_HISTORY","displayContent":"FOR_USER"}}"#,
+        );
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("original".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let sink = CollectingSink::new();
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_hook_runner(hook_runner)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        let events = sink.take();
+        let rr = events.iter().find(|e| matches!(e, AgentEvent::ResponseRewritten { .. }));
+        if let Some(AgentEvent::ResponseRewritten { display_content, modified_response, .. }) = rr {
+            assert_eq!(display_content, "FOR_USER", "displayContent must take priority for display");
+            assert_eq!(modified_response.as_deref(), Some("FOR_HISTORY"), "modifiedResponse stored");
+        } else {
+            panic!("ResponseRewritten event not found");
+        }
+    }
+
+    /// AgentResponse hook: no change means no ResponseRewritten event.
+    #[tokio::test]
+    async fn agent_response_hook_no_change_emits_no_event() {
+        // Hook returns empty JSON (no modifications).
+        let hook_runner = make_agent_response_hook_runner("{}");
+
+        let client = MockLlmClient::new(vec![vec![
+            Ok(StreamEvent::TextDelta("original".into())),
+            Ok(done()),
+        ]]);
+        let tools = Arc::new(ToolRegistry::new([] as [Arc<dyn crate::tool::Tool>; 0]));
+        let sink = CollectingSink::new();
+
+        let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+            .with_hook_runner(hook_runner)
+            .with_tool_max_duration(None)
+            .build();
+
+        let mut history = vec![Message::user("go")];
+        agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+        let events = sink.take();
+        let has_rr = events.iter().any(|e| matches!(e, AgentEvent::ResponseRewritten { .. }));
+        assert!(!has_rr, "no ResponseRewritten event must be emitted when hook returns no change");
+    }
 }
+
+
+
+

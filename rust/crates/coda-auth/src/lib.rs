@@ -49,4 +49,4 @@ pub use error::AuthError;
 pub use manager::CredentialManager;
 pub use provider::{AuthProvider, DeviceCodePrompt};
 pub use secret::Secret;
-pub use store::{CredentialStore, EncryptedFileStore, InMemoryStore, KeyringStore};
+pub use store::{CredentialStore, DpapiStore, EncryptedFileStore, InMemoryStore, KeyringStore};

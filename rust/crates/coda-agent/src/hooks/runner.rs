@@ -8,15 +8,17 @@
 //! 2. For each matching hook (in configuration order):
 //!    a. Check trust guard (project / plugin hooks).
 //!    b. Apply per-hook timeout (hook override → event default).
-//!    c. Dispatch to the executor (shell, HTTP, or unsupported handler).
+//!    c. Dispatch to the executor (shell, HTTP, or agent-type handler).
 //!    d. Apply fail-open / fail-closed policy on timeout / error.
 //!    e. Stop iterating when `continue_execution = false`.
 //! 3. Merge outputs by event-specific rules.
 
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use super::content_hash::HookContentHash;
@@ -27,8 +29,10 @@ use super::output::{
     SubagentStopResult, UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 use super::policy::HookEventPolicy;
+use super::run_log::{HookRunEntry, HookRunLog};
 use super::trust_guard::HookTrustGuard;
 use super::{HookScope, UserHook};
+use crate::subagents::{SubagentFactory, SubagentRequest};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Executor trait
@@ -119,6 +123,15 @@ pub struct HookRunner {
     hooks: Vec<UserHook>,
     executor: Arc<dyn HookExecutor>,
     trust_guard: Option<Arc<HookTrustGuard>>,
+    /// Optional run log: records each hook's outcome + duration.
+    /// Caller-cancelled runs are excluded from the log.
+    run_log: Option<Arc<HookRunLog>>,
+    /// Hook-free subagent factory for `agent`-type hooks.
+    /// MUST be constructed without a `HookRunner` to prevent hook re-entrancy.
+    hook_subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    /// Allowlist of hostnames that `http`-type hooks are permitted to call.
+    /// An empty list means all HTTP hooks are refused (security: fail-closed).
+    http_hook_allowlist: Vec<String>,
 
     // Fast-path flags so callers can skip entire event types cheaply.
     pub has_pre_tool_use: bool,
@@ -150,6 +163,18 @@ impl HookRunner {
         executor: Arc<dyn HookExecutor>,
         trust_guard: Option<Arc<HookTrustGuard>>,
     ) -> Self {
+        Self::build(hooks, executor, trust_guard, None, None, Vec::new())
+    }
+
+    /// Full constructor: executor + trust guard + run log + agent-hook factory + HTTP allowlist.
+    pub fn build(
+        hooks: Vec<UserHook>,
+        executor: Arc<dyn HookExecutor>,
+        trust_guard: Option<Arc<HookTrustGuard>>,
+        run_log: Option<Arc<HookRunLog>>,
+        hook_subagent_factory: Option<Arc<dyn SubagentFactory>>,
+        http_hook_allowlist: Vec<String>,
+    ) -> Self {
         let has = |ev: &str| hooks.iter().any(|h| h.event.eq_ignore_ascii_case(ev));
         let any_mutates_display = hooks.iter().any(|h| {
             h.event.eq_ignore_ascii_case("AgentResponse")
@@ -176,7 +201,19 @@ impl HookRunner {
             hooks,
             executor,
             trust_guard,
+            run_log,
+            hook_subagent_factory,
+            http_hook_allowlist,
         }
+    }
+
+    /// Returns the 0-based index of `hook` in `self.hooks` by pointer equality.
+    /// Matches C# `IndexOf` (reference equality on the configured list).
+    fn hook_index_of(&self, hook: &UserHook) -> usize {
+        self.hooks
+            .iter()
+            .position(|h| std::ptr::eq(h as *const UserHook, hook as *const UserHook))
+            .unwrap_or(0)
     }
 
     // ── Public run methods ────────────────────────────────────────────────────
@@ -421,6 +458,8 @@ impl HookRunner {
     }
 
     /// Run a single hook, applying trust check, timeout, and fail-open policy.
+    /// Records the outcome to the run log unless the caller cancelled the token
+    /// (caller-cancelled runs are excluded from the audit log).
     async fn run_single(
         &self,
         hook: &UserHook,
@@ -436,6 +475,15 @@ impl HookRunner {
         if let Some(guard) = &self.trust_guard {
             if hook.scope == HookScope::Project || hook.plugin_origin.is_some() {
                 if !guard.can_run(hook) {
+                    // Record "skipped" with zero duration.
+                    if let Some(log) = &self.run_log {
+                        let idx = self.hook_index_of(hook);
+                        log.record(idx, HookRunEntry {
+                            ran_at: Utc::now(),
+                            outcome: "skipped".into(),
+                            duration_ms: 0,
+                        });
+                    }
                     // Untrusted: apply fail-open/closed policy.
                     return if fail_open {
                         HookOutput::no_op()
@@ -454,15 +502,17 @@ impl HookRunner {
             }
         }
 
+        let start = Instant::now();
         let exec_result = self.dispatch(hook, payload, cancel.clone(), timeout_secs).await;
+        let duration_ms = start.elapsed().as_millis() as i64;
 
-        match exec_result {
+        let output = match exec_result {
             // Hook ran and produced output.
             Ok(stdout) => HookOutput::parse(&stdout),
 
-            // Hook timed out (our own CancellationToken fired, not caller's).
+            // Hook-specific timeout (our own timer fired, not caller's token).
             Err(ExecError::Timeout) => {
-                if fail_open {
+                let out = if fail_open {
                     HookOutput::no_op()
                 } else {
                     HookOutput {
@@ -471,12 +521,21 @@ impl HookRunner {
                         continue_execution: false,
                         specific: None,
                     }
+                };
+                // "timeout" IS recorded.
+                if let Some(log) = &self.run_log {
+                    let idx = self.hook_index_of(hook);
+                    log.record(idx, HookRunEntry {
+                        ran_at: Utc::now(),
+                        outcome: "timeout".into(),
+                        duration_ms,
+                    });
                 }
+                return out;
             }
 
-            // Caller cancellation — propagate by returning a no-op (the caller
-            // checks the cancel token and will exit before acting on it).
-            Err(ExecError::Cancelled) => HookOutput::no_op(),
+            // Caller cancellation — propagate as no-op but do NOT record.
+            Err(ExecError::Cancelled) => return HookOutput::no_op(),
 
             // A handler type this build cannot dispatch has NOT approved
             // anything, so it must take the event's fail-open policy rather
@@ -510,7 +569,26 @@ impl HookRunner {
                     }
                 }
             }
+        };
+
+        // Record the outcome (excluding caller-cancelled, already handled above).
+        if let Some(log) = &self.run_log {
+            let outcome = if !output.continue_execution {
+                "abort"
+            } else if output.is_blocking() {
+                "blocked"
+            } else {
+                "allow"
+            };
+            let idx = self.hook_index_of(hook);
+            log.record(idx, HookRunEntry {
+                ran_at: Utc::now(),
+                outcome: outcome.into(),
+                duration_ms,
+            });
         }
+
+        output
     }
 
     /// Dispatch a hook to the appropriate handler.
@@ -555,10 +633,109 @@ impl HookRunner {
                     }
                 }
             }
-            // HTTP and agent handler types are not dispatched by this build.
-            // Report that explicitly so the caller can apply the event's
-            // fail-open policy; returning Ok("") here would parse as a no-op
-            // and silently approve a fail-closed gate.
+
+            "http" => {
+                let url = match &hook.url {
+                    Some(u) if !u.trim().is_empty() => u.clone(),
+                    _ => return Err(ExecError::Other("http hook has no URL".into())),
+                };
+
+                // Fail-closed: an empty allowlist means no HTTP hooks are permitted.
+                if self.http_hook_allowlist.is_empty() {
+                    tracing::warn!(url = %url, "http hook refused: no allowlist configured");
+                    return Err(ExecError::Other(
+                        "http hook refused: no HTTP hook allowlist is configured".into(),
+                    ));
+                }
+
+                // Validate URL and run SSRF protection under the timeout.
+                let hook_cancel = CancellationToken::new();
+                let result = tokio::select! {
+                    r = dispatch_http_hook(&url, payload, &self.http_hook_allowlist, hook_cancel.clone()) => r,
+                    _ = cancel.cancelled() => return Err(ExecError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                        hook_cancel.cancel();
+                        return Err(ExecError::Timeout);
+                    }
+                };
+                result.map_err(ExecError::Other)
+            }
+
+            "agent" => {
+                let rule = match &hook.hook_prompt {
+                    Some(r) if !r.trim().is_empty() => r.clone(),
+                    _ => {
+                        return Err(ExecError::Other(
+                            "agent hook has no hook_prompt rule".into(),
+                        ))
+                    }
+                };
+
+                // Fail-open: no factory = treat as not supported
+                let factory = match &self.hook_subagent_factory {
+                    Some(f) => f.clone(),
+                    None => return Err(ExecError::Unsupported("agent (no factory)".into())),
+                };
+
+                // Extract depth from payload (default 0 if absent/unparseable).
+                let payload_depth: u32 =
+                    serde_json::from_str::<serde_json::Value>(payload)
+                        .ok()
+                        .and_then(|v| v.get("depth").and_then(|d| d.as_u64()))
+                        .map(|d| d as u32)
+                        .unwrap_or(0);
+
+                // Depth limit: fail-open (return no-op, not a block).
+                use crate::subagents::MAX_SUBAGENT_DEPTH;
+                if payload_depth >= MAX_SUBAGENT_DEPTH {
+                    tracing::warn!(
+                        depth = payload_depth,
+                        max = MAX_SUBAGENT_DEPTH,
+                        "agent hook skipped: would exceed max subagent depth"
+                    );
+                    return Ok(String::new()); // no-op output
+                }
+
+                let agent_type = hook.agent_type.clone().unwrap_or_else(|| "general-purpose".into());
+                let subagent_depth = payload_depth + 1;
+                let task_id = uuid::Uuid::new_v4().simple().to_string();
+
+                let prompt = build_agent_hook_prompt(&rule, payload);
+                let request = SubagentRequest::foreground(
+                    agent_type,
+                    prompt,
+                    task_id,
+                    subagent_depth,
+                );
+
+                // Run the hook-free subagent under the timeout.
+                let hook_cancel = CancellationToken::new();
+                let result = tokio::select! {
+                    r = factory.spawn(request, Arc::new(crate::events::NullSink), hook_cancel.clone()) => r,
+                    _ = cancel.cancelled() => return Err(ExecError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                        hook_cancel.cancel();
+                        return Err(ExecError::Timeout);
+                    }
+                };
+
+                match result {
+                    Ok(output) => {
+                        // Parse the model's JSON answer: {"ok": true/false, "reason": "..."}
+                        Ok(parse_agent_hook_result(&output))
+                    }
+                    Err(msg) => {
+                        // Concurrency slot exhausted → fail-open (return no-op).
+                        if msg.contains("slots are taken") || msg.contains("slot") {
+                            tracing::warn!("agent hook skipped: all concurrency slots are taken");
+                            Ok(String::new())
+                        } else {
+                            Err(ExecError::Other(msg))
+                        }
+                    }
+                }
+            }
+
             other => Err(ExecError::Unsupported(other.to_string())),
         }
     }
@@ -574,6 +751,181 @@ enum ExecError {
     /// The hook declares a handler type this build cannot run.
     Unsupported(String),
     Other(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP hook helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// POST the payload to `url`, returning the response body.
+/// Validates the URL against `allowlist` and performs SSRF IP checks.
+async fn dispatch_http_hook(
+    url: &str,
+    payload: &str,
+    allowlist: &[String],
+    cancel: CancellationToken,
+) -> Result<String, String> {
+    validate_http_url(url, allowlist)?;
+    check_ssrf(url, cancel.clone()).await?;
+
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("http client build failed: {e}"))?;
+
+    let response = tokio::select! {
+        r = client.post(url).header("content-type", "application/json").body(payload.to_owned()).send() => {
+            r.map_err(|e| format!("HTTP request failed: {e}"))?
+        }
+        _ = cancel.cancelled() => return Err("http hook cancelled".into()),
+    };
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let preview = if body.len() > 200 { &body[..200] } else { &body };
+        return Err(format!("HTTP {}: {preview}", status.as_u16()));
+    }
+
+    Ok(body)
+}
+
+/// Validate the URL against scheme rules, credentials check, and allowlist.
+pub(crate) fn validate_http_url(url: &str, allowlist: &[String]) -> Result<(), String> {
+    let parsed: reqwest::Url =
+        url.parse().map_err(|_| format!("invalid URL: {url}"))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not contain embedded credentials".into());
+    }
+
+    let scheme = parsed.scheme();
+
+    if scheme == "http" {
+        let host = parsed.host_str().unwrap_or("");
+        let is_loopback = host == "127.0.0.1"
+            || host == "::1"
+            || host.eq_ignore_ascii_case("localhost");
+        if !is_loopback {
+            return Err("http (non-TLS) is only permitted for loopback addresses".into());
+        }
+    } else if scheme != "https" {
+        return Err(format!("unsupported URL scheme: {scheme}"));
+    }
+
+    let host = parsed.host_str().unwrap_or("");
+    if !allowlist.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+        return Err(format!("host '{host}' is not in the HTTP hook allowlist"));
+    }
+
+    Ok(())
+}
+
+/// Resolve `url`'s host and refuse if any resolved address is in a blocked range.
+async fn check_ssrf(url: &str, cancel: CancellationToken) -> Result<(), String> {
+    let parsed: reqwest::Url = url.parse().map_err(|_| "invalid URL")?;
+    let host = parsed.host_str().unwrap_or("");
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_address(ip) {
+            return Err(format!("SSRF: IP address {ip} is in a blocked range"));
+        }
+        return Ok(());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_target = format!("{host}:{port}");
+    let addrs = tokio::select! {
+        r = tokio::net::lookup_host(&lookup_target) => {
+            r.map_err(|e| format!("SSRF: DNS resolution failed for '{host}': {e}"))?
+        }
+        _ = cancel.cancelled() => return Err("SSRF check cancelled".into()),
+    };
+
+    let addrs: Vec<_> = addrs.collect();
+    if addrs.is_empty() {
+        return Err(format!("SSRF: DNS resolution returned no addresses for '{host}'"));
+    }
+
+    for addr in &addrs {
+        if is_blocked_address(addr.ip()) {
+            return Err(format!(
+                "SSRF: '{}' resolves to blocked address {}",
+                host,
+                addr.ip()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// Returns `true` for IP addresses in RFC-1918, loopback, link-local, and
+/// metadata service ranges that must not be reachable from a hook.
+pub(crate) fn is_blocked_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if o[0] == 127 { return true; }
+            if o[0] == 10 { return true; }
+            if o[0] == 172 && (16..=31).contains(&o[1]) { return true; }
+            if o[0] == 192 && o[1] == 168 { return true; }
+            if o[0] == 169 && o[1] == 254 { return true; }
+            if o[0] == 0 { return true; }
+            false
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() { return true; }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_address(IpAddr::V4(v4));
+            }
+            let seg = v6.segments();
+            if seg[0] & 0xffc0 == 0xfe80 { return true; }
+            if seg[0] & 0xffc0 == 0xfec0 { return true; }
+            if seg[0] & 0xfe00 == 0xfc00 { return true; }
+            false
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent hook helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_agent_hook_prompt(rule: &str, payload: &str) -> String {
+    format!(
+        "You are evaluating a hook rule. Determine whether the following event payload \
+satisfies or violates the rule.\n\nRule: {rule}\n\nPayload:\n{payload}\n\n\
+Respond with EXACTLY ONE line of JSON — nothing else:\n  \
+{{\"ok\": true, \"reason\": \"brief explanation\"}}    when the payload passes the rule\n  \
+{{\"ok\": false, \"reason\": \"brief explanation\"}}   when the payload violates the rule"
+    )
+}
+
+fn parse_agent_hook_result(agent_output: &str) -> String {
+    if let Some(start) = agent_output.find('{') {
+        let slice = &agent_output[start..];
+        if let Some(end) = slice.find('}') {
+            let candidate = &slice[..=end];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+                let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_owned();
+                if ok {
+                    return serde_json::to_string(&serde_json::json!({
+                        "decision": "allow",
+                        "reason": reason,
+                    })).unwrap_or_default();
+                } else {
+                    return serde_json::to_string(&serde_json::json!({
+                        "decision": "block",
+                        "reason": reason,
+                    })).unwrap_or_default();
+                }
+            }
+        }
+    }
+    String::new() // Unparseable → allow (fail-open)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1546,5 +1898,360 @@ mod tests {
             "last writer must win for modifiedPrompt"
         );
     }
+
+    // ── Feature 5: Hook run log ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_log_records_allow_outcome_after_successful_run() {
+        let exec = MockExecutor::new(vec![(0, r#"{"decision":"allow"}"#)]);
+        let log = Arc::new(HookRunLog::new());
+        let h = hook("PreToolUse", "check.sh");
+        let runner = HookRunner::build(vec![h], exec, None, Some(log.clone()), None, Vec::new());
+        runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        let entry = log.get(0).expect("entry must be recorded");
+        assert_eq!(entry.outcome, "allow");
+        assert!(entry.duration_ms >= 0);
+    }
+
+    #[tokio::test]
+    async fn run_log_records_blocked_outcome() {
+        let exec = MockExecutor::new(vec![(0, r#"{"decision":"block","reason":"denied"}"#)]);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook("PreToolUse", "check.sh")],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert_eq!(log.get(0).unwrap().outcome, "blocked");
+    }
+
+    #[tokio::test]
+    async fn run_log_records_abort_when_continue_is_false() {
+        let exec = MockExecutor::new(vec![(0, r#"{"continue":false}"#)]);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook("PostToolUse", "notify.sh")],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        assert_eq!(log.get(0).unwrap().outcome, "abort");
+    }
+
+    #[tokio::test]
+    async fn run_log_records_timeout_outcome() {
+        let exec = MockExecutor::with_delay(vec![], 2000);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook_with_timeout("PostToolUse", "slow.sh", 0)],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        assert_eq!(log.get(0).unwrap().outcome, "timeout");
+    }
+
+    #[tokio::test]
+    async fn run_log_records_skipped_for_untrusted_hook() {
+        let store = Arc::new(InMemoryHookTrustStore::new());
+        let guard = Arc::new(HookTrustGuard::new(store, "/project", None));
+        let exec = MockExecutor::new(vec![]);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![project_hook("PostToolUse", "audit.sh")],
+            exec, Some(guard), Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        let entry = log.get(0).expect("entry must be recorded for skipped hook");
+        assert_eq!(entry.outcome, "skipped");
+        assert_eq!(entry.duration_ms, 0);
+    }
+
+    /// CRITICAL: caller-cancelled hook must NOT be recorded in the run log.
+    ///
+    /// Mutation-verified: change `Err(ExecError::Cancelled) => return HookOutput::no_op()`
+    /// in run_single to fall through to the recording path, then this test fails.
+    #[tokio::test]
+    async fn caller_cancelled_hook_is_not_recorded_in_runlog() {
+        let exec = MockExecutor::with_delay(vec![(0, r#"{"decision":"allow"}"#)], 2000);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook("PreToolUse", "check.sh")],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        let cts = CancellationToken::new();
+        cts.cancel();
+        runner.run_pre_tool_use("bash", "{}", cts).await;
+        assert!(
+            log.get(0).is_none(),
+            "caller-cancelled hook must not appear in the run log"
+        );
+    }
+
+    // ── Feature 4: HTTP hook handler ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_hook_with_empty_allowlist_is_refused() {
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("http".into());
+        h.url = Some("https://api.example.com/hook".into());
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, None, Vec::new(),
+        );
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(result.block, "http hook with empty allowlist must block (fail-closed)");
+    }
+
+    #[tokio::test]
+    async fn http_hook_url_not_in_allowlist_is_refused() {
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("http".into());
+        h.url = Some("https://evil.com/hook".into());
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, None,
+            vec!["trusted.example.com".to_owned()],
+        );
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(result.block, "url not in allowlist must block");
+    }
+
+    #[test]
+    fn validate_http_url_accepts_https_allowlisted_host() {
+        assert!(validate_http_url(
+            "https://api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_ok());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_embedded_credentials() {
+        assert!(validate_http_url(
+            "https://user:pass@api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_ftp_scheme() {
+        assert!(validate_http_url(
+            "ftp://api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_plain_http_non_loopback() {
+        assert!(validate_http_url(
+            "http://api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_http_url_allows_plain_http_for_loopback() {
+        assert!(validate_http_url(
+            "http://127.0.0.1:8080/hook",
+            &["127.0.0.1".to_owned()],
+        ).is_ok());
+    }
+
+    #[test]
+    fn blocked_address_covers_private_ranges() {
+        use std::str::FromStr;
+        let cases: &[(&str, bool)] = &[
+            ("10.0.0.1", true),
+            ("172.16.0.1", true),
+            ("172.31.255.254", true),
+            ("172.15.0.1", false),
+            ("172.32.0.1", false),
+            ("192.168.1.1", true),
+            ("192.169.1.1", false),
+            ("127.0.0.1", true),
+            ("169.254.1.1", true),
+            ("8.8.8.8", false),
+            ("0.0.0.1", true),
+        ];
+        for (addr, expected) in cases {
+            let ip = IpAddr::from_str(addr).unwrap();
+            assert_eq!(is_blocked_address(ip), *expected, "is_blocked_address({addr}) should be {expected}");
+        }
+    }
+
+    // ── Feature 4: Agent hook handler ─────────────────────────────────────────
+
+    /// SECURITY CRITICAL: hook-free subagent factory must be used.
+    ///
+    /// Mutation-verified: wire a factory WITH a HookRunner that calls a
+    /// CountingExecutor; with hook-free factory the count is 0.
+    #[tokio::test]
+    async fn agent_hook_spawned_subagent_does_not_retrigger_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering as Ord};
+
+        struct CountingFactory(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for CountingFactory {
+            async fn spawn(
+                &self,
+                _req: SubagentRequest,
+                _sink: Arc<dyn crate::events::AgentSink>,
+                _cancel: CancellationToken,
+            ) -> Result<String, String> {
+                self.0.fetch_add(1, Ord::SeqCst);
+                Ok(r#"{"ok": true, "reason": "approved"}"#.to_owned())
+            }
+        }
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn SubagentFactory> = Arc::new(CountingFactory(spawn_count.clone()));
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("Block any tool that modifies files".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(factory), Vec::new(),
+        );
+
+        let payload = serde_json::to_string(&serde_json::json!({"event":"PreToolUse","toolName":"bash","depth":0})).unwrap();
+        runner.run_pre_tool_use("bash", &payload, CancellationToken::new()).await;
+
+        assert_eq!(
+            spawn_count.load(Ord::SeqCst),
+            1,
+            "agent hook must spawn exactly one subagent; re-triggering would indicate recursion"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_hook_does_not_run_when_all_slots_are_taken() {
+        struct RefusingFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for RefusingFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                Err("All subagent concurrency slots are taken; try again later.".to_owned())
+            }
+        }
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("check this".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(RefusingFactory)), Vec::new(),
+        );
+
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(!result.block, "slot-exhausted agent hook must be fail-open");
+    }
+
+    #[tokio::test]
+    async fn agent_hook_ok_false_blocks_event() {
+        struct BlockingFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for BlockingFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                Ok(r#"{"ok": false, "reason": "policy violation"}"#.to_owned())
+            }
+        }
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("Block dangerous commands".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(BlockingFactory)), Vec::new(),
+        );
+
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(result.block, "agent hook returning ok:false must block the event");
+    }
+
+    #[tokio::test]
+    async fn agent_hook_unusable_output_is_fail_open() {
+        struct GarbageFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for GarbageFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                Ok("I could not decide".to_owned())
+            }
+        }
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("evaluate this".into());
+        h.fail_open = Some(true);
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(GarbageFactory)), Vec::new(),
+        );
+
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(!result.block, "unusable agent output must be fail-open");
+    }
+
+    /// Agent hook: depth limit exceeded → fail-open (no block, no spawn).
+    ///
+    /// Mutation-verified: remove the `payload_depth >= MAX_SUBAGENT_DEPTH` guard
+    /// in dispatch and this test fails (spawn_count > 0).
+    #[tokio::test]
+    async fn agent_hook_skipped_at_max_depth() {
+        use std::sync::atomic::{AtomicUsize, Ordering as Ord};
+
+        struct CountingFactory(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for CountingFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                self.0.fetch_add(1, Ord::SeqCst);
+                Ok(r#"{"ok":true}"#.to_owned())
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut h = hook("UserPromptSubmit", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("check".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None,
+            Some(Arc::new(CountingFactory(count.clone()))), Vec::new(),
+        );
+
+        use crate::subagents::MAX_SUBAGENT_DEPTH;
+        let result = runner
+            .run_user_prompt_submit("test", &[], 0, "model", "default", MAX_SUBAGENT_DEPTH, CancellationToken::new())
+            .await;
+
+        assert!(!result.block, "depth-limit skip must be fail-open");
+        assert_eq!(count.load(Ord::SeqCst), 0, "no subagent must be spawned at max depth");
+    }
+
+    #[tokio::test]
+    async fn agent_hook_without_prompt_fails_gracefully() {
+        struct NeverFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for NeverFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                panic!("should not be called");
+            }
+        }
+
+        let mut h = hook("PostToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = None;
+        h.fail_open = Some(true);
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(NeverFactory)), Vec::new(),
+        );
+
+        let result = runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        assert!(result.block_reason.is_none());
+    }
 }
+
 

@@ -12,12 +12,18 @@ use serde::{Deserialize, Serialize};
 use crate::secret::Secret;
 
 /// How a credential authenticates with its provider.
+///
+/// Serialized as the C# writes it (`"OAuth"` / `"ApiKey"`) so that a
+/// credential written by either build is readable by the other. The snake_case
+/// spellings are accepted as aliases because an earlier Rust build wrote them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "PascalCase")]
 pub enum CredentialKind {
     /// OAuth access/refresh token pair (e.g. Claude.ai subscriber).
+    #[serde(alias = "o_auth", alias = "oauth")]
     OAuth,
     /// A static API key sent as `x-api-key`.
+    #[serde(alias = "api_key")]
     ApiKey,
 }
 
@@ -38,28 +44,36 @@ pub struct AccountInfo {
 /// Serialized to the [`CredentialStore`][crate::store::CredentialStore] — the
 /// store is responsible for encrypting the blob at rest.  All secret fields use
 /// [`Secret`] so that `Debug` output never reveals token material.
+///
+/// The wire form is camelCase, matching the C# `Credential` record exactly, so
+/// a credential written by either build is readable by the other. Getting this
+/// wrong is silent and user-visible: deserialization fails, the engine finds no
+/// credential, and the user simply appears logged out. snake_case is accepted
+/// as an alias because an earlier Rust build wrote it.
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Credential {
     /// Stable provider id (e.g. `"claude-ai"` or `"github-copilot"`).
+    #[serde(alias = "provider_id")]
     pub provider_id: String,
 
     pub kind: CredentialKind,
 
     /// OAuth access token (OAuth credentials only).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "access_token", skip_serializing_if = "Option::is_none")]
     pub access_token: Option<Secret<String>>,
 
     /// OAuth refresh token, kept so the short-lived access token can be renewed
     /// without re-authenticating the user.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "refresh_token", skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<Secret<String>>,
 
     /// Static API key (`ApiKey` credentials only).
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "api_key", skip_serializing_if = "Option::is_none")]
     pub api_key: Option<Secret<String>>,
 
     /// Absolute UTC expiry of `access_token`, if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "expires_at", skip_serializing_if = "Option::is_none")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 
     /// Granted OAuth scopes.

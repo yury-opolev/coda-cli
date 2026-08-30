@@ -26,6 +26,7 @@ pub mod content_hash;
 pub mod matcher;
 pub mod output;
 pub mod policy;
+pub mod run_log;
 pub mod runner;
 pub mod trust_guard;
 pub mod trust_store;
@@ -38,6 +39,7 @@ pub use output::{
     UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 pub use policy::HookEventPolicy;
+pub use run_log::{HookRunEntry, HookRunLog};
 pub use runner::HookRunner;
 pub use trust_guard::HookTrustGuard;
 pub use trust_store::{HookTrustStore, InMemoryHookTrustStore};

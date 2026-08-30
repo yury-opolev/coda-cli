@@ -62,8 +62,8 @@ pub use goal::{
     GoalSupervisor, GoalVerdict,
 };
 pub use hooks::{
-    HookContentHash, HookEventPolicy, HookMatcher, HookRunner, HookScope, HookTrustGuard,
-    HookTrustStore, InMemoryHookTrustStore, UserHook,
+    HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,
+    HookScope, HookTrustGuard, HookTrustStore, InMemoryHookTrustStore, UserHook,
 };
 pub use output_styles::{BuiltInOutputStyles, DynOutputStyle, OutputStyle};
 pub use permission::{
@@ -78,3 +78,8 @@ pub use tool::{
     ToolRegistry, ToolResult, UserQuestion,
 };
 pub use tools::{built_in_file_tools, built_in_tools};
+pub use scheduling::{
+    NullScheduleLifecycleSink, ScheduleLifecycleEvent, ScheduleLifecycleSink,
+    ScheduleRuntimeSnapshot, ScheduleRuntimeState, ScheduleRuntimeStatus, ScheduleRuntimeView,
+    ScheduleRuntime, ScheduledAgentRunner, TaskManagerRunner,
+};
