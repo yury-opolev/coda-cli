@@ -19,7 +19,7 @@ use serde_json::Value;
 /// a hardcoded default caused here before.
 pub const FALLBACK_MODEL: &str = "claude-opus-5";
 
-/// The provider assumed when settings say nothing.
+/// The provider assumed when settings say nothing and no credential is connected.
 pub const FALLBACK_PROVIDER: &str = "github-copilot";
 
 /// Locates `~/.coda/settings.json`.
@@ -37,9 +37,11 @@ pub struct StartupModel {
 /// Resolves the startup provider and model from a settings document.
 ///
 /// Mirrors the C#: `modelByProvider[provider]` selects the model, falling back
-/// to a top-level `model`, then to the built-in default. A provider named in
-/// `defaultProvider` but absent from `modelByProvider` still resolves, because
-/// a half-configured file should not leave the engine with no model at all.
+/// to `defaultModel` (the canonical C# key), then to the built-in default.
+/// The legacy `model` key is also accepted as a secondary fallback for backwards
+/// compatibility with existing settings files. A provider named in `defaultProvider`
+/// but absent from `modelByProvider` still resolves, because a half-configured
+/// file should not leave the engine with no model at all.
 pub fn resolve_from(value: &Value) -> StartupModel {
     let provider_id = value
         .get("defaultProvider")
@@ -55,8 +57,10 @@ pub fn resolve_from(value: &Value) -> StartupModel {
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty());
 
+    // C# uses `defaultModel`; fall back to the legacy `model` key for backwards compat.
     let top_level = value
-        .get("model")
+        .get("defaultModel")
+        .or_else(|| value.get("model"))
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty());
 
@@ -66,6 +70,68 @@ pub fn resolve_from(value: &Value) -> StartupModel {
         .to_owned();
 
     StartupModel { provider_id, model }
+}
+
+/// Resolves the startup model for the credential that was **actually** connected.
+///
+/// Unlike [`resolve`], which reads `defaultProvider` from settings, this uses
+/// the provider id that the already-connected `LlmClient` reports — the one
+/// whose credential was found on this machine. This prevents a mismatch where
+/// the client is Anthropic (because `ANTHROPIC_API_KEY` is set) but the model
+/// is a Copilot id (because settings say `defaultProvider: github-copilot`).
+///
+/// Resolution: `modelByProvider[provider]` → `defaultModel` → `model` → built-in default.
+///
+/// When `provider` is `None`, falls back to `FALLBACK_PROVIDER` (same as [`resolve`]).
+pub fn resolve_for_provider(provider: Option<&str>) -> StartupModel {
+    match settings_path() {
+        Some(p) => resolve_for_provider_at(&p, provider),
+        None => StartupModel {
+            provider_id: provider.unwrap_or(FALLBACK_PROVIDER).into(),
+            model: FALLBACK_MODEL.into(),
+        },
+    }
+}
+
+/// Like [`resolve_for_provider`] but reads from an explicit file path.
+/// Exposed for testing; production callers use [`resolve_for_provider`].
+pub fn resolve_for_provider_at(path: &Path, provider: Option<&str>) -> StartupModel {
+    let value = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .unwrap_or_default();
+    resolve_for_provider_from(&value, provider)
+}
+
+fn resolve_for_provider_from(value: &Value, provider: Option<&str>) -> StartupModel {
+    let provider_id = provider.unwrap_or(FALLBACK_PROVIDER).to_owned();
+
+    let by_provider = value
+        .get("modelByProvider")
+        .and_then(Value::as_object)
+        .and_then(|map| map.get(&provider_id))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+
+    let top_level = value
+        .get("defaultModel")
+        .or_else(|| value.get("model"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+
+    let model = by_provider
+        .or(top_level)
+        .unwrap_or(FALLBACK_MODEL)
+        .to_owned();
+
+    StartupModel { provider_id, model }
+}
+
+/// Returns the model to use for the given connected provider.
+///
+/// Convenience wrapper around [`resolve_for_provider`].
+pub fn model_for_provider(provider: &str) -> String {
+    resolve_for_provider(Some(provider)).model
 }
 
 /// Reads the startup model from a specific settings file.
@@ -120,9 +186,25 @@ mod tests {
     }
 
     #[test]
-    fn a_top_level_model_is_used_when_the_map_has_no_entry() {
-        let value = json!({ "defaultProvider": "github-copilot", "model": "some-model" });
+    fn the_default_model_key_is_used_when_the_map_has_no_entry() {
+        let value = json!({ "defaultProvider": "github-copilot", "defaultModel": "some-model" });
         assert_eq!(resolve_from(&value).model, "some-model");
+    }
+
+    #[test]
+    fn the_legacy_model_key_is_accepted_for_backwards_compatibility() {
+        let value = json!({ "defaultProvider": "github-copilot", "model": "legacy-model" });
+        assert_eq!(resolve_from(&value).model, "legacy-model");
+    }
+
+    #[test]
+    fn default_model_wins_over_legacy_model_key() {
+        let value = json!({
+            "defaultProvider": "github-copilot",
+            "defaultModel": "new-model",
+            "model": "legacy-model"
+        });
+        assert_eq!(resolve_from(&value).model, "new-model", "defaultModel takes priority over model");
     }
 
     /// A provider named but not mapped must still yield a usable model, or the
@@ -177,5 +259,85 @@ mod tests {
         let resolved = resolve_at(Path::new("no-such-directory/settings.json"));
         assert_eq!(resolved.provider_id, FALLBACK_PROVIDER);
         assert_eq!(resolved.model, FALLBACK_MODEL);
+    }
+
+    // ── resolve_for_provider tests ────────────────────────────────────────────
+
+    #[test]
+    fn resolve_for_provider_uses_connected_provider_not_default_provider() {
+        // This test verifies the core of Finding 3: the model is chosen based on
+        // the credential that was actually connected, not settings.defaultProvider.
+        let dir = std::env::temp_dir().join(format!(
+            "coda-settings-provider-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "defaultProvider": "github-copilot",
+                "modelByProvider": {
+                    "github-copilot": "gpt-5",
+                    "anthropic": "claude-opus-4-8"
+                }
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        // resolve() would pick github-copilot + gpt-5.
+        // resolve_for_provider("anthropic") must pick anthropic + claude-opus-4-8.
+        let resolved = resolve_at(&path);
+        assert_eq!(resolved.provider_id, "github-copilot");
+        assert_eq!(resolved.model, "gpt-5");
+
+        let resolved_for = resolve_for_provider_at(&path, Some("anthropic"));
+        assert_eq!(resolved_for.provider_id, "anthropic");
+        assert_eq!(
+            resolved_for.model, "claude-opus-4-8",
+            "model must come from the connected provider, not defaultProvider"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_for_provider_falls_back_to_default_model_when_no_provider_entry() {
+        let dir = std::env::temp_dir().join(format!(
+            "coda-settings-fback-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "defaultModel": "fallback-model",
+                "modelByProvider": {}
+            })
+            .to_string(),
+        )
+        .expect("write");
+
+        let resolved = resolve_for_provider_at(&path, Some("anthropic"));
+        assert_eq!(resolved.model, "fallback-model",
+            "defaultModel must be the fallback when the provider has no entry");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_for_provider_none_uses_fallback_provider() {
+        let resolved = resolve_for_provider(None);
+        assert_eq!(resolved.provider_id, FALLBACK_PROVIDER);
     }
 }

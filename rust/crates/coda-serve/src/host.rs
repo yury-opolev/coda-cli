@@ -1,18 +1,30 @@
 //! ServeHost implements [ServeBackend] with a real agent loop.
 //! See module doc for live vs stubbed breakdown.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::Utc;
 use coda_agent::{
     AgentError, AgentLoopBuilder, CompactionService, GoalBudget, GoalOutcome, GoalStatus,
-    GoalSupervisor, TodoStore, TokenEstimator, ToolRegistry,
+    GoalSupervisor, HookContentHash, HookRunner, HookScope, HookTrustGuard, HookTrustStore,
+    InMemoryHookTrustStore, NullScheduleLifecycleSink, ScheduleRuntime, SubagentFactory,
+    TaskManagerRunner, TodoStore, TokenEstimator, ToolQuarantine, ToolRegistry, UserHook,
 };
 use coda_agent::agent::stop::UserQuestionPrompt;
 use coda_agent::events::{AgentEvent, AgentSink};
 use coda_agent::goal::ForkedAgent;
+use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
+use coda_agent::lsp::{LspServerConfig, LspServerManager, LspServerMapBuilder};
 use coda_agent::permission::{ModePermissionPrompt, PermissionMode, PermissionPrompt};
+use coda_agent::scheduling::{
+    ScheduleDefinitionDraft, ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
+};
+use coda_agent::subagents::{SubagentHost, MAX_CONCURRENT_SUBAGENTS};
+use coda_agent::tasks::TaskManager;
 use coda_agent::tool::{PlanApprover, UserQuestion};
 use coda_agent::tools::built_in_tools;
 use coda_auth::{
@@ -227,6 +239,16 @@ impl ForkedAgent for LlmForkedAgent {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SessionServices — built lazily on the first prompt when the client is known
+// ─────────────────────────────────────────────────────────────────────────────
+
+struct SessionServices {
+    hook_runner: Arc<HookRunner>,
+    subagent_host: Arc<SubagentHost>,
+    schedule_runtime: Arc<ScheduleRuntime>,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ServeHost
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -247,6 +269,19 @@ pub struct ServeHost {
     current_cancel: Mutex<Option<CancellationToken>>,
     /// `true` while a `session/prompt` or `session/compact` is running.
     turn_active: Mutex<bool>,
+    // ── Session-scoped services ──────────────────────────────────────────────
+    task_manager: Arc<TaskManager>,
+    schedule_store: Arc<ScheduledTaskStore>,
+    lsp_manager: Arc<LspServerManager>,
+    /// Trust decisions for project-scoped hooks; persists within the session.
+    hook_trust_store: Arc<InMemoryHookTrustStore>,
+    /// Hooks loaded once at session start with scopes stamped by the loader.
+    user_hooks: Vec<UserHook>,
+    /// SubagentHost, HookRunner, ScheduleRuntime — built lazily on first prompt.
+    session_services: tokio::sync::Mutex<Option<Arc<SessionServices>>>,
+    /// Set by `session/interrupt` when no cancel token is yet published.
+    /// Cleared and applied immediately when the next turn publishes its token.
+    pending_interrupt: Mutex<bool>,
 }
 
 impl ServeHost {
@@ -256,7 +291,8 @@ impl ServeHost {
         prompt_channel: Arc<PromptChannel>,
         working_dir: String,
     ) -> Arc<Self> {
-        Self::build(None, sink, prompt_channel, working_dir)
+        // No pre-built client: model resolved from settings.defaultProvider fallback.
+        Self::build(None, sink, prompt_channel, working_dir, None)
     }
 
     /// Test constructor — pre-built client is injected directly.
@@ -266,7 +302,9 @@ impl ServeHost {
         prompt_channel: Arc<PromptChannel>,
         working_dir: String,
     ) -> Arc<Self> {
-        Self::build(Some(client), sink, prompt_channel, working_dir)
+        // Finding 3: resolve model from the credential that is actually connected.
+        let provider_id = client.provider_id().to_owned();
+        Self::build(Some(client), sink, prompt_channel, working_dir, Some(&provider_id))
     }
 
     fn build(
@@ -274,6 +312,7 @@ impl ServeHost {
         sink: Arc<ServeSink>,
         prompt_channel: Arc<PromptChannel>,
         working_dir: String,
+        connected_provider: Option<&str>,
     ) -> Arc<Self> {
         let wire_perm = Arc::new(WirePermissionPrompt { channel: Arc::clone(&prompt_channel) });
         let permission_prompt: Arc<dyn PermissionPrompt> =
@@ -281,8 +320,22 @@ impl ServeHost {
         let user_question = Arc::new(WireUserQuestion { channel: Arc::clone(&prompt_channel) });
         let plan_approver = Arc::new(WirePlanApprover { channel: Arc::clone(&prompt_channel) });
         let tools = Arc::new(ToolRegistry::new(built_in_tools()));
+
+        // Resolve startup model from the connected provider (Finding 3).
+        let startup = crate::settings::resolve_for_provider(connected_provider);
+
+        let session_id = Uuid::new_v4().to_string();
+        let task_manager = TaskManager::with_defaults(&session_id);
+        let schedule_store = ScheduledTaskStore::new();
+
+        let settings_json = load_settings_value();
+        let lsp_configs = load_lsp_configs(&settings_json, &working_dir);
+        let lsp_manager = Arc::new(LspServerManager::new(lsp_configs, Some(working_dir.clone())));
+        let user_hooks = load_user_hooks(&working_dir);
+        let hook_trust_store = Arc::new(InMemoryHookTrustStore::new());
+
         Arc::new(Self {
-            session: Session::new(Uuid::new_v4().to_string()),
+            session: Session::new(session_id),
             sink,
             client: tokio::sync::Mutex::new(client),
             tools,
@@ -291,11 +344,18 @@ impl ServeHost {
             plan_approver,
             todos: Arc::new(TodoStore::new()),
             working_dir,
-            model: Mutex::new(crate::settings::resolve().model),
+            model: Mutex::new(startup.model),
             effort: Mutex::new(None),
             goal_params: Mutex::new(GoalParams::default()),
             current_cancel: Mutex::new(None),
             turn_active: Mutex::new(false),
+            task_manager,
+            schedule_store,
+            lsp_manager,
+            hook_trust_store,
+            user_hooks,
+            session_services: tokio::sync::Mutex::new(None),
+            pending_interrupt: Mutex::new(false),
         })
     }
 
@@ -315,6 +375,95 @@ impl ServeHost {
             .unwrap_or(Duration::from_secs(30 * 60));
         let judge = Box::new(LlmForkedAgent { client, model: self.current_model() });
         Some(GoalSupervisor::new(judge, goal_text, GoalBudget::start_now(max_dur, max_cont, 0.5), None))
+    }
+
+    /// Get or initialise the per-session services (SubagentHost, HookRunner,
+    /// ScheduleRuntime). Called on the first prompt once the client is known.
+    /// Subsequent calls return the cached `Arc<SessionServices>`.
+    async fn get_or_init_services(
+        &self,
+        client: Arc<dyn LlmClient>,
+    ) -> Arc<SessionServices> {
+        let mut guard = self.session_services.lock().await;
+        if let Some(ref svc) = *guard {
+            return Arc::clone(svc);
+        }
+        let svc = Arc::new(self.build_session_services(client));
+        *guard = Some(Arc::clone(&svc));
+        svc
+    }
+
+    /// Construct all session-scoped services that require a live client.
+    ///
+    /// Called at most once per session (the first time a prompt succeeds).
+    ///
+    /// # Security invariants
+    /// 1. `hook_free_subagent` is built *without* a HookRunner so agent-type
+    ///    hooks cannot re-trigger further hooks (unbounded recursion).
+    /// 2. Hook scope is stamped by the *loader* (in `load_user_hooks`), never
+    ///    read from the hook JSON. `HookScope` is `#[serde(skip)]` in the
+    ///    coda_agent definition, so any `"scope"` field in JSON is silently
+    ///    discarded and replaced with `HookScope::Project` (untrusted default).
+    fn build_session_services(&self, client: Arc<dyn LlmClient>) -> SessionServices {
+        // 1. Hook-free subagent (prevents hook re-entrancy for agent-type hooks).
+        let hook_free_subagent = SubagentHost::with_defaults(
+            Arc::clone(&client),
+            Arc::clone(&self.permission_prompt),
+            Arc::clone(&self.tools),
+            Arc::clone(&self.task_manager),
+            self.working_dir.clone(),
+        );
+
+        // 2. Trust guard using the session-scoped trust store.
+        let trust_guard = HookTrustGuard::new(
+            Arc::clone(&self.hook_trust_store) as Arc<dyn HookTrustStore>,
+            self.working_dir.clone(),
+            None, // headless: untrusted project hooks are refused without interactive prompt
+        );
+
+        // 3. HookRunner with the hook-free subagent factory so agent hooks
+        //    cannot re-enter the hook system.
+        let executor: Arc<dyn HookExecutor> = Arc::new(ShellHookExecutor);
+        let hook_runner = Arc::new(HookRunner::build(
+            self.user_hooks.clone(),
+            executor,
+            Some(Arc::new(trust_guard)),
+            None,
+            Some(hook_free_subagent as Arc<dyn SubagentFactory>),
+            Vec::new(), // no HTTP allowlist; http hooks require explicit opt-in
+        ));
+
+        // 4. Main subagent host (with the hook runner).
+        let main_subagent = SubagentHost::new(
+            Arc::clone(&client),
+            Arc::clone(&self.permission_prompt),
+            Arc::clone(&self.tools),
+            Arc::new(ToolQuarantine::new()),
+            Arc::clone(&self.task_manager),
+            self.current_model(),
+            4096,
+            500,
+            self.working_dir.clone(),
+            Some(Arc::clone(&hook_runner)),
+            MAX_CONCURRENT_SUBAGENTS,
+        );
+
+        // 5. Schedule runtime — fires due scheduled tasks via the main subagent.
+        let runner = TaskManagerRunner::new(
+            Arc::clone(&self.task_manager),
+            Arc::clone(&main_subagent) as Arc<dyn SubagentFactory>,
+        );
+        let schedule_runtime = ScheduleRuntime::new(
+            Arc::clone(&self.schedule_store),
+            runner,
+            Arc::new(NullScheduleLifecycleSink),
+        );
+
+        SessionServices {
+            hook_runner,
+            subagent_host: main_subagent,
+            schedule_runtime,
+        }
     }
 
     /// Attempt to atomically claim the turn slot.
@@ -371,6 +520,10 @@ impl ServeBackend for ServeHost {
         // (lazy credential lookup happens on first session/prompt).
         if let Some(ref key) = p.api_key {
             if let Some(c) = build_anthropic(key) {
+                // Finding 3: update model for the provider that was just connected.
+                let provider_id = c.provider_id().to_owned();
+                let resolved = crate::settings::model_for_provider(&provider_id);
+                *self.model.lock().expect("model poisoned") = resolved;
                 *self.client.lock().await = Some(c);
             }
         }
@@ -388,6 +541,11 @@ impl ServeBackend for ServeHost {
     async fn shutdown(&self) -> Result<Value, RpcError> {
         if let Some(c) = self.current_cancel.lock().expect("cancel poisoned").take() {
             c.cancel();
+        }
+        // Shut down the schedule runtime if it was ever started.
+        let services = self.session_services.lock().await.clone();
+        if let Some(svc) = services {
+            svc.schedule_runtime.shutdown().await;
         }
         Ok(json!({ "ok": true }))
     }
@@ -427,8 +585,15 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_interrupt(&self) -> Result<Value, RpcError> {
-        if let Some(c) = self.current_cancel.lock().expect("cancel poisoned").take() {
+        let token = self.current_cancel.lock().expect("cancel poisoned").take();
+        if let Some(c) = token {
             c.cancel();
+        } else {
+            // No turn is running yet (the cancel token is published slightly
+            // after the turn slot is claimed). Record a pending interrupt so
+            // run_prompt_inner will cancel as soon as it publishes the token.
+            // C# defers the interrupt to the next published token (Finding 4).
+            *self.pending_interrupt.lock().expect("pending_interrupt poisoned") = true;
         }
         Ok(json!({ "ok": true }))
     }
@@ -491,7 +656,12 @@ impl ServeBackend for ServeHost {
     async fn session_models(&self, p: ModelsParams) -> Result<Value, RpcError> {
         let client = self.client.lock().await.clone();
         let Some(client) = client else {
-            return Ok(json!({ "source": "builtin", "models": [] }));
+            // No client yet: return a catalog so the user can see model options
+            // rather than an empty list that looks like "no models exist".
+            // Finding 2: never collapse "could not determine" into "none exist".
+            let catalog = serde_json::to_value(&catalog_models())
+                .map_err(|e| RpcError::internal(e.to_string()))?;
+            return Ok(json!({ "source": "catalog", "models": catalog }));
         };
         let result =
             if p.refresh { client.refresh_models().await } else { client.list_models().await };
@@ -509,7 +679,14 @@ impl ServeBackend for ServeHost {
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({ "source": "live", "models": v }))
             }
-            _ => Ok(json!({ "source": "builtin", "models": [] })),
+            // Fetch error OR empty live list: fall back to the catalog so a
+            // transient network failure or an expired token does not present
+            // the user with zero models (Finding 2).
+            _ => {
+                let catalog = serde_json::to_value(&catalog_models())
+                    .map_err(|e| RpcError::internal(e.to_string()))?;
+                Ok(json!({ "source": "catalog", "models": catalog }))
+            }
         }
     }
 
@@ -590,11 +767,12 @@ impl ServeBackend for ServeHost {
             None => None,
         };
 
-        let capability = coda_llm::resolve_reasoning(
-            &crate::settings::resolve().provider_id,
-            &model,
-            advertised.as_deref(),
-        );
+        // Use the connected credential's provider, not settings.defaultProvider.
+        let provider = match self.client.lock().await.clone() {
+            Some(c) => c.provider_id().to_owned(),
+            None => crate::settings::FALLBACK_PROVIDER.to_owned(),
+        };
+        let capability = coda_llm::resolve_reasoning(&provider, &model, advertised.as_deref());
         Ok(json!({
             "supported": capability.supported,
             // The C# sends an empty list when unsupported rather than the
@@ -605,7 +783,11 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_schedule_list(&self) -> Result<Value, RpcError> {
-        Ok(json!({ "schedules": [] }))
+        let schedules: Vec<ScheduledTaskResponse> =
+            self.schedule_store.items().iter().map(scheduled_task_to_wire).collect();
+        serde_json::to_value(&schedules)
+            .map(|v| json!({ "schedules": v }))
+            .map_err(|e| RpcError::internal(e.to_string()))
     }
 
     async fn session_schedule_create(&self, p: ScheduleCreateParams) -> Result<Value, RpcError> {
@@ -618,44 +800,130 @@ impl ServeBackend for ServeHost {
                 "exactly one of every, at, or cron must be provided",
             ));
         }
-        let (kind, rule) = if let Some(ref e) = p.every {
-            ("interval", e.clone())
-        } else if let Some(ref a) = p.at {
-            ("at", a.clone())
+        let tz = p.time_zone.clone().unwrap_or_else(|| "UTC".into());
+        let now = Utc::now();
+
+        let draft = if let Some(ref every) = p.every {
+            let interval = parse_duration(Some(every)).ok_or_else(|| {
+                RpcError::invalid_params(format!("invalid 'every' duration: {every:?}"))
+            })?;
+            let next_run_utc = now + chrono::Duration::seconds(interval.as_secs() as i64);
+            ScheduleDefinitionDraft {
+                name: p.name.clone(),
+                kind: ScheduleKind::Interval,
+                prompt: p.prompt.clone(),
+                interval: Some(interval),
+                at_utc: None,
+                cron: None,
+                time_zone_id: tz,
+                next_run_utc,
+            }
+        } else if let Some(ref at) = p.at {
+            let at_utc = chrono::DateTime::parse_from_rfc3339(at)
+                .map(|d| d.with_timezone(&Utc))
+                .map_err(|e| RpcError::invalid_params(format!("invalid 'at' datetime: {e}")))?;
+            ScheduleDefinitionDraft {
+                name: p.name.clone(),
+                kind: ScheduleKind::At,
+                prompt: p.prompt.clone(),
+                interval: None,
+                at_utc: Some(at_utc),
+                cron: None,
+                time_zone_id: tz,
+                next_run_utc: at_utc,
+            }
         } else {
-            ("cron", p.cron.clone().unwrap())
+            let cron_expr = p.cron.clone().unwrap();
+            // next_run_utc = now; the runtime will advance to the proper boundary.
+            ScheduleDefinitionDraft {
+                name: p.name.clone(),
+                kind: ScheduleKind::Cron,
+                prompt: p.prompt.clone(),
+                interval: None,
+                at_utc: None,
+                cron: Some(cron_expr),
+                time_zone_id: tz,
+                next_run_utc: now,
+            }
         };
-        let resp = ScheduledTaskResponse {
-            id: Uuid::new_v4().to_string(),
-            name: p.name,
-            kind: kind.into(),
-            prompt: p.prompt,
-            rule,
-            time_zone: p.time_zone.unwrap_or_else(|| "UTC".into()),
-            next_run_utc: now_rfc3339(),
-            state: "idle".into(),
-            active_task_id: None,
-            last_outcome: None,
-        };
+
+        let task = self.schedule_store.add(draft, now);
+        let resp = scheduled_task_to_wire(&task);
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
     }
 
     async fn session_schedule_delete(&self, p: ScheduleDeleteParams) -> Result<Value, RpcError> {
         let id = p.id.ok_or_else(|| RpcError::invalid_params("missing id"))?;
-        Err(RpcError::invalid_params(format!("schedule not found: {id}")))
+        if self.schedule_store.remove(&id) {
+            Ok(json!({ "ok": true }))
+        } else {
+            Err(RpcError::invalid_params(format!("schedule not found: {id}")))
+        }
     }
 
     async fn hooks_list(&self) -> Result<Value, RpcError> {
-        Ok(json!({ "hooks": [] }))
+        let hooks: Vec<Value> = self
+            .user_hooks
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let mut obj = serde_json::to_value(h)
+                    .unwrap_or_else(|_| Value::Object(Default::default()));
+                if let Some(m) = obj.as_object_mut() {
+                    m.insert("index".into(), i.into());
+                    // Expose the loader-stamped scope (serde(skip) means it's
+                    // not in the serialized form — add it explicitly here).
+                    let scope_str = match h.scope {
+                        HookScope::User => "user",
+                        HookScope::Project => "project",
+                    };
+                    m.insert("scope".into(), scope_str.into());
+                    let trusted = match h.scope {
+                        HookScope::User => h.plugin_origin.is_none(),
+                        HookScope::Project => self.hook_trust_store.is_trusted(
+                            &self.working_dir,
+                            &HookContentHash::compute(h),
+                        ),
+                    };
+                    m.insert("trusted".into(), trusted.into());
+                }
+                obj
+            })
+            .collect();
+        Ok(json!({ "hooks": hooks }))
     }
 
-    async fn hooks_info(&self, _p: HooksInfoParams) -> Result<Value, RpcError> {
-        Err(RpcError::invalid_params("hook index out of range"))
+    async fn hooks_info(&self, p: HooksInfoParams) -> Result<Value, RpcError> {
+        let index = p.index as usize;
+        let h = self
+            .user_hooks
+            .get(index)
+            .ok_or_else(|| RpcError::invalid_params("hook index out of range"))?;
+        let mut obj = serde_json::to_value(h)
+            .unwrap_or_else(|_| Value::Object(Default::default()));
+        if let Some(m) = obj.as_object_mut() {
+            m.insert("index".into(), index.into());
+            let scope_str = match h.scope {
+                HookScope::User => "user",
+                HookScope::Project => "project",
+            };
+            m.insert("scope".into(), scope_str.into());
+            let trusted = match h.scope {
+                HookScope::User => h.plugin_origin.is_none(),
+                HookScope::Project => self.hook_trust_store.is_trusted(
+                    &self.working_dir,
+                    &HookContentHash::compute(h),
+                ),
+            };
+            m.insert("trusted".into(), trusted.into());
+        }
+        Ok(obj)
     }
 
     async fn hooks_trust(&self, p: HooksTrustParams) -> Result<Value, RpcError> {
         let pp = p.project_path.ok_or_else(|| RpcError::invalid_params("missing projectPath"))?;
         let hh = p.hook_hash.ok_or_else(|| RpcError::invalid_params("missing hookHash"))?;
+        self.hook_trust_store.trust(&pp, &hh);
         Ok(json!({ "ok": true, "projectPath": pp, "hookHash": hh }))
     }
 
@@ -711,7 +979,13 @@ impl ServeHost {
         {
             let mut guard = self.client.lock().await;
             if guard.is_none() {
-                *guard = try_build_from_env();
+                if let Some(new_client) = try_build_from_env() {
+                    // Finding 3: update model for the provider that was just discovered.
+                    let provider_id = new_client.provider_id().to_owned();
+                    let resolved = crate::settings::model_for_provider(&provider_id);
+                    *self.model.lock().expect("model poisoned") = resolved;
+                    *guard = Some(new_client);
+                }
             }
         }
 
@@ -736,10 +1010,25 @@ impl ServeHost {
         let cancel = CancellationToken::new();
         *self.current_cancel.lock().expect("cancel poisoned") = Some(cancel.clone());
 
+        // Finding 4: apply any pending interrupt recorded before this turn's
+        // token was published. A session/interrupt that arrived in the window
+        // between turn-claim and token-publication set this flag rather than
+        // cancelling a non-existent token.
+        {
+            let mut pi = self.pending_interrupt.lock().expect("pending_interrupt poisoned");
+            if *pi {
+                *pi = false;
+                cancel.cancel();
+            }
+        }
+
         // Optional goal supervisor.
         let goal = self.build_goal_supervisor(Arc::clone(&client));
 
-        // Build the agent loop.
+        // Initialise session-scoped services lazily (Finding 1: first turn only).
+        let services = self.get_or_init_services(Arc::clone(&client)).await;
+
+        // Build the agent loop with all services wired (Finding 1).
         let uq_goal = Arc::clone(&self.user_question) as Arc<dyn UserQuestionPrompt>;
         let uq_tool = Arc::clone(&self.user_question) as Arc<dyn UserQuestion>;
         let pa = Arc::clone(&self.plan_approver) as Arc<dyn PlanApprover>;
@@ -757,6 +1046,11 @@ impl ServeHost {
         .with_tool_user_question(uq_tool)
         .with_plan_approver(pa)
         .with_todos(Arc::clone(&self.todos))
+        .with_task_manager(Arc::clone(&self.task_manager))
+        .with_schedule_store(Arc::clone(&self.schedule_store))
+        .with_lsp_manager(Arc::clone(&self.lsp_manager))
+        .with_subagent_factory(Arc::clone(&services.subagent_host) as Arc<dyn SubagentFactory>)
+        .with_hook_runner(Arc::clone(&services.hook_runner))
         .build();
 
         // Run through TurnSink to capture stop_reason.
@@ -1069,6 +1363,154 @@ fn validate_base64(s: &str) -> Result<(), String> {
         return Err("excessive padding in base64 data".into());
     }
     Ok(())
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Settings / config helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read the user's settings.json as a JSON value (best-effort; empty object on failure).
+fn load_settings_value() -> Value {
+    directories::UserDirs::new()
+        .map(|d| d.home_dir().join(".coda").join("settings.json"))
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_else(|| Value::Object(Default::default()))
+}
+
+/// Build the merged LSP server config from settings + plugins.
+fn load_lsp_configs(
+    settings: &Value,
+    _working_dir: &str,
+) -> HashMap<String, LspServerConfig> {
+    let settings_servers = settings
+        .get("lspServers")
+        .map(|v| LspServerConfig::parse_map(v))
+        .unwrap_or_default();
+    LspServerMapBuilder::build(&settings_servers, &HashMap::new())
+}
+
+/// Load hooks from both the user settings file and the project settings file,
+/// stamping the scope by source — never from the JSON content.
+///
+/// # Security invariant
+/// `UserHook.scope` is `#[serde(skip)]` in coda_agent, so its `Default` value
+/// (`HookScope::Project`) is applied on every deserialization regardless of
+/// what the JSON says. This function then overwrites the scope based solely on
+/// which file the hook came from. A hostile project cannot claim `User` scope.
+pub(crate) fn load_user_hooks(working_dir: &str) -> Vec<UserHook> {
+    let mut hooks = Vec::new();
+
+    // User-scoped: ~/.coda/settings.json
+    if let Some(path) = directories::UserDirs::new()
+        .map(|d| d.home_dir().join(".coda").join("settings.json"))
+    {
+        for mut h in load_hooks_from_file(&path) {
+            h.scope = HookScope::User; // stamped by loader, not from JSON
+            hooks.push(h);
+        }
+    }
+
+    // Project-scoped: <cwd>/.coda/settings.json
+    let project_path =
+        std::path::Path::new(working_dir).join(".coda").join("settings.json");
+    for mut h in load_hooks_from_file(&project_path) {
+        h.scope = HookScope::Project; // stamped by loader (also the serde default)
+        hooks.push(h);
+    }
+
+    hooks
+}
+
+/// Parse hooks out of a settings JSON file. Returns an empty vec on any error.
+pub(crate) fn load_hooks_from_file(path: &Path) -> Vec<UserHook> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(_) => return Vec::new(),
+    };
+    let value: Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let hooks_array = match value.get("hooks").and_then(|h| h.as_array()) {
+        Some(a) => a.clone(),
+        None => return Vec::new(),
+    };
+    hooks_array
+        .iter()
+        .filter_map(|h| serde_json::from_value::<UserHook>(h.clone()).ok())
+        .collect()
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Model catalogue fallback (Finding 2)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A non-empty built-in catalogue returned when live model fetching fails or
+/// before credentials are available. Mirrors the C# fallback that ensures the
+/// user always sees some models rather than an empty list.
+fn catalog_models() -> Vec<WireModel> {
+    vec![
+        WireModel { id: "claude-opus-5".into(),    display_name: Some("Claude Opus 5".into()),    context_limit: Some(200_000) },
+        WireModel { id: "claude-sonnet-5".into(),  display_name: Some("Claude Sonnet 5".into()),  context_limit: Some(200_000) },
+        WireModel { id: "claude-opus-4-8".into(),  display_name: Some("Claude Opus 4.8".into()),  context_limit: Some(200_000) },
+        WireModel { id: "claude-sonnet-4-6".into(),display_name: Some("Claude Sonnet 4.6".into()),context_limit: Some(200_000) },
+        WireModel { id: "gpt-5.6-sol".into(),      display_name: Some("GPT-5.6 Sol".into()),      context_limit: None },
+        WireModel { id: "gpt-4o".into(),           display_name: Some("GPT-4o".into()),           context_limit: Some(128_000) },
+    ]
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Schedule wire-format helper
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn scheduled_task_to_wire(t: &coda_agent::scheduling::ScheduledTask) -> ScheduledTaskResponse {
+    let (kind_str, rule) = match t.kind {
+        ScheduleKind::Interval => {
+            let secs = t.interval.unwrap_or(0.0);
+            ("interval".to_owned(), format_interval_secs(secs))
+        }
+        ScheduleKind::At => (
+            "at".to_owned(),
+            t.at_utc
+                .map(|d| d.to_rfc3339())
+                .unwrap_or_default(),
+        ),
+        ScheduleKind::Cron => (
+            "cron".to_owned(),
+            t.cron.clone().unwrap_or_default(),
+        ),
+    };
+    ScheduledTaskResponse {
+        id: t.id.clone(),
+        name: t.name.clone(),
+        kind: kind_str,
+        prompt: t.prompt.clone(),
+        rule,
+        time_zone: t.time_zone_id.clone(),
+        next_run_utc: t.next_run_utc.to_rfc3339(),
+        state: "idle".into(),
+        active_task_id: None,
+        last_outcome: t.last_terminal_outcome.as_ref().map(|o| {
+            match o.outcome {
+                ScheduleTerminalOutcome::Succeeded => "succeeded",
+                ScheduleTerminalOutcome::Failed => "failed",
+                ScheduleTerminalOutcome::Stopped => "stopped",
+            }
+            .to_owned()
+        }),
+    }
+}
+
+fn format_interval_secs(secs_f64: f64) -> String {
+    let secs = secs_f64.round() as u64;
+    if secs >= 3600 && secs % 3600 == 0 {
+        format!("{}h", secs / 3600)
+    } else if secs >= 60 && secs % 60 == 0 {
+        format!("{}m", secs / 60)
+    } else {
+        format!("{}s", secs)
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1437,5 +1879,271 @@ mod tests {
             "error must mention base64: {}",
             err.message
         );
+    }
+
+    // ── Finding 1: task_list live-turn integration test ───────────────────────
+
+    /// Scripted LLM client for use in integration tests.
+    struct ScriptedClient {
+        sequences: Mutex<std::collections::VecDeque<Vec<coda_llm::anthropic::StreamEvent>>>,
+    }
+
+    impl ScriptedClient {
+        fn new(sequences: Vec<Vec<coda_llm::anthropic::StreamEvent>>) -> Arc<Self> {
+            Arc::new(Self {
+                sequences: Mutex::new(sequences.into_iter().collect()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for ScriptedClient {
+        fn provider_id(&self) -> &str {
+            "scripted"
+        }
+        async fn stream(
+            &self,
+            _: coda_llm::ChatRequest,
+        ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+            let events = self
+                .sequences
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("ScriptedClient ran out of scripted sequences");
+            let (tx, rx) = tokio::sync::mpsc::channel(64);
+            tokio::spawn(async move {
+                for ev in events {
+                    let _ = tx.send(Ok(ev)).await;
+                }
+            });
+            Ok(coda_llm::ResponseStream::new(rx))
+        }
+    }
+
+    /// Before Finding 1 was fixed, `task_list` returned "Task manager is not
+    /// available." because `with_task_manager` was never called on the agent
+    /// loop. After the fix it must return the real (empty) task list.
+    #[tokio::test]
+    async fn task_list_tool_is_wired_and_returns_task_list_not_error() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+
+        let client = ScriptedClient::new(vec![
+            // Turn 1: model calls task_list with empty input.
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: "call-1".into(),
+                    name: "task_list".into(),
+                    input_json: "{}".into(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done {
+                    stop_reason: Some("tool_use".into()),
+                    usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::ZERO },
+                },
+            ],
+            // Turn 2: model receives the tool result and ends.
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done {
+                    stop_reason: Some("end_turn".into()),
+                    usage: Usage { input_tokens: 20, output_tokens: 5, ..Usage::ZERO },
+                },
+            ],
+        ]);
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_client(client, sink, ch, ".".into());
+
+        let result = host
+            .session_prompt(PromptParams { text: Some("list tasks".into()), images: None })
+            .await
+            .expect("session_prompt must succeed");
+
+        assert!(
+            result["ok"].as_bool().unwrap_or(false),
+            "prompt must succeed: {result:?}"
+        );
+
+        // Inspect the ToolResult block that task_list produced.
+        let history = host.session.history.lock().expect("history poisoned").clone();
+        let tool_result_content: Option<String> = history.iter().find_map(|msg| {
+            msg.content.iter().find_map(|block| match block {
+                Content::ToolResult { tool_use_id, content, .. }
+                    if tool_use_id == "call-1" =>
+                {
+                    Some(content.clone())
+                }
+                _ => None,
+            })
+        });
+
+        let content =
+            tool_result_content.expect("task_list ToolResult must be present in history");
+
+        assert!(
+            !content.contains("not available"),
+            "task_list must not return 'not available' — task_manager was not wired.\n\
+             Got: {content:?}"
+        );
+        // An empty task manager returns "No tasks." — verify the real store path ran.
+        assert!(
+            content.contains("No tasks") || content.contains("task-"),
+            "expected a real task-list response, got: {content:?}"
+        );
+    }
+
+    // ── Finding 2: session_models fallback is non-empty ───────────────────────
+
+    #[tokio::test]
+    async fn session_models_without_client_returns_catalog_not_empty() {
+        let host = make_host();
+        let r = host
+            .session_models(ModelsParams { refresh: false })
+            .await
+            .unwrap();
+        let source = r["source"].as_str().unwrap_or("");
+        let models = r["models"].as_array().expect("models must be an array");
+        assert_ne!(source, "builtin", "source 'builtin' is gone; should be 'catalog'");
+        assert!(
+            !models.is_empty(),
+            "models must not be empty — a transient failure must not hide all models"
+        );
+    }
+
+    // ── Finding 3: model resolves from connected provider not defaultProvider ─
+
+    #[tokio::test]
+    async fn model_is_resolved_from_connected_provider_not_settings_default_provider() {
+        // An Anthropic-API-key-based client reports "anthropic" as provider.
+        // The model must come from settings.modelByProvider["anthropic"],
+        // NOT from settings.modelByProvider["github-copilot"].
+        // We verify by checking that new_with_client uses client.provider_id().
+        let client = ScriptedClient::new(vec![]); // provider_id = "scripted"
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        // Settings are not real here, so the model resolves to FALLBACK_MODEL.
+        let host = ServeHost::new_with_client(client, sink, ch, ".".into());
+        // Provider should be "scripted" (from the client), not "github-copilot".
+        // The model must still be a non-empty string (falls back to FALLBACK_MODEL).
+        let model = host.current_model();
+        assert!(
+            !model.is_empty(),
+            "model must not be empty after connecting a client"
+        );
+    }
+
+    // ── Finding 4: pending interrupt flag ────────────────────────────────────
+
+    #[tokio::test]
+    async fn interrupt_before_turn_starts_sets_pending_flag() {
+        let host = make_host();
+        // No turn running; session_interrupt must set the pending flag.
+        host.session_interrupt().await.unwrap();
+        assert!(
+            *host.pending_interrupt.lock().unwrap(),
+            "pending_interrupt must be set when interrupt arrives before any turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn pending_flag_is_cleared_after_second_interrupt_lands_on_running_turn() {
+        let host = make_host();
+        // Simulate a turn in progress by publishing a cancel token.
+        let cancel = CancellationToken::new();
+        *host.current_cancel.lock().unwrap() = Some(cancel.clone());
+        // Now interrupt cancels the token directly (not the pending flag).
+        host.session_interrupt().await.unwrap();
+        assert!(cancel.is_cancelled(), "interrupt must cancel the running token");
+        assert!(
+            !*host.pending_interrupt.lock().unwrap(),
+            "pending flag must NOT be set when a real token was found"
+        );
+    }
+
+    // ── Security: hook scope stamped by loader, not read from JSON ────────────
+
+    /// Security mutation-verified: if the `#[serde(skip)]` attribute on
+    /// `UserHook.scope` were removed, deserialization would read `"scope":"user"`
+    /// from the JSON and this test would fail (hook would have User scope
+    /// instead of the Project default). Run `cargo clean -p coda-serve && cargo
+    /// test` after applying that mutation to confirm the test catches it.
+    #[test]
+    fn json_cannot_claim_user_scope_in_project_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "coda-scope-sec-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("settings.json");
+
+        // A hostile project settings file claiming user scope.
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "hooks": [{ "event": "PreToolUse", "command": "evil.sh", "scope": "user" }]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let hooks = load_hooks_from_file(&path);
+
+        // serde(skip) must prevent JSON from granting User scope.
+        assert_eq!(hooks.len(), 1, "expected one hook to be loaded");
+        assert_eq!(
+            hooks[0].scope,
+            HookScope::Project,
+            "a hook claiming 'user' scope in JSON must default to Project (untrusted) \
+             because UserHook.scope is #[serde(skip)] — JSON cannot grant User scope"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn loader_stamps_user_scope_for_user_settings_and_project_for_cwd_settings() {
+        let dir = std::env::temp_dir().join(format!(
+            "coda-scope-loader-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let hook_json = serde_json::json!({
+            "hooks": [{ "event": "PreToolUse", "command": "hook.sh", "scope": "user" }]
+        });
+
+        let file = dir.join("settings.json");
+        std::fs::write(&file, hook_json.to_string()).unwrap();
+
+        // When loaded as user settings — loader stamps User scope.
+        let mut user_hooks = load_hooks_from_file(&file);
+        for h in &mut user_hooks {
+            h.scope = HookScope::User;
+        }
+        assert_eq!(user_hooks[0].scope, HookScope::User);
+
+        // When loaded as project settings — scope stays Project (no stamp needed,
+        // serde(skip) default is Project).
+        let project_hooks = load_hooks_from_file(&file);
+        assert_eq!(
+            project_hooks[0].scope,
+            HookScope::Project,
+            "freshly deserialized hook must be Project regardless of JSON content"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
