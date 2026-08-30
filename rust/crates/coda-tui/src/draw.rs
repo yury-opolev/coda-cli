@@ -175,13 +175,19 @@ pub fn draw(
     theme: &Theme,
     browser: Option<&Browser>,
 ) {
-    draw_with_pin(frame, state, composer, viewport, rows, theme, browser, None);
+    draw_with_pin(frame, state, composer, viewport, rows, theme, browser, None, None);
 }
 
 /// Draws the whole screen, optionally showing a pin row at the top of the
 /// transcript when the active user prompt has scrolled out of view.
 ///
 /// The `pin_text` is pre-composed by `App` so that draw logic stays pure.
+/// Draws the whole screen and reports where the transcript content ended up.
+///
+/// The returned `(top_row, height)` is what turns a mouse position into a
+/// transcript row. Returning it from the draw keeps the two in step instead of
+/// duplicating the layout arithmetic in the event handler, where it would
+/// silently drift the first time the layout changed.
 pub fn draw_with_pin(
     frame: &mut Frame,
     state: &UiState,
@@ -191,7 +197,8 @@ pub fn draw_with_pin(
     theme: &Theme,
     browser: Option<&Browser>,
     pin_text: Option<&str>,
-) {
+    selection: Option<&crate::selection::TranscriptSelection>,
+) -> (u16, u16) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(theme.surface()),
@@ -200,7 +207,15 @@ pub fn draw_with_pin(
 
     let regions = layout(area, composer.line_count(), viewport.is_scrollable());
 
-    draw_transcript_with_pin(frame, regions.transcript, viewport, rows, theme, pin_text);
+    let content = draw_transcript_with_pin(
+        frame,
+        regions.transcript,
+        viewport,
+        rows,
+        theme,
+        pin_text,
+        selection,
+    );
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
     }
@@ -215,6 +230,8 @@ pub fn draw_with_pin(
     if let Some(prompt) = &state.prompt {
         draw_prompt(frame, area, prompt, theme);
     }
+
+    content
 }
 
 fn draw_transcript_with_pin(
@@ -224,7 +241,8 @@ fn draw_transcript_with_pin(
     rows: &[RenderLine],
     theme: &Theme,
     pin_text: Option<&str>,
-) {
+    selection: Option<&crate::selection::TranscriptSelection>,
+) -> (u16, u16) {
     let width = area.width as usize;
 
     // When a pin is active, it occupies the top row of the transcript area and
@@ -254,10 +272,70 @@ fn draw_transcript_with_pin(
         .unwrap_or(&[])
         .iter()
         .take(take)
-        .map(|row| to_line(row, theme, width))
+        .enumerate()
+        .map(|(offset, row)| {
+            let line = to_line(row, theme, width);
+            // Highlight the selected span of this row, if any. Done here
+            // rather than in `to_line` so an unselected transcript costs
+            // nothing extra.
+            match selection.and_then(|s| s.range_for_row(visible.start + offset, width)) {
+                Some((start, end)) if end > start => highlight_span(line, start, end, theme),
+                _ => line,
+            }
+        })
         .collect();
 
     frame.render_widget(Paragraph::new(lines).style(theme.surface()), content_area);
+
+    (content_area.y, content_area.height)
+}
+
+/// Re-styles the cells in `[start, end)` to read as selected.
+///
+/// Reverses the existing style rather than imposing a fixed colour, so the
+/// highlight works on both the light and dark themes without either needing to
+/// know about it.
+fn highlight_span(line: Line<'static>, start: usize, end: usize, _theme: &Theme) -> Line<'static> {
+    use ratatui::style::Modifier;
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cell = 0usize;
+
+    for span in line.spans {
+        let text = span.content.to_string();
+        let width = coda_render::text::width(&text);
+        let span_start = cell;
+        let span_end = cell + width;
+        cell = span_end;
+
+        // Entirely outside the selection.
+        if span_end <= start || span_start >= end {
+            out.push(Span::styled(text, span.style));
+            continue;
+        }
+
+        // Split the span at the selection boundaries, measured in cells so a
+        // wide character is never cut in half.
+        let before = crate::selection::slice_by_cells(&text, 0, start.saturating_sub(span_start));
+        let mid = crate::selection::slice_by_cells(
+            &text,
+            start.saturating_sub(span_start),
+            end.saturating_sub(span_start),
+        );
+        let after = crate::selection::slice_by_cells(&text, end.saturating_sub(span_start), width);
+
+        if !before.is_empty() {
+            out.push(Span::styled(before, span.style));
+        }
+        if !mid.is_empty() {
+            out.push(Span::styled(mid, span.style.add_modifier(Modifier::REVERSED)));
+        }
+        if !after.is_empty() {
+            out.push(Span::styled(after, span.style));
+        }
+    }
+
+    Line::from(out)
 }
 
 /// `draw_transcript` kept for tests that call it directly.
@@ -268,7 +346,7 @@ pub fn draw_transcript(
     rows: &[RenderLine],
     theme: &Theme,
 ) {
-    draw_transcript_with_pin(frame, area, viewport, rows, theme, None);
+    draw_transcript_with_pin(frame, area, viewport, rows, theme, None, None);
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Theme) {

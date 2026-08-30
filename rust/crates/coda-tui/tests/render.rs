@@ -8,6 +8,7 @@
 use coda_proto::events::ToolCallStatus;
 use coda_proto::{Correlation, Event};
 use coda_render::theme::{ColorDepth, Theme};
+use coda_render::RenderLine;
 use coda_tui::composer::Composer;
 use coda_tui::draw;
 use coda_tui::state::{PendingPrompt, UiEvent, UiState};
@@ -217,6 +218,97 @@ fn renders_a_question_prompt_with_numbered_options() {
     assert!(rows.iter().any(|r| r.contains("Which approach?")));
     assert!(rows.iter().any(|r| r.contains("1. rewrite")));
     assert!(rows.iter().any(|r| r.contains("2. patch")));
+}
+
+/// Selecting a span must actually change what is rendered.
+///
+/// The selection module was fully implemented and unit-tested, but nothing
+/// drove it: mouse events only handled scroll, so `TranscriptSelection` was
+/// never constructed and drag-selection silently did nothing. A test that
+/// exercises the *drawing path* with a selection is what catches that, since
+/// the module's own tests pass either way.
+#[test]
+fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
+    use coda_tui::selection::{SelectionPos, TranscriptSelection};
+
+    let width = 40u16;
+    let height = 10u16;
+    let rows = vec![RenderLine::new("hello selectable world", coda_render::Role::Assistant)];
+
+    let render = |selection: Option<&TranscriptSelection>| {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let state = session();
+        let composer = Composer::new();
+        let mut viewport = Viewport::new();
+        viewport.update(rows.len(), height as usize);
+        terminal
+            .draw(|frame| {
+                draw::draw_with_pin(
+                    frame,
+                    &state,
+                    &composer,
+                    &viewport,
+                    &rows,
+                    &Theme::default(),
+                    None,
+                    None,
+                    selection,
+                );
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    };
+
+    let plain = render(None);
+
+    let mut selection = TranscriptSelection::new();
+    selection.begin(SelectionPos { row: 0, col: 0 });
+    selection.update(SelectionPos { row: 0, col: 5 });
+    assert!(selection.has_selection(), "the test selection must be non-empty");
+    let selected = render(Some(&selection));
+
+    assert_ne!(
+        plain, selected,
+        "a selection must be visible on screen; if these match, nothing drove the highlight"
+    );
+}
+
+/// A drawn frame must report where the transcript actually is, or a click
+/// cannot be translated into a transcript row.
+#[test]
+fn drawing_reports_the_transcript_origin_for_mouse_mapping() {
+    let width = 40u16;
+    let height = 12u16;
+    let rows = vec![RenderLine::new("one", coda_render::Role::Assistant), RenderLine::new("two", coda_render::Role::Assistant)];
+
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let state = session();
+    let composer = Composer::new();
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), height as usize);
+
+    let mut origin = (0u16, 0u16);
+    terminal
+        .draw(|frame| {
+            origin = draw::draw_with_pin(
+                frame,
+                &state,
+                &composer,
+                &viewport,
+                &rows,
+                &Theme::default(),
+                None,
+                None,
+                None,
+            );
+        })
+        .expect("draw");
+
+    assert!(origin.1 > 0, "the transcript must have a non-zero height: {origin:?}");
+    assert!(
+        origin.0 + origin.1 <= height,
+        "the transcript must fit on screen: {origin:?} in {height}"
+    );
 }
 
 #[test]

@@ -103,6 +103,15 @@ pub struct App {
     restarted: Option<(Engine, mpsc::UnboundedReceiver<Inbound>)>,
     /// Images staged by `/image` to be sent with the next user turn.
     staged_images: Vec<messages::WireImage>,
+    /// The active drag-selection over the transcript, if any.
+    selection: crate::selection::TranscriptSelection,
+    /// Screen row where the transcript area starts, captured at draw time.
+    ///
+    /// Mouse coordinates are screen-relative, so translating a click into a
+    /// transcript row needs to know where the transcript begins and how far it
+    /// is scrolled. Recording it during the draw keeps the two in step rather
+    /// than duplicating the layout arithmetic here.
+    transcript_origin: (u16, u16),
 }
 
 /// Which overlay is on screen.
@@ -169,6 +178,8 @@ impl App {
             engine_command: command,
             restarted: None,
             staged_images: Vec::new(),
+            selection: crate::selection::TranscriptSelection::new(),
+            transcript_origin: (0, 0),
         };
 
         Ok((app, engine, inbound))
@@ -427,6 +438,33 @@ impl App {
                 }
                 MouseEventKind::ScrollDown => {
                     self.viewport.scroll_down(WHEEL_ROWS);
+                    self.dirty = true;
+                }
+                // Drag-select. Mouse capture disables the terminal's own
+                // selection, so without this there is no way to select
+                // anything at all — the capture takes the native behaviour
+                // away and gives nothing back.
+                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
+                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                        self.selection.begin(pos);
+                        self.dirty = true;
+                    }
+                }
+                MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
+                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                        self.selection.update(pos);
+                        self.dirty = true;
+                    }
+                }
+                MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
+                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                        self.selection.update(pos);
+                    }
+                    // A click with no drag clears rather than leaving a stale
+                    // one-cell selection that Ctrl+Y would then copy.
+                    if !self.selection.has_selection() {
+                        self.selection.clear();
+                    }
                     self.dirty = true;
                 }
                 _ => {}
@@ -1441,6 +1479,28 @@ impl App {
         }
     }
 
+    /// Translates a screen cell into a position in the flat `rows` array.
+    ///
+    /// Returns `None` for a click outside the transcript area, so clicking the
+    /// composer or status bar does not start a selection in the transcript.
+    fn mouse_to_selection(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::selection::SelectionPos> {
+        let (origin_row, height) = self.transcript_origin;
+        if height == 0 || row < origin_row || row >= origin_row.saturating_add(height) {
+            return None;
+        }
+        let offset_in_view = (row - origin_row) as usize;
+        let visible = self.viewport.visible_range();
+        let index = visible.start.checked_add(offset_in_view)?;
+        if index >= self.rows.len() {
+            return None;
+        }
+        Some(crate::selection::SelectionPos { row: index, col: column as usize })
+    }
+
     fn key_context(&self) -> KeyContext {        let (line, _) = self.composer.cursor_position();
         KeyContext {
             focus: if self.state.prompt.is_some() {
@@ -1598,10 +1658,17 @@ impl App {
         let theme = &self.theme;
         let browser = self.browser.as_ref();
         let pin = pin_text.as_deref();
+        let selection = self.selection.has_selection().then_some(&self.selection);
 
+        // The transcript origin is captured from the draw so mouse-to-row
+        // translation always matches the layout that was actually rendered.
+        let mut origin = self.transcript_origin;
         guard.terminal().draw(|frame| {
-            draw::draw_with_pin(frame, state, composer, viewport, rows, theme, browser, pin);
+            origin = draw::draw_with_pin(
+                frame, state, composer, viewport, rows, theme, browser, pin, selection,
+            );
         })?;
+        self.transcript_origin = origin;
 
         self.last_frame_at = Some(std::time::Instant::now());
         self.dirty = false;
@@ -1680,14 +1747,24 @@ impl App {
     /// clipboard (e.g. no display server) is reported as a notice rather than
     /// crashing the application.
     fn copy_to_clipboard(&mut self) {
-        let text = crate::selection::copy_visible_text(&self.rows, self.viewport.visible_range());
+        // A selection wins over the visible screen: if the user has selected
+        // something, copying everything on screen instead is silently the
+        // wrong answer.
+        let (text, what) = if self.selection.has_selection() {
+            (self.selection.copy_text(&self.rows), "selection")
+        } else {
+            (
+                crate::selection::copy_visible_text(&self.rows, self.viewport.visible_range()),
+                "transcript",
+            )
+        };
         if text.is_empty() {
             self.dirty = false;
             return;
         }
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
             Ok(()) => {
-                self.notice("Copied transcript to clipboard.", NoticeLevel::Info);
+                self.notice(format!("Copied {what} to clipboard."), NoticeLevel::Info);
             }
             Err(err) => {
                 self.notice(
