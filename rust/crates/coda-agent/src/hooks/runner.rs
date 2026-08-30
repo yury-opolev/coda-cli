@@ -766,12 +766,30 @@ async fn dispatch_http_hook(
     cancel: CancellationToken,
 ) -> Result<String, String> {
     validate_http_url(url, allowlist)?;
-    check_ssrf(url, cancel.clone()).await?;
+    let vetted = check_ssrf(url, cancel.clone()).await?;
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(|e| format!("http client build failed: {e}"))?;
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+
+    // Pin the connection to an address we actually vetted.
+    //
+    // `check_ssrf` resolves the host and rejects blocked ranges, but reqwest
+    // would otherwise resolve the name again at connect time — so a DNS server
+    // that answers with a public address on the first lookup and 169.254.169.254
+    // on the second slips straight past the check. Overriding resolution with
+    // the vetted address closes that window: the socket goes where we looked.
+    if let (Some(host), Some(ip)) = (
+        url.parse::<reqwest::Url>().ok().and_then(|u| u.host_str().map(str::to_owned)),
+        vetted.first().copied(),
+    ) {
+        let port = url
+            .parse::<reqwest::Url>()
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+            .unwrap_or(443);
+        builder = builder.resolve(&host, std::net::SocketAddr::new(ip, port));
+    }
+
+    let client = builder.build().map_err(|e| format!("http client build failed: {e}"))?;
 
     let response = tokio::select! {
         r = client.post(url).header("content-type", "application/json").body(payload.to_owned()).send() => {
@@ -823,7 +841,7 @@ pub(crate) fn validate_http_url(url: &str, allowlist: &[String]) -> Result<(), S
 }
 
 /// Resolve `url`'s host and refuse if any resolved address is in a blocked range.
-async fn check_ssrf(url: &str, cancel: CancellationToken) -> Result<(), String> {
+async fn check_ssrf(url: &str, cancel: CancellationToken) -> Result<Vec<IpAddr>, String> {
     let parsed: reqwest::Url = url.parse().map_err(|_| "invalid URL")?;
     let host = parsed.host_str().unwrap_or("");
 
@@ -831,7 +849,8 @@ async fn check_ssrf(url: &str, cancel: CancellationToken) -> Result<(), String> 
         if is_blocked_address(ip) {
             return Err(format!("SSRF: IP address {ip} is in a blocked range"));
         }
-        return Ok(());
+        // A literal address needs no resolution, so there is nothing to pin.
+        return Ok(Vec::new());
     }
 
     let port = parsed.port_or_known_default().unwrap_or(443);
@@ -858,7 +877,9 @@ async fn check_ssrf(url: &str, cancel: CancellationToken) -> Result<(), String> 
         }
     }
 
-    Ok(())
+    // Hand back the vetted addresses so the caller can connect to one of
+    // *these* rather than re-resolving. See `dispatch_http_hook`.
+    Ok(addrs.iter().map(|a| a.ip()).collect())
 }
 
 /// Returns `true` for IP addresses in RFC-1918, loopback, link-local, and
@@ -877,10 +898,19 @@ pub(crate) fn is_blocked_address(ip: IpAddr) -> bool {
         }
         IpAddr::V6(v6) => {
             if v6.is_loopback() { return true; }
+            if v6.is_unspecified() { return true; }
             if let Some(v4) = v6.to_ipv4_mapped() {
                 return is_blocked_address(IpAddr::V4(v4));
             }
+            // `::a.b.c.d` (IPv4-compatible, deprecated but still routable by
+            // some stacks) embeds an IPv4 address the same way and must be
+            // judged on that address, not waved through as "some IPv6 host".
             let seg = v6.segments();
+            if seg[0..6].iter().all(|s| *s == 0) && (seg[6] != 0 || seg[7] != 0) {
+                if let Some(v4) = v6.to_ipv4() {
+                    return is_blocked_address(IpAddr::V4(v4));
+                }
+            }
             if seg[0] & 0xffc0 == 0xfe80 { return true; }
             if seg[0] & 0xffc0 == 0xfec0 { return true; }
             if seg[0] & 0xfe00 == 0xfc00 { return true; }
@@ -2072,6 +2102,70 @@ mod tests {
         for (addr, expected) in cases {
             let ip = IpAddr::from_str(addr).unwrap();
             assert_eq!(is_blocked_address(ip), *expected, "is_blocked_address({addr}) should be {expected}");
+        }
+    }
+
+    /// IPv6 forms that embed an IPv4 address must be judged on that address.
+    ///
+    /// Both the mapped (`::ffff:a.b.c.d`) and the deprecated compatible
+    /// (`::a.b.c.d`) encodings reach the same host as the bare IPv4 address, so
+    /// treating either as "just some IPv6 host" would let the metadata service
+    /// and the loopback interface straight through.
+    #[test]
+    fn ipv6_forms_embedding_ipv4_are_judged_on_the_embedded_address() {
+        use std::str::FromStr;
+        let cases: &[(&str, bool)] = &[
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:169.254.169.254", true),
+            ("::ffff:10.0.0.1", true),
+            ("::ffff:8.8.8.8", false),
+            // IPv4-compatible IPv6, the form the review flagged as uncovered.
+            ("::127.0.0.1", true),
+            ("::169.254.169.254", true),
+            ("::10.0.0.1", true),
+            ("::8.8.8.8", false),
+            // Genuine IPv6 ranges.
+            ("::1", true),
+            ("::", true),
+            ("fe80::1", true),
+            ("fc00::1", true),
+            ("2606:4700:4700::1111", false),
+        ];
+        for (addr, expected) in cases {
+            let ip = IpAddr::from_str(addr).unwrap();
+            assert_eq!(
+                is_blocked_address(ip),
+                *expected,
+                "is_blocked_address({addr}) should be {expected}"
+            );
+        }
+    }
+
+    /// A literal address needs no pinning; a hostname yields vetted addresses
+    /// for the caller to connect to.
+    ///
+    /// The distinction matters because pinning is what closes the DNS-rebinding
+    /// window: `check_ssrf` validates what it resolved, and the caller must
+    /// connect to *that*, not re-resolve and get a different answer.
+    #[tokio::test]
+    async fn ssrf_check_returns_no_addresses_to_pin_for_a_literal_ip() {
+        let vetted = check_ssrf("https://8.8.8.8/hook", CancellationToken::new())
+            .await
+            .expect("a public literal address passes");
+        assert!(vetted.is_empty(), "a literal address needs no DNS pinning");
+    }
+
+    #[tokio::test]
+    async fn ssrf_check_rejects_a_blocked_literal_address() {
+        for url in [
+            "https://127.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/hook",
+        ] {
+            assert!(
+                check_ssrf(url, CancellationToken::new()).await.is_err(),
+                "{url} must be refused"
+            );
         }
     }
 
