@@ -163,8 +163,41 @@ impl McpClient {
         }
     }
 
-    /// Sends the MCP `shutdown` notification and drops the connection.
+    /// Fetches a prompt's rendered text (`prompts/get`).
     ///
+    /// Unlike the `list_*` calls this reports failure rather than degrading to
+    /// an empty result: the caller asked for one specific prompt, so silently
+    /// returning nothing would look like an empty prompt rather than an error.
+    pub async fn get_prompt(&self, name: &str) -> Result<String, String> {
+        let params = serde_json::json!({ "name": name });
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.connection.request("prompts/get", Some(params)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(render_prompt_messages(&result)),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out fetching prompt '{name}'")),
+        }
+    }
+
+    /// Reads a resource's contents (`resources/read`).
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let params = serde_json::json!({ "uri": uri });
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.connection.request("resources/read", Some(params)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(render_resource_contents(&result)),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out reading resource '{uri}'")),
+        }
+    }
+
+    /// Sends the MCP `shutdown` notification and drops the connection.
     /// MCP's stdio shutdown is simpler than LSP's: closing stdin tells the
     /// server we are done. We send a courtesy `shutdown` request first (best-
     /// effort, bounded at 2 s) then let the connection drop, which closes the
@@ -404,8 +437,92 @@ pub(crate) fn parse_resource_list(result: &Value) -> Vec<McpResourceInfo> {
         .unwrap_or_default()
 }
 
-pub(crate) fn parse_prompt_list(result: &Value) -> Vec<McpPromptInfo> {
-    result
+/// Flattens a `prompts/get` result into readable text.
+///
+/// The result is a list of messages, each with content that may be a plain
+/// string or a typed block. Only text is rendered; a non-text block is named
+/// rather than dropped, so a prompt that is mostly an image does not silently
+/// arrive as an empty string.
+pub(crate) fn render_prompt_messages(result: &Value) -> String {
+    let Some(messages) = result.get("messages").and_then(Value::as_array) else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for message in messages {
+        let role = message.get("role").and_then(Value::as_str).unwrap_or("user");
+        let rendered = match message.get("content") {
+            Some(Value::String(s)) => s.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .map(render_content_block)
+                .collect::<Vec<_>>()
+                .join("\n"),
+            Some(block @ Value::Object(_)) => render_content_block(block),
+            _ => String::new(),
+        };
+        if rendered.trim().is_empty() {
+            continue;
+        }
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        out.push_str(role);
+        out.push_str(": ");
+        out.push_str(rendered.trim_end());
+    }
+    out
+}
+
+/// Renders one content block, naming non-text kinds rather than dropping them.
+fn render_content_block(block: &Value) -> String {
+    match block.get("type").and_then(Value::as_str) {
+        Some("text") | None => block
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        Some(other) => format!("[{other} content]"),
+    }
+}
+
+/// Flattens a `resources/read` result into readable text.
+///
+/// Binary contents arrive base64-encoded under `blob`; those are summarised
+/// rather than dumped, since pasting megabytes of base64 into the model's
+/// context is never what the caller wanted.
+pub(crate) fn render_resource_contents(result: &Value) -> String {
+    let Some(contents) = result.get("contents").and_then(Value::as_array) else {
+        return String::new();
+    };
+
+    let mut out = String::new();
+    for item in contents {
+        let rendered = if let Some(text) = item.get("text").and_then(Value::as_str) {
+            text.to_string()
+        } else if let Some(blob) = item.get("blob").and_then(Value::as_str) {
+            let mime = item
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("application/octet-stream");
+            format!("[binary {mime}, {} base64 chars]", blob.len())
+        } else {
+            continue;
+        };
+
+        if !out.is_empty() {
+            out.push_str("\n\n");
+        }
+        if let Some(uri) = item.get("uri").and_then(Value::as_str) {
+            out.push_str(uri);
+            out.push('\n');
+        }
+        out.push_str(&rendered);
+    }
+    out
+}
+
+pub(crate) fn parse_prompt_list(result: &Value) -> Vec<McpPromptInfo> {    result
         .get("prompts")
         .and_then(Value::as_array)
         .map(|arr| {

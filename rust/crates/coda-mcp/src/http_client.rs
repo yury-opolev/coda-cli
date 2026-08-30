@@ -215,6 +215,40 @@ impl McpHttpClient {
         }
     }
 
+    /// Fetches a prompt's rendered text (`prompts/get`).
+    ///
+    /// Reports failure rather than degrading to an empty result: the caller
+    /// asked for one specific prompt, so returning nothing silently would look
+    /// like an empty prompt rather than an error.
+    pub async fn get_prompt(&self, name: &str) -> Result<String, String> {
+        let params = serde_json::json!({ "name": name });
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.send_request("prompts/get", Some(&params)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(crate::client::render_prompt_messages(&result)),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out fetching prompt '{name}'")),
+        }
+    }
+
+    /// Reads a resource's contents (`resources/read`).
+    pub async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        let params = serde_json::json!({ "uri": uri });
+        match tokio::time::timeout(
+            Duration::from_secs(30),
+            self.send_request("resources/read", Some(&params)),
+        )
+        .await
+        {
+            Ok(Ok(result)) => Ok(crate::client::render_resource_contents(&result)),
+            Ok(Err(e)) => Err(e.to_string()),
+            Err(_) => Err(format!("timed out reading resource '{uri}'")),
+        }
+    }
+
     /// Cancel all in-flight requests and drop the connection.
     pub async fn shutdown(self) {
         self.lifetime.cancel();

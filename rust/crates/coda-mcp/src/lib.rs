@@ -24,6 +24,7 @@ pub mod auth;
 pub mod config;
 pub mod error;
 pub mod manager;
+pub mod management_tools;
 pub mod secret;
 pub mod tool;
 

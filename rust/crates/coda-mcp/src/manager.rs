@@ -78,6 +78,34 @@ impl AnyClient {
             Self::Http(c) => c.shutdown().await,
         }
     }
+
+    async fn list_prompts(&self) -> Vec<crate::client::McpPromptInfo> {
+        match self {
+            Self::Stdio(c) => c.list_prompts().await,
+            Self::Http(c) => c.list_prompts().await,
+        }
+    }
+
+    async fn list_resources(&self) -> Vec<crate::client::McpResourceInfo> {
+        match self {
+            Self::Stdio(c) => c.list_resources().await,
+            Self::Http(c) => c.list_resources().await,
+        }
+    }
+
+    async fn get_prompt(&self, name: &str) -> Result<String, String> {
+        match self {
+            Self::Stdio(c) => c.get_prompt(name).await,
+            Self::Http(c) => c.get_prompt(name).await,
+        }
+    }
+
+    async fn read_resource(&self, uri: &str) -> Result<String, String> {
+        match self {
+            Self::Stdio(c) => c.read_resource(uri).await,
+            Self::Http(c) => c.read_resource(uri).await,
+        }
+    }
 }
 
 /// Per-server state held by the manager.
@@ -85,6 +113,20 @@ struct ServerEntry {
     client: AnyClient,
     /// Child process kept alive as long as the entry exists; `None` for HTTP.
     _process: Option<McpProcess>,
+    /// How to reconnect this server.
+    ///
+    /// Retained so a restart can relaunch without re-reading and re-resolving
+    /// the config, which would silently pick up an edit the user has not
+    /// approved — and would fail entirely for a server that is connected but
+    /// no longer present in the file.
+    spec: ServerSpec,
+}
+
+/// Enough to reconnect a server after a restart.
+#[derive(Clone)]
+enum ServerSpec {
+    Stdio(Box<McpConnectable>),
+    Http(Box<config::McpHttpConnectable>),
 }
 
 /// Connects configured MCP servers and exposes their tools.
@@ -266,6 +308,103 @@ impl McpClientManager {
         }
     }
 
+    /// Lists prompts across every connected server, tagged with the server name.
+    ///
+    /// A server that does not support prompts, or fails to answer, contributes
+    /// nothing rather than failing the whole listing — one broken server must
+    /// not hide every other server's prompts.
+    pub async fn list_prompts(&self) -> Vec<(String, crate::client::McpPromptInfo)> {
+        let guard = self.servers.read().await;
+        let mut out = Vec::new();
+        for (name, entry) in guard.iter() {
+            for prompt in entry.client.list_prompts().await {
+                out.push((name.clone(), prompt));
+            }
+        }
+        out.sort_by(|a, b| (&a.0, &a.1.name).cmp(&(&b.0, &b.1.name)));
+        out
+    }
+
+    /// Lists resources across every connected server, tagged with the server name.
+    pub async fn list_resources(&self) -> Vec<(String, crate::client::McpResourceInfo)> {
+        let guard = self.servers.read().await;
+        let mut out = Vec::new();
+        for (name, entry) in guard.iter() {
+            for resource in entry.client.list_resources().await {
+                out.push((name.clone(), resource));
+            }
+        }
+        out.sort_by(|a, b| (&a.0, &a.1.uri).cmp(&(&b.0, &b.1.uri)));
+        out
+    }
+
+    /// Fetches one prompt's rendered text from a named server.
+    pub async fn get_prompt(&self, server_name: &str, prompt_name: &str) -> Result<String, String> {
+        let guard = self.servers.read().await;
+        let Some(entry) = guard.get(server_name) else {
+            return Err(format!(
+                "MCP server '{server_name}' is not connected. \
+                 Check /mcp status and restart it if needed."
+            ));
+        };
+        entry.client.get_prompt(prompt_name).await
+    }
+
+    /// Reads one resource from a named server.
+    pub async fn read_resource(&self, server_name: &str, uri: &str) -> Result<String, String> {
+        let guard = self.servers.read().await;
+        let Some(entry) = guard.get(server_name) else {
+            return Err(format!(
+                "MCP server '{server_name}' is not connected. \
+                 Check /mcp status and restart it if needed."
+            ));
+        };
+        entry.client.read_resource(uri).await
+    }
+
+    /// Restarts one server, reconnecting and refreshing its tool list.
+    ///
+    /// Returns the number of tools the restarted server advertises. A server
+    /// that is not currently connected is an error rather than a silent
+    /// no-op — the caller asked for a restart and needs to know it did not
+    /// happen.
+    pub async fn restart_server(&self, server_name: &str) -> Result<usize, String> {
+        let entry = {
+            let mut guard = self.servers.write().await;
+            guard.remove(server_name)
+        };
+        let Some(entry) = entry else {
+            return Err(format!("MCP server '{server_name}' is not connected."));
+        };
+
+        let spec = entry.spec.clone();
+        // Shut the old process down before starting a new one, so a server
+        // holding an exclusive resource (a port, a lock file) can rebind.
+        entry.client.shutdown().await;
+
+        let connect_timeout = DEFAULT_CONNECT_TIMEOUT;
+        let tool_timeout = self.tool_timeout;
+        let reconnected = match &spec {
+            ServerSpec::Stdio(cfg) => {
+                connect_one_stdio(cfg, connect_timeout, tool_timeout).await
+            }
+            ServerSpec::Http(cfg) => {
+                connect_one_http(cfg, connect_timeout, tool_timeout).await
+            }
+        };
+
+        match reconnected {
+            Ok(new_entry) => {
+                let count = new_entry.client.tools().len();
+                self.servers.write().await.insert(server_name.to_string(), new_entry);
+                Ok(count)
+            }
+            // The server is now disconnected rather than half-restarted; the
+            // caller is told so instead of being left believing it recovered.
+            Err(e) => Err(format!("failed to restart '{server_name}': {e}")),
+        }
+    }
+
     /// Gracefully shut down all servers.
     pub async fn shutdown(&self) {
         let mut guard = self.servers.write().await;
@@ -295,7 +434,7 @@ async fn connect_one_stdio(
 ) -> Result<ServerEntry, McpError> {
     let (proc, stdin, stdout) = McpProcess::spawn(config)?;
     let client = McpClient::connect(stdout, stdin, connect_timeout, tool_timeout).await?;
-    Ok(ServerEntry { client: AnyClient::Stdio(client), _process: Some(proc) })
+    Ok(ServerEntry { client: AnyClient::Stdio(client), _process: Some(proc), spec: ServerSpec::Stdio(Box::new(config.clone())) })
 }
 
 async fn connect_one_http(
@@ -312,7 +451,11 @@ async fn connect_one_http(
         tool_timeout,
     )
     .await?;
-    Ok(ServerEntry { client: AnyClient::Http(client), _process: None })
+    Ok(ServerEntry {
+        client: AnyClient::Http(client),
+        _process: None,
+        spec: ServerSpec::Http(Box::new(config.clone())),
+    })
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -338,7 +481,18 @@ mod tests {
         let mut guard = manager.servers.write().await;
         guard.insert(
             server_name.to_string(),
-            ServerEntry { client: AnyClient::Stdio(client), _process: None },
+            ServerEntry {
+                client: AnyClient::Stdio(client),
+                _process: None,
+                // An injected client has no real launch spec; a restart of it
+                // would legitimately fail, which is what the test expects.
+                spec: ServerSpec::Stdio(Box::new(McpConnectable {
+                    name: server_name.to_string(),
+                    command: "does-not-exist".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                })),
+            },
         );
     }
 
