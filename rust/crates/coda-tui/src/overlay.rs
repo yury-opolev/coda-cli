@@ -342,6 +342,25 @@ impl Browser {
         .join(" ")
 }
 
+    /// Moves the selection to the row with `id`, if it is visible.
+    ///
+    /// Used when a browser is rebuilt from fresh data: the new instance starts
+    /// at the top, so without this a reload silently throws away the user's
+    /// place in the list.
+    pub fn select_by_id(&mut self, id: &str) -> bool {
+        match self
+            .visible
+            .iter()
+            .position(|&i| self.items[i].id == id)
+        {
+            Some(position) => {
+                self.selected = position;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn handle(&mut self, key: crossterm::event::KeyEvent) -> Intent {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 

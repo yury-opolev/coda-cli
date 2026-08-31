@@ -69,11 +69,20 @@ impl Surface for BrowserSurface {
     }
 
     fn hints(&self) -> String {
-        // The status row shows the filter while one is being typed, which
-        // matters more than the key list at that moment.
-        match self.browser.filter_text() {
-            Some(filter) => format!("/{filter}"),
-            None => self.browser.footer().to_string(),
+        // The status row and the key list share one line. A filter being typed
+        // outranks both: it is what the user is doing right now.
+        //
+        // The old three-row layout had a dedicated status row; folding it in
+        // here keeps `set_status` visible rather than writing to something
+        // nothing renders, which is what happened when the row was dropped.
+        if let Some(filter) = self.browser.filter_text() {
+            return format!("/{filter}");
+        }
+        let status = self.browser.status();
+        if status.is_empty() {
+            self.browser.footer().to_string()
+        } else {
+            format!("{status}    {}", self.browser.footer())
         }
     }
 
@@ -331,6 +340,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_status_is_visible_alongside_the_key_hints() {
+        // The old layout had a dedicated status row. When it was dropped,
+        // set_status wrote to something nothing rendered, so a reload gave no
+        // confirmation at all.
+        let mut s = surface();
+        s.browser.set_status("reloaded");
+        let hints = s.hints();
+        assert!(hints.contains("reloaded"), "status missing from {hints:?}");
+        assert!(hints.contains("Enter select"), "hints lost: {hints:?}");
+    }
+
+    #[test]
+    fn selecting_by_id_moves_to_that_row() {
+        // A reload builds a fresh Browser, which starts at the top; without
+        // this the user's place is silently thrown away.
+        let mut s = surface();
+        assert!(s.browser.select_by_id("c"));
+        assert_eq!(s.browser.selected_id(), Some("c"));
+        assert!(!s.browser.select_by_id("nope"));
+        assert_eq!(s.browser.selected_id(), Some("c"), "a miss moved the selection");
     }
 
     #[test]

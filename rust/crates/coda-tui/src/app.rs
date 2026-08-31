@@ -151,12 +151,6 @@ impl App {
             .map(BrowserSurface::browser)
     }
 
-    fn browser_mut(&mut self) -> Option<&mut Browser> {
-        self.surfaces
-            .top_mut()
-            .and_then(|s| s.as_any_mut().downcast_mut::<BrowserSurface>())
-            .map(BrowserSurface::browser_mut)
-    }
 
     fn browser_kind(&self) -> Option<BrowserKind> {
         self.surfaces
@@ -715,8 +709,14 @@ impl App {
         self.retire_browser_surface();
     }
 
-    /// Opens a browser, fetching its data from the engine.
-    async fn open_browser(&mut self, kind: BrowserKind) {
+    /// Fetches a browser's data and builds it, without opening it.
+    ///
+    /// Separate from opening so a reload can fetch first and only replace the
+    /// open browser once it has something to replace it with. Retiring the old
+    /// surface before a fallible fetch makes a transient engine error close the
+    /// browser and lose the user's place -- and reload is exactly when a flaky
+    /// engine is most likely.
+    async fn build_browser(&mut self, kind: BrowserKind) -> Option<Browser> {
         let browser = match kind {
             BrowserKind::Models => {
                 match self
@@ -731,7 +731,10 @@ impl App {
                         self.state.model.as_deref(),
                         &result.source,
                     ),
-                    Err(error) => return self.browser_failed("models", error),
+                    Err(error) => {
+                        self.browser_failed("models", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Schedules => {
@@ -743,7 +746,10 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::schedules(&result.schedules),
-                    Err(error) => return self.browser_failed("schedules", error),
+                    Err(error) => {
+                        self.browser_failed("schedules", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Skills => {
@@ -755,7 +761,10 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::skills(&result.skills),
-                    Err(error) => return self.browser_failed("skills", error),
+                    Err(error) => {
+                        self.browser_failed("skills", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Plugins => {
@@ -767,7 +776,10 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::plugins(&result.plugins),
-                    Err(error) => return self.browser_failed("plugins", error),
+                    Err(error) => {
+                        self.browser_failed("plugins", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Hooks => {
@@ -779,17 +791,21 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::hooks(&result.hooks),
-                    Err(error) => return self.browser_failed("hooks", error),
+                    Err(error) => {
+                        self.browser_failed("hooks", error);
+                        return None;
+                    }
                 }
             }
             // MCP configuration lives in local JSON, so it needs no engine call.
             BrowserKind::Mcp => match config::load_mcp_servers(&self.paths) {
                 Ok(servers) => browsers::mcp(&servers),
                 Err(error) => {
-                    return self.notice(
+                    self.notice(
                         format!("Could not read MCP configuration: {error}"),
                         NoticeLevel::Error,
-                    )
+                    );
+                    return None;
                 }
             },
             // Tasks are engine state, but the runtime persists a log per task
@@ -808,21 +824,31 @@ impl App {
                 {
                     Ok(list) => list,
                     Err(_) => {
-                        return self.notice("Could not load sessions.", NoticeLevel::Error)
+                        self.notice("Could not load sessions.", NoticeLevel::Error);
+                        return None;
                     }
                 };
                 if summaries.is_empty() {
-                    return self.notice(
+                    self.notice(
                         "No sessions found. Start a conversation to create one.",
                         NoticeLevel::Info,
                     );
+                    return None;
                 }
                 browsers::sessions(&summaries)
             }
         };
 
-        self.surfaces.push(Box::new(BrowserSurface::new(kind, browser)));
-        self.dirty = true;
+        Some(browser)
+    }
+
+    /// Opens a browser, fetching its data from the engine.
+    async fn open_browser(&mut self, kind: BrowserKind) {
+        if let Some(browser) = self.build_browser(kind).await {
+            self.surfaces
+                .push(Box::new(BrowserSurface::new(kind, browser)));
+            self.dirty = true;
+        }
     }
 
     fn browser_failed(&mut self, what: &str, error: ClientError) {
@@ -833,19 +859,27 @@ impl App {
     }
 
     async fn reload_browser(&mut self) {
-        if let Some(kind) = self.browser_kind() {
-            // Rebuilding preserves the selected row by id.
-            let selected = self
-                .browser()
-                .and_then(|b| b.selected_id().map(str::to_string));
-            // Retire the old surface first, or open_browser would push a
-            // second browser on top of it.
-            self.retire_browser_surface();
-            self.open_browser(kind).await;
-            if let (Some(browser), Some(_)) = (self.browser_mut(), selected) {
-                browser.set_status("reloaded");
-            }
+        let Some(kind) = self.browser_kind() else {
+            return;
+        };
+        let selected = self
+            .browser()
+            .and_then(|b| b.selected_id().map(str::to_string));
+
+        // Fetch before retiring. If the engine hiccups the old browser stays
+        // exactly as it was, rather than vanishing and losing the user's place.
+        let Some(mut browser) = self.build_browser(kind).await else {
+            return;
+        };
+        if let Some(id) = selected {
+            browser.select_by_id(&id);
         }
+        browser.set_status("reloaded");
+
+        self.retire_browser_surface();
+        self.surfaces
+            .push(Box::new(BrowserSurface::new(kind, browser)));
+        self.dirty = true;
     }
 
     /// Handles Enter on a row.
