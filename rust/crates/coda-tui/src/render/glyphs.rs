@@ -111,3 +111,6 @@ pub const SWITCH_OFF: &str = "[\u{25CF} ]"; // "[● ]"
 
 /// Both arrows, for hint text such as "↑↓: choose".
 pub const ARROWS_VERTICAL: &str = "\u{2191}\u{2193}"; // "↑↓"
+
+/// Marks model reasoning in the transcript.
+pub const THINKING: &str = "\u{1F4AD}"; // 💭

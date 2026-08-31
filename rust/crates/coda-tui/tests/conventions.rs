@@ -28,24 +28,100 @@ fn sources() -> Vec<(String, String)> {
 /// Tests legitimately contain glyph literals — CJK strings for width
 /// assertions, for example — and holding them to the UI rule would force
 /// pointless indirection in test data.
+///
+/// Brace-matches each test module rather than truncating the file at the first
+/// `#[cfg(test)]`. Truncating looks equivalent while every file happens to keep
+/// one test module at the bottom, but a single test-only `use` near the top —
+/// an ordinary thing to write — would silently disable every rule below it for
+/// the rest of the file, with nothing to tell the author.
 fn without_test_modules(source: &str) -> String {
-    match source.find("#[cfg(test)]") {
-        Some(at) => source[..at].to_string(),
-        None => source.to_string(),
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+
+    while let Some(at) = rest.find("#[cfg(test)]") {
+        out.push_str(&rest[..at]);
+        let after = &rest[at + "#[cfg(test)]".len()..];
+
+        // Only a module is skipped wholesale. A test-only `use` or `const` is
+        // a single item, so dropping the rest of the file for it would be the
+        // very bug this avoids; skip just the attribute and keep scanning.
+        let Some(brace) = after.find('{') else {
+            rest = after;
+            continue;
+        };
+        if !after[..brace].contains("mod ") {
+            rest = after;
+            continue;
+        }
+
+        let mut depth = 0usize;
+        let mut end = None;
+        for (index, ch) in after[brace..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(brace + index + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        match end {
+            Some(end) => rest = &after[end..],
+            // Unbalanced braces: drop the remainder rather than risk a false
+            // pass on a file we cannot parse.
+            None => return out,
+        }
     }
+
+    out.push_str(rest);
+    out
 }
 
 /// Drops comment text, so a constant may document itself with the glyph it
 /// names without the documentation counting as a violation.
+///
+/// Quote-aware. Treating the first `//` on a line as a comment start looks
+/// right until a string contains a URL: `"see https://example.com ✓"` would
+/// have everything from `//` discarded, masking the glyph after it.
 fn without_comments(source: &str) -> String {
-    source
-        .lines()
-        .map(|line| match line.find("//") {
-            Some(at) => &line[..at],
-            None => line,
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut out = String::with_capacity(source.len());
+
+    for line in source.lines() {
+        let mut in_string = false;
+        let mut in_char = false;
+        let mut escaped = false;
+        let mut cut = line.len();
+        let bytes: Vec<char> = line.chars().collect();
+
+        for i in 0..bytes.len() {
+            let ch = bytes[i];
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' if in_string || in_char => escaped = true,
+                '"' if !in_char => in_string = !in_string,
+                '\'' if !in_string => in_char = !in_char,
+                '/' if !in_string && !in_char && i + 1 < bytes.len() && bytes[i + 1] == '/' => {
+                    cut = line
+                        .char_indices()
+                        .nth(i)
+                        .map(|(byte, _)| byte)
+                        .unwrap_or(line.len());
+                    break;
+                }
+                _ => {}
+            }
+        }
+        out.push_str(&line[..cut]);
+        out.push('\n');
+    }
+    out
 }
 
 /// The symbol glyphs that must come from `render::glyphs`.
@@ -69,6 +145,7 @@ const ENFORCED: &[char] = &[
     '\u{2713}', // ✓ check
     '\u{2717}', // ✗ cross
     '\u{2588}', // █ block
+    '\u{1F4AD}', // 💭 thinking
 ];
 
 #[test]

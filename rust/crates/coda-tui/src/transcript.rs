@@ -316,11 +316,11 @@ fn render_thinking(
     let seconds = (elapsed_ms as f64 / 1000.0).round() as i64;
 
     let status = if complete {
-        format!("💭 Thought for {seconds}s")
+        format!("{} Thought for {seconds}s", glyphs::THINKING)
     } else {
         match tokens {
-            Some(tokens) => format!("💭 Thinking… {seconds}s · {tokens} tok"),
-            None => format!("💭 Thinking… {seconds}s"),
+            Some(tokens) => format!("{} Thinking… {seconds}s · {tokens} tok", glyphs::THINKING),
+            None => format!("{} Thinking… {seconds}s", glyphs::THINKING),
         }
     };
 

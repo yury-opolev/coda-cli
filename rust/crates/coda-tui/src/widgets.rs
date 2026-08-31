@@ -122,8 +122,12 @@ fn label_style(focused: bool, theme: &Theme) -> ratatui::style::Style {
 /// layered beneath it so none of the three is load-bearing alone and the state
 /// survives a terminal with no colour at all.
 ///
-/// Applied last, over spans that already carry their own foreground, so a
-/// control does not have to know whether it is focused when choosing colours.
+/// A span that already carries a background keeps it. The open dropdown's
+/// highlighted option is the case that matters: it is drawn as dark text on a
+/// bright highlight, so overwriting that background would leave the *selected*
+/// row the hardest one to read. Focus and selection have to be legible at the
+/// same time, which is the whole reason the two colours are required to
+/// differ.
 fn band(lines: Vec<Line<'static>>, focused: bool, theme: &Theme) -> Vec<Line<'static>> {
     if !focused {
         return lines;
@@ -136,7 +140,11 @@ fn band(lines: Vec<Line<'static>>, focused: bool, theme: &Theme) -> Vec<Line<'st
                 line.spans
                     .into_iter()
                     .map(|span| {
-                        let style = span.style.bg(bg);
+                        let style = if span.style.bg.is_none() {
+                            span.style.bg(bg)
+                        } else {
+                            span.style
+                        };
                         Span::styled(span.content, style)
                     })
                     .collect::<Vec<_>>(),
@@ -1350,6 +1358,26 @@ mod tests {
             .count();
         // The focused text input contributes a label row and a value row.
         assert_eq!(banded, 2, "expected the focused control's two rows banded");
+    }
+
+    #[test]
+    fn the_band_does_not_overwrite_the_open_dropdown_highlight() {
+        // The highlighted option is dark text on a bright highlight. Painting
+        // the band over it would leave the selected row the hardest one to
+        // read — the exact inversion the focus/selection split exists to
+        // prevent.
+        let mut select = Select::new("Pick", options());
+        select.handle_key(key(KeyCode::Enter)); // open the list
+
+        let highlight = theme().fg(Role::CompletionSelectedBackground);
+        let rendered = select.render(40, true, &theme());
+        assert!(
+            rendered
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style.bg == Some(highlight)),
+            "the band overwrote the highlighted option's background"
+        );
     }
 
     #[test]
