@@ -168,18 +168,13 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
 
     // Connect before touching the terminal, so a failure prints a normal error
     // instead of a blank alternate screen.
-    let (app, engine_process, inbound) = App::connect(command, theme).await?;
+    let (mut app, engine_process, inbound) = App::connect(command, theme).await?;
 
-    // The banner goes out before the alternate screen is entered, so it stays
-    // in the scrollback the way the C# build's does rather than being wiped on
-    // exit. It names the provider and model, which is the only pre-flight
-    // signal that you are about to spend money against the wrong one.
-    let session = app.session_snapshot();
-    coda_tui::branding::print_startup(
-        &working_dir.to_string_lossy(),
-        session.provider.as_deref(),
-        session.model.as_deref(),
-    );
+    // The banner is seeded into the transcript rather than printed to the raw
+    // console: printed before the alternate screen it would be wiped the
+    // instant that screen is entered, so the user would never see it. The exit
+    // summary still prints, because by then the screen has been released.
+    app.push_banner(&working_dir.to_string_lossy());
 
     install_panic_hook();
     let started_at = std::time::Instant::now();

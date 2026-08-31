@@ -6,8 +6,6 @@
 //! to get back to the session. Their absence was the first thing noticed when
 //! the Rust build was actually used.
 
-use coda_render::Theme;
-
 pub const PRODUCT_NAME: &str = "Coda";
 pub const TAGLINE: &str = "an agentic coding assistant";
 
@@ -103,13 +101,18 @@ pub fn quote_argument(value: &str) -> String {
     out
 }
 
-/// The startup banner, as plain lines ready to print.
-pub fn startup_lines(
+/// The wordmark rows, for callers that colour them separately.
+pub fn wordmark_lines() -> Vec<String> {
+    WORDMARK.iter().map(|l| (*l).to_string()).collect()
+}
+
+/// The startup banner's detail lines, without the wordmark.
+pub fn startup_detail_lines(
     working_directory: &str,
     provider: Option<&str>,
     model: Option<&str>,
 ) -> Vec<String> {
-    let mut lines: Vec<String> = WORDMARK.iter().map(|l| (*l).to_string()).collect();
+    let mut lines = Vec::new();
     lines.push(String::new());
     lines.push(format!("Welcome to {PRODUCT_NAME} v{}", version()));
     lines.push(TAGLINE.to_string());
@@ -120,6 +123,17 @@ pub fn startup_lines(
         None => lines.push("not signed in — run /login".to_string()),
     }
     lines.push("Type /help for commands, or /exit to quit.".to_string());
+    lines
+}
+
+/// The startup banner, as plain lines ready to print.
+pub fn startup_lines(
+    working_directory: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Vec<String> {
+    let mut lines = wordmark_lines();
+    lines.extend(startup_detail_lines(working_directory, provider, model));
     lines
 }
 
@@ -159,17 +173,6 @@ pub fn exit_lines(summary: &ExitSummary) -> Vec<String> {
         None => lines.push("This session was not saved.".to_string()),
     }
     lines
-}
-
-/// Writes the startup banner to the terminal, before the alternate screen.
-pub fn print_startup(working_directory: &str, provider: Option<&str>, model: Option<&str>) {
-    let theme = Theme::default();
-    let _ = theme; // reserved for colouring once the plain path is verified
-    println!();
-    for line in startup_lines(working_directory, provider, model) {
-        println!("{line}");
-    }
-    println!();
 }
 
 /// Writes the exit summary, after the alternate screen has been left.

@@ -13,7 +13,8 @@ use coda_proto::messages::{self, method, server_method};
 use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
 use crossterm::event::{
-    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, MouseEventKind,
+    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use futures::future::OptionFuture;
 use futures_lite::StreamExt;
@@ -37,6 +38,29 @@ use crate::viewport::{Viewport, ViewportAnchor};
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Rows scrolled per mouse wheel notch.
 const WHEEL_ROWS: usize = 3;
+
+/// What a pointer gesture asks the clipboard to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerAction {
+    Copy,
+    Paste,
+}
+
+/// Decides what a right-click means.
+///
+/// One button carries both operations, chosen by whether anything is selected:
+/// this is the Windows console convention and matches the C# build, so muscle
+/// memory carries over. A selection is consumed by the copy, which is what
+/// makes the alternation feel natural — select, right-click to copy, then
+/// right-click again to paste.
+fn pointer_action(has_selection: bool) -> Option<PointerAction> {
+    Some(if has_selection {
+        PointerAction::Copy
+    } else {
+        PointerAction::Paste
+    })
+}
+
 /// Minimum interval between streaming (non-critical) frames — 30 FPS.
 ///
 /// Matches C# `UiActor.MinStreamingFrameIntervalMs = 33`.
@@ -430,48 +454,74 @@ impl App {
                 self.dirty = true;
                 guard.terminal().autoresize()?;
             }
-            TerminalEvent::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.capture_anchor_if_following();
-                    self.viewport.scroll_up(WHEEL_ROWS);
-                    self.dirty = true;
-                }
-                MouseEventKind::ScrollDown => {
-                    self.viewport.scroll_down(WHEEL_ROWS);
-                    self.dirty = true;
-                }
-                // Drag-select. Mouse capture disables the terminal's own
-                // selection, so without this there is no way to select
-                // anything at all — the capture takes the native behaviour
-                // away and gives nothing back.
-                MouseEventKind::Down(crossterm::event::MouseButton::Left) => {
-                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                        self.selection.begin(pos);
-                        self.dirty = true;
+            TerminalEvent::Mouse(mouse) => {
+                if let Some(action) = self.decide_pointer_action(mouse) {
+                    match action {
+                        PointerAction::Copy => self.copy_selection_via_pointer(),
+                        PointerAction::Paste => self.paste_from_pointer(),
                     }
                 }
-                MouseEventKind::Drag(crossterm::event::MouseButton::Left) => {
-                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                        self.selection.update(pos);
-                        self.dirty = true;
-                    }
-                }
-                MouseEventKind::Up(crossterm::event::MouseButton::Left) => {
-                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                        self.selection.update(pos);
-                    }
-                    // A click with no drag clears rather than leaving a stale
-                    // one-cell selection that Ctrl+Y would then copy.
-                    if !self.selection.has_selection() {
-                        self.selection.clear();
-                    }
-                    self.dirty = true;
-                }
-                _ => {}
-            },
+            }
             TerminalEvent::FocusGained | TerminalEvent::FocusLost => {}
         }
         Ok(())
+    }
+
+    /// Maps a pointer event onto its effect, returning the clipboard action the
+    /// gesture asks for (if any).
+    ///
+    /// Split out from the event loop so tests can drive real pointer events and
+    /// observe the decision. Handlers buried in the loop are exactly the shape
+    /// that has silently gone unwired here before.
+    fn decide_pointer_action(&mut self, mouse: MouseEvent) -> Option<PointerAction> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.capture_anchor_if_following();
+                self.viewport.scroll_up(WHEEL_ROWS);
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                self.viewport.scroll_down(WHEEL_ROWS);
+                self.dirty = true;
+            }
+            // Drag-select. Mouse capture disables the terminal's own selection,
+            // so without this there is no way to select anything at all — the
+            // capture takes the native behaviour away and gives nothing back.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                    self.selection.begin(pos);
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                    self.selection.update(pos);
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                    self.selection.update(pos);
+                }
+                // A click with no drag clears rather than leaving a stale
+                // one-cell selection that Ctrl+Y would then copy.
+                if !self.selection.has_selection() {
+                    self.selection.clear();
+                }
+                self.dirty = true;
+            }
+            // Right-click is copy-or-paste, matching the C# build and the
+            // Windows console convention: with a selection it copies, and with
+            // nothing selected it pastes into the draft. The paste target is
+            // always the composer regardless of where the pointer was, so the
+            // gesture does not depend on aim.
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.dirty = true;
+                return pointer_action(self.selection.has_selection());
+            }
+            _ => {}
+        }
+        None
     }
 
     async fn on_key(&mut self, key: KeyEvent) {
@@ -1455,6 +1505,25 @@ impl App {
         SessionSnapshot { provider, model }
     }
 
+    /// Seeds the transcript with the startup banner.
+    ///
+    /// The banner belongs in the transcript, not on the raw console: written
+    /// before the alternate screen it is hidden the moment the screen is
+    /// entered, so the user never sees it at all. In the transcript it scrolls
+    /// and can be selected like any other content.
+    pub fn push_banner(&mut self, working_directory: &str) {
+        let session = self.session_snapshot();
+        self.state.transcript.push(crate::transcript::Block::Banner {
+            wordmark: crate::branding::wordmark_lines(),
+            details: crate::branding::startup_detail_lines(
+                working_directory,
+                session.provider.as_deref(),
+                session.model.as_deref(),
+            ),
+        });
+        self.dirty = true;
+    }
+
     /// Builds the exit summary from the session's final state.
     pub fn exit_summary(&self, duration: std::time::Duration) -> crate::branding::ExitSummary {
         let snapshot = self.session_snapshot();
@@ -1746,6 +1815,53 @@ impl App {
     /// If nothing is visible, the call is a no-op.  A failure to access the
     /// clipboard (e.g. no display server) is reported as a notice rather than
     /// crashing the application.
+    /// Copies the active selection for a right-click gesture.
+    ///
+    /// The selection is cleared only on a successful write. Keeping it after a
+    /// failure means the user can retry rather than having to reselect, which
+    /// is what the C# does for the same reason.
+    fn copy_selection_via_pointer(&mut self) {
+        let text = self.selection.copy_text(&self.rows);
+        if text.is_empty() {
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
+            Ok(()) => {
+                self.selection.clear();
+                self.notice("Copied selection to clipboard.", NoticeLevel::Info);
+            }
+            Err(err) => {
+                self.notice(
+                    format!("Could not access the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    /// Pastes the clipboard into the composer for a right-click with nothing
+    /// selected.
+    ///
+    /// Refused while a prompt is up, so a pointer can never type into a
+    /// composer the user cannot see — the same guard the C# applies.
+    fn paste_from_pointer(&mut self) {
+        if self.state.prompt.is_some() || self.browser.is_some() {
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) if !text.is_empty() => {
+                self.composer.insert(&text);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.notice(
+                    format!("Could not read the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
     fn copy_to_clipboard(&mut self) {
         // A selection wins over the visible screen: if the user has selected
         // something, copying everything on screen instead is silently the
@@ -3060,6 +3176,7 @@ pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
             | Block::Question { .. }
             | Block::CommandOutput { .. }
             | Block::Thinking { .. }
+            | Block::Banner { .. }
             | Block::SessionBoundary { .. } => {}
         }
     }
@@ -3420,6 +3537,16 @@ mod tests {
     }
 
     // -- /rewind argument parsing -----------------------------------------------
+
+    #[test]
+    fn right_click_with_a_selection_copies() {
+        assert_eq!(pointer_action(true), Some(PointerAction::Copy));
+    }
+
+    #[test]
+    fn right_click_without_a_selection_pastes() {
+        assert_eq!(pointer_action(false), Some(PointerAction::Paste));
+    }
 
     #[test]
     fn rewind_n_defaults_to_one_when_no_arg() {

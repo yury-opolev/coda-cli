@@ -502,3 +502,39 @@ fn an_overlay_renders_at_every_reasonable_size() {
         }
     }
 }
+
+#[test]
+fn the_composer_panel_is_edged_with_half_blocks() {
+    let state = session();
+    let composer = Composer::new();
+    let lines = render(&state, &composer, 40, 12);
+
+    // The panel sits above the one-row status bar: bottom edge at height - 2,
+    // top edge two rows above that for a single-line composer.
+    let bottom_edge = &lines[lines.len() - 2];
+    let top_edge = &lines[lines.len() - 4];
+
+    assert!(
+        top_edge.chars().all(|c| c == '\u{2584}') && !top_edge.is_empty(),
+        "top edge should be lower half blocks, got {top_edge:?}"
+    );
+    assert!(
+        bottom_edge.chars().all(|c| c == '\u{2580}') && !bottom_edge.is_empty(),
+        "bottom edge should be upper half blocks, got {bottom_edge:?}"
+    );
+}
+
+#[test]
+fn the_startup_banner_renders_in_the_transcript() {
+    let mut state = session();
+    state.transcript.push(coda_tui::transcript::Block::Banner {
+        wordmark: vec!["WORDMARK".to_string()],
+        details: vec![String::new(), "cwd: /tmp/project".to_string()],
+    });
+
+    let composer = Composer::new();
+    let lines = render(&state, &composer, 60, 16).join("\n");
+
+    assert!(lines.contains("WORDMARK"), "wordmark missing from {lines:?}");
+    assert!(lines.contains("cwd: /tmp/project"), "details missing from {lines:?}");
+}

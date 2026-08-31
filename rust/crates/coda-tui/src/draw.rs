@@ -40,15 +40,16 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
     let composer_rows = (composer_lines as u16)
         .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
         // Leave at least three transcript rows however tall the composer is.
-        // The composer costs its rows plus a border, and the status bar one
-        // more, so the budget is `height - 3 - 1 - 1`.
-        .min(area.height.saturating_sub(5).max(COMPOSER_MIN_ROWS));
+        // The composer costs its rows plus both half-block edges, and the
+        // status bar one more, so the budget is `height - 3 - 2 - 1`.
+        .min(area.height.saturating_sub(6).max(COMPOSER_MIN_ROWS));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(composer_rows + 1), // + the panel's top border
+            // + the panel's top and bottom half-block edges
+            Constraint::Length(composer_rows + 2),
             Constraint::Length(1),
         ])
         .split(area);
@@ -373,6 +374,16 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Th
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The composer's top edge is a *lower* half block: the cell's upper half keeps
+/// the shell background and its lower half carries the panel colour, so the
+/// panel appears to begin half a row above its first content row rather than
+/// starting abruptly on a cell boundary.
+const TOP_EDGE_GLYPH: &str = "\u{2584}";
+
+/// Mirrors [`TOP_EDGE_GLYPH`] with an *upper* half block, so the panel appears
+/// to end half a row below its last content row.
+const BOTTOM_EDGE_GLYPH: &str = "\u{2580}";
+
 fn draw_composer(
     frame: &mut Frame,
     area: Rect,
@@ -380,12 +391,49 @@ fn draw_composer(
     state: &UiState,
     theme: &Theme,
 ) {
-    let panel = Block::default()
-        .borders(Borders::TOP)
-        .border_style(theme.style(Role::ComposerPanelEdge))
-        .style(Style::default().bg(theme.fg(Role::ComposerPanelBackground)));
-    let inner = panel.inner(area);
-    frame.render_widget(panel, area);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // The panel body. The edges are drawn over the first and last rows below.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.fg(Role::ComposerPanelBackground))),
+        area,
+    );
+
+    // The edge rows are painted against the SHELL background, not the panel
+    // background: the half block then reads as the panel bleeding half a row
+    // outward, rather than as a lighter rim floating inside the panel.
+    let edge_style = Style::default()
+        .fg(theme.fg(Role::ComposerPanelEdge))
+        .bg(theme.fg(Role::Background));
+    let width = area.width as usize;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            TOP_EDGE_GLYPH.repeat(width),
+            edge_style,
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                BOTTOM_EDGE_GLYPH.repeat(width),
+                edge_style,
+            ))),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
+
+    let inner = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    if inner.height == 0 {
+        return;
+    }
 
     let prompt_style = theme.style(Role::ComposerPrompt);
     let text_style = theme.style(Role::ComposerText);
@@ -720,21 +768,21 @@ mod tests {
     fn layout_reserves_rows_for_the_composer_and_status() {
         let regions = layout(area(80, 24), 1, false);
         assert_eq!(regions.status.height, 1);
-        assert_eq!(regions.composer.height, 2); // one row plus the border
-        assert_eq!(regions.transcript.height, 21);
+        assert_eq!(regions.composer.height, 3); // one row plus both edges
+        assert_eq!(regions.transcript.height, 20);
     }
 
     #[test]
     fn the_composer_grows_with_its_content() {
         let regions = layout(area(80, 24), 5, false);
-        assert_eq!(regions.composer.height, 6);
-        assert_eq!(regions.transcript.height, 17);
+        assert_eq!(regions.composer.height, 7);
+        assert_eq!(regions.transcript.height, 16);
     }
 
     #[test]
     fn the_composer_stops_growing_at_its_cap() {
         let regions = layout(area(80, 40), 50, false);
-        assert_eq!(regions.composer.height, COMPOSER_MAX_ROWS + 1);
+        assert_eq!(regions.composer.height, COMPOSER_MAX_ROWS + 2);
     }
 
     #[test]

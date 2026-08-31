@@ -117,6 +117,16 @@ pub enum Block {
     Diff { raw: String },
     /// A marker separating resumed sessions.
     SessionBoundary { id: String },
+    /// The startup banner: wordmark plus session details.
+    ///
+    /// Rendered in the transcript rather than written to the raw console, so it
+    /// scrolls, reflows and can be selected like any other content.
+    Banner {
+        /// The wordmark rows, carried separately so they keep the brand colour.
+        wordmark: Vec<String>,
+        /// Version, cwd, provider and model.
+        details: Vec<String>,
+    },
 }
 
 impl Block {
@@ -172,6 +182,22 @@ impl Block {
                 .flat_map(|line| text::wrap_preformatted(&text::sanitize(line), width))
                 .map(|chunk| RenderLine::new(chunk, Role::Code))
                 .collect(),
+            Block::Banner { wordmark, details } => {
+                // The wordmark is never wrapped: a broken figlet is worse than
+                // one clipped by a narrow terminal.
+                let mut lines: Vec<RenderLine> = wordmark
+                    .iter()
+                    .map(|row| {
+                        RenderLine::new(text::truncate(&text::sanitize(row), width), Role::Heading)
+                    })
+                    .collect();
+                lines.extend(details.iter().flat_map(|line| {
+                    text::wrap_preformatted(&text::sanitize(line), width)
+                        .into_iter()
+                        .map(|chunk| RenderLine::new(chunk, Role::Notification))
+                }));
+                lines
+            }
             Block::Diff { raw } => {
                 let diff = coda_render::diff::parse(raw);
                 if diff.is_empty() {
