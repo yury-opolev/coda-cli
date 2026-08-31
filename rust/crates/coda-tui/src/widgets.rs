@@ -36,9 +36,9 @@ use crate::render::glyphs;
 
 /// Gutter marker on the focused control, echoing the composer's prompt so the
 /// two read as the same idea.
-const FOCUS_MARKER: &str = "❯ ";
+const FOCUS_MARKER: &str = glyphs::FOCUS_MARKER;
 /// Same width as [`FOCUS_MARKER`], so unfocused rows stay aligned.
-const FOCUS_BLANK: &str = "  ";
+const FOCUS_BLANK: &str = glyphs::FOCUS_BLANK;
 
 /// Whether a control used a key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -655,7 +655,7 @@ impl Control for Select {
                 } else {
                     theme.style(Role::CompletionNormal)
                 };
-                let prefix = if selected { "› " } else { "  " };
+                let prefix = if selected { glyphs::OPTION_MARKER } else { glyphs::OPTION_BLANK };
                 rows.push(Line::from(vec![
                     Span::raw(FOCUS_BLANK),
                     Span::styled(
@@ -748,7 +748,7 @@ impl Control for RadioGroup {
             let chosen = index == self.selected;
             // A filled dot rather than colour alone, so the choice survives a
             // monochrome terminal.
-            let glyph = if chosen { "(●)" } else { "( )" };
+            let glyph = if chosen { glyphs::RADIO_ON } else { glyphs::RADIO_OFF };
             let style = if chosen && focused {
                 theme.style(Role::PromptAccent)
             } else if chosen {
@@ -834,7 +834,7 @@ impl Control for Switch {
     fn render(&self, width: u16, focused: bool, theme: &Theme) -> Vec<Line<'static>> {
         // The knob's position carries the state on its own, so the switch is
         // still readable where colour is not.
-        let knob = if self.on { "[ ●]" } else { "[● ]" };
+        let knob = if self.on { glyphs::SWITCH_ON } else { glyphs::SWITCH_OFF };
         let state = if self.on { "on" } else { "off" };
         let state_style = if self.on {
             theme.style(Role::ToolSuccess)

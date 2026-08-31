@@ -15,7 +15,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use coda_render::text;
 
 /// The gutter prefix width used for the pin row (matches `Gutter::UserMarker`).
-const PREFIX: &str = " ❯ "; // ❯
+const PREFIX: &str = crate::render::glyphs::PROMPT_PADDED;
 const PREFIX_CELLS: usize = 3;
 
 /// Builds the pin row text for `prompt_text` at `width` cells.

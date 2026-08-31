@@ -1771,7 +1771,10 @@ impl App {
                     frame,
                     frame.area(),
                     "Settings",
-                    "Tab: next    ↑↓: change    Enter: save    Esc: cancel",
+                    &format!(
+                        "Tab: next    {}: change    Enter: save    Esc: cancel",
+                        crate::render::glyphs::ARROWS_VERTICAL
+                    ),
                     form,
                     theme,
                 );

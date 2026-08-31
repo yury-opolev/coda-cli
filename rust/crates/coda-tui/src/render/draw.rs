@@ -459,9 +459,9 @@ fn draw_composer(
             // continuation indent matches its width so wrapped lines align
             // under the first one's text.
             let marker = if index == 0 {
-                if state.is_busy() { " ⋯ " } else { " ❯ " }
+                if state.is_busy() { glyphs::BUSY_PADDED } else { glyphs::PROMPT_PADDED }
             } else {
-                "   "
+                glyphs::PROMPT_CONTINUATION
             };
             Line::from(vec![
                 Span::styled(marker, prompt_style),
@@ -600,7 +600,7 @@ fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Th
         PendingPrompt::Permission { tool, preview } => (
             "Permission required",
             format!("{tool}\n\n{preview}"),
-            "y: allow    n: deny    Esc: deny",
+            "y: allow    n: deny    Esc: deny".to_string(),
         ),
         PendingPrompt::Question { question, options, .. } => {
             let body = if options.is_empty() {
@@ -614,12 +614,16 @@ fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Th
                     .join("\n");
                 format!("{question}\n\n{list}")
             };
-            ("Question", body, "↑↓: choose    Enter: answer")
+            (
+                "Question",
+                body,
+                format!("{}: choose    Enter: answer", glyphs::ARROWS_VERTICAL),
+            )
         }
         PendingPrompt::PlanApproval { plan } => (
             "Approve plan?",
             plan.clone(),
-            "y: approve    n: reject    Esc: reject",
+            "y: approve    n: reject    Esc: reject".to_string(),
         ),
     };
 
