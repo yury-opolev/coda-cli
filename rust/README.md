@@ -35,7 +35,7 @@ That means:
 | `coda-proto` | Framing codec, JSON-RPC envelopes, and typed payloads for every `serve` method, event and server-initiated request. I/O free. |
 | `coda-client` | Engine process supervision, duplex transport, request correlation, drop-safe responders. |
 | `coda-render` | Text measurement, the theme, markdown, unified diffs, syntax highlighting, tool display modes. Terminal-agnostic. |
-| `coda-tui` | State reducer, composer, viewport, keymap, drawing and the application loop. |
+| `coda-tui` | State reducer, composer, viewport, keymap, the `Surface` abstraction and its stack, reusable form controls, drawing, and the application loop. |
 | `coda-tool` | Leaf crate: the `Tool` trait, `ToolContext` and the path sandbox. Depends on nothing, so tool hosts need not pull in the engine. |
 | `coda-llm` | Neutral chat model, SSE decoding, Anthropic and Copilot clients, retry policy, reasoning-capability resolution, and the `CredentialSource` seam. |
 | `coda-agent` | The agent loop, 30 built-in tools, permissions, tasks, scheduling, hooks, subagents, compaction and the LSP client. |
@@ -99,6 +99,40 @@ resolves it to 24-bit or 16-colour depending on terminal capability.
 
 **Keys resolve as a pure function** of the event plus UI context, so every
 binding has a test.
+
+**Every interactive overlay is a `Surface`** (`surface::Surface`). A surface
+turns keys into a `SurfaceOutcome` and renders to `Line`s, and it **cannot
+reach the engine** — no `App`, no async, no RPC, no I/O. That constraint is
+what makes each one testable with a key event and an assertion; work that
+needs the engine or the filesystem is requested as a `SurfaceAction` and
+performed by `App::apply_surface_action`, the only bridge.
+
+`SurfaceStack` routes keys to the top surface and renders bottom-up, so a
+detail view sits over the list that opened it. A key the top surface declines
+falls through to the global keymap, which is what keeps `Ctrl+C` working while
+a surface is open.
+
+**Placement is declared by the surface, not chosen by the caller** —
+`Modal`, `Full`, `Split` or `Inline` — and it *degrades rather than clips*: a
+split too narrow for two columns becomes a modal, a modal too small for its
+chrome becomes full screen. A cramped terminal shows a usable surface instead
+of a truncated one.
+
+**A surface scrolls itself**, keyed off the focused element's row range rather
+than the caret. A switch and a radio group have no caret, so a caret-based
+scroll loses them exactly when they take focus.
+
+**Glyphs live in one table** (`render::glyphs`), including composite forms such
+as `(●)` and `"❯ "`. Assembling those at the call site is how a raw glyph gets
+reintroduced. Two tests in `tests/conventions.rs` enforce this and the
+Role-only colour rule; both are written to catch the escaped *and* the raw
+spelling, because closing only one leaves the convention merely looking
+enforced.
+
+**Focus is three layered signals**: a background band across the focused
+control (primary), an accent label, and a `❯` gutter marker (the fallback that
+survives a terminal with no colour). Inversion is reserved for the *selected
+row* inside a list, so focus and selection stay legible at the same time.
 
 ## Status
 
@@ -211,6 +245,19 @@ the obvious alternative is exploitable:
   `McpTool::is_read_only()` is always `false`; the hint is display metadata.
 - **Permission gates fail closed.** Only post-hoc hooks, which cannot prevent
   anything, fail open.
+- **The permission prompt is an `Exclusive` surface.** The engine is blocked
+  until it is answered, so nothing may open above it and `Esc` *denies* rather
+  than dismissing — closing without answering would leave the turn waiting
+  forever on a responder that never receives a reply. Stray keys are swallowed
+  rather than ignored, since an ignored key would reach the stack's own `Esc`
+  handling and pop a prompt the turn depends on. This replaced an ordering
+  rule implied by the sequence of `if` statements in `on_key`: exclusivity is
+  now a property of the prompt rather than a convention about branch order.
+- **The prompt surface and the reducer are kept in lockstep.** The engine
+  clears `state.prompt` when a turn ends or is interrupted, without the prompt
+  being answered; an `Exclusive` surface left behind would be undismissable
+  and would wedge the interface. `App::apply` retires the surface whenever the
+  reducer has no prompt.
 - **Sandbox containment folds case only on case-insensitive platforms.**
   Folding unconditionally would treat a case-variant sibling as inside the
   root on a case-sensitive filesystem.

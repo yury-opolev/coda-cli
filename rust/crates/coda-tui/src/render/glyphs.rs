@@ -112,5 +112,25 @@ pub const SWITCH_OFF: &str = "[\u{25CF} ]"; // "[● ]"
 /// Both arrows, for hint text such as "↑↓: choose".
 pub const ARROWS_VERTICAL: &str = "\u{2191}\u{2193}"; // "↑↓"
 
+/// Separates a thing from its outcome: "question → answer".
+pub const ARROW_RIGHT: &str = "\u{2192}"; // →
+
 /// Marks model reasoning in the transcript.
 pub const THINKING: &str = "\u{1F4AD}"; // 💭
+
+// --- Brand ---------------------------------------------------------------
+
+/// The six-line wordmark spelling "Coda", drawn in box-drawing characters.
+///
+/// Art rather than a symbol, but it lives here for the same reason everything
+/// else does: it is visual vocabulary, and keeping it with the rest means the
+/// glyph rule needs no exemption for the one file that would otherwise be full
+/// of raw box-drawing characters.
+pub const WORDMARK: &[&str] = &[
+    " \u{250C}\u{2500}\u{2500}\u{2500}\u{2510}      \u{250C}\u{2510}",
+    " \u{2502}\u{252C}\u{2500}\u{2510}\u{2502}\u{250C}\u{2500}\u{2500}\u{2510}\u{250C}\u{2500}\u{2518}\u{2502}\u{250C}\u{2500}\u{2500}\u{2510}",
+    " \u{2502}\u{2502} \u{2514}\u{2518}\u{2502}\u{252C}\u{2510}\u{2502}\u{2502}\u{252C}\u{2510}\u{2502}\u{2502}\u{252C}\u{2510}\u{2502}",
+    " \u{2502}\u{2502} \u{250C}\u{2510}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}\u{2502}",
+    " \u{2502}\u{2514}\u{2500}\u{2534}\u{2502}\u{2502}\u{2514}\u{2534}\u{2502}\u{2502}\u{2514}\u{2534}\u{2502}\u{2502}\u{2514}\u{2534}\u{2514}\u{2510}",
+    " \u{2514}\u{2500}\u{2500}\u{2500}\u{2518}\u{2514}\u{2500}\u{2500}\u{2518}\u{2514}\u{2500}\u{2500}\u{2518}\u{2514}\u{2500}\u{2500}\u{2500}\u{2518}",
+];

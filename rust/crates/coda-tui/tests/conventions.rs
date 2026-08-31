@@ -124,30 +124,6 @@ fn without_comments(source: &str) -> String {
     out
 }
 
-/// The symbol glyphs that must come from `render::glyphs`.
-///
-/// These carry chrome and state, where a stray variant is a visual bug. Arrows,
-/// the middot, the ellipsis and the em dash are deliberately absent: they occur
-/// inside hint prose such as `"↑/↓ k/j move · Enter select"`, where spelling
-/// them as constants would make the sentence unreadable for no gain.
-const ENFORCED: &[char] = &[
-    '\u{276F}', // ❯ prompt and focus marker
-    '\u{22EF}', // ⋯ busy
-    '\u{203A}', // › selected option
-    '\u{2584}', // ▄ composer top edge
-    '\u{2580}', // ▀ composer bottom edge
-    '\u{25CF}', // ● filled dot
-    '\u{25CB}', // ○ hollow dot
-    '\u{2022}', // • bullet
-    '\u{25BC}', // ▼ dropdown closed
-    '\u{25B2}', // ▲ dropdown open
-    '\u{25A0}', // ■ square
-    '\u{2713}', // ✓ check
-    '\u{2717}', // ✗ cross
-    '\u{2588}', // █ block
-    '\u{1F4AD}', // 💭 thinking
-];
-
 #[test]
 fn glyph_literals_live_only_in_the_glyph_table() {
     let offenders: Vec<String> = sources()
@@ -184,12 +160,36 @@ fn colours_come_from_the_theme_not_from_literals() {
     );
 }
 
+/// Characters allowed to appear raw outside the glyph table.
+///
+/// These occur inside hint and message prose — `"↑/↓ k/j move · Enter select"`,
+/// `"Restarting the engine…"` — where spelling them as constants would make
+/// the sentence unreadable for no gain.
+///
+/// An allowlist rather than a blocklist: listing the *enforced* glyphs meant a
+/// brand-new glyph pasted as a raw character passed both rules, so the
+/// convention only looked closed. Anything non-ASCII that is not deliberately
+/// exempted now has to come from the table.
+const PROSE_EXEMPT: &[char] = &[
+    '\u{2191}', // ↑ in hint text
+    '\u{2193}', // ↓ in hint text
+    '\u{00B7}', // · separator
+    '\u{2026}', // … ellipsis
+    '\u{2014}', // — em dash
+    '\u{2013}', // – en dash
+    '\u{2018}', // ' typographic quotes
+    '\u{2019}', // '
+    '\u{201C}', // "
+    '\u{201D}', // "
+    '\u{26A0}', // ⚠ warning in a message
+];
+
 #[test]
 fn raw_glyph_characters_live_only_in_the_glyph_table() {
     // The companion to the test above, and the one that actually bites: an
     // escape is easy to grep for, so the tempting way around the rule is to
-    // paste the character itself. Both spellings have to be closed or the
-    // convention only looks enforced.
+    // paste the character itself. Both spellings have to be closed, and the
+    // raw one has to be closed for glyphs nobody has thought of yet.
     let mut offenders: Vec<String> = Vec::new();
 
     for (path, source) in sources() {
@@ -198,15 +198,23 @@ fn raw_glyph_characters_live_only_in_the_glyph_table() {
         }
         let code = without_comments(&without_test_modules(&source));
         for (index, line) in code.lines().enumerate() {
-            if let Some(glyph) = line.chars().find(|c| ENFORCED.contains(c)) {
-                offenders.push(format!("{path}:{} contains {glyph:?}", index + 1));
+            if let Some(glyph) = line
+                .chars()
+                .find(|c| !c.is_ascii() && !PROSE_EXEMPT.contains(c))
+            {
+                offenders.push(format!(
+                    "{path}:{} contains {glyph:?} ({:#06X})",
+                    index + 1,
+                    glyph as u32
+                ));
             }
         }
     }
 
     assert!(
         offenders.is_empty(),
-        "raw glyph characters must come from render::glyphs, found:\n{}",
+        "non-ASCII glyphs must come from render::glyphs, or be added to \
+         PROSE_EXEMPT if they are prose punctuation. Found:\n{}",
         offenders.join("\n")
     );
 }

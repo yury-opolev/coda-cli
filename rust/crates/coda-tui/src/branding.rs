@@ -9,15 +9,10 @@
 pub const PRODUCT_NAME: &str = "Coda";
 pub const TAGLINE: &str = "an agentic coding assistant";
 
-/// The six-line Unicode wordmark spelling "Coda".
-pub const WORDMARK: &[&str] = &[
-    " ┌───┐      ┌┐",
-    " │┬─┐│┌──┐┌─┘│┌──┐",
-    " ││ └┘│┬┐││┬┐││┬┐│",
-    " ││ ┌┐││││││││││││",
-    " │└─┴││└┴││└┴││└┴└┐",
-    " └───┘└──┘└──┘└───┘",
-];
+/// The six-line wordmark spelling "Coda".
+///
+/// Defined with the rest of the visual vocabulary in [crate::render::glyphs].
+pub const WORDMARK: &[&str] = crate::render::glyphs::WORDMARK;
 
 /// The crate version, matching the C# `Branding.Version`.
 pub fn version() -> &'static str {

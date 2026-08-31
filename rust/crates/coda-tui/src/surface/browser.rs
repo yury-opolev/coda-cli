@@ -60,9 +60,6 @@ impl Surface for BrowserSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
 
     fn title(&self) -> String {
         self.browser.title().to_string()

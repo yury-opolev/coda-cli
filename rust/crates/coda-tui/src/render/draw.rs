@@ -556,7 +556,8 @@ pub fn draw_surface(
     // drawn into exactly the area it scrolled itself against.
     frame.render_widget(Paragraph::new(rendered.lines.clone()), rendered.content);
 
-    let footer = crate::surface::chrome::footer(region, &rendered.hints);
+    let footer =
+        crate::surface::chrome::footer(region, &rendered.hints, rendered.placement);
     if footer.height > 0 {
         // Wrapped, not truncated. A hint line that runs past the border loses
         // whatever is on the right — which is where "Esc: cancel" sits, the

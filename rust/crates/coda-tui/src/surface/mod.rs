@@ -168,10 +168,6 @@ pub trait Surface {
     /// Recovers the concrete type, so the action interpreter can read typed
     /// values back out of the surface that emitted an action.
     fn as_any(&self) -> &dyn std::any::Any;
-
-    /// Mutable counterpart, for a host refreshing a surface's data in place
-    /// rather than keeping a second copy in step with the stack.
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Chrome geometry, shared by the stack and the renderer.
@@ -181,7 +177,7 @@ pub trait Surface {
 /// height while being drawn into another — content that silently disappears
 /// with nothing in either file looking wrong.
 pub mod chrome {
-    use super::Rect;
+    use super::{Placement, Rect};
 
     /// Rows the border costs: one at the top, one at the bottom.
     pub const BORDER_ROWS: u16 = 2;
@@ -193,13 +189,26 @@ pub mod chrome {
     /// at a glance and should be shortened instead.
     pub const MAX_HINT_ROWS: u16 = 2;
 
+    /// Whether a placement is drawn inside a bordered box.
+    ///
+    /// Only a modal floats and therefore needs edges to read as bounded. A
+    /// full-screen surface owns the screen, and an inline or split one is
+    /// contiguous with the shell — bordering those would draw a box around the
+    /// whole terminal, or a rail down the middle of a pane that has no edge.
+    pub fn is_bordered(placement: Placement) -> bool {
+        matches!(placement, Placement::Modal { .. })
+    }
+
     /// The area inside the border and padding.
     ///
     /// A region too small to hold its own chrome yields an empty rect at the
     /// region's own origin, rather than an origin pushed outside it. Nothing
     /// draws either way, but a caller doing arithmetic on the origin would be
     /// working from a point that is not in the region at all.
-    pub fn inner(region: Rect) -> Rect {
+    pub fn inner(region: Rect, placement: Placement) -> Rect {
+        if !is_bordered(placement) {
+            return region;
+        }
         let width = region.width.saturating_sub(BORDER_COLS * 2);
         let height = region.height.saturating_sub(BORDER_ROWS);
         if width == 0 || height == 0 {
@@ -217,8 +226,8 @@ pub mod chrome {
     }
 
     /// The area a surface's own content gets: inside the chrome, above hints.
-    pub fn content(region: Rect, hints: &str) -> Rect {
-        let inner = inner(region);
+    pub fn content(region: Rect, hints: &str, placement: Placement) -> Rect {
+        let inner = inner(region, placement);
         let footer = hint_rows(hints, inner.width);
         Rect::new(
             inner.x,
@@ -229,8 +238,8 @@ pub mod chrome {
     }
 
     /// The area the hint footer occupies.
-    pub fn footer(region: Rect, hints: &str) -> Rect {
-        let inner = inner(region);
+    pub fn footer(region: Rect, hints: &str, placement: Placement) -> Rect {
+        let inner = inner(region, placement);
         let rows = hint_rows(hints, inner.width).min(inner.height);
         Rect::new(
             inner.x,
@@ -289,9 +298,6 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-                self
-            }
         fn title(&self) -> String {
             "Stub".into()
         }
@@ -398,9 +404,9 @@ mod tests {
         // they leave a gap, rows are wasted. Both are silent.
         let region = Rect::new(0, 0, 60, 20);
         let hints = "Tab: next    Enter: save    Esc: cancel";
-        let content = chrome::content(region, hints);
-        let footer = chrome::footer(region, hints);
-        let inner = chrome::inner(region);
+        let content = chrome::content(region, hints, Placement::Modal { width_pct: 70, height_pct: 70 });
+        let footer = chrome::footer(region, hints, Placement::Modal { width_pct: 70, height_pct: 70 });
+        let inner = chrome::inner(region, Placement::Modal { width_pct: 70, height_pct: 70 });
 
         assert_eq!(content.y, inner.y);
         assert_eq!(content.bottom(), footer.y, "content and footer disagree");
@@ -416,7 +422,7 @@ mod tests {
         let narrow = Rect::new(0, 0, 30, 20);
         let long = "Tab: next    Enter: save    Esc: cancel    F1: help";
         assert!(
-            chrome::hint_rows(long, chrome::inner(narrow).width) > 1,
+            chrome::hint_rows(long, chrome::inner(narrow, Placement::Modal { width_pct: 70, height_pct: 70 }).width) > 1,
             "long hints were squeezed onto one row"
         );
     }
@@ -425,20 +431,48 @@ mod tests {
     fn hints_never_take_more_than_their_cap() {
         let region = Rect::new(0, 0, 24, 20);
         let absurd = "a ".repeat(200);
-        assert!(chrome::hint_rows(&absurd, chrome::inner(region).width) <= chrome::MAX_HINT_ROWS);
+        assert!(chrome::hint_rows(&absurd, chrome::inner(region, Placement::Modal { width_pct: 70, height_pct: 70 }).width) <= chrome::MAX_HINT_ROWS);
     }
 
     #[test]
     fn chrome_survives_a_region_too_small_to_hold_it() {
         for (w, h) in [(0u16, 0u16), (1, 1), (3, 2), (4, 3)] {
             let region = Rect::new(0, 0, w, h);
-            let content = chrome::content(region, "Esc");
+            let content = chrome::content(region, "Esc", Placement::Modal { width_pct: 70, height_pct: 70 });
             assert!(
                 content.right() <= region.right().max(region.x)
                     && content.bottom() <= region.bottom().max(region.y),
                 "content escaped a {w}x{h} region: {content:?}"
             );
         }
+    }
+
+    #[test]
+    fn only_a_modal_is_boxed() {
+        // A full-screen surface owns the screen and an inline or split one is
+        // contiguous with the shell. Bordering those would draw a box around
+        // the whole terminal, or a rail down the middle of a pane with no edge.
+        assert!(chrome::is_bordered(Placement::Modal {
+            width_pct: 70,
+            height_pct: 70
+        }));
+        assert!(!chrome::is_bordered(Placement::Full));
+        assert!(!chrome::is_bordered(Placement::Inline { max_rows: 4 }));
+        assert!(!chrome::is_bordered(Placement::Split {
+            side: Side::Right,
+            width_pct: 50
+        }));
+    }
+
+    #[test]
+    fn an_unboxed_placement_gives_its_content_the_whole_region() {
+        // The rows a border would have cost are content instead, so a wizard
+        // is not silently four columns and two rows smaller than the screen.
+        let region = Rect::new(0, 0, 80, 24);
+        let content = chrome::content(region, "", Placement::Full);
+        assert_eq!(content.width, region.width);
+        assert_eq!(content.height, region.height);
+        assert_eq!((content.x, content.y), (region.x, region.y));
     }
 
     #[test]

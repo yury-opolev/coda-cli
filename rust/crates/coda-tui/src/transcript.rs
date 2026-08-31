@@ -171,7 +171,7 @@ impl Block {
             } => render_permission(tool, preview, *decision, width),
             Block::Question { question, answer } => {
                 let text = match answer {
-                    Some(answer) => format!("{question} → {answer}"),
+                    Some(answer) => format!("{question} {} {answer}", glyphs::ARROW_RIGHT),
                     None => question.clone(),
                 };
                 text::wrap(&text, width)
@@ -377,9 +377,15 @@ fn render_permission(
     width: usize,
 ) -> Vec<RenderLine> {
     let (suffix, role) = match decision {
-        PermissionDecision::Allowed => (" → allowed", Role::PermissionApproved),
-        PermissionDecision::Denied => (" → denied", Role::Permission),
-        PermissionDecision::Pending => ("", Role::Question),
+        PermissionDecision::Allowed => (
+            format!(" {} allowed", glyphs::ARROW_RIGHT),
+            Role::PermissionApproved,
+        ),
+        PermissionDecision::Denied => (
+            format!(" {} denied", glyphs::ARROW_RIGHT),
+            Role::Permission,
+        ),
+        PermissionDecision::Pending => (String::new(), Role::Question),
     };
     let text = format!("{tool} {preview}{suffix}");
     text::wrap(&text, width)

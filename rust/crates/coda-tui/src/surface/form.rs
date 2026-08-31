@@ -74,10 +74,6 @@ impl FormSurface {
         &self.form
     }
 
-    pub fn form_mut(&mut self) -> &mut Form {
-        &mut self.form
-    }
-
     /// Routes a key, returning the outcome a wrapping surface should report.
     pub fn dispatch(&mut self, key: KeyEvent) -> SurfaceOutcome {
         match self.form.handle_key(key) {
@@ -96,9 +92,6 @@ impl Surface for FormSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
 
     fn title(&self) -> String {
         self.title.clone()

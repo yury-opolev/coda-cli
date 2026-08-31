@@ -13,7 +13,7 @@ use crate::render::glyphs;
 use crate::state::PendingPrompt;
 use coda_render::text;
 use coda_render::theme::{Role, Theme};
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
@@ -55,9 +55,6 @@ impl Surface for PromptSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-            self
-        }
 
     fn title(&self) -> String {
         match &self.prompt {
@@ -86,6 +83,26 @@ impl Surface for PromptSurface {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
+        // A chord is never an answer. Only an unmodified keystroke may approve
+        // or refuse.
+        //
+        // Ctrl+Y is the application's copy shortcut, and the most natural
+        // moment to press it is while reading a permission prompt in order to
+        // scrutinise the command. Matching on the key code alone made that
+        // chord grant approval — the exact opposite of the user's intent, with
+        // nothing in the footer to warn them. Shift is allowed through because
+        // it is how `Y` is typed.
+        //
+        // `TextInput` already applies this guard; the prompt, which is the one
+        // control where the cost of getting it wrong is a command running
+        // unasked, did not.
+        let modified = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        if modified {
+            return SurfaceOutcome::Handled;
+        }
+
         let deny = SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt {
             allowed: false,
             answer: None,
@@ -265,6 +282,49 @@ mod tests {
         ));
         assert!(matches!(
             permission().handle_key(key(KeyCode::Char('N'))),
+            SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt { allowed: false, .. })
+        ));
+    }
+
+    #[test]
+    fn no_chord_can_approve_a_permission_gate() {
+        // Ctrl+Y is the copy shortcut, and reading a prompt is exactly when a
+        // user reaches for it. Matching on the key code alone made it approve.
+        for modifier in [
+            KeyModifiers::CONTROL,
+            KeyModifiers::ALT,
+            KeyModifiers::SUPER,
+            KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+        ] {
+            for code in [
+                KeyCode::Char('y'),
+                KeyCode::Char('Y'),
+                KeyCode::Enter,
+                KeyCode::Char('1'),
+            ] {
+                let outcome = permission().handle_key(KeyEvent::new(code, modifier));
+                assert!(
+                    matches!(outcome, SurfaceOutcome::Handled),
+                    "{code:?} with {modifier:?} was treated as an answer"
+                );
+                let outcome = question().handle_key(KeyEvent::new(code, modifier));
+                assert!(
+                    matches!(outcome, SurfaceOutcome::Handled),
+                    "{code:?} with {modifier:?} answered a question"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn shift_still_types_an_uppercase_answer() {
+        // Y is typed with Shift, so the guard must not reject it.
+        assert!(matches!(
+            permission().handle_key(KeyEvent::new(KeyCode::Char('Y'), KeyModifiers::SHIFT)),
+            SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt { allowed: true, .. })
+        ));
+        assert!(matches!(
+            permission().handle_key(KeyEvent::new(KeyCode::Char('N'), KeyModifiers::SHIFT)),
             SurfaceOutcome::Emit(SurfaceAction::AnswerPrompt { allowed: false, .. })
         ));
     }

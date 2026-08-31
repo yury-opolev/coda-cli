@@ -1585,9 +1585,11 @@ impl App {
             // editing and typed into a composer the user cannot see: letters
             // inserted, Backspace deleting, Up loading a past submission —
             // all behind a modal, and submitted on close.
-            focus: if self.state.prompt.is_some() {
-                Focus::Overlay
-            } else if !self.surfaces.is_empty() {
+            //
+            // A prompt is a surface too, so it needs no separate branch; a
+            // second condition reading `state.prompt` would be a second source
+            // of truth for the same question.
+            focus: if !self.surfaces.is_empty() {
                 Focus::Surface
             } else if self.composer.completion().is_active() {
                 Focus::Completion
@@ -2015,7 +2017,9 @@ impl App {
     /// Refused while a prompt is up, so a pointer can never type into a
     /// composer the user cannot see — the same guard the C# applies.
     fn paste_from_pointer(&mut self) {
-        if self.state.prompt.is_some() || self.browser().is_some() {
+        // Any open surface blocks it, not just a prompt or a browser: a
+        // pointer must never type into a composer the user cannot see.
+        if !self.surfaces.is_empty() {
             return;
         }
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {

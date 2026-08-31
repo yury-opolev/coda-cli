@@ -25,6 +25,9 @@ pub enum StackOutcome {
 pub struct RenderedSurface {
     /// The whole surface including its chrome.
     pub region: Rect,
+    /// The placement actually used, after degradation. The renderer needs it
+    /// to draw chrome that matches the geometry the content was laid out for.
+    pub placement: super::Placement,
     /// Where the lines go: inside the chrome, above the hints.
     pub content: Rect,
     pub title: String,
@@ -57,14 +60,6 @@ impl SurfaceStack {
         self.surfaces.last().map(|s| s.as_ref())
     }
 
-    /// Mutable access to the top surface, for a host updating its data.
-    ///
-    /// Reloading a browser refreshes the rows in place; without this the host
-    /// would have to keep a second copy in step with the stack, which is the
-    /// duplication this abstraction exists to remove.
-    pub fn top_mut(&mut self) -> Option<&mut (dyn Surface + 'static)> {
-        self.surfaces.last_mut().map(|s| s.as_mut())
-    }
 
     /// Opens a surface. Returns `false` when an exclusive surface refused it.
     ///
@@ -139,9 +134,10 @@ impl SurfaceStack {
             .iter()
             .enumerate()
             .map(|(index, surface)| {
-                let region = region_for(surface.placement().resolve(area), area);
+                let placement = surface.placement().resolve(area);
+                let region = region_for(placement, area);
                 let hints = surface.hints();
-                let content = super::chrome::content(region, &hints);
+                let content = super::chrome::content(region, &hints, placement);
                 // Only the top surface gets a caret: two visible carets would
                 // be worse than none, and the terminal only has one.
                 let cursor = (index == top)
@@ -150,6 +146,7 @@ impl SurfaceStack {
                     .map(|(x, y)| (content.x + x, content.y + y));
                 RenderedSurface {
                     region,
+                    placement,
                     content,
                     title: surface.title(),
                     hints,
@@ -205,9 +202,6 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
-                self
-            }
         fn title(&self) -> String {
             self.name.into()
         }
