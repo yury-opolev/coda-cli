@@ -17,6 +17,7 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
+pub mod browser;
 pub mod form;
 pub mod prompt;
 pub mod settings;
@@ -104,6 +105,14 @@ pub enum SurfaceAction {
         allowed: bool,
         answer: Option<String>,
     },
+    /// A browser row action that needs the engine or the filesystem.
+    ///
+    /// Carries the browser's kind, so the host knows what the row refers to
+    /// without keeping a parallel field in step with the stack.
+    Browser {
+        kind: browser::BrowserKind,
+        intent: crate::overlay::Intent,
+    },
 }
 
 /// What a key did.
@@ -159,6 +168,10 @@ pub trait Surface {
     /// Recovers the concrete type, so the action interpreter can read typed
     /// values back out of the surface that emitted an action.
     fn as_any(&self) -> &dyn std::any::Any;
+
+    /// Mutable counterpart, for a host refreshing a surface's data in place
+    /// rather than keeping a second copy in step with the stack.
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
 }
 
 /// Chrome geometry, shared by the stack and the renderer.
@@ -276,6 +289,9 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
         fn title(&self) -> String {
             "Stub".into()
         }

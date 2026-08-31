@@ -57,6 +57,15 @@ impl SurfaceStack {
         self.surfaces.last().map(|s| s.as_ref())
     }
 
+    /// Mutable access to the top surface, for a host updating its data.
+    ///
+    /// Reloading a browser refreshes the rows in place; without this the host
+    /// would have to keep a second copy in step with the stack, which is the
+    /// duplication this abstraction exists to remove.
+    pub fn top_mut(&mut self) -> Option<&mut (dyn Surface + 'static)> {
+        self.surfaces.last_mut().map(|s| s.as_mut())
+    }
+
     /// Opens a surface. Returns `false` when an exclusive surface refused it.
     ///
     /// The caller is told rather than silently ignored, so a command that
@@ -196,6 +205,9 @@ mod tests {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
+            fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+                self
+            }
         fn title(&self) -> String {
             self.name.into()
         }

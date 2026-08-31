@@ -29,6 +29,7 @@ use crate::composer::{Completion, Composer};
 use crate::draw;
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::overlay::{Browser, Intent};
+use crate::surface::browser::{BrowserKind, BrowserSurface};
 use crate::state::{PendingPrompt, UiEvent, UiState};
 use crate::terminal::TerminalGuard;
 use crate::transcript::NoticeLevel;
@@ -113,10 +114,6 @@ pub struct App {
     pending_responder: Option<Responder>,
     /// A two-press chord armed by the previous keystroke, and when.
     armed: Option<(keymap::Chord, std::time::Instant)>,
-    /// The open browser overlay, if any.
-    browser: Option<Browser>,
-    /// Which browser is open, so reload and actions know what to do.
-    browser_kind: Option<BrowserKind>,
     /// Open surfaces, topmost last. Owns key routing while non-empty.
     surfaces: crate::surface::stack::SurfaceStack,
     /// Local Coda file locations for this session.
@@ -140,20 +137,33 @@ pub struct App {
     transcript_origin: (u16, u16),
 }
 
-/// Which overlay is on screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserKind {
-    Models,
-    Schedules,
-    Skills,
-    Plugins,
-    Hooks,
-    Mcp,
-    Tasks,
-    Sessions,
-}
 
 impl App {
+    /// The open browser, read from the stack.
+    ///
+    /// Read through rather than kept as a field: a second copy would have to
+    /// be held in step with the stack, and the two disagreeing is exactly the
+    /// class of bug this abstraction removes.
+    fn browser(&self) -> Option<&Browser> {
+        self.surfaces
+            .top()
+            .and_then(|s| s.as_any().downcast_ref::<BrowserSurface>())
+            .map(BrowserSurface::browser)
+    }
+
+    fn browser_mut(&mut self) -> Option<&mut Browser> {
+        self.surfaces
+            .top_mut()
+            .and_then(|s| s.as_any_mut().downcast_mut::<BrowserSurface>())
+            .map(BrowserSurface::browser_mut)
+    }
+
+    fn browser_kind(&self) -> Option<BrowserKind> {
+        self.surfaces
+            .top()
+            .and_then(|s| s.as_any().downcast_ref::<BrowserSurface>())
+            .map(BrowserSurface::kind)
+    }
     /// Connects to an engine and completes the handshake.
     pub async fn connect(
         command: EngineCommand,
@@ -197,8 +207,6 @@ impl App {
             turn: None,
             pending_responder: None,
             armed: None,
-            browser: None,
-            browser_kind: None,
             surfaces: Default::default(),
             paths: Paths::new(project_root),
             task_outcomes: std::collections::BTreeMap::new(),
@@ -561,12 +569,6 @@ impl App {
             }
         }
 
-        // An open overlay owns the keyboard next.
-        if self.browser.is_some() {
-            self.on_browser_key(key).await;
-            return;
-        }
-
         // Ctrl+C copies when there is a selection, matching the Windows console
         // and every terminal emulator. The selection is cleared either way, so
         // a second Ctrl+C still exits — leaving it set would trap the user in a
@@ -708,29 +710,9 @@ impl App {
         }
     }
 
-    /// Routes a key to the open overlay and performs whatever it asks for.
-    async fn on_browser_key(&mut self, key: KeyEvent) {
-        let Some(browser) = self.browser.as_mut() else {
-            return;
-        };
-        let intent = browser.handle(key);
-        self.dirty = true;
-
-        match intent {
-            Intent::Redraw => {}
-            Intent::Ignored => self.dirty = false,
-            Intent::Close => self.close_browser(),
-            Intent::Reload => self.reload_browser().await,
-            Intent::Activate(id) => self.activate_browser_row(&id).await,
-            Intent::Toggle(id) => self.toggle_browser_row(&id).await,
-            Intent::Delete(id) => self.delete_browser_row(&id).await,
-            Intent::Key(c, id) => self.browser_key_action(c, id).await,
-        }
-    }
 
     fn close_browser(&mut self) {
-        self.browser = None;
-        self.browser_kind = None;
+        self.retire_browser_surface();
     }
 
     /// Opens a browser, fetching its data from the engine.
@@ -839,8 +821,7 @@ impl App {
             }
         };
 
-        self.browser = Some(browser);
-        self.browser_kind = Some(kind);
+        self.surfaces.push(Box::new(BrowserSurface::new(kind, browser)));
         self.dirty = true;
     }
 
@@ -852,14 +833,16 @@ impl App {
     }
 
     async fn reload_browser(&mut self) {
-        if let Some(kind) = self.browser_kind {
+        if let Some(kind) = self.browser_kind() {
             // Rebuilding preserves the selected row by id.
             let selected = self
-                .browser
-                .as_ref()
+                .browser()
                 .and_then(|b| b.selected_id().map(str::to_string));
+            // Retire the old surface first, or open_browser would push a
+            // second browser on top of it.
+            self.retire_browser_surface();
             self.open_browser(kind).await;
-            if let (Some(browser), Some(_)) = (self.browser.as_mut(), selected) {
+            if let (Some(browser), Some(_)) = (self.browser_mut(), selected) {
                 browser.set_status("reloaded");
             }
         }
@@ -867,7 +850,7 @@ impl App {
 
     /// Handles Enter on a row.
     async fn activate_browser_row(&mut self, id: &str) {
-        match self.browser_kind {
+        match self.browser_kind() {
             Some(BrowserKind::Models) => self.switch_model(id).await,
             Some(BrowserKind::Sessions) => self.resume_to_session(id.to_string()).await,
             _ => self.dirty = true,
@@ -937,7 +920,7 @@ impl App {
 
     /// Toggles the selected row where the change can actually be persisted.
     async fn toggle_browser_row(&mut self, id: &str) {
-        match self.browser_kind {
+        match self.browser_kind() {
             Some(BrowserKind::Plugins) => {
                 // Plugin state lives in a JSON file; read and write are blocking
                 // I/O that must not block the async runtime.
@@ -1060,7 +1043,7 @@ impl App {
     }
 
     async fn delete_browser_row(&mut self, id: &str) {
-        if self.browser_kind != Some(BrowserKind::Schedules) {
+        if self.browser_kind() != Some(BrowserKind::Schedules) {
             return;
         }
         match self
@@ -1083,7 +1066,7 @@ impl App {
     }
 
     async fn browser_key_action(&mut self, key: char, id: Option<String>) {
-        match (self.browser_kind, key) {
+        match (self.browser_kind(), key) {
             (Some(BrowserKind::Schedules), 'd') => {
                 if let Some(id) = id {
                     self.delete_browser_row(&id).await;
@@ -1731,7 +1714,7 @@ impl App {
         let viewport = &self.viewport;
         let rows = &self.rows;
         let theme = &self.theme;
-        let browser = self.browser.as_ref();
+        
         let pin = pin_text.as_deref();
         let selection = self.selection.has_selection().then_some(&self.selection);
         let surfaces = &self.surfaces;
@@ -1741,7 +1724,7 @@ impl App {
         let mut origin = self.transcript_origin;
         guard.terminal().draw(|frame| {
             origin = draw::draw_with_pin(
-                frame, state, composer, viewport, rows, theme, browser, pin, selection,
+                frame, state, composer, viewport, rows, theme, pin, selection,
             );
             // Surfaces draw last and bottom-up, so a detail sits over its list
             // and the whole stack sits over the shell. Rendered as a second
@@ -1890,6 +1873,15 @@ impl App {
                     ),
                 }
             }
+            SurfaceAction::Browser { kind: _, intent } => match intent {
+                Intent::Reload => self.reload_browser().await,
+                Intent::Activate(id) => self.activate_browser_row(&id).await,
+                Intent::Toggle(id) => self.toggle_browser_row(&id).await,
+                Intent::Delete(id) => self.delete_browser_row(&id).await,
+                Intent::Key(c, id) => self.browser_key_action(c, id).await,
+                // Handled by the surface itself before reaching here.
+                Intent::Redraw | Intent::Ignored | Intent::Close => {}
+            },
             SurfaceAction::AnswerPrompt { allowed, answer } => {
                 self.surfaces.pop();
                 self.answer_prompt(allowed, answer);
@@ -1898,6 +1890,17 @@ impl App {
     }
 
     /// Sends the reply to an engine prompt and records the outcome.
+    /// Removes an open browser surface.
+    fn retire_browser_surface(&mut self) {
+        while self
+            .surfaces
+            .top()
+            .is_some_and(|s| s.as_any().is::<BrowserSurface>())
+        {
+            self.surfaces.pop();
+        }
+    }
+
     /// Removes an open prompt surface, wherever it sits in the stack.
     ///
     /// Used when a prompt is superseded or cancelled by the engine rather than
@@ -1978,7 +1981,7 @@ impl App {
     /// Refused while a prompt is up, so a pointer can never type into a
     /// composer the user cannot see — the same guard the C# applies.
     fn paste_from_pointer(&mut self) {
-        if self.state.prompt.is_some() || self.browser.is_some() {
+        if self.state.prompt.is_some() || self.browser().is_some() {
             return;
         }
         match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {

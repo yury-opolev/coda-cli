@@ -36,7 +36,7 @@ fn main() {
     let rows = state.transcript.render(regions.transcript.width as usize, state.display_mode);
     let mut viewport = Viewport::new();
     viewport.update(rows.len(), regions.transcript.height as usize);
-    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme, None)).unwrap();
+    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme)).unwrap();
 
     let models: Vec<coda_proto::messages::WireModel> = serde_json::from_value(serde_json::json!([
         { "id": "claude-opus-5", "displayName": "Claude Opus 5", "contextLimit": 200000 },
@@ -45,7 +45,20 @@ fn main() {
     ])).unwrap();
     let mut mb = coda_tui::browsers::models(&models, Some("claude-opus-5"), "live");
     mb.handle(crossterm::event::KeyEvent::new(crossterm::event::KeyCode::Down, crossterm::event::KeyModifiers::NONE));
-    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme, Some(&mb))).unwrap();
+    // Browsers are surfaces now, so the preview drives the stack too.
+    let mut stack = coda_tui::surface::stack::SurfaceStack::default();
+    stack.push(Box::new(coda_tui::surface::browser::BrowserSurface::new(
+        coda_tui::surface::browser::BrowserKind::Models,
+        mb,
+    )));
+    terminal
+        .draw(|f| {
+            draw::draw(f, &state, &composer, &viewport, &rows, &theme);
+            for rendered in stack.render(f.area(), &theme) {
+                draw::draw_surface(f, &rendered, &theme);
+            }
+        })
+        .unwrap();
 
     let buffer = terminal.backend().buffer().clone();
     println!("{}", "-".repeat(width as usize));

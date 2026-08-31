@@ -33,7 +33,7 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
     viewport.update(rows.len(), regions.transcript.height as usize);
 
     terminal
-        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme, None))
+        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme))
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -255,7 +255,6 @@ fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
                     &rows,
                     &Theme::default(),
                     None,
-                    None,
                     selection,
                 );
             })
@@ -301,7 +300,6 @@ fn drawing_reports_the_transcript_origin_for_mouse_mapping() {
                 &viewport,
                 &rows,
                 &Theme::default(),
-                None,
                 None,
                 None,
             );
@@ -434,7 +432,18 @@ fn render_with_browser(browser: &coda_tui::overlay::Browser, width: u16, height:
     viewport.update(0, 1);
 
     terminal
-        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &[], &theme, Some(browser)))
+        .draw(|frame| {
+            draw::draw(frame, &state, &composer, &viewport, &[], &theme);
+            // Browsers are surfaces now; drive the stack the way the app does.
+            let mut stack = coda_tui::surface::stack::SurfaceStack::default();
+            stack.push(Box::new(coda_tui::surface::browser::BrowserSurface::new(
+                coda_tui::surface::browser::BrowserKind::Models,
+                browser.clone(),
+            )));
+            for rendered in stack.render(frame.area(), &theme) {
+                draw::draw_surface(frame, &rendered, &theme);
+            }
+        })
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();

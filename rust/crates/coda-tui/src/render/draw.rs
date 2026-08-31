@@ -13,7 +13,6 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::composer::Composer;
-use crate::overlay::{Browser, View as BrowserView};
 use crate::state::UiState;
 use crate::render::glyphs;
 use crate::viewport::Viewport;
@@ -175,9 +174,8 @@ pub fn draw(
     viewport: &Viewport,
     rows: &[RenderLine],
     theme: &Theme,
-    browser: Option<&Browser>,
 ) {
-    draw_with_pin(frame, state, composer, viewport, rows, theme, browser, None, None);
+    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None);
 }
 
 /// Draws the whole screen, optionally showing a pin row at the top of the
@@ -197,7 +195,6 @@ pub fn draw_with_pin(
     viewport: &Viewport,
     rows: &[RenderLine],
     theme: &Theme,
-    browser: Option<&Browser>,
     pin_text: Option<&str>,
     selection: Option<&crate::selection::TranscriptSelection>,
 ) -> (u16, u16) {
@@ -224,9 +221,6 @@ pub fn draw_with_pin(
     draw_composer(frame, regions.composer, composer, state, theme);
     draw_status(frame, regions.status, state, viewport, theme);
 
-    if let Some(browser) = browser {
-        draw_browser(frame, centered(area, 90, 85), browser, theme);
-    }
 
     // Prompts are surfaces now, drawn by the stack after this returns. Their
     // Exclusive modality is what puts them above a browser, rather than the
@@ -583,177 +577,9 @@ pub fn draw_surface(
 }
 
 
-/// Draws a browser overlay over the whole frame.
-///
-/// Layout matches the C# overlays: a title row, the list or detail body, a
-/// status row and a footer of key hints.
-pub fn draw_browser(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
-    frame.render_widget(Clear, area);
 
-    let block = Block::default()
-        .title(format!(" {} ", browser.title()))
-        .borders(Borders::ALL)
-        .border_style(theme.style(Role::PromptAccent))
-        .padding(MODAL_PADDING)
-        .style(theme.surface());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
 
-    match browser.view() {
-        BrowserView::List => draw_browser_list(frame, chunks[0], browser, theme),
-        BrowserView::Detail => draw_browser_detail(frame, chunks[0], browser, theme),
-    }
-
-    // The status row shows the filter while one is being typed.
-    let status = match browser.filter_text() {
-        Some(filter) => format!("/{filter}"),
-        None => browser.status().to_string(),
-    };
-    frame.render_widget(
-        Paragraph::new(status).style(theme.style(Role::Notification)),
-        chunks[1],
-    );
-    frame.render_widget(
-        Paragraph::new(browser.footer().to_string()).style(theme.style(Role::Notification)),
-        chunks[2],
-    );
-}
-
-fn draw_browser_list(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
-    let height = area.height as usize;
-    let width = area.width as usize;
-    if height == 0 || width == 0 {
-        return;
-    }
-
-    // Keep the selection on screen without letting the window run past the end.
-    let selected = browser.selected_index();
-    let offset = selected.saturating_sub(height.saturating_sub(1));
-    let items = browser.visible_items();
-
-    if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new("(nothing to show)").style(theme.style(Role::Notification)),
-            area,
-        );
-        return;
-    }
-
-    let widths = fit_columns(browser, width);
-
-    let lines: Vec<Line> = items
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(height)
-        .map(|(index, item)| {
-            let text = format_columns(browser, item, &widths);
-            let text = text::truncate(&text, width);
-
-            let style = if index == selected {
-                theme.style_on(Role::SelectionText, Role::SelectionBackground)
-            } else {
-                theme.style(Role::Assistant)
-            };
-            // Pad the selected row so its highlight spans the full width.
-            let padding = width.saturating_sub(text::width(&text));
-            Line::from(Span::styled(format!("{text}{}", " ".repeat(padding)), style))
-        })
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Chooses a display width for each column so the row fits the viewport.
-///
-/// Columns declare a maximum, but a narrow terminal cannot honour all of them.
-/// Rather than letting the rightmost columns fall off the edge, the surplus is
-/// taken from the widest columns first, which preserves short status and
-/// version columns that carry most of the signal per cell.
-fn fit_columns(browser: &Browser, available: usize) -> Vec<usize> {
-    let mut widths: Vec<usize> = browser.columns().iter().map(|c| c.max_width).collect();
-    if widths.is_empty() {
-        return widths;
-    }
-
-    let separators = widths.len().saturating_sub(1);
-    let budget = available.saturating_sub(separators);
-
-    let mut total: usize = widths.iter().sum();
-    while total > budget {
-        // Shrink the widest column by one cell, never below one.
-        let Some((index, _)) = widths
-            .iter()
-            .enumerate()
-            .filter(|(_, &w)| w > 1)
-            .max_by_key(|(_, &w)| w)
-        else {
-            break;
-        };
-        widths[index] -= 1;
-        total -= 1;
-    }
-    widths
-}
-
-/// Renders one row's cells into a padded, separated line.
-fn format_columns(browser: &Browser, item: &crate::overlay::Item, widths: &[usize]) -> String {
-    browser
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let width = widths.get(i).copied().unwrap_or(0);
-            let cell = item.cells.get(i).map(String::as_str).unwrap_or("");
-            let cell = text::truncate_with_ellipsis(cell, width);
-            let padding = width.saturating_sub(text::width(&cell));
-            format!("{cell}{}", " ".repeat(padding))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn draw_browser_detail(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
-    let lines: Vec<Line> = browser
-        .detail_lines()
-        .iter()
-        .skip(browser.detail_scroll())
-        .take(area.height as usize)
-        .map(|line| Line::from(Span::styled(line.clone(), theme.style(Role::Assistant))))
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
-
-/// A rectangle centred within `area`, sized as a percentage of it.
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
 
 #[cfg(test)]
 mod tests {
@@ -910,17 +736,6 @@ mod tests {
         assert!(plain_text(&line).starts_with(" \u{25CF} "));
     }
 
-    #[test]
-    fn the_centred_region_stays_inside_its_area() {
-        for (width, height) in [(80u16, 24u16), (20, 10), (200, 60), (4, 4)] {
-            let outer = area(width, height);
-            let inner = centered(outer, 70, 60);
-            assert!(inner.right() <= outer.right());
-            assert!(inner.bottom() <= outer.bottom());
-            assert!(inner.x >= outer.x);
-            assert!(inner.y >= outer.y);
-        }
-    }
 
     #[test]
     fn columns_keep_their_widths_when_they_all_fit() {
@@ -931,7 +746,7 @@ mod tests {
                 crate::overlay::Column::new("b", 10),
             ],
         );
-        assert_eq!(fit_columns(&browser, 80), vec![5, 10]);
+        assert_eq!(browser.fit_columns(80), vec![5, 10]);
     }
 
     #[test]
@@ -944,7 +759,7 @@ mod tests {
                 crate::overlay::Column::new("c", 30),
             ],
         );
-        let widths = fit_columns(&browser, 40);
+        let widths = browser.fit_columns(40);
         let total: usize = widths.iter().sum::<usize>() + widths.len() - 1;
 
         assert!(total <= 40, "columns {widths:?} still overflow");
@@ -960,7 +775,7 @@ mod tests {
                 crate::overlay::Column::new("b", 40),
             ],
         );
-        let widths = fit_columns(&browser, 30);
+        let widths = browser.fit_columns(30);
         assert_eq!(widths[0], 4, "the narrow column was raided first");
         assert!(widths[1] < 40);
     }
@@ -976,7 +791,7 @@ mod tests {
             ],
         );
         for available in [0usize, 1, 2, 5] {
-            for width in fit_columns(&browser, available) {
+            for width in browser.fit_columns(available) {
                 assert!(width >= 1, "a column collapsed to nothing");
             }
         }
@@ -995,8 +810,8 @@ mod tests {
             "x",
             vec!["ab".into(), "a rather long value here".into()],
         );
-        let widths = fit_columns(&browser, 40);
-        let row = format_columns(&browser, &item, &widths);
+        let widths = browser.fit_columns(40);
+        let row = browser.format_columns(&item, &widths);
 
         assert!(text::width(&row) <= 40, "row {row:?} overflows");
         assert!(row.starts_with("ab "), "cells should be padded: {row:?}");

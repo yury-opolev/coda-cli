@@ -293,6 +293,55 @@ impl Browser {
     }
 
     /// Handles a key, returning what the host should do.
+    /// Chooses a display width for each column so the row fits the viewport.
+///
+    /// Columns declare a maximum, but a narrow terminal cannot honour all of them.
+    /// Rather than letting the rightmost columns fall off the edge, the surplus is
+    /// taken from the widest columns first, which preserves short status and
+    /// version columns that carry most of the signal per cell.
+    pub fn fit_columns(&self, available: usize) -> Vec<usize> {
+    let mut widths: Vec<usize> = self.columns().iter().map(|c| c.max_width).collect();
+    if widths.is_empty() {
+        return widths;
+    }
+
+    let separators = widths.len().saturating_sub(1);
+    let budget = available.saturating_sub(separators);
+
+    let mut total: usize = widths.iter().sum();
+    while total > budget {
+        // Shrink the widest column by one cell, never below one.
+        let Some((index, _)) = widths
+            .iter()
+            .enumerate()
+            .filter(|(_, &w)| w > 1)
+            .max_by_key(|(_, &w)| w)
+        else {
+            break;
+        };
+        widths[index] -= 1;
+        total -= 1;
+    }
+    widths
+}
+
+    /// Renders one row's cells into a padded, separated line.
+    pub fn format_columns(&self, item: &Item, widths: &[usize]) -> String {
+    self
+        .columns()
+        .iter()
+        .enumerate()
+        .map(|(i, _)| {
+            let width = widths.get(i).copied().unwrap_or(0);
+            let cell = item.cells.get(i).map(String::as_str).unwrap_or("");
+            let cell = text::truncate_with_ellipsis(cell, width);
+            let padding = width.saturating_sub(text::width(&cell));
+            format!("{cell}{}", " ".repeat(padding))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
     pub fn handle(&mut self, key: crossterm::event::KeyEvent) -> Intent {
         use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers};
 

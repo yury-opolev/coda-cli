@@ -158,6 +158,9 @@ impl Surface for SettingsSurface {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
+        fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+            self
+        }
 
     fn title(&self) -> String {
         self.inner.title()

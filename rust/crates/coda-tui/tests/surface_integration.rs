@@ -216,3 +216,96 @@ fn a_superseded_prompt_does_not_block_its_replacement() {
     );
     assert_eq!(stack.len(), 1);
 }
+
+fn skills_browser() -> Box<dyn Surface> {
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface};
+
+    let mut browser = Browser::new(
+        "Skills",
+        vec![Column::new("Name", 24), Column::new("Summary", 40)],
+    )
+    .with_footer("Enter select");
+    browser.set_items(vec![
+        Item::new("a", vec!["alpha".into(), "first".into()]),
+        Item::new("b", vec!["beta".into(), "second".into()]),
+    ]);
+    Box::new(BrowserSurface::new(BrowserKind::Skills, browser))
+}
+
+#[test]
+fn a_browser_cannot_open_over_a_prompt() {
+    // Before this phase, a prompt outranked a browser because of the order of
+    // two if statements in on_key. Now it is a property of the prompt.
+    let mut stack = SurfaceStack::default();
+    stack.push(permission());
+    assert!(
+        !stack.push(skills_browser()),
+        "a browser opened over a blocking permission prompt"
+    );
+    assert_eq!(stack.len(), 1);
+}
+
+#[test]
+fn a_browser_row_action_reaches_the_host_with_its_kind() {
+    use coda_tui::overlay::Intent;
+    use coda_tui::surface::browser::BrowserKind;
+
+    let mut stack = SurfaceStack::default();
+    stack.push(skills_browser());
+    match stack.handle_key(key(KeyCode::Char(' '))) {
+        StackOutcome::Action(SurfaceAction::Browser { kind, intent }) => {
+            assert_eq!(kind, BrowserKind::Skills);
+            assert_eq!(intent, Intent::Toggle("a".into()));
+        }
+        _ => panic!("the toggle never reached the host"),
+    }
+}
+
+#[test]
+fn a_browser_navigates_without_troubling_the_host() {
+    let mut stack = SurfaceStack::default();
+    stack.push(skills_browser());
+    assert!(matches!(
+        stack.handle_key(key(KeyCode::Down)),
+        StackOutcome::Handled
+    ));
+}
+
+#[test]
+fn a_browser_closes_on_escape() {
+    let mut stack = SurfaceStack::default();
+    stack.push(skills_browser());
+    stack.handle_key(key(KeyCode::Esc));
+    assert!(stack.is_empty(), "Esc did not close the browser");
+}
+
+#[test]
+fn a_browser_stays_inside_its_area_at_any_size() {
+    let theme = Theme::default();
+    for (w, h) in [(80u16, 24u16), (40, 10), (20, 6), (12, 3), (1, 1)] {
+        let area = Rect::new(0, 0, w, h);
+        let mut stack = SurfaceStack::default();
+        stack.push(skills_browser());
+        for rendered in stack.render(area, &theme) {
+            assert!(
+                rendered.lines.len() <= rendered.content.height as usize,
+                "browser produced {} lines for {} rows at {w}x{h}",
+                rendered.lines.len(),
+                rendered.content.height
+            );
+            for line in &rendered.lines {
+                let width: usize = line
+                    .spans
+                    .iter()
+                    .map(|s| coda_render::text::width(&s.content))
+                    .sum();
+                assert!(
+                    width <= rendered.content.width as usize,
+                    "browser produced a {width}-cell line for {} cells at {w}x{h}",
+                    rendered.content.width
+                );
+            }
+        }
+    }
+}
