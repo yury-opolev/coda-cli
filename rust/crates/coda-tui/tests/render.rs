@@ -553,3 +553,89 @@ fn the_composer_prompt_is_inset_from_the_edge() {
         "prompt should be inset by one space, got {prompt_row:?}"
     );
 }
+
+fn render_form(form: &coda_tui::widgets::Form, width: u16, height: u16) -> Vec<String> {
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            draw::draw_form(frame, frame.area(), "Settings", "Esc: cancel", form, &theme)
+        })
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+#[test]
+fn a_form_renders_its_controls_inside_a_padded_modal() {
+    let form = coda_tui::settings_form::build(&coda_tui::config::Settings::empty_at(
+        std::env::temp_dir().join("coda-render-form-test.json"),
+    ));
+    let lines = render_form(&form, 70, 34);
+    let joined = lines.join("\n");
+
+    assert!(joined.contains("Settings"), "title missing");
+    assert!(joined.contains("Permission mode"), "radio group missing");
+    assert!(joined.contains("Theme"), "select missing");
+    assert!(joined.contains("Telemetry"), "switch missing");
+    assert!(joined.contains("\u{276F}"), "focus marker missing");
+
+    // The border column, one padding column, then content: no control may start
+    // flush against the border.
+    let content_row = lines
+        .iter()
+        .find(|row| row.contains("Permission mode"))
+        .expect("the radio group row");
+    // Char-wise, not byte-wise: the border glyph is three bytes wide.
+    let after_border: String = content_row
+        .chars()
+        .skip_while(|c| *c != '\u{2502}')
+        .skip(1)
+        .collect();
+    assert!(
+        after_border.starts_with(' '),
+        "no padding between border and content in {content_row:?}"
+    );
+}
+
+#[test]
+fn a_form_shows_exactly_one_focus_marker() {
+    let form = coda_tui::settings_form::build(&coda_tui::config::Settings::empty_at(
+        std::env::temp_dir().join("coda-render-form-focus.json"),
+    ));
+    let markers = render_form(&form, 70, 34)
+        .iter()
+        .filter(|row| row.contains('\u{276F}'))
+        .count();
+    assert_eq!(markers, 1, "expected one focused control, found {markers}");
+}
+
+#[test]
+fn a_form_keeps_a_focused_caretless_control_on_screen() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut form = coda_tui::settings_form::build(&coda_tui::config::Settings::empty_at(
+        std::env::temp_dir().join("coda-render-form-scroll.json"),
+    ));
+
+    // Tab to the telemetry switch, the last control and the one with no caret.
+    while form.focused_index() + 1 < form.len() {
+        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+
+    // A modal too short to show the whole form must scroll to the switch.
+    let joined = render_form(&form, 70, 20).join("\n");
+    assert!(
+        joined.contains("Telemetry"),
+        "the focused switch was scrolled out of sight:\n{joined}"
+    );
+}

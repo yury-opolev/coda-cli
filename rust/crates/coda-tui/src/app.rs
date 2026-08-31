@@ -117,6 +117,8 @@ pub struct App {
     browser: Option<Browser>,
     /// Which browser is open, so reload and actions know what to do.
     browser_kind: Option<BrowserKind>,
+    /// The open settings form, if any.
+    settings_form: Option<crate::widgets::Form>,
     /// Local Coda file locations for this session.
     paths: Paths,
     /// Outcomes reported by `event/taskCompleted`, keyed by task id.
@@ -197,6 +199,7 @@ impl App {
             armed: None,
             browser: None,
             browser_kind: None,
+            settings_form: None,
             paths: Paths::new(project_root),
             task_outcomes: std::collections::BTreeMap::new(),
             engine_command: command,
@@ -528,6 +531,13 @@ impl App {
         // A prompt takes the keyboard until it is answered.
         if self.state.prompt.is_some() {
             self.on_prompt_key(key);
+            return;
+        }
+
+        // The settings form owns the keyboard while it is open, ahead of the
+        // browser so the two can never both act on one key.
+        if self.settings_form.is_some() {
+            self.on_settings_key(key);
             return;
         }
 
@@ -1315,6 +1325,7 @@ impl App {
             "skills" => self.open_browser(BrowserKind::Skills).await,
             "plugins" => self.open_browser(BrowserKind::Plugins).await,
             "hooks" => self.open_browser(BrowserKind::Hooks).await,
+            "settings" => self.open_settings_form(),
             "mcp" if invocation.args.is_empty() => self.open_browser(BrowserKind::Mcp).await,
             "tasks" => self.open_browser(BrowserKind::Tasks).await,
             "version" => self.output(format!(
@@ -1743,6 +1754,7 @@ impl App {
         let browser = self.browser.as_ref();
         let pin = pin_text.as_deref();
         let selection = self.selection.has_selection().then_some(&self.selection);
+        let settings_form = self.settings_form.as_ref();
 
         // The transcript origin is captured from the draw so mouse-to-row
         // translation always matches the layout that was actually rendered.
@@ -1751,6 +1763,19 @@ impl App {
             origin = draw::draw_with_pin(
                 frame, state, composer, viewport, rows, theme, browser, pin, selection,
             );
+            // Drawn as a second pass rather than another parameter on an
+            // already nine-argument signature. It goes last so it sits above
+            // everything else, which is what an open modal should do.
+            if let Some(form) = settings_form {
+                draw::draw_form(
+                    frame,
+                    frame.area(),
+                    "Settings",
+                    "Tab: next    \u{2191}\u{2193}: change    Enter: save    Esc: cancel",
+                    form,
+                    theme,
+                );
+            }
         })?;
         self.transcript_origin = origin;
 
@@ -1830,6 +1855,50 @@ impl App {
     /// If nothing is visible, the call is a no-op.  A failure to access the
     /// clipboard (e.g. no display server) is reported as a notice rather than
     /// crashing the application.
+    /// Opens the settings form, seeded from the settings on disk.
+    fn open_settings_form(&mut self) {
+        self.settings_form = Some(crate::settings_form::open(&self.paths));
+        self.dirty = true;
+    }
+
+    /// Routes a key to the open settings form.
+    fn on_settings_key(&mut self, key: KeyEvent) {
+        use crate::widgets::FormOutcome;
+
+        self.dirty = true;
+        let Some(form) = self.settings_form.as_mut() else {
+            return;
+        };
+
+        match form.handle_key(key) {
+            FormOutcome::Consumed | FormOutcome::Ignored => {}
+            FormOutcome::Cancel => {
+                self.settings_form = None;
+                self.notice("Settings unchanged.", NoticeLevel::Info);
+            }
+            FormOutcome::Submit => {
+                // Take the form first: whether the save succeeds or fails, the
+                // modal closes, so a broken settings file cannot trap the user
+                // in a form they can only escape by killing the process.
+                let form = self.settings_form.take().expect("just matched");
+                let mut settings = crate::config::Settings::load(&self.paths)
+                    .unwrap_or_else(|_| {
+                        crate::config::Settings::empty_at(self.paths.settings())
+                    });
+                match crate::settings_form::apply(&form, &mut settings) {
+                    Ok(()) => self.notice(
+                        "Settings saved. Some changes apply on restart.",
+                        NoticeLevel::Info,
+                    ),
+                    Err(err) => self.notice(
+                        format!("Could not save settings: {err}"),
+                        NoticeLevel::Error,
+                    ),
+                }
+            }
+        }
+    }
+
     /// Copies the active selection for a right-click gesture.
     ///
     /// The selection is cleared only on a successful write. Keeping it after a

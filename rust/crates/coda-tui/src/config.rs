@@ -361,6 +361,36 @@ impl Settings {
         telemetry.insert("logToStderr".into(), Value::Bool(stderr));
     }
 
+    fn telemetry_field(&self, key: &str) -> Option<&Value> {
+        self.root.get("telemetry")?.as_object()?.get(key)
+    }
+
+    /// Whether telemetry is on. Absent means off, matching the C# default.
+    pub fn telemetry_enabled(&self) -> bool {
+        self.telemetry_field("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    pub fn telemetry_level(&self) -> Option<&str> {
+        self.telemetry_field("minLevel").and_then(Value::as_str)
+    }
+
+    pub fn telemetry_stderr(&self) -> bool {
+        self.telemetry_field("logToStderr")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+    }
+
+    /// An empty settings object rooted at `path`, for tests and for the case
+    /// where `settings.json` does not exist yet.
+    pub fn empty_at(path: PathBuf) -> Self {
+        Self {
+            path,
+            root: Value::Object(Map::new()),
+        }
+    }
+
     // -- Marketplaces --------------------------------------------------------
 
     /// Registered marketplace registries as (name, source-URL-or-path) pairs.

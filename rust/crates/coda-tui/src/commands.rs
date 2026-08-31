@@ -148,6 +148,13 @@ pub const COMMANDS: &[CommandSpec] = &[
         scope: Scope::Engine,
     },
     CommandSpec {
+        name: "settings",
+        aliases: &[],
+        args: "",
+        summary: "Edit settings in a form.",
+        scope: Scope::Local,
+    },
+    CommandSpec {
         name: "mcp",
         aliases: &[],
         args: "",

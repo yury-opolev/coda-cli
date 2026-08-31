@@ -12,8 +12,11 @@ pub mod keymap;
 pub mod overlay;
 pub mod pin;
 pub mod selection;
+pub mod settings_form;
 pub mod setup;
 pub mod state;
 pub mod terminal;
 pub mod transcript;
 pub mod viewport;
+pub mod widgets;
+
