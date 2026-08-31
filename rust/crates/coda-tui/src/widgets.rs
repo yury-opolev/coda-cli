@@ -32,9 +32,11 @@ use coda_render::text;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::{Line, Span};
 
+use crate::render::glyphs;
+
 /// Gutter marker on the focused control, echoing the composer's prompt so the
 /// two read as the same idea.
-const FOCUS_MARKER: &str = "\u{276F} ";
+const FOCUS_MARKER: &str = "❯ ";
 /// Same width as [`FOCUS_MARKER`], so unfocused rows stay aligned.
 const FOCUS_BLANK: &str = "  ";
 
@@ -224,7 +226,7 @@ impl TextInput {
             return (self.placeholder.clone(), true);
         }
         if self.masked {
-            return ("\u{2022}".repeat(self.value.len()), false);
+            return (glyphs::BULLET.repeat(self.value.len()), false);
         }
         (self.value(), false)
     }
@@ -625,7 +627,7 @@ impl Control for Select {
     fn render(&self, width: u16, focused: bool, theme: &Theme) -> Vec<Line<'static>> {
         let inner = content_width(width);
         let current = self.value().unwrap_or("—").to_string();
-        let marker = if self.open { "\u{25B2}" } else { "\u{25BC}" };
+        let marker = if self.open { glyphs::CHEVRON_UP } else { glyphs::CHEVRON_DOWN };
 
         let mut rows = vec![
             Line::from(vec![
@@ -653,7 +655,7 @@ impl Control for Select {
                 } else {
                     theme.style(Role::CompletionNormal)
                 };
-                let prefix = if selected { "\u{203A} " } else { "  " };
+                let prefix = if selected { "› " } else { "  " };
                 rows.push(Line::from(vec![
                     Span::raw(FOCUS_BLANK),
                     Span::styled(
@@ -746,7 +748,7 @@ impl Control for RadioGroup {
             let chosen = index == self.selected;
             // A filled dot rather than colour alone, so the choice survives a
             // monochrome terminal.
-            let glyph = if chosen { "(\u{25CF})" } else { "( )" };
+            let glyph = if chosen { "(●)" } else { "( )" };
             let style = if chosen && focused {
                 theme.style(Role::PromptAccent)
             } else if chosen {
@@ -832,7 +834,7 @@ impl Control for Switch {
     fn render(&self, width: u16, focused: bool, theme: &Theme) -> Vec<Line<'static>> {
         // The knob's position carries the state on its own, so the switch is
         // still readable where colour is not.
-        let knob = if self.on { "[ \u{25CF}]" } else { "[\u{25CF} ]" };
+        let knob = if self.on { "[ ●]" } else { "[● ]" };
         let state = if self.on { "on" } else { "off" };
         let state_style = if self.on {
             theme.style(Role::ToolSuccess)

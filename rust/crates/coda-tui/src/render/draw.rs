@@ -15,6 +15,7 @@ use ratatui::Frame;
 use crate::composer::Composer;
 use crate::overlay::{Browser, View as BrowserView};
 use crate::state::{PendingPrompt, UiState};
+use crate::render::glyphs;
 use crate::viewport::Viewport;
 
 /// Width of the scrollbar column.
@@ -363,9 +364,9 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Th
         .map(|row| {
             let inside = row >= position && row < position + size;
             let (glyph, style) = if inside {
-                ("\u{2588}", thumb_style) // █
+                (glyphs::BLOCK, thumb_style) // █
             } else {
-                ("\u{2502}", track_style) // │
+                (glyphs::RULE_VERTICAL, track_style) // │
             };
             Line::from(Span::styled(glyph, style))
         })
@@ -378,11 +379,11 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Th
 /// the shell background and its lower half carries the panel colour, so the
 /// panel appears to begin half a row above its first content row rather than
 /// starting abruptly on a cell boundary.
-const TOP_EDGE_GLYPH: &str = "\u{2584}";
+const TOP_EDGE_GLYPH: &str = glyphs::COMPOSER_TOP;
 
 /// Mirrors [`TOP_EDGE_GLYPH`] with an *upper* half block, so the panel appears
 /// to end half a row below its last content row.
-const BOTTOM_EDGE_GLYPH: &str = "\u{2580}";
+const BOTTOM_EDGE_GLYPH: &str = glyphs::COMPOSER_BOTTOM;
 
 /// Column where composer text starts, past the padded prompt marker.
 ///
@@ -458,7 +459,7 @@ fn draw_composer(
             // continuation indent matches its width so wrapped lines align
             // under the first one's text.
             let marker = if index == 0 {
-                if state.is_busy() { " \u{22EF} " } else { " \u{276F} " }
+                if state.is_busy() { " ⋯ " } else { " ❯ " }
             } else {
                 "   "
             };
@@ -494,28 +495,28 @@ fn draw_status(
 
     if let Some(model) = &state.model {
         spans.push(Span::styled(
-            format!("\u{2502} {model} "),
+            format!("{} {model} ", glyphs::RULE_VERTICAL),
             theme.style(Role::Notification),
         ));
     }
 
     if let Some(percent) = state.usage.percent_used() {
         spans.push(Span::styled(
-            format!("\u{2502} context {percent}% "),
+            format!("{} context {percent}% ", glyphs::RULE_VERTICAL),
             theme.style(Role::Notification),
         ));
     }
 
     if state.interrupting {
         spans.push(Span::styled(
-            "\u{2502} interrupting… ",
+            format!("{} interrupting… ", glyphs::RULE_VERTICAL),
             theme.style(Role::Warning),
         ));
     }
 
     if !state.queued.is_empty() {
         spans.push(Span::styled(
-            format!("\u{2502} {} queued ", state.queued.len()),
+            format!("{} {} queued ", glyphs::RULE_VERTICAL, state.queued.len()),
             theme.style(Role::PendingUser),
         ));
     }
@@ -523,7 +524,7 @@ fn draw_status(
     // The jump-to-bottom hint only matters when content arrived unseen.
     if viewport.unread() > 0 {
         spans.push(Span::styled(
-            format!("\u{2502} {} new \u{2193} Ctrl+End ", viewport.unread()),
+            format!("{} {} new {} Ctrl+End ", glyphs::RULE_VERTICAL, viewport.unread(), glyphs::ARROW_DOWN),
             theme.style(Role::PromptAccent),
         ));
     }
@@ -613,7 +614,7 @@ fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Th
                     .join("\n");
                 format!("{question}\n\n{list}")
             };
-            ("Question", body, "\u{2191}\u{2193}: choose    Enter: answer")
+            ("Question", body, "↑↓: choose    Enter: answer")
         }
         PendingPrompt::PlanApproval { plan } => (
             "Approve plan?",

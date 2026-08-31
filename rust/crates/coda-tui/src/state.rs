@@ -690,7 +690,7 @@ impl UiState {
         if !self.buffer_rewritten_by_hook && !buf.is_empty() {
             // Withhold: show a notice instead of the raw text.
             self.notice(
-                "[response withheld \u{2014} interrupted before the redaction hook ran]",
+                "[response withheld — interrupted before the redaction hook ran]",
                 NoticeLevel::Warning,
             );
         } else {

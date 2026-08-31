@@ -1771,7 +1771,7 @@ impl App {
                     frame,
                     frame.area(),
                     "Settings",
-                    "Tab: next    \u{2191}\u{2193}: change    Enter: save    Esc: cancel",
+                    "Tab: next    ↑↓: change    Enter: save    Esc: cancel",
                     form,
                     theme,
                 );

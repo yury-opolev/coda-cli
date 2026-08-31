@@ -10,6 +10,8 @@ use coda_render::theme::Role;
 use coda_render::tool::{CallStatus, ToolActivity, ToolDisplayMode};
 use coda_render::{markdown, Gutter, RenderLine, MARKER_CELLS};
 
+use crate::render::glyphs;
+
 /// Identifies a batch of tool calls within a turn.
 ///
 /// Both components are optional because the engine may omit them; two batches
@@ -220,7 +222,7 @@ impl Block {
                 coda_render::diff::render(&diff, width, false)
             }
             Block::SessionBoundary { id } => {
-                let label = format!("\u{2500}\u{2500} session {id} \u{2500}\u{2500}");
+                let label = format!("{0}{0} session {id} {0}{0}", glyphs::RULE);
                 text::wrap(&label, width)
                     .into_iter()
                     .map(|chunk| RenderLine::new(chunk, Role::Notification))
@@ -314,11 +316,11 @@ fn render_thinking(
     let seconds = (elapsed_ms as f64 / 1000.0).round() as i64;
 
     let status = if complete {
-        format!("\u{1F4AD} Thought for {seconds}s")
+        format!("💭 Thought for {seconds}s")
     } else {
         match tokens {
-            Some(tokens) => format!("\u{1F4AD} Thinking… {seconds}s · {tokens} tok"),
-            None => format!("\u{1F4AD} Thinking… {seconds}s"),
+            Some(tokens) => format!("💭 Thinking… {seconds}s · {tokens} tok"),
+            None => format!("💭 Thinking… {seconds}s"),
         }
     };
 

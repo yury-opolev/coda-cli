@@ -17,15 +17,15 @@ use crate::overlay::{Browser, Column, Item};
 /// Status glyphs shared across browsers.
 mod glyph {
     /// Enabled, running, or otherwise healthy.
-    pub const ACTIVE: &str = "\u{25CF}"; // ●
+    pub const ACTIVE: &str = crate::render::glyphs::DOT;       // ●
     /// Disabled or idle.
-    pub const INACTIVE: &str = "\u{25CB}"; // ○
+    pub const INACTIVE: &str = crate::render::glyphs::DOT_HOLLOW; // ○
     /// Failed or blocked.
-    pub const BLOCKED: &str = "\u{2717}"; // ✗
+    pub const BLOCKED: &str = crate::render::glyphs::CROSS;    // ✗
     /// Neither active nor failed.
-    pub const OTHER: &str = "\u{25A0}"; // ■
+    pub const OTHER: &str = crate::render::glyphs::SQUARE;     // ■
     /// The current selection, e.g. the active model.
-    pub const CURRENT: &str = "\u{2713}"; // ✓
+    pub const CURRENT: &str = crate::render::glyphs::CHECK;    // ✓
 }
 
 /// Formats a context window as a compact token count, e.g. `200K`.
