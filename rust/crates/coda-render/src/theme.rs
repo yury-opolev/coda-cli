@@ -85,6 +85,12 @@ pub enum Role {
     // Chrome
     SelectionText,
     SelectionBackground,
+    /// Text on the focused control's band.
+    FocusText,
+    /// Band drawn across every row of the focused control. The primary focus
+    /// signal; the accent label and gutter marker are layered beneath it so
+    /// none is load-bearing alone.
+    FocusBackground,
     ScrollbarTrack,
     ScrollbarThumb,
     CompletionNormal,
@@ -202,6 +208,8 @@ struct ThemeColors {
     operational_waiting: ThemeColor,
     selection_text: ThemeColor,
     selection_background: ThemeColor,
+    focus_text: ThemeColor,
+    focus_background: ThemeColor,
     scrollbar_track: ThemeColor,
     scrollbar_thumb: ThemeColor,
     completion_normal: ThemeColor,
@@ -253,6 +261,10 @@ const WARM_EMBER: ThemeColors = ThemeColors {
     operational_waiting: ThemeColor::new(143, 136, 128, Color::Gray),
     selection_text: ThemeColor::new(23, 19, 16, Color::Black),
     selection_background: ThemeColor::new(230, 168, 74, Color::LightYellow),
+    // Lifted a few steps off the shell background: enough to find in
+    // peripheral vision, not so much that a focused control shouts.
+    focus_text: ThemeColor::new(240, 224, 208, Color::White),
+    focus_background: ThemeColor::new(46, 38, 32, Color::DarkGray),
     scrollbar_track: ThemeColor::new(112, 102, 92, Color::DarkGray),
     scrollbar_thumb: ThemeColor::new(230, 168, 74, Color::LightYellow),
     completion_normal: ThemeColor::new(215, 194, 168, Color::White),
@@ -304,6 +316,8 @@ const COOL_DARK: ThemeColors = ThemeColors {
     operational_waiting: ThemeColor::new(130, 140, 158, Color::Gray),
     selection_text: ThemeColor::new(16, 18, 24, Color::Black),
     selection_background: ThemeColor::new(112, 176, 232, Color::LightBlue),
+    focus_text: ThemeColor::new(226, 232, 240, Color::White),
+    focus_background: ThemeColor::new(30, 38, 52, Color::DarkGray),
     scrollbar_track: ThemeColor::new(92, 100, 116, Color::DarkGray),
     scrollbar_thumb: ThemeColor::new(112, 176, 232, Color::LightBlue),
     completion_normal: ThemeColor::new(200, 210, 226, Color::White),
@@ -416,6 +430,8 @@ impl Theme {
             Role::OperationalWaiting => c.operational_waiting,
             Role::SelectionText => c.selection_text,
             Role::SelectionBackground => c.selection_background,
+            Role::FocusText => c.focus_text,
+            Role::FocusBackground => c.focus_background,
             Role::ScrollbarTrack => c.scrollbar_track,
             Role::ScrollbarThumb => c.scrollbar_thumb,
             Role::CompletionNormal => c.completion_normal,
@@ -488,6 +504,27 @@ mod tests {
     }
 
     #[test]
+    fn every_theme_defines_a_distinct_focus_band() {
+        for theme in [Theme::warm_ember(), Theme::cool_dark()] {
+            assert_ne!(
+                theme.fg(Role::FocusBackground),
+                theme.fg(Role::Background),
+                "{}: the focus band must differ from the shell background, \
+                 or a focused control is invisible",
+                theme.name
+            );
+            assert_ne!(
+                theme.fg(Role::FocusBackground),
+                theme.fg(Role::SelectionBackground),
+                "{}: focus and selection must be distinguishable at the same \
+                 time, so a list shows both which control is focused and which \
+                 row is chosen",
+                theme.name
+            );
+        }
+    }
+
+    #[test]
     fn resolves_every_role_without_panicking() {
         let roles = [
             Role::Background,
@@ -543,6 +580,8 @@ mod tests {
             Role::OperationalWaiting,
             Role::SelectionText,
             Role::SelectionBackground,
+            Role::FocusText,
+            Role::FocusBackground,
             Role::ScrollbarTrack,
             Role::ScrollbarThumb,
             Role::CompletionNormal,

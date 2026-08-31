@@ -114,6 +114,37 @@ fn label_style(focused: bool, theme: &Theme) -> ratatui::style::Style {
     }
 }
 
+/// Paints the focus band across every row of the focused control.
+///
+/// The band is the primary focus signal, because it is findable in peripheral
+/// vision and it scales to multi-row controls: a six-option radio group still
+/// reads as one focused unit. The accent label and the gutter marker are
+/// layered beneath it so none of the three is load-bearing alone and the state
+/// survives a terminal with no colour at all.
+///
+/// Applied last, over spans that already carry their own foreground, so a
+/// control does not have to know whether it is focused when choosing colours.
+fn band(lines: Vec<Line<'static>>, focused: bool, theme: &Theme) -> Vec<Line<'static>> {
+    if !focused {
+        return lines;
+    }
+    let bg = theme.fg(Role::FocusBackground);
+    lines
+        .into_iter()
+        .map(|line| {
+            Line::from(
+                line.spans
+                    .into_iter()
+                    .map(|span| {
+                        let style = span.style.bg(bg);
+                        Span::styled(span.content, style)
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // Static text
 // ---------------------------------------------------------------------------
@@ -293,19 +324,23 @@ impl Control for TextInput {
         } else {
             theme.style(Role::ComposerText)
         };
-        vec![
-            Line::from(vec![
-                gutter(focused, theme),
-                Span::styled(self.label.clone(), label_style(focused, theme)),
-            ]),
-            Line::from(vec![
-                Span::raw(FOCUS_BLANK),
-                Span::styled(
-                    text::truncate(&text::sanitize(&shown), content_width(width)),
-                    style,
-                ),
-            ]),
-        ]
+        band(
+            vec![
+                Line::from(vec![
+                    gutter(focused, theme),
+                    Span::styled(self.label.clone(), label_style(focused, theme)),
+                ]),
+                Line::from(vec![
+                    Span::raw(FOCUS_BLANK),
+                    Span::styled(
+                        text::truncate(&text::sanitize(&shown), content_width(width)),
+                        style,
+                    ),
+                ]),
+            ],
+            focused,
+            theme,
+        )
     }
 
     fn cursor(&self, width: u16) -> Option<(u16, u16)> {
@@ -498,7 +533,7 @@ impl Control for TextArea {
                 Span::styled(content, style),
             ]));
         }
-        rows
+        band(rows, focused, theme)
     }
 
     fn cursor(&self, width: u16) -> Option<(u16, u16)> {
@@ -668,7 +703,7 @@ impl Control for Select {
                 ]));
             }
         }
-        rows
+        band(rows, focused, theme)
     }
 }
 
@@ -767,7 +802,7 @@ impl Control for RadioGroup {
                 ),
             ]));
         }
-        rows
+        band(rows, focused, theme)
     }
 }
 
@@ -841,20 +876,24 @@ impl Control for Switch {
         } else {
             theme.style(Role::Notification)
         };
-        vec![Line::from(vec![
-            gutter(focused, theme),
-            Span::styled(
-                text::truncate(
-                    &text::sanitize(&self.label),
-                    content_width(width).saturating_sub(10),
+        band(
+            vec![Line::from(vec![
+                gutter(focused, theme),
+                Span::styled(
+                    text::truncate(
+                        &text::sanitize(&self.label),
+                        content_width(width).saturating_sub(10),
+                    ),
+                    label_style(focused, theme),
                 ),
-                label_style(focused, theme),
-            ),
-            Span::raw("  "),
-            Span::styled(knob.to_string(), state_style),
-            Span::raw(" "),
-            Span::styled(state.to_string(), state_style),
-        ])]
+                Span::raw("  "),
+                Span::styled(knob.to_string(), state_style),
+                Span::raw(" "),
+                Span::styled(state.to_string(), state_style),
+            ])],
+            focused,
+            theme,
+        )
     }
 }
 
@@ -1261,6 +1300,56 @@ mod tests {
             Box::new(TextInput::new("Name")),
             Box::new(Switch::new("Telemetry")),
         ])
+    }
+
+    #[test]
+    fn a_focused_control_is_banded_on_every_row() {
+        let radio = RadioGroup::new("Mode", options());
+        let focused = radio.render(40, true, &theme());
+        let unfocused = radio.render(40, false, &theme());
+        let expected = theme().fg(Role::FocusBackground);
+
+        for (index, line) in focused.iter().enumerate() {
+            assert!(
+                line.spans.iter().all(|s| s.style.bg == Some(expected)),
+                "focused row {index} is missing the band"
+            );
+        }
+        assert!(
+            unfocused
+                .iter()
+                .flat_map(|l| l.spans.iter())
+                .all(|s| s.style.bg != Some(expected)),
+            "an unfocused control must not be banded"
+        );
+    }
+
+    #[test]
+    fn a_focused_switch_is_banded_even_though_it_has_no_caret() {
+        // The switch is what proves the band earns its place: it has no caret,
+        // so without the band its focus would rest on the gutter marker alone.
+        let switch = Switch::new("Telemetry");
+        let expected = theme().fg(Role::FocusBackground);
+        assert!(switch.render(40, true, &theme())[0]
+            .spans
+            .iter()
+            .all(|s| s.style.bg == Some(expected)));
+    }
+
+    #[test]
+    fn a_form_bands_only_the_focused_control() {
+        let form = sample_form();
+        let expected = theme().fg(Role::FocusBackground);
+        let banded = form
+            .render(40, &theme())
+            .iter()
+            .filter(|line| {
+                !line.spans.is_empty()
+                    && line.spans.iter().all(|s| s.style.bg == Some(expected))
+            })
+            .count();
+        // The focused text input contributes a label row and a value row.
+        assert_eq!(banded, 2, "expected the focused control's two rows banded");
     }
 
     #[test]
