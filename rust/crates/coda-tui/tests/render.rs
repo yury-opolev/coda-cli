@@ -8,6 +8,7 @@
 use coda_proto::events::ToolCallStatus;
 use coda_proto::{Correlation, Event};
 use coda_render::theme::{ColorDepth, Theme};
+use coda_render::RenderLine;
 use coda_tui::composer::Composer;
 use coda_tui::draw;
 use coda_tui::state::{PendingPrompt, UiEvent, UiState};
@@ -32,7 +33,7 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
     viewport.update(rows.len(), regions.transcript.height as usize);
 
     terminal
-        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme, None))
+        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme))
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -182,16 +183,17 @@ fn renders_a_multiline_composer() {
 
 #[test]
 fn renders_a_permission_prompt_over_the_transcript() {
-    let mut state = session();
-    state.apply(UiEvent::Engine(Event::AssistantText {
-        delta: "working on it".into(),
-    }));
-    state.apply(UiEvent::PromptRequested(PendingPrompt::Permission {
-        tool: "run_command".into(),
-        preview: "rm -rf build".into(),
-    }));
-
-    let rows = render(&state, &Composer::new(), 80, 24);
+    // Prompts are surfaces now, so this drives the stack the way the app does.
+    let rows = render_surface(
+        Box::new(coda_tui::surface::prompt::PromptSurface::new(
+            PendingPrompt::Permission {
+                tool: "run_command".into(),
+                preview: "rm -rf build".into(),
+            },
+        )),
+        80,
+        24,
+    );
     assert!(
         rows.iter().any(|r| r.contains("Permission required")),
         "prompt title missing from {rows:?}"
@@ -205,18 +207,110 @@ fn renders_a_permission_prompt_over_the_transcript() {
 
 #[test]
 fn renders_a_question_prompt_with_numbered_options() {
-    let mut state = session();
-    state.apply(UiEvent::PromptRequested(PendingPrompt::Question {
-        question: "Which approach?".into(),
-        options: vec!["rewrite".into(), "patch".into()],
-        multi_select: false,
-        allow_free_text: true,
-    }));
-
-    let rows = render(&state, &Composer::new(), 80, 24);
+    let rows = render_surface(
+        Box::new(coda_tui::surface::prompt::PromptSurface::new(
+            PendingPrompt::Question {
+                question: "Which approach?".into(),
+                options: vec!["rewrite".into(), "patch".into()],
+                multi_select: false,
+                allow_free_text: true,
+            },
+        )),
+        80,
+        24,
+    );
     assert!(rows.iter().any(|r| r.contains("Which approach?")));
     assert!(rows.iter().any(|r| r.contains("1. rewrite")));
     assert!(rows.iter().any(|r| r.contains("2. patch")));
+}
+
+/// Selecting a span must actually change what is rendered.
+///
+/// The selection module was fully implemented and unit-tested, but nothing
+/// drove it: mouse events only handled scroll, so `TranscriptSelection` was
+/// never constructed and drag-selection silently did nothing. A test that
+/// exercises the *drawing path* with a selection is what catches that, since
+/// the module's own tests pass either way.
+#[test]
+fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
+    use coda_tui::selection::{SelectionPos, TranscriptSelection};
+
+    let width = 40u16;
+    let height = 10u16;
+    let rows = vec![RenderLine::new("hello selectable world", coda_render::Role::Assistant)];
+
+    let render = |selection: Option<&TranscriptSelection>| {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+        let state = session();
+        let composer = Composer::new();
+        let mut viewport = Viewport::new();
+        viewport.update(rows.len(), height as usize);
+        terminal
+            .draw(|frame| {
+                draw::draw_with_pin(
+                    frame,
+                    &state,
+                    &composer,
+                    &viewport,
+                    &rows,
+                    &Theme::default(),
+                    None,
+                    selection,
+                );
+            })
+            .expect("draw");
+        terminal.backend().buffer().clone()
+    };
+
+    let plain = render(None);
+
+    let mut selection = TranscriptSelection::new();
+    selection.begin(SelectionPos { row: 0, col: 0 });
+    selection.update(SelectionPos { row: 0, col: 5 });
+    assert!(selection.has_selection(), "the test selection must be non-empty");
+    let selected = render(Some(&selection));
+
+    assert_ne!(
+        plain, selected,
+        "a selection must be visible on screen; if these match, nothing drove the highlight"
+    );
+}
+
+/// A drawn frame must report where the transcript actually is, or a click
+/// cannot be translated into a transcript row.
+#[test]
+fn drawing_reports_the_transcript_origin_for_mouse_mapping() {
+    let width = 40u16;
+    let height = 12u16;
+    let rows = vec![RenderLine::new("one", coda_render::Role::Assistant), RenderLine::new("two", coda_render::Role::Assistant)];
+
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let state = session();
+    let composer = Composer::new();
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), height as usize);
+
+    let mut origin = (0u16, 0u16);
+    terminal
+        .draw(|frame| {
+            origin = draw::draw_with_pin(
+                frame,
+                &state,
+                &composer,
+                &viewport,
+                &rows,
+                &Theme::default(),
+                None,
+                None,
+            );
+        })
+        .expect("draw");
+
+    assert!(origin.1 > 0, "the transcript must have a non-zero height: {origin:?}");
+    assert!(
+        origin.0 + origin.1 <= height,
+        "the transcript must fit on screen: {origin:?} in {height}"
+    );
 }
 
 #[test]
@@ -338,7 +432,18 @@ fn render_with_browser(browser: &coda_tui::overlay::Browser, width: u16, height:
     viewport.update(0, 1);
 
     terminal
-        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &[], &theme, Some(browser)))
+        .draw(|frame| {
+            draw::draw(frame, &state, &composer, &viewport, &[], &theme);
+            // Browsers are surfaces now; drive the stack the way the app does.
+            let mut stack = coda_tui::surface::stack::SurfaceStack::default();
+            stack.push(Box::new(coda_tui::surface::browser::BrowserSurface::new(
+                coda_tui::surface::browser::BrowserKind::Models,
+                browser.clone(),
+            )));
+            for rendered in stack.render(frame.area(), &theme) {
+                draw::draw_surface(frame, &rendered, &theme);
+            }
+        })
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -409,4 +514,160 @@ fn an_overlay_renders_at_every_reasonable_size() {
             }
         }
     }
+}
+
+#[test]
+fn the_composer_panel_is_edged_with_half_blocks() {
+    let state = session();
+    let composer = Composer::new();
+    let lines = render(&state, &composer, 40, 12);
+
+    // The panel sits above the one-row status bar: bottom edge at height - 2,
+    // top edge two rows above that for a single-line composer.
+    let bottom_edge = &lines[lines.len() - 2];
+    let top_edge = &lines[lines.len() - 4];
+
+    assert!(
+        top_edge.chars().all(|c| c == '\u{2584}') && !top_edge.is_empty(),
+        "top edge should be lower half blocks, got {top_edge:?}"
+    );
+    assert!(
+        bottom_edge.chars().all(|c| c == '\u{2580}') && !bottom_edge.is_empty(),
+        "bottom edge should be upper half blocks, got {bottom_edge:?}"
+    );
+}
+
+#[test]
+fn the_startup_banner_renders_in_the_transcript() {
+    let mut state = session();
+    state.transcript.push(coda_tui::transcript::Block::Banner {
+        wordmark: vec!["WORDMARK".to_string()],
+        details: vec![String::new(), "cwd: /tmp/project".to_string()],
+    });
+
+    let composer = Composer::new();
+    let lines = render(&state, &composer, 60, 16).join("\n");
+
+    assert!(lines.contains("WORDMARK"), "wordmark missing from {lines:?}");
+    assert!(lines.contains("cwd: /tmp/project"), "details missing from {lines:?}");
+}
+
+#[test]
+fn the_composer_prompt_is_inset_from_the_edge() {
+    let state = session();
+    let mut composer = Composer::new();
+    composer.insert("hi");
+    let lines = render(&state, &composer, 40, 12);
+
+    // The prompt row sits between the two half-block edges.
+    let prompt_row = &lines[lines.len() - 3];
+    assert_eq!(
+        prompt_row, " \u{276F} hi",
+        "prompt should be inset by one space, got {prompt_row:?}"
+    );
+}
+
+/// Renders a surface through the real stack, exactly as the app does.
+///
+/// Driving the stack rather than calling the draw helper directly is what
+/// makes this an integration test: a surface that is never reached by the
+/// stack would still pass a test that rendered it by hand.
+fn render_surface(
+    surface: Box<dyn coda_tui::surface::Surface>,
+    width: u16,
+    height: u16,
+) -> Vec<String> {
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut stack = coda_tui::surface::stack::SurfaceStack::default();
+    stack.push(surface);
+
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    terminal
+        .draw(|frame| {
+            for rendered in stack.render(frame.area(), &theme) {
+                draw::draw_surface(frame, &rendered, &theme);
+            }
+        })
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+fn settings_surface() -> coda_tui::surface::settings::SettingsSurface {
+    coda_tui::surface::settings::SettingsSurface::new(&coda_tui::config::Settings::empty_at(
+        std::env::temp_dir().join("coda-render-surface-test.json"),
+    ))
+}
+
+#[test]
+fn a_surface_renders_its_controls_inside_a_padded_modal() {
+    let lines = render_surface(Box::new(settings_surface()), 70, 34);
+    let joined = lines.join("\n");
+
+    assert!(joined.contains("Settings"), "title missing");
+    assert!(joined.contains("Permission mode"), "radio group missing");
+    assert!(joined.contains("Theme"), "select missing");
+    assert!(joined.contains("Telemetry"), "switch missing");
+    assert!(joined.contains('\u{276F}'), "focus marker missing");
+
+    // Border column, one padding column, then content: no control may start
+    // flush against the border.
+    let content_row = lines
+        .iter()
+        .find(|row| row.contains("Permission mode"))
+        .expect("the radio group row");
+    // Char-wise, not byte-wise: the border glyph is three bytes wide.
+    let after_border: String = content_row
+        .chars()
+        .skip_while(|c| *c != '\u{2502}')
+        .skip(1)
+        .collect();
+    assert!(
+        after_border.starts_with(' '),
+        "no padding between border and content in {content_row:?}"
+    );
+}
+
+#[test]
+fn a_surface_shows_exactly_one_focus_marker() {
+    let markers = render_surface(Box::new(settings_surface()), 70, 34)
+        .iter()
+        .filter(|row| row.contains('\u{276F}'))
+        .count();
+    assert_eq!(markers, 1, "expected one focused control, found {markers}");
+}
+
+#[test]
+fn a_surface_keeps_a_focused_caretless_control_on_screen() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use coda_tui::surface::Surface;
+
+    let mut surface = settings_surface();
+    // Tab to the telemetry switch: the last control, and the one with no
+    // caret. A caret-based scroll would lose it exactly when focused.
+    while surface.form().focused_index() + 1 < surface.form().len() {
+        surface.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    }
+
+    let joined = render_surface(Box::new(surface), 70, 20).join("\n");
+    assert!(
+        joined.contains("Telemetry"),
+        "the focused switch was scrolled out of sight:\n{joined}"
+    );
+}
+
+#[test]
+fn a_surface_shows_its_own_hints() {
+    // The footer comes from the surface, so a new surface cannot forget it.
+    let joined = render_surface(Box::new(settings_surface()), 70, 34).join("\n");
+    assert!(joined.contains("Esc: cancel"), "hints missing:\n{joined}");
 }

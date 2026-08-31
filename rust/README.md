@@ -35,12 +35,15 @@ That means:
 | `coda-proto` | Framing codec, JSON-RPC envelopes, and typed payloads for every `serve` method, event and server-initiated request. I/O free. |
 | `coda-client` | Engine process supervision, duplex transport, request correlation, drop-safe responders. |
 | `coda-render` | Text measurement, the theme, markdown, unified diffs, syntax highlighting, tool display modes. Terminal-agnostic. |
-| `coda-tui` | State reducer, composer, viewport, keymap, drawing and the application loop. |
+| `coda-tui` | State reducer, composer, viewport, keymap, the `Surface` abstraction and its stack, reusable form controls, drawing, and the application loop. |
 | `coda-tool` | Leaf crate: the `Tool` trait, `ToolContext` and the path sandbox. Depends on nothing, so tool hosts need not pull in the engine. |
-| `coda-llm` | Neutral chat model, SSE decoding, Anthropic and Copilot clients, retry policy, and the `CredentialSource` seam. |
+| `coda-llm` | Neutral chat model, SSE decoding, Anthropic and Copilot clients, retry policy, reasoning-capability resolution, and the `CredentialSource` seam. |
 | `coda-agent` | The agent loop, 30 built-in tools, permissions, tasks, scheduling, hooks, subagents, compaction and the LSP client. |
 | `coda-mcp` | MCP stdio client, server manager, and the shared `.mcp.json` config. |
-| `coda-auth` | OAuth/PKCE and device-code flows, keyring storage with an encrypted-file fallback, single-flight refresh. |
+| `coda-auth` | OAuth/PKCE and device-code flows, DPAPI/keyring/encrypted-file stores, single-flight refresh. |
+| `coda-serve` | The engine host: pure method dispatch, the event bridge, server-initiated prompts, and the stdio transport. |
+| `coda-diff` | Differential tests asserting the C# and Rust engines answer identically. |
+| `coda` | The shipping binary: interactive, `serve` and `run` modes. |
 
 The dependency direction is strictly one way: `coda-tui → coda-render`,
 `coda-tui → coda-client → coda-proto`, and `coda-agent → {coda-llm, coda-mcp}
@@ -97,48 +100,92 @@ resolves it to 24-bit or 16-colour depending on terminal capability.
 **Keys resolve as a pure function** of the event plus UI context, so every
 binding has a test.
 
+**Every interactive overlay is a `Surface`** (`surface::Surface`). A surface
+turns keys into a `SurfaceOutcome` and renders to `Line`s, and it **cannot
+reach the engine** — no `App`, no async, no RPC, no I/O. That constraint is
+what makes each one testable with a key event and an assertion; work that
+needs the engine or the filesystem is requested as a `SurfaceAction` and
+performed by `App::apply_surface_action`, the only bridge.
+
+`SurfaceStack` routes keys to the top surface and renders bottom-up, so a
+detail view sits over the list that opened it. A key the top surface declines
+falls through to the global keymap, which is what keeps `Ctrl+C` working while
+a surface is open.
+
+**Placement is declared by the surface, not chosen by the caller** —
+`Modal`, `Full`, `Split` or `Inline` — and it *degrades rather than clips*: a
+split too narrow for two columns becomes a modal, a modal too small for its
+chrome becomes full screen. A cramped terminal shows a usable surface instead
+of a truncated one.
+
+**A surface scrolls itself**, keyed off the focused element's row range rather
+than the caret. A switch and a radio group have no caret, so a caret-based
+scroll loses them exactly when they take focus.
+
+**Glyphs live in one table** (`render::glyphs`), including composite forms such
+as `(●)` and `"❯ "`. Assembling those at the call site is how a raw glyph gets
+reintroduced. Two tests in `tests/conventions.rs` enforce this and the
+Role-only colour rule; both are written to catch the escaped *and* the raw
+spelling, because closing only one leaves the convention merely looking
+enforced.
+
+**Focus is three layered signals**: a background band across the focused
+control (primary), an accent label, and a `❯` gutter marker (the fallback that
+survives a terminal with no colour). Inversion is reserved for the *selected
+row* inside a list, so focus and selection stay legible at the same time.
+
 ## Status
 
-**The TUI ships and works.** It is the binary you run, and it drives the .NET
-engine over `serve`. The engine crates are complete, tested libraries but are
-not yet wired to a Rust `serve` entrypoint — see "What remains" below.
+**`coda.exe` is a standalone binary that no longer needs .NET.** It ships the
+TUI, the engine, and a headless mode:
 
-Ported and working, in the shipping TUI:
+```
+coda                  interactive TUI
+coda serve            JSON-RPC engine over stdio
+coda run -p "<task>"  headless one-shot
+```
 
-- the wire protocol, transport and engine supervision;
-- transcript rendering: markdown, unified diffs, syntax highlighting for eight
-  languages, tool display modes, the warm-ember and cool-dark themes;
-- the state reducer, composer, viewport, keymap and drawing;
-- the application loop, slash commands, and permission/question/plan prompts;
-- browser overlays for models, schedules, skills, plugins, hooks, MCP servers
-  and background tasks, on a shared list/detail browser with filtering, paging
-  and reload;
-- switching model, and toggling or updating plugins and MCP servers.
+Interactive mode drives the engine over the same JSON-RPC seam, defaulting the
+engine to this same executable. Running the agent in-process would be slightly
+faster but would bypass the boundary the parity tests exercise, so it is
+deliberately not done.
 
-Ported as libraries, complete with tests, not yet hosted by a Rust binary:
+### Parity with the C# engine
 
-- **providers** (`coda-llm`): the neutral chat model, streaming, Anthropic and
-  Copilot clients;
-- **agent core** (`coda-agent`): the loop, goals, events, tool contract and
-  permission gates;
-- **tools** (`coda-agent`): the 30 built-in file, search, shell, web and agent
-  tools, over the `coda-tool` sandbox;
-- **integrations** (`coda-mcp`): MCP client and manager, and the LSP client;
-- **runtime** (`coda-agent`): tasks, scheduling, subagents, hooks, compaction
-  and output styles;
-- **auth** (`coda-auth`): OAuth/PKCE, device code and credential storage.
+Two independent checks, both green:
+
+- **Contract tests** (`coda-tui/tests/engine_contract.rs`) run against either
+  engine via `CODA_ENGINE`. Six tests, identical assertions, both pass.
+- **Differential tests** (`coda-diff`) drive both engines with an identical
+  request sequence and compare normalised responses. **Zero divergences**;
+  `KNOWN_GAPS` is empty.
+
+The differential suite covers the deterministic surface — handshake, history,
+models, listings, errors, goals, effort, schedules. It excludes live model
+turns on purpose: a provider's output is not reproducible, and a flaky parity
+test is worse than none.
+
+Differential testing has been worth more than its cost. Three times a Rust
+unit test had pinned the *wrong* value and so agreed with a bug —
+`serverInfo: "coda-serve"` where C# says `"coda"`, an absent `setEffort` note
+where C# sends `""`, and a hook that approved a fail-closed gate. A test
+written beside an implementation tends to encode that implementation's
+assumptions; only cross-checking against the reference breaks the circularity.
 
 ### What remains
 
-- **A Rust `serve` binary.** The engine crates are not yet mounted behind the
-  JSON-RPC surface, so the shipping TUI still spawns the .NET engine. This is
-  the natural next phase: the crates exist, the protocol types exist, and the
-  contract tests already pin the surface they must satisfy.
 - session resume, transcript export/import, and the setup/onboarding wizard;
-- around 20 of the 40 slash commands, most of which are local-file or
-  session-state operations rather than engine calls;
+- five slash commands (`/compact` is wired; `/resume`, `/fork`, `/rewind`,
+  `/import`, `/login`, `/logout` need session-state or auth RPCs);
 - the 30 FPS frame throttle and the assistant-buffering mode, including its
-  withhold-on-interrupt rule.
+  withhold-on-interrupt rule;
+- session-level wiring for a few engine features that exist and are tested but
+  are not yet constructed by `coda-serve`: the `ScheduleRuntime`, the
+  hook-free subagent factory for `agent`-type hooks, and `SubagentRegistry`
+  injection into `SubagentHost`;
+- **real-model validation.** The engine has been exercised by its own tests and
+  by the parity suite, not by sustained real use. That is the one gap no test
+  closes.
 
 ## The two seams
 
@@ -198,9 +245,47 @@ the obvious alternative is exploitable:
   `McpTool::is_read_only()` is always `false`; the hint is display metadata.
 - **Permission gates fail closed.** Only post-hoc hooks, which cannot prevent
   anything, fail open.
+- **The permission prompt is an `Exclusive` surface.** The engine is blocked
+  until it is answered, so nothing may open above it and `Esc` *denies* rather
+  than dismissing — closing without answering would leave the turn waiting
+  forever on a responder that never receives a reply. Stray keys are swallowed
+  rather than ignored, since an ignored key would reach the stack's own `Esc`
+  handling and pop a prompt the turn depends on. This replaced an ordering
+  rule implied by the sequence of `if` statements in `on_key`: exclusivity is
+  now a property of the prompt rather than a convention about branch order.
+- **The prompt surface and the reducer are kept in lockstep.** The engine
+  clears `state.prompt` when a turn ends or is interrupted, without the prompt
+  being answered; an `Exclusive` surface left behind would be undismissable
+  and would wedge the interface. `App::apply` retires the surface whenever the
+  reducer has no prompt.
 - **Sandbox containment folds case only on case-insensitive platforms.**
   Folding unconditionally would treat a case-variant sibling as inside the
   root on a case-sensitive filesystem.
 - **Everything rendered from an untrusted source is sanitized** — model prose
   as well as code blocks, tool output, diffs and command output.
+- **A task may only be acted on by an ancestor.** `task_output` and `task_stop`
+  check the caller against the task tree: the main agent has full authority, a
+  subagent only over its strict descendants, neither over itself. Denied and
+  not-found return identical wording so a caller cannot probe for the existence
+  of tasks it may not touch.
+- **A plugin may not point outside its own directory.** A plugin-declared LSP
+  server path is rejected if absolute or if it resolves outside the plugin
+  root, since it names an executable to launch. A *project-scoped* plugin may
+  also not set `model:`, because the project directory is attacker-controlled
+  and model choice is a cost lever.
+- **An undispatchable hook has not approved anything.** Handler types this
+  build cannot run take the event's fail-open policy rather than parsing as a
+  silent success, so an `agent` hook on a fail-closed `PreToolUse` gate blocks
+  rather than allows.
+- **`allowedTools` from multiple hooks is intersected, not unioned.** Union
+  would grant a tool that an individual hook intended to block. A hook that
+  omits the field has *no opinion* and must not narrow the set to empty.
+- **An enterprise domain must be a bare host.** It is interpolated into the
+  OAuth token-exchange URL, so a path, query, fragment or userinfo component
+  could redirect a durable token elsewhere. A hostile value fails the whole
+  configuration rather than falling back to the public default, which would
+  silently route enterprise traffic to github.com.
+- **The turn slot is released by a `Drop` guard.** A serve task is cancellable;
+  releasing only on the `Ok`/`Err` paths would leave the slot claimed forever
+  after a client disconnects mid-turn, refusing every later prompt as busy.
 

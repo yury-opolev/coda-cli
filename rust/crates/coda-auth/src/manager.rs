@@ -526,4 +526,40 @@ mod tests {
             Some("mock".into())
         );
     }
+
+    // ── additional behaviours from the C# CredentialManagerTests spec ─────────
+
+    /// `provider_ids()` must enumerate exactly the providers that were passed to
+    /// the constructor — no more, no less.
+    #[test]
+    fn provider_ids_reflects_all_registered_providers() {
+        let store = Arc::new(InMemoryStore::new());
+        let manager = CredentialManager::new(
+            store,
+            [
+                Arc::new(MockProvider::new("alpha", Arc::new(AtomicUsize::new(0))))
+                    as Arc<dyn AuthProvider>,
+                Arc::new(MockProvider::new("beta", Arc::new(AtomicUsize::new(0)))),
+            ],
+        );
+        let mut ids: Vec<_> = manager.provider_ids().collect();
+        ids.sort(); // HashMap ordering is non-deterministic
+        assert_eq!(ids, vec!["alpha", "beta"]);
+    }
+
+    /// `get_auth_headers` must return `AuthError::NotFound` when no credential
+    /// has been stored for the requested provider.  Callers must not receive an
+    /// empty-header result that would silently make unauthenticated API calls.
+    #[tokio::test]
+    async fn get_auth_headers_returns_error_when_nothing_stored() {
+        let (mgr, _) = manager_with(Arc::new(MockProvider::new(
+            "mock",
+            Arc::new(AtomicUsize::new(0)),
+        )));
+        let err = mgr.get_auth_headers("mock").await.unwrap_err();
+        assert!(
+            matches!(err, AuthError::NotFound(_)),
+            "expected AuthError::NotFound when no credential stored, got {err:?}"
+        );
+    }
 }

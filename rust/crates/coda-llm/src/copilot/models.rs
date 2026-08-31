@@ -187,11 +187,29 @@ pub fn parse_models(value: &Value) -> Vec<ModelInfo> {
             })
             .unwrap_or_default();
 
+        // Advertised reasoning-effort levels, when the provider declares them.
+        // Copilot/OpenAI models carry these; Anthropic models do not and are
+        // resolved from static rules by the caller instead.
+        let reasoning_levels = item
+            .get("capabilities")
+            .and_then(|c| c.get("supports"))
+            .and_then(|s| s.get("reasoning_effort"))
+            .and_then(Value::as_array)
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         models.push(ModelInfo {
             id,
             display_name,
             context_limit,
             supported_endpoints,
+            reasoning_levels,
         });
     }
 

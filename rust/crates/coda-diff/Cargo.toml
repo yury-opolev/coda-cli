@@ -1,0 +1,19 @@
+[package]
+name = "coda-diff"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Differential tests: the C# and Rust engines must answer identically"
+publish = false
+
+[dependencies]
+coda-client = { workspace = true }
+coda-proto = { workspace = true }
+anyhow = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+pretty_assertions = { workspace = true }

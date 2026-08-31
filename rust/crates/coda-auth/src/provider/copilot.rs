@@ -40,6 +40,9 @@ const DEVICE_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// and may be absent; bound the probe so it does not stall the whole login.
 const EXCHANGE_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Minimum GitHub REST API version for all requests.
+const GITHUB_API_VERSION: &str = "2026-06-01";
+
 /// GitHub Copilot provider configuration.
 #[derive(Debug, Clone)]
 pub struct CopilotConfig {
@@ -59,6 +62,39 @@ pub struct CopilotConfig {
     pub editor_plugin_version: String,
     pub integration_id: String,
     pub user_agent: String,
+    /// Inference endpoint. Callers plumb this into the chat client's base URL;
+    /// enterprise tenants serve inference from their own host.
+    pub api_base_url: String,
+    /// Whether to exchange the GitHub OAuth token for a short-lived Copilot
+    /// token. The raw device-flow token grants only a legacy subset of models,
+    /// so this is on by default wherever an exchange endpoint exists.
+    pub use_exchange: bool,
+}
+
+/// Characters that mean a value is not a bare hostname — a path, query,
+/// fragment, or embedded credentials.
+const DISALLOWED_HOST_CHARS: &[char] = &['/', '\\', '@', '?', '#'];
+
+/// Rejects anything but a bare `host[:port]`.
+///
+/// # Security
+/// The domain is interpolated into `api.<domain>` and used as the destination
+/// of the durable OAuth token exchange. A stray path, query, fragment, or
+/// userinfo component could therefore redirect that token to a host the user
+/// never intended — `evil.com/@github.com` and friends. Failing loudly at
+/// config time is safer than sanitizing and hoping, which is also what the C#
+/// `EnsureBareHost` does.
+fn ensure_bare_host(host: &str) -> Result<(), AuthError> {
+    if host.is_empty()
+        || host.chars().any(char::is_whitespace)
+        || host.contains(DISALLOWED_HOST_CHARS)
+    {
+        return Err(AuthError::InvalidUrl(format!(
+            "GitHub Enterprise domain must be a bare hostname, e.g. 'octocorp.ghe.com' \
+             (no path, query, fragment, or embedded credentials); got '{host}'"
+        )));
+    }
+    Ok(())
 }
 
 impl CopilotConfig {
@@ -74,7 +110,102 @@ impl CopilotConfig {
             editor_plugin_version: "copilot-chat/0.22.0".into(),
             integration_id: "vscode-chat".into(),
             user_agent: "GitHubCopilotChat/0.22.0".into(),
+            api_base_url: "https://api.githubcopilot.com".into(),
+            use_exchange: true,
         }
+    }
+
+    /// Configuration for a GitHub Enterprise data-residency tenant.
+    ///
+    /// Device-code and token endpoints live on the GHE host, inference on
+    /// `copilot-api.<domain>`, and the token exchange on
+    /// `api.<domain>/copilot_internal/v2/token`. Client id and editor headers
+    /// are inherited from [`CopilotConfig::default_public`].
+    ///
+    /// A leading scheme and trailing slashes are stripped. If the caller pastes
+    /// the *Copilot* host (`copilot-api.<ghe>`) by mistake, the GHE host is
+    /// recovered so every derived URL stays consistent and no doubled
+    /// `copilot-api.` prefix is produced.
+    pub fn for_enterprise(domain: &str) -> Result<Self, AuthError> {
+        let trimmed = domain.trim();
+        if trimmed.is_empty() {
+            return Err(AuthError::InvalidUrl(
+                "GitHub Enterprise domain must not be empty".into(),
+            ));
+        }
+
+        let mut d = trimmed;
+        for scheme in ["https://", "http://"] {
+            if d.len() >= scheme.len() && d[..scheme.len()].eq_ignore_ascii_case(scheme) {
+                d = &d[scheme.len()..];
+                break;
+            }
+        }
+        let mut d = d.trim_end_matches('/').to_owned();
+
+        const COPILOT_PREFIX: &str = "copilot-api.";
+        if d.len() >= COPILOT_PREFIX.len()
+            && d[..COPILOT_PREFIX.len()].eq_ignore_ascii_case(COPILOT_PREFIX)
+        {
+            d = d[COPILOT_PREFIX.len()..].to_owned();
+        }
+
+        ensure_bare_host(&d)?;
+
+        Ok(Self {
+            device_code_url: format!("https://{d}/login/device/code"),
+            token_url: format!("https://{d}/login/oauth/access_token"),
+            copilot_token_url: Some(format!("https://api.{d}/copilot_internal/v2/token")),
+            api_base_url: format!("https://copilot-api.{d}"),
+            use_exchange: true,
+            ..Self::default_public()
+        })
+    }
+
+    /// Applies environment overrides.
+    ///
+    /// When `GH_COPILOT_ENTERPRISE_DOMAIN` is set the base is
+    /// [`CopilotConfig::for_enterprise`] rather than the public default;
+    /// individual overrides are then layered on top, so a tenant can still
+    /// redirect one endpoint without restating the rest.
+    pub fn from_environment() -> Result<Self, AuthError> {
+        Self::from_env_lookup(|key| std::env::var(key).ok().filter(|v| !v.is_empty()))
+    }
+
+    /// Testable core of [`CopilotConfig::from_environment`].
+    ///
+    /// Takes an explicit lookup because the process environment is global
+    /// mutable state: tests that set real variables interfere with each other
+    /// under the default parallel test runner.
+    pub fn from_env_lookup(
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<Self, AuthError> {
+        let base = match env("GH_COPILOT_ENTERPRISE_DOMAIN") {
+            Some(domain) => Self::for_enterprise(&domain)?,
+            None => Self::default_public(),
+        };
+
+        // Any value other than "false" or "0" enables the exchange, matching
+        // the C# truthiness rule rather than a stricter bool parse.
+        let use_exchange = match env("GH_COPILOT_USE_EXCHANGE") {
+            Some(raw) => !raw.eq_ignore_ascii_case("false") && raw != "0",
+            None => base.use_exchange,
+        };
+
+        Ok(Self {
+            client_id: env("GH_COPILOT_CLIENT_ID").unwrap_or(base.client_id),
+            device_code_url: env("GH_COPILOT_DEVICE_CODE_URL").unwrap_or(base.device_code_url),
+            token_url: env("GH_COPILOT_TOKEN_URL").unwrap_or(base.token_url),
+            copilot_token_url: env("GH_COPILOT_COPILOT_TOKEN_URL").or(base.copilot_token_url),
+            api_base_url: env("GH_COPILOT_API_BASE_URL").unwrap_or(base.api_base_url),
+            use_exchange,
+            editor_version: env("GH_COPILOT_EDITOR_VERSION").unwrap_or(base.editor_version),
+            editor_plugin_version: env("GH_COPILOT_PLUGIN_VERSION")
+                .unwrap_or(base.editor_plugin_version),
+            integration_id: env("GH_COPILOT_INTEGRATION_ID").unwrap_or(base.integration_id),
+            user_agent: env("GH_COPILOT_USER_AGENT").unwrap_or(base.user_agent),
+            scope: base.scope,
+        })
     }
 }
 
@@ -359,7 +490,27 @@ impl AuthProvider for CopilotProvider {
         if credential.kind != CredentialKind::OAuth {
             return false;
         }
-        // Refresh when approaching expiry.
+
+        // Self-heal: if the exchange URL is configured AND the stored access
+        // token is a raw GitHub OAuth/device-flow/PAT token (identifiable by
+        // its prefix), force a refresh so the token is exchanged for a full-
+        // entitlement Copilot token.  ExpiresAt is null on direct credentials
+        // built without the exchange (BuildDirectCredential never sets it).
+        //
+        // This covers the "stale credential" scenario where the user logged in
+        // before the exchange endpoint existed and has a raw ghu_/gho_/ghe_…
+        // token stored.  Without this check, the null ExpiresAt would cause
+        // needs_refresh to return false forever, permanently denying the user
+        // full model entitlement without prompting a re-login.
+        if self.config.copilot_token_url.is_some() {
+            if let Some(token) = &credential.access_token {
+                if is_raw_github_token(token.expose()) && credential.expires_at.is_none() {
+                    return true;
+                }
+            }
+        }
+
+        // Normal path: refresh when the token is within the 5-minute buffer.
         credential
             .expires_at
             .map(|exp| chrono::Utc::now() + chrono::Duration::from_std(REFRESH_BUFFER).unwrap() >= exp)
@@ -410,6 +561,7 @@ impl AuthProvider for CopilotProvider {
             ("copilot-integration-id".into(), self.config.integration_id.clone()),
             ("user-agent".into(), self.config.user_agent.clone()),
             ("x-initiator".into(), "user".into()),
+            ("x-github-api-version".into(), GITHUB_API_VERSION.into()),
         ])
     }
 }
@@ -435,6 +587,22 @@ fn build_direct_credential(github_token: &str) -> Credential {
 /// failing the entire login.
 fn is_exchange_absent_status(status: u16) -> bool {
     matches!(status, 404 | 501 | 502 | 503 | 504)
+}
+
+/// Returns `true` for raw GitHub OAuth / device-flow / PAT tokens that carry
+/// no Copilot entitlement and must be exchanged before use.
+///
+/// These prefixes are part of the GitHub token format spec; a token matching
+/// any of them has never passed through the Copilot exchange endpoint and will
+/// result in reduced model access if used as-is.
+fn is_raw_github_token(token: &str) -> bool {
+    token.starts_with("ghu_")
+        || token.starts_with("gho_")
+        || token.starts_with("ghp_")
+        || token.starts_with("ghs_")
+        || token.starts_with("ghr_")
+        || token.starts_with("ghe_")
+        || token.starts_with("github_pat_")
 }
 
 // ── DTOs ─────────────────────────────────────────────────────────────────────
@@ -470,6 +638,195 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
+    // ── Enterprise configuration ─────────────────────────────────────────────
+    //
+    // Mirrors the C# GitHubCopilotConfig ForEnterprise_* / FromEnvironment_*
+    // tests. Enterprise support was absent from the Rust port entirely, so
+    // enterprise GitHub users could not authenticate at all.
+
+    mod enterprise {
+        use super::*;
+
+        /// An empty or whitespace domain is a configuration error, not a
+        /// silently-accepted host.
+        #[test]
+        fn a_blank_domain_is_rejected() {
+            for blank in ["", "   ", "\t"] {
+                assert!(
+                    CopilotConfig::for_enterprise(blank).is_err(),
+                    "blank domain {blank:?} must be rejected"
+                );
+            }
+        }
+
+        /// SECURITY: the domain lands in the OAuth token-exchange URL, so a
+        /// path, query, fragment, or userinfo component could redirect the
+        /// durable token to an unintended host.
+        #[test]
+        fn a_domain_that_is_not_a_bare_host_is_rejected() {
+            for hostile in [
+                "ghe.com/path",
+                "ghe.com?query=1",
+                "ghe.com#frag",
+                "user@evil.com",
+                "evil.com/@ghe.com",
+                "ghe.com\\share",
+                "ghe com",
+            ] {
+                assert!(
+                    CopilotConfig::for_enterprise(hostile).is_err(),
+                    "non-bare host {hostile:?} must be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn a_scheme_and_trailing_slashes_are_stripped() {
+            for form in [
+                "https://octocorp.ghe.com",
+                "http://octocorp.ghe.com",
+                "octocorp.ghe.com/",
+                "HTTPS://octocorp.ghe.com//",
+                "  octocorp.ghe.com  ",
+            ] {
+                let config = CopilotConfig::for_enterprise(form).expect("valid host");
+                assert_eq!(
+                    config.device_code_url, "https://octocorp.ghe.com/login/device/code",
+                    "input form {form:?} produced the wrong device-code URL"
+                );
+            }
+        }
+
+        /// Pasting the Copilot host instead of the GHE host is an easy mistake;
+        /// recovering it keeps every derived URL consistent and avoids a
+        /// doubled `copilot-api.` prefix.
+        #[test]
+        fn the_copilot_host_pasted_by_mistake_recovers_the_ghe_host() {
+            let config =
+                CopilotConfig::for_enterprise("copilot-api.octocorp.ghe.com").expect("valid host");
+            assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+            assert_eq!(
+                config.copilot_token_url.as_deref(),
+                Some("https://api.octocorp.ghe.com/copilot_internal/v2/token")
+            );
+            assert_eq!(
+                config.api_base_url, "https://copilot-api.octocorp.ghe.com",
+                "the copilot-api prefix must not be doubled"
+            );
+        }
+
+        #[test]
+        fn enterprise_urls_are_derived_from_the_domain() {
+            let config = CopilotConfig::for_enterprise("octocorp.ghe.com").expect("valid host");
+            assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+            assert_eq!(config.token_url, "https://octocorp.ghe.com/login/oauth/access_token");
+            assert_eq!(
+                config.copilot_token_url.as_deref(),
+                Some("https://api.octocorp.ghe.com/copilot_internal/v2/token")
+            );
+            assert_eq!(config.api_base_url, "https://copilot-api.octocorp.ghe.com");
+        }
+
+        /// The raw device-flow token grants only a legacy subset of models, so
+        /// the exchange must be on for enterprise tenants.
+        #[test]
+        fn enterprise_uses_the_token_exchange() {
+            let config = CopilotConfig::for_enterprise("octocorp.ghe.com").expect("valid host");
+            assert!(config.use_exchange);
+        }
+
+        #[test]
+        fn enterprise_inherits_client_id_and_editor_headers_from_the_default() {
+            let default = CopilotConfig::default_public();
+            let config = CopilotConfig::for_enterprise("octocorp.ghe.com").expect("valid host");
+            assert_eq!(config.client_id, default.client_id);
+            assert_eq!(config.editor_version, default.editor_version);
+            assert_eq!(config.editor_plugin_version, default.editor_plugin_version);
+            assert_eq!(config.integration_id, default.integration_id);
+            assert_eq!(config.user_agent, default.user_agent);
+            assert_eq!(config.scope, default.scope);
+        }
+    }
+
+    mod from_environment {
+        use super::*;
+
+        fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+            let owned: Vec<(String, String)> =
+                pairs.iter().map(|(k, v)| ((*k).to_string(), (*v).to_string())).collect();
+            move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+        }
+
+        #[test]
+        fn no_variables_matches_the_public_default() {
+            let config = CopilotConfig::from_env_lookup(env_of(&[])).expect("config");
+            let default = CopilotConfig::default_public();
+            assert_eq!(config.device_code_url, default.device_code_url);
+            assert_eq!(config.token_url, default.token_url);
+            assert_eq!(config.copilot_token_url, default.copilot_token_url);
+            assert_eq!(config.api_base_url, default.api_base_url);
+            assert_eq!(config.use_exchange, default.use_exchange);
+        }
+
+        #[test]
+        fn an_enterprise_domain_starts_from_the_enterprise_config() {
+            let config = CopilotConfig::from_env_lookup(env_of(&[(
+                "GH_COPILOT_ENTERPRISE_DOMAIN",
+                "octocorp.ghe.com",
+            )]))
+            .expect("config");
+            assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+            assert_eq!(config.api_base_url, "https://copilot-api.octocorp.ghe.com");
+        }
+
+        /// A tenant may redirect one endpoint without restating the rest.
+        #[test]
+        fn individual_overrides_apply_on_top_of_enterprise() {
+            let config = CopilotConfig::from_env_lookup(env_of(&[
+                ("GH_COPILOT_ENTERPRISE_DOMAIN", "octocorp.ghe.com"),
+                ("GH_COPILOT_COPILOT_TOKEN_URL", "https://proxy.internal/token"),
+            ]))
+            .expect("config");
+            assert_eq!(config.copilot_token_url.as_deref(), Some("https://proxy.internal/token"));
+            // Everything not overridden still comes from the enterprise base.
+            assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+        }
+
+        #[test]
+        fn the_exchange_flag_follows_the_c_sharp_truthiness_rule() {
+            for (raw, expected) in
+                [("false", false), ("FALSE", false), ("0", false), ("true", true), ("1", true)]
+            {
+                let config =
+                    CopilotConfig::from_env_lookup(env_of(&[("GH_COPILOT_USE_EXCHANGE", raw)]))
+                        .expect("config");
+                assert_eq!(config.use_exchange, expected, "GH_COPILOT_USE_EXCHANGE={raw}");
+            }
+        }
+
+        #[test]
+        fn the_exchange_can_be_disabled_for_an_enterprise_tenant() {
+            let config = CopilotConfig::from_env_lookup(env_of(&[
+                ("GH_COPILOT_ENTERPRISE_DOMAIN", "octocorp.ghe.com"),
+                ("GH_COPILOT_USE_EXCHANGE", "false"),
+            ]))
+            .expect("config");
+            assert!(!config.use_exchange);
+        }
+
+        /// A hostile domain must fail the whole configuration rather than
+        /// falling back to the public default, which would silently send an
+        /// enterprise user's traffic to github.com.
+        #[test]
+        fn a_hostile_enterprise_domain_fails_rather_than_falling_back() {
+            let result = CopilotConfig::from_env_lookup(env_of(&[(
+                "GH_COPILOT_ENTERPRISE_DOMAIN",
+                "evil.com/@octocorp.ghe.com",
+            )]));
+            assert!(result.is_err(), "a non-bare host must not fall back to the public default");
+        }
+    }
+
     #[allow(dead_code)] // used by exchange tests; kept for future use
     async fn mock_server(status: u16, body: &'static str) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -502,6 +859,7 @@ mod tests {
             editor_plugin_version: "copilot/0.1".into(),
             integration_id: "vscode".into(),
             user_agent: "TestAgent/0.1".into(),
+            ..CopilotConfig::default_public()
         }
     }
 
@@ -689,6 +1047,7 @@ mod tests {
             editor_plugin_version: "p".into(),
             integration_id: "i".into(),
             user_agent: "u".into(),
+            ..CopilotConfig::default_public()
         };
 
         let device = DeviceCodeResponse {
@@ -784,4 +1143,188 @@ mod tests {
             "expected InvalidUrl, got {err:?}"
         );
     }
+
+    // ── auth header includes GitHub API version ────────────────────────────────
+
+    #[test]
+    fn auth_headers_include_github_api_version() {
+        let cred = Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("bearer_token".into())),
+            refresh_token: None,
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        let headers = p.auth_headers(&cred).expect("headers");
+        let header_map: std::collections::HashMap<_, _> = headers.into_iter().collect();
+        assert_eq!(
+            header_map.get("x-github-api-version").map(String::as_str),
+            Some(GITHUB_API_VERSION),
+            "x-github-api-version header must match the declared constant"
+        );
+    }
+
+    // ── raw-token self-heal ────────────────────────────────────────────────────
+
+    /// When the exchange URL is configured AND the stored credential holds a
+    /// raw GitHub OAuth token (identifiable by its prefix), `needs_refresh`
+    /// must return `true` so the token is immediately re-exchanged for a
+    /// full-entitlement Copilot token.  This "self-heal" is crucial for
+    /// credentials stored before the exchange endpoint existed.
+    #[test]
+    fn needs_refresh_is_true_for_raw_github_token_with_exchange_configured() {
+        let raw_prefixes = [
+            "ghu_RawDeviceFlowToken",
+            "gho_RawOAuthToken",
+            "ghp_PersonalAccessToken",
+            "ghs_ServerToken",
+            "ghr_RunnerToken",
+            "ghe_EnterpriseToken",
+            "github_pat_FinegrainedPat",
+        ];
+        // default_public() has copilot_token_url = Some(...)  → UseExchange=true equivalent
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+
+        for raw_token in raw_prefixes {
+            let cred = Credential {
+                provider_id: PROVIDER_ID.into(),
+                kind: CredentialKind::OAuth,
+                access_token: Some(Secret::new(raw_token.into())),
+                refresh_token: Some(Secret::new(raw_token.into())),
+                api_key: None,
+                // Null ExpiresAt is the fingerprint of a build_direct_credential result.
+                expires_at: None,
+                scopes: Vec::new(),
+                account: None,
+            };
+            assert!(
+                p.needs_refresh(&cred),
+                "raw token '{raw_token}' with exchange configured must trigger refresh"
+            );
+        }
+    }
+
+    /// When the exchange URL is NOT configured (copilot_token_url = None),
+    /// a raw GitHub token with null ExpiresAt represents a legitimate long-lived
+    /// credential and must NOT trigger a refresh.
+    #[test]
+    fn needs_refresh_is_false_for_raw_token_when_no_exchange_configured() {
+        let config = CopilotConfig {
+            copilot_token_url: None, // UseExchange=false equivalent
+            ..CopilotConfig::default_public()
+        };
+        let p = CopilotProvider::new(config);
+        let cred = Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            access_token: Some(Secret::new("ghu_RawToken".into())),
+            refresh_token: Some(Secret::new("ghu_RawToken".into())),
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        assert!(
+            !p.needs_refresh(&cred),
+            "raw token without exchange configured must NOT trigger refresh"
+        );
+    }
+
+    /// An already-exchanged token that happens to have null ExpiresAt (unusual
+    /// but possible) must NOT be flagged as needing self-heal, since its
+    /// access_token doesn't start with a known raw-token prefix.
+    #[test]
+    fn needs_refresh_is_false_for_already_exchanged_token_with_null_expiry() {
+        let p = CopilotProvider::new(CopilotConfig::default_public());
+        let cred = Credential {
+            provider_id: PROVIDER_ID.into(),
+            kind: CredentialKind::OAuth,
+            // "tid=…" is the Copilot-exchanged token format — not a raw prefix.
+            access_token: Some(Secret::new(
+                "tid=abc;exp=123;sku=copilot_enterprise_seat_quota".into(),
+            )),
+            refresh_token: Some(Secret::new("ghu_underlying_github_token".into())),
+            api_key: None,
+            expires_at: None,
+            scopes: Vec::new(),
+            account: None,
+        };
+        assert!(
+            !p.needs_refresh(&cred),
+            "already-exchanged token must not be mistaken for a raw token"
+        );
+    }
+
+    // ── access denied during device login ────────────────────────────────────
+
+    /// When the user denies consent in the browser, the token endpoint returns
+    /// `"error":"access_denied"`.  The polling loop must surface this as
+    /// `AuthError::LoginCancelled` rather than retrying indefinitely or panicking.
+    /// Mirrors C# `DeviceLogin_AccessDenied_Throws`.
+    #[tokio::test]
+    async fn device_login_access_denied_throws_login_cancelled() {
+        // We test the polling phase directly (same pattern as the other polling
+        // tests) because the mock HTTP infrastructure used for the device-code
+        // phase would add complexity without covering new code paths.
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut buf = vec![0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let body = r#"{"error":"access_denied"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = socket.write_all(resp.as_bytes()).await;
+        });
+
+        let token_url = format!("http://127.0.0.1:{port}");
+        let config = CopilotConfig {
+            client_id: "id".into(),
+            device_code_url: "http://unused/device".into(),
+            token_url,
+            copilot_token_url: None,
+            scope: "read:user".into(),
+            editor_version: "v".into(),
+            editor_plugin_version: "p".into(),
+            integration_id: "i".into(),
+            user_agent: "u".into(),
+            ..CopilotConfig::default_public()
+        };
+
+        let device = DeviceCodeResponse {
+            device_code: Some("dc".into()),
+            user_code: Some("AAAA-BBBB".into()),
+            verification_uri: Some("http://gh".into()),
+            verification_uri_complete: None,
+            expires_in: 900,
+            interval: 0, // → max(0,1)=1 s sleep before the one poll
+        };
+
+        let p = CopilotProvider::new(config);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            p.poll_for_github_token(&device),
+        )
+        .await
+        .expect("test must not timeout")
+        .expect_err("access_denied must produce an error");
+
+        assert!(
+            matches!(result, AuthError::LoginCancelled(_)),
+            "access_denied must surface as AuthError::LoginCancelled, got {result:?}"
+        );
+    }
 }
+
+
+
+

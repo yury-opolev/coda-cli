@@ -19,7 +19,10 @@ pub mod client;
 pub mod config;
 pub mod diagnostic;
 pub mod manager;
+pub mod map_builder;
+pub mod plugin_loader;
 pub mod tool;
+pub mod lsp_tool;
 
 pub use client::{LspClient, LspError};
 pub use config::LspServerConfig;
@@ -28,4 +31,7 @@ pub use diagnostic::{
     LspRange,
 };
 pub use manager::{LspServerManager, LspServerSnapshot, LspServerState};
+pub use map_builder::LspServerMapBuilder;
+pub use plugin_loader::PluginLspServerLoader;
 pub use tool::LspDiagnosticsTool;
+pub use lsp_tool::LspTool;

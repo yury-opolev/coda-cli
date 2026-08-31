@@ -245,6 +245,77 @@ impl PostCompactResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// UserPromptSubmit result
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Per-turn shape overrides returned by `UserPromptSubmit` hooks.
+///
+/// Hooks may restrict (intersect) the allowed tool set, widen the denied set,
+/// append to the system prompt, or set model/effort/tool-choice overrides.
+/// All fields are optional; absent = "no opinion from this hook".
+#[derive(Debug, Clone, Default)]
+pub struct UserPromptSubmitShape {
+    /// Intersection of all hooks' `allowedTools` lists.
+    /// `None` means no hook expressed an opinion → the default tool set applies.
+    /// An empty `Vec` means every hook agreed to allow zero tools.
+    pub allowed_tools: Option<Vec<String>>,
+    /// Union of all hooks' `deniedTools` lists.
+    pub denied_tools: Vec<String>,
+    /// Concatenation of all hooks' `appendSystemPrompt` values.
+    pub append_system_prompt: Option<String>,
+    /// System-prompt replacement — only honoured when the hook sets
+    /// `allowSystemPromptReplace: true`.  Last writer wins.
+    pub system_prompt: Option<String>,
+    /// Model override (last writer wins).
+    pub model: Option<String>,
+    /// Effort override (last writer wins).
+    pub effort: Option<String>,
+    /// Tool-choice override (last writer wins).
+    pub tool_choice: Option<String>,
+}
+
+impl UserPromptSubmitShape {
+    /// `true` when no field carries a non-trivial value.
+    pub fn is_empty(&self) -> bool {
+        self.allowed_tools.is_none()
+            && self.denied_tools.is_empty()
+            && self.append_system_prompt.is_none()
+            && self.system_prompt.is_none()
+            && self.model.is_none()
+            && self.effort.is_none()
+            && self.tool_choice.is_none()
+    }
+}
+
+/// Combined result of running all `UserPromptSubmit` hooks.
+#[derive(Debug, Clone)]
+pub struct UserPromptSubmitResult {
+    /// `true` when any hook chose to block the prompt.
+    pub block: bool,
+    /// Human-readable reason from the blocking hook.
+    pub reason: Option<String>,
+    pub by_hook_command: Option<String>,
+    /// Replacement prompt text (last writer wins across all non-blocking hooks).
+    pub modified_prompt: Option<String>,
+    /// Additional context for this turn (concatenated from all hooks).
+    pub additional_context: Option<String>,
+    /// Accumulated shape overrides.  `None` when no hook produced any override.
+    pub shape: Option<UserPromptSubmitShape>,
+}
+
+impl UserPromptSubmitResult {
+    /// Unconditional allow with no modifications.
+    pub const ALLOW: Self = Self {
+        block: false,
+        reason: None,
+        by_hook_command: None,
+        modified_prompt: None,
+        additional_context: None,
+        shape: None,
+    };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Tests
 // ─────────────────────────────────────────────────────────────────────────────
 

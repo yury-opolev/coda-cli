@@ -13,8 +13,15 @@ pub enum Focus {
     Composer,
     /// A completion popup is open.
     Completion,
-    /// A modal prompt or browser overlay is open.
-    Overlay,
+    /// A `Surface` is open.
+    ///
+    /// The surface owns its navigation completely: it has already declined
+    /// this key, so nothing should be interpreted on its behalf.
+    ///
+    /// This replaced a separate `Overlay` focus that became unreachable once
+    /// prompts became `Exclusive` surfaces — a prompt now consumes every key
+    /// itself, so the keymap is never consulted on its behalf.
+    Surface,
 }
 
 /// A destructive action that must be confirmed by pressing the key twice.
@@ -161,7 +168,9 @@ pub fn resolve(key: KeyEvent, context: KeyContext) -> Action {
 
     match context.focus {
         Focus::Completion => resolve_completion(key, ctrl),
-        Focus::Overlay => resolve_overlay(key),
+        // Everything reaching here was already declined by the surface, and
+        // the global chords were handled above. Swallow the rest.
+        Focus::Surface => Action::None,
         Focus::Composer => resolve_composer(key, context, ctrl, shift, alt),
     }
 }
@@ -179,17 +188,6 @@ fn resolve_completion(key: KeyEvent, ctrl: bool) -> Action {
     }
 }
 
-fn resolve_overlay(key: KeyEvent) -> Action {
-    match key.code {
-        KeyCode::Up | KeyCode::Char('k') => Action::CompletionPrevious,
-        KeyCode::Down | KeyCode::Char('j') => Action::CompletionNext,
-        KeyCode::Enter => Action::Confirm,
-        KeyCode::Esc => Action::Cancel,
-        KeyCode::PageUp => Action::PageUp,
-        KeyCode::PageDown => Action::PageDown,
-        _ => Action::None,
-    }
-}
 
 fn resolve_composer(
     key: KeyEvent,
@@ -489,7 +487,7 @@ mod tests {
     #[test]
     fn ctrl_end_works_even_inside_an_overlay() {
         let context = KeyContext {
-            focus: Focus::Overlay,
+            focus: Focus::Surface,
             ..composing()
         };
         assert_eq!(
@@ -563,34 +561,32 @@ mod tests {
     }
 
     #[test]
-    fn overlays_navigate_with_arrows_and_vim_keys() {
+    fn a_surface_swallows_everything_it_declined() {
+        // A surface owns its own navigation and has already had first refusal
+        // on this key, so the keymap must interpret nothing on its behalf.
+        // Anything else would act twice on one keystroke, or act on a key the
+        // surface deliberately ignored.
         let context = KeyContext {
-            focus: Focus::Overlay,
+            focus: Focus::Surface,
             ..composing()
         };
-        assert_eq!(resolve(key(KeyCode::Down), context), Action::CompletionNext);
-        assert_eq!(resolve(key(KeyCode::Char('j')), context), Action::CompletionNext);
-        assert_eq!(resolve(key(KeyCode::Up), context), Action::CompletionPrevious);
-        assert_eq!(resolve(key(KeyCode::Char('k')), context), Action::CompletionPrevious);
-    }
-
-    #[test]
-    fn overlays_confirm_and_cancel() {
-        let context = KeyContext {
-            focus: Focus::Overlay,
-            ..composing()
-        };
-        assert_eq!(resolve(key(KeyCode::Enter), context), Action::Confirm);
-        assert_eq!(resolve(key(KeyCode::Esc), context), Action::Cancel);
-    }
-
-    #[test]
-    fn overlays_do_not_insert_text() {
-        let context = KeyContext {
-            focus: Focus::Overlay,
-            ..composing()
-        };
-        assert_eq!(resolve(key(KeyCode::Char('z')), context), Action::None);
+        for code in [
+            KeyCode::Down,
+            KeyCode::Up,
+            KeyCode::Char('j'),
+            KeyCode::Char('k'),
+            KeyCode::Enter,
+            KeyCode::Esc,
+            KeyCode::Char('z'),
+            KeyCode::Backspace,
+            KeyCode::Tab,
+        ] {
+            assert_eq!(
+                resolve(key(code), context),
+                Action::None,
+                "{code:?} was interpreted on an open surface's behalf"
+            );
+        }
     }
 
     #[test]

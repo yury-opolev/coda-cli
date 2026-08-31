@@ -564,5 +564,93 @@ mod tests {
         assert_eq!(sent["method"], "session/interrupt");
         assert!(sent.get("id").is_none());
     }
+
+    // ── additional behaviours from the C# JsonRpcConnectionTests spec ─────────
+
+    /// A response whose id does not match any in-flight request must be silently
+    /// discarded.  The connection must keep serving subsequent messages normally —
+    /// one stray frame must not poison the entire session.
+    #[tokio::test]
+    async fn response_for_unknown_id_is_ignored_and_connection_survives() {
+        let (_connection, mut inbound, mut engine_out, _engine_in) = harness();
+
+        // Send a response for an id that was never requested.
+        write_frame(
+            &mut engine_out,
+            json!({ "jsonrpc": "2.0", "id": 9999, "result": "stray" }),
+        )
+        .await;
+
+        // Then send a real notification; it must still arrive.
+        write_frame(
+            &mut engine_out,
+            json!({ "jsonrpc": "2.0", "method": "event/turnComplete" }),
+        )
+        .await;
+
+        let message = inbound.recv().await.expect("inbound notification");
+        assert!(matches!(
+            message,
+            Inbound::Notification { ref method, .. } if method == "event/turnComplete"
+        ));
+    }
+
+    /// When the engine sends a server-initiated request whose id is a string
+    /// rather than a number, the responder must echo the same string id back —
+    /// the protocol is symmetric and the server may choose any id type.
+    #[tokio::test]
+    async fn server_request_with_string_id_echoes_the_same_string_id() {
+        let (_connection, mut inbound, mut engine_out, mut engine_in) = harness();
+
+        write_frame(
+            &mut engine_out,
+            json!({
+                "jsonrpc": "2.0",
+                "id": "str-id-42",
+                "method": "request/permission",
+                "params": { "tool": "run_command" }
+            }),
+        )
+        .await;
+
+        let Inbound::Request { responder, .. } = inbound.recv().await.expect("inbound") else {
+            panic!("expected a server request");
+        };
+        assert_eq!(responder.id(), &RequestId::String("str-id-42".into()));
+        responder.respond(json!({ "decision": "allow" }));
+
+        let reply = engine_in.read_frame().await;
+        assert_eq!(reply["id"], "str-id-42");
+        assert_eq!(reply["result"], json!({ "decision": "allow" }));
+    }
+
+    /// After the outgoing channel is closed (engine side disconnected), any
+    /// attempt to send a request must return an error rather than silently
+    /// dropping the message.
+    #[tokio::test]
+    async fn sending_request_after_engine_disconnects_returns_connection_closed() {
+        // Close the engine's read side so the very next write will fail, causing
+        // the write loop to exit and close the outgoing channel.
+        let (connection, _inbound, _engine_out, engine_in) = harness();
+        drop(engine_in); // client's writes now go nowhere
+
+        // Queue a notification: the write loop will attempt to flush it and fail.
+        let _ = connection.notify("ping", None);
+
+        // Let the write loop observe the broken pipe and exit.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // With the write loop gone, the outgoing receiver is dropped; the sender
+        // detects this as "closed".
+        assert!(
+            connection.is_closed(),
+            "connection must report closed after the write loop exits"
+        );
+        let err = connection.notify("gone", None).expect_err("must fail");
+        assert!(
+            matches!(err, ClientError::ConnectionClosed),
+            "expected ConnectionClosed, got {err:?}"
+        );
+    }
 }
 

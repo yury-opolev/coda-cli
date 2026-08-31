@@ -46,6 +46,7 @@ pub mod lsp;
 pub mod output_styles;
 pub mod permission;
 pub mod scheduling;
+pub mod session;
 pub mod steering;
 pub mod subagents;
 pub mod tasks;
@@ -62,16 +63,26 @@ pub use goal::{
     GoalSupervisor, GoalVerdict,
 };
 pub use hooks::{
-    HookContentHash, HookEventPolicy, HookMatcher, HookRunner, HookScope, HookTrustGuard,
-    HookTrustStore, InMemoryHookTrustStore, UserHook,
+    HookContentHash, HookEventPolicy, HookMatcher, HookRunEntry, HookRunLog, HookRunner,
+    HookScope, HookTrustGuard, HookTrustStore, InMemoryHookTrustStore, UserHook,
 };
 pub use output_styles::{BuiltInOutputStyles, DynOutputStyle, OutputStyle};
 pub use permission::{
     PermissionDecision, PermissionMode, PermissionModeState, PermissionPrompt, PermissionRule,
     PermissionRuleStore,
 };
+pub use scheduling::{
+    NullScheduleLifecycleSink, ScheduleLifecycleEvent, ScheduleLifecycleSink,
+    ScheduleRuntimeSnapshot, ScheduleRuntimeState, ScheduleRuntimeStatus, ScheduleRuntimeView,
+    ScheduleRuntime, ScheduledAgentRunner, TaskManagerRunner,
+};
+pub use session::{
+    AuditToolCall, AuditTurn, BundleTurn, ImportError, SessionAuditStore, SessionBundle,
+    SessionBundleService, SessionSummary, SessionTranscriptStore, StoredSession,
+    fork as fork_session, new_session_id, rewind as rewind_session, session_id_is_valid,
+};
 pub use steering::{SteeringEntry, SteeringInbox};
-pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest};
+pub use subagents::{BuiltInAgents, SubagentDefinition, SubagentFactory, SubagentRequest, SubagentRegistry, PluginAgentLoader};
 pub use todos::{TodoItem, TodoStatus, TodoStore};
 pub use tool::{
     PlanApprover, Tool, ToolContext, ToolDescriptor, ToolNameFilter, ToolOutcome, ToolQuarantine,

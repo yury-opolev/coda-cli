@@ -82,8 +82,16 @@ impl AnthropicDecoder {
             return Ok(Vec::new());
         }
 
-        let value: Value = serde_json::from_str(data)
-            .map_err(|error| LlmError::Protocol(format!("invalid event JSON: {error}")))?;
+        let value: Value = serde_json::from_str(data).map_err(|error| {
+            // Include what actually arrived. A bare parse error names a column
+            // in a payload the reader cannot see, which is useless in the field
+            // — the first real Copilot `/v1/messages` turn failed with exactly
+            // that and gave no clue what the provider had sent.
+            let preview: String = data.chars().take(200).collect();
+            LlmError::Protocol(format!(
+                "invalid event JSON on '{event_name}': {error}; payload starts: {preview:?}"
+            ))
+        })?;
 
         // The `type` field is authoritative; the SSE event name mirrors it.
         let kind = value

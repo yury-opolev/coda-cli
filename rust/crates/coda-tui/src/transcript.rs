@@ -10,6 +10,8 @@ use coda_render::theme::Role;
 use coda_render::tool::{CallStatus, ToolActivity, ToolDisplayMode};
 use coda_render::{markdown, Gutter, RenderLine, MARKER_CELLS};
 
+use crate::render::glyphs;
+
 /// Identifies a batch of tool calls within a turn.
 ///
 /// Both components are optional because the engine may omit them; two batches
@@ -113,8 +115,20 @@ pub enum Block {
     },
     /// Output from a slash command.
     CommandOutput { text: String },
+    /// A git diff requested via `/diff`.
+    Diff { raw: String },
     /// A marker separating resumed sessions.
     SessionBoundary { id: String },
+    /// The startup banner: wordmark plus session details.
+    ///
+    /// Rendered in the transcript rather than written to the raw console, so it
+    /// scrolls, reflows and can be selected like any other content.
+    Banner {
+        /// The wordmark rows, carried separately so they keep the brand colour.
+        wordmark: Vec<String>,
+        /// Version, cwd, provider and model.
+        details: Vec<String>,
+    },
 }
 
 impl Block {
@@ -157,7 +171,7 @@ impl Block {
             } => render_permission(tool, preview, *decision, width),
             Block::Question { question, answer } => {
                 let text = match answer {
-                    Some(answer) => format!("{question} → {answer}"),
+                    Some(answer) => format!("{question} {} {answer}", glyphs::ARROW_RIGHT),
                     None => question.clone(),
                 };
                 text::wrap(&text, width)
@@ -170,8 +184,45 @@ impl Block {
                 .flat_map(|line| text::wrap_preformatted(&text::sanitize(line), width))
                 .map(|chunk| RenderLine::new(chunk, Role::Code))
                 .collect(),
+            Block::Banner { wordmark, details } => {
+                // The wordmark is never wrapped: a broken figlet is worse than
+                // one clipped by a narrow terminal.
+                let mut lines: Vec<RenderLine> = wordmark
+                    .iter()
+                    .map(|row| {
+                        RenderLine::new(text::truncate(&text::sanitize(row), width), Role::Heading)
+                    })
+                    .collect();
+                lines.extend(details.iter().flat_map(|line| {
+                    text::wrap_preformatted(&text::sanitize(line), width)
+                        .into_iter()
+                        .map(|chunk| RenderLine::new(chunk, Role::Notification))
+                }));
+                lines
+            }
+            Block::Diff { raw } => {
+                let diff = coda_render::diff::parse(raw);
+                if diff.is_empty() {
+                    if raw.trim().is_empty() {
+                        return text::wrap("No changes.", width)
+                            .into_iter()
+                            .map(|chunk| RenderLine::new(chunk, Role::Notification))
+                            .collect();
+                    }
+                    // Unparseable but non-empty: render the raw text flat so the
+                    // user can still read it (matches the C# legacy fallback).
+                    return raw
+                        .lines()
+                        .flat_map(|line| {
+                            text::wrap_preformatted(&text::sanitize(line), width)
+                        })
+                        .map(|chunk| RenderLine::new(chunk, Role::Code))
+                        .collect();
+                }
+                coda_render::diff::render(&diff, width, false)
+            }
             Block::SessionBoundary { id } => {
-                let label = format!("\u{2500}\u{2500} session {id} \u{2500}\u{2500}");
+                let label = format!("{0}{0} session {id} {0}{0}", glyphs::RULE);
                 text::wrap(&label, width)
                     .into_iter()
                     .map(|chunk| RenderLine::new(chunk, Role::Notification))
@@ -265,11 +316,11 @@ fn render_thinking(
     let seconds = (elapsed_ms as f64 / 1000.0).round() as i64;
 
     let status = if complete {
-        format!("\u{1F4AD} Thought for {seconds}s")
+        format!("{} Thought for {seconds}s", glyphs::THINKING)
     } else {
         match tokens {
-            Some(tokens) => format!("\u{1F4AD} Thinking… {seconds}s · {tokens} tok"),
-            None => format!("\u{1F4AD} Thinking… {seconds}s"),
+            Some(tokens) => format!("{} Thinking… {seconds}s · {tokens} tok", glyphs::THINKING),
+            None => format!("{} Thinking… {seconds}s", glyphs::THINKING),
         }
     };
 
@@ -326,9 +377,15 @@ fn render_permission(
     width: usize,
 ) -> Vec<RenderLine> {
     let (suffix, role) = match decision {
-        PermissionDecision::Allowed => (" → allowed", Role::PermissionApproved),
-        PermissionDecision::Denied => (" → denied", Role::Permission),
-        PermissionDecision::Pending => ("", Role::Question),
+        PermissionDecision::Allowed => (
+            format!(" {} allowed", glyphs::ARROW_RIGHT),
+            Role::PermissionApproved,
+        ),
+        PermissionDecision::Denied => (
+            format!(" {} denied", glyphs::ARROW_RIGHT),
+            Role::Permission,
+        ),
+        PermissionDecision::Pending => (String::new(), Role::Question),
     };
     let text = format!("{tool} {preview}{suffix}");
     text::wrap(&text, width)
@@ -472,6 +529,36 @@ impl Transcript {
             out.push(RenderLine::separator());
         }
         out
+    }
+
+    /// Renders all blocks and returns both the flat row list and a per-block
+    /// start-row table.
+    ///
+    /// `block_starts[i]` is the index of the first row of block `i` in the
+    /// returned `Vec<RenderLine>`.  Blocks that render to zero rows have a
+    /// start equal to the next non-empty block's start.  A sentinel entry
+    /// equal to `rows.len()` is appended so callers can use adjacent pairs for
+    /// a range without bounds-checking.
+    ///
+    /// This is the Rust equivalent of `TranscriptLayoutIndex`'s prefix-sum
+    /// array, computed in a single O(n) pass to avoid rendering blocks twice.
+    pub fn render_with_block_starts(
+        &self,
+        width: usize,
+        mode: ToolDisplayMode,
+    ) -> (Vec<RenderLine>, Vec<usize>) {
+        let mut rows: Vec<RenderLine> = Vec::new();
+        let mut starts: Vec<usize> = Vec::with_capacity(self.blocks.len() + 1);
+        for block in &self.blocks {
+            starts.push(rows.len());
+            let block_rows = block.render(width, mode);
+            if !block_rows.is_empty() {
+                rows.extend(block_rows);
+                rows.push(RenderLine::separator());
+            }
+        }
+        starts.push(rows.len()); // sentinel
+        (rows, starts)
     }
 }
 
@@ -840,6 +927,99 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_diff_block_renders_file_path_and_change_lines() {
+        let raw = "diff --git a/foo.rs b/foo.rs\n\
+            --- a/foo.rs\n\
+            +++ b/foo.rs\n\
+            @@ -1,1 +1,1 @@\n\
+            -old line\n\
+            +new line\n";
+        let rows = Block::Diff { raw: raw.to_string() }.render(80, ToolDisplayMode::Summary);
+        assert!(
+            rows.iter().any(|r| r.text.contains("foo.rs")),
+            "expected filename in rows: {:?}",
+            rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        assert!(rows.iter().any(|r| r.text.contains("old line")));
+        assert!(rows.iter().any(|r| r.text.contains("new line")));
+    }
+
+    #[test]
+    fn an_empty_diff_block_says_no_changes() {
+        let rows = Block::Diff { raw: String::new() }.render(80, ToolDisplayMode::Summary);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].text.contains("No changes."));
+    }
+
+    #[test]
+    fn a_diff_block_with_unparseable_non_empty_content_renders_flat_lines() {
+        // Input that has no recognisable diff structure (no @@ hunks) must not
+        // show "No changes." — the content should still be visible.
+        let raw = "-old line\n+new line\n";
+        let rows = Block::Diff { raw: raw.to_string() }.render(80, ToolDisplayMode::Summary);
+        assert!(!rows.is_empty(), "expected at least one row");
+        assert!(
+            rows.iter().any(|r| r.text.contains("old line") || r.text.contains("new line")),
+            "raw content should be visible; rows: {:?}",
+            rows.iter().map(|r| &r.text).collect::<Vec<_>>()
+        );
+        // Must not claim "no changes" when there IS content.
+        assert!(!rows.iter().any(|r| r.text.contains("No changes.")));
+    }
+
+    #[test]
+    fn a_diff_block_is_never_open() {
+        assert!(!Block::Diff { raw: String::new() }.is_open());
+    }
+
+    #[test]
+    fn render_with_block_starts_matches_render_rows() {
+        let mut transcript = Transcript::new();
+        transcript.push(user("hello"));
+        transcript.push(Block::Assistant {
+            text: "world".to_string(),
+            complete: true,
+        });
+        let width = 80;
+        let mode = ToolDisplayMode::Summary;
+
+        let expected_rows = transcript.render(width, mode);
+        let (rows, starts) = transcript.render_with_block_starts(width, mode);
+
+        assert_eq!(rows.len(), expected_rows.len(), "row counts must match");
+        // starts has one sentinel past the end
+        assert_eq!(starts.len(), transcript.len() + 1);
+    }
+
+    #[test]
+    fn block_starts_sentinel_equals_total_row_count() {
+        let mut transcript = Transcript::new();
+        transcript.push(user("a"));
+        transcript.push(Block::Assistant { text: "b".to_string(), complete: true });
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        assert_eq!(*starts.last().unwrap(), rows.len());
+    }
+
+    #[test]
+    fn block_starts_are_strictly_increasing_for_non_empty_blocks() {
+        let mut transcript = Transcript::new();
+        for i in 0..5 {
+            transcript.push(Block::Notice {
+                text: format!("notice {i}"),
+                level: NoticeLevel::Info,
+            });
+        }
+        let (_, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        let content_starts: Vec<usize> = starts[..5].to_vec();
+        for window in content_starts.windows(2) {
+            assert!(
+                window[0] < window[1],
+                "block starts must be strictly increasing: {content_starts:?}"
+            );
         }
     }
 }

@@ -1,7 +1,7 @@
 //! Subagent host: spawn nested `AgentLoop` runs.
 //!
 //! Matches C# `SubagentHost.cs`, `Subagents/BuiltInAgents.cs`,
-//! `Subagents/SubagentDefinition.cs`.
+//! `Subagents/SubagentDefinition.cs`, `Subagents/SubagentRegistry.cs`.
 //!
 //! # Nesting model
 //! - Depth 0: main agent.
@@ -19,8 +19,12 @@
 //! survive a context switch and can be monitored/stopped.
 
 pub mod host;
+pub mod plugin_loader;
+pub mod registry;
 
 pub use host::SubagentHost;
+pub use plugin_loader::PluginAgentLoader;
+pub use registry::SubagentRegistry;
 
 use std::sync::Arc;
 
@@ -45,76 +49,84 @@ pub const MAX_CONCURRENT_SUBAGENTS: usize = 10;
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Describes a named subagent type: its system-prompt body and capability constraints.
+///
+/// Matches C# `SubagentDefinition`. Uses owned `String` fields so both built-in
+/// (static) and plugin-loaded (dynamic) definitions share one type.
 #[derive(Debug, Clone)]
 pub struct SubagentDefinition {
-    pub agent_type: &'static str,
-    pub description: &'static str,
-    pub system_prompt_body: &'static str,
+    pub agent_type: String,
+    pub description: String,
+    pub system_prompt_body: String,
     /// When `true`, only read-only tools are offered to this agent type.
     pub read_only_tools_only: bool,
-    pub default_model: Option<&'static str>,
+    /// Optional model override for this subagent type.
+    pub default_model: Option<String>,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Built-in agents
 // ─────────────────────────────────────────────────────────────────────────────
 
-static GENERAL_PURPOSE: SubagentDefinition = SubagentDefinition {
-    agent_type: "general-purpose",
-    description: "A general-purpose autonomous subagent with full tool access.",
-    system_prompt_body: "\
-        You are a subagent launched to complete a single, self-contained task \
-        autonomously. Use the available tools (read_file, list_dir, glob, grep, \
-        edit_file, write_file, run_command) to do the work, then finish with a \
-        concise report of what you found or changed — that report is your only \
-        return value to the caller, so make it self-sufficient.",
-    read_only_tools_only: false,
-    default_model: None,
-};
+fn general_purpose_def() -> SubagentDefinition {
+    SubagentDefinition {
+        agent_type: "general-purpose".to_owned(),
+        description: "A general-purpose autonomous subagent with full tool access.".to_owned(),
+        system_prompt_body: "You are a subagent launched to complete a single, self-contained task \
+            autonomously. Use the available tools (read_file, list_dir, glob, grep, \
+            edit_file, write_file, run_command) to do the work, then finish with a \
+            concise report of what you found or changed — that report is your only \
+            return value to the caller, so make it self-sufficient."
+            .to_owned(),
+        read_only_tools_only: false,
+        default_model: None,
+    }
+}
 
-static EXPLORE: SubagentDefinition = SubagentDefinition {
-    agent_type: "explore",
-    description: "A read-only research subagent that investigates and reports findings.",
-    system_prompt_body: "\
-        You are an Explore subagent. Investigate the codebase to answer the request. \
-        Use only read-only tools; do NOT modify anything. \
-        Report your findings concisely as your final message — that report is your only output.",
-    read_only_tools_only: true,
-    default_model: None,
-};
-
-static ALL_BUILTIN: &[&SubagentDefinition] = &[&GENERAL_PURPOSE, &EXPLORE];
+fn explore_def() -> SubagentDefinition {
+    SubagentDefinition {
+        agent_type: "explore".to_owned(),
+        description: "A read-only research subagent that investigates and reports findings."
+            .to_owned(),
+        system_prompt_body: "You are an Explore subagent. Investigate the codebase to answer the request. \
+            Use only read-only tools; do NOT modify anything. \
+            Report your findings concisely as your final message — that report is your only output."
+            .to_owned(),
+        read_only_tools_only: true,
+        default_model: None,
+    }
+}
 
 pub struct BuiltInAgents;
 
 impl BuiltInAgents {
     /// Resolve a subagent type name to its built-in definition.
     /// Unknown or empty names fall back to `general-purpose`.
-    pub fn resolve(agent_type: Option<&str>) -> &'static SubagentDefinition {
+    pub fn resolve(agent_type: Option<&str>) -> SubagentDefinition {
         match agent_type {
             Some(t) if !t.is_empty() => {
-                for def in ALL_BUILTIN {
-                    if def.agent_type.eq_ignore_ascii_case(t) {
-                        return def;
-                    }
+                if t.eq_ignore_ascii_case("general-purpose") {
+                    return general_purpose_def();
                 }
-                &GENERAL_PURPOSE // unknown → general-purpose
+                if t.eq_ignore_ascii_case("explore") {
+                    return explore_def();
+                }
+                general_purpose_def() // unknown → general-purpose
             }
-            _ => &GENERAL_PURPOSE,
+            _ => general_purpose_def(),
         }
     }
 
     pub fn is_builtin(agent_type: Option<&str>) -> bool {
         match agent_type {
             Some(t) if !t.is_empty() => {
-                ALL_BUILTIN.iter().any(|d| d.agent_type.eq_ignore_ascii_case(t))
+                t.eq_ignore_ascii_case("general-purpose") || t.eq_ignore_ascii_case("explore")
             }
             _ => false,
         }
     }
 
-    pub fn all() -> &'static [&'static SubagentDefinition] {
-        ALL_BUILTIN
+    pub fn all() -> Vec<SubagentDefinition> {
+        vec![general_purpose_def(), explore_def()]
     }
 }
 
@@ -133,6 +145,9 @@ pub struct SubagentRequest {
     pub model: Option<String>,
     /// Whether to run in the foreground (blocking) or background.
     pub foreground: bool,
+    /// For background spawns: used as `parent_task_id` when registering the task
+    /// so the authorization tree is correct. Null means the main agent is the parent.
+    pub caller_task_id: Option<String>,
 }
 
 impl SubagentRequest {
@@ -144,6 +159,7 @@ impl SubagentRequest {
             depth,
             model: None,
             foreground: true,
+            caller_task_id: None,
         }
     }
 }

@@ -38,6 +38,7 @@ pub mod method {
 
     pub const SKILLS_LIST: &str = "skills/list";
     pub const PLUGINS_LIST: &str = "plugins/list";
+    pub const COMPACT: &str = "session/compact";
 }
 
 /// Method names the server may call on us. Each expects a reply.
@@ -311,6 +312,37 @@ pub struct ReasoningCapabilityResult {
     pub levels: Vec<String>,
     #[serde(default)]
     pub supports_auto: bool,
+}
+
+// ---------------------------------------------------------------------------
+// Compaction
+// ---------------------------------------------------------------------------
+
+/// Params for `session/compact`.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactParams {
+    /// Optional override for the summarisation system prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub instructions: Option<String>,
+}
+
+/// Result of `session/compact`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct CompactResult {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub messages_before: i64,
+    #[serde(default)]
+    pub messages_after: i64,
+    #[serde(default)]
+    pub tokens_before: Option<i64>,
+    #[serde(default)]
+    pub tokens_after: Option<i64>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

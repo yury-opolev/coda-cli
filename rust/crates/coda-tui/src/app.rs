@@ -12,7 +12,10 @@ use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound, Respo
 use coda_proto::messages::{self, method, server_method};
 use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
-use crossterm::event::{Event as TerminalEvent, EventStream, KeyCode, KeyEvent, MouseEventKind};
+use crossterm::event::{
+    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
+};
 use futures::future::OptionFuture;
 use futures_lite::StreamExt;
 use serde_json::Value;
@@ -26,15 +29,43 @@ use crate::composer::{Completion, Composer};
 use crate::draw;
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::overlay::{Browser, Intent};
+use crate::surface::browser::{BrowserKind, BrowserSurface};
 use crate::state::{PendingPrompt, UiEvent, UiState};
 use crate::terminal::TerminalGuard;
 use crate::transcript::NoticeLevel;
-use crate::viewport::Viewport;
+use crate::viewport::{Viewport, ViewportAnchor};
 
 /// How long a turn may take before we stop waiting on shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Rows scrolled per mouse wheel notch.
 const WHEEL_ROWS: usize = 3;
+
+/// What a pointer gesture asks the clipboard to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointerAction {
+    Copy,
+    Paste,
+}
+
+/// Decides what a right-click means.
+///
+/// One button carries both operations, chosen by whether anything is selected:
+/// this is the Windows console convention and matches the C# build, so muscle
+/// memory carries over. A selection is consumed by the copy, which is what
+/// makes the alternation feel natural — select, right-click to copy, then
+/// right-click again to paste.
+fn pointer_action(has_selection: bool) -> Option<PointerAction> {
+    Some(if has_selection {
+        PointerAction::Copy
+    } else {
+        PointerAction::Paste
+    })
+}
+
+/// Minimum interval between streaming (non-critical) frames — 30 FPS.
+///
+/// Matches C# `UiActor.MinStreamingFrameIntervalMs = 33`.
+const MIN_STREAMING_FRAME_MS: u64 = 33;
 
 /// Outcome of an in-flight `session/prompt`.
 struct TurnOutcome {
@@ -42,27 +73,49 @@ struct TurnOutcome {
 }
 
 /// The running application.
+/// What the startup banner needs before the UI takes over the terminal.
+#[derive(Debug, Clone, Default)]
+pub struct SessionSnapshot {
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
 pub struct App {
-    state: UiState,
-    composer: Composer,
+    state: UiState,    composer: Composer,
     viewport: Viewport,
     theme: Theme,
     connection: Connection,
     /// Cached rendered rows, invalidated whenever state or width changes.
     rows: Vec<RenderLine>,
+    /// Per-block start-row table, parallel to `state.transcript.blocks()`.
+    ///
+    /// `block_starts[i]` is the index into `rows` where block `i` begins.  A
+    /// sentinel entry equal to `rows.len()` is appended.  Rebuilt together
+    /// with `rows` whenever the layout is invalidated.
+    block_starts: Vec<usize>,
     /// Width the cached rows were laid out for.
     laid_out_width: usize,
     dirty: bool,
+    /// Set when a critical event arrived since the last frame.  Critical frames
+    /// are not throttled.  Matches C# `UiActor.IsCritical`.
+    critical_dirty: bool,
+    /// When `Some`, a non-critical frame is deferred until this instant.
+    frame_deadline: Option<tokio::time::Instant>,
+    /// When the most recent frame was drawn (wall-clock monotonic).
+    last_frame_at: Option<std::time::Instant>,
+    /// Stable position anchor captured when the viewport detaches.
+    ///
+    /// Resolved to a new global row on every reflow (width change) so the
+    /// user's reading position stays stable while the model is typing.
+    detached_anchor: Option<ViewportAnchor>,
     /// Set while a `session/prompt` is outstanding.
     turn: Option<oneshot::Receiver<Result<Value, coda_proto::ResponseError>>>,
     /// The responder for a prompt the user has not answered yet.
     pending_responder: Option<Responder>,
     /// A two-press chord armed by the previous keystroke, and when.
     armed: Option<(keymap::Chord, std::time::Instant)>,
-    /// The open browser overlay, if any.
-    browser: Option<Browser>,
-    /// Which browser is open, so reload and actions know what to do.
-    browser_kind: Option<BrowserKind>,
+    /// Open surfaces, topmost last. Owns key routing while non-empty.
+    surfaces: crate::surface::stack::SurfaceStack,
     /// Local Coda file locations for this session.
     paths: Paths,
     /// Outcomes reported by `event/taskCompleted`, keyed by task id.
@@ -71,21 +124,40 @@ pub struct App {
     engine_command: EngineCommand,
     /// A freshly started engine waiting for the run loop to swap it in.
     restarted: Option<(Engine, mpsc::UnboundedReceiver<Inbound>)>,
+    /// Images staged by `/image` to be sent with the next user turn.
+    staged_images: Vec<messages::WireImage>,
+    /// The active drag-selection over the transcript, if any.
+    selection: crate::selection::TranscriptSelection,
+    /// Screen row where the transcript area starts, captured at draw time.
+    ///
+    /// Mouse coordinates are screen-relative, so translating a click into a
+    /// transcript row needs to know where the transcript begins and how far it
+    /// is scrolled. Recording it during the draw keeps the two in step rather
+    /// than duplicating the layout arithmetic here.
+    transcript_origin: (u16, u16),
 }
 
-/// Which overlay is on screen.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BrowserKind {
-    Models,
-    Schedules,
-    Skills,
-    Plugins,
-    Hooks,
-    Mcp,
-    Tasks,
-}
 
 impl App {
+    /// The open browser, read from the stack.
+    ///
+    /// Read through rather than kept as a field: a second copy would have to
+    /// be held in step with the stack, and the two disagreeing is exactly the
+    /// class of bug this abstraction removes.
+    fn browser(&self) -> Option<&Browser> {
+        self.surfaces
+            .top()
+            .and_then(|s| s.as_any().downcast_ref::<BrowserSurface>())
+            .map(BrowserSurface::browser)
+    }
+
+
+    fn browser_kind(&self) -> Option<BrowserKind> {
+        self.surfaces
+            .top()
+            .and_then(|s| s.as_any().downcast_ref::<BrowserSurface>())
+            .map(BrowserSurface::kind)
+    }
     /// Connects to an engine and completes the handshake.
     pub async fn connect(
         command: EngineCommand,
@@ -119,28 +191,40 @@ impl App {
             theme,
             connection,
             rows: Vec::new(),
+            block_starts: Vec::new(),
             laid_out_width: 0,
             dirty: true,
+            critical_dirty: false,
+            frame_deadline: None,
+            last_frame_at: None,
+            detached_anchor: None,
             turn: None,
             pending_responder: None,
             armed: None,
-            browser: None,
-            browser_kind: None,
+            surfaces: Default::default(),
             paths: Paths::new(project_root),
             task_outcomes: std::collections::BTreeMap::new(),
             engine_command: command,
             restarted: None,
+            staged_images: Vec::new(),
+            selection: crate::selection::TranscriptSelection::new(),
+            transcript_origin: (0, 0),
         };
 
         Ok((app, engine, inbound))
     }
 
     /// Runs until the user quits or the engine disconnects.
+    /// Runs the UI loop, returning the summary the caller prints on exit.
+    ///
+    /// The summary is produced here rather than by the caller because the loop
+    /// consumes `self`: usage and session id are only final once it returns.
     pub async fn run(
         mut self,
         guard: &mut TerminalGuard,
         mut inbound: mpsc::UnboundedReceiver<Inbound>,
-    ) -> Result<()> {
+        started_at: std::time::Instant,
+    ) -> Result<crate::branding::ExitSummary> {
         // Holds an engine this loop started itself, so it can be shut down
         // when superseded by another restart.
         let mut owned_engine: Option<Engine> = None;
@@ -148,9 +232,18 @@ impl App {
         let (turn_tx, mut turn_rx) = mpsc::unbounded_channel::<TurnOutcome>();
 
         self.load_models().await;
+        // Show the setup wizard welcome on first run.
+        self.check_first_run();
         self.redraw(guard)?;
 
         loop {
+            // Compute the frame deadline for the timer branch.  When no
+            // deferred frame is pending, a far-future deadline is used so the
+            // branch competes but never wins before being explicitly armed.
+            let frame_deadline = self.frame_deadline.unwrap_or_else(|| {
+                tokio::time::Instant::now() + Duration::from_secs(86400)
+            });
+
             tokio::select! {
                 // Engine notifications and server-initiated requests.
                 message = inbound.recv() => match message {
@@ -189,6 +282,12 @@ impl App {
                         .and_then(|r| r.map_err(ClientError::Rpc));
                     let _ = turn_tx.send(TurnOutcome { result: outcome });
                 }
+
+                // A deferred streaming frame is due.
+                _ = tokio::time::sleep_until(frame_deadline), if self.frame_deadline.is_some() => {
+                    self.frame_deadline = None;
+                    // Fall through to the redraw logic below.
+                }
             }
 
             // A restart stages a new engine; swap it in between iterations so
@@ -204,15 +303,13 @@ impl App {
             if self.state.should_quit {
                 break;
             }
-            if self.dirty {
-                self.redraw(guard)?;
-            }
+            self.maybe_redraw(guard)?;
         }
 
         if let Some(engine) = owned_engine {
             let _ = engine.shutdown(SHUTDOWN_GRACE).await;
         }
-        Ok(())
+        Ok(self.exit_summary(started_at.elapsed()))
     }
 
     // -- Engine -------------------------------------------------------------
@@ -284,8 +381,20 @@ impl App {
                         coda_proto::error_codes::INTERNAL_ERROR,
                         "superseded by another request",
                     );
+                    // Retire the superseded surface too. Its exclusivity would
+                    // otherwise refuse the replacement, leaving a stale prompt
+                    // on screen bound to a responder that has already failed.
+                    self.retire_prompt_surface();
                 }
                 self.pending_responder = Some(responder);
+                // The surface is pushed alongside the state so the two cannot
+                // disagree about whether a prompt is open. Exclusive modality
+                // then guarantees it stays on top and cannot be dismissed
+                // without an answer, which the engine is blocked awaiting.
+                self.surfaces
+                    .push(Box::new(crate::surface::prompt::PromptSurface::new(
+                        prompt.clone(),
+                    )));
                 self.apply(UiEvent::PromptRequested(prompt));
             }
             None => responder.fail(
@@ -340,7 +449,18 @@ impl App {
         guard: &mut TerminalGuard,
     ) -> Result<()> {
         match event {
-            TerminalEvent::Key(key) => self.on_key(key).await,
+            // Windows reports key *release* (and repeat) events as well as
+            // presses. Acting on a release is wrong for every binding, but it
+            // is actively broken for the two-press chords: the release of the
+            // first Ctrl+C disarms the chord immediately, so the second press
+            // only ever re-arms and the app can never be exited from the
+            // keyboard. Repeats are kept so held keys still autorepeat.
+            TerminalEvent::Key(key)
+                if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) =>
+            {
+                self.on_key(key).await
+            }
+            TerminalEvent::Key(_) => {}
             TerminalEvent::Paste(text) => {
                 self.composer.insert(&text);
                 self.dirty = true;
@@ -351,32 +471,110 @@ impl App {
                 self.dirty = true;
                 guard.terminal().autoresize()?;
             }
-            TerminalEvent::Mouse(mouse) => match mouse.kind {
-                MouseEventKind::ScrollUp => {
-                    self.viewport.scroll_up(WHEEL_ROWS);
-                    self.dirty = true;
+            TerminalEvent::Mouse(mouse) => {
+                if let Some(action) = self.decide_pointer_action(mouse) {
+                    match action {
+                        PointerAction::Copy => self.copy_selection_via_pointer(),
+                        PointerAction::Paste => self.paste_from_pointer(),
+                    }
                 }
-                MouseEventKind::ScrollDown => {
-                    self.viewport.scroll_down(WHEEL_ROWS);
-                    self.dirty = true;
-                }
-                _ => {}
-            },
+            }
             TerminalEvent::FocusGained | TerminalEvent::FocusLost => {}
         }
         Ok(())
     }
 
+    /// Maps a pointer event onto its effect, returning the clipboard action the
+    /// gesture asks for (if any).
+    ///
+    /// Split out from the event loop so tests can drive real pointer events and
+    /// observe the decision. Handlers buried in the loop are exactly the shape
+    /// that has silently gone unwired here before.
+    fn decide_pointer_action(&mut self, mouse: MouseEvent) -> Option<PointerAction> {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.capture_anchor_if_following();
+                self.viewport.scroll_up(WHEEL_ROWS);
+                self.dirty = true;
+            }
+            MouseEventKind::ScrollDown => {
+                self.viewport.scroll_down(WHEEL_ROWS);
+                self.dirty = true;
+            }
+            // Drag-select. Mouse capture disables the terminal's own selection,
+            // so without this there is no way to select anything at all — the
+            // capture takes the native behaviour away and gives nothing back.
+            MouseEventKind::Down(MouseButton::Left) => {
+                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                    self.selection.begin(pos);
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                    self.selection.update(pos);
+                    self.dirty = true;
+                }
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                    self.selection.update(pos);
+                }
+                // A click with no drag clears rather than leaving a stale
+                // one-cell selection that Ctrl+Y would then copy.
+                if !self.selection.has_selection() {
+                    self.selection.clear();
+                }
+                self.dirty = true;
+            }
+            // Right-click is copy-or-paste, matching the C# build and the
+            // Windows console convention: with a selection it copies, and with
+            // nothing selected it pastes into the draft. The paste target is
+            // always the composer regardless of where the pointer was, so the
+            // gesture does not depend on aim.
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.dirty = true;
+                return pointer_action(self.selection.has_selection());
+            }
+            _ => {}
+        }
+        None
+    }
+
     async fn on_key(&mut self, key: KeyEvent) {
-        // A prompt takes the keyboard until it is answered.
-        if self.state.prompt.is_some() {
-            self.on_prompt_key(key);
-            return;
+        // Open surfaces own the keyboard, topmost first. A key the top surface
+        // declines falls through to the global keymap below, so opening a
+        // surface never disables Ctrl+C. An engine prompt is a surface too,
+        // and its Exclusive modality is what keeps it on top rather than the
+        // ordering of the branches here.
+        if !self.surfaces.is_empty() {
+            use crate::surface::stack::StackOutcome;
+            match self.surfaces.handle_key(key) {
+                StackOutcome::Handled => {
+                    self.dirty = true;
+                    return;
+                }
+                StackOutcome::Action(action) => {
+                    self.dirty = true;
+                    self.apply_surface_action(action).await;
+                    return;
+                }
+                StackOutcome::Ignored => {}
+            }
         }
 
-        // An open overlay owns the keyboard next.
-        if self.browser.is_some() {
-            self.on_browser_key(key).await;
+        // Ctrl+C copies when there is a selection, matching the Windows console
+        // and every terminal emulator. The selection is cleared either way, so
+        // a second Ctrl+C still exits — leaving it set would trap the user in a
+        // session they cannot quit with the key that normally quits it.
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            && self.selection.has_selection()
+        {
+            self.copy_selection_via_pointer();
+            self.selection.clear();
+            self.armed = None;
+            self.dirty = true;
             return;
         }
 
@@ -454,12 +652,24 @@ impl App {
             }
             Action::CompletionCancel => self.composer.clear_completions(),
 
-            Action::ScrollUp => self.viewport.scroll_up(1),
+            Action::ScrollUp => {
+                self.capture_anchor_if_following();
+                self.viewport.scroll_up(1);
+            }
             Action::ScrollDown => self.viewport.scroll_down(1),
-            Action::PageUp => self.viewport.page_up(),
+            Action::PageUp => {
+                self.capture_anchor_if_following();
+                self.viewport.page_up();
+            }
             Action::PageDown => self.viewport.page_down(),
-            Action::ScrollTop => self.viewport.scroll_to_top(),
-            Action::ScrollBottom => self.viewport.scroll_to_bottom(),
+            Action::ScrollTop => {
+                self.capture_anchor_if_following();
+                self.viewport.scroll_to_top();
+            }
+            Action::ScrollBottom => {
+                self.detached_anchor = None;
+                self.viewport.scroll_to_bottom();
+            }
 
             Action::Interrupt => {
                 self.armed = None;
@@ -489,37 +699,24 @@ impl App {
                 }
             }
             Action::ClearTranscript => self.apply(UiEvent::Cleared),
-            Action::Copy | Action::Paste | Action::Confirm | Action::None => self.dirty = false,
+            Action::Copy => self.copy_to_clipboard(),
+            Action::Paste | Action::Confirm | Action::None => self.dirty = false,
         }
     }
 
-    /// Routes a key to the open overlay and performs whatever it asks for.
-    async fn on_browser_key(&mut self, key: KeyEvent) {
-        let Some(browser) = self.browser.as_mut() else {
-            return;
-        };
-        let intent = browser.handle(key);
-        self.dirty = true;
-
-        match intent {
-            Intent::Redraw => {}
-            Intent::Ignored => self.dirty = false,
-            Intent::Close => self.close_browser(),
-            Intent::Reload => self.reload_browser().await,
-            Intent::Activate(id) => self.activate_browser_row(&id).await,
-            Intent::Toggle(id) => self.toggle_browser_row(&id).await,
-            Intent::Delete(id) => self.delete_browser_row(&id).await,
-            Intent::Key(c, id) => self.browser_key_action(c, id).await,
-        }
-    }
 
     fn close_browser(&mut self) {
-        self.browser = None;
-        self.browser_kind = None;
+        self.retire_browser_surface();
     }
 
-    /// Opens a browser, fetching its data from the engine.
-    async fn open_browser(&mut self, kind: BrowserKind) {
+    /// Fetches a browser's data and builds it, without opening it.
+    ///
+    /// Separate from opening so a reload can fetch first and only replace the
+    /// open browser once it has something to replace it with. Retiring the old
+    /// surface before a fallible fetch makes a transient engine error close the
+    /// browser and lose the user's place -- and reload is exactly when a flaky
+    /// engine is most likely.
+    async fn build_browser(&mut self, kind: BrowserKind) -> Option<Browser> {
         let browser = match kind {
             BrowserKind::Models => {
                 match self
@@ -534,7 +731,10 @@ impl App {
                         self.state.model.as_deref(),
                         &result.source,
                     ),
-                    Err(error) => return self.browser_failed("models", error),
+                    Err(error) => {
+                        self.browser_failed("models", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Schedules => {
@@ -546,7 +746,10 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::schedules(&result.schedules),
-                    Err(error) => return self.browser_failed("schedules", error),
+                    Err(error) => {
+                        self.browser_failed("schedules", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Skills => {
@@ -558,7 +761,10 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::skills(&result.skills),
-                    Err(error) => return self.browser_failed("skills", error),
+                    Err(error) => {
+                        self.browser_failed("skills", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Plugins => {
@@ -570,7 +776,10 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::plugins(&result.plugins),
-                    Err(error) => return self.browser_failed("plugins", error),
+                    Err(error) => {
+                        self.browser_failed("plugins", error);
+                        return None;
+                    }
                 }
             }
             BrowserKind::Hooks => {
@@ -582,17 +791,21 @@ impl App {
                     .await
                 {
                     Ok(result) => browsers::hooks(&result.hooks),
-                    Err(error) => return self.browser_failed("hooks", error),
+                    Err(error) => {
+                        self.browser_failed("hooks", error);
+                        return None;
+                    }
                 }
             }
             // MCP configuration lives in local JSON, so it needs no engine call.
             BrowserKind::Mcp => match config::load_mcp_servers(&self.paths) {
                 Ok(servers) => browsers::mcp(&servers),
                 Err(error) => {
-                    return self.notice(
+                    self.notice(
                         format!("Could not read MCP configuration: {error}"),
                         NoticeLevel::Error,
-                    )
+                    );
+                    return None;
                 }
             },
             // Tasks are engine state, but the runtime persists a log per task
@@ -601,11 +814,41 @@ impl App {
                 let logs = config::list_task_logs(&self.paths, self.state.session_id.as_deref());
                 browsers::tasks(&logs, &self.task_outcomes)
             }
+            // Sessions are read from disk; there is no engine RPC for listing them.
+            BrowserKind::Sessions => {
+                let project_root = self.paths.project_root.clone();
+                let summaries = match tokio::task::spawn_blocking(move || {
+                    coda_agent::SessionTranscriptStore::new(&project_root).list()
+                })
+                .await
+                {
+                    Ok(list) => list,
+                    Err(_) => {
+                        self.notice("Could not load sessions.", NoticeLevel::Error);
+                        return None;
+                    }
+                };
+                if summaries.is_empty() {
+                    self.notice(
+                        "No sessions found. Start a conversation to create one.",
+                        NoticeLevel::Info,
+                    );
+                    return None;
+                }
+                browsers::sessions(&summaries)
+            }
         };
 
-        self.browser = Some(browser);
-        self.browser_kind = Some(kind);
-        self.dirty = true;
+        Some(browser)
+    }
+
+    /// Opens a browser, fetching its data from the engine.
+    async fn open_browser(&mut self, kind: BrowserKind) {
+        if let Some(browser) = self.build_browser(kind).await {
+            self.surfaces
+                .push(Box::new(BrowserSurface::new(kind, browser)));
+            self.dirty = true;
+        }
     }
 
     fn browser_failed(&mut self, what: &str, error: ClientError) {
@@ -616,23 +859,34 @@ impl App {
     }
 
     async fn reload_browser(&mut self) {
-        if let Some(kind) = self.browser_kind {
-            // Rebuilding preserves the selected row by id.
-            let selected = self
-                .browser
-                .as_ref()
-                .and_then(|b| b.selected_id().map(str::to_string));
-            self.open_browser(kind).await;
-            if let (Some(browser), Some(_)) = (self.browser.as_mut(), selected) {
-                browser.set_status("reloaded");
-            }
+        let Some(kind) = self.browser_kind() else {
+            return;
+        };
+        let selected = self
+            .browser()
+            .and_then(|b| b.selected_id().map(str::to_string));
+
+        // Fetch before retiring. If the engine hiccups the old browser stays
+        // exactly as it was, rather than vanishing and losing the user's place.
+        let Some(mut browser) = self.build_browser(kind).await else {
+            return;
+        };
+        if let Some(id) = selected {
+            browser.select_by_id(&id);
         }
+        browser.set_status("reloaded");
+
+        self.retire_browser_surface();
+        self.surfaces
+            .push(Box::new(BrowserSurface::new(kind, browser)));
+        self.dirty = true;
     }
 
     /// Handles Enter on a row.
     async fn activate_browser_row(&mut self, id: &str) {
-        match self.browser_kind {
+        match self.browser_kind() {
             Some(BrowserKind::Models) => self.switch_model(id).await,
+            Some(BrowserKind::Sessions) => self.resume_to_session(id.to_string()).await,
             _ => self.dirty = true,
         }
     }
@@ -700,7 +954,7 @@ impl App {
 
     /// Toggles the selected row where the change can actually be persisted.
     async fn toggle_browser_row(&mut self, id: &str) {
-        match self.browser_kind {
+        match self.browser_kind() {
             Some(BrowserKind::Plugins) => {
                 // Plugin state lives in a JSON file; read and write are blocking
                 // I/O that must not block the async runtime.
@@ -823,7 +1077,7 @@ impl App {
     }
 
     async fn delete_browser_row(&mut self, id: &str) {
-        if self.browser_kind != Some(BrowserKind::Schedules) {
+        if self.browser_kind() != Some(BrowserKind::Schedules) {
             return;
         }
         match self
@@ -846,7 +1100,7 @@ impl App {
     }
 
     async fn browser_key_action(&mut self, key: char, id: Option<String>) {
-        match (self.browser_kind, key) {
+        match (self.browser_kind(), key) {
             (Some(BrowserKind::Schedules), 'd') => {
                 if let Some(id) = id {
                     self.delete_browser_row(&id).await;
@@ -922,72 +1176,20 @@ impl App {
     }
 
     /// Answers an open prompt.
-    fn on_prompt_key(&mut self, key: KeyEvent) {        let Some(prompt) = self.state.prompt.clone() else {
-            return;
-        };
-        self.dirty = true;
-
-        let (allowed, answer) = match (&prompt, key.code) {
-            // Yes/no prompts.
-            (PendingPrompt::Permission { .. } | PendingPrompt::PlanApproval { .. }, code) => {
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => (true, None),
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => (false, None),
-                    _ => return,
-                }
-            }
-            // Numbered choices.
-            (PendingPrompt::Question { options, .. }, KeyCode::Char(c))
-                if c.is_ascii_digit() =>
-            {
-                let index = c.to_digit(10).unwrap_or(0) as usize;
-                match index.checked_sub(1).and_then(|i| options.get(i)) {
-                    Some(option) => (true, Some(option.clone())),
-                    None => return,
-                }
-            }
-            (PendingPrompt::Question { options, .. }, KeyCode::Enter) => {
-                (true, options.first().cloned())
-            }
-            (PendingPrompt::Question { .. }, KeyCode::Esc) => (false, None),
-            _ => return,
-        };
-
-        if let Some(responder) = self.pending_responder.take() {
-            let reply = match &prompt {
-                PendingPrompt::Permission { .. } => {
-                    serde_json::to_value(messages::PermissionResponse { allow: allowed })
-                }
-                PendingPrompt::PlanApproval { .. } => {
-                    serde_json::to_value(messages::PlanApprovalResponse { approve: allowed })
-                }
-                PendingPrompt::Question { .. } => {
-                    serde_json::to_value(messages::QuestionResponse {
-                        answer: answer.clone().unwrap_or_default(),
-                    })
-                }
-            };
-            match reply {
-                Ok(value) => responder.respond(value),
-                Err(error) => responder.fail(
-                    coda_proto::error_codes::INTERNAL_ERROR,
-                    error.to_string(),
-                ),
-            }
-        }
-
-        self.apply(UiEvent::PromptAnswered { allowed, answer });
-    }
 
     // -- Actions ------------------------------------------------------------
 
     async fn submit(&mut self) {
         let text = self.composer.take_submission();
-        if text.trim().is_empty() {
+        // A prompt needs text, staged images, or both.
+        let has_content = !text.trim().is_empty() || !self.staged_images.is_empty();
+        if !has_content {
             return;
         }
 
         if let Some(invocation) = commands::parse(&text) {
+            // Commands are dispatched without consuming staged images; the images
+            // remain for the next real user turn.
             self.run_command(invocation).await;
             return;
         }
@@ -999,9 +1201,20 @@ impl App {
             return;
         }
 
-        self.apply(UiEvent::Submitted { text: text.clone() });
+        // Use the text as the displayed turn label; blank text with images
+        // still needs something in the transcript.
+        let display = if text.is_empty() {
+            "[image]".to_string()
+        } else {
+            text.clone()
+        };
+        self.apply(UiEvent::Submitted { text: display });
 
-        let params = serde_json::to_value(messages::PromptParams::text(text)).unwrap_or_default();
+        let params = serde_json::to_value(messages::PromptParams {
+            text: if text.is_empty() { None } else { Some(text) },
+            images: std::mem::take(&mut self.staged_images),
+        })
+        .unwrap_or_default();
         match self.connection.send_request(method::PROMPT, Some(params)) {
             Ok(receiver) => self.turn = Some(receiver),
             Err(error) => self.apply(UiEvent::TurnFinished {
@@ -1063,7 +1276,10 @@ impl App {
 
         match spec.name {
             "help" => self.output(commands::help(invocation.first())),
-            "clear" => self.apply(UiEvent::Cleared),
+            "clear" => {
+                self.staged_images.clear();
+                self.apply(UiEvent::Cleared);
+            }
             "exit" => self.state.should_quit = true,
             "interrupt" => self.interrupt(),
             "theme" => self.set_theme(invocation.first()),
@@ -1090,6 +1306,7 @@ impl App {
             "skills" => self.open_browser(BrowserKind::Skills).await,
             "plugins" => self.open_browser(BrowserKind::Plugins).await,
             "hooks" => self.open_browser(BrowserKind::Hooks).await,
+            "settings" => self.open_settings_form(),
             "mcp" if invocation.args.is_empty() => self.open_browser(BrowserKind::Mcp).await,
             "tasks" => self.open_browser(BrowserKind::Tasks).await,
             "version" => self.output(format!(
@@ -1097,6 +1314,25 @@ impl App {
                 env!("CARGO_PKG_VERSION")
             )),
             "doctor" => self.output(self.doctor_text()),
+            "init" => self.cmd_init().await,
+            "memory" => self.cmd_memory(),
+            "output-style" => self.cmd_output_style(&invocation).await,
+            "permissions" => self.cmd_permissions(&invocation).await,
+            "yolo" => self.cmd_yolo().await,
+            "provider" => self.cmd_provider(&invocation).await,
+            "headers" => self.cmd_headers(&invocation).await,
+            "log" => self.cmd_log(&invocation).await,
+            "marketplace" => self.cmd_marketplace(&invocation).await,
+            "plugin" => self.cmd_plugin(&invocation).await,
+            "skill" => self.cmd_skill(&invocation).await,
+            "export" => self.cmd_export(&invocation).await,
+            "diff" => self.cmd_diff().await,
+            "image" => self.cmd_image(&invocation).await,
+            "setup" => self.cmd_setup(),
+            "compact" => self.cmd_compact().await,
+            "resume" => self.cmd_resume(&invocation).await,
+            "fork" => self.cmd_fork().await,
+            "rewind" => self.cmd_rewind(&invocation).await,
             _ if spec.scope == Scope::Engine => self.run_engine_command(spec, invocation).await,
             _ => self.notice(
                 format!("/{} is not implemented yet.", spec.name),
@@ -1257,11 +1493,104 @@ impl App {
 
     // -- Helpers ------------------------------------------------------------
 
+    /// What the startup banner needs to know before the UI takes the terminal.
+    ///
+    /// Provider and model come from settings rather than the engine, because
+    /// the banner is printed before the first turn and there is nothing to ask
+    /// yet — and because naming the wrong provider is exactly the mistake the
+    /// banner exists to prevent.
+    pub fn session_snapshot(&self) -> SessionSnapshot {
+        let settings = Settings::load(&self.paths).ok();
+        let provider = settings
+            .as_ref()
+            .and_then(|s| s.default_provider().map(str::to_owned));
+        let model = self.state.model.clone().or_else(|| {
+            let settings = settings.as_ref()?;
+            let provider = provider.as_deref()?;
+            settings.model_for(provider).map(str::to_owned)
+        });
+        SessionSnapshot { provider, model }
+    }
+
+    /// Seeds the transcript with the startup banner.
+    ///
+    /// The banner belongs in the transcript, not on the raw console: written
+    /// before the alternate screen it is hidden the moment the screen is
+    /// entered, so the user never sees it at all. In the transcript it scrolls
+    /// and can be selected like any other content.
+    pub fn push_banner(&mut self, working_directory: &str) {
+        let session = self.session_snapshot();
+        self.state.transcript.push(crate::transcript::Block::Banner {
+            wordmark: crate::branding::wordmark_lines(),
+            details: crate::branding::startup_detail_lines(
+                working_directory,
+                session.provider.as_deref(),
+                session.model.as_deref(),
+            ),
+        });
+        self.dirty = true;
+    }
+
+    /// Builds the exit summary from the session's final state.
+    pub fn exit_summary(&self, duration: std::time::Duration) -> crate::branding::ExitSummary {
+        let snapshot = self.session_snapshot();
+        let settings = Settings::load(&self.paths).ok();
+        let effort = match (&snapshot.provider, &snapshot.model) {
+            (Some(p), Some(m)) => settings
+                .as_ref()
+                .and_then(|s| s.effort_for(p, m).map(str::to_owned)),
+            _ => None,
+        };
+
+        crate::branding::ExitSummary {
+            duration,
+            message_count: self.state.transcript.blocks().len(),
+            provider_id: snapshot.provider.unwrap_or_else(|| "—".into()),
+            model: snapshot.model.unwrap_or_else(|| "—".into()),
+            effort,
+            input_tokens: self.state.usage.input_tokens.max(0) as u64,
+            output_tokens: self.state.usage.output_tokens.max(0) as u64,
+            session_id: self.state.session_id.clone(),
+            working_directory: self.paths.project_root.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Translates a screen cell into a position in the flat `rows` array.
+    ///
+    /// Returns `None` for a click outside the transcript area, so clicking the
+    /// composer or status bar does not start a selection in the transcript.
+    fn mouse_to_selection(
+        &self,
+        column: u16,
+        row: u16,
+    ) -> Option<crate::selection::SelectionPos> {
+        let (origin_row, height) = self.transcript_origin;
+        if height == 0 || row < origin_row || row >= origin_row.saturating_add(height) {
+            return None;
+        }
+        let offset_in_view = (row - origin_row) as usize;
+        let visible = self.viewport.visible_range();
+        let index = visible.start.checked_add(offset_in_view)?;
+        if index >= self.rows.len() {
+            return None;
+        }
+        Some(crate::selection::SelectionPos { row: index, col: column as usize })
+    }
+
     fn key_context(&self) -> KeyContext {
         let (line, _) = self.composer.cursor_position();
         KeyContext {
-            focus: if self.state.prompt.is_some() {
-                Focus::Overlay
+            // An open surface takes focus away from the composer. Without
+            // this, any key the surface declines is resolved as composer
+            // editing and typed into a composer the user cannot see: letters
+            // inserted, Backspace deleting, Up loading a past submission —
+            // all behind a modal, and submitted on close.
+            //
+            // A prompt is a surface too, so it needs no separate branch; a
+            // second condition reading `state.prompt` would be a second source
+            // of truth for the same question.
+            focus: if !self.surfaces.is_empty() {
+                Focus::Surface
             } else if self.composer.completion().is_active() {
                 Focus::Completion
             } else {
@@ -1307,9 +1636,21 @@ impl App {
     }
 
     fn apply(&mut self, event: UiEvent) {
+        if is_critical_event(&event) {
+            self.critical_dirty = true;
+        } else {
+            self.dirty = true;
+        }
         self.state.apply(event);
         self.laid_out_width = 0;
-        self.dirty = true;
+
+        // Keep the prompt surface in lockstep with the reducer. The engine can
+        // clear a prompt without it being answered — a turn ending or being
+        // interrupted does exactly that — and an Exclusive surface left behind
+        // would be undismissable, wedging the interface permanently.
+        if self.state.prompt.is_none() {
+            self.retire_prompt_surface();
+        }
     }
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
@@ -1323,6 +1664,46 @@ impl App {
         self.apply(UiEvent::CommandOutput { text: text.into() });
     }
 
+    /// Redraws immediately if warranted, or schedules a deferred frame.
+    ///
+    /// Critical events bypass the 30 FPS throttle (C# `UiActor.IsCritical`).
+    /// Streaming events defer to the deadline so a burst of deltas at >30 FPS
+    /// does not cause 60+ redraws per second, while the deferred timer
+    /// guarantees the last frame is drawn even if no further events arrive.
+    fn maybe_redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
+        let has_work = self.dirty || self.critical_dirty;
+        if !has_work {
+            return Ok(());
+        }
+
+        if self.critical_dirty {
+            self.critical_dirty = false;
+            self.dirty = false;
+            self.frame_deadline = None;
+            return self.redraw(guard);
+        }
+
+        // Non-critical: honour the 30 FPS cap.
+        let min_interval = Duration::from_millis(MIN_STREAMING_FRAME_MS);
+        let elapsed = self
+            .last_frame_at
+            .map(|t| t.elapsed())
+            .unwrap_or(min_interval);
+
+        if elapsed >= min_interval {
+            self.dirty = false;
+            self.frame_deadline = None;
+            self.redraw(guard)
+        } else {
+            // Defer: arm the timer for the remaining slice.
+            if self.frame_deadline.is_none() {
+                let remaining = min_interval - elapsed;
+                self.frame_deadline = Some(tokio::time::Instant::now() + remaining);
+            }
+            Ok(())
+        }
+    }
+
     fn redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
         let size = guard.terminal().size()?;
         let regions = draw::layout(
@@ -1331,27 +1712,364 @@ impl App {
             self.viewport.is_scrollable(),
         );
         let width = regions.transcript.width as usize;
+        let height = regions.transcript.height as usize;
 
         if width != self.laid_out_width {
-            self.rows = self.state.transcript.render(width, self.state.display_mode);
+            let was_following = self.viewport.is_following();
+            let (rows, starts) = self
+                .state
+                .transcript
+                .render_with_block_starts(width, self.state.display_mode);
+            self.rows = rows;
+            self.block_starts = starts;
             self.laid_out_width = width;
+
+            // Anchor-aware reflow: restore the detached position rather than
+            // clamping, so the user's reading position survives a resize or
+            // streaming growth above the viewport.
+            if was_following {
+                self.viewport.update(self.rows.len(), height);
+            } else {
+                let anchor_row = self.detached_anchor.and_then(|a| {
+                    self.block_starts
+                        .get(a.block_index)
+                        .map(|&s| s + a.row_within_block)
+                });
+                self.viewport
+                    .update_with_anchor(self.rows.len(), height, anchor_row.unwrap_or(0));
+            }
+        } else {
+            self.viewport.update(self.rows.len(), height);
         }
-        self.viewport
-            .update(self.rows.len(), regions.transcript.height as usize);
+
+        // Compose the pin row when the user prompt has scrolled out of view.
+        let pin_text = self.compose_pin(width);
 
         let state = &self.state;
         let composer = &self.composer;
         let viewport = &self.viewport;
         let rows = &self.rows;
         let theme = &self.theme;
-        let browser = self.browser.as_ref();
+        
+        let pin = pin_text.as_deref();
+        let selection = self.selection.has_selection().then_some(&self.selection);
+        let surfaces = &self.surfaces;
 
+        // The transcript origin is captured from the draw so mouse-to-row
+        // translation always matches the layout that was actually rendered.
+        let mut origin = self.transcript_origin;
         guard.terminal().draw(|frame| {
-            draw::draw(frame, state, composer, viewport, rows, theme, browser);
+            origin = draw::draw_with_pin(
+                frame, state, composer, viewport, rows, theme, pin, selection,
+            );
+            // Surfaces draw last and bottom-up, so a detail sits over its list
+            // and the whole stack sits over the shell. Rendered as a second
+            // pass rather than a tenth parameter on draw_with_pin.
+            for rendered in surfaces.render(frame.area(), theme) {
+                draw::draw_surface(frame, &rendered, theme);
+            }
         })?;
+        self.transcript_origin = origin;
 
+        self.last_frame_at = Some(std::time::Instant::now());
         self.dirty = false;
+        self.critical_dirty = false;
         Ok(())
+    }
+
+    /// Computes the pin text for the current frame, or `None` when the pin
+    /// should not be shown.
+    fn compose_pin(&self, width: usize) -> Option<String> {
+        if !self.state.is_busy() {
+            return None;
+        }
+        // Find the last non-pending user block.
+        let (block_idx, user_text) = self
+            .state
+            .transcript
+            .blocks()
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, b)| {
+                if let crate::transcript::Block::User { text, pending: false, .. } = b {
+                    Some((i, text.as_str()))
+                } else {
+                    None
+                }
+            })?;
+
+        let block_start = self.block_starts.get(block_idx).copied()?;
+        let block_end = self.block_starts.get(block_idx + 1).copied().unwrap_or(block_start);
+
+        if !crate::pin::should_show(
+            true,
+            Some(block_start),
+            block_end,
+            self.viewport.offset(),
+            self.viewport.height(),
+        ) {
+            return None;
+        }
+
+        crate::pin::compose(user_text, width)
+    }
+
+    /// Captures a viewport anchor from the current offset if the viewport is
+    /// currently following (about to be detached by a scroll).
+    fn capture_anchor_if_following(&mut self) {
+        if !self.viewport.is_following() {
+            return;
+        }
+        self.detached_anchor = self.compute_anchor();
+    }
+
+    /// Computes a `ViewportAnchor` from the current viewport offset and block layout.
+    fn compute_anchor(&self) -> Option<ViewportAnchor> {
+        if self.block_starts.is_empty() {
+            return None;
+        }
+        let offset = self.viewport.offset();
+        // Binary search: find the last block whose start <= offset.
+        let i = self.block_starts.partition_point(|&s| s <= offset);
+        let block_index = i.saturating_sub(1);
+        let row_within_block = offset.saturating_sub(
+            self.block_starts.get(block_index).copied().unwrap_or(0),
+        );
+        Some(ViewportAnchor {
+            block_index,
+            row_within_block,
+        })
+    }
+
+    /// Copies the visible transcript to the clipboard (Ctrl+Y).
+    ///
+    /// If nothing is visible, the call is a no-op.  A failure to access the
+    /// clipboard (e.g. no display server) is reported as a notice rather than
+    /// crashing the application.
+    /// Opens the settings surface, seeded from the settings on disk.
+    fn open_settings_form(&mut self) {
+        if !self
+            .surfaces
+            .push(Box::new(crate::surface::settings::SettingsSurface::open(
+                &self.paths,
+            )))
+        {
+            // Refused by an exclusive surface. Say so, rather than appearing
+            // to do nothing.
+            self.notice(
+                "Answer the open prompt first.",
+                NoticeLevel::Warning,
+            );
+        }
+        self.dirty = true;
+    }
+
+    /// Performs the work a surface asked for.
+    ///
+    /// The only bridge from a surface to the engine and the filesystem;
+    /// surfaces themselves do no I/O, which is what makes them testable
+    /// without either.
+    async fn apply_surface_action(&mut self, action: crate::surface::SurfaceAction) {
+        use crate::surface::SurfaceAction;
+
+        match action {
+            SurfaceAction::SaveSettings => {
+                // Take the surface first: whether the save succeeds or fails,
+                // the modal closes, so a broken settings file cannot trap the
+                // user in a form they can only escape by killing the process.
+                let Some(surface) = self.surfaces.pop() else {
+                    return;
+                };
+                let Some(settings_surface) = surface
+                    .as_any()
+                    .downcast_ref::<crate::surface::settings::SettingsSurface>()
+                else {
+                    // Some other surface emitted SaveSettings. Put it back
+                    // rather than closing it and discarding the edit: losing
+                    // both the modal and the save with no message is the worst
+                    // of the available outcomes.
+                    self.surfaces.push(surface);
+                    self.notice(
+                        "Could not save: unexpected surface.",
+                        NoticeLevel::Error,
+                    );
+                    return;
+                };
+                let mut settings = crate::config::Settings::load(&self.paths)
+                    .unwrap_or_else(|_| crate::config::Settings::empty_at(self.paths.settings()));
+                match settings_surface.apply(&mut settings) {
+                    Ok(()) => self.notice(
+                        "Settings saved. Some changes apply on restart.",
+                        NoticeLevel::Info,
+                    ),
+                    Err(err) => self.notice(
+                        format!("Could not save settings: {err}"),
+                        NoticeLevel::Error,
+                    ),
+                }
+            }
+            SurfaceAction::Browser { kind: _, intent } => match intent {
+                Intent::Reload => self.reload_browser().await,
+                Intent::Activate(id) => self.activate_browser_row(&id).await,
+                Intent::Toggle(id) => self.toggle_browser_row(&id).await,
+                Intent::Delete(id) => self.delete_browser_row(&id).await,
+                Intent::Key(c, id) => self.browser_key_action(c, id).await,
+                // Handled by the surface itself before reaching here.
+                Intent::Redraw | Intent::Ignored | Intent::Close => {}
+            },
+            SurfaceAction::AnswerPrompt { allowed, answer } => {
+                self.surfaces.pop();
+                self.answer_prompt(allowed, answer);
+            }
+        }
+    }
+
+    /// Sends the reply to an engine prompt and records the outcome.
+    /// Removes an open browser surface.
+    fn retire_browser_surface(&mut self) {
+        while self
+            .surfaces
+            .top()
+            .is_some_and(|s| s.as_any().is::<BrowserSurface>())
+        {
+            self.surfaces.pop();
+        }
+    }
+
+    /// Removes an open prompt surface, wherever it sits in the stack.
+    ///
+    /// Used when a prompt is superseded or cancelled by the engine rather than
+    /// answered by the user: the surface must go even though nothing was
+    /// answered, and its own exclusivity would otherwise keep it there.
+    fn retire_prompt_surface(&mut self) {
+        while self
+            .surfaces
+            .top()
+            .is_some_and(|s| s.as_any().is::<crate::surface::prompt::PromptSurface>())
+        {
+            self.surfaces.pop();
+        }
+    }
+
+    /// Split from the surface deliberately: the responder is engine state, so
+    /// a surface must not hold it. The surface decides what the answer is and
+    /// this sends it.
+    fn answer_prompt(&mut self, allowed: bool, answer: Option<String>) {
+        let Some(prompt) = self.state.prompt.clone() else {
+            return;
+        };
+        self.dirty = true;
+
+        if let Some(responder) = self.pending_responder.take() {
+            let reply = match &prompt {
+                PendingPrompt::Permission { .. } => {
+                    serde_json::to_value(messages::PermissionResponse { allow: allowed })
+                }
+                PendingPrompt::PlanApproval { .. } => {
+                    serde_json::to_value(messages::PlanApprovalResponse { approve: allowed })
+                }
+                PendingPrompt::Question { .. } => {
+                    serde_json::to_value(messages::QuestionResponse {
+                        answer: answer.clone().unwrap_or_default(),
+                    })
+                }
+            };
+            match reply {
+                Ok(value) => responder.respond(value),
+                Err(error) => responder.fail(
+                    coda_proto::error_codes::INTERNAL_ERROR,
+                    error.to_string(),
+                ),
+            }
+        }
+
+        self.apply(UiEvent::PromptAnswered { allowed, answer });
+    }
+
+    /// Copies the active selection for a right-click gesture.
+    ///
+    /// The selection is cleared only on a successful write. Keeping it after a
+    /// failure means the user can retry rather than having to reselect, which
+    /// is what the C# does for the same reason.
+    fn copy_selection_via_pointer(&mut self) {
+        let text = self.selection.copy_text(&self.rows);
+        if text.is_empty() {
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
+            Ok(()) => {
+                self.selection.clear();
+                self.notice("Copied selection to clipboard.", NoticeLevel::Info);
+            }
+            Err(err) => {
+                self.notice(
+                    format!("Could not access the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    /// Pastes the clipboard into the composer for a right-click with nothing
+    /// selected.
+    ///
+    /// Refused while a prompt is up, so a pointer can never type into a
+    /// composer the user cannot see — the same guard the C# applies.
+    fn paste_from_pointer(&mut self) {
+        // Any open surface blocks it, not just a prompt or a browser: a
+        // pointer must never type into a composer the user cannot see.
+        if !self.surfaces.is_empty() {
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
+            Ok(text) if !text.is_empty() => {
+                self.composer.insert(&text);
+            }
+            Ok(_) => {}
+            Err(err) => {
+                self.notice(
+                    format!("Could not read the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    fn copy_to_clipboard(&mut self) {
+        // A selection wins over the visible screen: if the user has selected
+        // something, copying everything on screen instead is silently the
+        // wrong answer.
+        let (text, what) = if self.selection.has_selection() {
+            (self.selection.copy_text(&self.rows), "selection")
+        } else {
+            (
+                crate::selection::copy_visible_text(&self.rows, self.viewport.visible_range()),
+                "transcript",
+            )
+        };
+        if text.is_empty() {
+            self.dirty = false;
+            return;
+        }
+        match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
+            Ok(()) => {
+                self.notice(format!("Copied {what} to clipboard."), NoticeLevel::Info);
+            }
+            Err(err) => {
+                self.notice(
+                    format!("Could not access the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    /// Checks for a first run and surfaces the setup wizard notice.
+    fn check_first_run(&mut self) {
+        if crate::setup::is_first_run(&self.paths) {
+            self.notice(crate::setup::WELCOME_TEXT, NoticeLevel::Info);
+        }
     }
 
     /// Closes the engine down cleanly.
@@ -1368,6 +2086,1275 @@ impl App {
             .await;
         let _ = engine.shutdown(SHUTDOWN_GRACE).await;
     }
+
+    /// `/setup` — re-run the setup wizard.
+    fn cmd_setup(&mut self) {
+        use crate::setup;
+        let providers = setup::provider_selection_prompt();
+        self.output(format!(
+            "Setup wizard\n\
+             \n\
+             {providers}\n\
+             \n\
+             Choose a provider and run /login <id> to authenticate.\n\
+             \n\
+             {}",
+            "[SEAM: OAuth login handoff requires coda-auth login RPCs, \
+             being added by another agent.  Once available, /login will \
+             complete the authentication flow interactively.]"
+        ));
+    }
+
+    // -- Slash command handlers (local / config scope) -----------------------
+
+    /// Submits a programmatic prompt to the engine on behalf of a command.
+    ///
+    /// Used by `/init` and `/skill` to inject model-directed work into the
+    /// running session without touching the composer.
+    async fn submit_programmatic(&mut self, text: String) {
+        if self.state.is_busy() {
+            self.notice("A turn is already running; try again when ready.", NoticeLevel::Warning);
+            return;
+        }
+        self.apply(UiEvent::Submitted { text: text.clone() });
+        let params = serde_json::to_value(messages::PromptParams::text(text)).unwrap_or_default();
+        match self.connection.send_request(method::PROMPT, Some(params)) {
+            Ok(receiver) => self.turn = Some(receiver),
+            Err(error) => self.apply(UiEvent::TurnFinished {
+                interrupted: false,
+                error: Some(error.to_string()),
+            }),
+        }
+    }
+
+    /// `/init` — ask the agent to generate a CLAUDE.md for this project.
+    async fn cmd_init(&mut self) {
+        let claude_md = self.paths.project_root.join("CLAUDE.md");
+        if claude_md.exists() {
+            self.notice(
+                "CLAUDE.md already exists; not overwriting. Use /memory to view it.",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+        let prompt = concat!(
+            "Analyze this codebase and write a concise CLAUDE.md that captures: ",
+            "the project purpose, key architecture decisions, important conventions, ",
+            "build/test commands, and any gotchas worth knowing. ",
+            "Write ONLY the raw Markdown content to CLAUDE.md using the write_file tool — ",
+            "no additional commentary, no code fences around the file content."
+        );
+        self.notice("Sending analysis request to agent…", NoticeLevel::Info);
+        self.submit_programmatic(prompt.to_string()).await;
+    }
+
+    /// `/memory` — display CLAUDE.md if it exists.
+    fn cmd_memory(&mut self) {
+        let claude_md = self.paths.project_root.join("CLAUDE.md");
+        self.output(format!("CLAUDE.md path: {}", claude_md.display()));
+        match std::fs::read_to_string(&claude_md) {
+            Ok(contents) => self.output(contents),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => self.notice(
+                "CLAUDE.md not found. Run /init to generate one for this project.",
+                NoticeLevel::Warning,
+            ),
+            Err(e) => self.notice(format!("Could not read CLAUDE.md: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/output-style [<style>]` — show or set the response style persona.
+    async fn cmd_output_style(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let paths = self.paths.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+
+            if let Some(ref style_name) = arg {
+                if !coda_agent::BuiltInOutputStyles::is_known(Some(style_name)) {
+                    let names: Vec<&str> =
+                        coda_agent::BuiltInOutputStyles::all().iter().map(|s| s.name).collect();
+                    return Ok(format!(
+                        "Unknown style '{style_name}'. Available: {}",
+                        names.join(", ")
+                    ));
+                }
+                settings.set_output_style(style_name);
+                settings.save()?;
+                return Ok(format!(
+                    "Output style set to {style_name}. Restart the engine to apply."
+                ));
+            }
+
+            let current = settings.output_style().unwrap_or("default");
+            let mut out = format!("Current style: {current}\n");
+            for s in coda_agent::BuiltInOutputStyles::all() {
+                let marker = if s.name.eq_ignore_ascii_case(current) { " (active)" } else { "" };
+                out.push_str(&format!("  {}{marker} — {}\n", s.name, s.description));
+            }
+            Ok(out.trim_end().to_string())
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/permissions [<mode>]` — show or set the tool-permission mode.
+    async fn cmd_permissions(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let paths = self.paths.clone();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+
+            if let Some(ref raw) = arg {
+                match parse_permission_mode(raw) {
+                    Some(canonical) => {
+                        settings.set_permission_mode(canonical);
+                        settings.save()?;
+                        let note = if canonical == "bypass" {
+                            " (YOLO — tools run without asking)"
+                        } else {
+                            ""
+                        };
+                        Ok(format!("Permission mode set to {canonical}{note}. Restart the engine to apply."))
+                    }
+                    None => Ok(format!(
+                        "Unknown mode '{raw}'. Use: default | acceptEdits | plan | bypass"
+                    )),
+                }
+            } else {
+                let current = settings.permission_mode().unwrap_or("default");
+                Ok(format!(
+                    "Permission mode: {current}\nModes: default (ask), acceptEdits (auto-edit), plan (read-only), bypass (yolo: allow all)"
+                ))
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/yolo` — grant bypass-permissions mode. Explicit, loud, and impossible to miss.
+    async fn cmd_yolo(&mut self) {
+        let paths = self.paths.clone();
+        let result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            settings.set_permission_mode("bypass");
+            settings.save()
+        })
+        .await;
+
+        match result {
+            Ok(Ok(())) => {
+                // The warning appears first in the transcript to make the state
+                // change impossible to overlook before the confirmation notice.
+                self.notice(
+                    "⚠  YOLO mode: tools will run without asking for permission.",
+                    NoticeLevel::Warning,
+                );
+                self.notice(
+                    "Restart the engine to apply. Use /permissions default to revert.",
+                    NoticeLevel::Info,
+                );
+            }
+            Ok(Err(e)) => self.notice(format!("Could not save setting: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings write was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/provider [<id>]` — show the configured provider or switch to a different one.
+    async fn cmd_provider(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let paths = self.paths.clone();
+
+        if let Some(new_provider) = arg {
+            // Write the new provider and restart so the engine picks it up.
+            let success_msg = format!("Provider set to {new_provider}. Restarting engine…");
+            let write_result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+                let mut settings = config::Settings::load(&paths)?;
+                settings.set_default_provider(&new_provider);
+                settings.save()
+            })
+            .await;
+
+            match write_result {
+                Ok(Ok(())) => {
+                    self.notice(success_msg, NoticeLevel::Info);
+                    self.restart_engine().await;
+                }
+                Ok(Err(e)) => self.notice(format!("Could not save provider: {e}"), NoticeLevel::Error),
+                Err(_) => self.notice("Settings write was interrupted.", NoticeLevel::Error),
+            }
+            return;
+        }
+
+        // No argument — display the configured provider and any model-by-provider entries.
+        let read_result = tokio::task::spawn_blocking(move || config::Settings::load(&paths)).await;
+        match read_result {
+            Ok(Ok(settings)) => {
+                let provider = settings.default_provider().unwrap_or("(none)");
+                let mut out = format!("Active provider: {provider}\n");
+                let providers_seen: Vec<String> = settings
+                    .raw()
+                    .get("modelByProvider")
+                    .and_then(|m| m.as_object())
+                    .map(|obj| obj.keys().cloned().collect())
+                    .unwrap_or_default();
+                if !providers_seen.is_empty() {
+                    out.push_str("Configured providers:");
+                    for p in &providers_seen {
+                        let mark = if p == provider { " (active)" } else { "" };
+                        out.push_str(&format!("\n  {p}{mark}"));
+                    }
+                } else {
+                    out.push_str("Use /provider <id> to switch (e.g. github-copilot, claude-ai).");
+                }
+                self.output(out);
+            }
+            Ok(Err(e)) => self.notice(format!("Could not read settings: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/headers [--set <name> <value> | --remove <name>]` — manage custom HTTP headers.
+    async fn cmd_headers(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+        let paths = self.paths.clone();
+
+        // Collect the operation before spawning so we don't capture `words` (non-Send).
+        enum HeaderOp {
+            Show,
+            Set(String, String),
+            Remove(String),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] => HeaderOp::Show,
+            ["--set", name, value] => HeaderOp::Set((*name).to_string(), (*value).to_string()),
+            ["--remove", name] => HeaderOp::Remove((*name).to_string()),
+            _ => HeaderOp::BadUsage,
+        };
+
+        if matches!(op, HeaderOp::BadUsage) {
+            self.notice(
+                "Usage: /headers | /headers --set <name> <value> | /headers --remove <name>",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            match op {
+                HeaderOp::Show => {
+                    let headers = settings.custom_headers();
+                    if headers.is_empty() {
+                        return Ok("No custom headers configured.\nAuth headers are managed by the engine.".to_string());
+                    }
+                    let mut out = String::from("Custom headers:\n");
+                    for (k, v) in &headers {
+                        out.push_str(&format!("  {k}: {v}\n"));
+                    }
+                    out.push_str("Auth headers are managed by the engine.");
+                    Ok(out.trim_end().to_string())
+                }
+                HeaderOp::Set(name, value) => {
+                    settings.set_custom_header(&name, &value);
+                    settings.save()?;
+                    Ok(format!("Custom header set: {name}: {value}"))
+                }
+                HeaderOp::Remove(name) => {
+                    settings.remove_custom_header(&name);
+                    settings.save()?;
+                    Ok(format!("Custom header removed: {name}"))
+                }
+                HeaderOp::BadUsage => unreachable!(),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/log [<level> | stderr on|off | off]` — show or change telemetry logging.
+    async fn cmd_log(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+        let paths = self.paths.clone();
+
+        enum LogOp {
+            Show,
+            SetLevel(String),
+            Disable,
+            Stderr(bool),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] => LogOp::Show,
+            ["off"] => LogOp::Disable,
+            ["stderr", "on"] => LogOp::Stderr(true),
+            ["stderr", "off"] => LogOp::Stderr(false),
+            ["stderr", ..] => LogOp::BadUsage,
+            [level] => {
+                let lc = level.to_lowercase();
+                if ["trace", "debug", "info", "warn", "error"].contains(&lc.as_str()) {
+                    LogOp::SetLevel(lc)
+                } else {
+                    LogOp::BadUsage
+                }
+            }
+            _ => LogOp::BadUsage,
+        };
+
+        if matches!(op, LogOp::BadUsage) {
+            self.notice(
+                "Usage: /log | /log <level> | /log off | /log stderr on|off  (levels: trace debug info warn error)",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        let log_dir = self.paths.logs();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            match op {
+                LogOp::Show => {
+                    let dir = settings
+                        .log_directory_override()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| log_dir.display().to_string());
+                    Ok(format!(
+                        "Telemetry: {}\nLog level:  {}\nStderr:     {}\nLog dir:    {}\nChanges apply to the next session.",
+                        if settings.log_enabled() { "enabled" } else { "disabled" },
+                        settings.log_level(),
+                        if settings.log_to_stderr() { "on" } else { "off" },
+                        dir
+                    ))
+                }
+                LogOp::SetLevel(level) => {
+                    let stderr = settings.log_to_stderr();
+                    settings.set_telemetry(true, &level, stderr);
+                    let dir = settings
+                        .log_directory_override()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| log_dir.display().to_string());
+                    settings.save()?;
+                    Ok(format!(
+                        "Telemetry enabled at {level}. Logs: {dir}. Applies to the next session."
+                    ))
+                }
+                LogOp::Disable => {
+                    let level = settings.log_level().to_string();
+                    let stderr = settings.log_to_stderr();
+                    settings.set_telemetry(false, &level, stderr);
+                    settings.save()?;
+                    Ok("Telemetry disabled. Applies to the next session.".to_string())
+                }
+                LogOp::Stderr(on) => {
+                    let enabled = settings.log_enabled();
+                    let level = settings.log_level().to_string();
+                    settings.set_telemetry(enabled, &level, on);
+                    settings.save()?;
+                    Ok(format!(
+                        "Stderr logging: {}. Applies to the next session.",
+                        if on { "on" } else { "off" }
+                    ))
+                }
+                LogOp::BadUsage => unreachable!(),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/marketplace [list | add <source> | remove <name>]`.
+    async fn cmd_marketplace(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+        let paths = self.paths.clone();
+
+        enum MktOp {
+            List,
+            Add(String),
+            Remove(String),
+            Unsupported(String),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] | ["list"] => MktOp::List,
+            ["add", source] => MktOp::Add((*source).to_string()),
+            ["remove", name] => MktOp::Remove((*name).to_string()),
+            [sub, ..] if ["browse", "install", "search", "refresh"].contains(sub) => {
+                MktOp::Unsupported((*sub).to_string())
+            }
+            _ => MktOp::BadUsage,
+        };
+
+        if let MktOp::Unsupported(sub) = op {
+            self.notice(
+                format!("/{sub} is not yet available in the Rust front-end. Use the C# coda tool."),
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        if matches!(op, MktOp::BadUsage) {
+            self.notice(
+                "Usage: /marketplace [list | add <source> | remove <name>]",
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            match op {
+                MktOp::List => {
+                    let markets = settings.marketplaces();
+                    if markets.is_empty() {
+                        return Ok("No marketplaces configured. Use /marketplace add <source> to register one.".to_string());
+                    }
+                    let mut out = String::from("Marketplaces\n");
+                    for (name, source) in &markets {
+                        out.push_str(&format!("  {name}  {source}\n"));
+                    }
+                    Ok(out.trim_end().to_string())
+                }
+                MktOp::Add(source) => {
+                    // Derive a name from the last URL segment or filename.
+                    let name = marketplace_name_from_source(&source);
+                    settings.add_marketplace(&name, &source);
+                    settings.save()?;
+                    Ok(format!("Registered marketplace '{name}' ({source})."))
+                }
+                MktOp::Remove(name) => {
+                    if settings.remove_marketplace(&name) {
+                        settings.save()?;
+                        Ok(format!("Removed marketplace '{name}'."))
+                    } else {
+                        Ok(format!("No marketplace named '{name}'."))
+                    }
+                }
+                _ => unreachable!(),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(text)) => self.output(text),
+            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/plugin [list | info <name> | enable <name> | disable <name>]`.
+    async fn cmd_plugin(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+
+        enum PluginOp {
+            List,
+            Info(String),
+            SetEnabled(String, bool),
+            Unsupported(String),
+            BadUsage,
+        }
+
+        let op = match words.as_slice() {
+            [] | ["list"] => PluginOp::List,
+            ["info", name] => PluginOp::Info((*name).to_string()),
+            ["enable", name] => PluginOp::SetEnabled((*name).to_string(), true),
+            ["disable", name] => PluginOp::SetEnabled((*name).to_string(), false),
+            [sub, ..] if ["install", "remove", "update", "prune", "approve", "validate", "new"].contains(sub) => {
+                PluginOp::Unsupported((*sub).to_string())
+            }
+            _ => PluginOp::BadUsage,
+        };
+
+        if let PluginOp::Unsupported(sub) = op {
+            self.notice(
+                format!("plugin {sub} is not yet available in the Rust front-end. Use the C# coda tool or /plugins browser."),
+                NoticeLevel::Warning,
+            );
+            return;
+        }
+
+        match op {
+            PluginOp::List => {
+                // Delegate to the engine for the definitive plugin list.
+                match self
+                    .fetch::<messages::PluginsListResult>(
+                        method::PLUGINS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        let text = if result.plugins.is_empty() {
+                            "No plugins installed.".to_string()
+                        } else {
+                            let mut out = String::from("Plugins\n");
+                            for p in &result.plugins {
+                                out.push_str(&format!(
+                                    "  {} {}\n",
+                                    p.name,
+                                    p.version.as_deref().unwrap_or("")
+                                ));
+                            }
+                            out.trim_end().to_string()
+                        };
+                        self.output(text);
+                    }
+                    Err(e) => self.notice(format!("Could not list plugins: {e}"), NoticeLevel::Error),
+                }
+            }
+            PluginOp::Info(name) => {
+                match self
+                    .fetch::<messages::PluginsListResult>(
+                        method::PLUGINS_LIST,
+                        Some(serde_json::json!({})),
+                    )
+                    .await
+                {
+                    Ok(result) => {
+                        if let Some(plugin) = result.plugins.iter().find(|p| p.name.eq_ignore_ascii_case(&name)) {
+                            let version = plugin.version.as_deref().unwrap_or("(unknown)");
+                            self.output(format!("Plugin: {}\nVersion: {version}", plugin.name));
+                        } else {
+                            self.notice(format!("Plugin '{name}' not found."), NoticeLevel::Warning);
+                        }
+                    }
+                    Err(e) => self.notice(format!("Could not fetch plugins: {e}"), NoticeLevel::Error),
+                }
+            }
+            PluginOp::SetEnabled(name, enabled) => {
+                let paths = self.paths.clone();
+                let result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+                    let mut state = config::PluginState::load(&paths)?;
+                    state.set_enabled(&name, enabled);
+                    state.save()
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(())) => {
+                        let word = if enabled { "Enabled" } else { "Disabled" };
+                        self.notice(format!("{word} plugin. Restart the engine to apply."), NoticeLevel::Info);
+                    }
+                    Ok(Err(e)) => self.notice(format!("Could not update plugin state: {e}"), NoticeLevel::Error),
+                    Err(_) => self.notice("Plugin state write was interrupted.", NoticeLevel::Error),
+                }
+            }
+            PluginOp::BadUsage => self.notice(
+                "Usage: /plugin [list | info <name> | enable <name> | disable <name>]",
+                NoticeLevel::Warning,
+            ),
+            _ => {}
+        }
+    }
+
+    /// `/skill [<name> [args...]]` — list skills or run one by name.
+    async fn cmd_skill(&mut self, invocation: &commands::Invocation) {
+        let words = invocation.words();
+
+        if words.is_empty() {
+            // No arguments: list available skills via the engine.
+            match self
+                .fetch::<messages::SkillsListResult>(
+                    method::SKILLS_LIST,
+                    Some(serde_json::json!({})),
+                )
+                .await
+            {
+                    Ok(result) => {
+                        let text = if result.skills.is_empty() {
+                            "No skills available.".to_string()
+                        } else {
+                            let mut out = String::from("Skills\n");
+                            for s in &result.skills {
+                                let mark = if s.enabled { "*" } else { " " };
+                                out.push_str(&format!(
+                                    "  {mark} {}  {}\n",
+                                    s.name,
+                                    s.description.as_deref().unwrap_or("")
+                                ));
+                            }
+                            out.trim_end().to_string()
+                        };
+                        self.output(text);
+                    }
+                    Err(e) => self.notice(format!("Could not list skills: {e}"), NoticeLevel::Error),
+                }
+                return;
+            }
+
+        let name = words[0];
+        let args: Vec<&str> = words[1..].to_vec();
+
+        // Look up the SKILL.md in project-local and user-scoped dirs.
+        let body = find_local_skill_body(&self.paths, name, &args);
+        match body {
+            Some(text) => {
+                self.notice(format!("Running skill '{name}'…"), NoticeLevel::Info);
+                self.submit_programmatic(text).await;
+            }
+            None => {
+                // Report what IS available to help the user.
+                let available = list_local_skill_names(&self.paths);
+                let list = if available.is_empty() {
+                    "(none found locally)".to_string()
+                } else {
+                    available.join(", ")
+                };
+                self.notice(
+                    format!("Skill '{name}' not found. Available locally: {list}"),
+                    NoticeLevel::Warning,
+                );
+            }
+        }
+    }
+
+    /// `/export [<path>]` — write the current conversation to a Markdown file.
+    async fn cmd_export(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+        let project_root = self.paths.project_root.clone();
+
+        // Capture the transcript before spawning; the transcript is !Send.
+        let markdown = build_markdown_export(self.state.transcript.blocks());
+
+        if markdown.trim().is_empty() {
+            self.notice("Nothing to export yet.", NoticeLevel::Info);
+            return;
+        }
+
+        let result = tokio::task::spawn_blocking(move || -> std::io::Result<std::path::PathBuf> {
+            let path = match arg {
+                Some(ref provided) if !provided.is_empty() => {
+                    let p = std::path::Path::new(provided);
+                    if p.is_absolute() {
+                        p.to_path_buf()
+                    } else {
+                        project_root.join(p)
+                    }
+                }
+                _ => {
+                    use time::OffsetDateTime;
+                    let now = OffsetDateTime::now_utc();
+                    let ts = format!(
+                        "{}{:02}{:02}-{:02}{:02}{:02}",
+                        now.year(),
+                        u8::from(now.month()),
+                        now.day(),
+                        now.hour(),
+                        now.minute(),
+                        now.second()
+                    );
+                    project_root.join(format!("coda-conversation-{ts}.md"))
+                }
+            };
+
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, markdown.as_bytes())?;
+            Ok(path)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(path)) => self.notice(format!("Conversation exported to {}", path.display()), NoticeLevel::Info),
+            Ok(Err(e)) => self.notice(format!("Export failed: {e}"), NoticeLevel::Error),
+            Err(_) => self.notice("Export was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// `/diff` — run `git diff` and render the result with syntax colouring.
+    async fn cmd_diff(&mut self) {
+        let cwd = self.paths.project_root.clone();
+        let output = tokio::process::Command::new("git")
+            .arg("diff")
+            .current_dir(&cwd)
+            .output()
+            .await;
+
+        match output {
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                if !out.status.success() || stderr.contains("not a git repository") {
+                    let msg = if stderr.trim().is_empty() {
+                        "git exited with a non-zero status. Is this directory a git repository?"
+                            .to_string()
+                    } else {
+                        coda_render::text::sanitize(stderr.trim())
+                    };
+                    self.notice(msg, NoticeLevel::Error);
+                    return;
+                }
+                let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+                if stdout.trim().is_empty() {
+                    self.notice("No uncommitted changes.", NoticeLevel::Info);
+                } else {
+                    // Sanitize before storage: strips ANSI escapes from coloured git output.
+                    let sanitized = coda_render::text::sanitize(&stdout);
+                    self.apply(UiEvent::DiffOutput { text: sanitized });
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.notice(
+                    "git not found. Make sure git is installed and on your PATH.",
+                    NoticeLevel::Warning,
+                );
+            }
+            Err(e) => self.notice(format!("Could not run git: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/image <path>` — base64-encode an image and stage it for the next turn.
+    ///
+    /// Maximum size is 5 MB. Accepted formats: .png .jpg/.jpeg .gif .webp.
+    async fn cmd_image(&mut self, invocation: &commands::Invocation) {
+        let Some(path_str) = invocation.first() else {
+            self.notice(
+                "Usage: /image <path>  — attaches an image to the next turn.",
+                NoticeLevel::Warning,
+            );
+            return;
+        };
+
+        let path = std::path::PathBuf::from(path_str);
+        let file_name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("image")
+            .to_string();
+
+        let result = tokio::task::spawn_blocking(move || -> Result<(String, Vec<u8>), String> {
+            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
+            let media_type = image_media_type(ext).ok_or_else(|| {
+                format!(
+                    "File type not supported: '.{ext}'. Supported: .png, .jpg, .jpeg, .gif, .webp"
+                )
+            })?;
+
+            if !path.exists() {
+                return Err(format!("File not found: {}", path.display()));
+            }
+
+            let metadata = std::fs::metadata(&path)
+                .map_err(|e| format!("Could not read file: {e}"))?;
+            const MAX_BYTES: u64 = 5 * 1024 * 1024;
+            if metadata.len() > MAX_BYTES {
+                let size_mb = metadata.len() as f64 / (1024.0 * 1024.0);
+                return Err(format!(
+                    "File too large ({size_mb:.1} MB). Maximum size is 5 MB."
+                ));
+            }
+
+            let bytes = std::fs::read(&path).map_err(|e| format!("Could not read image: {e}"))?;
+            Ok((media_type.to_string(), bytes))
+        })
+        .await;
+
+        match result {
+            Ok(Ok((media_type, bytes))) => {
+                let label = self.staged_images.len() + 1;
+                self.staged_images.push(messages::WireImage {
+                    media_type,
+                    base64: base64_encode(&bytes),
+                });
+                // Insert the label token into the composer so the user can see
+                // where the attachment sits in the composed message.
+                let token = format!("[Image {label}]");
+                if !self.composer.is_empty() {
+                    self.composer.insert(" ");
+                }
+                self.composer.insert(&token);
+
+                let size_kb = bytes.len() as f64 / 1024.0;
+                self.notice(
+                    format!(
+                        "Attached {file_name} as {token} ({size_kb:.1} KB). It will be sent with your next message."
+                    ),
+                    NoticeLevel::Info,
+                );
+            }
+            Ok(Err(msg)) => self.notice(msg, NoticeLevel::Error),
+            Err(_) => self.notice("Could not read the image file.", NoticeLevel::Error),
+        }
+    }
+
+    // -- Session management commands -----------------------------------------
+
+    /// `/compact` — ask the engine to summarise the conversation.
+    ///
+    /// Mirrors C# `CompactCommand`: empty history → "Nothing to compact yet.";
+    /// success → "Conversation compacted (N messages kept).";
+    /// summariser error → warning with detail.
+    async fn cmd_compact(&mut self) {
+        let result = self
+            .fetch::<messages::CompactResult>(
+                method::COMPACT,
+                Some(serde_json::json!({})),
+            )
+            .await;
+
+        match result {
+            Ok(r) if r.messages_before == 0 => {
+                self.notice("Nothing to compact yet.", NoticeLevel::Info);
+            }
+            Ok(r) if r.error.is_some() => {
+                let detail = r.error.unwrap_or_default();
+                self.notice(
+                    format!("Compaction warning: {detail}"),
+                    NoticeLevel::Warning,
+                );
+            }
+            Ok(r) => {
+                self.notice(
+                    format!(
+                        "Conversation compacted ({} messages kept).",
+                        r.messages_after
+                    ),
+                    NoticeLevel::Info,
+                );
+            }
+            Err(e) => self.notice(format!("Compaction failed: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/resume [<id>]` — list or resume a past session.
+    ///
+    /// No arg → open the sessions browser picker (mirrors C#
+    /// `ResumeCommand.HandleNoArgsAsync`). A positive integer N → use the
+    /// N-th newest session (1-based). Any other string → treat as a literal
+    /// session id.
+    async fn cmd_resume(&mut self, invocation: &commands::Invocation) {
+        let arg = invocation.first().map(str::to_string);
+
+        if let Some(arg) = arg {
+            let session_id = self.resolve_resume_target(&arg).await;
+            self.resume_to_session(session_id).await;
+        } else {
+            self.open_browser(BrowserKind::Sessions).await;
+        }
+    }
+
+    /// Resolves a `/resume` argument to a session id.
+    ///
+    /// A bare positive integer selects the N-th newest session (1-based); any
+    /// other string is returned as-is. Mirrors C# `ResolveTargetIdAsync`.
+    async fn resolve_resume_target(&self, arg: &str) -> String {
+        if let Ok(n) = arg.parse::<usize>() {
+            if n >= 1 {
+                let project_root = self.paths.project_root.clone();
+                if let Ok(summaries) = tokio::task::spawn_blocking(move || {
+                    coda_agent::SessionTranscriptStore::new(&project_root).list()
+                })
+                .await
+                {
+                    if n <= summaries.len() {
+                        return summaries[n - 1].id.clone();
+                    }
+                }
+            }
+        }
+        arg.to_string()
+    }
+
+    /// Restarts the engine loading `session_id` from disk, clearing the
+    /// current transcript.
+    ///
+    /// Pre-checks that the session exists on disk so the user gets a clear
+    /// "not found" message instead of an engine handshake error.  Mirrors C#
+    /// `ResumeCommand.ResumeSessionAsync`.
+    async fn resume_to_session(&mut self, session_id: String) {
+        // Pre-check: verify the session exists and get its message count.
+        let project_root = self.paths.project_root.clone();
+        let sid = session_id.clone();
+        let summary = match tokio::task::spawn_blocking(move || {
+            coda_agent::SessionTranscriptStore::new(&project_root)
+                .list()
+                .into_iter()
+                .find(|s| s.id == sid)
+        })
+        .await
+        {
+            Ok(s) => s,
+            Err(_) => {
+                self.notice("Could not read session store.", NoticeLevel::Error);
+                return;
+            }
+        };
+
+        let Some(summary) = summary else {
+            let escaped = coda_render::text::sanitize(&session_id);
+            self.notice(
+                format!("Session '{escaped}' not found."),
+                NoticeLevel::Warning,
+            );
+            return;
+        };
+        let count = summary.message_count;
+
+        self.close_browser();
+        // Clear the current transcript — we are switching sessions.
+        self.apply(UiEvent::Cleared);
+
+        // Restart with the target session id; initialize loads the history.
+        let (engine, inbound) = match Engine::spawn(self.engine_command.clone()) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return self.notice(
+                    format!("Could not restart the engine: {error}"),
+                    NoticeLevel::Error,
+                )
+            }
+        };
+
+        let connection = engine.connection();
+        let params =
+            serde_json::to_value(messages::InitializeParams::new("coda-tui").resume(&session_id))
+                .unwrap_or_default();
+
+        match connection.request(method::INITIALIZE, Some(params)).await {
+            Ok(value) => {
+                let initialized: messages::InitializeResult =
+                    serde_json::from_value(value).unwrap_or(messages::InitializeResult {
+                        protocol_version: coda_proto::PROTOCOL_VERSION.to_string(),
+                        session_id: session_id.clone(),
+                        server_info: "coda".into(),
+                        telemetry_log_path: None,
+                    });
+
+                self.connection = connection;
+                self.restarted = Some((engine, inbound));
+
+                let actual_id = if initialized.session_id.is_empty() {
+                    session_id.clone()
+                } else {
+                    initialized.session_id.clone()
+                };
+                self.state.session_id = Some(actual_id.clone());
+
+                let escaped = coda_render::text::sanitize(&actual_id);
+                self.notice(
+                    format!("Resumed session {escaped} ({count} messages)."),
+                    NoticeLevel::Info,
+                );
+            }
+            Err(error) => {
+                self.notice(
+                    format!("The restarted engine rejected the handshake: {error}"),
+                    NoticeLevel::Error,
+                );
+            }
+        }
+    }
+
+    /// `/fork` — branch the live conversation into a new session.
+    ///
+    /// Calls `session/fork`; the engine persists the current history under a
+    /// fresh id and switches to it.  Mirrors C# `ForkCommand`.
+    async fn cmd_fork(&mut self) {
+        match self
+            .connection
+            .request("session/fork", Some(serde_json::json!({})))
+            .await
+        {
+            Ok(value) => {
+                if let Some(new_id) = value.get("newSessionId").and_then(Value::as_str) {
+                    let new_id = new_id.to_string();
+                    let escaped = coda_render::text::sanitize(&new_id);
+                    // Reflect the engine's new session id in the TUI state.
+                    self.state.session_id = Some(new_id);
+                    self.notice(
+                        format!("Forked into a new session {escaped} (original frozen)."),
+                        NoticeLevel::Info,
+                    );
+                } else {
+                    self.notice("Fork completed (session ID unknown).", NoticeLevel::Info);
+                }
+            }
+            Err(e) => self.notice(format!("Fork failed: {e}"), NoticeLevel::Error),
+        }
+    }
+
+    /// `/rewind [<n>]` — remove the last N user exchanges from the conversation.
+    ///
+    /// Default n = 1.  Mirrors C# `RewindCommand`: validates n, calls
+    /// `session/rewind`, then reports how many exchanges were removed.
+    async fn cmd_rewind(&mut self, invocation: &commands::Invocation) {
+        let n = match parse_rewind_n(invocation.first()) {
+            Ok(n) => n,
+            Err(msg) => {
+                self.notice(msg, NoticeLevel::Warning);
+                return;
+            }
+        };
+
+        match self
+            .connection
+            .request("session/rewind", Some(serde_json::json!({ "n": n })))
+            .await
+        {
+            Ok(value) => {
+                let removed =
+                    value.get("removed").and_then(Value::as_u64).unwrap_or(0) as usize;
+                let remaining =
+                    value.get("remaining").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if removed == 0 {
+                    self.notice("Nothing to rewind.", NoticeLevel::Info);
+                } else {
+                    self.notice(
+                        format!(
+                            "Rewound {removed} exchange(s). {remaining} message(s) remain."
+                        ),
+                        NoticeLevel::Info,
+                    );
+                }
+            }
+            Err(e) => self.notice(format!("Rewind failed: {e}"), NoticeLevel::Error),
+        }
+    }
+}
+
+/// Returns the MIME type for a supported image extension, case-insensitively.
+fn image_media_type(extension: &str) -> Option<&'static str> {
+    match extension.to_lowercase().as_str() {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        _ => None,
+    }
+}
+
+/// Parses the `n` argument of `/rewind`, returning `Ok(n)` for a valid
+/// positive integer or `Err` with a usage hint.
+///
+/// Mirrors C# `RewindCommand`: defaults to 1 when absent; rejects zero and
+/// non-integers with the same usage message.
+fn parse_rewind_n(arg: Option<&str>) -> Result<u32, &'static str> {
+    match arg {
+        None => Ok(1),
+        Some(s) => s
+            .parse::<u32>()
+            .ok()
+            .filter(|&v| v >= 1)
+            .ok_or("Usage: /rewind [n] where n is a positive integer."),
+    }
+}
+
+/// Encodes bytes as standard (RFC 4648) base64 with `=` padding.
+fn base64_encode(data: &[u8]) -> String {
+    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
+        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
+        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3F) as usize] as char } else { '=' });
+        out.push(if chunk.len() > 2 { TABLE[(n & 0x3F) as usize] as char } else { '=' });
+    }
+    out
+}
+
+/// Parses a permission-mode name into its canonical form, case-insensitively.
+///
+/// Accepts the same set of aliases as the C# `PermissionsCommand.TryParseMode`.
+fn parse_permission_mode(value: &str) -> Option<&'static str> {
+    match value.to_lowercase().as_str() {
+        "default" => Some("default"),
+        "acceptedits" | "accept-edits" | "edits" => Some("acceptEdits"),
+        "plan" => Some("plan"),
+        "bypass" | "bypasspermissions" | "yolo" => Some("bypass"),
+        _ => None,
+    }
+}
+
+/// Derives a marketplace name from a source URL or path.
+fn marketplace_name_from_source(source: &str) -> String {
+    // Use the last non-empty path segment, stripping common extensions.
+    source
+        .trim_end_matches('/')
+        .rsplit('/')
+        .find(|s| !s.is_empty())
+        .unwrap_or(source)
+        .trim_end_matches(".json")
+        .trim_end_matches(".git")
+        .to_string()
+}
+
+/// Reads a skill body from local SKILL.md files, binding positional args.
+///
+/// Searches project-scoped then user-scoped skill directories. Returns the
+/// bound body, or `None` when no matching skill is found.
+fn find_local_skill_body(paths: &config::Paths, name: &str, args: &[&str]) -> Option<String> {
+    for dir in [paths.skills_project(), paths.skills_user()] {
+        let skill_md = dir.join(name).join("SKILL.md");
+        if let Ok(body) = std::fs::read_to_string(&skill_md) {
+            return Some(bind_skill_args(&body, args));
+        }
+    }
+    None
+}
+
+/// Lists the names of locally available skills.
+fn list_local_skill_names(paths: &config::Paths) -> Vec<String> {
+    let mut names = Vec::new();
+    for dir in [paths.skills_project(), paths.skills_user()] {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            if entry.path().join("SKILL.md").is_file() {
+                if let Some(n) = entry.file_name().to_str() {
+                    if !names.iter().any(|e: &String| e.eq_ignore_ascii_case(n)) {
+                        names.push(n.to_string());
+                    }
+                }
+            }
+        }
+    }
+    names.sort();
+    names
+}
+
+/// Substitutes skill argument placeholders in a single pass, preventing
+/// re-expansion of substituted values.
+///
+/// Rules (matching C# `SkillArgumentBinder`):
+/// - `$$`         → literal `$`
+/// - `$ARGUMENTS` → all positional args joined by a single space (case-sensitive)
+/// - `$N` (N ≥ 1) → the N-th positional arg, or empty if out of range
+/// - `$identifier` → empty (named args from frontmatter; treated as unknown
+///                   here because the Rust TUI does not parse frontmatter)
+/// - bare `$`     → kept as-is
+pub fn bind_skill_args(body: &str, args: &[&str]) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut chars = body.char_indices().peekable();
+
+    while let Some((_, c)) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+
+        match chars.peek() {
+            Some((_, '$')) => {
+                // $$ → literal $
+                chars.next();
+                out.push('$');
+            }
+            Some((_, d)) if d.is_ascii_digit() => {
+                let d = *d;
+                let mut num_str = String::new();
+                num_str.push(d);
+                chars.next();
+                while let Some(&(_, nd)) = chars.peek() {
+                    if nd.is_ascii_digit() {
+                        num_str.push(nd);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let n: usize = num_str.parse().unwrap_or(0);
+                if n >= 1 && n <= args.len() {
+                    out.push_str(args[n - 1]);
+                }
+                // $0 or out-of-range → push nothing (renders as empty)
+            }
+            Some((_, d)) if d.is_alphabetic() || *d == '_' => {
+                let mut name = String::new();
+                while let Some(&(_, nc)) = chars.peek() {
+                    if nc.is_alphanumeric() || nc == '_' {
+                        name.push(nc);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if name == "ARGUMENTS" {
+                    out.push_str(&args.join(" "));
+                }
+                // Any other named identifier → empty (unknown; no frontmatter)
+            }
+            _ => {
+                // Bare `$` not followed by a recognisable pattern → keep.
+                out.push('$');
+            }
+        }
+    }
+
+    out
+}
+
+/// Renders transcript blocks as a Markdown document for `/export`.
+pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
+    use crate::transcript::Block;
+    let mut out = String::from("# Coda Conversation Export\n\n");
+    for block in blocks {
+        match block {
+            Block::User { text, .. } => {
+                out.push_str("## User\n\n");
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+            Block::Assistant { text, .. } => {
+                out.push_str("## Assistant\n\n");
+                out.push_str(text);
+                out.push_str("\n\n");
+            }
+            Block::Tools { activity, .. } => {
+                for call in &activity.calls {
+                    out.push_str(&format!("- tool call: {}\n", call.name));
+                    if let Some(result) = &call.result {
+                        out.push_str(&format!("- tool result: {}\n", result.chars().take(200).collect::<String>()));
+                    }
+                }
+                if !activity.calls.is_empty() {
+                    out.push('\n');
+                }
+            }
+            Block::Diff { raw } => {
+                out.push_str("```diff\n");
+                out.push_str(raw);
+                out.push_str("```\n\n");
+            }
+            // Skip non-content blocks in the export.
+            Block::Notice { .. }
+            | Block::Permission { .. }
+            | Block::Question { .. }
+            | Block::CommandOutput { .. }
+            | Block::Thinking { .. }
+            | Block::Banner { .. }
+            | Block::SessionBoundary { .. } => {}
+        }
+    }
+    out
 }
 
 /// Formats an engine response for display.
@@ -1448,6 +3435,46 @@ fn pretty(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// Returns `true` for events that bypass the 30 FPS streaming throttle.
+///
+/// Mirrors `UiActor.IsCritical` in C#: turn boundaries, errors, prompts,
+/// session lifecycle, and mode changes all get immediate frames.
+fn is_critical_event(event: &UiEvent) -> bool {
+    use coda_proto::Event;
+    match event {
+        UiEvent::TurnFinished { .. }
+        | UiEvent::Connected { .. }
+        | UiEvent::PromptRequested(_)
+        | UiEvent::PromptAnswered { .. }
+        | UiEvent::Notice { .. }
+        | UiEvent::Cleared
+        | UiEvent::ModelChanged { .. }
+        | UiEvent::DisplayModeChanged(_)
+        | UiEvent::Submitted { .. }
+        | UiEvent::Queued { .. }
+        | UiEvent::InterruptRequested => true,
+        UiEvent::Engine(inner) => match inner {
+            Event::TurnComplete { .. }
+            | Event::Error { .. }
+            | Event::LimitReached { .. }
+            | Event::AssistantTextComplete
+            | Event::ThinkingComplete { .. }
+            | Event::PermissionDecided { .. }
+            | Event::SteeringDelivered { .. } => true,
+            // Streaming events: subject to throttle.
+            Event::AssistantText { .. }
+            | Event::Thinking { .. }
+            | Event::ToolProgress { .. }
+            | Event::Usage { .. }
+            | Event::StreamProgress { .. } => false,
+            _ => true,
+        },
+        // The buffering activation seam is rare and user-visible.
+        UiEvent::EnableAssistantBuffering => true,
+        UiEvent::CommandOutput { .. } | UiEvent::DiffOutput { .. } => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1519,6 +3546,220 @@ mod tests {
     fn tolerates_a_result_missing_its_optional_fields() {
         let text = format_result("models", &json!({ "models": [{ "id": "a" }] }));
         assert!(text.contains("  a"), "got {text:?}");
+    }
+
+    #[test]
+    fn base64_encodes_rfc_4648_test_vectors() {
+        // RFC 4648 §10 test vectors.
+        assert_eq!(base64_encode(b""), "");
+        assert_eq!(base64_encode(b"f"), "Zg==");
+        assert_eq!(base64_encode(b"fo"), "Zm8=");
+        assert_eq!(base64_encode(b"foo"), "Zm9v");
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+    }
+
+    #[test]
+    fn base64_encodes_a_longer_string() {
+        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
+    }
+
+    #[test]
+    fn image_media_type_maps_supported_extensions() {
+        assert_eq!(image_media_type("png"), Some("image/png"));
+        assert_eq!(image_media_type("jpg"), Some("image/jpeg"));
+        assert_eq!(image_media_type("jpeg"), Some("image/jpeg"));
+        assert_eq!(image_media_type("gif"), Some("image/gif"));
+        assert_eq!(image_media_type("webp"), Some("image/webp"));
+    }
+
+    #[test]
+    fn image_media_type_is_case_insensitive() {
+        assert_eq!(image_media_type("PNG"), Some("image/png"));
+        assert_eq!(image_media_type("JPG"), Some("image/jpeg"));
+        assert_eq!(image_media_type("WEBP"), Some("image/webp"));
+    }
+
+    #[test]
+    fn image_media_type_rejects_unsupported_extensions() {
+        assert_eq!(image_media_type("bmp"), None);
+        assert_eq!(image_media_type("svg"), None);
+        assert_eq!(image_media_type("tiff"), None);
+        assert_eq!(image_media_type(""), None);
+    }
+
+    #[test]
+    fn parse_permission_mode_accepts_canonical_names() {
+        assert_eq!(parse_permission_mode("default"), Some("default"));
+        assert_eq!(parse_permission_mode("acceptEdits"), Some("acceptEdits"));
+        assert_eq!(parse_permission_mode("plan"), Some("plan"));
+        assert_eq!(parse_permission_mode("bypass"), Some("bypass"));
+    }
+
+    #[test]
+    fn parse_permission_mode_accepts_aliases() {
+        assert_eq!(parse_permission_mode("edits"), Some("acceptEdits"));
+        assert_eq!(parse_permission_mode("accept-edits"), Some("acceptEdits"));
+        assert_eq!(parse_permission_mode("yolo"), Some("bypass"));
+        assert_eq!(parse_permission_mode("bypassPermissions"), Some("bypass"));
+    }
+
+    #[test]
+    fn parse_permission_mode_is_case_insensitive() {
+        assert_eq!(parse_permission_mode("DEFAULT"), Some("default"));
+        assert_eq!(parse_permission_mode("BYPASS"), Some("bypass"));
+        assert_eq!(parse_permission_mode("YOLO"), Some("bypass"));
+    }
+
+    #[test]
+    fn parse_permission_mode_rejects_unknown_names() {
+        assert_eq!(parse_permission_mode("admin"), None);
+        assert_eq!(parse_permission_mode(""), None);
+    }
+
+    #[test]
+    fn marketplace_name_strips_extension_and_uses_last_segment() {
+        assert_eq!(marketplace_name_from_source("https://example.com/plugins.json"), "plugins");
+        assert_eq!(marketplace_name_from_source("https://example.com/my-marketplace"), "my-marketplace");
+        assert_eq!(marketplace_name_from_source("git@github.com:org/repo.git"), "repo");
+        assert_eq!(marketplace_name_from_source("/local/path/plugins/"), "plugins");
+    }
+
+    #[test]
+    fn bind_skill_args_substitutes_positional_placeholders() {
+        let body = "Translate to $1: $ARGUMENTS";
+        let result = bind_skill_args(body, &["French", "Hello world"]);
+        assert_eq!(result, "Translate to French: French Hello world");
+    }
+
+    #[test]
+    fn bind_skill_args_handles_missing_args_gracefully() {
+        // Out-of-range positionals render as empty (not left as literal `$3`).
+        let result = bind_skill_args("Do $1 and $3", &["first"]);
+        assert_eq!(result, "Do first and ");
+    }
+
+    #[test]
+    fn bind_skill_args_double_dollar_produces_a_literal_dollar() {
+        assert_eq!(bind_skill_args("Cost: $$10", &[]), "Cost: $10");
+    }
+
+    #[test]
+    fn bind_skill_args_double_dollar_is_not_re_expanded() {
+        // $$ → $, then $1 on the next pass must NOT be expanded.
+        assert_eq!(bind_skill_args("$$1", &["ignored"]), "$1");
+    }
+
+    #[test]
+    fn bind_skill_args_substituted_value_is_not_re_expanded() {
+        // The value "$ARGUMENTS" inserted for $1 must not trigger a second pass.
+        assert_eq!(bind_skill_args("$1", &["$ARGUMENTS"]), "$ARGUMENTS");
+    }
+
+    #[test]
+    fn bind_skill_args_positional_zero_renders_empty() {
+        assert_eq!(bind_skill_args("$0", &["a"]), "");
+    }
+
+    #[test]
+    fn bind_skill_args_unknown_identifier_renders_empty() {
+        // $nonexistent is not $ARGUMENTS and not positional → empty.
+        assert_eq!(bind_skill_args("$nonexistent", &["val"]), "");
+    }
+
+    #[test]
+    fn bind_skill_args_arguments_is_case_sensitive() {
+        // $arguments (lowercase) is NOT the special $ARGUMENTS token → empty.
+        assert_eq!(bind_skill_args("$arguments", &["val"]), "");
+    }
+
+    #[test]
+    fn build_markdown_export_includes_user_and_assistant_turns() {
+        use crate::transcript::Block;
+        let blocks = vec![
+            Block::User {
+                text: "Hello".to_string(),
+                timestamp: "09:41".to_string(),
+                pending: false,
+                queue_id: None,
+            },
+            Block::Assistant {
+                text: "World".to_string(),
+                complete: true,
+            },
+        ];
+        let md = build_markdown_export(&blocks);
+        assert!(md.contains("## User"));
+        assert!(md.contains("Hello"));
+        assert!(md.contains("## Assistant"));
+        assert!(md.contains("World"));
+    }
+
+    #[test]
+    fn build_markdown_export_is_empty_for_no_content_blocks() {
+        use crate::transcript::Block;
+        // Notice blocks are not exported.
+        let blocks = vec![Block::Notice {
+            text: "internal notice".to_string(),
+            level: crate::transcript::NoticeLevel::Info,
+        }];
+        let md = build_markdown_export(&blocks);
+        // Only the header line; no turns.
+        assert!(!md.contains("## User"));
+        assert!(!md.contains("## Assistant"));
+    }
+
+    // -- /rewind argument parsing -----------------------------------------------
+
+    #[test]
+    fn right_click_with_a_selection_copies() {
+        assert_eq!(pointer_action(true), Some(PointerAction::Copy));
+    }
+
+    #[test]
+    fn right_click_without_a_selection_pastes() {
+        assert_eq!(pointer_action(false), Some(PointerAction::Paste));
+    }
+
+    #[test]
+    fn rewind_n_defaults_to_one_when_no_arg() {
+        assert_eq!(parse_rewind_n(None), Ok(1));
+    }
+
+    #[test]
+    fn rewind_n_parses_a_valid_positive_integer() {
+        assert_eq!(parse_rewind_n(Some("3")), Ok(3));
+        assert_eq!(parse_rewind_n(Some("1")), Ok(1));
+        assert_eq!(parse_rewind_n(Some("100")), Ok(100));
+    }
+
+    #[test]
+    fn rewind_n_rejects_zero() {
+        assert!(parse_rewind_n(Some("0")).is_err());
+    }
+
+    #[test]
+    fn rewind_n_rejects_non_integer() {
+        assert!(parse_rewind_n(Some("abc")).is_err());
+        assert!(parse_rewind_n(Some("1.5")).is_err());
+        assert!(parse_rewind_n(Some("")).is_err());
+    }
+
+    #[test]
+    fn rewind_n_rejects_negative_integers() {
+        // u32 parse rejects negative strings.
+        assert!(parse_rewind_n(Some("-1")).is_err());
+        assert!(parse_rewind_n(Some("-100")).is_err());
+    }
+
+    #[test]
+    fn rewind_n_error_message_matches_c_sharp() {
+        let err = parse_rewind_n(Some("0")).unwrap_err();
+        assert!(
+            err.contains("positive integer"),
+            "error must mention 'positive integer', got: {err}"
+        );
     }
 }
 

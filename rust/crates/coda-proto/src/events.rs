@@ -36,6 +36,8 @@ pub mod event_method {
     pub const PERMISSIONS_UPDATED: &str = "event/permissionsUpdated";
     pub const SUBAGENT_BLOCKED: &str = "event/subagentBlocked";
     pub const SUBAGENT_RESULT_MODIFIED: &str = "event/subagentResultModified";
+    pub const COMPACTION_CANCELLED: &str = "event/compactionCancelled";
+    pub const POST_COMPACT_CONTEXT_INJECTED: &str = "event/postCompactContextInjected";
 }
 
 /// Status reported alongside a tool result.
@@ -138,15 +140,21 @@ pub enum Event {
     },
     ResponseRewritten {
         hook_command: String,
+        original_response: String,
         display_content: String,
+        modified_response: Option<String>,
     },
     ToolInputModified {
         hook_command: String,
         tool_name: String,
+        original_input: String,
+        modified_input: String,
     },
     ToolResultModified {
         hook_command: String,
         tool_name: String,
+        original_result: String,
+        modified_result: String,
     },
     PermissionDecided {
         hook_command: String,
@@ -172,6 +180,10 @@ pub enum Event {
         original_result: String,
         modified_result: String,
     },
+    /// A hook cancelled a compaction pass.
+    CompactionCancelled { hook_command: String, trigger: String },
+    /// A hook injected extra context immediately after compaction.
+    PostCompactContextInjected { additional_context: String },
     /// An event this build does not model. Kept so newer engines still work.
     Unknown { method: String, params: Option<Value> },
 }
@@ -349,16 +361,55 @@ struct ResponseRewrittenPayload {
     #[serde(default)]
     hook_command: String,
     #[serde(default)]
+    original_response: String,
+    #[serde(default)]
     display_content: String,
+    #[serde(default)]
+    modified_response: Option<String>,
 }
 
+/// `event/toolInputModified` carries the input before and after the hook ran.
 #[derive(Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct HookToolPayload {
+struct ToolInputModifiedPayload {
     #[serde(default)]
     hook_command: String,
     #[serde(default)]
     tool_name: String,
+    #[serde(default)]
+    original_input: String,
+    #[serde(default)]
+    modified_input: String,
+}
+
+/// `event/toolResultModified` carries the result before and after the hook ran.
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ToolResultModifiedPayload {
+    #[serde(default)]
+    hook_command: String,
+    #[serde(default)]
+    tool_name: String,
+    #[serde(default)]
+    original_result: String,
+    #[serde(default)]
+    modified_result: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CompactionCancelledPayload {
+    #[serde(default)]
+    hook_command: String,
+    #[serde(default)]
+    trigger: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PostCompactContextInjectedPayload {
+    #[serde(default)]
+    additional_context: String,
 }
 
 #[derive(Default, Deserialize)]
@@ -528,21 +579,27 @@ impl Event {
                 let p: ResponseRewrittenPayload = parse(params);
                 Event::ResponseRewritten {
                     hook_command: p.hook_command,
+                    original_response: p.original_response,
                     display_content: p.display_content,
+                    modified_response: p.modified_response,
                 }
             }
             m::TOOL_INPUT_MODIFIED => {
-                let p: HookToolPayload = parse(params);
+                let p: ToolInputModifiedPayload = parse(params);
                 Event::ToolInputModified {
                     hook_command: p.hook_command,
                     tool_name: p.tool_name,
+                    original_input: p.original_input,
+                    modified_input: p.modified_input,
                 }
             }
             m::TOOL_RESULT_MODIFIED => {
-                let p: HookToolPayload = parse(params);
+                let p: ToolResultModifiedPayload = parse(params);
                 Event::ToolResultModified {
                     hook_command: p.hook_command,
                     tool_name: p.tool_name,
+                    original_result: p.original_result,
+                    modified_result: p.modified_result,
                 }
             }
             m::PERMISSION_DECIDED => {
@@ -579,6 +636,19 @@ impl Event {
                     modified_result: p.modified_result,
                 }
             }
+            m::COMPACTION_CANCELLED => {
+                let p: CompactionCancelledPayload = parse(params);
+                Event::CompactionCancelled {
+                    hook_command: p.hook_command,
+                    trigger: p.trigger,
+                }
+            }
+            m::POST_COMPACT_CONTEXT_INJECTED => {
+                let p: PostCompactContextInjectedPayload = parse(params);
+                Event::PostCompactContextInjected {
+                    additional_context: p.additional_context,
+                }
+            }
             other => Event::Unknown {
                 method: other.to_string(),
                 params: params.cloned(),
@@ -590,11 +660,463 @@ impl Event {
     pub fn ends_turn(&self) -> bool {
         matches!(self, Event::TurnComplete { .. })
     }
+
+    /// Encodes this event as a `(method, params)` pair for a notification.
+    ///
+    /// This is the inverse of [`Event::parse`] and exists for the server half
+    /// of the protocol.  The C# host omits null-valued properties rather than
+    /// writing `null`, so optional fields are inserted only when `Some`; a
+    /// round trip through [`Event::parse`] must therefore reproduce the
+    /// original event, which is what the round-trip tests assert.
+    ///
+    /// Returns `None` for [`Event::Unknown`] with no captured method, which
+    /// cannot be re-encoded.
+    pub fn to_notification(&self) -> Option<(String, Value)> {
+        use event_method as m;
+        use serde_json::Map;
+
+        // Inserts only when present, mirroring the C# null-omitting policy.
+        fn put_opt(map: &mut Map<String, Value>, key: &str, value: &Option<String>) {
+            if let Some(v) = value {
+                map.insert(key.to_string(), Value::String(v.clone()));
+            }
+        }
+
+        fn correlation_fields(map: &mut Map<String, Value>, c: &Correlation) {
+            put_opt(map, "rootTurnId", &c.root_turn_id);
+            put_opt(map, "activityId", &c.activity_id);
+            put_opt(map, "callId", &c.call_id);
+            put_opt(map, "sourceId", &c.source_id);
+        }
+
+        let (method, params): (&str, Value) = match self {
+            Event::AssistantText { delta } => {
+                (m::ASSISTANT_TEXT, serde_json::json!({ "delta": delta }))
+            }
+            Event::AssistantTextComplete => {
+                (m::ASSISTANT_TEXT_COMPLETE, Value::Object(Map::new()))
+            }
+            Event::Thinking { delta } => (m::THINKING, serde_json::json!({ "delta": delta })),
+            Event::ThinkingComplete { elapsed_ms, thinking_tokens } => {
+                let mut map = Map::new();
+                map.insert("elapsedMs".into(), (*elapsed_ms).into());
+                if let Some(t) = thinking_tokens {
+                    map.insert("thinkingTokens".into(), (*t).into());
+                }
+                (m::THINKING_COMPLETE, Value::Object(map))
+            }
+            Event::ToolCall { tool_name, input_json, correlation } => {
+                let mut map = Map::new();
+                map.insert("toolName".into(), tool_name.clone().into());
+                map.insert("inputJson".into(), input_json.clone().into());
+                correlation_fields(&mut map, correlation);
+                (m::TOOL_CALL, Value::Object(map))
+            }
+            Event::ToolProgress { tool_name, elapsed_ms, correlation } => {
+                let mut map = Map::new();
+                map.insert("toolName".into(), tool_name.clone().into());
+                map.insert("elapsedMs".into(), (*elapsed_ms).into());
+                correlation_fields(&mut map, correlation);
+                (m::TOOL_PROGRESS, Value::Object(map))
+            }
+            Event::ToolResult { tool_name, content, is_error, status, correlation } => {
+                let mut map = Map::new();
+                map.insert("toolName".into(), tool_name.clone().into());
+                map.insert("content".into(), content.clone().into());
+                map.insert("isError".into(), (*is_error).into());
+                correlation_fields(&mut map, correlation);
+                if let Some(s) = status {
+                    map.insert("status".into(), format!("{s:?}").into());
+                }
+                (m::TOOL_RESULT, Value::Object(map))
+            }
+            Event::TurnComplete { stop_reason, interrupted, root_turn_id, activity_id } => {
+                let mut map = Map::new();
+                put_opt(&mut map, "stopReason", stop_reason);
+                map.insert("interrupted".into(), (*interrupted).into());
+                put_opt(&mut map, "rootTurnId", root_turn_id);
+                put_opt(&mut map, "activityId", activity_id);
+                (m::TURN_COMPLETE, Value::Object(map))
+            }
+            Event::Stop { stop_reason } => {
+                let mut map = Map::new();
+                put_opt(&mut map, "stopReason", stop_reason);
+                (m::STOP, Value::Object(map))
+            }
+            Event::Usage { input_tokens, output_tokens } => (
+                m::USAGE,
+                serde_json::json!({ "inputTokens": input_tokens, "outputTokens": output_tokens }),
+            ),
+            Event::Error { message } => (m::ERROR, serde_json::json!({ "message": message })),
+            Event::LimitReached { kind, message } => (
+                m::LIMIT_REACHED,
+                serde_json::json!({ "kind": kind, "message": message }),
+            ),
+            Event::StreamProgress { phase, chunks, chars, elapsed_ms } => (
+                m::STREAM_PROGRESS,
+                serde_json::json!({
+                    "phase": phase, "chunks": chunks, "chars": chars, "elapsedMs": elapsed_ms
+                }),
+            ),
+            Event::SteeringDelivered { message_ids } => (
+                m::STEERING_DELIVERED,
+                serde_json::json!({ "messageIds": message_ids }),
+            ),
+            Event::TaskCompleted { task_id, status, description, report } => {
+                let mut map = Map::new();
+                map.insert("taskId".into(), task_id.clone().into());
+                map.insert("status".into(), status.clone().into());
+                map.insert("description".into(), description.clone().into());
+                put_opt(&mut map, "report", report);
+                (m::TASK_COMPLETED, Value::Object(map))
+            }
+            Event::ScheduleLifecycle {
+                definition_id,
+                definition_name,
+                task_id,
+                state,
+                timestamp,
+                summary,
+            } => {
+                let mut map = Map::new();
+                map.insert("definitionId".into(), definition_id.clone().into());
+                put_opt(&mut map, "definitionName", definition_name);
+                put_opt(&mut map, "taskId", task_id);
+                map.insert("state".into(), state.clone().into());
+                put_opt(&mut map, "timestamp", timestamp);
+                put_opt(&mut map, "summary", summary);
+                (m::SCHEDULE_LIFECYCLE, Value::Object(map))
+            }
+            Event::PromptRewritten { hook_command, original_prompt, modified_prompt } => (
+                m::PROMPT_REWRITTEN,
+                serde_json::json!({
+                    "hookCommand": hook_command,
+                    "originalPrompt": original_prompt,
+                    "modifiedPrompt": modified_prompt
+                }),
+            ),
+            Event::ResponseRewritten {
+                hook_command,
+                original_response,
+                display_content,
+                modified_response,
+            } => {
+                let mut map = Map::new();
+                map.insert("hookCommand".into(), hook_command.clone().into());
+                map.insert("originalResponse".into(), original_response.clone().into());
+                map.insert("displayContent".into(), display_content.clone().into());
+                put_opt(&mut map, "modifiedResponse", modified_response);
+                (m::RESPONSE_REWRITTEN, Value::Object(map))
+            }
+            Event::ToolInputModified { hook_command, tool_name, original_input, modified_input } => (
+                m::TOOL_INPUT_MODIFIED,
+                serde_json::json!({
+                    "hookCommand": hook_command,
+                    "toolName": tool_name,
+                    "originalInput": original_input,
+                    "modifiedInput": modified_input
+                }),
+            ),
+            Event::ToolResultModified {
+                hook_command,
+                tool_name,
+                original_result,
+                modified_result,
+            } => (
+                m::TOOL_RESULT_MODIFIED,
+                serde_json::json!({
+                    "hookCommand": hook_command,
+                    "toolName": tool_name,
+                    "originalResult": original_result,
+                    "modifiedResult": modified_result
+                }),
+            ),
+            Event::PermissionDecided { hook_command, tool_name, decision } => (
+                m::PERMISSION_DECIDED,
+                serde_json::json!({
+                    "hookCommand": hook_command, "toolName": tool_name, "decision": decision
+                }),
+            ),
+            Event::PermissionsUpdated { hook_command, mode_applied, added_allow, added_deny } => {
+                let mut map = Map::new();
+                map.insert("hookCommand".into(), hook_command.clone().into());
+                put_opt(&mut map, "modeApplied", mode_applied);
+                map.insert("addedAllow".into(), added_allow.clone().into());
+                map.insert("addedDeny".into(), added_deny.clone().into());
+                (m::PERMISSIONS_UPDATED, Value::Object(map))
+            }
+            Event::SubagentBlocked { hook_command, task_id, reason } => (
+                m::SUBAGENT_BLOCKED,
+                serde_json::json!({
+                    "hookCommand": hook_command, "taskId": task_id, "reason": reason
+                }),
+            ),
+            Event::SubagentResultModified {
+                hook_command,
+                task_id,
+                original_result,
+                modified_result,
+            } => (
+                m::SUBAGENT_RESULT_MODIFIED,
+                serde_json::json!({
+                    "hookCommand": hook_command,
+                    "taskId": task_id,
+                    "originalResult": original_result,
+                    "modifiedResult": modified_result
+                }),
+            ),
+            Event::CompactionCancelled { hook_command, trigger } => (
+                m::COMPACTION_CANCELLED,
+                serde_json::json!({ "hookCommand": hook_command, "trigger": trigger }),
+            ),
+            Event::PostCompactContextInjected { additional_context } => (
+                m::POST_COMPACT_CONTEXT_INJECTED,
+                serde_json::json!({ "additionalContext": additional_context }),
+            ),
+            Event::Unknown { method, params } => {
+                return Some((
+                    method.clone(),
+                    params.clone().unwrap_or(Value::Object(Map::new())),
+                ));
+            }
+        };
+
+        Some((method.to_string(), params))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Encoding an event and parsing it back must reproduce it exactly.
+    ///
+    /// This is the parity net for the server half: every field the C# host
+    /// puts on the wire has to survive the round trip, so a field dropped
+    /// from either direction fails here rather than silently degrading a
+    /// client that expects it.
+    mod round_trip {
+        use super::*;
+
+        fn assert_round_trips(event: Event) {
+            let (method, params) = event
+                .to_notification()
+                .unwrap_or_else(|| panic!("{event:?} did not encode"));
+            let parsed = Event::parse(&method, Some(&params));
+            assert_eq!(
+                format!("{event:?}"),
+                format!("{parsed:?}"),
+                "round trip changed the event via {method}"
+            );
+        }
+
+        fn correlation() -> Correlation {
+            Correlation {
+                root_turn_id: Some("root".into()),
+                activity_id: Some("act".into()),
+                call_id: Some("call".into()),
+                source_id: Some("src".into()),
+            }
+        }
+
+        #[test]
+        fn every_hook_event_keeps_its_before_and_after_payloads() {
+            assert_round_trips(Event::ResponseRewritten {
+                hook_command: "cmd".into(),
+                original_response: "before".into(),
+                display_content: "shown".into(),
+                modified_response: Some("after".into()),
+            });
+            assert_round_trips(Event::ToolInputModified {
+                hook_command: "cmd".into(),
+                tool_name: "read".into(),
+                original_input: "before".into(),
+                modified_input: "after".into(),
+            });
+            assert_round_trips(Event::ToolResultModified {
+                hook_command: "cmd".into(),
+                tool_name: "read".into(),
+                original_result: "before".into(),
+                modified_result: "after".into(),
+            });
+        }
+
+        #[test]
+        fn compaction_events_round_trip() {
+            assert_round_trips(Event::CompactionCancelled {
+                hook_command: "cmd".into(),
+                trigger: "auto".into(),
+            });
+            assert_round_trips(Event::PostCompactContextInjected {
+                additional_context: "extra".into(),
+            });
+        }
+
+        #[test]
+        fn core_stream_events_round_trip() {
+            assert_round_trips(Event::AssistantText { delta: "hi".into() });
+            assert_round_trips(Event::AssistantTextComplete);
+            assert_round_trips(Event::Thinking { delta: "hmm".into() });
+            assert_round_trips(Event::ThinkingComplete {
+                elapsed_ms: 12,
+                thinking_tokens: Some(34),
+            });
+            assert_round_trips(Event::ThinkingComplete {
+                elapsed_ms: 12,
+                thinking_tokens: None,
+            });
+            assert_round_trips(Event::Usage { input_tokens: 1, output_tokens: 2 });
+            assert_round_trips(Event::Error { message: "boom".into() });
+            assert_round_trips(Event::LimitReached {
+                kind: "context".into(),
+                message: "full".into(),
+            });
+            assert_round_trips(Event::StreamProgress {
+                phase: "progress".into(),
+                chunks: 3,
+                chars: 40,
+                elapsed_ms: 7,
+            });
+        }
+
+        #[test]
+        fn tool_events_round_trip_with_correlation() {
+            assert_round_trips(Event::ToolCall {
+                tool_name: "read".into(),
+                input_json: "{}".into(),
+                correlation: correlation(),
+            });
+            assert_round_trips(Event::ToolProgress {
+                tool_name: "read".into(),
+                elapsed_ms: 5,
+                correlation: correlation(),
+            });
+            for status in [
+                ToolCallStatus::Pending,
+                ToolCallStatus::AwaitingApproval,
+                ToolCallStatus::Running,
+                ToolCallStatus::Succeeded,
+                ToolCallStatus::Failed,
+                ToolCallStatus::Cancelled,
+                ToolCallStatus::Skipped,
+            ] {
+                assert_round_trips(Event::ToolResult {
+                    tool_name: "read".into(),
+                    content: "ok".into(),
+                    is_error: false,
+                    status: Some(status),
+                    correlation: correlation(),
+                });
+            }
+        }
+
+        #[test]
+        fn turn_and_lifecycle_events_round_trip() {
+            assert_round_trips(Event::TurnComplete {
+                stop_reason: Some("end_turn".into()),
+                interrupted: false,
+                root_turn_id: Some("root".into()),
+                activity_id: Some("act".into()),
+            });
+            assert_round_trips(Event::Stop { stop_reason: None });
+            assert_round_trips(Event::SteeringDelivered {
+                message_ids: vec!["a".into(), "b".into()],
+            });
+            assert_round_trips(Event::TaskCompleted {
+                task_id: "t1".into(),
+                status: "completed".into(),
+                description: "did a thing".into(),
+                report: None,
+            });
+            assert_round_trips(Event::ScheduleLifecycle {
+                definition_id: "d1".into(),
+                definition_name: Some("nightly".into()),
+                task_id: None,
+                state: "started".into(),
+                timestamp: Some("2026-01-01T00:00:00Z".into()),
+                summary: None,
+            });
+        }
+
+        #[test]
+        fn permission_and_subagent_events_round_trip() {
+            assert_round_trips(Event::PermissionDecided {
+                hook_command: "cmd".into(),
+                tool_name: "bash".into(),
+                decision: "allow".into(),
+            });
+            assert_round_trips(Event::PermissionsUpdated {
+                hook_command: "cmd".into(),
+                mode_applied: Some("acceptEdits".into()),
+                added_allow: vec!["read".into()],
+                added_deny: vec!["bash".into()],
+            });
+            assert_round_trips(Event::SubagentBlocked {
+                hook_command: "cmd".into(),
+                task_id: "t1".into(),
+                reason: "denied".into(),
+            });
+            assert_round_trips(Event::SubagentResultModified {
+                hook_command: "cmd".into(),
+                task_id: "t1".into(),
+                original_result: "before".into(),
+                modified_result: "after".into(),
+            });
+            assert_round_trips(Event::PromptRewritten {
+                hook_command: "cmd".into(),
+                original_prompt: "before".into(),
+                modified_prompt: "after".into(),
+            });
+        }
+
+        /// The C# host omits null-valued properties rather than emitting
+        /// `null`, so absent optionals must not appear as keys at all.
+        #[test]
+        fn absent_optionals_are_omitted_not_null() {
+            let (_, params) = Event::ThinkingComplete { elapsed_ms: 1, thinking_tokens: None }
+                .to_notification()
+                .expect("encodes");
+            assert!(
+                params.get("thinkingTokens").is_none(),
+                "absent optional must be omitted, got {params}"
+            );
+
+            let (_, params) = Event::ToolCall {
+                tool_name: "read".into(),
+                input_json: "{}".into(),
+                correlation: Correlation::default(),
+            }
+            .to_notification()
+            .expect("encodes");
+            for key in ["rootTurnId", "activityId", "callId", "sourceId"] {
+                assert!(params.get(key).is_none(), "{key} must be omitted, got {params}");
+            }
+        }
+
+        /// The method names must match the C# constants verbatim.
+        #[test]
+        fn encodes_to_the_documented_method_names() {
+            let cases = [
+                (Event::AssistantTextComplete, "event/assistantTextComplete"),
+                (
+                    Event::CompactionCancelled {
+                        hook_command: String::new(),
+                        trigger: String::new(),
+                    },
+                    "event/compactionCancelled",
+                ),
+                (
+                    Event::PostCompactContextInjected { additional_context: String::new() },
+                    "event/postCompactContextInjected",
+                ),
+            ];
+            for (event, expected) in cases {
+                let (method, _) = event.to_notification().expect("encodes");
+                assert_eq!(method, expected);
+            }
+        }
+    }
+
     use serde_json::json;
 
     fn parse_event(method: &str, params: serde_json::Value) -> Event {

@@ -579,4 +579,137 @@ mod tests {
         let body = "Something went wrong with no tool name";
         assert!(try_identify_schema_rejection(body, &["tool_a", "tool_b"]).is_none());
     }
+
+    // ── Already-closed burst does not produce a second ThinkingComplete ──────
+    //
+    // When the provider sends ThinkingDone (closing the burst) and then the
+    // stream completes normally, stream_with_retries must NOT emit a second
+    // ThinkingComplete in the `if acc.thinking_burst_open` check.
+    //
+    // Mutation-verified: remove the `if acc.thinking_burst_open` guard and
+    // restore it to an unconditional emit — this test fails with 2 events.
+    #[tokio::test]
+    async fn open_burst_at_stream_end_emits_exactly_one_thinking_complete() {
+        use crate::events::CollectingSink;
+        use crate::tool::ToolQuarantine;
+
+        // A client whose only stream is: ThinkingDelta → ThinkingDone(signed) → Done.
+        // ThinkingDone closes the burst; the `if acc.thinking_burst_open` guard in
+        // stream_with_retries must be false at that point.
+        struct OneShotClient;
+        #[async_trait::async_trait]
+        impl coda_llm::LlmClient for OneShotClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, _: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let block = Content::Thinking { text: "thinking".into(), signature: Some("sig".into()) };
+                let events = vec![
+                    Ok(StreamEvent::ThinkingDelta("thinking".into())),
+                    Ok(StreamEvent::ThinkingDone(block)),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        usage: coda_llm::Usage::ZERO,
+                    }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let quarantine = ToolQuarantine::new();
+        let sink = CollectingSink::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        stream_with_retries(
+            &OneShotClient,
+            &mut request,
+            &quarantine,
+            &sink,
+            cancel,
+            &retry_cfg,
+            None,
+            &mut blocked,
+        )
+        .await
+        .unwrap();
+
+        let events = sink.take();
+        let complete_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ThinkingComplete { .. }))
+            .count();
+        assert_eq!(
+            complete_count,
+            1,
+            "exactly one ThinkingComplete must be emitted when the provider closes the burst with ThinkingDone"
+        );
+    }
+
+    // ── Burst open at stream end still emits ThinkingComplete ────────────────
+    //
+    // If the provider sends ThinkingDelta but never sends ThinkingDone (unusual
+    // but permitted), `stream_with_retries` must close the burst and emit
+    // ThinkingComplete so callers see a balanced open/close pair.
+    //
+    // Mutation-verified: remove the `if acc.thinking_burst_open` block in
+    // stream_with_retries and this test fails with 0 ThinkingComplete events.
+    #[tokio::test]
+    async fn unclosed_burst_at_stream_end_still_emits_thinking_complete() {
+        use crate::events::CollectingSink;
+        use crate::tool::ToolQuarantine;
+
+        struct OpenBurstClient;
+        #[async_trait::async_trait]
+        impl coda_llm::LlmClient for OpenBurstClient {
+            fn provider_id(&self) -> &str { "mock" }
+            async fn stream(&self, _: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                // ThinkingDelta without ThinkingDone — burst stays open when
+                // the stream completes (Done event closes the stream, not the burst).
+                let events = vec![
+                    Ok(StreamEvent::ThinkingDelta("unfinished reasoning".into())),
+                    Ok(StreamEvent::Done {
+                        stop_reason: Some("end_turn".into()),
+                        usage: coda_llm::Usage::ZERO,
+                    }),
+                ];
+                let (tx, rx) = tokio::sync::mpsc::channel(8);
+                tokio::spawn(async move { for e in events { let _ = tx.send(e).await; } });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let quarantine = ToolQuarantine::new();
+        let sink = CollectingSink::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        stream_with_retries(
+            &OpenBurstClient,
+            &mut request,
+            &quarantine,
+            &sink,
+            cancel,
+            &retry_cfg,
+            None,
+            &mut blocked,
+        )
+        .await
+        .unwrap();
+
+        let events = sink.take();
+        let complete_count = events
+            .iter()
+            .filter(|e| matches!(e, AgentEvent::ThinkingComplete { .. }))
+            .count();
+        assert_eq!(
+            complete_count,
+            1,
+            "ThinkingComplete must be emitted for a burst left open at stream end"
+        );
+    }
 }

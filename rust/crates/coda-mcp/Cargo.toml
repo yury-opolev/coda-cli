@@ -10,6 +10,7 @@ description = "MCP (Model Context Protocol) client for the Coda agent."
 [dependencies]
 coda-proto.workspace = true
 coda-tool.workspace = true
+coda-auth.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true
@@ -23,7 +24,9 @@ async-trait.workspace = true
 regex.workspace = true
 directories.workspace = true
 bytes.workspace = true
+reqwest.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
-tokio = { workspace = true, features = ["rt", "macros"] }
+tokio = { workspace = true, features = ["rt", "macros", "time"] }

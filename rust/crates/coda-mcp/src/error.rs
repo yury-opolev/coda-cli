@@ -11,6 +11,8 @@ pub enum McpTransportError {
     Json(#[from] serde_json::Error),
     #[error("RPC error {}: {}", .0.code, .0.message)]
     Rpc(ResponseError),
+    #[error("Other transport error: {0}")]
+    Other(String),
 }
 
 /// Errors that can occur when connecting to or calling an MCP server.
@@ -34,6 +36,12 @@ pub enum McpError {
     Transport(#[from] McpTransportError),
     #[error("MCP server stdout closed unexpectedly")]
     StdoutClosed,
+    /// The MCP server URL failed SSRF/scheme validation.
+    #[error("MCP server URL is unsafe: {0}")]
+    Ssrf(String),
+    /// An HTTP-level error from an HTTP MCP server.
+    #[error("MCP HTTP error: {0}")]
+    Http(String),
 }
 
 /// A connect attempt that failed with a diagnostic context.

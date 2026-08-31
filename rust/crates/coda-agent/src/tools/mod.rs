@@ -51,7 +51,7 @@ use crate::lsp::LspDiagnosticsTool;
 pub(super) const OUTPUT_TRUNCATED: &str = "… [output truncated]";
 
 pub use ask_user_question::AskUserQuestionTool;
-pub use background_task::{BackgroundTaskOutputTool, BackgroundTaskStartTool, BackgroundTaskStopTool};
+pub use background_task::{BackgroundTaskOutputTool, BackgroundTaskStartTool};
 pub use edit_file::EditTool;
 pub use exit_plan_mode::ExitPlanModeTool;
 pub use git_worktree::GitWorktreeTool;
@@ -120,6 +120,7 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(GitWorktreeTool),
         // ── LSP ───────────────────────────────────────────────────────────────
         Arc::new(LspDiagnosticsTool),
+        Arc::new(crate::lsp::LspTool),
         // ── task management ────────────────────────────────────────────────────
         Arc::new(TaskListTool),
         Arc::new(TaskGetTool),
@@ -131,7 +132,6 @@ pub fn built_in_tools() -> Vec<Arc<dyn Tool>> {
         Arc::new(TaskRecallTool),
         Arc::new(BackgroundTaskStartTool),
         Arc::new(BackgroundTaskOutputTool),
-        Arc::new(BackgroundTaskStopTool),
         // ── foreground subagent task ───────────────────────────────────────────
         Arc::new(TaskTool),
         // ── scheduling ─────────────────────────────────────────────────────────

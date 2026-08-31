@@ -348,7 +348,24 @@ impl ProtocolDecoder for Decoder {
                 }
             }
             Decoder::Responses(d) => d.decode(name, data),
-            Decoder::Messages(d) => d.decode(name, data),
+            Decoder::Messages(d) => {
+                // Copilot terminates its Anthropic-shaped `/v1/messages`
+                // stream with the OpenAI `[DONE]` sentinel, which native
+                // Anthropic never sends. The pure decoder is faithful to the
+                // real protocol and rejects it as malformed JSON, so it is
+                // absorbed here rather than teaching the shared decoder a
+                // dialect only this provider speaks.
+                //
+                // The turn is already complete at this point — `message_stop`
+                // arrives first — so this is genuinely a trailing terminator,
+                // not a missing event. Without it a working turn still ended
+                // in "could not parse the provider's response".
+                if data.trim() == "[DONE]" {
+                    Ok(Vec::new())
+                } else {
+                    d.decode(name, data)
+                }
+            }
         }
     }
 
@@ -397,6 +414,41 @@ mod tests {
         assert_eq!(
             c.endpoint_url(CopilotEndpoint::Messages),
             "https://api.githubcopilot.com/v1/messages"
+        );
+    }
+
+    /// Copilot closes its Anthropic-shaped stream with the OpenAI `[DONE]`
+    /// sentinel; native Anthropic never sends one, so the shared decoder
+    /// rejects it as malformed JSON.
+    ///
+    /// This is the bug that made the very first real turn fail: the model had
+    /// already answered correctly and the trailing terminator turned a working
+    /// turn into "could not parse the provider's response". No unit test could
+    /// have caught it — only a live call against the real endpoint.
+    #[test]
+    fn the_messages_decoder_absorbs_the_copilot_done_sentinel() {
+        let mut decoder = Decoder::Messages(AnthropicDecoder::new());
+        let events = decoder
+            .decode("", "[DONE]")
+            .expect("the [DONE] terminator must not fail the stream");
+        assert!(events.is_empty(), "the sentinel carries no events");
+    }
+
+    /// Whitespace around the sentinel must not defeat the check.
+    #[test]
+    fn the_done_sentinel_is_matched_after_trimming() {
+        let mut decoder = Decoder::Messages(AnthropicDecoder::new());
+        assert!(decoder.decode("", "  [DONE]\n").is_ok());
+    }
+
+    /// A genuinely malformed payload must still be reported — absorbing
+    /// `[DONE]` must not turn into swallowing every parse error.
+    #[test]
+    fn a_malformed_messages_payload_is_still_an_error() {
+        let mut decoder = Decoder::Messages(AnthropicDecoder::new());
+        assert!(
+            decoder.decode("", "{not json").is_err(),
+            "only the sentinel is absorbed, not arbitrary junk"
         );
     }
 

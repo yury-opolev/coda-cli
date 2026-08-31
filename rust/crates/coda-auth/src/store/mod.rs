@@ -15,7 +15,9 @@ use crate::error::AuthError;
 pub use self::encrypted_file::EncryptedFileStore;
 pub use self::keyring::KeyringStore;
 pub use self::memory::InMemoryStore;
+pub use self::dpapi::DpapiStore;
 
+pub mod dpapi;
 pub mod encrypted_file;
 pub mod keyring;
 pub mod memory;

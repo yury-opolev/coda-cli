@@ -5,6 +5,22 @@
 //! away from what they were reading. Rows that arrive while detached are
 //! counted so the UI can offer a "jump to bottom" hint.
 
+/// A stable anchor into the transcript used to preserve scroll position during
+/// a reflow (resize) or streaming growth.
+///
+/// Ported from `TranscriptViewportAnchor` in C#.  Stores the index of the
+/// transcript block whose first row was at (or just above) the viewport top,
+/// plus how many wrapped rows into that block the viewport started.  On reflow
+/// the block start is looked up in the new layout and the row offset is added
+/// to give the new absolute viewport position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ViewportAnchor {
+    /// Index of the transcript block containing the top viewport row.
+    pub block_index: usize,
+    /// Rows into that block where the viewport started.
+    pub row_within_block: usize,
+}
+
 /// How the viewport tracks new content.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Follow {
@@ -127,6 +143,36 @@ impl Viewport {
             self.follow = Follow::Detached;
             self.unread = 0;
         }
+    }
+
+    /// Updates total and height for a detached viewport, placing it at
+    /// `anchor_row` instead of clamping the old offset.  Used after a reflow
+    /// (resize or streaming growth) when the caller has resolved a stable
+    /// block-level anchor to the new global row.
+    ///
+    /// Equivalent to `ApplyContentLayout` with a resolved anchor in C#.
+    pub fn update_with_anchor(&mut self, total: usize, height: usize, anchor_row: usize) {
+        self.total = total;
+        self.height = height;
+        match self.follow {
+            Follow::Bottom => {
+                self.offset = self.max_offset();
+                self.unread = 0;
+            }
+            Follow::Detached => {
+                self.offset = anchor_row.min(self.max_offset());
+                if !self.is_scrollable() {
+                    self.attach();
+                }
+            }
+        }
+    }
+
+    /// Forces the offset to `row` (clamped), without changing the follow mode.
+    ///
+    /// Used when restoring a detached anchor after a reflow.
+    pub fn set_offset_clamped(&mut self, row: usize) {
+        self.offset = row.min(self.max_offset());
     }
 
     /// Scrolls up by `rows`, detaching from the bottom.
@@ -427,5 +473,66 @@ mod tests {
                 );
             }
         }
+    }
+
+    // --- anchor / reflow tests ---
+
+    #[test]
+    fn update_with_anchor_restores_detached_position_on_reflow() {
+        let mut viewport = viewport(100, 10);
+        // Scroll to row 30 (detached)
+        viewport.scroll_up(60);
+        assert_eq!(viewport.offset(), 30);
+        assert!(!viewport.is_following());
+
+        // Reflow: content grew to 150 rows (wider → more wrapping reduced, or narrower → more).
+        // Anchor says the old row 30 is now row 40.
+        viewport.update_with_anchor(150, 10, 40);
+
+        assert_eq!(viewport.offset(), 40);
+        assert!(!viewport.is_following());
+    }
+
+    #[test]
+    fn update_with_anchor_follows_bottom_when_not_detached() {
+        let mut viewport = viewport(100, 10);
+        assert!(viewport.is_following());
+
+        viewport.update_with_anchor(150, 10, 40);
+
+        // Following mode: bottom pinned, anchor ignored
+        assert_eq!(viewport.offset(), 140);
+        assert!(viewport.is_following());
+    }
+
+    #[test]
+    fn update_with_anchor_reattaches_when_content_fits() {
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_up(50);
+        assert!(!viewport.is_following());
+
+        // Content shrank to 5 rows — nothing to scroll
+        viewport.update_with_anchor(5, 10, 0);
+
+        assert!(viewport.is_following());
+    }
+
+    #[test]
+    fn set_offset_clamped_does_not_exceed_max() {
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_up(50);
+        // max_offset = 90
+        viewport.set_offset_clamped(999);
+        assert_eq!(viewport.offset(), 90);
+        assert!(!viewport.is_following());
+    }
+
+    #[test]
+    fn set_offset_clamped_preserves_detached_mode() {
+        let mut viewport = viewport(100, 10);
+        viewport.scroll_up(50);
+        viewport.set_offset_clamped(20);
+        assert_eq!(viewport.offset(), 20);
+        assert!(!viewport.is_following());
     }
 }

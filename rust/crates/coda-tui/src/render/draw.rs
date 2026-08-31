@@ -9,12 +9,12 @@ use coda_render::RenderLine;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::composer::Composer;
-use crate::overlay::{Browser, View as BrowserView};
-use crate::state::{PendingPrompt, UiState};
+use crate::state::UiState;
+use crate::render::glyphs;
 use crate::viewport::Viewport;
 
 /// Width of the scrollbar column.
@@ -40,15 +40,16 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
     let composer_rows = (composer_lines as u16)
         .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
         // Leave at least three transcript rows however tall the composer is.
-        // The composer costs its rows plus a border, and the status bar one
-        // more, so the budget is `height - 3 - 1 - 1`.
-        .min(area.height.saturating_sub(5).max(COMPOSER_MIN_ROWS));
+        // The composer costs its rows plus both half-block edges, and the
+        // status bar one more, so the budget is `height - 3 - 2 - 1`.
+        .min(area.height.saturating_sub(6).max(COMPOSER_MIN_ROWS));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(1),
-            Constraint::Length(composer_rows + 1), // + the panel's top border
+            // + the panel's top and bottom half-block edges
+            Constraint::Length(composer_rows + 2),
             Constraint::Length(1),
         ])
         .split(area);
@@ -173,8 +174,30 @@ pub fn draw(
     viewport: &Viewport,
     rows: &[RenderLine],
     theme: &Theme,
-    browser: Option<&Browser>,
 ) {
+    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None);
+}
+
+/// Draws the whole screen, optionally showing a pin row at the top of the
+/// transcript when the active user prompt has scrolled out of view.
+///
+/// The `pin_text` is pre-composed by `App` so that draw logic stays pure.
+/// Draws the whole screen and reports where the transcript content ended up.
+///
+/// The returned `(top_row, height)` is what turns a mouse position into a
+/// transcript row. Returning it from the draw keeps the two in step instead of
+/// duplicating the layout arithmetic in the event handler, where it would
+/// silently drift the first time the layout changed.
+pub fn draw_with_pin(
+    frame: &mut Frame,
+    state: &UiState,
+    composer: &Composer,
+    viewport: &Viewport,
+    rows: &[RenderLine],
+    theme: &Theme,
+    pin_text: Option<&str>,
+    selection: Option<&crate::selection::TranscriptSelection>,
+) -> (u16, u16) {
     let area = frame.area();
     frame.render_widget(
         Block::default().style(theme.surface()),
@@ -183,39 +206,142 @@ pub fn draw(
 
     let regions = layout(area, composer.line_count(), viewport.is_scrollable());
 
-    draw_transcript(frame, regions.transcript, viewport, rows, theme);
+    let content = draw_transcript_with_pin(
+        frame,
+        regions.transcript,
+        viewport,
+        rows,
+        theme,
+        pin_text,
+        selection,
+    );
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
     }
     draw_composer(frame, regions.composer, composer, state, theme);
     draw_status(frame, regions.status, state, viewport, theme);
 
-    if let Some(browser) = browser {
-        draw_browser(frame, centered(area, 90, 85), browser, theme);
-    }
 
-    // A prompt from the engine outranks a browser: it blocks the turn.
-    if let Some(prompt) = &state.prompt {
-        draw_prompt(frame, area, prompt, theme);
-    }
+    // Prompts are surfaces now, drawn by the stack after this returns. Their
+    // Exclusive modality is what puts them above a browser, rather than the
+    // order of these calls.
+
+    content
 }
 
-fn draw_transcript(
+fn draw_transcript_with_pin(
+    frame: &mut Frame,
+    area: Rect,
+    viewport: &Viewport,
+    rows: &[RenderLine],
+    theme: &Theme,
+    pin_text: Option<&str>,
+    selection: Option<&crate::selection::TranscriptSelection>,
+) -> (u16, u16) {
+    let width = area.width as usize;
+
+    // When a pin is active, it occupies the top row of the transcript area and
+    // the remaining rows show one fewer scroll line.
+    let (pin_area, content_area) = if pin_text.is_some() && area.height > 1 {
+        let top = Rect::new(area.x, area.y, area.width, 1);
+        let rest = Rect::new(area.x, area.y + 1, area.width, area.height - 1);
+        (Some(top), rest)
+    } else {
+        (None, area)
+    };
+
+    // Draw the pin row.
+    if let (Some(pin_area), Some(text)) = (pin_area, pin_text) {
+        let style = theme.style(Role::User);
+        let line = Line::from(Span::styled(text.to_string(), style));
+        frame.render_widget(Paragraph::new(vec![line]), pin_area);
+    }
+
+    // Draw the transcript rows.
+    let content_height = content_area.height as usize;
+    let visible = viewport.visible_range();
+    // Clamp to what the content area can show.
+    let take = visible.len().min(content_height);
+    let lines: Vec<Line> = rows
+        .get(visible.clone())
+        .unwrap_or(&[])
+        .iter()
+        .take(take)
+        .enumerate()
+        .map(|(offset, row)| {
+            let line = to_line(row, theme, width);
+            // Highlight the selected span of this row, if any. Done here
+            // rather than in `to_line` so an unselected transcript costs
+            // nothing extra.
+            match selection.and_then(|s| s.range_for_row(visible.start + offset, width)) {
+                Some((start, end)) if end > start => highlight_span(line, start, end, theme),
+                _ => line,
+            }
+        })
+        .collect();
+
+    frame.render_widget(Paragraph::new(lines).style(theme.surface()), content_area);
+
+    (content_area.y, content_area.height)
+}
+
+/// Re-styles the cells in `[start, end)` to read as selected.
+///
+/// Reverses the existing style rather than imposing a fixed colour, so the
+/// highlight works on both the light and dark themes without either needing to
+/// know about it.
+fn highlight_span(line: Line<'static>, start: usize, end: usize, _theme: &Theme) -> Line<'static> {
+    use ratatui::style::Modifier;
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cell = 0usize;
+
+    for span in line.spans {
+        let text = span.content.to_string();
+        let width = coda_render::text::width(&text);
+        let span_start = cell;
+        let span_end = cell + width;
+        cell = span_end;
+
+        // Entirely outside the selection.
+        if span_end <= start || span_start >= end {
+            out.push(Span::styled(text, span.style));
+            continue;
+        }
+
+        // Split the span at the selection boundaries, measured in cells so a
+        // wide character is never cut in half.
+        let before = crate::selection::slice_by_cells(&text, 0, start.saturating_sub(span_start));
+        let mid = crate::selection::slice_by_cells(
+            &text,
+            start.saturating_sub(span_start),
+            end.saturating_sub(span_start),
+        );
+        let after = crate::selection::slice_by_cells(&text, end.saturating_sub(span_start), width);
+
+        if !before.is_empty() {
+            out.push(Span::styled(before, span.style));
+        }
+        if !mid.is_empty() {
+            out.push(Span::styled(mid, span.style.add_modifier(Modifier::REVERSED)));
+        }
+        if !after.is_empty() {
+            out.push(Span::styled(after, span.style));
+        }
+    }
+
+    Line::from(out)
+}
+
+/// `draw_transcript` kept for tests that call it directly.
+pub fn draw_transcript(
     frame: &mut Frame,
     area: Rect,
     viewport: &Viewport,
     rows: &[RenderLine],
     theme: &Theme,
 ) {
-    let width = area.width as usize;
-    let lines: Vec<Line> = rows
-        .get(viewport.visible_range())
-        .unwrap_or(&[])
-        .iter()
-        .map(|row| to_line(row, theme, width))
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines).style(theme.surface()), area);
+    draw_transcript_with_pin(frame, area, viewport, rows, theme, None, None);
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Theme) {
@@ -231,9 +357,9 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Th
         .map(|row| {
             let inside = row >= position && row < position + size;
             let (glyph, style) = if inside {
-                ("\u{2588}", thumb_style) // █
+                (glyphs::BLOCK, thumb_style) // █
             } else {
-                ("\u{2502}", track_style) // │
+                (glyphs::RULE_VERTICAL, track_style) // │
             };
             Line::from(Span::styled(glyph, style))
         })
@@ -242,6 +368,28 @@ fn draw_scrollbar(frame: &mut Frame, area: Rect, viewport: &Viewport, theme: &Th
     frame.render_widget(Paragraph::new(lines), area);
 }
 
+/// The composer's top edge is a *lower* half block: the cell's upper half keeps
+/// the shell background and its lower half carries the panel colour, so the
+/// panel appears to begin half a row above its first content row rather than
+/// starting abruptly on a cell boundary.
+const TOP_EDGE_GLYPH: &str = glyphs::COMPOSER_TOP;
+
+/// Mirrors [`TOP_EDGE_GLYPH`] with an *upper* half block, so the panel appears
+/// to end half a row below its last content row.
+const BOTTOM_EDGE_GLYPH: &str = glyphs::COMPOSER_BOTTOM;
+
+/// Column where composer text starts, past the padded prompt marker.
+///
+/// The cursor is placed from this, so it must track the marker's width or the
+/// caret drifts away from the text it is meant to sit in.
+const COMPOSER_TEXT_COLUMN: u16 = 3;
+
+/// Breathing room between a modal's border and its contents.
+///
+/// Horizontal only: vertical padding would cost rows that modals — which are
+/// already capped to a fraction of the screen — cannot spare.
+pub const MODAL_PADDING: Padding = Padding::horizontal(1);
+
 fn draw_composer(
     frame: &mut Frame,
     area: Rect,
@@ -249,12 +397,49 @@ fn draw_composer(
     state: &UiState,
     theme: &Theme,
 ) {
-    let panel = Block::default()
-        .borders(Borders::TOP)
-        .border_style(theme.style(Role::ComposerPanelEdge))
-        .style(Style::default().bg(theme.fg(Role::ComposerPanelBackground)));
-    let inner = panel.inner(area);
-    frame.render_widget(panel, area);
+    if area.height == 0 || area.width == 0 {
+        return;
+    }
+
+    // The panel body. The edges are drawn over the first and last rows below.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(theme.fg(Role::ComposerPanelBackground))),
+        area,
+    );
+
+    // The edge rows are painted against the SHELL background, not the panel
+    // background: the half block then reads as the panel bleeding half a row
+    // outward, rather than as a lighter rim floating inside the panel.
+    let edge_style = Style::default()
+        .fg(theme.fg(Role::ComposerPanelEdge))
+        .bg(theme.fg(Role::Background));
+    let width = area.width as usize;
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            TOP_EDGE_GLYPH.repeat(width),
+            edge_style,
+        ))),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+    if area.height > 1 {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                BOTTOM_EDGE_GLYPH.repeat(width),
+                edge_style,
+            ))),
+            Rect::new(area.x, area.bottom() - 1, area.width, 1),
+        );
+    }
+
+    let inner = Rect::new(
+        area.x,
+        area.y + 1,
+        area.width,
+        area.height.saturating_sub(2),
+    );
+    if inner.height == 0 {
+        return;
+    }
 
     let prompt_style = theme.style(Role::ComposerPrompt);
     let text_style = theme.style(Role::ComposerText);
@@ -263,10 +448,13 @@ fn draw_composer(
         .lines()
         .enumerate()
         .map(|(index, line)| {
+            // A leading space keeps the glyph off the terminal edge; the
+            // continuation indent matches its width so wrapped lines align
+            // under the first one's text.
             let marker = if index == 0 {
-                if state.is_busy() { "\u{22EF} " } else { "\u{276F} " }
+                if state.is_busy() { glyphs::BUSY_PADDED } else { glyphs::PROMPT_PADDED }
             } else {
-                "  "
+                glyphs::PROMPT_CONTINUATION
             };
             Line::from(vec![
                 Span::styled(marker, prompt_style),
@@ -279,7 +467,7 @@ fn draw_composer(
 
     // Place the hardware cursor so the terminal draws it for us.
     let (line, column) = composer.cursor_position();
-    let x = inner.x + 2 + column as u16;
+    let x = inner.x + COMPOSER_TEXT_COLUMN + column as u16;
     let y = inner.y + line as u16;
     if x < inner.right() && y < inner.bottom() {
         frame.set_cursor_position((x, y));
@@ -300,28 +488,28 @@ fn draw_status(
 
     if let Some(model) = &state.model {
         spans.push(Span::styled(
-            format!("\u{2502} {model} "),
+            format!("{} {model} ", glyphs::RULE_VERTICAL),
             theme.style(Role::Notification),
         ));
     }
 
     if let Some(percent) = state.usage.percent_used() {
         spans.push(Span::styled(
-            format!("\u{2502} context {percent}% "),
+            format!("{} context {percent}% ", glyphs::RULE_VERTICAL),
             theme.style(Role::Notification),
         ));
     }
 
     if state.interrupting {
         spans.push(Span::styled(
-            "\u{2502} interrupting… ",
+            format!("{} interrupting… ", glyphs::RULE_VERTICAL),
             theme.style(Role::Warning),
         ));
     }
 
     if !state.queued.is_empty() {
         spans.push(Span::styled(
-            format!("\u{2502} {} queued ", state.queued.len()),
+            format!("{} {} queued ", glyphs::RULE_VERTICAL, state.queued.len()),
             theme.style(Role::PendingUser),
         ));
     }
@@ -329,7 +517,7 @@ fn draw_status(
     // The jump-to-bottom hint only matters when content arrived unseen.
     if viewport.unread() > 0 {
         spans.push(Span::styled(
-            format!("\u{2502} {} new \u{2193} Ctrl+End ", viewport.unread()),
+            format!("{} {} new {} Ctrl+End ", glyphs::RULE_VERTICAL, viewport.unread(), glyphs::ARROW_DOWN),
             theme.style(Role::PromptAccent),
         ));
     }
@@ -340,232 +528,59 @@ fn draw_status(
     );
 }
 
-fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Theme) {
-    let (title, body, hint) = match prompt {
-        PendingPrompt::Permission { tool, preview } => (
-            "Permission required",
-            format!("{tool}\n\n{preview}"),
-            "y: allow    n: deny    Esc: deny",
-        ),
-        PendingPrompt::Question { question, options, .. } => {
-            let body = if options.is_empty() {
-                question.clone()
-            } else {
-                let list = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, option)| format!("  {}. {option}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("{question}\n\n{list}")
-            };
-            ("Question", body, "\u{2191}\u{2193}: choose    Enter: answer")
-        }
-        PendingPrompt::PlanApproval { plan } => (
-            "Approve plan?",
-            plan.clone(),
-            "y: approve    n: reject    Esc: reject",
-        ),
-    };
-
-    let region = centered(area, 70, 60);
+/// Draws one surface: chrome, its pre-rendered lines, its hints and its caret.
+///
+/// The surface has already scrolled and clipped its own content, so this is
+/// pure placement. Keeping the two apart is what lets a surface be tested
+/// without a terminal.
+pub fn draw_surface(
+    frame: &mut Frame,
+    rendered: &crate::surface::stack::RenderedSurface,
+    theme: &Theme,
+) {
+    let region = rendered.region;
+    if region.width == 0 || region.height == 0 {
+        return;
+    }
     frame.render_widget(Clear, region);
 
     let block = Block::default()
-        .title(format!(" {title} "))
+        .title(format!(" {} ", rendered.title))
         .borders(Borders::ALL)
         .border_style(theme.style(Role::PromptAccent))
+        .padding(MODAL_PADDING)
         .style(theme.surface());
-    let inner = block.inner(region);
     frame.render_widget(block, region);
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
+    // Geometry comes from the same helper the stack used, so the surface is
+    // drawn into exactly the area it scrolled itself against.
+    frame.render_widget(Paragraph::new(rendered.lines.clone()), rendered.content);
 
-    frame.render_widget(
-        Paragraph::new(body)
-            .style(theme.style(Role::PromptText))
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(hint).style(theme.style(Role::Notification)),
-        chunks[1],
-    );
-}
-
-/// Draws a browser overlay over the whole frame.
-///
-/// Layout matches the C# overlays: a title row, the list or detail body, a
-/// status row and a footer of key hints.
-pub fn draw_browser(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .title(format!(" {} ", browser.title()))
-        .borders(Borders::ALL)
-        .border_style(theme.style(Role::PromptAccent))
-        .style(theme.surface());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-        ])
-        .split(inner);
-
-    match browser.view() {
-        BrowserView::List => draw_browser_list(frame, chunks[0], browser, theme),
-        BrowserView::Detail => draw_browser_detail(frame, chunks[0], browser, theme),
-    }
-
-    // The status row shows the filter while one is being typed.
-    let status = match browser.filter_text() {
-        Some(filter) => format!("/{filter}"),
-        None => browser.status().to_string(),
-    };
-    frame.render_widget(
-        Paragraph::new(status).style(theme.style(Role::Notification)),
-        chunks[1],
-    );
-    frame.render_widget(
-        Paragraph::new(browser.footer().to_string()).style(theme.style(Role::Notification)),
-        chunks[2],
-    );
-}
-
-fn draw_browser_list(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
-    let height = area.height as usize;
-    let width = area.width as usize;
-    if height == 0 || width == 0 {
-        return;
-    }
-
-    // Keep the selection on screen without letting the window run past the end.
-    let selected = browser.selected_index();
-    let offset = selected.saturating_sub(height.saturating_sub(1));
-    let items = browser.visible_items();
-
-    if items.is_empty() {
+    let footer =
+        crate::surface::chrome::footer(region, &rendered.hints, rendered.placement);
+    if footer.height > 0 {
+        // Wrapped, not truncated. A hint line that runs past the border loses
+        // whatever is on the right — which is where "Esc: cancel" sits, the
+        // one hint a stuck user most needs.
         frame.render_widget(
-            Paragraph::new("(nothing to show)").style(theme.style(Role::Notification)),
-            area,
+            Paragraph::new(rendered.hints.clone())
+                .style(theme.style(Role::Notification))
+                .wrap(Wrap { trim: true }),
+            footer,
         );
-        return;
     }
 
-    let widths = fit_columns(browser, width);
-
-    let lines: Vec<Line> = items
-        .iter()
-        .enumerate()
-        .skip(offset)
-        .take(height)
-        .map(|(index, item)| {
-            let text = format_columns(browser, item, &widths);
-            let text = text::truncate(&text, width);
-
-            let style = if index == selected {
-                theme.style_on(Role::SelectionText, Role::SelectionBackground)
-            } else {
-                theme.style(Role::Assistant)
-            };
-            // Pad the selected row so its highlight spans the full width.
-            let padding = width.saturating_sub(text::width(&text));
-            Line::from(Span::styled(format!("{text}{}", " ".repeat(padding)), style))
-        })
-        .collect();
-
-    frame.render_widget(Paragraph::new(lines), area);
-}
-
-/// Chooses a display width for each column so the row fits the viewport.
-///
-/// Columns declare a maximum, but a narrow terminal cannot honour all of them.
-/// Rather than letting the rightmost columns fall off the edge, the surplus is
-/// taken from the widest columns first, which preserves short status and
-/// version columns that carry most of the signal per cell.
-fn fit_columns(browser: &Browser, available: usize) -> Vec<usize> {
-    let mut widths: Vec<usize> = browser.columns().iter().map(|c| c.max_width).collect();
-    if widths.is_empty() {
-        return widths;
+    if let Some((x, y)) = rendered.cursor {
+        if x < rendered.content.right() && y < rendered.content.bottom() {
+            frame.set_cursor_position((x, y));
+        }
     }
-
-    let separators = widths.len().saturating_sub(1);
-    let budget = available.saturating_sub(separators);
-
-    let mut total: usize = widths.iter().sum();
-    while total > budget {
-        // Shrink the widest column by one cell, never below one.
-        let Some((index, _)) = widths
-            .iter()
-            .enumerate()
-            .filter(|(_, &w)| w > 1)
-            .max_by_key(|(_, &w)| w)
-        else {
-            break;
-        };
-        widths[index] -= 1;
-        total -= 1;
-    }
-    widths
 }
 
-/// Renders one row's cells into a padded, separated line.
-fn format_columns(browser: &Browser, item: &crate::overlay::Item, widths: &[usize]) -> String {
-    browser
-        .columns()
-        .iter()
-        .enumerate()
-        .map(|(i, _)| {
-            let width = widths.get(i).copied().unwrap_or(0);
-            let cell = item.cells.get(i).map(String::as_str).unwrap_or("");
-            let cell = text::truncate_with_ellipsis(cell, width);
-            let padding = width.saturating_sub(text::width(&cell));
-            format!("{cell}{}", " ".repeat(padding))
-        })
-        .collect::<Vec<_>>()
-        .join(" ")
-}
 
-fn draw_browser_detail(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Theme) {
-    let lines: Vec<Line> = browser
-        .detail_lines()
-        .iter()
-        .skip(browser.detail_scroll())
-        .take(area.height as usize)
-        .map(|line| Line::from(Span::styled(line.clone(), theme.style(Role::Assistant))))
-        .collect();
 
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), area);
-}
 
-/// A rectangle centred within `area`, sized as a percentage of it.
-fn centered(area: Rect, percent_x: u16, percent_y: u16) -> Rect {
-    let vertical = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(area);
 
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vertical[1])[1]
-}
 
 #[cfg(test)]
 mod tests {
@@ -589,21 +604,21 @@ mod tests {
     fn layout_reserves_rows_for_the_composer_and_status() {
         let regions = layout(area(80, 24), 1, false);
         assert_eq!(regions.status.height, 1);
-        assert_eq!(regions.composer.height, 2); // one row plus the border
-        assert_eq!(regions.transcript.height, 21);
+        assert_eq!(regions.composer.height, 3); // one row plus both edges
+        assert_eq!(regions.transcript.height, 20);
     }
 
     #[test]
     fn the_composer_grows_with_its_content() {
         let regions = layout(area(80, 24), 5, false);
-        assert_eq!(regions.composer.height, 6);
-        assert_eq!(regions.transcript.height, 17);
+        assert_eq!(regions.composer.height, 7);
+        assert_eq!(regions.transcript.height, 16);
     }
 
     #[test]
     fn the_composer_stops_growing_at_its_cap() {
         let regions = layout(area(80, 40), 50, false);
-        assert_eq!(regions.composer.height, COMPOSER_MAX_ROWS + 1);
+        assert_eq!(regions.composer.height, COMPOSER_MAX_ROWS + 2);
     }
 
     #[test]
@@ -722,17 +737,6 @@ mod tests {
         assert!(plain_text(&line).starts_with(" \u{25CF} "));
     }
 
-    #[test]
-    fn the_centred_region_stays_inside_its_area() {
-        for (width, height) in [(80u16, 24u16), (20, 10), (200, 60), (4, 4)] {
-            let outer = area(width, height);
-            let inner = centered(outer, 70, 60);
-            assert!(inner.right() <= outer.right());
-            assert!(inner.bottom() <= outer.bottom());
-            assert!(inner.x >= outer.x);
-            assert!(inner.y >= outer.y);
-        }
-    }
 
     #[test]
     fn columns_keep_their_widths_when_they_all_fit() {
@@ -743,7 +747,7 @@ mod tests {
                 crate::overlay::Column::new("b", 10),
             ],
         );
-        assert_eq!(fit_columns(&browser, 80), vec![5, 10]);
+        assert_eq!(browser.fit_columns(80), vec![5, 10]);
     }
 
     #[test]
@@ -756,7 +760,7 @@ mod tests {
                 crate::overlay::Column::new("c", 30),
             ],
         );
-        let widths = fit_columns(&browser, 40);
+        let widths = browser.fit_columns(40);
         let total: usize = widths.iter().sum::<usize>() + widths.len() - 1;
 
         assert!(total <= 40, "columns {widths:?} still overflow");
@@ -772,7 +776,7 @@ mod tests {
                 crate::overlay::Column::new("b", 40),
             ],
         );
-        let widths = fit_columns(&browser, 30);
+        let widths = browser.fit_columns(30);
         assert_eq!(widths[0], 4, "the narrow column was raided first");
         assert!(widths[1] < 40);
     }
@@ -788,7 +792,7 @@ mod tests {
             ],
         );
         for available in [0usize, 1, 2, 5] {
-            for width in fit_columns(&browser, available) {
+            for width in browser.fit_columns(available) {
                 assert!(width >= 1, "a column collapsed to nothing");
             }
         }
@@ -807,8 +811,8 @@ mod tests {
             "x",
             vec!["ab".into(), "a rather long value here".into()],
         );
-        let widths = fit_columns(&browser, 40);
-        let row = format_columns(&browser, &item, &widths);
+        let widths = browser.fit_columns(40);
+        let row = browser.format_columns(&item, &widths);
 
         assert!(text::width(&row) <= 40, "row {row:?} overflows");
         assert!(row.starts_with("ab "), "cells should be padded: {row:?}");

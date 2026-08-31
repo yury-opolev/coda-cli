@@ -8,15 +8,17 @@
 //! 2. For each matching hook (in configuration order):
 //!    a. Check trust guard (project / plugin hooks).
 //!    b. Apply per-hook timeout (hook override → event default).
-//!    c. Dispatch to the executor (shell, HTTP, or unsupported handler).
+//!    c. Dispatch to the executor (shell, HTTP, or agent-type handler).
 //!    d. Apply fail-open / fail-closed policy on timeout / error.
 //!    e. Stop iterating when `continue_execution = false`.
 //! 3. Merge outputs by event-specific rules.
 
+use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use chrono::Utc;
 use tokio_util::sync::CancellationToken;
 
 use super::content_hash::HookContentHash;
@@ -24,11 +26,13 @@ use super::matcher::HookMatcher;
 use super::output::{
     AgentResponseResult, HookOutput, PermissionDecision, PermissionRequestResult,
     PostToolUseResult, PreCompactResult, PostCompactResult, SubagentStartResult,
-    SubagentStopResult, UserHookResult,
+    SubagentStopResult, UserHookResult, UserPromptSubmitResult, UserPromptSubmitShape,
 };
 use super::policy::HookEventPolicy;
+use super::run_log::{HookRunEntry, HookRunLog};
 use super::trust_guard::HookTrustGuard;
 use super::{HookScope, UserHook};
+use crate::subagents::{SubagentFactory, SubagentRequest};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Executor trait
@@ -119,6 +123,15 @@ pub struct HookRunner {
     hooks: Vec<UserHook>,
     executor: Arc<dyn HookExecutor>,
     trust_guard: Option<Arc<HookTrustGuard>>,
+    /// Optional run log: records each hook's outcome + duration.
+    /// Caller-cancelled runs are excluded from the log.
+    run_log: Option<Arc<HookRunLog>>,
+    /// Hook-free subagent factory for `agent`-type hooks.
+    /// MUST be constructed without a `HookRunner` to prevent hook re-entrancy.
+    hook_subagent_factory: Option<Arc<dyn SubagentFactory>>,
+    /// Allowlist of hostnames that `http`-type hooks are permitted to call.
+    /// An empty list means all HTTP hooks are refused (security: fail-closed).
+    http_hook_allowlist: Vec<String>,
 
     // Fast-path flags so callers can skip entire event types cheaply.
     pub has_pre_tool_use: bool,
@@ -150,6 +163,18 @@ impl HookRunner {
         executor: Arc<dyn HookExecutor>,
         trust_guard: Option<Arc<HookTrustGuard>>,
     ) -> Self {
+        Self::build(hooks, executor, trust_guard, None, None, Vec::new())
+    }
+
+    /// Full constructor: executor + trust guard + run log + agent-hook factory + HTTP allowlist.
+    pub fn build(
+        hooks: Vec<UserHook>,
+        executor: Arc<dyn HookExecutor>,
+        trust_guard: Option<Arc<HookTrustGuard>>,
+        run_log: Option<Arc<HookRunLog>>,
+        hook_subagent_factory: Option<Arc<dyn SubagentFactory>>,
+        http_hook_allowlist: Vec<String>,
+    ) -> Self {
         let has = |ev: &str| hooks.iter().any(|h| h.event.eq_ignore_ascii_case(ev));
         let any_mutates_display = hooks.iter().any(|h| {
             h.event.eq_ignore_ascii_case("AgentResponse")
@@ -176,7 +201,19 @@ impl HookRunner {
             hooks,
             executor,
             trust_guard,
+            run_log,
+            hook_subagent_factory,
+            http_hook_allowlist,
         }
+    }
+
+    /// Returns the 0-based index of `hook` in `self.hooks` by pointer equality.
+    /// Matches C# `IndexOf` (reference equality on the configured list).
+    fn hook_index_of(&self, hook: &UserHook) -> usize {
+        self.hooks
+            .iter()
+            .position(|h| std::ptr::eq(h as *const UserHook, hook as *const UserHook))
+            .unwrap_or(0)
     }
 
     // ── Public run methods ────────────────────────────────────────────────────
@@ -334,6 +371,34 @@ impl HookRunner {
         }
     }
 
+    /// Runs all `UserPromptSubmit` hooks.  **Fail-closed** — a timeout or error
+    /// must block the prompt, not silently allow it through.
+    ///
+    /// # Security note
+    /// This is the primary gate for prompt-level policy.  `allowedTools` from
+    /// multiple hooks is **intersected** (most restrictive wins); using union
+    /// here would allow tools that any one hook intended to restrict.
+    pub async fn run_user_prompt_submit(
+        &self,
+        prompt: &str,
+        attachments: &[String],
+        history_length: usize,
+        model: &str,
+        permission_mode: &str,
+        depth: u32,
+        cancel: CancellationToken,
+    ) -> UserPromptSubmitResult {
+        let matching = self.matching("UserPromptSubmit", None);
+        if matching.is_empty() {
+            return UserPromptSubmitResult::ALLOW;
+        }
+        let payload = build_user_prompt_submit_payload(
+            prompt, attachments, history_length, model, permission_mode, depth,
+        );
+        let pairs = self.run_with_pairs(&matching, "UserPromptSubmit", &payload, cancel).await;
+        merge_user_prompt_submit(pairs)
+    }
+
     // ── Internal helpers ─────────────────────────────────────────────────────
 
     /// Returns the hooks that match `event_name` and (optionally) `tool_name`.
@@ -393,6 +458,8 @@ impl HookRunner {
     }
 
     /// Run a single hook, applying trust check, timeout, and fail-open policy.
+    /// Records the outcome to the run log unless the caller cancelled the token
+    /// (caller-cancelled runs are excluded from the audit log).
     async fn run_single(
         &self,
         hook: &UserHook,
@@ -408,6 +475,15 @@ impl HookRunner {
         if let Some(guard) = &self.trust_guard {
             if hook.scope == HookScope::Project || hook.plugin_origin.is_some() {
                 if !guard.can_run(hook) {
+                    // Record "skipped" with zero duration.
+                    if let Some(log) = &self.run_log {
+                        let idx = self.hook_index_of(hook);
+                        log.record(idx, HookRunEntry {
+                            ran_at: Utc::now(),
+                            outcome: "skipped".into(),
+                            duration_ms: 0,
+                        });
+                    }
                     // Untrusted: apply fail-open/closed policy.
                     return if fail_open {
                         HookOutput::no_op()
@@ -426,15 +502,17 @@ impl HookRunner {
             }
         }
 
+        let start = Instant::now();
         let exec_result = self.dispatch(hook, payload, cancel.clone(), timeout_secs).await;
+        let duration_ms = start.elapsed().as_millis() as i64;
 
-        match exec_result {
+        let output = match exec_result {
             // Hook ran and produced output.
             Ok(stdout) => HookOutput::parse(&stdout),
 
-            // Hook timed out (our own CancellationToken fired, not caller's).
+            // Hook-specific timeout (our own timer fired, not caller's token).
             Err(ExecError::Timeout) => {
-                if fail_open {
+                let out = if fail_open {
                     HookOutput::no_op()
                 } else {
                     HookOutput {
@@ -443,12 +521,40 @@ impl HookRunner {
                         continue_execution: false,
                         specific: None,
                     }
+                };
+                // "timeout" IS recorded.
+                if let Some(log) = &self.run_log {
+                    let idx = self.hook_index_of(hook);
+                    log.record(idx, HookRunEntry {
+                        ran_at: Utc::now(),
+                        outcome: "timeout".into(),
+                        duration_ms,
+                    });
                 }
+                return out;
             }
 
-            // Caller cancellation — propagate by returning a no-op (the caller
-            // checks the cancel token and will exit before acting on it).
-            Err(ExecError::Cancelled) => HookOutput::no_op(),
+            // Caller cancellation — propagate as no-op but do NOT record.
+            Err(ExecError::Cancelled) => return HookOutput::no_op(),
+
+            // A handler type this build cannot dispatch has NOT approved
+            // anything, so it must take the event's fail-open policy rather
+            // than parsing as a silent success.  Treating it as a no-op would
+            // turn a fail-closed gate into an allow.
+            Err(ExecError::Unsupported(kind)) => {
+                if fail_open {
+                    HookOutput::no_op()
+                } else {
+                    HookOutput {
+                        decision: Some("block".into()),
+                        reason: Some(format!(
+                            "hook handler type '{kind}' is not supported by this build"
+                        )),
+                        continue_execution: false,
+                        specific: None,
+                    }
+                }
+            }
 
             // Any other error.
             Err(ExecError::Other(msg)) => {
@@ -463,7 +569,26 @@ impl HookRunner {
                     }
                 }
             }
+        };
+
+        // Record the outcome (excluding caller-cancelled, already handled above).
+        if let Some(log) = &self.run_log {
+            let outcome = if !output.continue_execution {
+                "abort"
+            } else if output.is_blocking() {
+                "blocked"
+            } else {
+                "allow"
+            };
+            let idx = self.hook_index_of(hook);
+            log.record(idx, HookRunEntry {
+                ran_at: Utc::now(),
+                outcome: outcome.into(),
+                duration_ms,
+            });
         }
+
+        output
     }
 
     /// Dispatch a hook to the appropriate handler.
@@ -508,10 +633,110 @@ impl HookRunner {
                     }
                 }
             }
-            // HTTP and other handler types are not yet dispatched in Rust —
-            // apply the event's fail-open policy (unsupported → no-op if fail-open,
-            // or block if fail-closed).
-            _ => Ok(String::new()),
+
+            "http" => {
+                let url = match &hook.url {
+                    Some(u) if !u.trim().is_empty() => u.clone(),
+                    _ => return Err(ExecError::Other("http hook has no URL".into())),
+                };
+
+                // Fail-closed: an empty allowlist means no HTTP hooks are permitted.
+                if self.http_hook_allowlist.is_empty() {
+                    tracing::warn!(url = %url, "http hook refused: no allowlist configured");
+                    return Err(ExecError::Other(
+                        "http hook refused: no HTTP hook allowlist is configured".into(),
+                    ));
+                }
+
+                // Validate URL and run SSRF protection under the timeout.
+                let hook_cancel = CancellationToken::new();
+                let result = tokio::select! {
+                    r = dispatch_http_hook(&url, payload, &self.http_hook_allowlist, hook_cancel.clone()) => r,
+                    _ = cancel.cancelled() => return Err(ExecError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                        hook_cancel.cancel();
+                        return Err(ExecError::Timeout);
+                    }
+                };
+                result.map_err(ExecError::Other)
+            }
+
+            "agent" => {
+                let rule = match &hook.hook_prompt {
+                    Some(r) if !r.trim().is_empty() => r.clone(),
+                    _ => {
+                        return Err(ExecError::Other(
+                            "agent hook has no hook_prompt rule".into(),
+                        ))
+                    }
+                };
+
+                // Fail-open: no factory = treat as not supported
+                let factory = match &self.hook_subagent_factory {
+                    Some(f) => f.clone(),
+                    None => return Err(ExecError::Unsupported("agent (no factory)".into())),
+                };
+
+                // Extract depth from payload (default 0 if absent/unparseable).
+                let payload_depth: u32 =
+                    serde_json::from_str::<serde_json::Value>(payload)
+                        .ok()
+                        .and_then(|v| v.get("depth").and_then(|d| d.as_u64()))
+                        .map(|d| d as u32)
+                        .unwrap_or(0);
+
+                // Depth limit: fail-open (return no-op, not a block).
+                use crate::subagents::MAX_SUBAGENT_DEPTH;
+                if payload_depth >= MAX_SUBAGENT_DEPTH {
+                    tracing::warn!(
+                        depth = payload_depth,
+                        max = MAX_SUBAGENT_DEPTH,
+                        "agent hook skipped: would exceed max subagent depth"
+                    );
+                    return Ok(String::new()); // no-op output
+                }
+
+                let agent_type = hook.agent_type.clone().unwrap_or_else(|| "general-purpose".into());
+                let subagent_depth = payload_depth + 1;
+                let task_id = uuid::Uuid::new_v4().simple().to_string();
+
+                let prompt = build_agent_hook_prompt(&rule, payload);
+                let request = SubagentRequest::foreground(
+                    agent_type,
+                    prompt,
+                    task_id,
+                    subagent_depth,
+                );
+
+                // Run the hook-free subagent under the timeout.
+                let hook_cancel = CancellationToken::new();
+                let result = tokio::select! {
+                    r = factory.spawn(request, Arc::new(crate::events::NullSink), hook_cancel.clone()) => r,
+                    _ = cancel.cancelled() => return Err(ExecError::Cancelled),
+                    _ = tokio::time::sleep(Duration::from_secs(timeout_secs)) => {
+                        hook_cancel.cancel();
+                        return Err(ExecError::Timeout);
+                    }
+                };
+
+                match result {
+                    Ok(output) => {
+                        // Parse the model's JSON answer: {"ok": true/false, "reason": "..."}
+                        Ok(parse_agent_hook_result(&output))
+                    }
+                    Err(msg) => {
+                        // Concurrency slot exhausted → fail-open (return no-op).
+                        if msg.contains("slots are taken") || msg.contains("slot") {
+                            tracing::warn!("agent hook skipped: all concurrency slots are taken");
+                            Ok(String::new())
+                        } else {
+                            Err(ExecError::Other(msg))
+                        }
+                    }
+                }
+            }
+
+            other => Err(ExecError::Unsupported(other.to_string())),
         }
     }
 }
@@ -523,7 +748,214 @@ impl HookRunner {
 enum ExecError {
     Timeout,
     Cancelled,
+    /// The hook declares a handler type this build cannot run.
+    Unsupported(String),
     Other(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HTTP hook helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// POST the payload to `url`, returning the response body.
+/// Validates the URL against `allowlist` and performs SSRF IP checks.
+async fn dispatch_http_hook(
+    url: &str,
+    payload: &str,
+    allowlist: &[String],
+    cancel: CancellationToken,
+) -> Result<String, String> {
+    validate_http_url(url, allowlist)?;
+    let vetted = check_ssrf(url, cancel.clone()).await?;
+
+    let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
+
+    // Pin the connection to an address we actually vetted.
+    //
+    // `check_ssrf` resolves the host and rejects blocked ranges, but reqwest
+    // would otherwise resolve the name again at connect time — so a DNS server
+    // that answers with a public address on the first lookup and 169.254.169.254
+    // on the second slips straight past the check. Overriding resolution with
+    // the vetted address closes that window: the socket goes where we looked.
+    if let (Some(host), Some(ip)) = (
+        url.parse::<reqwest::Url>().ok().and_then(|u| u.host_str().map(str::to_owned)),
+        vetted.first().copied(),
+    ) {
+        let port = url
+            .parse::<reqwest::Url>()
+            .ok()
+            .and_then(|u| u.port_or_known_default())
+            .unwrap_or(443);
+        builder = builder.resolve(&host, std::net::SocketAddr::new(ip, port));
+    }
+
+    let client = builder.build().map_err(|e| format!("http client build failed: {e}"))?;
+
+    let response = tokio::select! {
+        r = client.post(url).header("content-type", "application/json").body(payload.to_owned()).send() => {
+            r.map_err(|e| format!("HTTP request failed: {e}"))?
+        }
+        _ = cancel.cancelled() => return Err("http hook cancelled".into()),
+    };
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+
+    if !status.is_success() {
+        let preview = if body.len() > 200 { &body[..200] } else { &body };
+        return Err(format!("HTTP {}: {preview}", status.as_u16()));
+    }
+
+    Ok(body)
+}
+
+/// Validate the URL against scheme rules, credentials check, and allowlist.
+pub(crate) fn validate_http_url(url: &str, allowlist: &[String]) -> Result<(), String> {
+    let parsed: reqwest::Url =
+        url.parse().map_err(|_| format!("invalid URL: {url}"))?;
+
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("URL must not contain embedded credentials".into());
+    }
+
+    let scheme = parsed.scheme();
+
+    if scheme == "http" {
+        let host = parsed.host_str().unwrap_or("");
+        let is_loopback = host == "127.0.0.1"
+            || host == "::1"
+            || host.eq_ignore_ascii_case("localhost");
+        if !is_loopback {
+            return Err("http (non-TLS) is only permitted for loopback addresses".into());
+        }
+    } else if scheme != "https" {
+        return Err(format!("unsupported URL scheme: {scheme}"));
+    }
+
+    let host = parsed.host_str().unwrap_or("");
+    if !allowlist.iter().any(|a| a.eq_ignore_ascii_case(host)) {
+        return Err(format!("host '{host}' is not in the HTTP hook allowlist"));
+    }
+
+    Ok(())
+}
+
+/// Resolve `url`'s host and refuse if any resolved address is in a blocked range.
+async fn check_ssrf(url: &str, cancel: CancellationToken) -> Result<Vec<IpAddr>, String> {
+    let parsed: reqwest::Url = url.parse().map_err(|_| "invalid URL")?;
+    let host = parsed.host_str().unwrap_or("");
+
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        if is_blocked_address(ip) {
+            return Err(format!("SSRF: IP address {ip} is in a blocked range"));
+        }
+        // A literal address needs no resolution, so there is nothing to pin.
+        return Ok(Vec::new());
+    }
+
+    let port = parsed.port_or_known_default().unwrap_or(443);
+    let lookup_target = format!("{host}:{port}");
+    let addrs = tokio::select! {
+        r = tokio::net::lookup_host(&lookup_target) => {
+            r.map_err(|e| format!("SSRF: DNS resolution failed for '{host}': {e}"))?
+        }
+        _ = cancel.cancelled() => return Err("SSRF check cancelled".into()),
+    };
+
+    let addrs: Vec<_> = addrs.collect();
+    if addrs.is_empty() {
+        return Err(format!("SSRF: DNS resolution returned no addresses for '{host}'"));
+    }
+
+    for addr in &addrs {
+        if is_blocked_address(addr.ip()) {
+            return Err(format!(
+                "SSRF: '{}' resolves to blocked address {}",
+                host,
+                addr.ip()
+            ));
+        }
+    }
+
+    // Hand back the vetted addresses so the caller can connect to one of
+    // *these* rather than re-resolving. See `dispatch_http_hook`.
+    Ok(addrs.iter().map(|a| a.ip()).collect())
+}
+
+/// Returns `true` for IP addresses in RFC-1918, loopback, link-local, and
+/// metadata service ranges that must not be reachable from a hook.
+pub(crate) fn is_blocked_address(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            if o[0] == 127 { return true; }
+            if o[0] == 10 { return true; }
+            if o[0] == 172 && (16..=31).contains(&o[1]) { return true; }
+            if o[0] == 192 && o[1] == 168 { return true; }
+            if o[0] == 169 && o[1] == 254 { return true; }
+            if o[0] == 0 { return true; }
+            false
+        }
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() { return true; }
+            if v6.is_unspecified() { return true; }
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return is_blocked_address(IpAddr::V4(v4));
+            }
+            // `::a.b.c.d` (IPv4-compatible, deprecated but still routable by
+            // some stacks) embeds an IPv4 address the same way and must be
+            // judged on that address, not waved through as "some IPv6 host".
+            let seg = v6.segments();
+            if seg[0..6].iter().all(|s| *s == 0) && (seg[6] != 0 || seg[7] != 0) {
+                if let Some(v4) = v6.to_ipv4() {
+                    return is_blocked_address(IpAddr::V4(v4));
+                }
+            }
+            if seg[0] & 0xffc0 == 0xfe80 { return true; }
+            if seg[0] & 0xffc0 == 0xfec0 { return true; }
+            if seg[0] & 0xfe00 == 0xfc00 { return true; }
+            false
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Agent hook helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn build_agent_hook_prompt(rule: &str, payload: &str) -> String {
+    format!(
+        "You are evaluating a hook rule. Determine whether the following event payload \
+satisfies or violates the rule.\n\nRule: {rule}\n\nPayload:\n{payload}\n\n\
+Respond with EXACTLY ONE line of JSON — nothing else:\n  \
+{{\"ok\": true, \"reason\": \"brief explanation\"}}    when the payload passes the rule\n  \
+{{\"ok\": false, \"reason\": \"brief explanation\"}}   when the payload violates the rule"
+    )
+}
+
+fn parse_agent_hook_result(agent_output: &str) -> String {
+    if let Some(start) = agent_output.find('{') {
+        let slice = &agent_output[start..];
+        if let Some(end) = slice.find('}') {
+            let candidate = &slice[..=end];
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(candidate) {
+                let ok = v.get("ok").and_then(|o| o.as_bool()).unwrap_or(true);
+                let reason = v.get("reason").and_then(|r| r.as_str()).unwrap_or("").to_owned();
+                if ok {
+                    return serde_json::to_string(&serde_json::json!({
+                        "decision": "allow",
+                        "reason": reason,
+                    })).unwrap_or_default();
+                } else {
+                    return serde_json::to_string(&serde_json::json!({
+                        "decision": "block",
+                        "reason": reason,
+                    })).unwrap_or_default();
+                }
+            }
+        }
+    }
+    String::new() // Unparseable → allow (fail-open)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -630,6 +1062,28 @@ fn build_post_compact_payload(
         "tokensAfter": tokens_after,
         "messageCount": message_count,
         "summary": summary,
+    }))
+    .unwrap_or_default()
+}
+
+fn build_user_prompt_submit_payload(
+    prompt: &str,
+    attachments: &[String],
+    history_length: usize,
+    model: &str,
+    permission_mode: &str,
+    depth: u32,
+) -> String {
+    use chrono::Utc;
+    serde_json::to_string(&serde_json::json!({
+        "event": "UserPromptSubmit",
+        "prompt": prompt,
+        "historyLength": history_length,
+        "model": model,
+        "permissionMode": permission_mode,
+        "attachments": attachments,
+        "timestamp": Utc::now().to_rfc3339(),
+        "depth": depth,
     }))
     .unwrap_or_default()
 }
@@ -787,6 +1241,139 @@ fn merge_post_compact(outputs: Vec<HookOutput>) -> PostCompactResult {
         }
     }
     result
+}
+
+/// Merge outputs from multiple `UserPromptSubmit` hooks.
+///
+/// # Field-level combination rules
+/// - **block / reason**: first blocking hook wins; all others are ignored.
+/// - **modifiedPrompt**: last writer wins (later hooks override earlier ones).
+/// - **additionalContext**: concatenated with `"\n\n"` between non-empty values.
+/// - **appendSystemPrompt**: concatenated the same way.
+/// - **allowedTools**: intersected across hooks that express an opinion.
+///   A hook with no `allowedTools` field has "no opinion" and does not narrow
+///   the set.  Only hooks that explicitly list tools participate in the
+///   intersection.  If *no* hook expresses an opinion, the result is `None`
+///   (default tool set applies).  Getting this wrong — using union instead of
+///   intersection — would allow tools any individual hook intended to block.
+/// - **deniedTools**: unioned across all hooks.
+/// - **systemPrompt**: last writer wins, but ONLY when the emitting hook has
+///   `allow_system_prompt_replace = true`.
+/// - **model / effort / toolChoice**: last writer wins.
+fn merge_user_prompt_submit(pairs: Vec<(&UserHook, HookOutput)>) -> UserPromptSubmitResult {
+    // First blocking hook short-circuits everything.
+    for (hook, out) in &pairs {
+        if out.is_blocking() {
+            return UserPromptSubmitResult {
+                block: true,
+                reason: out.reason.clone(),
+                by_hook_command: Some(HookContentHash::hook_id(hook)),
+                modified_prompt: None,
+                additional_context: None,
+                shape: None,
+            };
+        }
+    }
+
+    let mut modified_prompt: Option<String> = None;
+    let mut modified_by: Option<String> = None;
+    let mut additional_context_parts: Vec<String> = Vec::new();
+    let mut shape = UserPromptSubmitShape::default();
+
+    for (hook, out) in &pairs {
+        let spec = match &out.specific {
+            Some(s) => s,
+            None => continue,
+        };
+
+        // modifiedPrompt: last writer wins.
+        if let Some(mp) = spec.get("modifiedPrompt").and_then(|v| v.as_str()) {
+            modified_prompt = Some(mp.to_owned());
+            modified_by = Some(HookContentHash::hook_id(hook));
+        }
+
+        // additionalContext: concatenated.
+        if let Some(ac) = spec.get("additionalContext").and_then(|v| v.as_str()) {
+            if !ac.is_empty() {
+                additional_context_parts.push(ac.to_owned());
+            }
+        }
+
+        // appendSystemPrompt: concatenated.
+        if let Some(asp) = spec.get("appendSystemPrompt").and_then(|v| v.as_str()) {
+            if !asp.is_empty() {
+                let existing = shape.append_system_prompt.get_or_insert_with(String::new);
+                if !existing.is_empty() {
+                    existing.push_str("\n\n");
+                }
+                existing.push_str(asp);
+            }
+        }
+
+        // allowedTools: intersect across opinionated hooks.
+        // A null/absent list means "no opinion" — it does NOT set the allowed
+        // set to empty.  Only an explicit list participates in the intersection.
+        if let Some(at) = spec.get("allowedTools").and_then(|v| v.as_array()) {
+            let hook_set: Vec<String> = at
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_lowercase))
+                .collect();
+            shape.allowed_tools = Some(match shape.allowed_tools.take() {
+                None => hook_set,
+                Some(existing) => {
+                    // Intersection: keep only tools present in both sets.
+                    let hook_set_lower: std::collections::HashSet<String> =
+                        hook_set.into_iter().collect();
+                    existing.into_iter().filter(|t| hook_set_lower.contains(t)).collect()
+                }
+            });
+        }
+
+        // deniedTools: union.
+        if let Some(dt) = spec.get("deniedTools").and_then(|v| v.as_array()) {
+            for tool in dt.iter().filter_map(|v| v.as_str()) {
+                let lower = tool.to_lowercase();
+                if !shape.denied_tools.contains(&lower) {
+                    shape.denied_tools.push(lower);
+                }
+            }
+        }
+
+        // systemPrompt: last writer wins, gated by allow_system_prompt_replace.
+        if hook.allow_system_prompt_replace {
+            if let Some(sp) = spec.get("systemPrompt").and_then(|v| v.as_str()) {
+                shape.system_prompt = Some(sp.to_owned());
+            }
+        }
+
+        // model, effort, toolChoice: last writer wins.
+        if let Some(m) = spec.get("model").and_then(|v| v.as_str()) {
+            shape.model = Some(m.to_owned());
+        }
+        if let Some(e) = spec.get("effort").and_then(|v| v.as_str()) {
+            shape.effort = Some(e.to_owned());
+        }
+        if let Some(tc) = spec.get("toolChoice").and_then(|v| v.as_str()) {
+            shape.tool_choice = Some(tc.to_owned());
+        }
+    }
+
+    let additional_context = if additional_context_parts.is_empty() {
+        None
+    } else {
+        Some(additional_context_parts.join("\n\n"))
+    };
+
+    let shape_opt = if shape.is_empty() { None } else { Some(shape) };
+
+    UserPromptSubmitResult {
+        block: false,
+        reason: None,
+        by_hook_command: modified_by,
+        modified_prompt,
+        additional_context,
+        shape: shape_opt,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -972,6 +1559,41 @@ mod tests {
         assert!(result.block_reason.is_none(), "fail-open: no block");
     }
 
+    /// CRITICAL: a handler type this build cannot dispatch must obey the
+    /// event's fail-open policy, not silently succeed.
+    ///
+    /// Only `command` hooks are dispatched today.  Returning an empty stdout
+    /// for `agent`/`http` parses as a no-op, which on a fail-closed event
+    /// (PreToolUse) reads as "the hook approved this" — so a user who
+    /// installed an agent hook precisely to gate tool calls would get a
+    /// silent allow.  An undispatchable hook has not approved anything.
+    #[tokio::test]
+    async fn undispatchable_handler_blocks_on_a_fail_closed_event() {
+        let mut h = hook("PreToolUse", "unused.sh");
+        h.handler_type = Some("agent".into());
+        let runner = HookRunner::with_executor(vec![h], MockExecutor::new(vec![]));
+        let result = runner
+            .run_pre_tool_use("bash", "{}", CancellationToken::new())
+            .await;
+        assert!(
+            result.block,
+            "an agent hook this build cannot run must block a fail-closed event, not allow it"
+        );
+    }
+
+    /// The same undispatchable hook on a fail-open event stays a no-op.
+    #[tokio::test]
+    async fn undispatchable_handler_is_a_no_op_on_a_fail_open_event() {
+        let mut h = hook("PostToolUse", "unused.sh");
+        h.handler_type = Some("http".into());
+        let runner = HookRunner::with_executor(vec![h], MockExecutor::new(vec![]));
+        let result = runner
+            .run_post_tool_use("bash", "{}", "output", None, CancellationToken::new())
+            .await;
+        assert!(result.block_reason.is_none(), "fail-open event must not block");
+        assert!(result.modified_result.is_none(), "fail-open event must not modify");
+    }
+
     /// An untrusted project hook must not run (fail-closed for PreToolUse).
     #[tokio::test]
     async fn untrusted_project_hook_is_blocked_fail_closed() {
@@ -1053,4 +1675,677 @@ mod tests {
         assert!(!runner.has_post_tool_use);
         assert!(!runner.has_agent_response);
     }
+
+    // ── UserPromptSubmit tests ─────────────────────────────────────────────────
+
+    async fn run_ups(runner: &HookRunner, prompt: &str) -> UserPromptSubmitResult {
+        runner
+            .run_user_prompt_submit(
+                prompt,
+                &[],
+                0,
+                "model",
+                "default",
+                0,
+                CancellationToken::new(),
+            )
+            .await
+    }
+
+    /// No hooks configured → allow with no modifications.
+    /// Mirrors C# `No_matching_hooks_returns_allow_with_no_modifications`.
+    #[tokio::test]
+    async fn user_prompt_submit_allows_when_no_hooks_are_configured() {
+        let runner = HookRunner::new(vec![]);
+        let result = run_ups(&runner, "hi").await;
+        assert!(!result.block);
+        assert!(result.modified_prompt.is_none());
+        assert!(result.additional_context.is_none());
+        assert!(result.shape.is_none());
+    }
+
+    /// A blocking hook blocks the prompt.
+    #[tokio::test]
+    async fn user_prompt_submit_blocks_on_block_decision() {
+        let exec = MockExecutor::new(vec![(0, r#"{"decision":"block","reason":"policy denied"}"#)]);
+        let runner = HookRunner::with_executor(vec![hook("UserPromptSubmit", "gate.sh")], exec);
+        let result = run_ups(&runner, "hello").await;
+        assert!(result.block, "hook with decision:block must block the prompt");
+        assert_eq!(result.reason.as_deref(), Some("policy denied"));
+    }
+
+    /// A timeout is fail-closed for UserPromptSubmit.
+    /// Mirrors C# `Timeout_blocks_fail_closed_for_UserPromptSubmit`.
+    #[tokio::test]
+    async fn user_prompt_submit_timeout_is_fail_closed() {
+        let exec = MockExecutor::with_delay(vec![], 2000);
+        let h = hook_with_timeout("UserPromptSubmit", "slow.sh", 0);
+        let runner = HookRunner::with_executor(vec![h], exec);
+        let result = run_ups(&runner, "hi").await;
+        assert!(
+            result.block,
+            "a timed-out UserPromptSubmit hook must block (fail-closed)"
+        );
+    }
+
+    /// A null-command hook must not panic; on a fail-closed event it must block.
+    /// Mirrors C# `HookBus_null_command_hook_does_not_throw_nre`.
+    #[tokio::test]
+    async fn null_command_hook_blocks_on_fail_closed_event_without_panicking() {
+        let mut h = hook("UserPromptSubmit", "unused");
+        h.command = None; // explicit null command
+        h.handler_type = Some("command".into());
+        let runner = HookRunner::with_executor(vec![h], MockExecutor::new(vec![]));
+        // Must not panic; must block because UserPromptSubmit is fail-closed.
+        let result = run_ups(&runner, "hi").await;
+        assert!(
+            result.block,
+            "a command hook with no command must block on a fail-closed event"
+        );
+    }
+
+    // ── allowedTools intersection (SECURITY CRITICAL) ─────────────────────────
+
+    /// When two hooks both express `allowedTools`, the result is the
+    /// **intersection** — only tools approved by EVERY hook are kept.
+    /// Using union here would allow tools that any individual hook intended
+    /// to restrict.
+    ///
+    /// Mirrors C# `AllowedTools_from_two_hooks_are_intersected`.
+    #[tokio::test]
+    async fn allowed_tools_from_two_hooks_are_intersected() {
+        // Hook A approves [tool_a, tool_b]; Hook B approves [tool_b, tool_c].
+        // Intersection = [tool_b] only.
+        let out_a = r#"{"hookSpecificOutput":{"allowedTools":["tool_a","tool_b"]}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"allowedTools":["tool_b","tool_c"]}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![
+                hook("UserPromptSubmit", "hook_a.sh"),
+                hook("UserPromptSubmit", "hook_b.sh"),
+            ],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        assert!(!result.block);
+        let allowed = result
+            .shape
+            .as_ref()
+            .and_then(|s| s.allowed_tools.as_deref())
+            .expect("shape.allowed_tools must be present");
+        assert_eq!(allowed.len(), 1, "intersection of [a,b] and [b,c] must yield exactly 1 tool");
+        assert!(
+            allowed.iter().any(|t| t.eq_ignore_ascii_case("tool_b")),
+            "only 'tool_b' is in both lists"
+        );
+    }
+
+    /// A hook that returns no `allowedTools` has "no opinion" — it must NOT
+    /// act as "deny all".  The null hook's absence must not empty the set.
+    ///
+    /// Mirrors C# `Null_allowed_list_from_first_hook_does_not_intersect_to_empty`.
+    #[tokio::test]
+    async fn null_allowed_list_does_not_intersect_to_empty() {
+        // Hook A: no allowedTools field (null opinion).
+        // Hook B: allowedTools = [tool_a].
+        // Result must be [tool_a], not empty.
+        let out_a = r#"{}"#; // no hookSpecificOutput, no opinion
+        let out_b = r#"{"hookSpecificOutput":{"allowedTools":["tool_a"]}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![
+                hook("UserPromptSubmit", "no_opinion.sh"),
+                hook("UserPromptSubmit", "has_opinion.sh"),
+            ],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let allowed = result
+            .shape
+            .as_ref()
+            .and_then(|s| s.allowed_tools.as_deref())
+            .expect("hook B's allowedTools must survive");
+        assert_eq!(allowed.len(), 1);
+        assert!(allowed.iter().any(|t| t.eq_ignore_ascii_case("tool_a")));
+    }
+
+    /// When NO hook sets allowedTools, the result shape.allowed_tools is None.
+    ///
+    /// Mirrors C# `Null_allowed_list_from_both_hooks_leaves_shape_AllowedTools_null`.
+    #[tokio::test]
+    async fn null_allowed_list_from_all_hooks_leaves_allowed_tools_as_none() {
+        let exec = MockExecutor::new(vec![(0, "{}"), (0, "{}")]);
+        let runner = HookRunner::with_executor(
+            vec![
+                hook("UserPromptSubmit", "hook_a.sh"),
+                hook("UserPromptSubmit", "hook_b.sh"),
+            ],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let allowed_is_none = result
+            .shape
+            .as_ref()
+            .map_or(true, |s| s.allowed_tools.is_none());
+        assert!(
+            allowed_is_none,
+            "both hooks returning no allowedTools must leave allowed_tools as None"
+        );
+    }
+
+    // ── deniedTools union ─────────────────────────────────────────────────────
+
+    /// `deniedTools` from multiple hooks are **unioned** (deny-any semantics).
+    ///
+    /// Mirrors C# `DeniedTools_from_two_hooks_are_unioned`.
+    #[tokio::test]
+    async fn denied_tools_from_two_hooks_are_unioned() {
+        let out_a = r#"{"hookSpecificOutput":{"deniedTools":["tool_a"]}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"deniedTools":["tool_b"]}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let denied = &result
+            .shape
+            .expect("shape must be present")
+            .denied_tools;
+        assert_eq!(denied.len(), 2, "union of [tool_a] and [tool_b] must have 2 entries");
+        assert!(denied.iter().any(|t| t.eq_ignore_ascii_case("tool_a")));
+        assert!(denied.iter().any(|t| t.eq_ignore_ascii_case("tool_b")));
+    }
+
+    // ── additionalContext concatenation ────────────────────────────────────────
+
+    /// `additionalContext` from multiple hooks is **concatenated**.
+    ///
+    /// Mirrors C# `AdditionalContext_from_two_hooks_is_concatenated`.
+    #[tokio::test]
+    async fn additional_context_from_two_hooks_is_concatenated() {
+        let out_a = r#"{"hookSpecificOutput":{"additionalContext":"first context"}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"additionalContext":"second context"}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let ac = result.additional_context.expect("additional_context must be set");
+        assert!(
+            ac.contains("first context"),
+            "first hook's context must appear in result"
+        );
+        assert!(
+            ac.contains("second context"),
+            "second hook's context must appear in result"
+        );
+    }
+
+    // ── appendSystemPrompt concatenation ──────────────────────────────────────
+
+    /// `appendSystemPrompt` from multiple hooks is **concatenated**.
+    ///
+    /// Mirrors C# `AppendSystemPrompt_from_two_hooks_is_concatenated`.
+    #[tokio::test]
+    async fn append_system_prompt_from_two_hooks_is_concatenated() {
+        let out_a = r#"{"hookSpecificOutput":{"appendSystemPrompt":"instruction A"}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"appendSystemPrompt":"instruction B"}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "hi").await;
+        let asp = result
+            .shape
+            .expect("shape must be present")
+            .append_system_prompt
+            .expect("append_system_prompt must be set");
+        assert!(asp.contains("instruction A"));
+        assert!(asp.contains("instruction B"));
+    }
+
+    // ── modifiedPrompt last-writer-wins ────────────────────────────────────────
+
+    /// When two hooks both set `modifiedPrompt`, the last one wins.
+    ///
+    /// Mirrors C# `Last_writer_wins_on_modifiedPrompt_and_override_is_logged`.
+    #[tokio::test]
+    async fn modified_prompt_last_writer_wins() {
+        let out_a = r#"{"hookSpecificOutput":{"modifiedPrompt":"first version"}}"#;
+        let out_b = r#"{"hookSpecificOutput":{"modifiedPrompt":"second version"}}"#;
+        let exec = MockExecutor::new(vec![(0, out_a), (0, out_b)]);
+        let runner = HookRunner::with_executor(
+            vec![hook("UserPromptSubmit", "a.sh"), hook("UserPromptSubmit", "b.sh")],
+            exec,
+        );
+        let result = run_ups(&runner, "original").await;
+        assert_eq!(
+            result.modified_prompt.as_deref(),
+            Some("second version"),
+            "last writer must win for modifiedPrompt"
+        );
+    }
+
+    // ── Feature 5: Hook run log ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn run_log_records_allow_outcome_after_successful_run() {
+        let exec = MockExecutor::new(vec![(0, r#"{"decision":"allow"}"#)]);
+        let log = Arc::new(HookRunLog::new());
+        let h = hook("PreToolUse", "check.sh");
+        let runner = HookRunner::build(vec![h], exec, None, Some(log.clone()), None, Vec::new());
+        runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        let entry = log.get(0).expect("entry must be recorded");
+        assert_eq!(entry.outcome, "allow");
+        assert!(entry.duration_ms >= 0);
+    }
+
+    #[tokio::test]
+    async fn run_log_records_blocked_outcome() {
+        let exec = MockExecutor::new(vec![(0, r#"{"decision":"block","reason":"denied"}"#)]);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook("PreToolUse", "check.sh")],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert_eq!(log.get(0).unwrap().outcome, "blocked");
+    }
+
+    #[tokio::test]
+    async fn run_log_records_abort_when_continue_is_false() {
+        let exec = MockExecutor::new(vec![(0, r#"{"continue":false}"#)]);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook("PostToolUse", "notify.sh")],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        assert_eq!(log.get(0).unwrap().outcome, "abort");
+    }
+
+    #[tokio::test]
+    async fn run_log_records_timeout_outcome() {
+        let exec = MockExecutor::with_delay(vec![], 2000);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook_with_timeout("PostToolUse", "slow.sh", 0)],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        assert_eq!(log.get(0).unwrap().outcome, "timeout");
+    }
+
+    #[tokio::test]
+    async fn run_log_records_skipped_for_untrusted_hook() {
+        let store = Arc::new(InMemoryHookTrustStore::new());
+        let guard = Arc::new(HookTrustGuard::new(store, "/project", None));
+        let exec = MockExecutor::new(vec![]);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![project_hook("PostToolUse", "audit.sh")],
+            exec, Some(guard), Some(log.clone()), None, Vec::new(),
+        );
+        runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        let entry = log.get(0).expect("entry must be recorded for skipped hook");
+        assert_eq!(entry.outcome, "skipped");
+        assert_eq!(entry.duration_ms, 0);
+    }
+
+    /// CRITICAL: caller-cancelled hook must NOT be recorded in the run log.
+    ///
+    /// Mutation-verified: change `Err(ExecError::Cancelled) => return HookOutput::no_op()`
+    /// in run_single to fall through to the recording path, then this test fails.
+    #[tokio::test]
+    async fn caller_cancelled_hook_is_not_recorded_in_runlog() {
+        let exec = MockExecutor::with_delay(vec![(0, r#"{"decision":"allow"}"#)], 2000);
+        let log = Arc::new(HookRunLog::new());
+        let runner = HookRunner::build(
+            vec![hook("PreToolUse", "check.sh")],
+            exec, None, Some(log.clone()), None, Vec::new(),
+        );
+        let cts = CancellationToken::new();
+        cts.cancel();
+        runner.run_pre_tool_use("bash", "{}", cts).await;
+        assert!(
+            log.get(0).is_none(),
+            "caller-cancelled hook must not appear in the run log"
+        );
+    }
+
+    // ── Feature 4: HTTP hook handler ──────────────────────────────────────────
+
+    #[tokio::test]
+    async fn http_hook_with_empty_allowlist_is_refused() {
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("http".into());
+        h.url = Some("https://api.example.com/hook".into());
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, None, Vec::new(),
+        );
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(result.block, "http hook with empty allowlist must block (fail-closed)");
+    }
+
+    #[tokio::test]
+    async fn http_hook_url_not_in_allowlist_is_refused() {
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("http".into());
+        h.url = Some("https://evil.com/hook".into());
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, None,
+            vec!["trusted.example.com".to_owned()],
+        );
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(result.block, "url not in allowlist must block");
+    }
+
+    #[test]
+    fn validate_http_url_accepts_https_allowlisted_host() {
+        assert!(validate_http_url(
+            "https://api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_ok());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_embedded_credentials() {
+        assert!(validate_http_url(
+            "https://user:pass@api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_ftp_scheme() {
+        assert!(validate_http_url(
+            "ftp://api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_http_url_rejects_plain_http_non_loopback() {
+        assert!(validate_http_url(
+            "http://api.example.com/hook",
+            &["api.example.com".to_owned()],
+        ).is_err());
+    }
+
+    #[test]
+    fn validate_http_url_allows_plain_http_for_loopback() {
+        assert!(validate_http_url(
+            "http://127.0.0.1:8080/hook",
+            &["127.0.0.1".to_owned()],
+        ).is_ok());
+    }
+
+    #[test]
+    fn blocked_address_covers_private_ranges() {
+        use std::str::FromStr;
+        let cases: &[(&str, bool)] = &[
+            ("10.0.0.1", true),
+            ("172.16.0.1", true),
+            ("172.31.255.254", true),
+            ("172.15.0.1", false),
+            ("172.32.0.1", false),
+            ("192.168.1.1", true),
+            ("192.169.1.1", false),
+            ("127.0.0.1", true),
+            ("169.254.1.1", true),
+            ("8.8.8.8", false),
+            ("0.0.0.1", true),
+        ];
+        for (addr, expected) in cases {
+            let ip = IpAddr::from_str(addr).unwrap();
+            assert_eq!(is_blocked_address(ip), *expected, "is_blocked_address({addr}) should be {expected}");
+        }
+    }
+
+    /// IPv6 forms that embed an IPv4 address must be judged on that address.
+    ///
+    /// Both the mapped (`::ffff:a.b.c.d`) and the deprecated compatible
+    /// (`::a.b.c.d`) encodings reach the same host as the bare IPv4 address, so
+    /// treating either as "just some IPv6 host" would let the metadata service
+    /// and the loopback interface straight through.
+    #[test]
+    fn ipv6_forms_embedding_ipv4_are_judged_on_the_embedded_address() {
+        use std::str::FromStr;
+        let cases: &[(&str, bool)] = &[
+            ("::ffff:127.0.0.1", true),
+            ("::ffff:169.254.169.254", true),
+            ("::ffff:10.0.0.1", true),
+            ("::ffff:8.8.8.8", false),
+            // IPv4-compatible IPv6, the form the review flagged as uncovered.
+            ("::127.0.0.1", true),
+            ("::169.254.169.254", true),
+            ("::10.0.0.1", true),
+            ("::8.8.8.8", false),
+            // Genuine IPv6 ranges.
+            ("::1", true),
+            ("::", true),
+            ("fe80::1", true),
+            ("fc00::1", true),
+            ("2606:4700:4700::1111", false),
+        ];
+        for (addr, expected) in cases {
+            let ip = IpAddr::from_str(addr).unwrap();
+            assert_eq!(
+                is_blocked_address(ip),
+                *expected,
+                "is_blocked_address({addr}) should be {expected}"
+            );
+        }
+    }
+
+    /// A literal address needs no pinning; a hostname yields vetted addresses
+    /// for the caller to connect to.
+    ///
+    /// The distinction matters because pinning is what closes the DNS-rebinding
+    /// window: `check_ssrf` validates what it resolved, and the caller must
+    /// connect to *that*, not re-resolve and get a different answer.
+    #[tokio::test]
+    async fn ssrf_check_returns_no_addresses_to_pin_for_a_literal_ip() {
+        let vetted = check_ssrf("https://8.8.8.8/hook", CancellationToken::new())
+            .await
+            .expect("a public literal address passes");
+        assert!(vetted.is_empty(), "a literal address needs no DNS pinning");
+    }
+
+    #[tokio::test]
+    async fn ssrf_check_rejects_a_blocked_literal_address() {
+        for url in [
+            "https://127.0.0.1/hook",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[::1]/hook",
+        ] {
+            assert!(
+                check_ssrf(url, CancellationToken::new()).await.is_err(),
+                "{url} must be refused"
+            );
+        }
+    }
+
+    // ── Feature 4: Agent hook handler ─────────────────────────────────────────
+
+    /// SECURITY CRITICAL: hook-free subagent factory must be used.
+    ///
+    /// Mutation-verified: wire a factory WITH a HookRunner that calls a
+    /// CountingExecutor; with hook-free factory the count is 0.
+    #[tokio::test]
+    async fn agent_hook_spawned_subagent_does_not_retrigger_hooks() {
+        use std::sync::atomic::{AtomicUsize, Ordering as Ord};
+
+        struct CountingFactory(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for CountingFactory {
+            async fn spawn(
+                &self,
+                _req: SubagentRequest,
+                _sink: Arc<dyn crate::events::AgentSink>,
+                _cancel: CancellationToken,
+            ) -> Result<String, String> {
+                self.0.fetch_add(1, Ord::SeqCst);
+                Ok(r#"{"ok": true, "reason": "approved"}"#.to_owned())
+            }
+        }
+
+        let spawn_count = Arc::new(AtomicUsize::new(0));
+        let factory: Arc<dyn SubagentFactory> = Arc::new(CountingFactory(spawn_count.clone()));
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("Block any tool that modifies files".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(factory), Vec::new(),
+        );
+
+        let payload = serde_json::to_string(&serde_json::json!({"event":"PreToolUse","toolName":"bash","depth":0})).unwrap();
+        runner.run_pre_tool_use("bash", &payload, CancellationToken::new()).await;
+
+        assert_eq!(
+            spawn_count.load(Ord::SeqCst),
+            1,
+            "agent hook must spawn exactly one subagent; re-triggering would indicate recursion"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_hook_does_not_run_when_all_slots_are_taken() {
+        struct RefusingFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for RefusingFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                Err("All subagent concurrency slots are taken; try again later.".to_owned())
+            }
+        }
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("check this".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(RefusingFactory)), Vec::new(),
+        );
+
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(!result.block, "slot-exhausted agent hook must be fail-open");
+    }
+
+    #[tokio::test]
+    async fn agent_hook_ok_false_blocks_event() {
+        struct BlockingFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for BlockingFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                Ok(r#"{"ok": false, "reason": "policy violation"}"#.to_owned())
+            }
+        }
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("Block dangerous commands".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(BlockingFactory)), Vec::new(),
+        );
+
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(result.block, "agent hook returning ok:false must block the event");
+    }
+
+    #[tokio::test]
+    async fn agent_hook_unusable_output_is_fail_open() {
+        struct GarbageFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for GarbageFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                Ok("I could not decide".to_owned())
+            }
+        }
+
+        let mut h = hook("PreToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("evaluate this".into());
+        h.fail_open = Some(true);
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(GarbageFactory)), Vec::new(),
+        );
+
+        let result = runner.run_pre_tool_use("bash", "{}", CancellationToken::new()).await;
+        assert!(!result.block, "unusable agent output must be fail-open");
+    }
+
+    /// Agent hook: depth limit exceeded → fail-open (no block, no spawn).
+    ///
+    /// Mutation-verified: remove the `payload_depth >= MAX_SUBAGENT_DEPTH` guard
+    /// in dispatch and this test fails (spawn_count > 0).
+    #[tokio::test]
+    async fn agent_hook_skipped_at_max_depth() {
+        use std::sync::atomic::{AtomicUsize, Ordering as Ord};
+
+        struct CountingFactory(Arc<AtomicUsize>);
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for CountingFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                self.0.fetch_add(1, Ord::SeqCst);
+                Ok(r#"{"ok":true}"#.to_owned())
+            }
+        }
+
+        let count = Arc::new(AtomicUsize::new(0));
+
+        let mut h = hook("UserPromptSubmit", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = Some("check".into());
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None,
+            Some(Arc::new(CountingFactory(count.clone()))), Vec::new(),
+        );
+
+        use crate::subagents::MAX_SUBAGENT_DEPTH;
+        let result = runner
+            .run_user_prompt_submit("test", &[], 0, "model", "default", MAX_SUBAGENT_DEPTH, CancellationToken::new())
+            .await;
+
+        assert!(!result.block, "depth-limit skip must be fail-open");
+        assert_eq!(count.load(Ord::SeqCst), 0, "no subagent must be spawned at max depth");
+    }
+
+    #[tokio::test]
+    async fn agent_hook_without_prompt_fails_gracefully() {
+        struct NeverFactory;
+
+        #[async_trait::async_trait]
+        impl SubagentFactory for NeverFactory {
+            async fn spawn(&self, _: SubagentRequest, _: Arc<dyn crate::events::AgentSink>, _: CancellationToken) -> Result<String, String> {
+                panic!("should not be called");
+            }
+        }
+
+        let mut h = hook("PostToolUse", "unused");
+        h.handler_type = Some("agent".into());
+        h.hook_prompt = None;
+        h.fail_open = Some(true);
+
+        let runner = HookRunner::build(
+            vec![h], MockExecutor::new(vec![]), None, None, Some(Arc::new(NeverFactory)), Vec::new(),
+        );
+
+        let result = runner.run_post_tool_use("bash", "{}", "output", None, CancellationToken::new()).await;
+        assert!(result.block_reason.is_none());
+    }
 }
+
+
