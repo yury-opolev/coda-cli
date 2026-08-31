@@ -40,3 +40,6 @@ BenchmarkDotNet.Artifacts/
 # Rust build output
 rust/target/
 **/*.rs.bk
+
+# Visual brainstorming companion sessions
+.superpowers/
