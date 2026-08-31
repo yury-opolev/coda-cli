@@ -9,7 +9,7 @@ use coda_render::RenderLine;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 use ratatui::Frame;
 
 use crate::composer::Composer;
@@ -384,6 +384,18 @@ const TOP_EDGE_GLYPH: &str = "\u{2584}";
 /// to end half a row below its last content row.
 const BOTTOM_EDGE_GLYPH: &str = "\u{2580}";
 
+/// Column where composer text starts, past the padded prompt marker.
+///
+/// The cursor is placed from this, so it must track the marker's width or the
+/// caret drifts away from the text it is meant to sit in.
+const COMPOSER_TEXT_COLUMN: u16 = 3;
+
+/// Breathing room between a modal's border and its contents.
+///
+/// Horizontal only: vertical padding would cost rows that modals — which are
+/// already capped to a fraction of the screen — cannot spare.
+pub const MODAL_PADDING: Padding = Padding::horizontal(1);
+
 fn draw_composer(
     frame: &mut Frame,
     area: Rect,
@@ -442,10 +454,13 @@ fn draw_composer(
         .lines()
         .enumerate()
         .map(|(index, line)| {
+            // A leading space keeps the glyph off the terminal edge; the
+            // continuation indent matches its width so wrapped lines align
+            // under the first one's text.
             let marker = if index == 0 {
-                if state.is_busy() { "\u{22EF} " } else { "\u{276F} " }
+                if state.is_busy() { " \u{22EF} " } else { " \u{276F} " }
             } else {
-                "  "
+                "   "
             };
             Line::from(vec![
                 Span::styled(marker, prompt_style),
@@ -458,7 +473,7 @@ fn draw_composer(
 
     // Place the hardware cursor so the terminal draws it for us.
     let (line, column) = composer.cursor_position();
-    let x = inner.x + 2 + column as u16;
+    let x = inner.x + COMPOSER_TEXT_COLUMN + column as u16;
     let y = inner.y + line as u16;
     if x < inner.right() && y < inner.bottom() {
         frame.set_cursor_position((x, y));
@@ -554,6 +569,7 @@ fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Th
         .title(format!(" {title} "))
         .borders(Borders::ALL)
         .border_style(theme.style(Role::PromptAccent))
+        .padding(MODAL_PADDING)
         .style(theme.surface());
     let inner = block.inner(region);
     frame.render_widget(block, region);
@@ -586,6 +602,7 @@ pub fn draw_browser(frame: &mut Frame, area: Rect, browser: &Browser, theme: &Th
         .title(format!(" {} ", browser.title()))
         .borders(Borders::ALL)
         .border_style(theme.style(Role::PromptAccent))
+        .padding(MODAL_PADDING)
         .style(theme.surface());
     let inner = block.inner(area);
     frame.render_widget(block, area);

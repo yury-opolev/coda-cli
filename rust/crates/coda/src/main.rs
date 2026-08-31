@@ -29,7 +29,9 @@ use coda_tui::terminal::{install_panic_hook, TerminalGuard};
 #[command(
     name = "coda",
     about = "Coda — an agentic coding assistant",
-    version,
+    // Reported from version.json rather than the crate version, so `--version`
+    // agrees with the banner and continues the C# build's version line.
+    version = coda_tui::branding::version(),
     disable_help_subcommand = true,
     args_conflicts_with_subcommands = true
 )]

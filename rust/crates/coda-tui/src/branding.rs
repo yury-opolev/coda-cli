@@ -21,7 +21,9 @@ pub const WORDMARK: &[&str] = &[
 
 /// The crate version, matching the C# `Branding.Version`.
 pub fn version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
+    // Set by build.rs from the repository's version.json, which is shared with
+    // the C# build so the version line is continuous across the two.
+    env!("CODA_VERSION")
 }
 
 /// What the exit summary reports.

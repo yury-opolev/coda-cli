@@ -538,3 +538,18 @@ fn the_startup_banner_renders_in_the_transcript() {
     assert!(lines.contains("WORDMARK"), "wordmark missing from {lines:?}");
     assert!(lines.contains("cwd: /tmp/project"), "details missing from {lines:?}");
 }
+
+#[test]
+fn the_composer_prompt_is_inset_from_the_edge() {
+    let state = session();
+    let mut composer = Composer::new();
+    composer.insert("hi");
+    let lines = render(&state, &composer, 40, 12);
+
+    // The prompt row sits between the two half-block edges.
+    let prompt_row = &lines[lines.len() - 3];
+    assert_eq!(
+        prompt_row, " \u{276F} hi",
+        "prompt should be inset by one space, got {prompt_row:?}"
+    );
+}

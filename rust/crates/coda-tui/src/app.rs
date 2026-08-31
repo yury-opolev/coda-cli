@@ -537,6 +537,21 @@ impl App {
             return;
         }
 
+        // Ctrl+C copies when there is a selection, matching the Windows console
+        // and every terminal emulator. The selection is cleared either way, so
+        // a second Ctrl+C still exits — leaving it set would trap the user in a
+        // session they cannot quit with the key that normally quits it.
+        if key.code == KeyCode::Char('c')
+            && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
+            && self.selection.has_selection()
+        {
+            self.copy_selection_via_pointer();
+            self.selection.clear();
+            self.armed = None;
+            self.dirty = true;
+            return;
+        }
+
         let action = keymap::resolve(key, self.key_context());
         self.dirty = true;
 
