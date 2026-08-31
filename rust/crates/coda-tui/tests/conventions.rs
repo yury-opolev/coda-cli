@@ -210,3 +210,51 @@ fn raw_glyph_characters_live_only_in_the_glyph_table() {
         offenders.join("\n")
     );
 }
+
+/// The key context an open surface must produce.
+///
+/// Regression guard: while a surface is open the composer must not have focus.
+/// Without this, every key the surface declines is resolved as composer
+/// editing and typed into a composer the user cannot see — letters inserted,
+/// Backspace deleting, Up loading a past submission, all behind a modal and
+/// submitted when it closes.
+#[test]
+fn an_open_surface_takes_focus_away_from_the_composer() {
+    use coda_tui::keymap::{resolve, Action, Focus, KeyContext};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let overlay = KeyContext {
+        focus: Focus::Surface,
+        busy: false,
+        composer_empty: true,
+        on_first_line: true,
+        on_last_line: true,
+        armed: None,
+    };
+
+    let plain = |code| resolve(KeyEvent::new(code, KeyModifiers::NONE), overlay);
+
+    assert!(
+        matches!(plain(KeyCode::Char('a')), Action::None),
+        "a letter reached the composer behind an open surface"
+    );
+    assert!(
+        matches!(plain(KeyCode::Backspace), Action::None),
+        "Backspace edited the composer behind an open surface"
+    );
+    assert!(
+        matches!(plain(KeyCode::Up), Action::None),
+        "Up loaded history into the composer behind an open surface"
+    );
+
+    // Ctrl+C must still reach the global handler, or an open surface would
+    // make the session unquittable.
+    let ctrl_c = resolve(
+        KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        overlay,
+    );
+    assert!(
+        !matches!(ctrl_c, Action::None),
+        "Ctrl+C was swallowed by an open surface"
+    );
+}

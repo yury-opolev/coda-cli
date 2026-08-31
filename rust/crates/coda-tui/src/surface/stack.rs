@@ -136,7 +136,7 @@ impl SurfaceStack {
                 // Only the top surface gets a caret: two visible carets would
                 // be worse than none, and the terminal only has one.
                 let cursor = (index == top)
-                    .then(|| surface.cursor(content))
+                    .then(|| surface.cursor(content, theme))
                     .flatten()
                     .map(|(x, y)| (content.x + x, content.y + y));
                 RenderedSurface {

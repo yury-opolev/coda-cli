@@ -4,11 +4,10 @@
 //! is what is persisted rather than a set of defaults that would silently
 //! overwrite the user's configuration on save.
 
-use super::form::{form_cursor, render_form};
 use super::{Surface, SurfaceAction, SurfaceOutcome};
 use crate::config::{ConfigError, Paths, Settings};
 use crate::render::glyphs;
-use crate::widgets::{Form, FormOutcome, RadioGroup, Select, StaticText, Switch};
+use crate::widgets::{Form, RadioGroup, Select, StaticText, Switch};
 use coda_render::theme::{Role, Theme};
 use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
@@ -95,13 +94,21 @@ fn selected(form: &Form, at: usize) -> Option<usize> {
 }
 
 pub struct SettingsSurface {
-    form: Form,
+    inner: super::form::FormSurface,
 }
 
 impl SettingsSurface {
     pub fn new(settings: &Settings) -> Self {
         Self {
-            form: build(settings),
+            inner: super::form::FormSurface::new(
+                "Settings",
+                format!(
+                    "Tab: next    {}: change    Enter: save    Esc: cancel",
+                    glyphs::ARROWS_VERTICAL
+                ),
+                build(settings),
+            )
+            .on_submit(SurfaceAction::SaveSettings),
         }
     }
 
@@ -113,26 +120,26 @@ impl SettingsSurface {
     }
 
     pub fn theme_index(&self) -> usize {
-        selected(&self.form, index::THEME).unwrap_or(0)
+        selected(self.form(), index::THEME).unwrap_or(0)
     }
 
     pub fn form(&self) -> &Form {
-        &self.form
+        self.inner.form()
     }
 
     /// Applies the form's values onto `settings` and saves.
     pub fn apply(&self, settings: &mut Settings) -> Result<(), ConfigError> {
-        if let Some(i) = selected(&self.form, index::PERMISSION) {
+        let form = self.form();
+        if let Some(i) = selected(form, index::PERMISSION) {
             settings.set_permission_mode(PERMISSION_MODES[i]);
         }
-        if let Some(i) = selected(&self.form, index::THEME) {
+        if let Some(i) = selected(form, index::THEME) {
             settings.set_theme(THEMES[i]);
         }
-        if let Some(i) = selected(&self.form, index::TOOL_DISPLAY) {
+        if let Some(i) = selected(form, index::TOOL_DISPLAY) {
             settings.set_tool_display_mode(TOOL_DISPLAY_MODES[i]);
         }
-        if let Some(switch) = self
-            .form
+        if let Some(switch) = form
             .control(index::TELEMETRY)
             .and_then(|c| c.as_any().downcast_ref::<Switch>())
         {
@@ -153,31 +160,23 @@ impl Surface for SettingsSurface {
     }
 
     fn title(&self) -> String {
-        "Settings".into()
+        self.inner.title()
     }
 
     fn hints(&self) -> String {
-        format!(
-            "Tab: next    {}: change    Enter: save    Esc: cancel",
-            glyphs::ARROWS_VERTICAL
-        )
+        self.inner.hints()
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
-        match self.form.handle_key(key) {
-            FormOutcome::Consumed => SurfaceOutcome::Handled,
-            FormOutcome::Ignored => SurfaceOutcome::Ignored,
-            FormOutcome::Cancel => SurfaceOutcome::Close,
-            FormOutcome::Submit => SurfaceOutcome::Emit(SurfaceAction::SaveSettings),
-        }
+        self.inner.dispatch(key)
     }
 
     fn render(&self, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
-        render_form(&self.form, area, theme)
+        self.inner.render(area, theme)
     }
 
-    fn cursor(&self, area: Rect) -> Option<(u16, u16)> {
-        form_cursor(&self.form, area, &Theme::default())
+    fn cursor(&self, area: Rect, theme: &Theme) -> Option<(u16, u16)> {
+        self.inner.cursor(area, theme)
     }
 }
 

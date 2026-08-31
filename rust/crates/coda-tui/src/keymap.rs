@@ -15,6 +15,13 @@ pub enum Focus {
     Completion,
     /// A modal prompt or browser overlay is open.
     Overlay,
+    /// A `Surface` is open.
+    ///
+    /// Distinct from [`Focus::Overlay`] because a surface owns its navigation
+    /// completely: it has already declined this key, and nothing should be
+    /// interpreted on its behalf. Overlay would map the arrows to completion
+    /// navigation, which belongs to a prompt, not to a surface.
+    Surface,
 }
 
 /// A destructive action that must be confirmed by pressing the key twice.
@@ -162,6 +169,9 @@ pub fn resolve(key: KeyEvent, context: KeyContext) -> Action {
     match context.focus {
         Focus::Completion => resolve_completion(key, ctrl),
         Focus::Overlay => resolve_overlay(key),
+        // Everything reaching here was already declined by the surface, and
+        // the global chords were handled above. Swallow the rest.
+        Focus::Surface => Action::None,
         Focus::Composer => resolve_composer(key, context, ctrl, shift, alt),
     }
 }

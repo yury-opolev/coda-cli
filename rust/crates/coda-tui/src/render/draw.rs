@@ -535,66 +535,6 @@ fn draw_status(
     );
 }
 
-/// Renders a [`Form`] as a centred modal.
-///
-/// This is the bridge between the pure, terminal-free controls in
-/// [`crate::widgets`] and the screen: the form produces lines, this places them
-/// inside a padded, bordered surface and translates the form's caret offset
-/// into absolute coordinates.
-pub fn draw_form(
-    frame: &mut Frame,
-    area: Rect,
-    title: &str,
-    hint: &str,
-    form: &crate::widgets::Form,
-    theme: &Theme,
-) {
-    let region = centered(area, 70, 70);
-    frame.render_widget(Clear, region);
-
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_style(theme.style(Role::PromptAccent))
-        .padding(MODAL_PADDING)
-        .style(theme.surface());
-    let inner = block.inner(region);
-    frame.render_widget(block, region);
-
-    if inner.height == 0 {
-        return;
-    }
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-    let body = chunks[0];
-
-    let lines = form.render(body.width, theme);
-
-    // Scroll so the whole focused control stays on screen. Keying this off the
-    // focused control rather than the caret matters: a switch and a radio group
-    // have no caret, so a caret-based scroll would leave them off-screen
-    // exactly when the user tabbed to them.
-    let (_, focus_end) = form.focused_rows(body.width, theme);
-    let scroll = focus_end.saturating_sub(body.height);
-
-    frame.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
-    frame.render_widget(
-        Paragraph::new(hint).style(theme.style(Role::Notification)),
-        chunks[1],
-    );
-
-    if let Some((column, row)) = form.cursor(body.width, theme) {
-        let x = body.x + column;
-        let y = body.y + row.saturating_sub(scroll);
-        if x < body.right() && y < body.bottom() {
-            frame.set_cursor_position((x, y));
-        }
-    }
-}
-
 /// Draws one surface: chrome, its pre-rendered lines, its hints and its caret.
 ///
 /// The surface has already scrolled and clipped its own content, so this is

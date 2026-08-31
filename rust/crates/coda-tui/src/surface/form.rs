@@ -40,6 +40,10 @@ pub(crate) fn form_cursor(form: &Form, area: Rect, theme: &Theme) -> Option<(u16
 }
 
 /// A form with a title, hints, and an action to emit on submit.
+///
+/// Surfaces that are just a form delegate to this rather than implementing
+/// `Surface` again: the key routing, scrolling and caret arithmetic are
+/// identical every time, and three copies of them would drift.
 pub struct FormSurface {
     form: Form,
     title: String,
@@ -68,6 +72,23 @@ impl FormSurface {
 
     pub fn form(&self) -> &Form {
         &self.form
+    }
+
+    pub fn form_mut(&mut self) -> &mut Form {
+        &mut self.form
+    }
+
+    /// Routes a key, returning the outcome a wrapping surface should report.
+    pub fn dispatch(&mut self, key: KeyEvent) -> SurfaceOutcome {
+        match self.form.handle_key(key) {
+            FormOutcome::Consumed => SurfaceOutcome::Handled,
+            FormOutcome::Ignored => SurfaceOutcome::Ignored,
+            FormOutcome::Cancel => SurfaceOutcome::Close,
+            FormOutcome::Submit => match self.on_submit.clone() {
+                Some(action) => SurfaceOutcome::Emit(action),
+                None => SurfaceOutcome::Close,
+            },
+        }
     }
 }
 
@@ -100,8 +121,8 @@ impl Surface for FormSurface {
         render_form(&self.form, area, theme)
     }
 
-    fn cursor(&self, area: Rect) -> Option<(u16, u16)> {
-        form_cursor(&self.form, area, &Theme::default())
+    fn cursor(&self, area: Rect, theme: &Theme) -> Option<(u16, u16)> {
+        form_cursor(&self.form, area, theme)
     }
 }
 
@@ -199,7 +220,7 @@ mod tests {
         let surface = FormSurface::new("T", "h", form());
         for height in [1, 2, 3, 40] {
             let area = Rect::new(0, 0, 60, height);
-            if let Some((_, row)) = surface.cursor(area) {
+            if let Some((_, row)) = surface.cursor(area, &Theme::default()) {
                 assert!(row < height, "caret at row {row} escaped a {height}-row area");
             }
         }

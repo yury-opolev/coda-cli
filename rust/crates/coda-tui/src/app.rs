@@ -1608,10 +1608,18 @@ impl App {
         Some(crate::selection::SelectionPos { row: index, col: column as usize })
     }
 
-    fn key_context(&self) -> KeyContext {        let (line, _) = self.composer.cursor_position();
+    fn key_context(&self) -> KeyContext {
+        let (line, _) = self.composer.cursor_position();
         KeyContext {
+            // An open surface takes focus away from the composer. Without
+            // this, any key the surface declines is resolved as composer
+            // editing and typed into a composer the user cannot see: letters
+            // inserted, Backspace deleting, Up loading a past submission —
+            // all behind a modal, and submitted on close.
             focus: if self.state.prompt.is_some() {
                 Focus::Overlay
+            } else if !self.surfaces.is_empty() {
+                Focus::Surface
             } else if self.composer.completion().is_active() {
                 Focus::Completion
             } else {
@@ -1898,6 +1906,15 @@ impl App {
                     .as_any()
                     .downcast_ref::<crate::surface::settings::SettingsSurface>()
                 else {
+                    // Some other surface emitted SaveSettings. Put it back
+                    // rather than closing it and discarding the edit: losing
+                    // both the modal and the save with no message is the worst
+                    // of the available outcomes.
+                    self.surfaces.push(surface);
+                    self.notice(
+                        "Could not save: unexpected surface.",
+                        NoticeLevel::Error,
+                    );
                     return;
                 };
                 let mut settings = crate::config::Settings::load(&self.paths)

@@ -142,7 +142,7 @@ pub trait Surface {
     /// otherwise be scrolled out of view exactly when focused.
     fn render(&self, area: Rect, theme: &Theme) -> Vec<Line<'static>>;
 
-    fn cursor(&self, _area: Rect) -> Option<(u16, u16)> {
+    fn cursor(&self, _area: Rect, _theme: &Theme) -> Option<(u16, u16)> {
         None
     }
 
@@ -285,7 +285,7 @@ mod tests {
         let mut stub = Stub;
         assert_eq!(stub.modality(), Modality::Normal);
         assert!(matches!(stub.placement(), Placement::Modal { .. }));
-        assert_eq!(stub.cursor(Rect::new(0, 0, 10, 10)), None);
+        assert_eq!(stub.cursor(Rect::new(0, 0, 10, 10), &Theme::default()), None);
         assert!(matches!(
             stub.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             SurfaceOutcome::Handled
