@@ -595,6 +595,54 @@ pub fn draw_form(
     }
 }
 
+/// Draws one surface: chrome, its pre-rendered lines, its hints and its caret.
+///
+/// The surface has already scrolled and clipped its own content, so this is
+/// pure placement. Keeping the two apart is what lets a surface be tested
+/// without a terminal.
+pub fn draw_surface(
+    frame: &mut Frame,
+    rendered: &crate::surface::stack::RenderedSurface,
+    theme: &Theme,
+) {
+    let region = rendered.region;
+    if region.width == 0 || region.height == 0 {
+        return;
+    }
+    frame.render_widget(Clear, region);
+
+    let block = Block::default()
+        .title(format!(" {} ", rendered.title))
+        .borders(Borders::ALL)
+        .border_style(theme.style(Role::PromptAccent))
+        .padding(MODAL_PADDING)
+        .style(theme.surface());
+    frame.render_widget(block, region);
+
+    // Geometry comes from the same helper the stack used, so the surface is
+    // drawn into exactly the area it scrolled itself against.
+    frame.render_widget(Paragraph::new(rendered.lines.clone()), rendered.content);
+
+    let footer = crate::surface::chrome::footer(region, &rendered.hints);
+    if footer.height > 0 {
+        // Wrapped, not truncated. A hint line that runs past the border loses
+        // whatever is on the right — which is where "Esc: cancel" sits, the
+        // one hint a stuck user most needs.
+        frame.render_widget(
+            Paragraph::new(rendered.hints.clone())
+                .style(theme.style(Role::Notification))
+                .wrap(Wrap { trim: true }),
+            footer,
+        );
+    }
+
+    if let Some((x, y)) = rendered.cursor {
+        if x < rendered.content.right() && y < rendered.content.bottom() {
+            frame.set_cursor_position((x, y));
+        }
+    }
+}
+
 fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Theme) {
     let (title, body, hint) = match prompt {
         PendingPrompt::Permission { tool, preview } => (

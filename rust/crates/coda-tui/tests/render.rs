@@ -554,12 +554,26 @@ fn the_composer_prompt_is_inset_from_the_edge() {
     );
 }
 
-fn render_form(form: &coda_tui::widgets::Form, width: u16, height: u16) -> Vec<String> {
+/// Renders a surface through the real stack, exactly as the app does.
+///
+/// Driving the stack rather than calling the draw helper directly is what
+/// makes this an integration test: a surface that is never reached by the
+/// stack would still pass a test that rendered it by hand.
+fn render_surface(
+    surface: Box<dyn coda_tui::surface::Surface>,
+    width: u16,
+    height: u16,
+) -> Vec<String> {
     let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut stack = coda_tui::surface::stack::SurfaceStack::default();
+    stack.push(surface);
+
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     terminal
         .draw(|frame| {
-            draw::draw_form(frame, frame.area(), "Settings", "Esc: cancel", form, &theme)
+            for rendered in stack.render(frame.area(), &theme) {
+                draw::draw_surface(frame, &rendered, &theme);
+            }
         })
         .expect("draw");
 
@@ -575,21 +589,24 @@ fn render_form(form: &coda_tui::widgets::Form, width: u16, height: u16) -> Vec<S
         .collect()
 }
 
+fn settings_surface() -> coda_tui::surface::settings::SettingsSurface {
+    coda_tui::surface::settings::SettingsSurface::new(&coda_tui::config::Settings::empty_at(
+        std::env::temp_dir().join("coda-render-surface-test.json"),
+    ))
+}
+
 #[test]
-fn a_form_renders_its_controls_inside_a_padded_modal() {
-    let form = coda_tui::settings_form::build(&coda_tui::config::Settings::empty_at(
-        std::env::temp_dir().join("coda-render-form-test.json"),
-    ));
-    let lines = render_form(&form, 70, 34);
+fn a_surface_renders_its_controls_inside_a_padded_modal() {
+    let lines = render_surface(Box::new(settings_surface()), 70, 34);
     let joined = lines.join("\n");
 
     assert!(joined.contains("Settings"), "title missing");
     assert!(joined.contains("Permission mode"), "radio group missing");
     assert!(joined.contains("Theme"), "select missing");
     assert!(joined.contains("Telemetry"), "switch missing");
-    assert!(joined.contains("\u{276F}"), "focus marker missing");
+    assert!(joined.contains('\u{276F}'), "focus marker missing");
 
-    // The border column, one padding column, then content: no control may start
+    // Border column, one padding column, then content: no control may start
     // flush against the border.
     let content_row = lines
         .iter()
@@ -608,11 +625,8 @@ fn a_form_renders_its_controls_inside_a_padded_modal() {
 }
 
 #[test]
-fn a_form_shows_exactly_one_focus_marker() {
-    let form = coda_tui::settings_form::build(&coda_tui::config::Settings::empty_at(
-        std::env::temp_dir().join("coda-render-form-focus.json"),
-    ));
-    let markers = render_form(&form, 70, 34)
+fn a_surface_shows_exactly_one_focus_marker() {
+    let markers = render_surface(Box::new(settings_surface()), 70, 34)
         .iter()
         .filter(|row| row.contains('\u{276F}'))
         .count();
@@ -620,22 +634,27 @@ fn a_form_shows_exactly_one_focus_marker() {
 }
 
 #[test]
-fn a_form_keeps_a_focused_caretless_control_on_screen() {
+fn a_surface_keeps_a_focused_caretless_control_on_screen() {
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use coda_tui::surface::Surface;
 
-    let mut form = coda_tui::settings_form::build(&coda_tui::config::Settings::empty_at(
-        std::env::temp_dir().join("coda-render-form-scroll.json"),
-    ));
-
-    // Tab to the telemetry switch, the last control and the one with no caret.
-    while form.focused_index() + 1 < form.len() {
-        form.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+    let mut surface = settings_surface();
+    // Tab to the telemetry switch: the last control, and the one with no
+    // caret. A caret-based scroll would lose it exactly when focused.
+    while surface.form().focused_index() + 1 < surface.form().len() {
+        surface.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
     }
 
-    // A modal too short to show the whole form must scroll to the switch.
-    let joined = render_form(&form, 70, 20).join("\n");
+    let joined = render_surface(Box::new(surface), 70, 20).join("\n");
     assert!(
         joined.contains("Telemetry"),
         "the focused switch was scrolled out of sight:\n{joined}"
     );
+}
+
+#[test]
+fn a_surface_shows_its_own_hints() {
+    // The footer comes from the surface, so a new surface cannot forget it.
+    let joined = render_surface(Box::new(settings_surface()), 70, 34).join("\n");
+    assert!(joined.contains("Esc: cancel"), "hints missing:\n{joined}");
 }

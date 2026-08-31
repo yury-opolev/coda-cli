@@ -13,7 +13,6 @@ pub use render::draw;
 pub mod overlay;
 pub mod pin;
 pub mod selection;
-pub mod settings_form;
 pub mod setup;
 pub mod state;
 pub mod surface;

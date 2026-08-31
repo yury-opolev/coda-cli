@@ -17,6 +17,8 @@ use crossterm::event::KeyEvent;
 use ratatui::layout::Rect;
 use ratatui::text::Line;
 
+pub mod form;
+pub mod settings;
 pub mod stack;
 
 /// Below this width a split pane leaves too little for either side.
@@ -85,18 +87,13 @@ pub enum Modality {
 ///
 /// The single channel from a surface to the engine and the filesystem. A
 /// surface never awaits anything.
+///
+/// Variants are added when a surface emits them, not in advance: an arm with
+/// no caller is dead code that reads as a working feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SurfaceAction {
     /// Persist the settings held by the surface that emitted this.
     SaveSettings,
-    /// Restart the engine against a stored session.
-    ResumeSession(String),
-    /// Run a slash command, without its leading slash.
-    RunCommand(String),
-    /// Answer the open engine prompt with the option at `index`.
-    AnswerPrompt { index: usize },
-    /// Refuse the open engine prompt.
-    DenyPrompt,
 }
 
 /// What a key did.
@@ -152,6 +149,73 @@ pub trait Surface {
     /// Recovers the concrete type, so the action interpreter can read typed
     /// values back out of the surface that emitted an action.
     fn as_any(&self) -> &dyn std::any::Any;
+}
+
+/// Chrome geometry, shared by the stack and the renderer.
+///
+/// Both need the same answer to "how much room does the content actually get".
+/// Computing it in two places is how a surface ends up scrolling against one
+/// height while being drawn into another — content that silently disappears
+/// with nothing in either file looking wrong.
+pub mod chrome {
+    use super::Rect;
+
+    /// Rows the border costs: one at the top, one at the bottom.
+    pub const BORDER_ROWS: u16 = 2;
+    /// Columns the border and its one-column padding cost, per side.
+    pub const BORDER_COLS: u16 = 2;
+    /// Most rows the hint footer may take before it is truncated.
+    ///
+    /// Two, because a hint list long enough to need three is too long to read
+    /// at a glance and should be shortened instead.
+    pub const MAX_HINT_ROWS: u16 = 2;
+
+    /// The area inside the border and padding.
+    ///
+    /// A region too small to hold its own chrome yields an empty rect at the
+    /// region's own origin, rather than an origin pushed outside it. Nothing
+    /// draws either way, but a caller doing arithmetic on the origin would be
+    /// working from a point that is not in the region at all.
+    pub fn inner(region: Rect) -> Rect {
+        let width = region.width.saturating_sub(BORDER_COLS * 2);
+        let height = region.height.saturating_sub(BORDER_ROWS);
+        if width == 0 || height == 0 {
+            return Rect::new(region.x, region.y, 0, 0);
+        }
+        Rect::new(region.x + BORDER_COLS, region.y + 1, width, height)
+    }
+
+    /// How many rows `hints` needs at `width`.
+    pub fn hint_rows(hints: &str, width: u16) -> u16 {
+        if hints.is_empty() || width == 0 {
+            return 0;
+        }
+        (coda_render::text::wrap(hints, width as usize).len() as u16).min(MAX_HINT_ROWS)
+    }
+
+    /// The area a surface's own content gets: inside the chrome, above hints.
+    pub fn content(region: Rect, hints: &str) -> Rect {
+        let inner = inner(region);
+        let footer = hint_rows(hints, inner.width);
+        Rect::new(
+            inner.x,
+            inner.y,
+            inner.width,
+            inner.height.saturating_sub(footer),
+        )
+    }
+
+    /// The area the hint footer occupies.
+    pub fn footer(region: Rect, hints: &str) -> Rect {
+        let inner = inner(region);
+        let rows = hint_rows(hints, inner.width).min(inner.height);
+        Rect::new(
+            inner.x,
+            inner.bottom().saturating_sub(rows),
+            inner.width,
+            rows,
+        )
+    }
 }
 
 /// Turns a resolved placement into a concrete region of `area`.
@@ -299,6 +363,56 @@ mod tests {
         let region = region_for(Placement::Inline { max_rows: 5 }, area);
         assert_eq!(region.bottom(), area.bottom());
         assert_eq!(region.height, 5);
+    }
+
+    #[test]
+    fn content_and_footer_partition_the_inner_area_without_overlapping() {
+        // The stack renders into `content` and the drawer puts hints in
+        // `footer`. If they overlap, content is drawn and then covered; if
+        // they leave a gap, rows are wasted. Both are silent.
+        let region = Rect::new(0, 0, 60, 20);
+        let hints = "Tab: next    Enter: save    Esc: cancel";
+        let content = chrome::content(region, hints);
+        let footer = chrome::footer(region, hints);
+        let inner = chrome::inner(region);
+
+        assert_eq!(content.y, inner.y);
+        assert_eq!(content.bottom(), footer.y, "content and footer disagree");
+        assert_eq!(footer.bottom(), inner.bottom());
+        assert_eq!(content.height + footer.height, inner.height);
+    }
+
+    #[test]
+    fn long_hints_are_given_a_second_row_rather_than_being_cut() {
+        // A hint line that runs past the border loses whatever is on the
+        // right, which is where "Esc: cancel" sits — the one hint a stuck
+        // user most needs.
+        let narrow = Rect::new(0, 0, 30, 20);
+        let long = "Tab: next    Enter: save    Esc: cancel    F1: help";
+        assert!(
+            chrome::hint_rows(long, chrome::inner(narrow).width) > 1,
+            "long hints were squeezed onto one row"
+        );
+    }
+
+    #[test]
+    fn hints_never_take_more_than_their_cap() {
+        let region = Rect::new(0, 0, 24, 20);
+        let absurd = "a ".repeat(200);
+        assert!(chrome::hint_rows(&absurd, chrome::inner(region).width) <= chrome::MAX_HINT_ROWS);
+    }
+
+    #[test]
+    fn chrome_survives_a_region_too_small_to_hold_it() {
+        for (w, h) in [(0u16, 0u16), (1, 1), (3, 2), (4, 3)] {
+            let region = Rect::new(0, 0, w, h);
+            let content = chrome::content(region, "Esc");
+            assert!(
+                content.right() <= region.right().max(region.x)
+                    && content.bottom() <= region.bottom().max(region.y),
+                "content escaped a {w}x{h} region: {content:?}"
+            );
+        }
     }
 
     #[test]

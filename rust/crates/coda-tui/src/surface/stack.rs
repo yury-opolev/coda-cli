@@ -23,7 +23,10 @@ pub enum StackOutcome {
 
 /// One surface's rendered output and where it goes.
 pub struct RenderedSurface {
+    /// The whole surface including its chrome.
     pub region: Rect,
+    /// Where the lines go: inside the chrome, above the hints.
+    pub content: Rect,
     pub title: String,
     pub hints: String,
     pub lines: Vec<Line<'static>>,
@@ -117,6 +120,10 @@ impl SurfaceStack {
     }
 
     /// Renders every surface bottom-up.
+    ///
+    /// Each surface is given its *content* area, not its outer region: it
+    /// scrolls itself, so telling it the wrong height would make it scroll
+    /// against one figure while being drawn into another.
     pub fn render(&self, area: Rect, theme: &Theme) -> Vec<RenderedSurface> {
         let top = self.surfaces.len().saturating_sub(1);
         self.surfaces
@@ -124,17 +131,20 @@ impl SurfaceStack {
             .enumerate()
             .map(|(index, surface)| {
                 let region = region_for(surface.placement().resolve(area), area);
+                let hints = surface.hints();
+                let content = super::chrome::content(region, &hints);
                 // Only the top surface gets a caret: two visible carets would
                 // be worse than none, and the terminal only has one.
                 let cursor = (index == top)
-                    .then(|| surface.cursor(region))
+                    .then(|| surface.cursor(content))
                     .flatten()
-                    .map(|(x, y)| (region.x + x, region.y + y));
+                    .map(|(x, y)| (content.x + x, content.y + y));
                 RenderedSurface {
                     region,
+                    content,
                     title: surface.title(),
-                    hints: surface.hints(),
-                    lines: surface.render(region, theme),
+                    hints,
+                    lines: surface.render(content, theme),
                     cursor,
                 }
             })

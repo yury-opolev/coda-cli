@@ -117,8 +117,8 @@ pub struct App {
     browser: Option<Browser>,
     /// Which browser is open, so reload and actions know what to do.
     browser_kind: Option<BrowserKind>,
-    /// The open settings form, if any.
-    settings_form: Option<crate::widgets::Form>,
+    /// Open surfaces, topmost last. Owns key routing while non-empty.
+    surfaces: crate::surface::stack::SurfaceStack,
     /// Local Coda file locations for this session.
     paths: Paths,
     /// Outcomes reported by `event/taskCompleted`, keyed by task id.
@@ -199,7 +199,7 @@ impl App {
             armed: None,
             browser: None,
             browser_kind: None,
-            settings_form: None,
+            surfaces: Default::default(),
             paths: Paths::new(project_root),
             task_outcomes: std::collections::BTreeMap::new(),
             engine_command: command,
@@ -534,11 +534,23 @@ impl App {
             return;
         }
 
-        // The settings form owns the keyboard while it is open, ahead of the
-        // browser so the two can never both act on one key.
-        if self.settings_form.is_some() {
-            self.on_settings_key(key);
-            return;
+        // Open surfaces own the keyboard, topmost first. A key the top surface
+        // declines falls through to the global keymap below, so opening a
+        // surface never disables Ctrl+C.
+        if !self.surfaces.is_empty() {
+            use crate::surface::stack::StackOutcome;
+            match self.surfaces.handle_key(key) {
+                StackOutcome::Handled => {
+                    self.dirty = true;
+                    return;
+                }
+                StackOutcome::Action(action) => {
+                    self.dirty = true;
+                    self.apply_surface_action(action).await;
+                    return;
+                }
+                StackOutcome::Ignored => {}
+            }
         }
 
         // An open overlay owns the keyboard next.
@@ -1754,7 +1766,7 @@ impl App {
         let browser = self.browser.as_ref();
         let pin = pin_text.as_deref();
         let selection = self.selection.has_selection().then_some(&self.selection);
-        let settings_form = self.settings_form.as_ref();
+        let surfaces = &self.surfaces;
 
         // The transcript origin is captured from the draw so mouse-to-row
         // translation always matches the layout that was actually rendered.
@@ -1763,21 +1775,11 @@ impl App {
             origin = draw::draw_with_pin(
                 frame, state, composer, viewport, rows, theme, browser, pin, selection,
             );
-            // Drawn as a second pass rather than another parameter on an
-            // already nine-argument signature. It goes last so it sits above
-            // everything else, which is what an open modal should do.
-            if let Some(form) = settings_form {
-                draw::draw_form(
-                    frame,
-                    frame.area(),
-                    "Settings",
-                    &format!(
-                        "Tab: next    {}: change    Enter: save    Esc: cancel",
-                        crate::render::glyphs::ARROWS_VERTICAL
-                    ),
-                    form,
-                    theme,
-                );
+            // Surfaces draw last and bottom-up, so a detail sits over its list
+            // and the whole stack sits over the shell. Rendered as a second
+            // pass rather than a tenth parameter on draw_with_pin.
+            for rendered in surfaces.render(frame.area(), theme) {
+                draw::draw_surface(frame, &rendered, theme);
             }
         })?;
         self.transcript_origin = origin;
@@ -1858,37 +1860,49 @@ impl App {
     /// If nothing is visible, the call is a no-op.  A failure to access the
     /// clipboard (e.g. no display server) is reported as a notice rather than
     /// crashing the application.
-    /// Opens the settings form, seeded from the settings on disk.
+    /// Opens the settings surface, seeded from the settings on disk.
     fn open_settings_form(&mut self) {
-        self.settings_form = Some(crate::settings_form::open(&self.paths));
+        if !self
+            .surfaces
+            .push(Box::new(crate::surface::settings::SettingsSurface::open(
+                &self.paths,
+            )))
+        {
+            // Refused by an exclusive surface. Say so, rather than appearing
+            // to do nothing.
+            self.notice(
+                "Answer the open prompt first.",
+                NoticeLevel::Warning,
+            );
+        }
         self.dirty = true;
     }
 
-    /// Routes a key to the open settings form.
-    fn on_settings_key(&mut self, key: KeyEvent) {
-        use crate::widgets::FormOutcome;
+    /// Performs the work a surface asked for.
+    ///
+    /// The only bridge from a surface to the engine and the filesystem;
+    /// surfaces themselves do no I/O, which is what makes them testable
+    /// without either.
+    async fn apply_surface_action(&mut self, action: crate::surface::SurfaceAction) {
+        use crate::surface::SurfaceAction;
 
-        self.dirty = true;
-        let Some(form) = self.settings_form.as_mut() else {
-            return;
-        };
-
-        match form.handle_key(key) {
-            FormOutcome::Consumed | FormOutcome::Ignored => {}
-            FormOutcome::Cancel => {
-                self.settings_form = None;
-                self.notice("Settings unchanged.", NoticeLevel::Info);
-            }
-            FormOutcome::Submit => {
-                // Take the form first: whether the save succeeds or fails, the
-                // modal closes, so a broken settings file cannot trap the user
-                // in a form they can only escape by killing the process.
-                let form = self.settings_form.take().expect("just matched");
+        match action {
+            SurfaceAction::SaveSettings => {
+                // Take the surface first: whether the save succeeds or fails,
+                // the modal closes, so a broken settings file cannot trap the
+                // user in a form they can only escape by killing the process.
+                let Some(surface) = self.surfaces.pop() else {
+                    return;
+                };
+                let Some(settings_surface) = surface
+                    .as_any()
+                    .downcast_ref::<crate::surface::settings::SettingsSurface>()
+                else {
+                    return;
+                };
                 let mut settings = crate::config::Settings::load(&self.paths)
-                    .unwrap_or_else(|_| {
-                        crate::config::Settings::empty_at(self.paths.settings())
-                    });
-                match crate::settings_form::apply(&form, &mut settings) {
+                    .unwrap_or_else(|_| crate::config::Settings::empty_at(self.paths.settings()));
+                match settings_surface.apply(&mut settings) {
                     Ok(()) => self.notice(
                         "Settings saved. Some changes apply on restart.",
                         NoticeLevel::Info,
