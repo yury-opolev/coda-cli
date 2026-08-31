@@ -183,16 +183,17 @@ fn renders_a_multiline_composer() {
 
 #[test]
 fn renders_a_permission_prompt_over_the_transcript() {
-    let mut state = session();
-    state.apply(UiEvent::Engine(Event::AssistantText {
-        delta: "working on it".into(),
-    }));
-    state.apply(UiEvent::PromptRequested(PendingPrompt::Permission {
-        tool: "run_command".into(),
-        preview: "rm -rf build".into(),
-    }));
-
-    let rows = render(&state, &Composer::new(), 80, 24);
+    // Prompts are surfaces now, so this drives the stack the way the app does.
+    let rows = render_surface(
+        Box::new(coda_tui::surface::prompt::PromptSurface::new(
+            PendingPrompt::Permission {
+                tool: "run_command".into(),
+                preview: "rm -rf build".into(),
+            },
+        )),
+        80,
+        24,
+    );
     assert!(
         rows.iter().any(|r| r.contains("Permission required")),
         "prompt title missing from {rows:?}"
@@ -206,15 +207,18 @@ fn renders_a_permission_prompt_over_the_transcript() {
 
 #[test]
 fn renders_a_question_prompt_with_numbered_options() {
-    let mut state = session();
-    state.apply(UiEvent::PromptRequested(PendingPrompt::Question {
-        question: "Which approach?".into(),
-        options: vec!["rewrite".into(), "patch".into()],
-        multi_select: false,
-        allow_free_text: true,
-    }));
-
-    let rows = render(&state, &Composer::new(), 80, 24);
+    let rows = render_surface(
+        Box::new(coda_tui::surface::prompt::PromptSurface::new(
+            PendingPrompt::Question {
+                question: "Which approach?".into(),
+                options: vec!["rewrite".into(), "patch".into()],
+                multi_select: false,
+                allow_free_text: true,
+            },
+        )),
+        80,
+        24,
+    );
     assert!(rows.iter().any(|r| r.contains("Which approach?")));
     assert!(rows.iter().any(|r| r.contains("1. rewrite")));
     assert!(rows.iter().any(|r| r.contains("2. patch")));

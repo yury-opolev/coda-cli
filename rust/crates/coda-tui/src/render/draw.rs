@@ -14,7 +14,7 @@ use ratatui::Frame;
 
 use crate::composer::Composer;
 use crate::overlay::{Browser, View as BrowserView};
-use crate::state::{PendingPrompt, UiState};
+use crate::state::UiState;
 use crate::render::glyphs;
 use crate::viewport::Viewport;
 
@@ -228,10 +228,9 @@ pub fn draw_with_pin(
         draw_browser(frame, centered(area, 90, 85), browser, theme);
     }
 
-    // A prompt from the engine outranks a browser: it blocks the turn.
-    if let Some(prompt) = &state.prompt {
-        draw_prompt(frame, area, prompt, theme);
-    }
+    // Prompts are surfaces now, drawn by the stack after this returns. Their
+    // Exclusive modality is what puts them above a browser, rather than the
+    // order of these calls.
 
     content
 }
@@ -583,66 +582,6 @@ pub fn draw_surface(
     }
 }
 
-fn draw_prompt(frame: &mut Frame, area: Rect, prompt: &PendingPrompt, theme: &Theme) {
-    let (title, body, hint) = match prompt {
-        PendingPrompt::Permission { tool, preview } => (
-            "Permission required",
-            format!("{tool}\n\n{preview}"),
-            "y: allow    n: deny    Esc: deny".to_string(),
-        ),
-        PendingPrompt::Question { question, options, .. } => {
-            let body = if options.is_empty() {
-                question.clone()
-            } else {
-                let list = options
-                    .iter()
-                    .enumerate()
-                    .map(|(i, option)| format!("  {}. {option}", i + 1))
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                format!("{question}\n\n{list}")
-            };
-            (
-                "Question",
-                body,
-                format!("{}: choose    Enter: answer", glyphs::ARROWS_VERTICAL),
-            )
-        }
-        PendingPrompt::PlanApproval { plan } => (
-            "Approve plan?",
-            plan.clone(),
-            "y: approve    n: reject    Esc: reject".to_string(),
-        ),
-    };
-
-    let region = centered(area, 70, 60);
-    frame.render_widget(Clear, region);
-
-    let block = Block::default()
-        .title(format!(" {title} "))
-        .borders(Borders::ALL)
-        .border_style(theme.style(Role::PromptAccent))
-        .padding(MODAL_PADDING)
-        .style(theme.surface());
-    let inner = block.inner(region);
-    frame.render_widget(block, region);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(body)
-            .style(theme.style(Role::PromptText))
-            .wrap(Wrap { trim: false }),
-        chunks[0],
-    );
-    frame.render_widget(
-        Paragraph::new(hint).style(theme.style(Role::Notification)),
-        chunks[1],
-    );
-}
 
 /// Draws a browser overlay over the whole frame.
 ///

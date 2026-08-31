@@ -18,6 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 pub mod form;
+pub mod prompt;
 pub mod settings;
 pub mod stack;
 
@@ -94,6 +95,15 @@ pub enum Modality {
 pub enum SurfaceAction {
     /// Persist the settings held by the surface that emitted this.
     SaveSettings,
+    /// Reply to the open engine prompt.
+    ///
+    /// Carries the decision, not the transport: the surface works out what
+    /// the answer is and the application sends it, because the responder is
+    /// engine state a surface must not hold.
+    AnswerPrompt {
+        allowed: bool,
+        answer: Option<String>,
+    },
 }
 
 /// What a key did.

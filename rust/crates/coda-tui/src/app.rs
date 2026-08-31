@@ -379,8 +379,20 @@ impl App {
                         coda_proto::error_codes::INTERNAL_ERROR,
                         "superseded by another request",
                     );
+                    // Retire the superseded surface too. Its exclusivity would
+                    // otherwise refuse the replacement, leaving a stale prompt
+                    // on screen bound to a responder that has already failed.
+                    self.retire_prompt_surface();
                 }
                 self.pending_responder = Some(responder);
+                // The surface is pushed alongside the state so the two cannot
+                // disagree about whether a prompt is open. Exclusive modality
+                // then guarantees it stays on top and cannot be dismissed
+                // without an answer, which the engine is blocked awaiting.
+                self.surfaces
+                    .push(Box::new(crate::surface::prompt::PromptSurface::new(
+                        prompt.clone(),
+                    )));
                 self.apply(UiEvent::PromptRequested(prompt));
             }
             None => responder.fail(
@@ -528,15 +540,11 @@ impl App {
     }
 
     async fn on_key(&mut self, key: KeyEvent) {
-        // A prompt takes the keyboard until it is answered.
-        if self.state.prompt.is_some() {
-            self.on_prompt_key(key);
-            return;
-        }
-
         // Open surfaces own the keyboard, topmost first. A key the top surface
         // declines falls through to the global keymap below, so opening a
-        // surface never disables Ctrl+C.
+        // surface never disables Ctrl+C. An engine prompt is a surface too,
+        // and its Exclusive modality is what keeps it on top rather than the
+        // ordering of the branches here.
         if !self.surfaces.is_empty() {
             use crate::surface::stack::StackOutcome;
             match self.surfaces.handle_key(key) {
@@ -1151,62 +1159,6 @@ impl App {
     }
 
     /// Answers an open prompt.
-    fn on_prompt_key(&mut self, key: KeyEvent) {        let Some(prompt) = self.state.prompt.clone() else {
-            return;
-        };
-        self.dirty = true;
-
-        let (allowed, answer) = match (&prompt, key.code) {
-            // Yes/no prompts.
-            (PendingPrompt::Permission { .. } | PendingPrompt::PlanApproval { .. }, code) => {
-                match code {
-                    KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => (true, None),
-                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => (false, None),
-                    _ => return,
-                }
-            }
-            // Numbered choices.
-            (PendingPrompt::Question { options, .. }, KeyCode::Char(c))
-                if c.is_ascii_digit() =>
-            {
-                let index = c.to_digit(10).unwrap_or(0) as usize;
-                match index.checked_sub(1).and_then(|i| options.get(i)) {
-                    Some(option) => (true, Some(option.clone())),
-                    None => return,
-                }
-            }
-            (PendingPrompt::Question { options, .. }, KeyCode::Enter) => {
-                (true, options.first().cloned())
-            }
-            (PendingPrompt::Question { .. }, KeyCode::Esc) => (false, None),
-            _ => return,
-        };
-
-        if let Some(responder) = self.pending_responder.take() {
-            let reply = match &prompt {
-                PendingPrompt::Permission { .. } => {
-                    serde_json::to_value(messages::PermissionResponse { allow: allowed })
-                }
-                PendingPrompt::PlanApproval { .. } => {
-                    serde_json::to_value(messages::PlanApprovalResponse { approve: allowed })
-                }
-                PendingPrompt::Question { .. } => {
-                    serde_json::to_value(messages::QuestionResponse {
-                        answer: answer.clone().unwrap_or_default(),
-                    })
-                }
-            };
-            match reply {
-                Ok(value) => responder.respond(value),
-                Err(error) => responder.fail(
-                    coda_proto::error_codes::INTERNAL_ERROR,
-                    error.to_string(),
-                ),
-            }
-        }
-
-        self.apply(UiEvent::PromptAnswered { allowed, answer });
-    }
 
     // -- Actions ------------------------------------------------------------
 
@@ -1672,6 +1624,14 @@ impl App {
         }
         self.state.apply(event);
         self.laid_out_width = 0;
+
+        // Keep the prompt surface in lockstep with the reducer. The engine can
+        // clear a prompt without it being answered — a turn ending or being
+        // interrupted does exactly that — and an Exclusive surface left behind
+        // would be undismissable, wedging the interface permanently.
+        if self.state.prompt.is_none() {
+            self.retire_prompt_surface();
+        }
     }
 
     fn notice(&mut self, text: impl Into<String>, level: NoticeLevel) {
@@ -1930,7 +1890,62 @@ impl App {
                     ),
                 }
             }
+            SurfaceAction::AnswerPrompt { allowed, answer } => {
+                self.surfaces.pop();
+                self.answer_prompt(allowed, answer);
+            }
         }
+    }
+
+    /// Sends the reply to an engine prompt and records the outcome.
+    /// Removes an open prompt surface, wherever it sits in the stack.
+    ///
+    /// Used when a prompt is superseded or cancelled by the engine rather than
+    /// answered by the user: the surface must go even though nothing was
+    /// answered, and its own exclusivity would otherwise keep it there.
+    fn retire_prompt_surface(&mut self) {
+        while self
+            .surfaces
+            .top()
+            .is_some_and(|s| s.as_any().is::<crate::surface::prompt::PromptSurface>())
+        {
+            self.surfaces.pop();
+        }
+    }
+
+    /// Split from the surface deliberately: the responder is engine state, so
+    /// a surface must not hold it. The surface decides what the answer is and
+    /// this sends it.
+    fn answer_prompt(&mut self, allowed: bool, answer: Option<String>) {
+        let Some(prompt) = self.state.prompt.clone() else {
+            return;
+        };
+        self.dirty = true;
+
+        if let Some(responder) = self.pending_responder.take() {
+            let reply = match &prompt {
+                PendingPrompt::Permission { .. } => {
+                    serde_json::to_value(messages::PermissionResponse { allow: allowed })
+                }
+                PendingPrompt::PlanApproval { .. } => {
+                    serde_json::to_value(messages::PlanApprovalResponse { approve: allowed })
+                }
+                PendingPrompt::Question { .. } => {
+                    serde_json::to_value(messages::QuestionResponse {
+                        answer: answer.clone().unwrap_or_default(),
+                    })
+                }
+            };
+            match reply {
+                Ok(value) => responder.respond(value),
+                Err(error) => responder.fail(
+                    coda_proto::error_codes::INTERNAL_ERROR,
+                    error.to_string(),
+                ),
+            }
+        }
+
+        self.apply(UiEvent::PromptAnswered { allowed, answer });
     }
 
     /// Copies the active selection for a right-click gesture.
