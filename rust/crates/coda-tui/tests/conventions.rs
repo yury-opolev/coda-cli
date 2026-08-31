@@ -89,6 +89,25 @@ fn glyph_literals_live_only_in_the_glyph_table() {
 }
 
 #[test]
+fn colours_come_from_the_theme_not_from_literals() {
+    // A ratchet. The convention already holds; this keeps it holding. A
+    // surface that hard-codes a colour is invisible in one theme and garish in
+    // another, and nothing about reading the diff would reveal it.
+    let offenders: Vec<String> = sources()
+        .into_iter()
+        .filter_map(|(path, source)| {
+            let code = without_comments(&without_test_modules(&source));
+            code.contains("Color::").then_some(path)
+        })
+        .collect();
+
+    assert!(
+        offenders.is_empty(),
+        "colours must come from a theme Role, not a literal; found Color:: in: {offenders:#?}"
+    );
+}
+
+#[test]
 fn raw_glyph_characters_live_only_in_the_glyph_table() {
     // The companion to the test above, and the one that actually bites: an
     // escape is easy to grep for, so the tempting way around the rule is to
