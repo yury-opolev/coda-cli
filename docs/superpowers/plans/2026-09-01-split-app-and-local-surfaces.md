@@ -446,10 +446,45 @@ git commit -m "Give each browser its own row actions"
 
 ## Definition of done
 
-- [ ] `cargo test --workspace` passes with zero warnings.
-- [ ] `app/mod.rs` is under 1,600 production lines, enforced by a test.
-- [ ] `browsers.rs` mentions `BrowserKind` no more than ten times, enforced by a test.
-- [ ] Adding a browser means: one constructor arm, one `RowActions`. Nothing else.
-- [ ] No behaviour change: every existing test passes unmodified except where a
+- [x] `cargo test --workspace` passes with zero warnings. *(2,267 passing.)*
+- [x] `app/mod.rs` is under 1,600 production lines, enforced by a test.
+      *(1,351, down from 3,959; `the_application_module_stays_a_shell`.)*
+- [x] ~~`browsers.rs` mentions `BrowserKind` no more than ten times~~ — replaced,
+      see the note below. `row_behaviour_is_not_looked_up_by_browser_kind` caps
+      `browser_kind()` at two calls instead.
+- [x] Adding a browser means: one constructor arm, one `RowActions`. Nothing else.
+      *(Both matches are exhaustive over `BrowserKind`, so a new browser is a
+      compile error until it says what its rows do.)*
+- [x] No behaviour change: every existing test passes unmodified except where a
       test moved file with the code it covers.
 - [ ] `.\build.ps1 -Deploy` produces a working `coda-rs.exe` at the bumped version.
+
+### Deviation: how "not dispatched by kind" is measured
+
+Task 6 planned to count `BrowserKind::` in `browsers.rs` and hold it under ten.
+That measures the wrong thing. It counts a browser *declaring itself* — its
+constructor arm and its `RowActions` arm — the same as it counts behaviour being
+looked up by kind, and the first is the very thing this task set out to produce.
+Written as planned the test would have failed at seventeen mentions with the
+refactor complete and correct, and the only way to pass it would have been to
+make the declarations less explicit.
+
+The property actually wanted is that *behaviour* is not chosen by asking which
+browser is open. That is `browser_kind()`, and after this task there are two
+calls left, both genuine "which browser is open" questions: rebuilding on
+reload, and noticing that saving an MCP server affects the open list. The test
+caps those at two, and it does fail if kind-dispatch is reintroduced — verified
+by putting one back.
+
+### Two bugs Task 6 surfaced
+
+Both are the shape this plan exists to prevent — an action that exists and never
+fires — and neither was visible to a unit test:
+
+- A `RowActions` key had to be registered on the `Browser` separately, or the
+  browser swallowed it before the surface ever saw it. Found by driving the real
+  stack in `surface_integration.rs`. `with_actions` now registers its own keys.
+- `reload_browser` rebuilt the surface without attaching actions, so pressing `r`
+  left a browser that looked identical and had gone inert. Both construction
+  sites now go through one helper, held by
+  `a_browser_surface_is_built_in_one_place`.
