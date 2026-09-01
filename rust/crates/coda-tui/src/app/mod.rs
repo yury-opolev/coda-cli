@@ -13,8 +13,7 @@ use coda_proto::messages::{self, method};
 use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
 use crossterm::event::{
-    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent,
-    MouseEventKind,
+    Event as TerminalEvent, EventStream, KeyCode, KeyEvent, KeyEventKind,
 };
 use futures::future::OptionFuture;
 use futures_lite::StreamExt;
@@ -22,6 +21,7 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+mod clipboard;
 mod engine;
 
 use crate::browsers::{self, TaskOutcome};
@@ -40,29 +40,15 @@ use crate::viewport::{Viewport, ViewportAnchor};
 /// How long a turn may take before we stop waiting on shutdown.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 /// Rows scrolled per mouse wheel notch.
-const WHEEL_ROWS: usize = 3;
+pub(crate) const WHEEL_ROWS: usize = 3;
 
 /// What a pointer gesture asks the clipboard to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PointerAction {
+pub(crate) enum PointerAction {
     Copy,
     Paste,
 }
 
-/// Decides what a right-click means.
-///
-/// One button carries both operations, chosen by whether anything is selected:
-/// this is the Windows console convention and matches the C# build, so muscle
-/// memory carries over. A selection is consumed by the copy, which is what
-/// makes the alternation feel natural — select, right-click to copy, then
-/// right-click again to paste.
-fn pointer_action(has_selection: bool) -> Option<PointerAction> {
-    Some(if has_selection {
-        PointerAction::Copy
-    } else {
-        PointerAction::Paste
-    })
-}
 
 /// Minimum interval between streaming (non-critical) frames — 30 FPS.
 ///
@@ -401,68 +387,6 @@ impl App {
         Ok(())
     }
 
-    /// Maps a pointer event onto its effect, returning the clipboard action the
-    /// gesture asks for (if any).
-    ///
-    /// Split out from the event loop so tests can drive real pointer events and
-    /// observe the decision. Handlers buried in the loop are exactly the shape
-    /// that has silently gone unwired here before.
-    fn decide_pointer_action(&mut self, mouse: MouseEvent) -> Option<PointerAction> {
-        match mouse.kind {
-            MouseEventKind::ScrollUp => {
-                self.capture_anchor_if_following();
-                self.viewport.scroll_up(WHEEL_ROWS);
-                self.dirty = true;
-            }
-            MouseEventKind::ScrollDown => {
-                self.viewport.scroll_down(WHEEL_ROWS);
-                self.dirty = true;
-            }
-            // Drag-select. Mouse capture disables the terminal's own selection,
-            // so without this there is no way to select anything at all — the
-            // capture takes the native behaviour away and gives nothing back.
-            MouseEventKind::Down(MouseButton::Left) => {
-                // A click in the composer moves the caret rather than starting
-                // a transcript selection: the composer is the one region where
-                // a click already has an editing meaning.
-                if self.move_caret_to_click(mouse.column, mouse.row) {
-                    self.selection.clear();
-                    self.dirty = true;
-                } else if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                    self.selection.begin(pos);
-                    self.dirty = true;
-                }
-            }
-            MouseEventKind::Drag(MouseButton::Left) => {
-                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                    self.selection.update(pos);
-                    self.dirty = true;
-                }
-            }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                    self.selection.update(pos);
-                }
-                // A click with no drag clears rather than leaving a stale
-                // one-cell selection that Ctrl+Y would then copy.
-                if !self.selection.has_selection() {
-                    self.selection.clear();
-                }
-                self.dirty = true;
-            }
-            // Right-click is copy-or-paste, matching the C# build and the
-            // Windows console convention: with a selection it copies, and with
-            // nothing selected it pastes into the draft. The paste target is
-            // always the composer regardless of where the pointer was, so the
-            // gesture does not depend on aim.
-            MouseEventKind::Down(MouseButton::Right) => {
-                self.dirty = true;
-                return pointer_action(self.selection.has_selection());
-            }
-            _ => {}
-        }
-        None
-    }
 
     async fn on_key(&mut self, key: KeyEvent) {
         // Open surfaces own the keyboard, topmost first. A key the top surface
@@ -1546,45 +1470,7 @@ impl App {
         }
     }
 
-    /// Translates a screen cell into a position in the flat `rows` array.
-    ///
-    /// Returns `None` for a click outside the transcript area, so clicking the
-    /// composer or status bar does not start a selection in the transcript.
-    /// Places the caret where the pointer was clicked, if it landed in the
-    /// composer. Returns whether it did.
-    fn move_caret_to_click(&mut self, column: u16, row: u16) -> bool {
-        let (origin_x, origin_y) = self.composer_origin;
-        if origin_y == 0 || row < origin_y {
-            return false;
-        }
-        let line = (row - origin_y) as usize;
-        if line >= self.composer.line_count() {
-            return false;
-        }
-        // Left of the prompt marker counts as column zero rather than missing,
-        // so clicking the gutter puts the caret at the start of the line.
-        let cell = column.saturating_sub(origin_x) as usize;
-        self.composer.move_cursor_to(line, cell);
-        true
-    }
 
-    fn mouse_to_selection(
-        &self,
-        column: u16,
-        row: u16,
-    ) -> Option<crate::selection::SelectionPos> {
-        let (origin_row, height) = self.transcript_origin;
-        if height == 0 || row < origin_row || row >= origin_row.saturating_add(height) {
-            return None;
-        }
-        let offset_in_view = (row - origin_row) as usize;
-        let visible = self.viewport.visible_range();
-        let index = visible.start.checked_add(offset_in_view)?;
-        if index >= self.rows.len() {
-            return None;
-        }
-        Some(crate::selection::SelectionPos { row: index, col: column as usize })
-    }
 
     fn key_context(&self) -> KeyContext {
         let (line, _) = self.composer.cursor_position();
@@ -2006,83 +1892,8 @@ impl App {
 
 
 
-    /// Copies the active selection for a right-click gesture.
-    ///
-    /// The selection is cleared only on a successful write. Keeping it after a
-    /// failure means the user can retry rather than having to reselect, which
-    /// is what the C# does for the same reason.
-    fn copy_selection_via_pointer(&mut self) {
-        let text = self.selection.copy_text(&self.rows);
-        if text.is_empty() {
-            return;
-        }
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
-            Ok(()) => {
-                self.selection.clear();
-                self.notice("Copied selection to clipboard.", NoticeLevel::Info);
-            }
-            Err(err) => {
-                self.notice(
-                    format!("Could not access the clipboard: {err}"),
-                    NoticeLevel::Warning,
-                );
-            }
-        }
-    }
 
-    /// Pastes the clipboard into the composer for a right-click with nothing
-    /// selected.
-    ///
-    /// Refused while a prompt is up, so a pointer can never type into a
-    /// composer the user cannot see — the same guard the C# applies.
-    fn paste_from_pointer(&mut self) {
-        // Any open surface blocks it, not just a prompt or a browser: a
-        // pointer must never type into a composer the user cannot see.
-        if !self.surfaces.is_empty() {
-            return;
-        }
-        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(text) if !text.is_empty() => {
-                self.composer.insert(&text);
-            }
-            Ok(_) => {}
-            Err(err) => {
-                self.notice(
-                    format!("Could not read the clipboard: {err}"),
-                    NoticeLevel::Warning,
-                );
-            }
-        }
-    }
 
-    fn copy_to_clipboard(&mut self) {
-        // A selection wins over the visible screen: if the user has selected
-        // something, copying everything on screen instead is silently the
-        // wrong answer.
-        let (text, what) = if self.selection.has_selection() {
-            (self.selection.copy_text(&self.rows), "selection")
-        } else {
-            (
-                crate::selection::copy_visible_text(&self.rows, self.viewport.visible_range()),
-                "transcript",
-            )
-        };
-        if text.is_empty() {
-            self.dirty = false;
-            return;
-        }
-        match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
-            Ok(()) => {
-                self.notice(format!("Copied {what} to clipboard."), NoticeLevel::Info);
-            }
-            Err(err) => {
-                self.notice(
-                    format!("Could not access the clipboard: {err}"),
-                    NoticeLevel::Warning,
-                );
-            }
-        }
-    }
 
     /// Checks for a first run and surfaces the setup wizard notice.
     fn check_first_run(&mut self) {
@@ -3715,16 +3526,6 @@ mod tests {
     }
 
     // -- /rewind argument parsing -----------------------------------------------
-
-    #[test]
-    fn right_click_with_a_selection_copies() {
-        assert_eq!(pointer_action(true), Some(PointerAction::Copy));
-    }
-
-    #[test]
-    fn right_click_without_a_selection_pastes() {
-        assert_eq!(pointer_action(false), Some(PointerAction::Paste));
-    }
 
     #[test]
     fn rewind_n_defaults_to_one_when_no_arg() {
