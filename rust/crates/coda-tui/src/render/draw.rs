@@ -19,6 +19,12 @@ use crate::viewport::Viewport;
 
 /// Width of the scrollbar column.
 const SCROLLBAR_WIDTH: u16 = 1;
+
+/// Most rows the completion popup may take.
+///
+/// Eight is enough to see the shape of the list without burying the
+/// transcript it floats over.
+const COMPLETION_MAX_ROWS: usize = 8;
 /// Composer height bounds, in rows.
 const COMPOSER_MIN_ROWS: u16 = 1;
 const COMPOSER_MAX_ROWS: u16 = 10;
@@ -219,6 +225,8 @@ pub fn draw_with_pin(
         draw_scrollbar(frame, scrollbar, viewport, theme);
     }
     draw_composer(frame, regions.composer, composer, state, theme);
+    // After the composer, so it floats above it rather than under it.
+    draw_completions(frame, regions.composer, composer, theme);
     draw_status(frame, regions.status, state, viewport, theme);
 
 
@@ -227,6 +235,79 @@ pub fn draw_with_pin(
     // order of these calls.
 
     content
+}
+
+/// Draws the completion popup just above the composer.
+///
+/// Floated over the transcript rather than given its own layout row, so the
+/// transcript does not reflow on every keystroke as candidates appear and
+/// disappear.
+///
+/// This is drawn by the shell rather than as a `Surface` because completions
+/// are not modal: the composer keeps the keyboard while they are shown, and a
+/// surface owns it. The popup is a hint over the shell, not a layer above it.
+fn draw_completions(frame: &mut Frame, below: Rect, composer: &Composer, theme: &Theme) {
+    let completion = composer.completion();
+    if !completion.is_active() || below.y == 0 {
+        return;
+    }
+
+    // At most eight rows, and never more than the space above the composer.
+    let rows = completion
+        .candidates
+        .len()
+        .min(COMPLETION_MAX_ROWS)
+        .min(below.y as usize) as u16;
+    if rows == 0 {
+        return;
+    }
+
+    let width = below.width;
+    let area = Rect::new(below.x, below.y - rows, width, rows);
+    frame.render_widget(Clear, area);
+
+    // Scrolled so the selection stays visible once the list is longer than
+    // the popup: otherwise pressing Down past the eighth entry moves a
+    // highlight nobody can see.
+    let first = completion
+        .selected
+        .saturating_sub(rows.saturating_sub(1) as usize);
+
+    let lines: Vec<Line> = completion
+        .candidates
+        .iter()
+        .enumerate()
+        .skip(first)
+        .take(rows as usize)
+        .map(|(index, candidate)| {
+            let selected = index == completion.selected && completion.navigated;
+            let style = if selected {
+                theme
+                    .style(Role::CompletionSelectedText)
+                    .bg(theme.fg(Role::CompletionSelectedBackground))
+            } else {
+                theme.style(Role::CompletionNormal)
+            };
+            let marker = if selected {
+                glyphs::OPTION_MARKER
+            } else {
+                glyphs::OPTION_BLANK
+            };
+            let label = match &candidate.description {
+                Some(detail) => format!("{marker}{:<18} {detail}", candidate.label),
+                None => format!("{marker}{}", candidate.label),
+            };
+            Line::from(Span::styled(
+                text::truncate(&text::sanitize(&label), width as usize),
+                style,
+            ))
+        })
+        .collect();
+
+    frame.render_widget(
+        Paragraph::new(lines).style(Style::default().bg(theme.fg(Role::ComposerPanelBackground))),
+        area,
+    );
 }
 
 fn draw_transcript_with_pin(
@@ -382,7 +463,7 @@ const BOTTOM_EDGE_GLYPH: &str = glyphs::COMPOSER_BOTTOM;
 ///
 /// The cursor is placed from this, so it must track the marker's width or the
 /// caret drifts away from the text it is meant to sit in.
-const COMPOSER_TEXT_COLUMN: u16 = 3;
+pub const COMPOSER_TEXT_COLUMN: u16 = 3;
 
 /// Breathing room between a modal's border and its contents.
 ///

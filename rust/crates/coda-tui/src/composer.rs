@@ -54,6 +54,13 @@ pub struct CompletionState {
     pub selected: usize,
     /// Byte range in the buffer that accepting a candidate replaces.
     pub range: (usize, usize),
+    /// Whether the user has moved the selection.
+    ///
+    /// Until they do, the popup is a *hint* rather than a choice, so Enter
+    /// runs what is typed instead of accepting a candidate. Without this
+    /// distinction, typing a command in full and pressing Enter silently
+    /// replaced it with itself and did nothing visible.
+    pub navigated: bool,
 }
 
 impl CompletionState {
@@ -68,6 +75,7 @@ impl CompletionState {
     fn next(&mut self) {
         if !self.candidates.is_empty() {
             self.selected = (self.selected + 1) % self.candidates.len();
+            self.navigated = true;
         }
     }
 
@@ -77,6 +85,7 @@ impl CompletionState {
                 .selected
                 .checked_sub(1)
                 .unwrap_or(self.candidates.len() - 1);
+            self.navigated = true;
         }
     }
 }
@@ -120,13 +129,58 @@ impl Composer {
         &self.history
     }
 
-    /// The line and column of the cursor, both zero-based, in grapheme units.
+    /// The line and column of the cursor, both zero-based.
+    ///
+    /// The column is in *cells*, not graphemes, because that is what the
+    /// renderer offsets the caret by — a wide character must advance the caret
+    /// by two.
     pub fn cursor_position(&self) -> (usize, usize) {
         let before = &self.buffer[..self.cursor];
         let line = before.matches('\n').count();
         let column_start = before.rfind('\n').map_or(0, |i| i + 1);
-        let column = self.buffer[column_start..self.cursor].graphemes(true).count();
+        let column = coda_render::text::width(&self.buffer[column_start..self.cursor]);
         (line, column)
+    }
+
+    /// Moves the cursor to `line` and `cell_column`, clamped to the text.
+    ///
+    /// The inverse of [`cursor_position`], used to place the caret where the
+    /// pointer was clicked. Clicking past the end of a line lands at its end
+    /// rather than doing nothing, which is what every editor does and what a
+    /// user aiming roughly at a line expects.
+    ///
+    /// Snaps to the nearer grapheme boundary, so clicking the right half of a
+    /// wide character puts the caret after it rather than inside it.
+    pub fn move_cursor_to(&mut self, line: usize, cell_column: usize) {
+        let mut start = 0usize;
+        for _ in 0..line {
+            match self.buffer[start..].find('\n') {
+                Some(offset) => start += offset + 1,
+                // Past the last line: clamp to the last one.
+                None => break,
+            }
+        }
+        let end = self.buffer[start..]
+            .find('\n')
+            .map_or(self.buffer.len(), |offset| start + offset);
+
+        let mut at = start;
+        let mut cells = 0usize;
+        for grapheme in self.buffer[start..end].graphemes(true) {
+            let w = coda_render::text::grapheme_width(grapheme);
+            if cells + w > cell_column {
+                // Inside this grapheme: take whichever edge is nearer.
+                if cell_column.saturating_sub(cells) * 2 >= w {
+                    at += grapheme.len();
+                }
+                break;
+            }
+            cells += w;
+            at += grapheme.len();
+        }
+        self.cursor = at.min(end);
+        // A click is a new intent, so a stale popup should not survive it.
+        self.clear_completions();
     }
 
     pub fn lines(&self) -> impl Iterator<Item = &str> {
@@ -399,11 +453,29 @@ impl Composer {
     }
 
     /// Opens the completion popup.
+    ///
+    /// Preserves `navigated` when the candidate list is unchanged, so that
+    /// refreshing on every keystroke does not silently discard the fact that
+    /// the user had chosen something.
     pub fn set_completions(&mut self, candidates: Vec<Completion>, range: (usize, usize)) {
+        let navigated = self.completion.navigated
+            && self.completion.candidates.len() == candidates.len()
+            && self
+                .completion
+                .candidates
+                .iter()
+                .zip(&candidates)
+                .all(|(a, b)| a.value == b.value);
+        let selected = if navigated {
+            self.completion.selected.min(candidates.len().saturating_sub(1))
+        } else {
+            0
+        };
         self.completion = CompletionState {
             candidates,
-            selected: 0,
+            selected,
             range,
+            navigated,
         };
     }
 
@@ -790,6 +862,133 @@ mod tests {
 
         assert!(!composer.history_next(), "editing should detach from history");
         assert_eq!(composer.text(), "older");
+    }
+
+    #[test]
+    fn a_click_places_the_caret_at_that_cell() {
+        let mut composer = Composer::new();
+        composer.insert("hello world");
+        composer.move_cursor_to(0, 6);
+        composer.insert("brave ");
+        assert_eq!(composer.text(), "hello brave world");
+    }
+
+    #[test]
+    fn a_click_past_the_end_of_a_line_lands_at_its_end() {
+        // Every editor does this, and it is what someone aiming roughly at a
+        // line expects. Doing nothing would feel broken.
+        let mut composer = Composer::new();
+        composer.insert("hi");
+        composer.move_cursor_to(0, 99);
+        composer.insert("!");
+        assert_eq!(composer.text(), "hi!");
+    }
+
+    #[test]
+    fn a_click_on_a_later_line_lands_on_that_line() {
+        let mut composer = Composer::new();
+        composer.insert("one");
+        composer.insert_newline();
+        composer.insert("two");
+        composer.move_cursor_to(0, 0);
+        composer.insert(">");
+        assert_eq!(composer.text(), ">one\ntwo");
+
+        composer.move_cursor_to(1, 3);
+        composer.insert("!");
+        assert_eq!(composer.text(), ">one\ntwo!");
+    }
+
+    #[test]
+    fn a_click_below_the_last_line_clamps_to_it() {
+        let mut composer = Composer::new();
+        composer.insert("only");
+        composer.move_cursor_to(9, 0);
+        composer.insert("<");
+        assert_eq!(composer.text(), "<only", "a click below the text was lost");
+    }
+
+    #[test]
+    fn a_click_snaps_to_a_grapheme_boundary() {
+        // Clicking the right half of a wide character puts the caret after it,
+        // never inside it — a byte index inside a code point would panic.
+        let mut composer = Composer::new();
+        composer.insert("\u{6587}\u{6587}");
+        composer.move_cursor_to(0, 1);
+        composer.insert("|");
+        assert_eq!(composer.text(), "\u{6587}|\u{6587}");
+    }
+
+    #[test]
+    fn a_click_dismisses_a_stale_popup() {
+        // A click is a new intent; leaving the popup up would let the next
+        // Enter act on a selection the user has moved away from.
+        let mut composer = Composer::new();
+        composer.insert("/y");
+        composer.set_completions(vec![Completion::new("/yolo", None)], (0, 2));
+        composer.move_cursor_to(0, 0);
+        assert!(!composer.completion().is_active());
+    }
+
+    #[test]
+    fn a_fresh_popup_is_a_hint_not_a_choice() {
+        // Until the user moves the selection, Enter must run what they typed
+        // rather than accepting a candidate. Accepting silently replaced a
+        // fully typed command with itself, so Enter appeared to do nothing.
+        let mut composer = Composer::new();
+        composer.insert("/yolo");
+        composer.set_completions(
+            vec![Completion::new("/yolo", None), Completion::new("/yank", None)],
+            (0, 5),
+        );
+        assert!(!composer.completion().navigated);
+
+        composer.completion_next();
+        assert!(composer.completion().navigated, "moving did not register");
+    }
+
+    #[test]
+    fn refreshing_keeps_a_choice_the_user_already_made() {
+        // The popup refreshes on every keystroke. Rebuilding it from scratch
+        // would drop the user's selection mid-typing.
+        let mut composer = Composer::new();
+        composer.insert("/y");
+        let candidates = vec![Completion::new("/yolo", None), Completion::new("/yank", None)];
+        composer.set_completions(candidates.clone(), (0, 2));
+        composer.completion_next();
+        let chosen = composer.completion().selected;
+
+        composer.set_completions(candidates, (0, 2));
+        assert!(composer.completion().navigated, "the choice was forgotten");
+        assert_eq!(composer.completion().selected, chosen);
+    }
+
+    #[test]
+    fn a_changed_candidate_list_starts_over() {
+        // Different candidates mean the old selection is meaningless, so the
+        // popup goes back to being a hint rather than pointing at whatever
+        // now happens to sit at that index.
+        let mut composer = Composer::new();
+        composer.insert("/y");
+        composer.set_completions(
+            vec![Completion::new("/yolo", None), Completion::new("/yank", None)],
+            (0, 2),
+        );
+        composer.completion_next();
+
+        composer.set_completions(vec![Completion::new("/yolo", None)], (0, 2));
+        assert!(!composer.completion().navigated);
+        assert_eq!(composer.completion().selected, 0);
+    }
+
+    #[test]
+    fn accepting_puts_the_command_in_the_buffer_without_running_it() {
+        let mut composer = Composer::new();
+        composer.insert("/y");
+        composer.set_completions(vec![Completion::new("/yolo", None)], (0, 2));
+        assert!(composer.accept_completion());
+        assert_eq!(composer.text(), "/yolo");
+        assert!(!composer.completion().is_active(), "the popup stayed open");
     }
 
     #[test]

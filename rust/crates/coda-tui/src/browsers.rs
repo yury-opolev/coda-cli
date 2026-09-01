@@ -299,7 +299,8 @@ pub fn mcp(servers: &[McpServer]) -> Browser {
             Column::new("target", 40),
         ],
     )
-    .with_footer("↑/↓ k/j move · Enter detail · Space toggle · r reload · / filter · Esc q close");
+    .with_footer("↑/↓ k/j move · Enter detail · Space toggle · n new · e edit · d delete · r reload · Esc q close")
+    .with_extra_keys(&['n', 'e', 'd']);
 
     browser.set_items(
         servers

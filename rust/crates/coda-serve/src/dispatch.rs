@@ -116,6 +116,14 @@ pub struct SetEffortParams {
     pub effort: Option<String>,
 }
 
+/// `session/setPermissionMode` — the live mode for the running session.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetPermissionModeParams {
+    #[serde(default)]
+    pub mode: String,
+}
+
 /// `session/scheduleCreate` — `prompt` is required on the wire.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -204,6 +212,10 @@ pub trait ServeBackend: Send + Sync {
     async fn session_models(&self, p: ModelsParams) -> Result<Value, RpcError>;
     async fn session_set_goal(&self, p: SetGoalParams) -> Result<Value, RpcError>;
     async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError>;
+    async fn session_set_permission_mode(
+        &self,
+        p: SetPermissionModeParams,
+    ) -> Result<Value, RpcError>;
     async fn model_reasoning_capability(&self) -> Result<Value, RpcError>;
     async fn session_schedule_list(&self) -> Result<Value, RpcError>;
     async fn session_schedule_create(&self, p: ScheduleCreateParams) -> Result<Value, RpcError>;
@@ -255,6 +267,9 @@ pub async fn dispatch(
         "session/models" => backend.session_models(optional(params)).await,
         "session/setGoal" => backend.session_set_goal(optional(params)).await,
         "session/setEffort" => backend.session_set_effort(optional(params)).await,
+        "session/setPermissionMode" => {
+            backend.session_set_permission_mode(required(params)?).await
+        }
         "model/reasoningCapability" => backend.model_reasoning_capability().await,
         "session/scheduleList" => backend.session_schedule_list().await,
         "session/scheduleCreate" => backend.session_schedule_create(required(params)?).await,
@@ -319,6 +334,15 @@ mod tests {
         }
         async fn session_set_goal(&self, _p: SetGoalParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true }))
+        }
+        async fn session_set_permission_mode(
+            &self,
+            p: SetPermissionModeParams,
+        ) -> Result<Value, RpcError> {
+            match p.mode.as_str() {
+                "bypassPermissions" => Ok(json!({ "ok": true, "applied": "bypassPermissions" })),
+                _ => Ok(json!({ "ok": false, "applied": "default" })),
+            }
         }
         async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError> {
             match p.effort.as_deref() {
@@ -662,7 +686,14 @@ mod tests {
         async fn session_set_goal(&self, _p: SetGoalParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
-        async fn session_set_effort(&self, _p: SetEffortParams) -> Result<Value, RpcError> {
+        async fn session_set_permission_mode(
+        &self,
+        _p: SetPermissionModeParams,
+    ) -> Result<Value, RpcError> {
+        Ok(serde_json::json!({ "ok": true, "applied": "default" }))
+    }
+
+    async fn session_set_effort(&self, _p: SetEffortParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {

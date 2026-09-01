@@ -26,6 +26,7 @@ pub mod method {
     pub const MODELS: &str = "session/models";
     pub const SET_GOAL: &str = "session/setGoal";
     pub const SET_EFFORT: &str = "session/setEffort";
+    pub const SET_PERMISSION_MODE: &str = "session/setPermissionMode";
     pub const REASONING_CAPABILITY: &str = "model/reasoningCapability";
 
     pub const SCHEDULE_LIST: &str = "session/scheduleList";
@@ -291,6 +292,26 @@ pub struct SetGoalResult {
 pub struct SetEffortParams {
     /// `"low"`, `"medium"`, `"high"`, `"max"`, `"auto"`, or `None` to clear.
     pub effort: Option<String>,
+}
+
+/// Switches the live permission mode for the running session.
+///
+/// The mode is session state, not a setting: applying it through the engine is
+/// what lets `/yolo` take effect on the next tool call instead of asking the
+/// user to restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SetPermissionModeParams {
+    /// `"default"`, `"acceptEdits"`, `"plan"` or `"bypassPermissions"`.
+    pub mode: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SetPermissionModeResult {
+    #[serde(default)]
+    pub ok: bool,
+    /// The mode actually in force after the call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

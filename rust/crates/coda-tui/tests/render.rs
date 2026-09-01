@@ -671,3 +671,60 @@ fn a_surface_shows_its_own_hints() {
     let joined = render_surface(Box::new(settings_surface()), 70, 34).join("\n");
     assert!(joined.contains("Esc: cancel"), "hints missing:\n{joined}");
 }
+/// The completion popup must actually reach the screen.
+///
+/// It was fully implemented in `composer` and driven by `refresh_completions`,
+/// but nothing drew it — so it was invisible *and* it swallowed Enter, which
+/// made every slash command appear to do nothing. The module's own tests
+/// passed throughout. Only a test that exercises the drawing path catches it.
+#[test]
+fn the_completion_popup_is_drawn_above_the_composer() {
+    use coda_tui::composer::Completion;
+
+    let state = session();
+    let mut composer = Composer::new();
+    composer.insert("/yo");
+    composer.set_completions(
+        vec![
+            Completion::new("/yolo", Some("Skip permission prompts.".into())),
+            Completion::new("/yank", Some("Copy the transcript.".into())),
+        ],
+        (0, 3),
+    );
+
+    let joined = render(&state, &composer, 80, 24).join("\n");
+    assert!(joined.contains("/yolo"), "the popup never reached the screen:\n{joined}");
+    assert!(joined.contains("/yank"), "only one candidate was drawn:\n{joined}");
+    assert!(
+        joined.contains("Skip permission prompts."),
+        "the description was dropped:\n{joined}"
+    );
+}
+
+#[test]
+fn the_completion_popup_marks_a_navigated_selection_only() {
+    use coda_tui::composer::Completion;
+
+    let state = session();
+    let mut composer = Composer::new();
+    composer.insert("/y");
+    let candidates = vec![
+        Completion::new("/yolo", None),
+        Completion::new("/yank", None),
+    ];
+    composer.set_completions(candidates.clone(), (0, 2));
+
+    // Untouched: the popup is a hint, so nothing is marked as chosen.
+    let hint = render(&state, &composer, 80, 24).join("\n");
+    assert!(
+        !hint.contains('\u{203A}'),
+        "an unnavigated popup marked a selection:\n{hint}"
+    );
+
+    composer.completion_next();
+    let chosen = render(&state, &composer, 80, 24).join("\n");
+    assert!(
+        chosen.contains('\u{203A}'),
+        "a navigated popup marked nothing:\n{chosen}"
+    );
+}
