@@ -33,14 +33,134 @@ pub enum BrowserKind {
     Sessions,
 }
 
+/// What a row's keys do, supplied when the browser is built.
+///
+/// Carried by the surface rather than looked up by kind in the host. A browser
+/// that knows its own actions can be added in one place and cannot be *half*
+/// added by forgetting one of several matches — a failure that is invisible
+/// until someone presses the key and nothing happens.
+#[derive(Default)]
+pub struct RowActions {
+    /// Enter on a row.
+    pub activate: Option<Box<dyn Fn(&str) -> SurfaceAction>>,
+    /// Space on a row.
+    pub toggle: Option<Box<dyn Fn(&str) -> SurfaceAction>>,
+    /// Per-browser keys acting on the selected row, such as `d` to delete.
+    pub keys: Vec<(char, Box<dyn Fn(&str) -> SurfaceAction>)>,
+    /// Per-browser keys acting on the browser rather than a row, such as `n`
+    /// to add a server.
+    pub bare_keys: Vec<(char, Box<dyn Fn() -> SurfaceAction>)>,
+}
+
+impl RowActions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn on_activate(mut self, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
+        self.activate = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_toggle(mut self, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
+        self.toggle = Some(Box::new(f));
+        self
+    }
+
+    /// A key acting on the selected row. Does nothing when nothing is selected.
+    pub fn on_key(mut self, key: char, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
+        self.keys.push((key, Box::new(f)));
+        self
+    }
+
+    /// A key acting on the browser rather than on a row.
+    ///
+    /// Separate from [`on_key`] because the two differ precisely when the list
+    /// is empty, and both directions are bugs. "Add a server" that needs a row
+    /// is dead on a project with no servers — the first time anyone reaches
+    /// for it. "Delete" that runs without a row deletes the id `""`.
+    ///
+    /// [`on_key`]: RowActions::on_key
+    pub fn on_bare_key(mut self, key: char, f: impl Fn() -> SurfaceAction + 'static) -> Self {
+        self.bare_keys.push((key, Box::new(f)));
+        self
+    }
+
+    fn for_intent(&self, intent: &Intent) -> Option<SurfaceAction> {
+        match intent {
+            Intent::Activate(id) => self.activate.as_ref().map(|f| f(id)),
+            Intent::Toggle(id) => self.toggle.as_ref().map(|f| f(id)),
+            // A row-independent key first: it is the one that must still work
+            // with the list empty, which is when `id` is `None`.
+            Intent::Key(c, id) => self
+                .bare_keys
+                .iter()
+                .find(|(key, _)| key == c)
+                .map(|(_, f)| f())
+                .or_else(|| {
+                    let id = id.as_deref()?;
+                    self.keys
+                        .iter()
+                        .find(|(key, _)| key == c)
+                        .map(|(_, f)| f(id))
+                }),
+            // `Delete` is the physical Del key, an alias for whatever `d`
+            // does. Without this it fell through to the host and was dropped,
+            // so Del quietly stopped deleting.
+            Intent::Delete(id) => self
+                .keys
+                .iter()
+                .find(|(key, _)| *key == 'd')
+                .map(|(_, f)| f(id)),
+            _ => None,
+        }
+    }
+
+    /// Every key this set claims, row-dependent or not.
+    fn declared_keys(&self) -> Vec<char> {
+        self.keys
+            .iter()
+            .map(|(k, _)| *k)
+            .chain(self.bare_keys.iter().map(|(k, _)| *k))
+            .collect()
+    }
+}
+
+impl std::fmt::Debug for RowActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowActions")
+            .field("activate", &self.activate.is_some())
+            .field("toggle", &self.toggle.is_some())
+            .field("keys", &self.declared_keys())
+            .finish()
+    }
+}
+
 pub struct BrowserSurface {
     browser: Browser,
     kind: BrowserKind,
+    actions: RowActions,
 }
 
 impl BrowserSurface {
     pub fn new(kind: BrowserKind, browser: Browser) -> Self {
-        Self { browser, kind }
+        Self {
+            browser,
+            kind,
+            actions: RowActions::default(),
+        }
+    }
+
+    /// Attaches the actions this browser's rows raise.
+    ///
+    /// Registers each action's key on the browser too. Without that, a key
+    /// with an action but no registration is swallowed before it ever reaches
+    /// the surface — the action would exist and never fire, which is the
+    /// half-added failure this whole arrangement is meant to prevent.
+    pub fn with_actions(mut self, actions: RowActions) -> Self {
+        self.browser.add_extra_keys(&actions.declared_keys());
+        self.actions = actions;
+        self
     }
 
     pub fn kind(&self) -> BrowserKind {
@@ -92,16 +212,21 @@ impl Surface for BrowserSurface {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
-        match self.browser.handle(key) {
+        let intent = self.browser.handle(key);
+        match intent {
             Intent::Redraw => SurfaceOutcome::Handled,
             Intent::Ignored => SurfaceOutcome::Ignored,
             Intent::Close => SurfaceOutcome::Close,
-            // Everything else needs the engine or the filesystem, so it goes
-            // to the host. The browser stays open; the host decides.
-            intent => SurfaceOutcome::Emit(SurfaceAction::Browser {
-                kind: self.kind,
-                intent,
-            }),
+            // A configured action wins: the browser knows what its own rows
+            // do. Anything it has no action for still reaches the host, so a
+            // browser part-way through being converted keeps working.
+            ref other => match self.actions.for_intent(other) {
+                Some(action) => SurfaceOutcome::Emit(action),
+                None => SurfaceOutcome::Emit(SurfaceAction::Browser {
+                    kind: self.kind,
+                    intent,
+                }),
+            },
         }
     }
 

@@ -108,6 +108,35 @@ pub enum SurfaceAction {
     },
     /// Persist the MCP server held by the editor that emitted this.
     SaveMcpServer,
+
+    // ── Browser row actions ────────────────────────────────────────────────
+    //
+    // Named after the work rather than the browser, so dispatching them needs
+    // no `BrowserKind` lookup. A browser declares these when it is built, next
+    // to its columns and its rows, which is what stops one being forgotten.
+    /// Switch the active model and restart the engine against this session.
+    SwitchModel(String),
+    /// Restart the engine against a stored session.
+    ResumeSession(String),
+    /// Enable or disable an installed plugin.
+    TogglePlugin(String),
+    /// Pull the latest for a git-installed plugin.
+    UpdatePlugin(String),
+    /// Enable or disable a configured MCP server.
+    ToggleMcp(String),
+    /// Open the editor on a new MCP server.
+    NewMcpServer,
+    /// Open the editor on an existing MCP server.
+    EditMcpServer(String),
+    /// Remove an MCP server from its `.mcp.json`.
+    DeleteMcpServer(String),
+    /// Remove a scheduled task.
+    DeleteSchedule(String),
+    /// Explain that creating a schedule needs arguments.
+    ExplainScheduleCreation,
+    /// Explain that a skill cannot be toggled from the browser.
+    ExplainSkillToggle,
+
     /// A browser row action that needs the engine or the filesystem.
     ///
     /// Carries the browser's kind, so the host knows what the row refers to

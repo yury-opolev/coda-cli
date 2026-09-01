@@ -309,3 +309,203 @@ fn a_browser_stays_inside_its_area_at_any_size() {
         }
     }
 }
+
+#[test]
+fn a_browser_declares_its_own_row_actions() {
+    // The point of RowActions: a browser's keys are defined where the browser
+    // is, so adding one cannot be half done by forgetting a match arm in the
+    // host. Nothing here mentions App.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let mut browser = Browser::new("Things", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![
+        Item::new("first", vec!["alpha".into()]),
+        Item::new("second", vec!["beta".into()]),
+    ]);
+
+    let actions = RowActions::new()
+        .on_activate(|id| SurfaceAction::SwitchModel(id.to_string()))
+        .on_toggle(|id| SurfaceAction::TogglePlugin(id.to_string()))
+        .on_key('u', |id| SurfaceAction::UpdatePlugin(id.to_string()));
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Plugins, browser).with_actions(actions),
+    ));
+
+    match stack.handle_key(key(KeyCode::Enter)) {
+        StackOutcome::Action(SurfaceAction::SwitchModel(id)) => assert_eq!(id, "first"),
+        _ => panic!("Enter did not raise the configured activate action"),
+    }
+    match stack.handle_key(key(KeyCode::Char(' '))) {
+        StackOutcome::Action(SurfaceAction::TogglePlugin(id)) => assert_eq!(id, "first"),
+        _ => panic!("Space did not raise the configured toggle action"),
+    }
+    match stack.handle_key(key(KeyCode::Char('u'))) {
+        StackOutcome::Action(SurfaceAction::UpdatePlugin(id)) => assert_eq!(id, "first"),
+        _ => panic!("the custom key did not raise its configured action"),
+    }
+}
+
+#[test]
+fn a_browser_without_actions_still_reaches_the_host() {
+    // Additive, not a cliff: a browser that declares nothing behaves exactly
+    // as every browser did before, so the conversion could be done one at a
+    // time without a flag day.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface};
+
+    let mut browser = Browser::new("Things", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![Item::new("only", vec!["alpha".into()])]);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(BrowserSurface::new(BrowserKind::Hooks, browser)));
+
+    match stack.handle_key(key(KeyCode::Char(' '))) {
+        StackOutcome::Action(SurfaceAction::Browser { kind, .. }) => {
+            assert_eq!(kind, BrowserKind::Hooks);
+        }
+        _ => panic!("an unconfigured row action did not reach the host"),
+    }
+}
+
+#[test]
+fn a_key_that_needs_no_row_works_on_an_empty_list() {
+    // "New MCP server" does not act on a row, so it must work when there are
+    // no rows -- which is exactly when a user reaches for it. Routing it
+    // through the row-key path made it fire only when something was selected,
+    // so on a project with no .mcp.json the footer advertised `n new` and
+    // pressing it did nothing, with hand-editing JSON the only way in.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let empty = Browser::new("MCP servers", vec![Column::new("Name", 24)]);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Mcp, empty).with_actions(
+            RowActions::new()
+                .on_bare_key('n', || SurfaceAction::NewMcpServer)
+                .on_key('d', |id| SurfaceAction::DeleteMcpServer(id.to_string())),
+        ),
+    ));
+
+    match stack.handle_key(key(KeyCode::Char('n'))) {
+        StackOutcome::Action(SurfaceAction::NewMcpServer) => {}
+        _ => panic!("`n` on an empty list did not open the editor"),
+    }
+
+    // The converse must hold too: a key that does act on a row must not fire
+    // with no row, or it would delete a server named "".
+    match stack.handle_key(key(KeyCode::Char('d'))) {
+        StackOutcome::Action(SurfaceAction::DeleteMcpServer(id)) => {
+            panic!("`d` deleted with nothing selected, targeting {id:?}")
+        }
+        _ => {}
+    }
+
+    // And with a row present, both still work.
+    let mut filled = Browser::new("MCP servers", vec![Column::new("Name", 24)]);
+    filled.set_items(vec![Item::new("ctx7", vec!["ctx7".into()])]);
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Mcp, filled).with_actions(
+            RowActions::new()
+                .on_bare_key('n', || SurfaceAction::NewMcpServer)
+                .on_key('d', |id| SurfaceAction::DeleteMcpServer(id.to_string())),
+        ),
+    ));
+    match stack.handle_key(key(KeyCode::Char('n'))) {
+        StackOutcome::Action(SurfaceAction::NewMcpServer) => {}
+        _ => panic!("`n` stopped working once a row existed"),
+    }
+    match stack.handle_key(key(KeyCode::Char('d'))) {
+        StackOutcome::Action(SurfaceAction::DeleteMcpServer(id)) => assert_eq!(id, "ctx7"),
+        _ => panic!("`d` did not delete the selected row"),
+    }
+}
+
+#[test]
+fn the_del_key_deletes_what_d_deletes() {
+    // Del is an alias for `d`. The browser reports it as its own intent, so
+    // without an arm for it the action set never sees it and Del quietly
+    // stops deleting -- working before this refactor, dead after, with
+    // nothing to say so.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let mut browser = Browser::new("Schedules", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![Item::new("nightly", vec!["nightly".into()])]);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Schedules, browser)
+            .with_actions(RowActions::new().on_key('d', |id| SurfaceAction::DeleteSchedule(id.to_string()))),
+    ));
+
+    match stack.handle_key(key(KeyCode::Delete)) {
+        StackOutcome::Action(SurfaceAction::DeleteSchedule(id)) => assert_eq!(id, "nightly"),
+        _ => panic!("the Del key did not raise the same action as `d`"),
+    }
+}
+
+#[test]
+fn a_control_chord_is_not_a_browser_key() {
+    // Ctrl+D is the universal "EOF, get me out of here" gesture. Reaching for
+    // it to dismiss a browser must not delete the selected row -- and because
+    // a browser registers `d` as an extra key, matching on the key code alone
+    // made it do exactly that, with no confirmation and no undo. Ctrl+U, the
+    // readline "erase to line start" chord, started a `git pull` the same way.
+    //
+    // This is the same defect that once let Ctrl+Y approve a permission
+    // prompt: the gesture meaning "wait, let me look at this" performed the
+    // dangerous thing instead.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let build = || {
+        let mut browser = Browser::new("Schedules", vec![Column::new("Name", 24)]);
+        browser.set_items(vec![Item::new("nightly", vec!["nightly".into()])]);
+        let mut stack = SurfaceStack::default();
+        stack.push(Box::new(
+            BrowserSurface::new(BrowserKind::Schedules, browser).with_actions(
+                RowActions::new().on_key('d', |id| SurfaceAction::DeleteSchedule(id.to_string())),
+            ),
+        ));
+        stack
+    };
+
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        let mut stack = build();
+        let chord = KeyEvent::new(KeyCode::Char('d'), modifier);
+        if let StackOutcome::Action(SurfaceAction::DeleteSchedule(id)) = stack.handle_key(chord) {
+            panic!("{modifier:?}+D deleted {id:?} without being asked");
+        }
+    }
+
+    // Plain `d` must still delete, or the guard has thrown out the feature.
+    let mut stack = build();
+    match stack.handle_key(key(KeyCode::Char('d'))) {
+        StackOutcome::Action(SurfaceAction::DeleteSchedule(id)) => assert_eq!(id, "nightly"),
+        _ => panic!("plain `d` stopped deleting"),
+    }
+
+    // Shift must still pass: it is how a capital extra key is typed.
+    let mut browser = Browser::new("Things", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![Item::new("first", vec!["alpha".into()])]);
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Plugins, browser).with_actions(
+            RowActions::new().on_key('U', |id| SurfaceAction::UpdatePlugin(id.to_string())),
+        ),
+    ));
+    match stack.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT)) {
+        StackOutcome::Action(SurfaceAction::UpdatePlugin(id)) => assert_eq!(id, "first"),
+        _ => panic!("Shift+U did not reach its action, so capitals are unreachable"),
+    }
+}
