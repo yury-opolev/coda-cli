@@ -4,7 +4,7 @@
 //! knows a wire protocol exists. Everything above it deals in `UiEvent` and
 //! `SurfaceAction`, which is what lets the rest be tested without an engine.
 
-use coda_client::{ClientError, Inbound, Responder};
+use coda_client::{ClientError, Engine, Inbound, Responder};
 use coda_proto::messages::{self, method, server_method};
 use coda_proto::Event;
 use serde_json::Value;
@@ -207,5 +207,53 @@ impl App {
 
         self.apply(UiEvent::PromptAnswered { allowed, answer });
     }
-}
 
+    /// Restarts the engine in place, resuming the current session.
+    ///
+    /// Settings are read once at engine start, so anything that changes them
+    /// only takes effect across a restart. `initialize` accepts a session id,
+    /// so the conversation survives.
+    pub(super) async fn restart_engine(&mut self) {
+        let session_id = self.state.session_id.clone();
+
+        let (engine, inbound) = match Engine::spawn(self.engine_command.clone()) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return self.notice(
+                    format!("Could not restart the engine: {error}"),
+                    NoticeLevel::Error,
+                )
+            }
+        };
+
+        let connection = engine.connection();
+        let mut params = messages::InitializeParams::new("coda-tui");
+        if let Some(session_id) = session_id {
+            params = params.resume(session_id);
+        }
+
+        let params = serde_json::to_value(params).unwrap_or_default();
+        match connection.request(method::INITIALIZE, Some(params)).await {
+            Ok(value) => {
+                let initialized: messages::InitializeResult =
+                    serde_json::from_value(value).unwrap_or(messages::InitializeResult {
+                        protocol_version: coda_proto::PROTOCOL_VERSION.to_string(),
+                        session_id: String::new(),
+                        server_info: "coda".into(),
+                        telemetry_log_path: None,
+                    });
+
+                self.connection = connection;
+                self.restarted = Some((engine, inbound));
+                if !initialized.session_id.is_empty() {
+                    self.state.session_id = Some(initialized.session_id);
+                }
+                self.notice("Engine restarted.", NoticeLevel::Info);
+            }
+            Err(error) => self.notice(
+                format!("The restarted engine rejected the handshake: {error}"),
+                NoticeLevel::Error,
+            ),
+        }
+    }
+}
