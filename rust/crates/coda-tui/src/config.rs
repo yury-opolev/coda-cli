@@ -89,6 +89,9 @@ fn dirs_home() -> Option<PathBuf> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// The value cannot be persisted as given.
+    #[error("{0}")]
+    Invalid(String),
     #[error("failed to read {path}: {source}")]
     Read {
         path: PathBuf,
@@ -510,9 +513,12 @@ impl PluginState {
 ///
 /// Mirrors `coda_mcp::config::McpScope`; kept as a separate type so the TUI
 /// API is not coupled to the coda-mcp crate's internal shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Scope {
     Project,
+    /// The default for a new server: user scope applies everywhere, which is
+    /// what someone adding a server usually wants.
+    #[default]
     User,
 }
 
@@ -591,6 +597,169 @@ fn raw_to_display(raw: coda_mcp::config::McpRawServer) -> McpServer {
         enabled: !raw.disabled,
         env_keys,
     }
+}
+
+/// A server as the editor works with it, before it reaches disk.
+///
+/// Deliberately carries only what the config model round-trips. Offering a
+/// field that the loader drops on save — OAuth credentials, for instance —
+/// would silently discard whatever the user typed, which is worse than not
+/// offering it at all.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct McpDraft {
+    pub name: String,
+    pub scope: Scope,
+    /// `"stdio"` or `"http"`.
+    pub transport: String,
+    pub command: String,
+    /// Whitespace-separated on screen, a list on disk.
+    pub args: String,
+    pub url: String,
+    pub enabled: bool,
+}
+
+impl McpDraft {
+    /// A draft for a new server, defaulting to the shape most people want.
+    pub fn new() -> Self {
+        Self {
+            transport: "stdio".to_string(),
+            scope: Scope::User,
+            enabled: true,
+            ..Default::default()
+        }
+    }
+
+    /// A draft describing an existing server.
+    pub fn from_server(server: &McpServer) -> Self {
+        Self {
+            name: server.name.clone(),
+            scope: server.scope,
+            transport: server.transport.to_string(),
+            command: server.command.clone().unwrap_or_default(),
+            args: server.args.join(" "),
+            url: server.url.clone().unwrap_or_default(),
+            enabled: server.enabled,
+        }
+    }
+
+    /// Why this draft cannot be saved, if it cannot.
+    ///
+    /// Checked before writing rather than after, so a half-valid server never
+    /// reaches the file and fails at connect time with a worse message.
+    pub fn validation_error(&self) -> Option<String> {
+        if self.name.trim().is_empty() {
+            return Some("A name is required.".to_string());
+        }
+        if self.name.contains(char::is_whitespace) {
+            return Some("A name cannot contain spaces.".to_string());
+        }
+        match self.transport.as_str() {
+            "stdio" if self.command.trim().is_empty() => {
+                Some("A stdio server needs a command.".to_string())
+            }
+            "http" if self.url.trim().is_empty() => {
+                Some("An HTTP server needs a URL.".to_string())
+            }
+            "http" if !self.url.starts_with("http://") && !self.url.starts_with("https://") => {
+                Some("The URL must start with http:// or https://.".to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Writes a server into the `.mcp.json` for its scope.
+///
+/// Replaces an entry of the same name, and removes it from the other scope's
+/// file when the scope changed — otherwise a rename-by-scope would leave two
+/// servers with one name and the loader would pick whichever it saw first.
+pub fn save_mcp_server(paths: &Paths, draft: &McpDraft) -> Result<(), ConfigError> {
+    if let Some(problem) = draft.validation_error() {
+        return Err(ConfigError::Invalid(problem));
+    }
+
+    let (target, other) = match draft.scope {
+        Scope::User => (paths.user_mcp(), paths.project_mcp()),
+        Scope::Project => (paths.project_mcp(), paths.user_mcp()),
+    };
+
+    let mut entry = Map::new();
+    match draft.transport.as_str() {
+        "http" => {
+            entry.insert("url".into(), Value::String(draft.url.trim().to_string()));
+        }
+        _ => {
+            entry.insert(
+                "command".into(),
+                Value::String(draft.command.trim().to_string()),
+            );
+            let args: Vec<Value> = draft
+                .args
+                .split_whitespace()
+                .map(|a| Value::String(a.to_string()))
+                .collect();
+            if !args.is_empty() {
+                entry.insert("args".into(), Value::Array(args));
+            }
+        }
+    }
+    if !draft.enabled {
+        entry.insert("disabled".into(), Value::Bool(true));
+    }
+
+    // Preserve any keys this build does not model, so editing a server written
+    // by a newer version does not quietly strip its settings.
+    let mut document = read_json(&target)?;
+    let servers = document
+        .as_object_mut()
+        .expect("mcp document is always an object")
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| Value::Object(Map::new()));
+    if !servers.is_object() {
+        *servers = Value::Object(Map::new());
+    }
+    let servers = servers.as_object_mut().expect("just ensured");
+
+    if let Some(Value::Object(existing)) = servers.get(&draft.name) {
+        for (key, value) in existing {
+            if !matches!(key.as_str(), "command" | "args" | "url" | "disabled") {
+                entry.entry(key.clone()).or_insert(value.clone());
+            }
+        }
+    }
+    servers.insert(draft.name.clone(), Value::Object(entry));
+    write_json(&target, &document)?;
+
+    // The same name in the other scope would shadow or be shadowed.
+    let mut other_document = read_json(&other)?;
+    if let Some(servers) = other_document
+        .get_mut("mcpServers")
+        .and_then(Value::as_object_mut)
+    {
+        if servers.remove(&draft.name).is_some() {
+            write_json(&other, &other_document)?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes a server from whichever file defines it.
+pub fn delete_mcp_server(paths: &Paths, name: &str) -> Result<bool, ConfigError> {
+    let mut removed = false;
+    for path in [paths.project_mcp(), paths.user_mcp()] {
+        let mut document = read_json(&path)?;
+        let Some(servers) = document
+            .get_mut("mcpServers")
+            .and_then(Value::as_object_mut)
+        else {
+            continue;
+        };
+        if servers.remove(name).is_some() {
+            write_json(&path, &document)?;
+            removed = true;
+        }
+    }
+    Ok(removed)
 }
 
 /// Enables or disables an MCP server in whichever file defines it.
@@ -700,7 +869,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn temp_paths() -> (tempdir::TempDir, Paths) {
+    pub(super) fn temp_paths() -> (tempdir::TempDir, Paths) {
         let dir = tempdir::TempDir::new();
         let paths = Paths::new(dir.path().join("project")).with_user_root(dir.path().join("user"));
         std::fs::create_dir_all(&paths.user_root).expect("user root");
@@ -709,7 +878,7 @@ mod tests {
     }
 
     /// A minimal scoped temporary directory, to avoid a dev-dependency.
-    mod tempdir {
+    pub(super) mod tempdir {
         use std::path::{Path, PathBuf};
         use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1200,5 +1369,144 @@ mod tests {
     fn paths_skills_user_is_under_user_root() {
         let (_dir, paths) = temp_paths();
         assert_eq!(paths.skills_user(), paths.user_root.join("skills"));
+    }
+}
+
+#[cfg(test)]
+mod mcp_editing_tests {
+    use super::*;
+
+    fn temp() -> (super::tests::tempdir::TempDir, Paths) {
+        super::tests::temp_paths()
+    }
+
+    fn stdio(name: &str) -> McpDraft {
+        McpDraft {
+            name: name.into(),
+            scope: Scope::User,
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: "-y server-everything".into(),
+            url: String::new(),
+            enabled: true,
+        }
+    }
+
+    #[test]
+    fn a_saved_server_reads_back_the_way_it_was_written() {
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("everything")).expect("save");
+
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "everything").expect("saved");
+        assert_eq!(saved.transport, "stdio");
+        assert_eq!(saved.command.as_deref(), Some("npx"));
+        assert_eq!(saved.args, vec!["-y", "server-everything"]);
+        assert!(saved.enabled);
+    }
+
+    #[test]
+    fn an_http_server_round_trips_its_url() {
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            transport: "http".into(),
+            url: "https://example.com/mcp".into(),
+            command: String::new(),
+            args: String::new(),
+            ..stdio("remote")
+        };
+        save_mcp_server(&paths, &draft).expect("save");
+
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "remote").expect("saved");
+        assert_eq!(saved.transport, "http");
+        assert_eq!(saved.url.as_deref(), Some("https://example.com/mcp"));
+        assert!(saved.command.is_none(), "an http server kept a command");
+    }
+
+    #[test]
+    fn changing_scope_does_not_leave_the_old_entry_behind() {
+        // Two files defining one name means the loader serves whichever it saw
+        // first, and disabling one would appear to do nothing.
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("moving")).expect("save to user");
+
+        let mut moved = stdio("moving");
+        moved.scope = Scope::Project;
+        save_mcp_server(&paths, &moved).expect("save to project");
+
+        let servers = load_mcp_servers(&paths).expect("load");
+        let matching: Vec<_> = servers.iter().filter(|s| s.name == "moving").collect();
+        assert_eq!(matching.len(), 1, "the server exists in both scopes");
+        assert_eq!(matching[0].scope, Scope::Project);
+    }
+
+    #[test]
+    fn saving_preserves_keys_this_build_does_not_model() {
+        // A server written by a newer version must not be quietly stripped of
+        // its settings just because it was opened in the editor.
+        let (_dir, paths) = temp();
+        let path = paths.user_mcp();
+        write_json(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    "everything": { "command": "old", "futureSetting": { "keep": true } }
+                }
+            }),
+        )
+        .expect("seed");
+
+        save_mcp_server(&paths, &stdio("everything")).expect("save");
+
+        let document = read_json(&path).expect("read");
+        let entry = &document["mcpServers"]["everything"];
+        assert_eq!(entry["command"], serde_json::json!("npx"), "the edit was lost");
+        assert_eq!(
+            entry["futureSetting"]["keep"],
+            serde_json::json!(true),
+            "an unmodelled setting was stripped"
+        );
+    }
+
+    #[test]
+    fn a_disabled_server_stays_disabled() {
+        let (_dir, paths) = temp();
+        let mut draft = stdio("off");
+        draft.enabled = false;
+        save_mcp_server(&paths, &draft).expect("save");
+
+        let servers = load_mcp_servers(&paths).expect("load");
+        assert!(!servers.iter().find(|s| s.name == "off").expect("saved").enabled);
+    }
+
+    #[test]
+    fn deleting_removes_it_from_disk() {
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("gone")).expect("save");
+        assert!(delete_mcp_server(&paths, "gone").expect("delete"));
+        assert!(!load_mcp_servers(&paths).expect("load").iter().any(|s| s.name == "gone"));
+        assert!(!delete_mcp_server(&paths, "gone").expect("delete again"));
+    }
+
+    #[test]
+    fn an_invalid_draft_is_refused_before_it_reaches_the_file() {
+        let (_dir, paths) = temp();
+        for (draft, why) in [
+            (McpDraft { name: String::new(), ..stdio("x") }, "no name"),
+            (McpDraft { name: "two words".into(), ..stdio("x") }, "spaced name"),
+            (McpDraft { command: String::new(), ..stdio("x") }, "no command"),
+            (
+                McpDraft { transport: "http".into(), url: String::new(), ..stdio("x") },
+                "no url",
+            ),
+            (
+                McpDraft { transport: "http".into(), url: "example.com".into(), ..stdio("x") },
+                "url without a scheme",
+            ),
+        ] {
+            assert!(draft.validation_error().is_some(), "{why} was accepted");
+            assert!(save_mcp_server(&paths, &draft).is_err(), "{why} reached the file");
+        }
     }
 }

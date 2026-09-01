@@ -1136,7 +1136,70 @@ impl App {
                 Some(id) => self.update_plugin(&id).await,
                 None => self.dirty = false,
             },
+            // The MCP list is where servers are managed, so the editor opens
+            // from here rather than from a command with a dozen arguments.
+            (Some(BrowserKind::Mcp), 'n') => {
+                self.surfaces.push(Box::new(
+                    crate::surface::mcp_editor::McpEditorSurface::creating(),
+                ));
+                self.dirty = true;
+            }
+            (Some(BrowserKind::Mcp), 'e') => self.edit_mcp_server(id).await,
+            (Some(BrowserKind::Mcp), 'd') => self.delete_mcp_server(id).await,
             _ => self.dirty = false,
+        }
+    }
+
+    /// Opens the editor on the selected MCP server.
+    async fn edit_mcp_server(&mut self, id: Option<String>) {
+        let Some(name) = id else {
+            self.dirty = false;
+            return;
+        };
+        let paths = self.paths.clone();
+        let found = tokio::task::spawn_blocking(move || {
+            config::load_mcp_servers(&paths)
+                .ok()
+                .and_then(|servers| servers.into_iter().find(|s| s.name == name))
+        })
+        .await
+        .ok()
+        .flatten();
+
+        match found {
+            Some(server) => {
+                self.surfaces.push(Box::new(
+                    crate::surface::mcp_editor::McpEditorSurface::editing(
+                        config::McpDraft::from_server(&server),
+                    ),
+                ));
+                self.dirty = true;
+            }
+            None => self.notice("That server is no longer defined.", NoticeLevel::Warning),
+        }
+    }
+
+    /// Removes the selected MCP server.
+    async fn delete_mcp_server(&mut self, id: Option<String>) {
+        let Some(name) = id else {
+            self.dirty = false;
+            return;
+        };
+        let paths = self.paths.clone();
+        let target = name.clone();
+        let removed =
+            tokio::task::spawn_blocking(move || config::delete_mcp_server(&paths, &target)).await;
+
+        match removed {
+            Ok(Ok(true)) => {
+                self.notice(format!("Removed MCP server '{name}'."), NoticeLevel::Info);
+                self.reload_browser().await;
+            }
+            Ok(Ok(false)) => {
+                self.notice("That server is no longer defined.", NoticeLevel::Warning)
+            }
+            Ok(Err(err)) => self.notice(format!("Could not remove: {err}"), NoticeLevel::Error),
+            Err(_) => self.notice("The removal was interrupted.", NoticeLevel::Error),
         }
     }
 
@@ -2003,6 +2066,55 @@ impl App {
                         format!("Could not save settings: {err}"),
                         NoticeLevel::Error,
                     ),
+                }
+            }
+            SurfaceAction::SaveMcpServer => {
+                let Some(surface) = self.surfaces.pop() else {
+                    return;
+                };
+                let Some(editor) = surface
+                    .as_any()
+                    .downcast_ref::<crate::surface::mcp_editor::McpEditorSurface>()
+                else {
+                    self.surfaces.push(surface);
+                    self.notice("Could not save: unexpected surface.", NoticeLevel::Error);
+                    return;
+                };
+
+                let draft = editor.draft();
+                // A rename leaves the old entry behind unless it is retired,
+                // and the loader would then serve two servers under one name.
+                let renamed_from = editor
+                    .original_name()
+                    .filter(|old| *old != draft.name)
+                    .map(str::to_string);
+
+                let paths = self.paths.clone();
+                let name = draft.name.clone();
+                let saved = tokio::task::spawn_blocking(move || {
+                    if let Some(old) = renamed_from {
+                        config::delete_mcp_server(&paths, &old)?;
+                    }
+                    config::save_mcp_server(&paths, &draft)
+                })
+                .await;
+
+                match saved {
+                    Ok(Ok(())) => {
+                        self.notice(
+                            format!("Saved MCP server '{name}'. Restart the engine to connect."),
+                            NoticeLevel::Info,
+                        );
+                        // Reflect the change in the list underneath, if it is
+                        // still open.
+                        if self.browser_kind() == Some(BrowserKind::Mcp) {
+                            self.reload_browser().await;
+                        }
+                    }
+                    Ok(Err(err)) => {
+                        self.notice(format!("Could not save: {err}"), NoticeLevel::Error)
+                    }
+                    Err(_) => self.notice("The save was interrupted.", NoticeLevel::Error),
                 }
             }
             SurfaceAction::Browser { kind: _, intent } => match intent {

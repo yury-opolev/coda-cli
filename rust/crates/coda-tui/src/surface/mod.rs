@@ -19,6 +19,7 @@ use ratatui::text::Line;
 
 pub mod browser;
 pub mod form;
+pub mod mcp_editor;
 pub mod prompt;
 pub mod settings;
 pub mod stack;
@@ -105,6 +106,8 @@ pub enum SurfaceAction {
         allowed: bool,
         answer: Option<String>,
     },
+    /// Persist the MCP server held by the editor that emitted this.
+    SaveMcpServer,
     /// A browser row action that needs the engine or the filesystem.
     ///
     /// Carries the browser's kind, so the host knows what the row refers to
