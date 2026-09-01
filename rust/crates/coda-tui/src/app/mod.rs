@@ -1211,13 +1211,45 @@ impl App {
             }
             SurfaceAction::Browser { kind: _, intent } => match intent {
                 Intent::Reload => self.reload_browser().await,
-                Intent::Activate(id) => self.activate_browser_row(&id).await,
-                Intent::Toggle(id) => self.toggle_browser_row(&id).await,
-                Intent::Delete(id) => self.delete_browser_row(&id).await,
-                Intent::Key(c, id) => self.browser_key_action(c, id).await,
-                // Handled by the surface itself before reaching here.
-                Intent::Redraw | Intent::Ignored | Intent::Close => {}
+                // Anything a browser did not claim for itself. Enter with no
+                // configured action opens a detail view, which the browser
+                // handled before reaching here.
+                Intent::Activate(_)
+                | Intent::Toggle(_)
+                | Intent::Delete(_)
+                | Intent::Key(_, _)
+                | Intent::Redraw
+                | Intent::Ignored
+                | Intent::Close => self.dirty = true,
             },
+
+            // ── Browser row actions ────────────────────────────────────────
+            //
+            // Flat, and named after the work. Reaching one of these means the
+            // browser that raised it declared it at construction, so there is
+            // no kind to look up and nothing to forget.
+            SurfaceAction::SwitchModel(id) => self.switch_model(&id).await,
+            SurfaceAction::ResumeSession(id) => self.resume_to_session(id).await,
+            SurfaceAction::TogglePlugin(id) => self.toggle_plugin(&id).await,
+            SurfaceAction::UpdatePlugin(id) => self.update_plugin(&id).await,
+            SurfaceAction::ToggleMcp(id) => self.toggle_mcp(&id).await,
+            SurfaceAction::DeleteSchedule(id) => self.delete_schedule(&id).await,
+            SurfaceAction::NewMcpServer => {
+                self.surfaces.push(Box::new(
+                    crate::surface::mcp_editor::McpEditorSurface::creating(),
+                ));
+                self.dirty = true;
+            }
+            SurfaceAction::EditMcpServer(id) => self.edit_mcp_server(Some(id)).await,
+            SurfaceAction::DeleteMcpServer(id) => self.delete_mcp_server(Some(id)).await,
+            SurfaceAction::ExplainScheduleCreation => self.notice(
+                "Creating a schedule needs arguments; use /schedule from the composer.",
+                NoticeLevel::Info,
+            ),
+            SurfaceAction::ExplainSkillToggle => self.notice(
+                "Skills are frontmatter-driven; edit the SKILL.md file to change them.",
+                NoticeLevel::Info,
+            ),
             SurfaceAction::AnswerPrompt { allowed, answer } => {
                 self.surfaces.pop();
                 self.answer_prompt(allowed, answer);

@@ -33,14 +33,92 @@ pub enum BrowserKind {
     Sessions,
 }
 
+/// What a row's keys do, supplied when the browser is built.
+///
+/// Carried by the surface rather than looked up by kind in the host. A browser
+/// that knows its own actions can be added in one place and cannot be *half*
+/// added by forgetting one of several matches — a failure that is invisible
+/// until someone presses the key and nothing happens.
+#[derive(Default)]
+pub struct RowActions {
+    /// Enter on a row.
+    pub activate: Option<Box<dyn Fn(&str) -> SurfaceAction>>,
+    /// Space on a row.
+    pub toggle: Option<Box<dyn Fn(&str) -> SurfaceAction>>,
+    /// Per-browser keys, such as `d` to delete.
+    pub keys: Vec<(char, Box<dyn Fn(&str) -> SurfaceAction>)>,
+}
+
+impl RowActions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn on_activate(mut self, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
+        self.activate = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_toggle(mut self, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
+        self.toggle = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_key(mut self, key: char, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
+        self.keys.push((key, Box::new(f)));
+        self
+    }
+
+    fn for_intent(&self, intent: &Intent) -> Option<SurfaceAction> {
+        match intent {
+            Intent::Activate(id) => self.activate.as_ref().map(|f| f(id)),
+            Intent::Toggle(id) => self.toggle.as_ref().map(|f| f(id)),
+            Intent::Key(c, Some(id)) => self
+                .keys
+                .iter()
+                .find(|(key, _)| key == c)
+                .map(|(_, f)| f(id)),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for RowActions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RowActions")
+            .field("activate", &self.activate.is_some())
+            .field("toggle", &self.toggle.is_some())
+            .field("keys", &self.keys.iter().map(|(k, _)| *k).collect::<Vec<_>>())
+            .finish()
+    }
+}
+
 pub struct BrowserSurface {
     browser: Browser,
     kind: BrowserKind,
+    actions: RowActions,
 }
 
 impl BrowserSurface {
     pub fn new(kind: BrowserKind, browser: Browser) -> Self {
-        Self { browser, kind }
+        Self {
+            browser,
+            kind,
+            actions: RowActions::default(),
+        }
+    }
+
+    /// Attaches the actions this browser's rows raise.
+    ///
+    /// Registers each action's key on the browser too. Without that, a key
+    /// with an action but no registration is swallowed before it ever reaches
+    /// the surface — the action would exist and never fire, which is the
+    /// half-added failure this whole arrangement is meant to prevent.
+    pub fn with_actions(mut self, actions: RowActions) -> Self {
+        let keys: Vec<char> = actions.keys.iter().map(|(k, _)| *k).collect();
+        self.browser.add_extra_keys(&keys);
+        self.actions = actions;
+        self
     }
 
     pub fn kind(&self) -> BrowserKind {
@@ -92,16 +170,21 @@ impl Surface for BrowserSurface {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
-        match self.browser.handle(key) {
+        let intent = self.browser.handle(key);
+        match intent {
             Intent::Redraw => SurfaceOutcome::Handled,
             Intent::Ignored => SurfaceOutcome::Ignored,
             Intent::Close => SurfaceOutcome::Close,
-            // Everything else needs the engine or the filesystem, so it goes
-            // to the host. The browser stays open; the host decides.
-            intent => SurfaceOutcome::Emit(SurfaceAction::Browser {
-                kind: self.kind,
-                intent,
-            }),
+            // A configured action wins: the browser knows what its own rows
+            // do. Anything it has no action for still reaches the host, so a
+            // browser part-way through being converted keeps working.
+            ref other => match self.actions.for_intent(other) {
+                Some(action) => SurfaceOutcome::Emit(action),
+                None => SurfaceOutcome::Emit(SurfaceAction::Browser {
+                    kind: self.kind,
+                    intent,
+                }),
+            },
         }
     }
 

@@ -142,6 +142,19 @@ impl Browser {
         self
     }
 
+    /// Adds keys the browser should report rather than swallow.
+    ///
+    /// Additive, unlike [`with_extra_keys`], so a caller attaching actions can
+    /// register their keys without discarding any the browser already
+    /// declared.
+    pub fn add_extra_keys(&mut self, keys: &[char]) {
+        for key in keys {
+            if !self.extra_keys.contains(key) {
+                self.extra_keys.push(*key);
+            }
+        }
+    }
+
     /// Marks this browser as list-only, so Enter activates instead of opening
     /// a detail pane.
     pub fn without_detail(mut self) -> Self {

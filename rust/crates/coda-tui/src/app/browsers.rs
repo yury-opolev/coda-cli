@@ -14,7 +14,8 @@ use crate::config::{PluginState, Settings};
 use crate::state::UiEvent;
 use crate::config;
 use crate::overlay::Browser;
-use crate::surface::browser::{BrowserKind, BrowserSurface};
+use crate::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+use crate::surface::SurfaceAction;
 use crate::transcript::NoticeLevel;
 
 impl App {
@@ -186,12 +187,153 @@ impl App {
         Some(browser)
     }
 
+    /// The row actions for a browser, declared beside the browser itself.
+    ///
+    /// One place per browser rather than a share of five `BrowserKind`
+    /// matches. A browser with no entry here still works — its rows fall
+    /// through to the host as before — so this is additive rather than a
+    /// cliff.
+    fn row_actions(kind: BrowserKind) -> RowActions {
+        use SurfaceAction as A;
+        match kind {
+            BrowserKind::Models => {
+                RowActions::new().on_activate(|id| A::SwitchModel(id.to_string()))
+            }
+            BrowserKind::Sessions => {
+                RowActions::new().on_activate(|id| A::ResumeSession(id.to_string()))
+            }
+            BrowserKind::Plugins => RowActions::new()
+                .on_toggle(|id| A::TogglePlugin(id.to_string()))
+                .on_key('u', |id| A::UpdatePlugin(id.to_string())),
+            BrowserKind::Mcp => RowActions::new()
+                .on_toggle(|id| A::ToggleMcp(id.to_string()))
+                .on_key('n', |_| A::NewMcpServer)
+                .on_key('e', |id| A::EditMcpServer(id.to_string()))
+                .on_key('d', |id| A::DeleteMcpServer(id.to_string())),
+            BrowserKind::Schedules => RowActions::new()
+                .on_key('d', |id| A::DeleteSchedule(id.to_string()))
+                .on_key('n', |_| A::ExplainScheduleCreation),
+            BrowserKind::Skills => {
+                RowActions::new().on_toggle(|_| A::ExplainSkillToggle)
+            }
+            // Hooks and tasks are read-only; Enter opens their detail view,
+            // which the browser handles without troubling the host.
+            BrowserKind::Hooks | BrowserKind::Tasks => RowActions::new(),
+        }
+    }
+
+    /// Wraps a built browser in its surface, actions attached.
+    ///
+    /// The only place a `BrowserSurface` is constructed, enforced by test.
+    /// Attaching the actions is what makes a browser's keys do anything, and
+    /// it is invisible when missed: the browser draws correctly and every key
+    /// quietly does nothing. Reload used to construct its own and was exactly
+    /// that bug.
+    fn browser_surface(kind: BrowserKind, browser: Browser) -> BrowserSurface {
+        BrowserSurface::new(kind, browser).with_actions(Self::row_actions(kind))
+    }
+
     /// Opens a browser, fetching its data from the engine.
     pub(super) async fn open_browser(&mut self, kind: BrowserKind) {
         if let Some(browser) = self.build_browser(kind).await {
             self.surfaces
-                .push(Box::new(BrowserSurface::new(kind, browser)));
+                .push(Box::new(Self::browser_surface(kind, browser)));
             self.dirty = true;
+        }
+    }
+
+    /// Enables or disables an installed plugin.
+    pub(super) async fn toggle_plugin(&mut self, id: &str) {
+        // Plugin state lives in a JSON file; read and write are blocking I/O
+        // that must not block the async runtime.
+        let paths = self.paths.clone();
+        let id_owned = id.to_string();
+        let result = tokio::task::spawn_blocking(move || -> Result<bool, config::ConfigError> {
+            let mut state = PluginState::load(&paths)?;
+            let enabled = state.is_disabled(&id_owned); // toggling to this
+            state.set_enabled(&id_owned, enabled);
+            state.save()?;
+            Ok(enabled)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(enabled)) => {
+                let word = if enabled { "Enabled" } else { "Disabled" };
+                self.notice(
+                    format!("{word} plugin {id}. Restart the engine to apply."),
+                    NoticeLevel::Info,
+                );
+                self.reload_browser().await;
+            }
+            Ok(Err(error)) => self.notice(
+                format!("Could not update plugin state: {error}"),
+                NoticeLevel::Error,
+            ),
+            Err(_) => self.notice("Plugin state write was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// Enables or disables a configured MCP server.
+    pub(super) async fn toggle_mcp(&mut self, id: &str) {
+        // Load and mutate MCP config; both are blocking.
+        let paths = self.paths.clone();
+        let id_owned = id.to_string();
+        let enable_result = tokio::task::spawn_blocking(move || {
+            let enabled = config::load_mcp_servers(&paths)
+                .ok()
+                .and_then(|servers| {
+                    servers
+                        .iter()
+                        .find(|s| s.name == id_owned)
+                        .map(|s| !s.enabled)
+                })
+                .unwrap_or(false);
+            config::set_mcp_enabled(&paths, &id_owned, enabled).map(|ok| (ok, enabled))
+        })
+        .await;
+
+        match enable_result {
+            Ok(Ok((true, _))) => {
+                self.notice(
+                    format!("Updated MCP server {id}. Restart the engine to apply."),
+                    NoticeLevel::Info,
+                );
+                self.reload_browser().await;
+            }
+            Ok(Ok((false, _))) => self.notice(
+                format!("MCP server {id} is not defined in a local .mcp.json."),
+                NoticeLevel::Warning,
+            ),
+            Ok(Err(error)) => self.notice(
+                format!("Could not update MCP configuration: {error}"),
+                NoticeLevel::Error,
+            ),
+            Err(_) => self.notice("MCP config write was interrupted.", NoticeLevel::Error),
+        }
+    }
+
+    /// Removes a scheduled task.
+    pub(super) async fn delete_schedule(&mut self, id: &str) {
+        match self
+            .fetch::<messages::OkResult>(
+                method::SCHEDULE_DELETE,
+                Some(serde_json::json!({ "id": id })),
+            )
+            .await
+        {
+            Ok(result) if result.ok => {
+                self.notice(format!("Deleted schedule {id}."), NoticeLevel::Info);
+                self.reload_browser().await;
+            }
+            Ok(_) => self.notice(
+                format!("Schedule {id} was already gone."),
+                NoticeLevel::Warning,
+            ),
+            Err(error) => self.notice(
+                format!("Could not delete schedule: {error}"),
+                NoticeLevel::Error,
+            ),
         }
     }
 
@@ -222,18 +364,10 @@ impl App {
 
         self.retire_browser_surface();
         self.surfaces
-            .push(Box::new(BrowserSurface::new(kind, browser)));
+            .push(Box::new(Self::browser_surface(kind, browser)));
         self.dirty = true;
     }
 
-    /// Handles Enter on a row.
-    pub(super) async fn activate_browser_row(&mut self, id: &str) {
-        match self.browser_kind() {
-            Some(BrowserKind::Models) => self.switch_model(id).await,
-            Some(BrowserKind::Sessions) => self.resume_to_session(id.to_string()).await,
-            _ => self.dirty = true,
-        }
-    }
 
     /// Switches the active model.
     ///
@@ -296,132 +430,8 @@ impl App {
         self.restart_engine().await;
     }
 
-    /// Toggles the selected row where the change can actually be persisted.
-    pub(super) async fn toggle_browser_row(&mut self, id: &str) {
-        match self.browser_kind() {
-            Some(BrowserKind::Plugins) => {
-                // Plugin state lives in a JSON file; read and write are blocking
-                // I/O that must not block the async runtime.
-                let paths = self.paths.clone();
-                let id_owned = id.to_string();
-                let result = tokio::task::spawn_blocking(move || -> Result<bool, config::ConfigError> {
-                    let mut state = PluginState::load(&paths)?;
-                    let enabled = state.is_disabled(&id_owned); // toggling to this
-                    state.set_enabled(&id_owned, enabled);
-                    state.save()?;
-                    Ok(enabled)
-                })
-                .await;
 
-                match result {
-                    Ok(Ok(enabled)) => {
-                        let word = if enabled { "Enabled" } else { "Disabled" };
-                        self.notice(
-                            format!("{word} plugin {id}. Restart the engine to apply."),
-                            NoticeLevel::Info,
-                        );
-                        self.reload_browser().await;
-                    }
-                    Ok(Err(error)) => self.notice(
-                        format!("Could not update plugin state: {error}"),
-                        NoticeLevel::Error,
-                    ),
-                    Err(_) => self.notice("Plugin state write was interrupted.", NoticeLevel::Error),
-                }
-            }
-            Some(BrowserKind::Mcp) => {
-                // Load + mutate MCP config; both are blocking.
-                let paths = self.paths.clone();
-                let id_owned = id.to_string();
-                let enable_result = tokio::task::spawn_blocking(move || {
-                    let enabled = config::load_mcp_servers(&paths)
-                        .ok()
-                        .and_then(|servers| {
-                            servers.iter().find(|s| s.name == id_owned).map(|s| !s.enabled)
-                        })
-                        .unwrap_or(false);
-                    config::set_mcp_enabled(&paths, &id_owned, enabled).map(|ok| (ok, enabled))
-                })
-                .await;
 
-                match enable_result {
-                    Ok(Ok((true, _))) => {
-                        self.notice(
-                            format!("Updated MCP server {id}. Restart the engine to apply."),
-                            NoticeLevel::Info,
-                        );
-                        self.reload_browser().await;
-                    }
-                    Ok(Ok((false, _))) => self.notice(
-                        format!("MCP server {id} is not defined in a local .mcp.json."),
-                        NoticeLevel::Warning,
-                    ),
-                    Ok(Err(error)) => self.notice(
-                        format!("Could not update MCP configuration: {error}"),
-                        NoticeLevel::Error,
-                    ),
-                    Err(_) => self.notice("MCP config write was interrupted.", NoticeLevel::Error),
-                }
-            }
-            Some(BrowserKind::Skills) => self.notice(
-                "Skills are frontmatter-driven; edit the SKILL.md file to change them.",
-                NoticeLevel::Info,
-            ),
-            _ => self.dirty = true,
-        }
-    }
-
-    pub(super) async fn delete_browser_row(&mut self, id: &str) {
-        if self.browser_kind() != Some(BrowserKind::Schedules) {
-            return;
-        }
-        match self
-            .connection
-            .request(
-                method::SCHEDULE_DELETE,
-                Some(serde_json::json!({ "id": id })),
-            )
-            .await
-        {
-            Ok(_) => {
-                self.notice(format!("Deleted schedule {id}."), NoticeLevel::Info);
-                self.reload_browser().await;
-            }
-            Err(error) => self.notice(
-                format!("Could not delete {id}: {error}"),
-                NoticeLevel::Error,
-            ),
-        }
-    }
-
-    pub(super) async fn browser_key_action(&mut self, key: char, id: Option<String>) {
-        match (self.browser_kind(), key) {
-            (Some(BrowserKind::Schedules), 'd') => {
-                if let Some(id) = id {
-                    self.delete_browser_row(&id).await;
-                }
-            }
-            (Some(BrowserKind::Schedules), 'n') => self.notice(
-                "Creating a schedule needs arguments; use /schedule from the composer.",
-                NoticeLevel::Info,
-            ),
-            (Some(BrowserKind::Plugins), 'u') => match id {
-                Some(id) => self.update_plugin(&id).await,
-                None => self.dirty = false,
-            },
-            // The MCP list is where servers are managed, so the editor opens
-            // from here rather than from a command with a dozen arguments.
-            (Some(BrowserKind::Mcp), 'n') => {
-                self.surfaces.push(Box::new(
-                    crate::surface::mcp_editor::McpEditorSurface::creating(),
-                ));
-                self.dirty = true;
-            }
-            (Some(BrowserKind::Mcp), 'e') => self.edit_mcp_server(id).await,
-            (Some(BrowserKind::Mcp), 'd') => self.delete_mcp_server(id).await,
-            _ => self.dirty = false,
-        }
-    }
 
     /// Opens the editor on the selected MCP server.
     pub(super) async fn edit_mcp_server(&mut self, id: Option<String>) {

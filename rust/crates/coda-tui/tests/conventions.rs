@@ -288,3 +288,74 @@ fn the_application_module_stays_a_shell() {
          sibling under app/ rather than raising this number."
     );
 }
+
+/// Row behaviour must not be looked up by browser kind.
+///
+/// Before this, pressing a key asked "which browser is open?" and then chose
+/// what to do — five separate matches on `BrowserKind`, one per verb. A ninth
+/// browser had to be remembered in all five, and forgetting one gave a browser
+/// whose key silently did nothing: invisible until someone pressed it.
+///
+/// Now a browser declares its actions when it is built, so the only remaining
+/// reasons to ask for the kind are "which browser is open" questions —
+/// rebuilding it on reload, and noticing that a save affects the open list.
+/// Counting those calls is a proxy for the property, because behaviour
+/// dispatch always needed one.
+#[test]
+fn row_behaviour_is_not_looked_up_by_browser_kind() {
+    const ALLOWED: usize = 2;
+
+    let mut calls = 0usize;
+    let mut sites: Vec<String> = Vec::new();
+    for (path, source) in sources() {
+        let code = without_comments(&without_test_modules(&source));
+        for (index, line) in code.lines().enumerate() {
+            let n = line.matches("browser_kind()").count();
+            if n > 0 {
+                calls += n;
+                sites.push(format!("{path}:{}", index + 1));
+            }
+        }
+    }
+
+    assert!(
+        calls <= ALLOWED,
+        "browser_kind() is called {calls} times, over the {ALLOWED} allowed:\n{}\n\
+         Row behaviour belongs on the browser that raises it — give it a RowActions \
+         at construction rather than asking which kind is open.",
+        sites.join("\n")
+    );
+}
+
+/// A browser surface must be constructed in exactly one place.
+///
+/// `BrowserSurface::new` alone yields a browser whose rows raise nothing: the
+/// actions are attached separately, so a second construction site is a browser
+/// that draws correctly and whose every key silently does nothing.
+///
+/// This is not hypothetical. `reload_browser` was written this way — opening a
+/// browser attached its actions, reloading it did not, so pressing `r` left a
+/// browser that looked identical and had gone inert. Nothing failed; the keys
+/// just stopped. One constructor removes the chance to get it wrong.
+#[test]
+fn a_browser_surface_is_built_in_one_place() {
+    let mut sites: Vec<String> = Vec::new();
+    for (path, source) in sources() {
+        let code = without_comments(&without_test_modules(&source));
+        for (index, line) in code.lines().enumerate() {
+            if line.contains("BrowserSurface::new(") {
+                sites.push(format!("{path}:{}", index + 1));
+            }
+        }
+    }
+
+    assert!(
+        sites.len() <= 1,
+        "BrowserSurface::new is called from {} places:\n{}\n\
+         Build browser surfaces through the one helper that also attaches their \
+         row actions, or a browser reachable by the other path will draw fine \
+         and respond to nothing.",
+        sites.len(),
+        sites.join("\n")
+    );
+}

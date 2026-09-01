@@ -309,3 +309,63 @@ fn a_browser_stays_inside_its_area_at_any_size() {
         }
     }
 }
+
+#[test]
+fn a_browser_declares_its_own_row_actions() {
+    // The point of RowActions: a browser's keys are defined where the browser
+    // is, so adding one cannot be half done by forgetting a match arm in the
+    // host. Nothing here mentions App.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let mut browser = Browser::new("Things", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![
+        Item::new("first", vec!["alpha".into()]),
+        Item::new("second", vec!["beta".into()]),
+    ]);
+
+    let actions = RowActions::new()
+        .on_activate(|id| SurfaceAction::SwitchModel(id.to_string()))
+        .on_toggle(|id| SurfaceAction::TogglePlugin(id.to_string()))
+        .on_key('u', |id| SurfaceAction::UpdatePlugin(id.to_string()));
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Plugins, browser).with_actions(actions),
+    ));
+
+    match stack.handle_key(key(KeyCode::Enter)) {
+        StackOutcome::Action(SurfaceAction::SwitchModel(id)) => assert_eq!(id, "first"),
+        _ => panic!("Enter did not raise the configured activate action"),
+    }
+    match stack.handle_key(key(KeyCode::Char(' '))) {
+        StackOutcome::Action(SurfaceAction::TogglePlugin(id)) => assert_eq!(id, "first"),
+        _ => panic!("Space did not raise the configured toggle action"),
+    }
+    match stack.handle_key(key(KeyCode::Char('u'))) {
+        StackOutcome::Action(SurfaceAction::UpdatePlugin(id)) => assert_eq!(id, "first"),
+        _ => panic!("the custom key did not raise its configured action"),
+    }
+}
+
+#[test]
+fn a_browser_without_actions_still_reaches_the_host() {
+    // Additive, not a cliff: a browser that declares nothing behaves exactly
+    // as every browser did before, so the conversion could be done one at a
+    // time without a flag day.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface};
+
+    let mut browser = Browser::new("Things", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![Item::new("only", vec!["alpha".into()])]);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(BrowserSurface::new(BrowserKind::Hooks, browser)));
+
+    match stack.handle_key(key(KeyCode::Char(' '))) {
+        StackOutcome::Action(SurfaceAction::Browser { kind, .. }) => {
+            assert_eq!(kind, BrowserKind::Hooks);
+        }
+        _ => panic!("an unconfigured row action did not reach the host"),
+    }
+}
