@@ -388,6 +388,25 @@ impl Browser {
 
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
+        // A modifier chord is not a browser key. Matching the code alone made
+        // `Ctrl+D` -- the universal "EOF, get me out of here" gesture -- reach
+        // the `d` extra key and delete the selected schedule or MCP server,
+        // with no confirmation and no undo; `Ctrl+U` likewise started a
+        // `git pull`. This is the defect that once let `Ctrl+Y` approve a
+        // permission prompt: the chord meaning "wait, let me look at this"
+        // performed the dangerous thing instead.
+        //
+        // Shift is deliberately not in the set -- it is how a capital extra
+        // key is typed. `Ctrl+B` is the one chord this control claims, for
+        // leaving the detail view, so it is let through to its arm below.
+        let chord = key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::SUPER);
+        let is_back = ctrl && key.code == KeyCode::Char('b');
+        if chord && !is_back {
+            return Intent::Ignored;
+        }
+
         match (self.view, key.code) {
             // Closing and going back.
             (View::Detail, KeyCode::Esc | KeyCode::Char('q'))
@@ -904,5 +923,29 @@ mod tests {
         browser.handle(key(KeyCode::Esc));
         browser.handle(key(KeyCode::Down));
         assert_eq!(browser.detail_scroll(), 0);
+    }
+
+    #[test]
+    fn a_control_chord_is_turned_away_but_ctrl_b_still_goes_back() {
+        // The guard turns chords away so Ctrl+D cannot reach a `d` extra key
+        // and delete a row. Ctrl+B is the one chord this control deliberately
+        // claims, so it is excepted -- and an exception to a safety guard is
+        // worth pinning, or a later tidy-up drops it and quietly breaks going
+        // back.
+        let mut b = browser();
+        b.add_extra_keys(&['d']);
+
+        let ctrl_d = KeyEvent::new(KeyCode::Char('d'), KeyModifiers::CONTROL);
+        assert!(
+            matches!(b.handle(ctrl_d), Intent::Ignored),
+            "Ctrl+D reached the browser's extra keys"
+        );
+
+        b.handle(key(KeyCode::Enter));
+        assert_eq!(b.view(), View::Detail, "Enter did not open the detail view");
+
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        assert!(matches!(b.handle(ctrl_b), Intent::Redraw));
+        assert_eq!(b.view(), View::List, "Ctrl+B no longer leaves the detail view");
     }
 }

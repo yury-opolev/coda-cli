@@ -449,3 +449,63 @@ fn the_del_key_deletes_what_d_deletes() {
         _ => panic!("the Del key did not raise the same action as `d`"),
     }
 }
+
+#[test]
+fn a_control_chord_is_not_a_browser_key() {
+    // Ctrl+D is the universal "EOF, get me out of here" gesture. Reaching for
+    // it to dismiss a browser must not delete the selected row -- and because
+    // a browser registers `d` as an extra key, matching on the key code alone
+    // made it do exactly that, with no confirmation and no undo. Ctrl+U, the
+    // readline "erase to line start" chord, started a `git pull` the same way.
+    //
+    // This is the same defect that once let Ctrl+Y approve a permission
+    // prompt: the gesture meaning "wait, let me look at this" performed the
+    // dangerous thing instead.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let build = || {
+        let mut browser = Browser::new("Schedules", vec![Column::new("Name", 24)]);
+        browser.set_items(vec![Item::new("nightly", vec!["nightly".into()])]);
+        let mut stack = SurfaceStack::default();
+        stack.push(Box::new(
+            BrowserSurface::new(BrowserKind::Schedules, browser).with_actions(
+                RowActions::new().on_key('d', |id| SurfaceAction::DeleteSchedule(id.to_string())),
+            ),
+        ));
+        stack
+    };
+
+    for modifier in [
+        KeyModifiers::CONTROL,
+        KeyModifiers::ALT,
+        KeyModifiers::SUPER,
+    ] {
+        let mut stack = build();
+        let chord = KeyEvent::new(KeyCode::Char('d'), modifier);
+        if let StackOutcome::Action(SurfaceAction::DeleteSchedule(id)) = stack.handle_key(chord) {
+            panic!("{modifier:?}+D deleted {id:?} without being asked");
+        }
+    }
+
+    // Plain `d` must still delete, or the guard has thrown out the feature.
+    let mut stack = build();
+    match stack.handle_key(key(KeyCode::Char('d'))) {
+        StackOutcome::Action(SurfaceAction::DeleteSchedule(id)) => assert_eq!(id, "nightly"),
+        _ => panic!("plain `d` stopped deleting"),
+    }
+
+    // Shift must still pass: it is how a capital extra key is typed.
+    let mut browser = Browser::new("Things", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![Item::new("first", vec!["alpha".into()])]);
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Plugins, browser).with_actions(
+            RowActions::new().on_key('U', |id| SurfaceAction::UpdatePlugin(id.to_string())),
+        ),
+    ));
+    match stack.handle_key(KeyEvent::new(KeyCode::Char('U'), KeyModifiers::SHIFT)) {
+        StackOutcome::Action(SurfaceAction::UpdatePlugin(id)) => assert_eq!(id, "first"),
+        _ => panic!("Shift+U did not reach its action, so capitals are unreachable"),
+    }
+}
