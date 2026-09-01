@@ -305,9 +305,22 @@ Each phase ends green and shippable. Work may stop after any phase.
 | 1 | `Surface` and `SurfaceStack`; migrate the settings form as first adopter | Low — newest, already isolated |
 | 2 | `PromptSurface` as `Exclusive` | **Highest** — blocking semantics |
 | 3 | `Table` control and `ListSurface`; migrate six browsers, one per commit | Medium, repetitive |
-| 4 | Completions become an `Inline` surface | Low |
+| 4 | ~~Completions become an `Inline` surface~~ — **revised, see below** | — |
 | 5 | Split `app.rs` into `commands/`, `engine.rs`, `clipboard.rs` | Low — much smaller by then |
 | 6 | New surfaces: wizard, diff review, model picker, theme editor | The payoff |
+
+### Revision: completions are not a surface
+
+Phase 4 assumed the completion popup should become an `Inline` surface. It
+should not, and the assumption was wrong for a reason worth recording: **a
+surface owns the keyboard, and completions do not.** The composer keeps
+receiving keystrokes while the popup is shown — that is the whole point of a
+completion popup — so routing keys through the stack would have taken the
+keyboard away from the control the popup exists to serve.
+
+Completions are drawn by the shell instead, alongside the pin: a hint layered
+over the shell rather than a layer above it. `Placement::Inline` remains in the
+enum for surfaces that genuinely are modal but sit at the bottom of the screen.
 
 Phase 2 is early by choice. Modality is the one place where a mistake breaks a
 blocking permission gate, and that is better found while the design is fresh
