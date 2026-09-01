@@ -49,7 +49,16 @@ fn without_test_modules(source: &str) -> String {
             rest = after;
             continue;
         };
-        if !after[..brace].contains("mod ") {
+        // The attribute must sit directly on the module, so only the item it
+        // decorates is inspected. Searching the whole span up to the next `{`
+        // instead would let `#[cfg(test)] use x;` followed anywhere later by a
+        // `mod y;` declaration read as a test module, and brace-skip the
+        // production code that followed.
+        let is_module = after[..brace]
+            .split_whitespace()
+            .find(|token| !token.starts_with("pub"))
+            .is_some_and(|token| token == "mod");
+        if !is_module {
             rest = after;
             continue;
         }
@@ -301,6 +310,9 @@ fn the_application_module_stays_a_shell() {
 /// rebuilding it on reload, and noticing that a save affects the open list.
 /// Counting those calls is a proxy for the property, because behaviour
 /// dispatch always needed one.
+///
+/// The needle omits the `(` deliberately. This project runs no rustfmt, so
+/// `browser_kind ()` is valid Rust that a `browser_kind()` search would miss.
 #[test]
 fn row_behaviour_is_not_looked_up_by_browser_kind() {
     const ALLOWED: usize = 2;
@@ -310,7 +322,11 @@ fn row_behaviour_is_not_looked_up_by_browser_kind() {
     for (path, source) in sources() {
         let code = without_comments(&without_test_modules(&source));
         for (index, line) in code.lines().enumerate() {
-            let n = line.matches("browser_kind()").count();
+            // The declaration is not a call.
+            if line.contains("fn browser_kind") {
+                continue;
+            }
+            let n = line.matches("browser_kind").count();
             if n > 0 {
                 calls += n;
                 sites.push(format!("{path}:{}", index + 1));
@@ -320,7 +336,7 @@ fn row_behaviour_is_not_looked_up_by_browser_kind() {
 
     assert!(
         calls <= ALLOWED,
-        "browser_kind() is called {calls} times, over the {ALLOWED} allowed:\n{}\n\
+        "browser_kind is called {calls} times, over the {ALLOWED} allowed:\n{}\n\
          Row behaviour belongs on the browser that raises it — give it a RowActions \
          at construction rather than asking which kind is open.",
         sites.join("\n")
@@ -337,13 +353,16 @@ fn row_behaviour_is_not_looked_up_by_browser_kind() {
 /// browser attached its actions, reloading it did not, so pressing `r` left a
 /// browser that looked identical and had gone inert. Nothing failed; the keys
 /// just stopped. One constructor removes the chance to get it wrong.
+///
+/// The needle omits the `(` deliberately: this project runs no rustfmt, so
+/// `BrowserSurface::new\n(..)` is valid Rust that would slip past it.
 #[test]
 fn a_browser_surface_is_built_in_one_place() {
     let mut sites: Vec<String> = Vec::new();
     for (path, source) in sources() {
         let code = without_comments(&without_test_modules(&source));
         for (index, line) in code.lines().enumerate() {
-            if line.contains("BrowserSurface::new(") {
+            if line.contains("BrowserSurface::new") {
                 sites.push(format!("{path}:{}", index + 1));
             }
         }

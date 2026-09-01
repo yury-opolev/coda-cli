@@ -45,8 +45,11 @@ pub struct RowActions {
     pub activate: Option<Box<dyn Fn(&str) -> SurfaceAction>>,
     /// Space on a row.
     pub toggle: Option<Box<dyn Fn(&str) -> SurfaceAction>>,
-    /// Per-browser keys, such as `d` to delete.
+    /// Per-browser keys acting on the selected row, such as `d` to delete.
     pub keys: Vec<(char, Box<dyn Fn(&str) -> SurfaceAction>)>,
+    /// Per-browser keys acting on the browser rather than a row, such as `n`
+    /// to add a server.
+    pub bare_keys: Vec<(char, Box<dyn Fn() -> SurfaceAction>)>,
 }
 
 impl RowActions {
@@ -64,8 +67,22 @@ impl RowActions {
         self
     }
 
+    /// A key acting on the selected row. Does nothing when nothing is selected.
     pub fn on_key(mut self, key: char, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
         self.keys.push((key, Box::new(f)));
+        self
+    }
+
+    /// A key acting on the browser rather than on a row.
+    ///
+    /// Separate from [`on_key`] because the two differ precisely when the list
+    /// is empty, and both directions are bugs. "Add a server" that needs a row
+    /// is dead on a project with no servers — the first time anyone reaches
+    /// for it. "Delete" that runs without a row deletes the id `""`.
+    ///
+    /// [`on_key`]: RowActions::on_key
+    pub fn on_bare_key(mut self, key: char, f: impl Fn() -> SurfaceAction + 'static) -> Self {
+        self.bare_keys.push((key, Box::new(f)));
         self
     }
 
@@ -73,13 +90,39 @@ impl RowActions {
         match intent {
             Intent::Activate(id) => self.activate.as_ref().map(|f| f(id)),
             Intent::Toggle(id) => self.toggle.as_ref().map(|f| f(id)),
-            Intent::Key(c, Some(id)) => self
-                .keys
+            // A row-independent key first: it is the one that must still work
+            // with the list empty, which is when `id` is `None`.
+            Intent::Key(c, id) => self
+                .bare_keys
                 .iter()
                 .find(|(key, _)| key == c)
+                .map(|(_, f)| f())
+                .or_else(|| {
+                    let id = id.as_deref()?;
+                    self.keys
+                        .iter()
+                        .find(|(key, _)| key == c)
+                        .map(|(_, f)| f(id))
+                }),
+            // `Delete` is the physical Del key, an alias for whatever `d`
+            // does. Without this it fell through to the host and was dropped,
+            // so Del quietly stopped deleting.
+            Intent::Delete(id) => self
+                .keys
+                .iter()
+                .find(|(key, _)| *key == 'd')
                 .map(|(_, f)| f(id)),
             _ => None,
         }
+    }
+
+    /// Every key this set claims, row-dependent or not.
+    fn declared_keys(&self) -> Vec<char> {
+        self.keys
+            .iter()
+            .map(|(k, _)| *k)
+            .chain(self.bare_keys.iter().map(|(k, _)| *k))
+            .collect()
     }
 }
 
@@ -88,7 +131,7 @@ impl std::fmt::Debug for RowActions {
         f.debug_struct("RowActions")
             .field("activate", &self.activate.is_some())
             .field("toggle", &self.toggle.is_some())
-            .field("keys", &self.keys.iter().map(|(k, _)| *k).collect::<Vec<_>>())
+            .field("keys", &self.declared_keys())
             .finish()
     }
 }
@@ -115,8 +158,7 @@ impl BrowserSurface {
     /// the surface — the action would exist and never fire, which is the
     /// half-added failure this whole arrangement is meant to prevent.
     pub fn with_actions(mut self, actions: RowActions) -> Self {
-        let keys: Vec<char> = actions.keys.iter().map(|(k, _)| *k).collect();
-        self.browser.add_extra_keys(&keys);
+        self.browser.add_extra_keys(&actions.declared_keys());
         self.actions = actions;
         self
     }

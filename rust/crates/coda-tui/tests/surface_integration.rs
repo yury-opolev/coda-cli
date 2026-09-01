@@ -369,3 +369,83 @@ fn a_browser_without_actions_still_reaches_the_host() {
         _ => panic!("an unconfigured row action did not reach the host"),
     }
 }
+
+#[test]
+fn a_key_that_needs_no_row_works_on_an_empty_list() {
+    // "New MCP server" does not act on a row, so it must work when there are
+    // no rows -- which is exactly when a user reaches for it. Routing it
+    // through the row-key path made it fire only when something was selected,
+    // so on a project with no .mcp.json the footer advertised `n new` and
+    // pressing it did nothing, with hand-editing JSON the only way in.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let empty = Browser::new("MCP servers", vec![Column::new("Name", 24)]);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Mcp, empty).with_actions(
+            RowActions::new()
+                .on_bare_key('n', || SurfaceAction::NewMcpServer)
+                .on_key('d', |id| SurfaceAction::DeleteMcpServer(id.to_string())),
+        ),
+    ));
+
+    match stack.handle_key(key(KeyCode::Char('n'))) {
+        StackOutcome::Action(SurfaceAction::NewMcpServer) => {}
+        _ => panic!("`n` on an empty list did not open the editor"),
+    }
+
+    // The converse must hold too: a key that does act on a row must not fire
+    // with no row, or it would delete a server named "".
+    match stack.handle_key(key(KeyCode::Char('d'))) {
+        StackOutcome::Action(SurfaceAction::DeleteMcpServer(id)) => {
+            panic!("`d` deleted with nothing selected, targeting {id:?}")
+        }
+        _ => {}
+    }
+
+    // And with a row present, both still work.
+    let mut filled = Browser::new("MCP servers", vec![Column::new("Name", 24)]);
+    filled.set_items(vec![Item::new("ctx7", vec!["ctx7".into()])]);
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Mcp, filled).with_actions(
+            RowActions::new()
+                .on_bare_key('n', || SurfaceAction::NewMcpServer)
+                .on_key('d', |id| SurfaceAction::DeleteMcpServer(id.to_string())),
+        ),
+    ));
+    match stack.handle_key(key(KeyCode::Char('n'))) {
+        StackOutcome::Action(SurfaceAction::NewMcpServer) => {}
+        _ => panic!("`n` stopped working once a row existed"),
+    }
+    match stack.handle_key(key(KeyCode::Char('d'))) {
+        StackOutcome::Action(SurfaceAction::DeleteMcpServer(id)) => assert_eq!(id, "ctx7"),
+        _ => panic!("`d` did not delete the selected row"),
+    }
+}
+
+#[test]
+fn the_del_key_deletes_what_d_deletes() {
+    // Del is an alias for `d`. The browser reports it as its own intent, so
+    // without an arm for it the action set never sees it and Del quietly
+    // stops deleting -- working before this refactor, dead after, with
+    // nothing to say so.
+    use coda_tui::overlay::{Browser, Column, Item};
+    use coda_tui::surface::browser::{BrowserKind, BrowserSurface, RowActions};
+
+    let mut browser = Browser::new("Schedules", vec![Column::new("Name", 24)]);
+    browser.set_items(vec![Item::new("nightly", vec!["nightly".into()])]);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(
+        BrowserSurface::new(BrowserKind::Schedules, browser)
+            .with_actions(RowActions::new().on_key('d', |id| SurfaceAction::DeleteSchedule(id.to_string()))),
+    ));
+
+    match stack.handle_key(key(KeyCode::Delete)) {
+        StackOutcome::Action(SurfaceAction::DeleteSchedule(id)) => assert_eq!(id, "nightly"),
+        _ => panic!("the Del key did not raise the same action as `d`"),
+    }
+}

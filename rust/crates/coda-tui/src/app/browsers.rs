@@ -207,12 +207,12 @@ impl App {
                 .on_key('u', |id| A::UpdatePlugin(id.to_string())),
             BrowserKind::Mcp => RowActions::new()
                 .on_toggle(|id| A::ToggleMcp(id.to_string()))
-                .on_key('n', |_| A::NewMcpServer)
+                .on_bare_key('n', || A::NewMcpServer)
                 .on_key('e', |id| A::EditMcpServer(id.to_string()))
                 .on_key('d', |id| A::DeleteMcpServer(id.to_string())),
             BrowserKind::Schedules => RowActions::new()
                 .on_key('d', |id| A::DeleteSchedule(id.to_string()))
-                .on_key('n', |_| A::ExplainScheduleCreation),
+                .on_bare_key('n', || A::ExplainScheduleCreation),
             BrowserKind::Skills => {
                 RowActions::new().on_toggle(|_| A::ExplainSkillToggle)
             }
