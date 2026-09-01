@@ -135,6 +135,8 @@ pub struct App {
     /// is scrolled. Recording it during the draw keeps the two in step rather
     /// than duplicating the layout arithmetic here.
     transcript_origin: (u16, u16),
+    /// Screen cell of the composer's first text column, for click-to-caret.
+    composer_origin: (u16, u16),
 }
 
 
@@ -209,6 +211,7 @@ impl App {
             staged_images: Vec::new(),
             selection: crate::selection::TranscriptSelection::new(),
             transcript_origin: (0, 0),
+            composer_origin: (0, 0),
         };
 
         Ok((app, engine, inbound))
@@ -505,7 +508,13 @@ impl App {
             // so without this there is no way to select anything at all — the
             // capture takes the native behaviour away and gives nothing back.
             MouseEventKind::Down(MouseButton::Left) => {
-                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                // A click in the composer moves the caret rather than starting
+                // a transcript selection: the composer is the one region where
+                // a click already has an editing meaning.
+                if self.move_caret_to_click(mouse.column, mouse.row) {
+                    self.selection.clear();
+                    self.dirty = true;
+                } else if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
                     self.selection.begin(pos);
                     self.dirty = true;
                 }
@@ -648,7 +657,20 @@ impl App {
             Action::CompletionNext => self.composer.completion_next(),
             Action::CompletionPrevious => self.composer.completion_previous(),
             Action::CompletionAccept => {
-                self.composer.accept_completion();
+                // Enter accepts only what the user actually chose. Until they
+                // move the selection the popup is a hint, not a choice, so
+                // Enter runs what is in the input — which is also what makes
+                // typing a command in full and pressing Enter work.
+                //
+                // Accepting a candidate never runs it: it puts the command in
+                // the input so the user can add arguments and see what they
+                // are about to run.
+                if self.composer.completion().navigated {
+                    self.composer.accept_completion();
+                } else {
+                    self.composer.clear_completions();
+                    self.submit().await;
+                }
             }
             Action::CompletionCancel => self.composer.clear_completions(),
 
@@ -1175,6 +1197,53 @@ impl App {
         serde_json::from_value(value).map_err(ClientError::Serde)
     }
 
+    /// Applies a permission mode to the running session and persists it.
+    ///
+    /// Both halves matter and neither is sufficient. Telling the engine makes
+    /// the change take effect on the next tool call, which is why this no
+    /// longer asks the user to restart. Writing it to settings makes it
+    /// survive one. Reporting a failure to persist while the live mode did
+    /// change would be the confusing outcome, so both are reported.
+    ///
+    /// `canonical` is the settings spelling; the engine accepts it as an
+    /// alias, so one value serves both.
+    async fn apply_permission_mode(&mut self, canonical: &str) -> bool {
+        let applied = self
+            .fetch::<Value>(
+                method::SET_PERMISSION_MODE,
+                Some(serde_json::json!({ "mode": canonical })),
+            )
+            .await
+            .ok()
+            .and_then(|value| value.get("ok").and_then(Value::as_bool))
+            .unwrap_or(false);
+
+        if !applied {
+            self.notice(
+                "The engine did not accept the permission mode; it is unchanged.",
+                NoticeLevel::Error,
+            );
+            return false;
+        }
+
+        let paths = self.paths.clone();
+        let mode = canonical.to_string();
+        let saved = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
+            let mut settings = config::Settings::load(&paths)?;
+            settings.set_permission_mode(&mode);
+            settings.save()
+        })
+        .await;
+
+        if !matches!(saved, Ok(Ok(()))) {
+            self.notice(
+                "Applied for this session, but it could not be saved for the next one.",
+                NoticeLevel::Warning,
+            );
+        }
+        true
+    }
+
     /// Answers an open prompt.
 
     // -- Actions ------------------------------------------------------------
@@ -1559,6 +1628,24 @@ impl App {
     ///
     /// Returns `None` for a click outside the transcript area, so clicking the
     /// composer or status bar does not start a selection in the transcript.
+    /// Places the caret where the pointer was clicked, if it landed in the
+    /// composer. Returns whether it did.
+    fn move_caret_to_click(&mut self, column: u16, row: u16) -> bool {
+        let (origin_x, origin_y) = self.composer_origin;
+        if origin_y == 0 || row < origin_y {
+            return false;
+        }
+        let line = (row - origin_y) as usize;
+        if line >= self.composer.line_count() {
+            return false;
+        }
+        // Left of the prompt marker counts as column zero rather than missing,
+        // so clicking the gutter puts the caret at the start of the line.
+        let cell = column.saturating_sub(origin_x) as usize;
+        self.composer.move_cursor_to(line, cell);
+        true
+    }
+
     fn mouse_to_selection(
         &self,
         column: u16,
@@ -1713,6 +1800,15 @@ impl App {
         );
         let width = regions.transcript.width as usize;
         let height = regions.transcript.height as usize;
+
+        // Where the composer's first text cell sits, so a click can be turned
+        // into a caret position. Captured from the same layout that is about
+        // to be drawn, rather than recomputed in the event handler where it
+        // would silently drift the first time the chrome changed.
+        self.composer_origin = (
+            regions.composer.x + draw::COMPOSER_TEXT_COLUMN,
+            regions.composer.y + 1,
+        );
 
         if width != self.laid_out_width {
             let was_following = self.viewport.is_following();
@@ -2205,70 +2301,56 @@ impl App {
 
     /// `/permissions [<mode>]` — show or set the tool-permission mode.
     async fn cmd_permissions(&mut self, invocation: &commands::Invocation) {
-        let arg = invocation.first().map(str::to_string);
-        let paths = self.paths.clone();
+        let Some(raw) = invocation.first().map(str::to_string) else {
+            // No argument: report the mode without changing anything.
+            let paths = self.paths.clone();
+            let current = tokio::task::spawn_blocking(move || {
+                config::Settings::load(&paths)
+                    .ok()
+                    .and_then(|s| s.permission_mode().map(str::to_string))
+                    .unwrap_or_else(|| "default".to_string())
+            })
+            .await
+            .unwrap_or_else(|_| "default".to_string());
 
-        let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
-            let mut settings = config::Settings::load(&paths)?;
+            self.output(format!(
+                "Permission mode: {current}\nModes: default (ask), acceptEdits (auto-edit), plan (read-only), bypass (yolo: allow all)"
+            ));
+            return;
+        };
 
-            if let Some(ref raw) = arg {
-                match parse_permission_mode(raw) {
-                    Some(canonical) => {
-                        settings.set_permission_mode(canonical);
-                        settings.save()?;
-                        let note = if canonical == "bypass" {
-                            " (YOLO — tools run without asking)"
-                        } else {
-                            ""
-                        };
-                        Ok(format!("Permission mode set to {canonical}{note}. Restart the engine to apply."))
-                    }
-                    None => Ok(format!(
-                        "Unknown mode '{raw}'. Use: default | acceptEdits | plan | bypass"
-                    )),
-                }
+        let Some(canonical) = parse_permission_mode(&raw) else {
+            self.output(format!(
+                "Unknown mode '{raw}'. Use: default | acceptEdits | plan | bypass"
+            ));
+            return;
+        };
+
+        if self.apply_permission_mode(canonical).await {
+            let note = if canonical == "bypass" {
+                " — tools now run without asking"
             } else {
-                let current = settings.permission_mode().unwrap_or("default");
-                Ok(format!(
-                    "Permission mode: {current}\nModes: default (ask), acceptEdits (auto-edit), plan (read-only), bypass (yolo: allow all)"
-                ))
-            }
-        })
-        .await;
-
-        match result {
-            Ok(Ok(text)) => self.output(text),
-            Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
-            Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),
+                ""
+            };
+            self.output(format!("Permission mode set to {canonical}{note}."));
         }
     }
 
     /// `/yolo` — grant bypass-permissions mode. Explicit, loud, and impossible to miss.
     async fn cmd_yolo(&mut self) {
-        let paths = self.paths.clone();
-        let result = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
-            let mut settings = config::Settings::load(&paths)?;
-            settings.set_permission_mode("bypass");
-            settings.save()
-        })
-        .await;
-
-        match result {
-            Ok(Ok(())) => {
-                // The warning appears first in the transcript to make the state
-                // change impossible to overlook before the confirmation notice.
-                self.notice(
-                    "⚠  YOLO mode: tools will run without asking for permission.",
-                    NoticeLevel::Warning,
-                );
-                self.notice(
-                    "Restart the engine to apply. Use /permissions default to revert.",
-                    NoticeLevel::Info,
-                );
-            }
-            Ok(Err(e)) => self.notice(format!("Could not save setting: {e}"), NoticeLevel::Error),
-            Err(_) => self.notice("Settings write was interrupted.", NoticeLevel::Error),
+        if !self.apply_permission_mode("bypass").await {
+            return;
         }
+        // The warning appears first in the transcript to make the state
+        // change impossible to overlook before the confirmation notice.
+        self.notice(
+            "⚠  YOLO mode: tools will run without asking for permission.",
+            NoticeLevel::Warning,
+        );
+        self.notice(
+            "In effect now. Use /permissions default to revert.",
+            NoticeLevel::Info,
+        );
     }
 
     /// `/provider [<id>]` — show the configured provider or switch to a different one.

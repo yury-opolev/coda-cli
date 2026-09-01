@@ -20,7 +20,9 @@ use coda_agent::events::{AgentEvent, AgentSink};
 use coda_agent::goal::ForkedAgent;
 use coda_agent::hooks::runner::{HookExecutor, ShellHookExecutor};
 use coda_agent::lsp::{LspServerConfig, LspServerManager, LspServerMapBuilder};
-use coda_agent::permission::{ModePermissionPrompt, PermissionMode, PermissionPrompt};
+use coda_agent::permission::{
+    ModePermissionPrompt, PermissionMode, PermissionModeState, PermissionPrompt,
+};
 use coda_agent::scheduling::{
     ScheduleDefinitionDraft, ScheduleKind, ScheduleTerminalOutcome, ScheduledTaskStore,
 };
@@ -48,7 +50,7 @@ use uuid::Uuid;
 use crate::dispatch::{
     CompactParams, ForkParams, HooksInfoParams, HooksTrustParams, InitParams, MessagesParams,
     ModelsParams, PromptParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
-    ServeBackend, SetEffortParams, SetGoalParams, SteerParams,
+    ServeBackend, SetEffortParams, SetGoalParams, SetPermissionModeParams, SteerParams,
 };
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::session::{Session, SteeringLogEntry};
@@ -268,6 +270,30 @@ struct SessionServices {
 // ServeHost
 // ─────────────────────────────────────────────────────────────────────────────
 
+/// Maps the wire spelling of a permission mode onto the enum.
+///
+/// The spellings match the C# `PermissionModeNames`, so a settings file or a
+/// hook written for either build means the same thing in both.
+fn parse_permission_mode(value: &str) -> Option<PermissionMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" | "ask" => Some(PermissionMode::Default),
+        "acceptedits" | "accept-edits" | "edits" => Some(PermissionMode::AcceptEdits),
+        "plan" => Some(PermissionMode::Plan),
+        "bypasspermissions" | "bypass" | "yolo" => Some(PermissionMode::BypassPermissions),
+        _ => None,
+    }
+}
+
+/// The wire spelling for a mode, for reporting what was applied.
+fn wire_permission_mode(mode: PermissionMode) -> &'static str {
+    match mode {
+        PermissionMode::Default => "default",
+        PermissionMode::AcceptEdits => "acceptEdits",
+        PermissionMode::Plan => "plan",
+        PermissionMode::BypassPermissions => "bypassPermissions",
+    }
+}
+
 pub struct ServeHost {
     session: Arc<Session>,
     sink: Arc<ServeSink>,
@@ -275,6 +301,9 @@ pub struct ServeHost {
     client: tokio::sync::Mutex<Option<Arc<dyn LlmClient>>>,
     tools: Arc<ToolRegistry>,
     permission_prompt: Arc<dyn PermissionPrompt>,
+    /// The live permission mode, shared with the prompt above so a change here
+    /// is observed by the next tool decision without restarting the engine.
+    permission_mode: Arc<PermissionModeState>,
     user_question: Arc<WireUserQuestion>,
     plan_approver: Arc<WirePlanApprover>,
     todos: Arc<TodoStore>,
@@ -334,8 +363,15 @@ impl ServeHost {
         connected_provider: Option<&str>,
     ) -> Arc<Self> {
         let wire_perm = Arc::new(WirePermissionPrompt { channel: Arc::clone(&prompt_channel) });
-        let permission_prompt: Arc<dyn PermissionPrompt> =
-            Arc::new(ModePermissionPrompt::new(PermissionMode::Default, Some(wire_perm)));
+        // The mode state is held by the host rather than buried inside the
+        // prompt, so `/yolo` and `/permissions` can switch it on a live
+        // session. Built with `new()` the prompt owns a state nothing can
+        // reach, which is why changing the mode used to require restarting
+        // the engine.
+        let permission_mode = Arc::new(PermissionModeState::new(PermissionMode::Default));
+        let permission_prompt: Arc<dyn PermissionPrompt> = Arc::new(
+            ModePermissionPrompt::new_with_state(Arc::clone(&permission_mode), Some(wire_perm)),
+        );
         let user_question = Arc::new(WireUserQuestion { channel: Arc::clone(&prompt_channel) });
         let plan_approver = Arc::new(WirePlanApprover { channel: Arc::clone(&prompt_channel) });
         let tools = Arc::new(ToolRegistry::new(built_in_tools()));
@@ -359,6 +395,7 @@ impl ServeHost {
             client: tokio::sync::Mutex::new(client),
             tools,
             permission_prompt,
+            permission_mode,
             user_question,
             plan_approver,
             todos: Arc::new(TodoStore::new()),
@@ -757,6 +794,29 @@ impl ServeBackend for ServeHost {
             max_continuations: p.max_continuations,
         };
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+    }
+
+    async fn session_set_permission_mode(
+        &self,
+        p: SetPermissionModeParams,
+    ) -> Result<Value, RpcError> {
+        // An unknown mode is refused rather than falling back to a default: a
+        // caller asking for "bypassPermissions" and silently getting "ask"
+        // would be told it worked while every tool still prompted, and a
+        // caller naming a mode we do not know must never be quietly granted a
+        // more permissive one.
+        let Some(mode) = parse_permission_mode(&p.mode) else {
+            return Ok(serde_json::json!({
+                "ok": false,
+                "applied": wire_permission_mode(self.permission_mode.get()),
+            }));
+        };
+
+        self.permission_mode.set(mode);
+        Ok(serde_json::json!({
+            "ok": true,
+            "applied": wire_permission_mode(mode),
+        }))
     }
 
     async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError> {
@@ -1767,6 +1827,63 @@ mod tests {
         )];
         let p = project_history(&msgs);
         assert_eq!(p[0].content, "done");
+    }
+
+    #[tokio::test]
+    async fn setting_a_mode_takes_effect_without_a_restart() {
+        // The whole point: PermissionModeState is shared with the prompt, so a
+        // change here is seen by the next tool decision. Built the old way the
+        // prompt owned a state nothing could reach, which is why /yolo used to
+        // ask the user to restart.
+        let host = make_host();
+        let before = host.permission_mode.get();
+        assert_eq!(before, PermissionMode::Default);
+
+        let result = host
+            .session_set_permission_mode(SetPermissionModeParams {
+                mode: "bypassPermissions".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], serde_json::json!(true));
+        assert_eq!(result["applied"], serde_json::json!("bypassPermissions"));
+        assert_eq!(host.permission_mode.get(), PermissionMode::BypassPermissions);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_mode_is_refused_and_changes_nothing() {
+        // Never quietly grant a mode we do not recognise, and never report
+        // success for one we did not apply.
+        let host = make_host();
+        host.permission_mode.set(PermissionMode::Plan);
+
+        let result = host
+            .session_set_permission_mode(SetPermissionModeParams {
+                mode: "ludicrous".into(),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(result["ok"], serde_json::json!(false));
+        assert_eq!(result["applied"], serde_json::json!("plan"));
+        assert_eq!(host.permission_mode.get(), PermissionMode::Plan);
+    }
+
+    #[tokio::test]
+    async fn mode_spellings_match_the_c_sharp_names() {
+        for (wire, expected) in [
+            ("default", PermissionMode::Default),
+            ("acceptEdits", PermissionMode::AcceptEdits),
+            ("plan", PermissionMode::Plan),
+            ("bypassPermissions", PermissionMode::BypassPermissions),
+            // Aliases the C# also accepts.
+            ("yolo", PermissionMode::BypassPermissions),
+            ("edits", PermissionMode::AcceptEdits),
+        ] {
+            assert_eq!(parse_permission_mode(wire), Some(expected), "{wire}");
+        }
+        assert_eq!(parse_permission_mode("nonsense"), None);
     }
 
     #[tokio::test]
