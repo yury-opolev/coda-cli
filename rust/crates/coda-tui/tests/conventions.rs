@@ -266,3 +266,25 @@ fn an_open_surface_takes_focus_away_from_the_composer() {
         "Ctrl+C was swallowed by an open surface"
     );
 }
+
+/// `app/mod.rs` must stay the event loop, not the whole application.
+///
+/// A ceiling rather than a target, and deliberately generous: the point is to
+/// notice when a responsibility drifts back in, not to police every line.
+/// Before the split this file held the loop, nineteen slash commands, engine
+/// RPC, the clipboard, pointer gestures and browser orchestration, and nothing
+/// about reading it said which of those you were in.
+#[test]
+fn the_application_module_stays_a_shell() {
+    const CEILING: usize = 1_600;
+
+    let source = std::fs::read_to_string("src/app/mod.rs").expect("read app/mod.rs");
+    let production = without_test_modules(&source).lines().count();
+
+    assert!(
+        production <= CEILING,
+        "app/mod.rs is {production} production lines, over the {CEILING}-line ceiling. \
+         Something with its own responsibility has drifted back in; move it to a \
+         sibling under app/ rather than raising this number."
+    );
+}

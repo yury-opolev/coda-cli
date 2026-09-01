@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use coda_client::{ClientError, Connection, Engine, EngineCommand, Inbound, Responder};
-use coda_proto::messages::{self, method, server_method};
+use coda_proto::messages::{self, method};
 use coda_proto::Event;
 use coda_render::{RenderLine, Theme};
 use crossterm::event::{
@@ -22,6 +22,8 @@ use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
+mod engine;
+
 use crate::browsers::{self, TaskOutcome};
 use crate::config::{self, Paths, PluginState, Settings};
 use crate::commands::{self, Scope};
@@ -30,7 +32,7 @@ use crate::draw;
 use crate::keymap::{self, Action, Focus, KeyContext};
 use crate::overlay::{Browser, Intent};
 use crate::surface::browser::{BrowserKind, BrowserSurface};
-use crate::state::{PendingPrompt, UiEvent, UiState};
+use crate::state::{UiEvent, UiState};
 use crate::terminal::TerminalGuard;
 use crate::transcript::NoticeLevel;
 use crate::viewport::{Viewport, ViewportAnchor};
@@ -317,95 +319,7 @@ impl App {
 
     // -- Engine -------------------------------------------------------------
 
-    fn on_inbound(&mut self, message: Inbound) {
-        match message {
-            Inbound::Notification { method, params } => {
-                let event = Event::parse(&method, params.as_ref());
-                if let Event::TaskCompleted {
-                    task_id,
-                    status,
-                    description,
-                    report,
-                } = &event
-                {
-                    self.task_outcomes.insert(
-                        task_id.clone(),
-                        TaskOutcome {
-                            status: status.clone(),
-                            description: description.clone(),
-                            report: report.clone(),
-                        },
-                    );
-                }
-                self.apply(UiEvent::Engine(event));
-            }
-            Inbound::Request {
-                method,
-                params,
-                responder,
-            } => self.on_server_request(&method, params, responder),
-        }
-    }
 
-    fn on_server_request(&mut self, method: &str, params: Option<Value>, responder: Responder) {
-        let params = params.unwrap_or(Value::Null);
-
-        let prompt = match method {
-            server_method::PERMISSION => serde_json::from_value::<messages::PermissionRequest>(
-                params,
-            )
-            .ok()
-            .map(|request| PendingPrompt::Permission {
-                tool: request.tool_name,
-                preview: request.input_preview,
-            }),
-            server_method::QUESTION => serde_json::from_value::<messages::QuestionRequest>(params)
-                .ok()
-                .map(|request| PendingPrompt::Question {
-                    question: request.question,
-                    options: request.options,
-                    multi_select: request.multi_select,
-                    allow_free_text: request.allow_free_text,
-                }),
-            server_method::PLAN_APPROVAL => serde_json::from_value::<
-                messages::PlanApprovalRequest,
-            >(params)
-            .ok()
-            .map(|request| PendingPrompt::PlanApproval { plan: request.plan }),
-            _ => None,
-        };
-
-        match prompt {
-            Some(prompt) => {
-                // Only one prompt can be outstanding; a second would leave the
-                // first unanswered and hang the turn.
-                if let Some(previous) = self.pending_responder.take() {
-                    previous.fail(
-                        coda_proto::error_codes::INTERNAL_ERROR,
-                        "superseded by another request",
-                    );
-                    // Retire the superseded surface too. Its exclusivity would
-                    // otherwise refuse the replacement, leaving a stale prompt
-                    // on screen bound to a responder that has already failed.
-                    self.retire_prompt_surface();
-                }
-                self.pending_responder = Some(responder);
-                // The surface is pushed alongside the state so the two cannot
-                // disagree about whether a prompt is open. Exclusive modality
-                // then guarantees it stays on top and cannot be dismissed
-                // without an answer, which the engine is blocked awaiting.
-                self.surfaces
-                    .push(Box::new(crate::surface::prompt::PromptSurface::new(
-                        prompt.clone(),
-                    )));
-                self.apply(UiEvent::PromptRequested(prompt));
-            }
-            None => responder.fail(
-                coda_proto::error_codes::METHOD_NOT_FOUND,
-                format!("{method} is not supported by this client"),
-            ),
-        }
-    }
 
     fn on_turn_finished(&mut self, outcome: TurnOutcome) {
         match outcome.result {
@@ -1250,62 +1164,7 @@ impl App {
         }
     }
 
-    /// Issues a request and deserialises its result.
-    async fn fetch<T: serde::de::DeserializeOwned>(
-        &self,
-        rpc_method: &str,
-        params: Option<Value>,
-    ) -> Result<T, ClientError> {
-        let value = self.connection.request(rpc_method, params).await?;
-        serde_json::from_value(value).map_err(ClientError::Serde)
-    }
 
-    /// Applies a permission mode to the running session and persists it.
-    ///
-    /// Both halves matter and neither is sufficient. Telling the engine makes
-    /// the change take effect on the next tool call, which is why this no
-    /// longer asks the user to restart. Writing it to settings makes it
-    /// survive one. Reporting a failure to persist while the live mode did
-    /// change would be the confusing outcome, so both are reported.
-    ///
-    /// `canonical` is the settings spelling; the engine accepts it as an
-    /// alias, so one value serves both.
-    async fn apply_permission_mode(&mut self, canonical: &str) -> bool {
-        let applied = self
-            .fetch::<Value>(
-                method::SET_PERMISSION_MODE,
-                Some(serde_json::json!({ "mode": canonical })),
-            )
-            .await
-            .ok()
-            .and_then(|value| value.get("ok").and_then(Value::as_bool))
-            .unwrap_or(false);
-
-        if !applied {
-            self.notice(
-                "The engine did not accept the permission mode; it is unchanged.",
-                NoticeLevel::Error,
-            );
-            return false;
-        }
-
-        let paths = self.paths.clone();
-        let mode = canonical.to_string();
-        let saved = tokio::task::spawn_blocking(move || -> Result<(), config::ConfigError> {
-            let mut settings = config::Settings::load(&paths)?;
-            settings.set_permission_mode(&mode);
-            settings.save()
-        })
-        .await;
-
-        if !matches!(saved, Ok(Ok(()))) {
-            self.notice(
-                "Applied for this session, but it could not be saved for the next one.",
-                NoticeLevel::Warning,
-            );
-        }
-        true
-    }
 
     /// Answers an open prompt.
 
@@ -2145,55 +2004,7 @@ impl App {
         }
     }
 
-    /// Removes an open prompt surface, wherever it sits in the stack.
-    ///
-    /// Used when a prompt is superseded or cancelled by the engine rather than
-    /// answered by the user: the surface must go even though nothing was
-    /// answered, and its own exclusivity would otherwise keep it there.
-    fn retire_prompt_surface(&mut self) {
-        while self
-            .surfaces
-            .top()
-            .is_some_and(|s| s.as_any().is::<crate::surface::prompt::PromptSurface>())
-        {
-            self.surfaces.pop();
-        }
-    }
 
-    /// Split from the surface deliberately: the responder is engine state, so
-    /// a surface must not hold it. The surface decides what the answer is and
-    /// this sends it.
-    fn answer_prompt(&mut self, allowed: bool, answer: Option<String>) {
-        let Some(prompt) = self.state.prompt.clone() else {
-            return;
-        };
-        self.dirty = true;
-
-        if let Some(responder) = self.pending_responder.take() {
-            let reply = match &prompt {
-                PendingPrompt::Permission { .. } => {
-                    serde_json::to_value(messages::PermissionResponse { allow: allowed })
-                }
-                PendingPrompt::PlanApproval { .. } => {
-                    serde_json::to_value(messages::PlanApprovalResponse { approve: allowed })
-                }
-                PendingPrompt::Question { .. } => {
-                    serde_json::to_value(messages::QuestionResponse {
-                        answer: answer.clone().unwrap_or_default(),
-                    })
-                }
-            };
-            match reply {
-                Ok(value) => responder.respond(value),
-                Err(error) => responder.fail(
-                    coda_proto::error_codes::INTERNAL_ERROR,
-                    error.to_string(),
-                ),
-            }
-        }
-
-        self.apply(UiEvent::PromptAnswered { allowed, answer });
-    }
 
     /// Copies the active selection for a right-click gesture.
     ///
@@ -3634,8 +3445,7 @@ fn pretty(value: &Value) -> String {
 /// Mirrors `UiActor.IsCritical` in C#: turn boundaries, errors, prompts,
 /// session lifecycle, and mode changes all get immediate frames.
 fn is_critical_event(event: &UiEvent) -> bool {
-    use coda_proto::Event;
-    match event {
+        match event {
         UiEvent::TurnFinished { .. }
         | UiEvent::Connected { .. }
         | UiEvent::PromptRequested(_)
