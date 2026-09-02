@@ -378,3 +378,63 @@ fn a_browser_surface_is_built_in_one_place() {
         sites.join("\n")
     );
 }
+
+/// A foldable block is worthless if nothing calls the toggle.
+///
+/// `toggle_fold_at_click` cannot be exercised by a unit test — reaching it
+/// needs an `App`, and building one spawns a real engine. That is precisely
+/// the shape of bug this codebase keeps producing: a complete, well-tested
+/// unit that nothing calls. So the wiring itself is asserted here.
+#[test]
+fn the_pointer_handler_offers_a_click_to_fold() {
+    let source = std::fs::read_to_string("src/app/clipboard.rs").expect("read clipboard.rs");
+    let code = without_test_modules(&source);
+    let start = code
+        .find("fn decide_pointer_action")
+        .expect("decide_pointer_action is gone; this rule needs rewriting");
+    // Up to the next item at the same indentation, so only this function counts.
+    let body = &code[start..];
+    let end = body.find("\n    pub(super) fn ").unwrap_or(body.len());
+
+    assert!(
+        body[..end].contains("toggle_fold_at_click"),
+        "decide_pointer_action never calls toggle_fold_at_click, so clicking a \
+         thinking block does nothing. The fold would be unreachable."
+    );
+}
+
+/// An indicator nothing advances is a static picture of a spinner.
+///
+/// `UiState::spinner` is drawn by the renderer but advanced by the event loop,
+/// and the loop cannot be unit tested — running it needs a live engine and a
+/// terminal. Both halves are asserted here: the frame has to move, and the
+/// loop has to wake up to move it. Dropping the wakeup is the subtler of the
+/// two, and leaves the indicator frozen through exactly the long silences it
+/// exists to cover.
+#[test]
+fn the_event_loop_drives_the_working_indicator() {
+    let source = std::fs::read_to_string("src/app/mod.rs").expect("read app/mod.rs");
+    let code = without_comments(&without_test_modules(&source));
+    let start = code
+        .find("pub async fn run")
+        .expect("App::run is gone; this rule needs rewriting");
+    let body = &code[start..];
+    // Stop at the next sibling item. A comment banner would be the obvious
+    // boundary, but `without_comments` has already removed it — and falling
+    // back to "rest of the file" would let a call anywhere in `App` satisfy
+    // this, which is not what is being asserted.
+    let end = ["\n    fn ", "\n    pub fn ", "\n    pub(super) fn ", "\n    async fn "]
+        .iter()
+        .filter_map(|needle| body.find(needle))
+        .min()
+        .unwrap_or(body.len());
+    let run = &body[..end];
+
+    for required in ["tick_spinner", "arm_spinner_wakeup"] {
+        assert!(
+            run.contains(required),
+            "App::run never calls {required}, so the working indicator does not \
+             animate. It would draw one frame and hold it."
+        );
+    }
+}

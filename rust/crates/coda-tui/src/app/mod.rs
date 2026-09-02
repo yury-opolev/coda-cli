@@ -56,6 +56,12 @@ pub(crate) enum PointerAction {
 /// Matches C# `UiActor.MinStreamingFrameIntervalMs = 33`.
 const MIN_STREAMING_FRAME_MS: u64 = 33;
 
+/// How long each frame of the working indicator is held.
+///
+/// Slower than the frame cap, so the spinner costs at most one extra redraw
+/// per interval rather than driving the loop at full rate while idle-but-busy.
+const SPINNER_FRAME_MS: u64 = 110;
+
 /// Outcome of an in-flight `session/prompt`.
 struct TurnOutcome {
     result: Result<Value, ClientError>,
@@ -92,6 +98,8 @@ pub struct App {
     frame_deadline: Option<tokio::time::Instant>,
     /// When the most recent frame was drawn (wall-clock monotonic).
     last_frame_at: Option<std::time::Instant>,
+    /// When the working indicator last advanced a frame.
+    spinner_at: Option<std::time::Instant>,
     /// Stable position anchor captured when the viewport detaches.
     ///
     /// Resolved to a new global row on every reflow (width change) so the
@@ -171,6 +179,7 @@ impl App {
             critical_dirty: false,
             frame_deadline: None,
             last_frame_at: None,
+            spinner_at: None,
             detached_anchor: None,
             turn: None,
             pending_responder: None,
@@ -278,7 +287,9 @@ impl App {
             if self.state.should_quit {
                 break;
             }
+            self.tick_spinner();
             self.maybe_redraw(guard)?;
+            self.arm_spinner_wakeup();
         }
 
         if let Some(engine) = owned_engine {
@@ -912,6 +923,44 @@ impl App {
     /// Streaming events defer to the deadline so a burst of deltas at >30 FPS
     /// does not cause 60+ redraws per second, while the deferred timer
     /// guarantees the last frame is drawn even if no further events arrive.
+    /// Advances the working indicator when its frame is due.
+    ///
+    /// Time-driven rather than event-driven: the indicator has to keep moving
+    /// through the long silences between engine events, which is exactly when
+    /// the user most needs telling that anything is still happening.
+    fn tick_spinner(&mut self) {
+        if !self.state.activity.is_animated() {
+            // Reset, so the next turn starts at the first frame rather than
+            // wherever the last one stopped.
+            self.state.spinner = 0;
+            self.spinner_at = None;
+            return;
+        }
+
+        let due = self
+            .spinner_at
+            .is_none_or(|at| at.elapsed() >= Duration::from_millis(SPINNER_FRAME_MS));
+        if due {
+            self.state.spinner = self.state.spinner.wrapping_add(1);
+            self.spinner_at = Some(std::time::Instant::now());
+            self.dirty = true;
+        }
+    }
+
+    /// Wakes the loop when the next indicator frame is due.
+    ///
+    /// Without this the loop blocks in `select!` until an event arrives, and
+    /// the indicator freezes during precisely the long waits it exists to
+    /// cover. Never displaces an already-armed deadline, which is a redraw
+    /// falling due sooner.
+    fn arm_spinner_wakeup(&mut self) {
+        if !self.state.activity.is_animated() || self.frame_deadline.is_some() {
+            return;
+        }
+        self.frame_deadline =
+            Some(tokio::time::Instant::now() + Duration::from_millis(SPINNER_FRAME_MS));
+    }
+
     fn maybe_redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
         let has_work = self.dirty || self.critical_dirty;
         if !has_work {

@@ -224,7 +224,7 @@ pub fn draw_with_pin(
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
     }
-    draw_composer(frame, regions.composer, composer, state, theme);
+    draw_composer(frame, regions.composer, composer, theme);
     // After the composer, so it floats above it rather than under it.
     draw_completions(frame, regions.composer, composer, theme);
     draw_status(frame, regions.status, state, viewport, theme);
@@ -475,7 +475,6 @@ fn draw_composer(
     frame: &mut Frame,
     area: Rect,
     composer: &Composer,
-    state: &UiState,
     theme: &Theme,
 ) {
     if area.height == 0 || area.width == 0 {
@@ -532,8 +531,13 @@ fn draw_composer(
             // A leading space keeps the glyph off the terminal edge; the
             // continuation indent matches its width so wrapped lines align
             // under the first one's text.
+            //
+            // The marker does not change while a turn runs. Swapping it for an
+            // ellipsis marked the one region inviting input as though it were
+            // disabled, when typing there queues the next message. Progress is
+            // the status bar's job.
             let marker = if index == 0 {
-                if state.is_busy() { glyphs::BUSY_PADDED } else { glyphs::PROMPT_PADDED }
+                glyphs::PROMPT_PADDED
             } else {
                 glyphs::PROMPT_CONTINUATION
             };
@@ -563,7 +567,14 @@ fn draw_status(
     theme: &Theme,
 ) {
     let mut spans = vec![Span::styled(
-        format!(" {} ", state.activity.label()),
+        // The spinner sits inside the activity span so it takes the activity's
+        // colour: one indicator, one meaning, one role.
+        if state.activity.is_animated() {
+            let frame = glyphs::SPINNER[state.spinner % glyphs::SPINNER.len()];
+            format!(" {frame} {} ", state.activity.label())
+        } else {
+            format!(" {} ", state.activity.label())
+        },
         theme.style(state.activity.role()),
     )];
 

@@ -47,6 +47,18 @@ impl Activity {
             Activity::Waiting => Role::OperationalWaiting,
         }
     }
+
+    /// Whether this state should show a moving indicator.
+    ///
+    /// A spinner is a claim that something is happening. `Waiting` is blocked
+    /// on the *user* answering a prompt, so spinning there claims progress
+    /// that is not being made and invites them to wait for themselves.
+    pub fn is_animated(self) -> bool {
+        matches!(
+            self,
+            Activity::Working | Activity::Thinking | Activity::Initializing
+        )
+    }
 }
 
 /// Cumulative token usage for the session.
@@ -158,6 +170,12 @@ pub struct UiState {
     /// Set when a `ResponseRewritten` engine event replaces the buffer's
     /// contents.  Determines whether to flush or withhold on interruption.
     pub buffer_rewritten_by_hook: bool,
+    /// Frame of the working indicator.
+    ///
+    /// Advanced by the event loop rather than the renderer, so drawing the
+    /// same state twice gives the same picture and the render tests stay
+    /// deterministic.
+    pub spinner: usize,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
 }
@@ -183,6 +201,7 @@ impl UiState {
             interrupting: false,
             assistant_buffer: None,
             buffer_rewritten_by_hook: false,
+            spinner: 0,
 
             clock: default_timestamp,
         }
@@ -368,6 +387,7 @@ impl UiState {
                             elapsed_ms: 0,
                             tokens: None,
                             complete: false,
+                            expanded: false,
                         });
                     }
                 }
@@ -858,6 +878,7 @@ mod tests {
                 elapsed_ms,
                 tokens,
                 complete,
+                ..
             } => {
                 assert_eq!(text, "hmm...");
                 assert_eq!(*elapsed_ms, 2500);
