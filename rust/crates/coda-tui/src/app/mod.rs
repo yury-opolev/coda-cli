@@ -522,12 +522,12 @@ impl App {
                 self.composer.accept_completion();
             }
             Action::CompletionSubmit => {
-                // Enter runs. It takes an explicitly chosen candidate first —
-                // otherwise the popup is only a hint, and running what is
-                // typed is what makes typing a command in full work.
-                if self.composer.completion().navigated {
-                    self.composer.accept_completion();
-                }
+                // Runs whatever is highlighted. A candidate is highlighted
+                // from the moment the popup opens, so acting on anything else
+                // would contradict what is on screen — and it is what makes
+                // typing a prefix and pressing Enter run the command rather
+                // than submitting an unknown one.
+                self.composer.accept_completion();
                 self.composer.clear_completions();
                 self.submit().await;
             }
