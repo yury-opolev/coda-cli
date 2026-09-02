@@ -99,7 +99,10 @@ pub enum Action {
 
     CompletionNext,
     CompletionPrevious,
+    /// Fill the input from the popup, without running it.
     CompletionAccept,
+    /// Run the command: take the chosen candidate first, if there was one.
+    CompletionSubmit,
     CompletionCancel,
     /// Request completions for the token under the cursor.
     CompletionRequest,
@@ -177,9 +180,14 @@ pub fn resolve(key: KeyEvent, context: KeyContext) -> Action {
 
 fn resolve_completion(key: KeyEvent, ctrl: bool) -> Action {
     match key.code {
-        KeyCode::Tab | KeyCode::Down => Action::CompletionNext,
+        // Tab fills the input and stops there, so arguments can be added and
+        // the command read back before it runs. Enter runs. Tab used to cycle
+        // the list, which left no key meaning "take this one, I am not done
+        // typing yet".
+        KeyCode::Tab => Action::CompletionAccept,
+        KeyCode::Down => Action::CompletionNext,
         KeyCode::BackTab | KeyCode::Up => Action::CompletionPrevious,
-        KeyCode::Enter => Action::CompletionAccept,
+        KeyCode::Enter => Action::CompletionSubmit,
         KeyCode::Esc => Action::CompletionCancel,
         // Typing keeps filtering rather than dismissing the popup.
         KeyCode::Char(c) if !ctrl => Action::Insert(c),
@@ -511,12 +519,12 @@ mod tests {
     }
 
     #[test]
-    fn tab_cycles_an_open_completion_popup() {
+    fn tab_fills_the_input_from_an_open_completion_popup() {
         let context = KeyContext {
             focus: Focus::Completion,
             ..composing()
         };
-        assert_eq!(resolve(key(KeyCode::Tab), context), Action::CompletionNext);
+        assert_eq!(resolve(key(KeyCode::Tab), context), Action::CompletionAccept);
         assert_eq!(
             resolve(key(KeyCode::BackTab), context),
             Action::CompletionPrevious
@@ -524,12 +532,12 @@ mod tests {
     }
 
     #[test]
-    fn enter_accepts_an_open_completion_rather_than_submitting() {
+    fn enter_runs_rather_than_only_filling_the_input() {
         let context = KeyContext {
             focus: Focus::Completion,
             ..composing()
         };
-        assert_eq!(resolve(key(KeyCode::Enter), context), Action::CompletionAccept);
+        assert_eq!(resolve(key(KeyCode::Enter), context), Action::CompletionSubmit);
     }
 
     #[test]
@@ -610,5 +618,35 @@ mod tests {
                 "ctrl+{c} was inserted as a literal character"
             );
         }
+    }
+
+    #[test]
+    fn tab_completes_and_enter_runs() {
+        // Tab fills the input from the popup; Enter runs what is in the
+        // input. Tab used to cycle the list, which left no key that meant
+        // "take this one and let me add arguments" -- Enter did that instead,
+        // so there was no way to run a chosen command without a second press.
+        let context = KeyContext {
+            focus: Focus::Completion,
+            ..composing()
+        };
+        assert_eq!(resolve(key(KeyCode::Tab), context), Action::CompletionAccept);
+        assert_eq!(resolve(key(KeyCode::Enter), context), Action::CompletionSubmit);
+    }
+
+    #[test]
+    fn the_arrows_still_move_through_the_completion_list() {
+        // Tab no longer cycles, so the arrows are the only way to choose.
+        // Losing them would leave the list unnavigable.
+        let context = KeyContext {
+            focus: Focus::Completion,
+            ..composing()
+        };
+        assert_eq!(resolve(key(KeyCode::Down), context), Action::CompletionNext);
+        assert_eq!(resolve(key(KeyCode::Up), context), Action::CompletionPrevious);
+        assert_eq!(
+            resolve(key(KeyCode::BackTab), context),
+            Action::CompletionPrevious
+        );
     }
 }

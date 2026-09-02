@@ -133,6 +133,14 @@ pub enum UiEvent {
     Cleared,
     /// The active model changed.
     ModelChanged { id: String, context_limit: Option<i64> },
+    /// Fold or unfold the reasoning block at this index.
+    ///
+    /// An event rather than a direct call so it passes through the same
+    /// invalidation as every other transcript change. Toggling the block
+    /// directly left the fold flipped internally while the cached rows —
+    /// rebuilt only on a width change — kept drawing the old shape, so a
+    /// click did nothing at all once a turn had finished.
+    ThinkingFoldToggled { block: usize },
     /// The tool display mode changed.
     DisplayModeChanged(ToolDisplayMode),
     /// Activates assistant-text buffering for the current and future turns.
@@ -329,6 +337,9 @@ impl UiState {
                 if let Some(limit) = context_limit {
                     self.usage.context_limit = limit;
                 }
+            }
+            UiEvent::ThinkingFoldToggled { block } => {
+                self.transcript.toggle_fold(block);
             }
             UiEvent::DisplayModeChanged(mode) => self.display_mode = mode,
             UiEvent::EnableAssistantBuffering => {
@@ -1803,5 +1814,34 @@ mod tests {
             "second EnableAssistantBuffering must not clear accumulated text"
         );
     }
-}
 
+    #[test]
+    fn folding_goes_through_the_reducer_so_the_layout_is_rebuilt() {
+        // The fold must be an event, not a direct call on the transcript.
+        // Everything that changes rendered rows invalidates the cached layout
+        // by passing through here; a direct call skipped that, so the block
+        // flipped internally and the screen stayed exactly as it was --
+        // meaning a click did nothing at all on a finished turn.
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "reasoning".into() }));
+
+        let expanded = |s: &UiState| match &s.transcript.blocks()[0] {
+            Block::Thinking { expanded, .. } => *expanded,
+            other => panic!("expected a thinking block, got {other:?}"),
+        };
+        assert!(!expanded(&state), "reasoning should start folded");
+
+        state.apply(UiEvent::ThinkingFoldToggled { block: 0 });
+        assert!(expanded(&state), "the event did not open the block");
+
+        state.apply(UiEvent::ThinkingFoldToggled { block: 0 });
+        assert!(!expanded(&state), "the event did not close the block again");
+    }
+
+    #[test]
+    fn folding_a_block_that_is_not_there_is_ignored() {
+        let mut state = state();
+        state.apply(UiEvent::ThinkingFoldToggled { block: 99 });
+        assert!(state.transcript.blocks().is_empty());
+    }
+}

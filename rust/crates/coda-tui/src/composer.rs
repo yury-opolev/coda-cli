@@ -492,6 +492,12 @@ impl Composer {
     }
 
     /// Replaces the completion range with the selected candidate.
+    ///
+    /// Leaves the caret past a single trailing space, so it lands where
+    /// arguments go. A command taking no arguments loses nothing, since a
+    /// trailing space is trimmed on submit. When a space already follows —
+    /// completing the first word of `/mod extra` — none is added, or the
+    /// candidate would arrive with a double space behind it.
     pub fn accept_completion(&mut self) -> bool {
         let Some(selected) = self.completion.selection().cloned() else {
             return false;
@@ -502,8 +508,15 @@ impl Composer {
             return false;
         }
 
-        self.buffer.replace_range(start..end, &selected.value);
-        self.cursor = start + selected.value.len();
+        let already_spaced = self.buffer[end..].starts_with(' ');
+        let inserted = if already_spaced {
+            selected.value.clone()
+        } else {
+            format!("{} ", selected.value)
+        };
+        self.buffer.replace_range(start..end, &inserted);
+        // Past the space either way: the one just added, or the one found.
+        self.cursor = start + inserted.len() + usize::from(already_spaced);
         self.clear_completions();
         true
     }
@@ -987,7 +1000,7 @@ mod tests {
         composer.insert("/y");
         composer.set_completions(vec![Completion::new("/yolo", None)], (0, 2));
         assert!(composer.accept_completion());
-        assert_eq!(composer.text(), "/yolo");
+        assert_eq!(composer.text(), "/yolo ");
         assert!(!composer.completion().is_active(), "the popup stayed open");
     }
 
@@ -1034,13 +1047,14 @@ mod tests {
         composer.set_completions(vec![Completion::new("/model", None)], (0, 4));
 
         assert!(composer.accept_completion());
-        assert_eq!(composer.text(), "/model");
-        assert_eq!(composer.cursor(), 6);
+        // A space follows, so arguments can be typed straight away.
+        assert_eq!(composer.text(), "/model ");
+        assert_eq!(composer.cursor(), 7);
         assert!(!composer.completion().is_active());
     }
 
     #[test]
-    fn accepting_a_completion_preserves_trailing_text() {
+    fn accepting_does_not_double_a_space_that_is_already_there() {
         let mut composer = Composer::new();
         composer.set_text("/mod extra");
         composer.cursor = 4;
@@ -1048,6 +1062,19 @@ mod tests {
 
         assert!(composer.accept_completion());
         assert_eq!(composer.text(), "/model extra");
+        // Past the existing space, on the argument.
+        assert_eq!(composer.cursor(), 7);
+    }
+
+    #[test]
+    fn accepting_a_completion_preserves_trailing_text() {
+        let mut composer = Composer::new();
+        composer.set_text("/mod|extra");
+        composer.cursor = 4;
+        composer.set_completions(vec![Completion::new("/model", None)], (0, 4));
+
+        assert!(composer.accept_completion());
+        assert_eq!(composer.text(), "/model |extra");
     }
 
     #[test]

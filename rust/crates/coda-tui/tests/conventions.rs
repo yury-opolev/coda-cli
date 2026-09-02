@@ -438,3 +438,40 @@ fn the_event_loop_drives_the_working_indicator() {
         );
     }
 }
+
+/// A transcript change must pass through the reducer, or it will not be drawn.
+///
+/// `App::apply` is what invalidates the cached rows; `redraw` otherwise reuses
+/// them and only rebuilds on a width change. The fold was written as a direct
+/// call on the transcript and so flipped the block internally while the screen
+/// stayed exactly as it was — a click did nothing at all on a finished turn,
+/// and appeared to work intermittently during one only because streaming
+/// events happened to invalidate the cache.
+#[test]
+fn only_the_reducer_mutates_the_transcript_fold() {
+    let mut offenders: Vec<String> = Vec::new();
+    for (path, source) in sources() {
+        if path.replace('\\', "/").ends_with("src/state.rs") {
+            continue;
+        }
+        let code = without_comments(&without_test_modules(&source));
+        for (index, line) in code.lines().enumerate() {
+            // The declaration is not a call.
+            if line.contains("fn toggle_fold") {
+                continue;
+            }
+            if line.contains("toggle_fold(") {
+                offenders.push(format!("{path}:{}", index + 1));
+            }
+        }
+    }
+
+    assert!(
+        offenders.is_empty(),
+        "toggle_fold is called outside the reducer:\n{}\n\
+         Send a UiEvent instead. Mutating the transcript directly skips the \
+         layout invalidation in App::apply, so the fold changes nothing on \
+         screen.",
+        offenders.join("\n")
+    );
+}

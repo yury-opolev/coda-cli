@@ -246,6 +246,40 @@ pub struct ModelsResult {
     pub source: String,
     #[serde(default)]
     pub models: Vec<WireModel>,
+    /// The model the engine will actually use.
+    ///
+    /// The list alone does not say which entry is active, and the obvious
+    /// guess — the first — is only whatever order the provider returned.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The provider whose credential the engine connected with.
+    ///
+    /// Not necessarily `defaultProvider` from settings: the engine uses the
+    /// credential it actually found. A client saving a model preference must
+    /// key it by this, or it writes where the engine will never read.
+    #[serde(default)]
+    pub provider_id: Option<String>,
+}
+
+impl ModelsResult {
+    /// How the active model should be shown, preferring its display name.
+    pub fn active_label(&self) -> Option<&str> {
+        let active = self.model.as_deref()?;
+        let named = self
+            .models
+            .iter()
+            .find(|m| m.id == active)
+            .map(WireModel::label);
+        // An id the list does not contain is still the truth about what is
+        // running — showing it beats showing an unrelated entry.
+        Some(named.unwrap_or(active))
+    }
+
+    /// The context limit of the active model, if the list describes it.
+    pub fn active_context_limit(&self) -> Option<i64> {
+        let active = self.model.as_deref()?;
+        self.models.iter().find(|m| m.id == active)?.context_limit
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -761,5 +795,49 @@ mod tests {
         let _: HooksListResult = serde_json::from_value(json!({})).expect("hooks");
         let _: ScheduleListResult = serde_json::from_value(json!({})).expect("schedules");
         let _: RecallSteeringResult = serde_json::from_value(json!({})).expect("steering");
+    }
+
+    #[test]
+    fn the_active_model_is_labelled_from_the_list() {
+        let result: ModelsResult = serde_json::from_value(json!({
+            "source": "live",
+            "model": "claude-opus-4-6",
+            "models": [
+                { "id": "claude-opus-5", "displayName": "Claude Opus 5", "contextLimit": 200000 },
+                { "id": "claude-opus-4-6", "displayName": "Claude Opus 4.6", "contextLimit": 150000 }
+            ]
+        }))
+        .expect("models");
+
+        // Not the first entry -- that is the bug this exists to prevent.
+        assert_eq!(result.active_label(), Some("Claude Opus 4.6"));
+        assert_eq!(result.active_context_limit(), Some(150_000));
+    }
+
+    #[test]
+    fn an_active_model_missing_from_the_list_still_names_itself() {
+        // The engine is running it whatever the catalogue says, and naming an
+        // unrelated entry instead would be a confident lie.
+        let result: ModelsResult = serde_json::from_value(json!({
+            "model": "some-unlisted-model",
+            "models": [{ "id": "claude-opus-5", "displayName": "Claude Opus 5" }]
+        }))
+        .expect("models");
+
+        assert_eq!(result.active_label(), Some("some-unlisted-model"));
+        assert_eq!(result.active_context_limit(), None);
+    }
+
+    #[test]
+    fn an_engine_that_reports_no_active_model_gets_no_label() {
+        // An older engine omits the field. Better to leave the status bar
+        // as it was than to invent an answer from list order.
+        let result: ModelsResult = serde_json::from_value(json!({
+            "models": [{ "id": "claude-opus-5", "displayName": "Claude Opus 5" }]
+        }))
+        .expect("models");
+
+        assert_eq!(result.active_label(), None);
+        assert_eq!(result.provider_id, None);
     }
 }

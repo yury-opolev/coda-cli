@@ -736,6 +736,12 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_models(&self, p: ModelsParams) -> Result<Value, RpcError> {
+        // The active model and provider travel with the list. Without them a
+        // client can only guess which entry is in use, and the obvious guess —
+        // the first — is whatever order the provider returned. That made the
+        // status bar name a model the engine was not using, and made switching
+        // look as though it had not been saved.
+        let active = self.current_model();
         let client = self.client.lock().await.clone();
         let Some(client) = client else {
             // No client yet: return a catalog so the user can see model options
@@ -743,8 +749,13 @@ impl ServeBackend for ServeHost {
             // Finding 2: never collapse "could not determine" into "none exist".
             let catalog = serde_json::to_value(&catalog_models())
                 .map_err(|e| RpcError::internal(e.to_string()))?;
-            return Ok(json!({ "source": "catalog", "models": catalog }));
+            return Ok(json!({
+                "source": "catalog",
+                "models": catalog,
+                "model": active,
+            }));
         };
+        let provider_id = client.provider_id().to_owned();
         let result =
             if p.refresh { client.refresh_models().await } else { client.list_models().await };
         match result {
@@ -759,7 +770,12 @@ impl ServeBackend for ServeHost {
                     .collect();
                 let v = serde_json::to_value(&wire)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
-                Ok(json!({ "source": "live", "models": v }))
+                Ok(json!({
+                    "source": "live",
+                    "models": v,
+                    "model": active,
+                    "providerId": provider_id,
+                }))
             }
             // Fetch error OR empty live list: fall back to the catalog so a
             // transient network failure or an expired token does not present
@@ -767,7 +783,12 @@ impl ServeBackend for ServeHost {
             _ => {
                 let catalog = serde_json::to_value(&catalog_models())
                     .map_err(|e| RpcError::internal(e.to_string()))?;
-                Ok(json!({ "source": "catalog", "models": catalog }))
+                Ok(json!({
+                    "source": "catalog",
+                    "models": catalog,
+                    "model": active,
+                    "providerId": provider_id,
+                }))
             }
         }
     }
@@ -2661,5 +2682,29 @@ mod tests {
         let _store = coda_agent::SessionTranscriptStore::new(dir.path());
         let in_memory = host.session.history.lock().unwrap().len();
         assert_eq!(in_memory, 0, "in-memory history must be empty after rewind");
+    }
+
+    #[tokio::test]
+    async fn session_models_reports_which_model_is_active() {
+        // The list alone says nothing about which entry is in use, so a client
+        // showing "the current model" had to guess -- and guessed `first()`,
+        // which is whatever order the provider happened to return. The status
+        // bar then named a model the engine was not using, and switching to
+        // another one appeared not to stick.
+        let host = make_host();
+        let result = host
+            .session_models(ModelsParams { refresh: false })
+            .await
+            .expect("models");
+
+        let active = result["model"]
+            .as_str()
+            .expect("session/models must name the active model");
+        assert!(!active.is_empty(), "the active model must not be blank");
+        assert_eq!(
+            active,
+            host.current_model(),
+            "the reported model must be the one the engine will actually use"
+        );
     }
 }

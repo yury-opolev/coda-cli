@@ -376,18 +376,26 @@ impl App {
     /// restarting the engine against the same session id therefore performs a
     /// real switch, with the conversation preserved.
     pub(super) async fn switch_model(&mut self, model: &str) {
-        // Read the configured provider (blocking I/O wrapped in spawn_blocking so
-        // it cannot block the async runtime).
+        // The provider the engine actually connected with, when it has said.
+        // Falling back to `defaultProvider` is a guess: settings can nominate
+        // a provider whose credential is not present, in which case the engine
+        // connects with a different one and reads a different key. Writing to
+        // the nominated one then saves the choice where nothing reads it, and
+        // the model silently reverts on the next start.
+        let connected = self.connected_provider.clone();
         let paths = self.paths.clone();
-        let provider = match tokio::task::spawn_blocking(move || Settings::load(&paths)).await {
-            Ok(Ok(settings)) => settings.default_provider().map(str::to_string),
-            Ok(Err(error)) => {
-                return self.notice(
-                    format!("Could not read settings: {error}"),
-                    NoticeLevel::Error,
-                )
-            }
-            Err(_) => return self.notice("Settings read was interrupted.", NoticeLevel::Error),
+        let provider = match connected {
+            Some(provider) => Some(provider),
+            None => match tokio::task::spawn_blocking(move || Settings::load(&paths)).await {
+                Ok(Ok(settings)) => settings.default_provider().map(str::to_string),
+                Ok(Err(error)) => {
+                    return self.notice(
+                        format!("Could not read settings: {error}"),
+                        NoticeLevel::Error,
+                    )
+                }
+                Err(_) => return self.notice("Settings read was interrupted.", NoticeLevel::Error),
+            },
         };
 
         let Some(provider) = provider else {

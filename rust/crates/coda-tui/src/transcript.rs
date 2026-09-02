@@ -553,6 +553,15 @@ impl Transcript {
         }
     }
 
+    /// Whether the block at `index` can be folded at all.
+    ///
+    /// Asked before a click is claimed, so a click on an ordinary row still
+    /// starts a selection instead of being swallowed by a fold that never
+    /// happens.
+    pub fn is_foldable(&self, index: usize) -> bool {
+        matches!(self.blocks.get(index), Some(Block::Thinking { .. }))
+    }
+
     /// Renders every block to rows, inserting a blank separator between them.
     pub fn render(&self, width: usize, mode: ToolDisplayMode) -> Vec<RenderLine> {
         let mut out = Vec::new();
