@@ -82,11 +82,17 @@ pub enum Block {
     /// Assistant prose, rendered as markdown.
     Assistant { text: String, complete: bool },
     /// Model reasoning.
+    ///
+    /// Foldable: collapsed it shows the header and the last line of reasoning,
+    /// which is the part that says where the model got to. Expanding is a
+    /// deliberate click, never automatic — reasoning that unfolds itself
+    /// buries the answer the user is actually waiting for.
     Thinking {
         text: String,
         elapsed_ms: i64,
         tokens: Option<i32>,
         complete: bool,
+        expanded: bool,
     },
     /// A batch of tool calls made in one agent step.
     ///
@@ -158,7 +164,16 @@ impl Block {
                 elapsed_ms,
                 tokens,
                 complete,
-            } => render_thinking(text, *elapsed_ms, *tokens, *complete, width, mode),
+                expanded,
+            } => render_thinking(
+                text,
+                *elapsed_ms,
+                *tokens,
+                *complete,
+                *expanded,
+                width,
+                mode,
+            ),
             Block::Tools { activity, .. } => activity.render(mode, width),
             Block::Notice { text, level } => text::wrap(text, width)
                 .into_iter()
@@ -307,6 +322,7 @@ fn render_thinking(
     elapsed_ms: i64,
     tokens: Option<i32>,
     complete: bool,
+    expanded: bool,
     width: usize,
     mode: ToolDisplayMode,
 ) -> Vec<RenderLine> {
@@ -315,12 +331,28 @@ fn render_thinking(
     // a stopwatch running backwards when the elapsed time ticks past .5.
     let seconds = (elapsed_ms as f64 / 1000.0).round() as i64;
 
+    if mode == ToolDisplayMode::Hidden {
+        return Vec::new();
+    }
+
+    // Full is the "show me everything" mode, so it opens every block without
+    // needing a click; otherwise the block's own state decides.
+    let open = expanded || mode == ToolDisplayMode::Full;
+    let fold = if open {
+        glyphs::FOLD_EXPANDED
+    } else {
+        glyphs::FOLD_COLLAPSED
+    };
+
     let status = if complete {
-        format!("{} Thought for {seconds}s", glyphs::THINKING)
+        format!("{fold} {} Thought for {seconds}s", glyphs::THINKING)
     } else {
         match tokens {
-            Some(tokens) => format!("{} Thinking… {seconds}s · {tokens} tok", glyphs::THINKING),
-            None => format!("{} Thinking… {seconds}s", glyphs::THINKING),
+            Some(tokens) => format!(
+                "{fold} {} Thinking… {seconds}s · {tokens} tok",
+                glyphs::THINKING
+            ),
+            None => format!("{fold} {} Thinking… {seconds}s", glyphs::THINKING),
         }
     };
 
@@ -340,30 +372,19 @@ fn render_thinking(
         })
         .collect();
 
-    match mode {
-        // The status line alone; the reasoning text stays hidden.
-        ToolDisplayMode::Summary | ToolDisplayMode::Hidden => {}
-        ToolDisplayMode::Compact => {
-            // The tail is the most relevant part of a long reasoning trace.
-            let tail: Vec<&str> = body
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .rev()
-                .take(5)
-                .collect();
-            for line in tail.into_iter().rev() {
-                for chunk in text::wrap(line, content) {
-                    out.push(
-                        RenderLine::new(chunk, Role::Notification)
-                            .with_gutter(Gutter::Continuation),
-                    );
-                }
-            }
+    if open {
+        for line in markdown::render(body, content) {
+            out.push(line.with_gutter(Gutter::Continuation));
         }
-        ToolDisplayMode::Full => {
-            for line in markdown::render(body, content) {
-                out.push(line.with_gutter(Gutter::Continuation));
-            }
+        return out;
+    }
+
+    // Collapsed: the last line of reasoning. It is the part that says where
+    // the model actually got to, and one line costs nothing when a turn
+    // produces a dozen of these.
+    if let Some(last) = body.lines().map(str::trim).filter(|l| !l.is_empty()).next_back() {
+        for chunk in text::wrap(last, content) {
+            out.push(RenderLine::new(chunk, Role::Notification).with_gutter(Gutter::Continuation));
         }
     }
 
@@ -515,6 +536,21 @@ impl Transcript {
             }
         }
         promoted
+    }
+
+    /// Toggles the fold on the block at `index`, reporting whether it moved.
+    ///
+    /// Only reasoning blocks fold today. Returning `false` for everything else
+    /// lets the caller treat a click on an ordinary row as "not mine" and pass
+    /// it on to selection, rather than swallowing it.
+    pub fn toggle_fold(&mut self, index: usize) -> bool {
+        match self.blocks.get_mut(index) {
+            Some(Block::Thinking { expanded, .. }) => {
+                *expanded = !*expanded;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Renders every block to rows, inserting a blank separator between them.
@@ -671,17 +707,80 @@ mod tests {
     }
 
     #[test]
-    fn thinking_shows_only_its_status_in_summary_mode() {
-        let rows = Block::Thinking {
-            text: "deep thoughts".to_string(),
-            elapsed_ms: 3000,
-            tokens: Some(120),
-            complete: false,
-        }
-        .render(80, ToolDisplayMode::Summary);
+    fn a_collapsed_thinking_block_previews_its_last_line() {
+        let rows = texts(
+            &Block::Thinking {
+                text: "first thought\nsecond thought\nwhere it got to".to_string(),
+                elapsed_ms: 3000,
+                tokens: Some(120),
+                complete: false,
+                expanded: false,
+            }
+            .render(80, ToolDisplayMode::Summary),
+        );
 
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].text.contains("Thinking… 3s · 120 tok"));
+        // The header, then one line of preview -- the last, because that is
+        // where the model actually got to.
+        assert_eq!(rows.len(), 2, "expected a header and one preview: {rows:?}");
+        assert!(rows[0].contains("Thinking… 3s · 120 tok"));
+        assert!(rows[1].contains("where it got to"));
+        assert!(!rows.iter().any(|r| r.contains("first thought")));
+    }
+
+    #[test]
+    fn a_collapsed_thinking_block_offers_to_open_and_an_open_one_to_close() {
+        let block = |expanded| Block::Thinking {
+            text: "reasoning".to_string(),
+            elapsed_ms: 1000,
+            tokens: None,
+            complete: true,
+            expanded,
+        };
+
+        let collapsed = texts(&block(false).render(80, ToolDisplayMode::Summary));
+        assert!(
+            collapsed[0].contains(glyphs::FOLD_COLLAPSED),
+            "a foldable block that does not say so is a feature nobody finds: {collapsed:?}"
+        );
+
+        let open = texts(&block(true).render(80, ToolDisplayMode::Summary));
+        assert!(open[0].contains(glyphs::FOLD_EXPANDED), "{open:?}");
+    }
+
+    #[test]
+    fn an_expanded_thinking_block_shows_everything() {
+        let body = (1..=10)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let rows = texts(
+            &Block::Thinking {
+                text: body,
+                elapsed_ms: 1000,
+                tokens: None,
+                complete: true,
+                expanded: true,
+            }
+            .render(80, ToolDisplayMode::Summary),
+        );
+
+        assert!(rows.iter().any(|r| r.contains("line 1")));
+        assert!(rows.iter().any(|r| r.contains("line 10")));
+    }
+
+    #[test]
+    fn a_hidden_thinking_block_renders_nothing_at_all() {
+        // Hidden means hidden: the fold does not override an explicit request
+        // to see none of this.
+        let rows = Block::Thinking {
+            text: "reasoning".to_string(),
+            elapsed_ms: 1000,
+            tokens: None,
+            complete: true,
+            expanded: true,
+        }
+        .render(80, ToolDisplayMode::Hidden);
+        assert!(rows.is_empty(), "{rows:?}");
     }
 
     #[test]
@@ -691,6 +790,7 @@ mod tests {
             elapsed_ms: 4500,
             tokens: None,
             complete: true,
+            expanded: false,
         }
         .render(80, ToolDisplayMode::Summary);
         assert!(rows[0].text.contains("Thought for 5s"));
@@ -704,6 +804,7 @@ mod tests {
                 elapsed_ms: 1000,
                 tokens: None,
                 complete: true,
+                expanded: false,
             }
             .render(80, ToolDisplayMode::Full),
         );
@@ -711,7 +812,10 @@ mod tests {
     }
 
     #[test]
-    fn thinking_shows_only_the_tail_in_compact_mode() {
+    fn a_collapsed_thinking_block_previews_one_line_whatever_the_mode() {
+        // Compact used to show the last five lines. The fold replaces that:
+        // one line collapsed, everything expanded. Two different partial views
+        // was a distinction nobody could act on.
         let body = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
         let rows = texts(
             &Block::Thinking {
@@ -719,14 +823,14 @@ mod tests {
                 elapsed_ms: 1000,
                 tokens: None,
                 complete: true,
+                expanded: false,
             }
             .render(80, ToolDisplayMode::Compact),
         );
 
-        assert!(!rows.iter().any(|r| r.contains("line 1\u{0}")));
-        assert!(rows.iter().any(|r| r.contains("line 10")));
-        assert!(rows.iter().any(|r| r.contains("line 6")));
-        assert!(!rows.iter().any(|r| r.contains("line 5")));
+        assert_eq!(rows.len(), 2, "expected a header and one preview: {rows:?}");
+        assert!(rows[1].contains("line 10"));
+        assert!(!rows.iter().any(|r| r.contains("line 6")));
     }
 
     #[test]
@@ -896,6 +1000,7 @@ mod tests {
             elapsed_ms: 1200,
             tokens: Some(40),
             complete: true,
+            expanded: false,
         });
         transcript.push(Block::Tools {
             activity: ToolActivity {

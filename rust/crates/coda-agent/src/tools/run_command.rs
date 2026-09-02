@@ -1,8 +1,10 @@
 //! Run a shell command with a timeout, bounded output capture, and
 //! process-tree kill on timeout or cancellation.
 //!
-//! Shell choice: PowerShell on Windows, `sh` on Unix. The description says
-//! "PowerShell" because the primary target is Windows.
+//! Shell choice: PowerShell on Windows, `sh` on Unix. The description names
+//! whichever it is, because the model has nothing else to go on and will
+//! otherwise reach for bash — `for i in $(seq 1 100)` fails on PowerShell
+//! with a parser error, costing a whole turn to discover.
 //!
 //! Security: no shell-injection string filtering is applied. The permission
 //! layer is the control. String filtering gives false assurance and would
@@ -35,8 +37,22 @@ impl Tool for RunCommandTool {
     }
 
     fn description(&self) -> &str {
-        "Run a shell command in the working directory and return combined stdout/stderr. \
-         Requires permission."
+        // Names the shell per platform, which is more than the C# original
+        // did — it hard-coded "(PowerShell)" everywhere.
+        #[cfg(windows)]
+        {
+            concat!(
+                "Run a shell command (PowerShell) in the working directory and ",
+                "return combined stdout/stderr. Requires permission."
+            )
+        }
+        #[cfg(not(windows))]
+        {
+            concat!(
+                "Run a shell command (sh) in the working directory and return ",
+                "combined stdout/stderr. Requires permission."
+            )
+        }
     }
 
     fn input_schema_json(&self) -> &str {
@@ -471,5 +487,22 @@ mod tests {
             .execute(&serde_json::json!({}), &ctx(), CancellationToken::new())
             .await;
         assert!(result.is_error);
+    }
+
+    #[test]
+    fn the_description_names_the_shell_it_will_use() {
+        // The description is all the model has to go on. Left saying only
+        // "a shell command", it reaches for bash -- and on Windows
+        // `for i in $(seq 1 100); do ...` dies with "Missing opening '('
+        // after keyword 'for'", burning a turn before it retries in
+        // PowerShell. The C# original always named the shell; the port
+        // dropped it.
+        let description = RunCommandTool.description();
+        let shell = shell_program();
+        let named = if shell == "powershell.exe" { "PowerShell" } else { "sh" };
+        assert!(
+            description.contains(named),
+            "description does not say which shell it runs ({named}): {description:?}"
+        );
     }
 }

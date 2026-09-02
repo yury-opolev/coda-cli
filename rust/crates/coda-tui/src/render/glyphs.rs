@@ -85,9 +85,12 @@ pub const FOCUS_MARKER: &str = "\u{276F} "; // "❯ "
 pub const FOCUS_BLANK: &str = "  ";
 
 /// Composer prompt with its one-space inset, keeping the glyph off the edge.
+/// Composer prompt marker, padded so text clears the terminal edge.
+///
+/// Shown whatever the engine is doing: the composer accepts typing during a
+/// turn and queues it, so marking it "busy" would deny an affordance that
+/// works. Progress belongs in the status bar.
 pub const PROMPT_PADDED: &str = " \u{276F} "; // " ❯ "
-/// Busy composer prompt, same width as [`PROMPT_PADDED`].
-pub const BUSY_PADDED: &str = " \u{22EF} "; // " ⋯ "
 /// Composer continuation indent, matching [`PROMPT_PADDED`]'s width so
 /// wrapped lines align under the first line's text.
 pub const PROMPT_CONTINUATION: &str = "   ";
@@ -116,7 +119,39 @@ pub const ARROWS_VERTICAL: &str = "\u{2191}\u{2193}"; // "↑↓"
 pub const ARROW_RIGHT: &str = "\u{2192}"; // →
 
 /// Marks model reasoning in the transcript.
-pub const THINKING: &str = "\u{1F4AD}"; // 💭
+///
+/// The variation selector U+FE0E asks for *text* presentation rather than
+/// emoji, so the bulb is drawn monochrome in the surrounding role colour
+/// instead of injecting a colour the theme cannot control. Terminals that
+/// ignore the selector fall back to the emoji, which is still legible.
+pub const THINKING: &str = "\u{1F4A1}\u{FE0E}"; // 💡︎
+
+/// Fold markers for a collapsible block, sized to one cell.
+///
+/// Present on every foldable header, because a block that expands on click
+/// with nothing to say so is a feature nobody finds.
+pub const FOLD_COLLAPSED: &str = "\u{25B8}"; // ▸
+/// Counterpart to [`FOLD_COLLAPSED`], shown when the block is open.
+pub const FOLD_EXPANDED: &str = "\u{25BE}"; // ▾
+
+/// Frames of the working indicator, one cell each.
+///
+/// Braille dots rather than the usual `|/-\`: they occupy a fixed cell,
+/// carry no ASCII meaning to confuse a copied transcript, and rotate
+/// smoothly. Advanced by the event loop, never by the renderer — a
+/// renderer that mutates cannot be drawn twice for the same state.
+pub const SPINNER: &[&str] = &[
+    "\u{280B}", // ⠋
+    "\u{2819}", // ⠙
+    "\u{2839}", // ⠹
+    "\u{2838}", // ⠸
+    "\u{283C}", // ⠼
+    "\u{2834}", // ⠴
+    "\u{2826}", // ⠦
+    "\u{2827}", // ⠧
+    "\u{2807}", // ⠇
+    "\u{280F}", // ⠏
+];
 
 // --- Brand ---------------------------------------------------------------
 

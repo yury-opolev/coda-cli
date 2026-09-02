@@ -728,3 +728,68 @@ fn the_completion_popup_marks_a_navigated_selection_only() {
         "a navigated popup marked nothing:\n{chosen}"
     );
 }
+
+#[test]
+fn the_status_bar_animates_while_the_engine_works() {
+    // The composer used to swap its prompt marker for an ellipsis, which said
+    // "busy" in the one place the user is being invited to type -- and said it
+    // without moving, so it read as a disabled input rather than as progress.
+    // Progress belongs in the status bar, next to the word for it.
+    use coda_tui::render::glyphs;
+
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    assert!(state.is_busy(), "submitting should start a turn");
+
+    let composer = Composer::new();
+    let status_of = |state: &UiState| {
+        render(state, &composer, 80, 10)
+            .into_iter()
+            .rev()
+            .find(|row| row.contains("working"))
+            .expect("no status row said 'working'")
+    };
+
+    let mut seen = std::collections::HashSet::new();
+    for frame in 0..glyphs::SPINNER.len() {
+        state.spinner = frame;
+        let row = status_of(&state);
+        let glyph = glyphs::SPINNER[frame];
+        assert!(
+            row.contains(glyph),
+            "frame {frame} did not draw {glyph:?}: {row:?}"
+        );
+        seen.insert(glyph);
+    }
+    assert!(seen.len() > 1, "a spinner that never changes is not animated");
+
+    // The composer keeps its prompt marker throughout: it still accepts
+    // typing while a turn runs, and the queue counter proves it.
+    let screen = render(&state, &composer, 80, 10);
+    assert!(
+        screen.iter().any(|row| row.contains(glyphs::PROMPT)),
+        "the composer lost its prompt marker while busy: {screen:?}"
+    );
+}
+
+#[test]
+fn the_status_bar_is_still_while_waiting_on_the_user() {
+    // A spinner means "I am working on it". Spinning while blocked on a
+    // permission prompt claims progress that is not happening, and invites
+    // the user to wait for something only they can unblock.
+    use coda_tui::render::glyphs;
+
+    let mut state = session();
+    let composer = Composer::new();
+
+    for frame in 0..glyphs::SPINNER.len() {
+        state.spinner = frame;
+        let screen = render(&state, &composer, 80, 10).join("\n");
+        for glyph in glyphs::SPINNER {
+            assert!(
+                !screen.contains(glyph),
+                "an idle session drew the spinner frame {glyph:?}"
+            );
+        }
+    }
+}

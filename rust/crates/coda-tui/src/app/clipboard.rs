@@ -39,6 +39,9 @@ impl App {
                 if self.move_caret_to_click(mouse.column, mouse.row) {
                     self.selection.clear();
                     self.dirty = true;
+                } else if self.toggle_fold_at_click(mouse.column, mouse.row) {
+                    self.selection.clear();
+                    self.dirty = true;
                 } else if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
                     self.selection.begin(pos);
                     self.dirty = true;
@@ -95,6 +98,21 @@ impl App {
         self.composer.move_cursor_to(line, cell);
         true
     }
+    /// Folds or unfolds the block whose header was clicked.
+    ///
+    /// Only the header row counts. Clicking anywhere in the body would make
+    /// selecting the reasoning text impossible, and the body is exactly what
+    /// someone expands the block in order to read.
+    pub(super) fn toggle_fold_at_click(&mut self, _column: u16, row: u16) -> bool {
+        let Some(pos) = self.mouse_to_selection(0, row) else {
+            return false;
+        };
+        let Some(index) = header_block_at(&self.block_starts, pos.row) else {
+            return false;
+        };
+        self.state.transcript.toggle_fold(index)
+    }
+
     pub(super) fn mouse_to_selection(
         &self,
         column: u16,
@@ -217,5 +235,74 @@ mod tests {
     #[test]
     fn right_click_without_a_selection_pastes() {
         assert_eq!(pointer_action(false), Some(PointerAction::Paste));
+    }
+}
+
+/// The block whose *header* row this is, if any.
+///
+/// A free function because `App` needs a live engine to construct, so anything
+/// living on it cannot be unit tested -- and this is the part with the edge
+/// cases. `block_starts` ends with a sentinel equal to the row count, and
+/// blocks that render to nothing share the following block's start.
+pub(super) fn header_block_at(block_starts: &[usize], row: usize) -> Option<usize> {
+    // Drop the sentinel: it is a row count, not a block, and treating it as
+    // one folds the last block when the click lands past the end.
+    let blocks = block_starts.len().checked_sub(1)?;
+    if blocks == 0 {
+        return None;
+    }
+    // The last block starting at or before the row. Taking the *last* matters
+    // when a block renders no rows: it shares the next block's start, and the
+    // row belongs to the one that actually drew it.
+    let index = block_starts
+        .partition_point(|&start| start <= row)
+        .checked_sub(1)?
+        .min(blocks - 1);
+    (block_starts[index] == row).then_some(index)
+}
+
+#[cfg(test)]
+mod fold_tests {
+    use super::header_block_at;
+
+    #[test]
+    fn a_click_on_a_block_header_finds_that_block() {
+        // Three blocks of 3, 2 and 4 rows, then the sentinel.
+        let starts = vec![0, 3, 5, 9];
+        assert_eq!(header_block_at(&starts, 0), Some(0));
+        assert_eq!(header_block_at(&starts, 3), Some(1));
+        assert_eq!(header_block_at(&starts, 5), Some(2));
+    }
+
+    #[test]
+    fn a_click_on_a_body_row_is_not_a_header() {
+        let starts = vec![0, 3, 5, 9];
+        for row in [1, 2, 4, 6, 7, 8] {
+            assert_eq!(header_block_at(&starts, row), None, "row {row}");
+        }
+    }
+
+    #[test]
+    fn a_click_past_the_end_folds_nothing() {
+        // The sentinel is a row count. Counted as a block, row 9 would fold
+        // the last block from a click on empty space below the transcript.
+        let starts = vec![0, 3, 5, 9];
+        assert_eq!(header_block_at(&starts, 9), None);
+        assert_eq!(header_block_at(&starts, 40), None);
+    }
+
+    #[test]
+    fn an_empty_block_does_not_steal_its_neighbours_header() {
+        // Block 1 renders nothing, so it shares block 2's start. The row was
+        // drawn by block 2, and folding block 1 would leave the user clicking
+        // a header and watching a different block move.
+        let starts = vec![0, 3, 3, 7];
+        assert_eq!(header_block_at(&starts, 3), Some(2));
+    }
+
+    #[test]
+    fn an_empty_table_folds_nothing() {
+        assert_eq!(header_block_at(&[], 0), None);
+        assert_eq!(header_block_at(&[0], 0), None);
     }
 }
