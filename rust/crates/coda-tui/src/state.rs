@@ -421,6 +421,19 @@ impl UiState {
                     *elapsed = elapsed_ms;
                     *tokens = thinking_tokens;
                     *complete = true;
+                } else {
+                    // No block to finish, because none was ever started: a
+                    // provider that encrypts its reasoning sends no deltas at
+                    // all, only a signed block at the end whose text is empty.
+                    // Without this the turn showed no sign of having reasoned.
+                    self.transcript.close_open();
+                    self.transcript.push(Block::Thinking {
+                        text: String::new(),
+                        elapsed_ms,
+                        tokens: thinking_tokens,
+                        complete: true,
+                        expanded: false,
+                    });
                 }
                 self.activity = Activity::Working;
             }
@@ -1576,16 +1589,46 @@ mod tests {
     }
 
     #[test]
-    fn thinking_complete_without_prior_delta_is_a_no_op() {
+    fn thinking_complete_without_prior_delta_still_records_that_it_reasoned() {
+        // This used to be asserted as a no-op, faithfully porting the C#
+        // (`UiReducer.CompleteThinking` returns the state unchanged when no
+        // incomplete block exists). Both were wrong in the same way: a
+        // provider that encrypts its reasoning sends no deltas, so there is
+        // never a block to complete and the reasoning vanished entirely.
         let mut state = state();
         state.apply(UiEvent::Engine(Event::ThinkingComplete {
             elapsed_ms: 500,
             thinking_tokens: None,
         }));
-        assert!(
-            state.transcript.is_empty(),
-            "a ThinkingComplete with no preceding delta must not create a block"
+        assert_eq!(
+            state.transcript.len(),
+            1,
+            "the turn must show that it reasoned, even with nothing to show for it"
         );
+    }
+
+    #[test]
+    fn a_finished_thinking_block_is_not_reopened_by_a_later_complete() {
+        // Completing twice must not resurrect the first burst or append an
+        // empty second one to it.
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "first".into() }));
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 100,
+            thinking_tokens: None,
+        }));
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 999,
+            thinking_tokens: None,
+        }));
+
+        match &state.transcript.blocks()[0] {
+            Block::Thinking { text, elapsed_ms, .. } => {
+                assert_eq!(text, "first");
+                assert_eq!(*elapsed_ms, 100, "the finished burst was rewritten");
+            }
+            other => panic!("expected a thinking block: {other:?}"),
+        }
     }
 
     #[test]
@@ -1843,5 +1886,55 @@ mod tests {
         let mut state = state();
         state.apply(UiEvent::ThinkingFoldToggled { block: 99 });
         assert!(state.transcript.blocks().is_empty());
+    }
+
+    #[test]
+    fn reasoning_with_no_deltas_still_appears() {
+        // A provider that encrypts its reasoning sends no ThinkingDelta at
+        // all -- only a signed block at the end, with the text empty and the
+        // content in the signature. ThinkingComplete then had no open block
+        // to update, so the whole turn showed no sign of having reasoned:
+        // the response marker appeared, time passed, and that was all.
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 0,
+            thinking_tokens: None,
+        }));
+
+        match state.transcript.blocks().first() {
+            Some(Block::Thinking { complete, text, .. }) => {
+                assert!(complete, "the block must arrive already finished");
+                assert!(text.is_empty(), "there was no reasoning text to show");
+            }
+            other => panic!("no reasoning block was created: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reasoning_that_did_stream_is_still_updated_not_duplicated() {
+        // The normal path must not regress into creating a second block.
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::Thinking { delta: "reasoning".into() }));
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 2500,
+            thinking_tokens: Some(90),
+        }));
+
+        let thinking: Vec<_> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter(|b| matches!(b, Block::Thinking { .. }))
+            .collect();
+        assert_eq!(thinking.len(), 1, "a second block was created");
+        match thinking[0] {
+            Block::Thinking { text, elapsed_ms, tokens, complete, .. } => {
+                assert_eq!(text, "reasoning");
+                assert_eq!(*elapsed_ms, 2500);
+                assert_eq!(*tokens, Some(90));
+                assert!(complete);
+            }
+            other => panic!("expected a thinking block: {other:?}"),
+        }
     }
 }

@@ -595,7 +595,11 @@ public sealed class ServeHost : IAsyncDisposable
             var models = result.Models
                 .Select(m => new WireModel(m.Id, m.DisplayName, m.ContextLimit))
                 .ToList();
-            return ServeJson.ToNode(new ModelsResult(result.Source.ToString().ToLowerInvariant(), models));
+            return ServeJson.ToNode(new ModelsResult(
+                result.Source.ToString().ToLowerInvariant(),
+                models,
+                sess.Options.Model,
+                sess.Options.ProviderId));
         });
 
         // session/setGoal → mutate the session's goal options (persist-until-cleared).
