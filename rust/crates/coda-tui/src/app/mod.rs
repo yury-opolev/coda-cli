@@ -100,6 +100,20 @@ pub struct App {
     last_frame_at: Option<std::time::Instant>,
     /// When the working indicator last advanced a frame.
     spinner_at: Option<std::time::Instant>,
+    /// The provider the engine connected with, as it reports it.
+    ///
+    /// Not the same as `defaultProvider` in settings: the engine uses whatever
+    /// credential it actually found. A model preference saved under the wrong
+    /// one is written where the engine will never read it, so the choice
+    /// silently reverts on the next start.
+    connected_provider: Option<String>,
+    /// Whether a left-drag selection is genuinely in progress.
+    ///
+    /// A drag only continues a selection that was explicitly begun. Without
+    /// this, a drag starting on a row that consumed the press — a fold header —
+    /// updated a selection whose anchor was still at its default, selecting
+    /// from the top of the transcript.
+    dragging: bool,
     /// Stable position anchor captured when the viewport detaches.
     ///
     /// Resolved to a new global row on every reflow (width change) so the
@@ -180,6 +194,8 @@ impl App {
             frame_deadline: None,
             last_frame_at: None,
             spinner_at: None,
+            connected_provider: None,
+            dragging: false,
             detached_anchor: None,
             turn: None,
             pending_responder: None,
@@ -320,6 +336,11 @@ impl App {
     }
 
     /// Fetches the model list so the status bar can name the active model.
+    ///
+    /// The engine reports which model is active; the list is only how it is
+    /// labelled. Taking the first entry instead named whatever the provider
+    /// happened to return first, so the status bar could disagree with the
+    /// engine and switching a model looked as though it had not been saved.
     async fn load_models(&mut self) {
         let Ok(value) = self
             .connection
@@ -331,10 +352,16 @@ impl App {
         let Ok(result) = serde_json::from_value::<messages::ModelsResult>(value) else {
             return;
         };
-        if let Some(model) = result.models.first() {
+        // Remembered so a model switch is saved under the provider the engine
+        // connected with, rather than the one settings nominate.
+        if let Some(provider) = result.provider_id.clone() {
+            self.connected_provider = Some(provider);
+        }
+        if let Some(label) = result.active_label() {
+            let context_limit = result.active_context_limit();
             self.apply(UiEvent::ModelChanged {
-                id: model.label().to_string(),
-                context_limit: model.context_limit,
+                id: label.to_string(),
+                context_limit,
             });
         }
     }
@@ -490,20 +517,19 @@ impl App {
             Action::CompletionNext => self.composer.completion_next(),
             Action::CompletionPrevious => self.composer.completion_previous(),
             Action::CompletionAccept => {
-                // Enter accepts only what the user actually chose. Until they
-                // move the selection the popup is a hint, not a choice, so
-                // Enter runs what is in the input — which is also what makes
-                // typing a command in full and pressing Enter work.
-                //
-                // Accepting a candidate never runs it: it puts the command in
-                // the input so the user can add arguments and see what they
-                // are about to run.
+                // Fills the input and stops. Accepting never runs: the point
+                // is to see what you are about to run, and add arguments.
+                self.composer.accept_completion();
+            }
+            Action::CompletionSubmit => {
+                // Enter runs. It takes an explicitly chosen candidate first —
+                // otherwise the popup is only a hint, and running what is
+                // typed is what makes typing a command in full work.
                 if self.composer.completion().navigated {
                     self.composer.accept_completion();
-                } else {
-                    self.composer.clear_completions();
-                    self.submit().await;
                 }
+                self.composer.clear_completions();
+                self.submit().await;
             }
             Action::CompletionCancel => self.composer.clear_completions(),
 
@@ -1405,6 +1431,10 @@ fn is_critical_event(event: &UiEvent) -> bool {
         | UiEvent::Cleared
         | UiEvent::ModelChanged { .. }
         | UiEvent::DisplayModeChanged(_)
+        // A fold is a direct response to a click, so it must repaint at once
+        // rather than waiting for the streaming throttle: an idle session
+        // produces no further frames to carry it.
+        | UiEvent::ThinkingFoldToggled { .. }
         | UiEvent::Submitted { .. }
         | UiEvent::Queued { .. }
         | UiEvent::InterruptRequested => true,

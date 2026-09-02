@@ -40,22 +40,33 @@ impl App {
                     self.selection.clear();
                     self.dirty = true;
                 } else if self.toggle_fold_at_click(mouse.column, mouse.row) {
+                    // No anchor is set here, so a drag that starts on a header
+                    // must not be treated as an in-progress selection: with the
+                    // anchor left at its default the drag would select from the
+                    // top of the transcript, and Ctrl+Y would copy all of it.
                     self.selection.clear();
-                    self.dirty = true;
+                    self.dragging = false;
                 } else if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
                     self.selection.begin(pos);
+                    self.dragging = true;
                     self.dirty = true;
                 }
             }
             MouseEventKind::Drag(MouseButton::Left) => {
+                if !self.dragging {
+                    return None;
+                }
                 if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
                     self.selection.update(pos);
                     self.dirty = true;
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
-                if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
-                    self.selection.update(pos);
+                if self.dragging {
+                    if let Some(pos) = self.mouse_to_selection(mouse.column, mouse.row) {
+                        self.selection.update(pos);
+                    }
+                    self.dragging = false;
                 }
                 // A click with no drag clears rather than leaving a stale
                 // one-cell selection that Ctrl+Y would then copy.
@@ -110,7 +121,14 @@ impl App {
         let Some(index) = header_block_at(&self.block_starts, pos.row) else {
             return false;
         };
-        self.state.transcript.toggle_fold(index)
+        if !self.state.transcript.is_foldable(index) {
+            return false;
+        }
+        // Through `apply`, never straight at the transcript: `apply` is what
+        // invalidates the cached rows. Toggling directly flipped the fold and
+        // left the screen exactly as it was.
+        self.apply(crate::state::UiEvent::ThinkingFoldToggled { block: index });
+        true
     }
 
     pub(super) fn mouse_to_selection(
