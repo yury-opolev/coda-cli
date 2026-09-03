@@ -173,6 +173,45 @@ pub fn find_engine(program: &str) -> Option<std::ffi::OsString> {
     matches!(status, Ok(s) if s.success()).then(|| program.into())
 }
 
+/// Fields the Rust engine sends that an older C# engine does not.
+///
+/// **Not a gap** — the direction is the opposite of [`KNOWN_GAPS`]. The Rust
+/// engine is ahead, and the C# source has been changed to match; but this
+/// harness runs the *installed* `coda` tool, which lags its source until
+/// someone rebuilds and reinstalls it. Without this, every additive fix would
+/// leave the suite red for everyone whose tool is a day old.
+///
+/// The allowance is deliberately narrow: a listed field may be present in the
+/// Rust response and absent from the C#. If both send it, both must agree, so
+/// this cannot hide a regression once the tool catches up — and any field not
+/// listed here still fails loudly.
+pub const RUST_ADDITIONS: &[(&str, &[&str])] = &[
+    // Which model is in use, and under which provider. The list alone does not
+    // say, so a client could only guess — and guessed the first entry.
+    ("session/models", &["model", "providerId"]),
+];
+
+/// Drops declared additive fields from `rust` when `csharp` does not send them.
+///
+/// Only top-level keys, and only when the C# side is silent: a field both
+/// engines report is compared normally.
+fn ignore_rust_additions(method: &str, csharp: &StepOutcome, rust: &mut StepOutcome) {
+    let Some((_, fields)) = RUST_ADDITIONS.iter().find(|(m, _)| *m == method) else {
+        return;
+    };
+    let (StepOutcome::Ok(left), StepOutcome::Ok(right)) = (csharp, rust) else {
+        return;
+    };
+    let (Some(left), Some(right)) = (left.as_object(), right.as_object_mut()) else {
+        return;
+    };
+    for field in *fields {
+        if !left.contains_key(*field) {
+            right.remove(*field);
+        }
+    }
+}
+
 /// Runs every step against both engines and returns the disagreements.
 ///
 /// Returns `(step_index, method, csharp, rust)` for each mismatch, so a
@@ -185,7 +224,8 @@ pub async fn compare(
     let mut mismatches = Vec::new();
     for (index, step) in steps.iter().enumerate() {
         let left = csharp.run(step).await?;
-        let right = rust.run(step).await?;
+        let mut right = rust.run(step).await?;
+        ignore_rust_additions(step.method, &left, &mut right);
         if left != right {
             mismatches.push((index, step.method, left, right));
         }
@@ -316,5 +356,41 @@ mod tests {
             steps.iter().any(|s| s.method == "does/notExist"),
             "an unknown method must be exercised"
         );
+    }
+
+    #[test]
+    fn a_declared_addition_is_ignored_only_while_the_other_engine_is_silent() {
+        let csharp = StepOutcome::Ok(json!({ "source": "live", "models": [] }));
+        let mut rust = StepOutcome::Ok(json!({
+            "source": "live", "models": [], "model": "m", "providerId": "p"
+        }));
+        ignore_rust_additions("session/models", &csharp, &mut rust);
+        assert_eq!(csharp, rust, "the declared additions were not ignored");
+    }
+
+    #[test]
+    fn a_declared_addition_is_still_compared_once_both_engines_send_it() {
+        // Otherwise the declaration would go on hiding a real disagreement
+        // long after the older engine caught up.
+        let csharp = StepOutcome::Ok(json!({ "models": [], "model": "opus" }));
+        let mut rust = StepOutcome::Ok(json!({ "models": [], "model": "sonnet" }));
+        ignore_rust_additions("session/models", &csharp, &mut rust);
+        assert_ne!(csharp, rust, "a disagreement on a shared field was swallowed");
+    }
+
+    #[test]
+    fn an_undeclared_field_is_never_ignored() {
+        let csharp = StepOutcome::Ok(json!({ "models": [] }));
+        let mut rust = StepOutcome::Ok(json!({ "models": [], "surprise": true }));
+        ignore_rust_additions("session/models", &csharp, &mut rust);
+        assert_ne!(csharp, rust, "an undeclared field was swallowed");
+    }
+
+    #[test]
+    fn additions_declared_for_one_method_do_not_leak_to_another() {
+        let csharp = StepOutcome::Ok(json!({ "models": [] }));
+        let mut rust = StepOutcome::Ok(json!({ "models": [], "model": "m" }));
+        ignore_rust_additions("session/history", &csharp, &mut rust);
+        assert_ne!(csharp, rust, "the allowance applied to the wrong method");
     }
 }

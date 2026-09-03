@@ -280,7 +280,7 @@ fn draw_completions(frame: &mut Frame, below: Rect, composer: &Composer, theme: 
         .skip(first)
         .take(rows as usize)
         .map(|(index, candidate)| {
-            let selected = index == completion.selected && completion.navigated;
+            let selected = index == completion.selected;
             let style = if selected {
                 theme
                     .style(Role::CompletionSelectedText)

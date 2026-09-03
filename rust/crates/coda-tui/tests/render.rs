@@ -702,7 +702,7 @@ fn the_completion_popup_is_drawn_above_the_composer() {
 }
 
 #[test]
-fn the_completion_popup_marks_a_navigated_selection_only() {
+fn the_completion_popup_moves_its_mark_with_the_selection() {
     use coda_tui::composer::Completion;
 
     let state = session();
@@ -714,19 +714,22 @@ fn the_completion_popup_marks_a_navigated_selection_only() {
     ];
     composer.set_completions(candidates.clone(), (0, 2));
 
-    // Untouched: the popup is a hint, so nothing is marked as chosen.
-    let hint = render(&state, &composer, 80, 24).join("\n");
-    assert!(
-        !hint.contains('\u{203A}'),
-        "an unnavigated popup marked a selection:\n{hint}"
-    );
+    // Marked on open, on the first candidate: Tab and Enter both act on it
+    // straight away, so a list with nothing marked gives no sign of what
+    // they will take.
+    let opened = render(&state, &composer, 80, 24);
+    let marked = |screen: &[String]| -> String {
+        screen
+            .iter()
+            .find(|row| row.contains('\u{203A}'))
+            .unwrap_or_else(|| panic!("nothing was marked:\n{}", screen.join("\n")))
+            .clone()
+    };
+    assert!(marked(&opened).contains("/yolo"), "{:?}", marked(&opened));
 
     composer.completion_next();
-    let chosen = render(&state, &composer, 80, 24).join("\n");
-    assert!(
-        chosen.contains('\u{203A}'),
-        "a navigated popup marked nothing:\n{chosen}"
-    );
+    let moved = render(&state, &composer, 80, 24);
+    assert!(marked(&moved).contains("/yank"), "{:?}", marked(&moved));
 }
 
 #[test]
@@ -792,4 +795,42 @@ fn the_status_bar_is_still_while_waiting_on_the_user() {
             );
         }
     }
+}
+
+#[test]
+fn the_completion_popup_highlights_a_candidate_as_soon_as_it_opens() {
+    // The popup used to show nothing highlighted until the selection was
+    // moved, so on opening there was no sign of what Tab would take or what
+    // Enter would run -- both act on the first candidate from the moment the
+    // list appears.
+    use coda_tui::composer::Completion;
+    use coda_tui::render::glyphs;
+
+    let state = session();
+    let mut composer = Composer::new();
+    composer.insert("/mo");
+    composer.set_completions(
+        vec![
+            Completion::new("/model", Some("Switch the model.".into())),
+            Completion::new("/models", Some("List the models.".into())),
+        ],
+        (0, 3),
+    );
+
+    let screen = render(&state, &composer, 80, 14);
+    let marked: Vec<&String> = screen
+        .iter()
+        .filter(|row| row.contains(glyphs::OPTION_MARKER.trim_end()))
+        .collect();
+
+    assert_eq!(
+        marked.len(),
+        1,
+        "exactly one candidate should be marked on open: {screen:?}"
+    );
+    assert!(
+        marked[0].contains("/model"),
+        "the first candidate should be the marked one: {:?}",
+        marked[0]
+    );
 }

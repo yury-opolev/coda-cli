@@ -56,10 +56,12 @@ pub struct CompletionState {
     pub range: (usize, usize),
     /// Whether the user has moved the selection.
     ///
-    /// Until they do, the popup is a *hint* rather than a choice, so Enter
-    /// runs what is typed instead of accepting a candidate. Without this
-    /// distinction, typing a command in full and pressing Enter silently
-    /// replaced it with itself and did nothing visible.
+    /// The popup refreshes on every keystroke, so this is what stops a
+    /// deliberate choice being reset to the top candidate while the list is
+    /// still the same one the choice was made from. It no longer governs
+    /// what is highlighted: a candidate is highlighted from the moment the
+    /// popup opens, because Tab and Enter both act on it immediately and a
+    /// list with nothing marked gives no sign of what they will take.
     pub navigated: bool,
 }
 

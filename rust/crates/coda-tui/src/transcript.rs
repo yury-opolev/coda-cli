@@ -335,17 +335,31 @@ fn render_thinking(
         return Vec::new();
     }
 
+    // Nothing to open when the reasoning never arrived as text — a provider
+    // that encrypts it sends only a signature. Offering a fold that expands to
+    // an empty block would be a lie about what is behind it.
+    let has_body = body.lines().any(|line| !line.trim().is_empty());
+
     // Full is the "show me everything" mode, so it opens every block without
     // needing a click; otherwise the block's own state decides.
-    let open = expanded || mode == ToolDisplayMode::Full;
-    let fold = if open {
+    let open = has_body && (expanded || mode == ToolDisplayMode::Full);
+    let fold = if !has_body {
+        // Same width as a marker, so headers stay aligned in a column of them.
+        " "
+    } else if open {
         glyphs::FOLD_EXPANDED
     } else {
         glyphs::FOLD_COLLAPSED
     };
 
     let status = if complete {
-        format!("{fold} {} Thought for {seconds}s", glyphs::THINKING)
+        // A duration of zero means the clock never started, not that no time
+        // passed: it only runs from the first delta, and encrypted reasoning
+        // produces none. Claiming "0s" would be inventing a measurement.
+        match seconds {
+            0 => format!("{fold} {} Thought", glyphs::THINKING),
+            seconds => format!("{fold} {} Thought for {seconds}s", glyphs::THINKING),
+        }
     } else {
         match tokens {
             Some(tokens) => format!(
@@ -557,9 +571,14 @@ impl Transcript {
     ///
     /// Asked before a click is claimed, so a click on an ordinary row still
     /// starts a selection instead of being swallowed by a fold that never
-    /// happens.
+    /// happens. A reasoning block with no text is not foldable: it draws no
+    /// fold marker, and toggling a state nothing renders would consume the
+    /// click for nothing.
     pub fn is_foldable(&self, index: usize) -> bool {
-        matches!(self.blocks.get(index), Some(Block::Thinking { .. }))
+        matches!(
+            self.blocks.get(index),
+            Some(Block::Thinking { text, .. }) if text.lines().any(|l| !l.trim().is_empty())
+        )
     }
 
     /// Renders every block to rows, inserting a blank separator between them.
@@ -1136,5 +1155,56 @@ mod tests {
             );
         }
     }
-}
 
+    #[test]
+    fn reasoning_with_no_body_offers_no_fold_and_claims_no_duration() {
+        // Encrypted reasoning arrives as a signature with empty text, and the
+        // clock only runs from the first delta -- so there are none and the
+        // elapsed time is zero. Showing "Thought for 0s" would invent a
+        // measurement, and a fold marker would promise a body that is not
+        // there.
+        let rows = texts(
+            &Block::Thinking {
+                text: String::new(),
+                elapsed_ms: 0,
+                tokens: None,
+                complete: true,
+                expanded: false,
+            }
+            .render(80, ToolDisplayMode::Summary),
+        );
+
+        assert_eq!(rows.len(), 1, "nothing to preview: {rows:?}");
+        assert!(rows[0].contains("Thought"), "{rows:?}");
+        assert!(!rows[0].contains("0s"), "invented a duration: {rows:?}");
+        assert!(
+            !rows[0].contains(glyphs::FOLD_COLLAPSED)
+                && !rows[0].contains(glyphs::FOLD_EXPANDED),
+            "offered a fold with nothing behind it: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_bodyless_reasoning_block_cannot_be_folded() {
+        // The click path must agree with what is drawn, or a click is
+        // swallowed toggling a state nothing renders.
+        let mut transcript = Transcript::new();
+        transcript.push(Block::Thinking {
+            text: "   \n\n  ".to_string(),
+            elapsed_ms: 0,
+            tokens: None,
+            complete: true,
+            expanded: false,
+        });
+        assert!(!transcript.is_foldable(0));
+
+        transcript.push(Block::Thinking {
+            text: "actual reasoning".to_string(),
+            elapsed_ms: 1000,
+            tokens: None,
+            complete: true,
+            expanded: false,
+        });
+        assert!(transcript.is_foldable(1));
+    }
+}
