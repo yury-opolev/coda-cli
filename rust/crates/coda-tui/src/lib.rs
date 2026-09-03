@@ -14,6 +14,7 @@ pub mod overlay;
 pub mod pin;
 pub mod selection;
 pub mod setup;
+pub mod startup;
 pub mod state;
 pub mod surface;
 pub mod terminal;

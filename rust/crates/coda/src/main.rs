@@ -23,6 +23,7 @@ use clap::{Args, Parser, Subcommand};
 use coda_client::EngineCommand;
 use coda_render::theme::{ColorDepth, Theme};
 use coda_tui::app::App;
+use coda_tui::startup::SessionIntent;
 use coda_tui::terminal::{install_panic_hook, TerminalGuard};
 
 #[derive(Debug, Parser)]
@@ -76,6 +77,22 @@ struct InteractiveArgs {
     /// Disable mouse capture, which some terminals handle poorly.
     #[arg(long)]
     no_mouse: bool,
+
+    /// Continue the most recent session in this directory.
+    #[arg(long = "continue", short = 'c', conflicts_with_all = ["resume", "fork"])]
+    continue_latest: bool,
+
+    /// Resume a session. Without an id, the most recent one.
+    ///
+    /// The exit summary prints this exact command, so it has to accept what it
+    /// advertises.
+    #[arg(long, short = 'r', value_name = "ID", num_args = 0..=1, conflicts_with = "fork")]
+    resume: Option<Option<String>>,
+
+    /// Open a copy of a session, leaving the original untouched.
+    /// Without an id, copies the most recent one.
+    #[arg(long, short = 'f', value_name = "ID", num_args = 0..=1)]
+    fork: Option<Option<String>>,
 }
 
 #[derive(Debug, Args)]
@@ -168,9 +185,19 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
 
     let theme = Theme::default().with_depth(ColorDepth::detect());
 
+    // Resolved before the terminal is touched, so "no such session" prints as
+    // an ordinary error rather than flashing up behind an alternate screen.
+    let intent = SessionIntent::from_flags(
+        args.continue_latest,
+        args.resume.clone(),
+        args.fork.clone(),
+    );
+    let resuming = coda_tui::startup::resolve(&intent, &working_dir).await?;
+
     // Connect before touching the terminal, so a failure prints a normal error
     // instead of a blank alternate screen.
-    let (mut app, engine_process, inbound) = App::connect(command, theme).await?;
+    let (mut app, engine_process, inbound) =
+        App::connect_to_session(command, theme, resuming.clone()).await?;
 
     // The banner is seeded into the transcript rather than printed to the raw
     // console: printed before the alternate screen it would be wiped the
@@ -384,4 +411,92 @@ mod tests {
         let resolved = resolve_engine(Some(PathBuf::from("other.exe"))).expect("resolve");
         assert_eq!(resolved, PathBuf::from("other.exe"));
     }
-}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    fn interactive(args: &[&str]) -> InteractiveArgs {
+        let mut argv = vec!["coda"];
+        argv.extend_from_slice(args);
+        Cli::try_parse_from(argv).expect("parse").interactive
+    }
+
+    #[test]
+    fn resume_accepts_the_form_the_exit_summary_prints() {
+        // The exit summary ends with `coda --resume <id>`. Rejecting that was
+        // the app advertising a command it did not have.
+        let args = interactive(&["--resume", "90260319-1f67-4c7c-9b41-2f6ff38d96f1"]);
+        assert_eq!(
+            SessionIntent::from_flags(args.continue_latest, args.resume, args.fork),
+            SessionIntent::Resume("90260319-1f67-4c7c-9b41-2f6ff38d96f1".into())
+        );
+    }
+
+    #[test]
+    fn a_flag_after_the_id_is_not_swallowed_as_the_id() {
+        // `--resume <id> --yolo` is what a user actually types. If the id were
+        // greedy the trailing flag would vanish into it.
+        let args = interactive(&["--resume", "abc123", "--no-mouse"]);
+        assert!(args.no_mouse, "the trailing flag was swallowed");
+        assert_eq!(
+            SessionIntent::from_flags(args.continue_latest, args.resume, args.fork),
+            SessionIntent::Resume("abc123".into())
+        );
+    }
+
+    #[test]
+    fn the_short_forms_match_the_long_ones() {
+        for (short, long) in [("-c", "--continue"), ("-r", "--resume"), ("-f", "--fork")] {
+            let a = interactive(&[short]);
+            let b = interactive(&[long]);
+            assert_eq!(
+                SessionIntent::from_flags(a.continue_latest, a.resume, a.fork),
+                SessionIntent::from_flags(b.continue_latest, b.resume, b.fork),
+                "{short} and {long} disagree"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_resume_and_continue_both_mean_the_most_recent() {
+        let resume = interactive(&["--resume"]);
+        assert_eq!(
+            SessionIntent::from_flags(resume.continue_latest, resume.resume, resume.fork),
+            SessionIntent::Latest
+        );
+    }
+
+    #[test]
+    fn the_session_flags_refuse_to_be_combined() {
+        // Two intents is a mistake with no sensible reading, and picking one
+        // silently is how a resume ends up starting an empty session.
+        for pair in [
+            ["--continue", "--resume"],
+            ["--continue", "--fork"],
+            ["--resume", "--fork"],
+        ] {
+            let mut argv = vec!["coda"];
+            argv.extend_from_slice(&pair);
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{pair:?} were accepted together"
+            );
+        }
+    }
+
+    #[test]
+    fn no_session_flag_starts_fresh() {
+        let args = interactive(&[]);
+        assert_eq!(
+            SessionIntent::from_flags(args.continue_latest, args.resume, args.fork),
+            SessionIntent::New
+        );
+    }
+}}

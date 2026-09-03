@@ -42,4 +42,6 @@ uuid.workspace = true
 [dev-dependencies]
 insta.workspace = true
 pretty_assertions.workspace = true
+tempfile = "3"
+coda-llm.workspace = true
 

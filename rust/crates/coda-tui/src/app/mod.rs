@@ -159,10 +159,25 @@ impl App {
         command: EngineCommand,
         theme: Theme,
     ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
+        Self::connect_to_session(command, theme, None).await
+    }
+
+    /// Connects to an engine, resuming `session_id` when one is given.
+    ///
+    /// Resuming is part of the handshake rather than something done afterwards
+    /// because the engine seeds its history from the stored transcript while
+    /// initialising; asking later would leave the first turn without it.
+    pub async fn connect_to_session(
+        command: EngineCommand,
+        theme: Theme,
+        session_id: Option<String>,
+    ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
         let (engine, inbound) = Engine::spawn(command.clone()).context("failed to start the engine")?;
         let connection = engine.connection();
 
-        let params = serde_json::to_value(messages::InitializeParams::new("coda-tui"))?;
+        let mut init = messages::InitializeParams::new("coda-tui");
+        init.session_id = session_id;
+        let params = serde_json::to_value(init)?;
         let result = connection
             .request(method::INITIALIZE, Some(params))
             .await
