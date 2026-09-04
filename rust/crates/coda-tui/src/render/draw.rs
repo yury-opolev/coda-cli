@@ -6,7 +6,7 @@
 use coda_render::text;
 use coda_render::theme::{Role, Theme};
 use coda_render::RenderLine;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -317,23 +317,30 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
 /// reflows the transcript underneath it, so the conversation would jump every
 /// time something was copied.
 ///
-/// Unread content outranks a passing notice. A user who has scrolled away and
-/// is being told nothing is the complaint this line exists to answer, and a
-/// stale "copied" message must not hide it.
+/// Centred, because it belongs to the whole screen rather than to the column
+/// of text beneath it, and a short message pinned left reads as debris.
+///
+/// Being scrolled away outranks a passing notice, and shows the way back for
+/// as long as it applies — not only while something new is arriving. A reader
+/// who has stopped following has no other indication that the view is frozen,
+/// and a stale "copied" message must not hide it.
 fn draw_hint(frame: &mut Frame, area: Rect, state: &UiState, viewport: &Viewport, theme: &Theme) {
-    let (text, role) = match (viewport.unread(), state.hint.as_deref()) {
-        (0, None) => (String::new(), Role::Notification),
-        (0, Some(hint)) => (format!(" {hint}"), Role::Notification),
-        (unread, _) => (
-            format!(
-                " {unread} new below {} Ctrl+End to catch up",
-                glyphs::RULE_VERTICAL
-            ),
-            Role::PendingUser,
-        ),
+    let (text, role) = if !viewport.is_following() {
+        let catch_up = "Ctrl+End to catch up";
+        let text = match viewport.unread() {
+            0 => catch_up.to_string(),
+            unread => format!("{unread} new below {} {catch_up}", glyphs::RULE_VERTICAL),
+        };
+        (text, Role::PendingUser)
+    } else {
+        match state.hint.as_deref() {
+            Some(hint) => (hint.to_string(), Role::Notification),
+            None => (String::new(), Role::Notification),
+        }
     };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(text, theme.style(role)))),
+        Paragraph::new(Line::from(Span::styled(text, theme.style(role))))
+            .alignment(Alignment::Center),
         area,
     );
 }

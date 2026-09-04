@@ -910,3 +910,54 @@ fn the_hint_line_reports_what_arrived_while_scrolled_away() {
     assert!(hint.contains("12"), "the count is wrong: {hint:?}");
     assert!(hint.contains("Ctrl+End"), "no way to catch up was offered: {hint:?}");
 }
+
+#[test]
+fn the_way_back_stays_offered_while_scrolled_away() {
+    // Not only while something is arriving. A reader who has stopped
+    // following has no other sign that the view is frozen, so the way back
+    // has to stay on screen for as long as it applies.
+    use coda_render::theme::{ColorDepth, Theme};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut state = session();
+    for i in 0..200 {
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: format!("line {i}\n") }));
+    }
+
+    let composer = Composer::new();
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true);
+    let rows = state
+        .transcript
+        .render(regions.transcript.width as usize, state.display_mode);
+
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), regions.transcript.height as usize);
+    viewport.scroll_up(30);
+    assert_eq!(viewport.unread(), 0, "nothing has arrived yet");
+
+    terminal
+        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme))
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    let screen: Vec<String> = (0..24)
+        .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    let hint = screen
+        .iter()
+        .find(|row| row.contains("Ctrl+End"))
+        .unwrap_or_else(|| panic!("no way back was offered:\n{}", screen.join("\n")));
+    assert!(!hint.contains("new below"), "claimed arrivals that did not happen: {hint:?}");
+
+    // Centred: it belongs to the screen, not to the column of text below it.
+    let left = hint.len() - hint.trim_start().len();
+    let right = hint.len() - hint.trim_end().len();
+    assert!(
+        left.abs_diff(right) <= 1,
+        "the hint is not centred (left {left}, right {right})"
+    );
+}
