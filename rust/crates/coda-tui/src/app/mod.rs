@@ -549,22 +549,28 @@ impl App {
             Action::CompletionCancel => self.composer.clear_completions(),
 
             Action::ScrollUp => {
-                self.capture_anchor_if_following();
                 self.viewport.scroll_up(1);
+                self.remember_position();
             }
-            Action::ScrollDown => self.viewport.scroll_down(1),
+            Action::ScrollDown => {
+                self.viewport.scroll_down(1);
+                self.remember_position();
+            }
             Action::PageUp => {
-                self.capture_anchor_if_following();
                 self.viewport.page_up();
+                self.remember_position();
             }
-            Action::PageDown => self.viewport.page_down(),
+            Action::PageDown => {
+                self.viewport.page_down();
+                self.remember_position();
+            }
             Action::ScrollTop => {
-                self.capture_anchor_if_following();
                 self.viewport.scroll_to_top();
+                self.remember_position();
             }
             Action::ScrollBottom => {
-                self.detached_anchor = None;
                 self.viewport.scroll_to_bottom();
+                self.remember_position();
             }
 
             Action::Interrupt => {
@@ -1158,11 +1164,19 @@ impl App {
 
     /// Captures a viewport anchor from the current offset if the viewport is
     /// currently following (about to be detached by a scroll).
-    fn capture_anchor_if_following(&mut self) {
-        if !self.viewport.is_following() {
-            return;
-        }
-        self.detached_anchor = self.compute_anchor();
+    /// Records where the user is now, so a reflow can put them back.
+    ///
+    /// Recomputed after *every* scroll, not only when the viewport first
+    /// detaches. An anchor captured once describes where the user was at that
+    /// moment, so every later scroll was undone by the next arriving event —
+    /// the transcript jumped back to wherever they had first scrolled away
+    /// from, which reads as the panel moving on its own.
+    fn remember_position(&mut self) {
+        self.detached_anchor = if self.viewport.is_following() {
+            None
+        } else {
+            self.compute_anchor()
+        };
     }
 
     /// Computes a `ViewportAnchor` from the current viewport offset and block layout.

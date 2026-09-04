@@ -357,16 +357,13 @@ fn render_thinking(
         // passed: it only runs from the first delta, and encrypted reasoning
         // produces none. Claiming "0s" would be inventing a measurement.
         match seconds {
-            0 => format!("{fold} {} Thought", glyphs::THINKING),
-            seconds => format!("{fold} {} Thought for {seconds}s", glyphs::THINKING),
+            0 => format!("{fold} Thought"),
+            seconds => format!("{fold} Thought for {seconds}s"),
         }
     } else {
         match tokens {
-            Some(tokens) => format!(
-                "{fold} {} Thinking… {seconds}s · {tokens} tok",
-                glyphs::THINKING
-            ),
-            None => format!("{fold} {} Thinking… {seconds}s", glyphs::THINKING),
+            Some(tokens) => format!("{fold} Thinking… {seconds}s · {tokens} tok"),
+            None => format!("{fold} Thinking… {seconds}s"),
         }
     };
 

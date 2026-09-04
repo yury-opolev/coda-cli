@@ -21,12 +21,13 @@ impl App {
     pub(super) fn decide_pointer_action(&mut self, mouse: MouseEvent) -> Option<PointerAction> {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.capture_anchor_if_following();
                 self.viewport.scroll_up(WHEEL_ROWS);
+                self.remember_position();
                 self.dirty = true;
             }
             MouseEventKind::ScrollDown => {
                 self.viewport.scroll_down(WHEEL_ROWS);
+                self.remember_position();
                 self.dirty = true;
             }
             // Drag-select. Mouse capture disables the terminal's own selection,

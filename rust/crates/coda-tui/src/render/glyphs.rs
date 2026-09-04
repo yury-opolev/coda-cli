@@ -118,21 +118,14 @@ pub const ARROWS_VERTICAL: &str = "\u{2191}\u{2193}"; // "↑↓"
 /// Separates a thing from its outcome: "question → answer".
 pub const ARROW_RIGHT: &str = "\u{2192}"; // →
 
-/// Marks model reasoning in the transcript.
-///
-/// The variation selector U+FE0E asks for *text* presentation rather than
-/// emoji, so the bulb is drawn monochrome in the surrounding role colour
-/// instead of injecting a colour the theme cannot control. Terminals that
-/// ignore the selector fall back to the emoji, which is still legible.
-pub const THINKING: &str = "\u{1F4A1}\u{FE0E}"; // 💡︎
-
 /// Fold markers for a collapsible block, sized to one cell.
 ///
 /// Present on every foldable header, because a block that expands on click
-/// with nothing to say so is a feature nobody finds.
-pub const FOLD_COLLAPSED: &str = "\u{25B8}"; // ▸
+/// with nothing to say so is a feature nobody finds. A chevron alone carries
+/// the meaning: it points at what is hidden, and turns down when it is not.
+pub const FOLD_COLLAPSED: &str = "\u{276F}"; // ❯
 /// Counterpart to [`FOLD_COLLAPSED`], shown when the block is open.
-pub const FOLD_EXPANDED: &str = "\u{25BE}"; // ▾
+pub const FOLD_EXPANDED: &str = "\u{2304}"; // ⌄
 
 /// Frames of the working indicator, one cell each.
 ///

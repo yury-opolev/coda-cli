@@ -152,6 +152,7 @@ impl Viewport {
     ///
     /// Equivalent to `ApplyContentLayout` with a resolved anchor in C#.
     pub fn update_with_anchor(&mut self, total: usize, height: usize, anchor_row: usize) {
+        let grew_by = total.saturating_sub(self.total);
         self.total = total;
         self.height = height;
         match self.follow {
@@ -160,6 +161,12 @@ impl Viewport {
                 self.unread = 0;
             }
             Follow::Detached => {
+                // Counted here as well as in `update`. This is the path that
+                // actually runs while the agent works — every content event
+                // reflows — so leaving it out meant the unread count the
+                // status line reads was permanently zero, and a user who had
+                // scrolled away was never told anything had arrived.
+                self.unread += grew_by;
                 self.offset = anchor_row.min(self.max_offset());
                 if !self.is_scrollable() {
                     self.attach();
@@ -534,5 +541,57 @@ mod tests {
         viewport.set_offset_clamped(20);
         assert_eq!(viewport.offset(), 20);
         assert!(!viewport.is_following());
+    }
+
+    #[test]
+    fn a_detached_viewport_counts_arrivals_through_the_anchored_path_too() {
+        // Every content event reflows, so `update_with_anchor` is the path
+        // that actually runs while the agent is working -- and it never
+        // touched `unread`. The count the status bar reads was therefore
+        // always zero, so a user who had scrolled away was never told
+        // anything had arrived.
+        let mut viewport = Viewport::new();
+        viewport.update(100, 10);
+        viewport.scroll_up(20);
+        assert!(!viewport.is_following(), "scrolling up must detach");
+
+        let anchor = viewport.offset();
+        viewport.update_with_anchor(130, 10, anchor);
+        assert_eq!(viewport.unread(), 30, "arrivals went uncounted");
+
+        viewport.update_with_anchor(140, 10, anchor);
+        assert_eq!(viewport.unread(), 40, "arrivals stopped accumulating");
+    }
+
+    #[test]
+    fn returning_to_the_bottom_clears_an_anchored_count() {
+        let mut viewport = Viewport::new();
+        viewport.update(100, 10);
+        viewport.scroll_up(20);
+        let anchor = viewport.offset();
+        viewport.update_with_anchor(150, 10, anchor);
+        assert!(viewport.unread() > 0);
+
+        viewport.scroll_to_bottom();
+        assert_eq!(viewport.unread(), 0, "the count survived going back to the bottom");
+        assert!(viewport.is_following());
+    }
+
+    #[test]
+    fn content_arriving_does_not_move_a_detached_viewport() {
+        // The whole point: a user who scrolled up did so for a reason.
+        let mut viewport = Viewport::new();
+        viewport.update(100, 10);
+        viewport.scroll_up(20);
+        let settled = viewport.offset();
+
+        for total in [120, 140, 160] {
+            viewport.update_with_anchor(total, 10, settled);
+            assert_eq!(
+                viewport.offset(),
+                settled,
+                "the viewport moved when content arrived"
+            );
+        }
     }
 }
