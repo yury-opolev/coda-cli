@@ -1105,6 +1105,15 @@ impl App {
         // The transcript origin is captured from the draw so mouse-to-row
         // translation always matches the layout that was actually rendered.
         let mut origin = self.transcript_origin;
+        // Hidden for the duration of the write. Ratatui shows the cursor after
+        // painting, at whatever position the frame asked for, but never hides
+        // it beforehand — so while cells are being written the hardware cursor
+        // is dragged across the screen by the writes and the terminal blinks
+        // it wherever it happens to be. Visible as flicker away from the
+        // caret, and worse now the working indicator forces a frame every
+        // 110ms. Whatever sets a cursor position — the composer, or a focused
+        // field in a surface — shows it again at the end of the frame.
+        guard.terminal().hide_cursor()?;
         guard.terminal().draw(|frame| {
             origin = draw::draw_with_pin(
                 frame, state, composer, viewport, rows, theme, pin, selection,
