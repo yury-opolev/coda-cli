@@ -161,8 +161,12 @@ impl App {
         }
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
             Ok(()) => {
+                let count = text.chars().count();
                 self.selection.clear();
-                self.notice("Copied selection to clipboard.", NoticeLevel::Info);
+                // A hint, not a transcript entry: copying is worth saying once
+                // and worth no permanent record, and putting it in the
+                // conversation pushed the conversation up the screen to do it.
+                self.hint(format!("Copied {count} characters to the clipboard."));
             }
             Err(err) => {
                 self.notice(
@@ -214,7 +218,8 @@ impl App {
         }
         match arboard::Clipboard::new().and_then(|mut c| c.set_text(&text)) {
             Ok(()) => {
-                self.notice(format!("Copied {what} to clipboard."), NoticeLevel::Info);
+                let count = text.chars().count();
+                self.hint(format!("Copied {what} — {count} characters."));
             }
             Err(err) => {
                 self.notice(

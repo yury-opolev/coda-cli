@@ -1164,6 +1164,16 @@ impl App {
 
     /// Captures a viewport anchor from the current offset if the viewport is
     /// currently following (about to be detached by a scroll).
+    /// Shows a passing message on the line above the composer.
+    ///
+    /// For facts worth saying once and not worth keeping. The transcript is a
+    /// record of the conversation; "copied 412 characters" is not part of it,
+    /// and putting it there pushed the conversation up the screen to say so.
+    pub(super) fn hint(&mut self, text: impl Into<String>) {
+        self.state.hint = Some(text.into());
+        self.dirty = true;
+    }
+
     /// Records where the user is now, so a reflow can put them back.
     ///
     /// Recomputed after *every* scroll, not only when the viewport first
