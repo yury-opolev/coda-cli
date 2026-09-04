@@ -327,9 +327,14 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
 fn draw_hint(frame: &mut Frame, area: Rect, state: &UiState, viewport: &Viewport, theme: &Theme) {
     let (text, role) = if !viewport.is_following() {
         let catch_up = "Ctrl+End to catch up";
+        // Lines, not messages. The count is rows of rendered transcript, and
+        // calling five rows "5 new" reads as five messages — which is how a
+        // single command's output came to look like a conversation the reader
+        // had missed.
         let text = match viewport.unread() {
             0 => catch_up.to_string(),
-            unread => format!("{unread} new below {} {catch_up}", glyphs::RULE_VERTICAL),
+            1 => format!("1 new line below {} {catch_up}", glyphs::RULE_VERTICAL),
+            unread => format!("{unread} new lines below {} {catch_up}", glyphs::RULE_VERTICAL),
         };
         (text, Role::PendingUser)
     } else {

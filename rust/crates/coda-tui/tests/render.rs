@@ -905,7 +905,7 @@ fn the_hint_line_reports_what_arrived_while_scrolled_away() {
 
     let hint = screen
         .iter()
-        .find(|row| row.contains("new below"))
+        .find(|row| row.contains("new lines below"))
         .unwrap_or_else(|| panic!("nothing told the reader anything arrived:\n{}", screen.join("\n")));
     assert!(hint.contains("12"), "the count is wrong: {hint:?}");
     assert!(hint.contains("Ctrl+End"), "no way to catch up was offered: {hint:?}");
@@ -951,7 +951,7 @@ fn the_way_back_stays_offered_while_scrolled_away() {
         .iter()
         .find(|row| row.contains("Ctrl+End"))
         .unwrap_or_else(|| panic!("no way back was offered:\n{}", screen.join("\n")));
-    assert!(!hint.contains("new below"), "claimed arrivals that did not happen: {hint:?}");
+    assert!(!hint.contains("new lines below"), "claimed arrivals that did not happen: {hint:?}");
 
     // Centred: it belongs to the screen, not to the column of text below it.
     let left = hint.len() - hint.trim_start().len();
