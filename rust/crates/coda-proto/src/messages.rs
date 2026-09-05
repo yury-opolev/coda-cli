@@ -26,6 +26,8 @@ pub mod method {
     pub const MODELS: &str = "session/models";
     pub const SET_GOAL: &str = "session/setGoal";
     pub const SET_EFFORT: &str = "session/setEffort";
+    /// Switches the model for subsequent turns, without restarting.
+    pub const SET_MODEL: &str = "session/setModel";
     pub const SET_PERMISSION_MODE: &str = "session/setPermissionMode";
     pub const REASONING_CAPABILITY: &str = "model/reasoningCapability";
 

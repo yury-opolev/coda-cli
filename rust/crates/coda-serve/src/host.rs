@@ -50,7 +50,7 @@ use uuid::Uuid;
 use crate::dispatch::{
     CompactParams, ForkParams, HooksInfoParams, HooksTrustParams, InitParams, MessagesParams,
     ModelsParams, PromptParams, RewindParams, RpcError, ScheduleCreateParams, ScheduleDeleteParams,
-    ServeBackend, SetEffortParams, SetGoalParams, SetPermissionModeParams, SteerParams,
+    ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams, SteerParams,
 };
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::session::{Session, SteeringLogEntry};
@@ -837,6 +837,28 @@ impl ServeBackend for ServeHost {
         Ok(serde_json::json!({
             "ok": true,
             "applied": wire_permission_mode(mode),
+        }))
+    }
+
+    async fn session_set_model(&self, p: SetModelParams) -> Result<Value, RpcError> {
+        let requested = p.model.trim();
+        if requested.is_empty() {
+            return Ok(json!({
+                "ok": false,
+                "note": "No model given.",
+            }));
+        }
+
+        // Takes effect on the next turn: the agent is rebuilt from
+        // `current_model()` each time, so there is nothing to invalidate and
+        // nothing to restart. The running turn keeps the model it started
+        // with, which is the only coherent answer — swapping mid-turn would
+        // leave one exchange split across two models.
+        *self.model.lock().expect("model poisoned") = requested.to_owned();
+
+        Ok(json!({
+            "ok": true,
+            "model": requested,
         }))
     }
 
@@ -2706,5 +2728,40 @@ mod tests {
             host.current_model(),
             "the reported model must be the one the engine will actually use"
         );
+    }
+
+    #[tokio::test]
+    async fn setting_the_model_takes_effect_without_a_restart() {
+        // The agent is rebuilt from current_model() every turn, so a switch
+        // needs no restart. Writing the setting and bouncing the process cost
+        // the running session, and failed outright with -32002 when that
+        // session had not been written to disk yet.
+        let host = make_host();
+        let before = host.current_model();
+
+        let result = host
+            .session_set_model(SetModelParams { model: "claude-opus-4-8".into() })
+            .await
+            .expect("setModel");
+        assert_eq!(result["ok"], true);
+        assert_eq!(host.current_model(), "claude-opus-4-8");
+        assert_ne!(host.current_model(), before, "the model did not change");
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_is_refused_rather_than_blanking_the_setting() {
+        // A blank would leave the engine with no model at all, which fails at
+        // the next turn rather than here where it can be reported.
+        let host = make_host();
+        let before = host.current_model();
+
+        for blank in ["", "   "] {
+            let result = host
+                .session_set_model(SetModelParams { model: blank.into() })
+                .await
+                .expect("setModel must not error");
+            assert_eq!(result["ok"], false, "{blank:?} was accepted");
+        }
+        assert_eq!(host.current_model(), before, "the model was blanked");
     }
 }
