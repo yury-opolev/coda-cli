@@ -427,6 +427,7 @@ impl App {
         }
 
         self.close_browser();
+        // Immediate feedback uses the id, because that is all this code has.
         self.apply(UiEvent::ModelChanged {
             id: model.to_string(),
             context_limit: None,
@@ -436,6 +437,11 @@ impl App {
             NoticeLevel::Info,
         );
         self.restart_engine().await;
+        // Then ask the engine, which reports the active model along with its
+        // display name and context limit. Without this the status line kept
+        // the raw id — "claude-opus-5" where it had read "Claude Opus 5" —
+        // for the rest of the session, and lost the context limit with it.
+        self.load_models().await;
     }
 
 
