@@ -115,6 +115,12 @@ pub struct WireModel {
     pub display_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_limit: Option<i64>,
+    /// US dollars per million input tokens, when the catalogue knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_cost: Option<f64>,
+    /// US dollars per million output tokens, when the catalogue knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_cost: Option<f64>,
 }
 
 #[derive(Serialize)]
@@ -760,12 +766,22 @@ impl ServeBackend for ServeHost {
             if p.refresh { client.refresh_models().await } else { client.list_models().await };
         match result {
             Ok(models) if !models.is_empty() => {
+                // A live list says what the provider offers; the catalogue
+                // says what it costs. The provider does not report prices, so
+                // without this join a live list has none and the cost quietly
+                // disappears whenever the network is up.
+                let catalog = crate::catalog::ModelCatalog::load();
                 let wire: Vec<WireModel> = models
                     .into_iter()
-                    .map(|m| WireModel {
-                        id: m.id,
-                        display_name: m.display_name,
-                        context_limit: m.context_limit.map(|n| n as i64),
+                    .map(|m| {
+                        let priced = catalog.find(Some(&provider_id), &m.id);
+                        WireModel {
+                            display_name: m.display_name,
+                            context_limit: m.context_limit.map(|n| n as i64),
+                            input_cost: priced.and_then(|c| c.cost).map(|c| c.input),
+                            output_cost: priced.and_then(|c| c.cost).map(|c| c.output),
+                            id: m.id,
+                        }
                     })
                     .collect();
                 let v = serde_json::to_value(&wire)
@@ -1646,15 +1662,32 @@ pub(crate) fn load_hooks_from_file(path: &Path) -> Vec<UserHook> {
 /// A non-empty built-in catalogue returned when live model fetching fails or
 /// before credentials are available. Mirrors the C# fallback that ensures the
 /// user always sees some models rather than an empty list.
+/// The bundled catalogue, as wire models.
+///
+/// Was a hand-written list with no prices and context limits typed in beside
+/// the names. The snapshot carries both, and stays right when a provider
+/// changes them.
 fn catalog_models() -> Vec<WireModel> {
-    vec![
-        WireModel { id: "claude-opus-5".into(),    display_name: Some("Claude Opus 5".into()),    context_limit: Some(200_000) },
-        WireModel { id: "claude-sonnet-5".into(),  display_name: Some("Claude Sonnet 5".into()),  context_limit: Some(200_000) },
-        WireModel { id: "claude-opus-4-8".into(),  display_name: Some("Claude Opus 4.8".into()),  context_limit: Some(200_000) },
-        WireModel { id: "claude-sonnet-4-6".into(),display_name: Some("Claude Sonnet 4.6".into()),context_limit: Some(200_000) },
-        WireModel { id: "gpt-5.6-sol".into(),      display_name: Some("GPT-5.6 Sol".into()),      context_limit: None },
-        WireModel { id: "gpt-4o".into(),           display_name: Some("GPT-4o".into()),           context_limit: Some(128_000) },
-    ]
+    let catalog = crate::catalog::ModelCatalog::load();
+    let mut seen: Vec<WireModel> = Vec::new();
+    for provider in ["anthropic", "github-copilot"] {
+        for model in catalog.models_for(provider) {
+            // The same model is offered by more than one provider — a
+            // Copilot-hosted Claude keeps its Anthropic id — and listing it
+            // twice would show the user a duplicate.
+            if seen.iter().any(|m| m.id == model.id) {
+                continue;
+            }
+            seen.push(WireModel {
+                id: model.id,
+                display_name: model.display_name,
+                context_limit: model.context_limit,
+                input_cost: model.cost.map(|c| c.input),
+                output_cost: model.cost.map(|c| c.output),
+            });
+        }
+    }
+    seen
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1983,10 +2016,36 @@ mod tests {
 
     #[test]
     fn wire_model_omits_optional_fields_when_none() {
-        let m = WireModel { id: "x".into(), display_name: None, context_limit: None };
+        let m = WireModel {
+            id: "x".into(),
+            display_name: None,
+            context_limit: None,
+            input_cost: None,
+            output_cost: None,
+        };
         let v = serde_json::to_value(&m).unwrap();
         assert!(v.get("displayName").is_none());
         assert!(v.get("contextLimit").is_none());
+        // An unpriced model must carry no price at all rather than a zero,
+        // which a client would read as free.
+        assert!(v.get("inputCost").is_none());
+        assert!(v.get("outputCost").is_none());
+    }
+
+    #[test]
+    fn the_catalogue_prices_the_models_it_lists() {
+        // The whole point of bundling the snapshot: a model list that says
+        // what each one costs.
+        let models = catalog_models();
+        assert!(!models.is_empty(), "the catalogue listed nothing");
+        assert!(
+            models.iter().any(|m| m.input_cost.is_some() && m.output_cost.is_some()),
+            "not one model carried a price"
+        );
+        assert!(
+            models.iter().any(|m| m.context_limit.is_some()),
+            "not one model carried a context limit"
+        );
     }
 
     #[test]

@@ -62,15 +62,28 @@ impl Activity {
 }
 
 /// Cumulative token usage for the session.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct Usage {
     pub input_tokens: i64,
     pub output_tokens: i64,
     /// Nominal context window, used to show a percentage.
     pub context_limit: i64,
+    /// Dollars per million tokens in and out, when the model's price is known.
+    ///
+    /// Carried rather than looked up so the cost can be shown without the
+    /// renderer reaching for a catalogue, and so an unpriced model shows
+    /// nothing rather than a confident zero.
+    pub price_per_million: Option<(f64, f64)>,
 }
 
 impl Usage {
+    /// What this session has cost so far, in US dollars.
+    pub fn estimated_cost(&self) -> Option<f64> {
+        let (input, output) = self.price_per_million?;
+        let per_million = |tokens: i64, price: f64| tokens as f64 / 1_000_000.0 * price;
+        Some(per_million(self.input_tokens, input) + per_million(self.output_tokens, output))
+    }
+
     /// Percentage of the context window consumed, if a limit is known.
     pub fn percent_used(&self) -> Option<u8> {
         if self.context_limit <= 0 {
@@ -1135,6 +1148,7 @@ mod tests {
             input_tokens: 50_000,
             output_tokens: 0,
             context_limit: 0,
+            price_per_million: None,
         };
         assert_eq!(usage.percent_used(), None);
 
@@ -1148,6 +1162,7 @@ mod tests {
             input_tokens: 400_000,
             output_tokens: 0,
             context_limit: 200_000,
+            price_per_million: None,
         };
         assert_eq!(usage.percent_used(), Some(100));
     }
