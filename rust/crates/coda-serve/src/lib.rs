@@ -12,6 +12,7 @@
 //! - `transport`  — stdio read/write loop
 //! - `session`    — per-session state
 
+pub mod catalog;
 pub mod dispatch;
 pub mod host;
 pub mod prompts;

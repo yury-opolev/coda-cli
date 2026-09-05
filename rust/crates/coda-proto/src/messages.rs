@@ -282,6 +282,16 @@ impl ModelsResult {
         let active = self.model.as_deref()?;
         self.models.iter().find(|m| m.id == active)?.context_limit
     }
+
+    /// What the active model charges, per million tokens in and out.
+    ///
+    /// `None` when the catalogue does not price it. A missing price shows
+    /// nothing rather than zero, because a cost of "$0.00" reads as free.
+    pub fn active_price(&self) -> Option<(f64, f64)> {
+        let active = self.model.as_deref()?;
+        let model = self.models.iter().find(|m| m.id == active)?;
+        Some((model.input_cost?, model.output_cost?))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -292,6 +302,12 @@ pub struct WireModel {
     pub display_name: Option<String>,
     #[serde(default)]
     pub context_limit: Option<i64>,
+    /// US dollars per million input tokens, when the catalogue knows.
+    #[serde(default)]
+    pub input_cost: Option<f64>,
+    /// US dollars per million output tokens, when the catalogue knows.
+    #[serde(default)]
+    pub output_cost: Option<f64>,
 }
 
 impl WireModel {

@@ -708,10 +708,6 @@ fn draw_status(
     // Tokens in and out. The direction matters: a long context re-sent every
     // turn reads very differently from a long reply, and a single total hides
     // which one is growing.
-    //
-    // No cost estimate yet. The C# reads per-model prices from its model
-    // catalogue; the Rust catalogue carries no cost data, and a made-up
-    // number is worse than none because it would be believed.
     if state.usage.input_tokens > 0 || state.usage.output_tokens > 0 {
         spans.push(Span::styled(
             format!(
@@ -724,6 +720,14 @@ fn draw_status(
             ),
             theme.style(Role::Notification),
         ));
+        // Only when the catalogue prices this model. Showing "$0.00" for an
+        // unpriced one would read as free.
+        if let Some(cost) = state.usage.estimated_cost() {
+            spans.push(Span::styled(
+                format!("{} ${cost:.2} ", glyphs::RULE_VERTICAL),
+                theme.style(Role::Notification),
+            ));
+        }
     }
 
     if state.interrupting {
