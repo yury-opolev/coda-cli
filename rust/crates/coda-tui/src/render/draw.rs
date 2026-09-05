@@ -781,13 +781,15 @@ pub fn draw_surface(
     }
     frame.render_widget(Clear, region);
 
-    let block = Block::default()
-        .title(format!(" {} ", rendered.title))
-        .borders(Borders::ALL)
-        .border_style(theme.style(Role::PromptAccent))
-        .padding(MODAL_PADDING)
-        .style(theme.surface());
-    frame.render_widget(block, region);
+    if crate::surface::chrome::is_bordered(rendered.placement) {
+        let block = Block::default()
+            .title(format!(" {} ", rendered.title))
+            .borders(Borders::ALL)
+            .border_style(theme.style(Role::PromptAccent))
+            .padding(MODAL_PADDING)
+            .style(theme.surface());
+        frame.render_widget(block, region);
+    }
 
     // Geometry comes from the same helper the stack used, so the surface is
     // drawn into exactly the area it scrolled itself against.

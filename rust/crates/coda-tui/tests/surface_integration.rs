@@ -509,3 +509,140 @@ fn a_control_chord_is_not_a_browser_key() {
         _ => panic!("Shift+U did not reach its action, so capitals are unreachable"),
     }
 }
+
+// ── FitContent integration tests ─────────────────────────────────────────────
+
+#[test]
+fn a_short_permission_prompt_is_more_compact_than_seventy_percent() {
+    // Before FitContent, a simple "write_file / src/main.rs" prompt occupied
+    // 70% × 70% of the terminal (about 16 rows on a 24-row terminal). Three
+    // lines of content in a 24-row terminal should not consume 16 rows.
+    let theme = Theme::default();
+    let area = Rect::new(0, 0, 80, 24);
+    let seventy_pct_h = area.height * 70 / 100; // 16
+
+    let mut stack = SurfaceStack::default();
+    stack.push(permission());
+
+    let rendered = stack.render(area, &theme);
+    assert_eq!(rendered.len(), 1);
+    assert!(
+        rendered[0].region.height < seventy_pct_h,
+        "short permission prompt occupies {} rows; expected less than {} (70% of {}) at {}x{}",
+        rendered[0].region.height,
+        seventy_pct_h,
+        area.height,
+        area.width,
+        area.height,
+    );
+}
+
+#[test]
+fn a_long_form_stays_within_the_terminal_and_scrolls() {
+    // A form taller than the terminal must be capped, not clipped off the
+    // bottom. The surface's scroll logic keeps the focused control visible.
+    use coda_tui::surface::mcp_editor::McpEditorSurface;
+
+    let theme = Theme::default();
+    // Use a terminal that is shorter than the full form but large enough to
+    // hold the modal chrome.
+    let area = Rect::new(0, 0, 80, 14);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(McpEditorSurface::creating()));
+
+    for rendered in stack.render(area, &theme) {
+        assert!(
+            rendered.region.bottom() <= area.bottom(),
+            "form region ({}) escaped terminal bottom ({}) at {}x{}",
+            rendered.region.bottom(),
+            area.bottom(),
+            area.width,
+            area.height,
+        );
+        assert!(
+            rendered.lines.len() <= rendered.content.height as usize,
+            "form produced {} lines into {} rows",
+            rendered.lines.len(),
+            rendered.content.height
+        );
+    }
+}
+
+#[test]
+fn fit_content_surface_degrades_to_full_on_narrow_terminal() {
+    // On a terminal too cramped for the modal chrome, the surface must fill
+    // the screen rather than rendering clipped or zero-sized.
+    let theme = Theme::default();
+    let cramped = Rect::new(0, 0, 15, 5);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(permission());
+
+    for rendered in stack.render(cramped, &theme) {
+        assert_eq!(
+            rendered.region, cramped,
+            "FitContent did not degrade to Full on a {}x{} terminal",
+            cramped.width, cramped.height,
+        );
+    }
+}
+
+#[test]
+fn fit_content_cursor_stays_inside_content_area() {
+    // The caret must never escape the content rect: a caret outside its area
+    // places the hardware cursor outside the modal and is invisible or wrong.
+    use coda_tui::surface::settings::SettingsSurface;
+
+    let theme = Theme::default();
+    let area = Rect::new(0, 0, 80, 24);
+
+    let mut stack = SurfaceStack::default();
+    stack.push(Box::new(SettingsSurface::new(&settings())));
+
+    for rendered in stack.render(area, &theme) {
+        if let Some((cx, cy)) = rendered.cursor {
+            let c = rendered.content;
+            assert!(
+                cx >= c.x && cx < c.right(),
+                "cursor column {cx} is outside content [{}, {})",
+                c.x, c.right()
+            );
+            assert!(
+                cy >= c.y && cy < c.bottom(),
+                "cursor row {cy} is outside content [{}, {})",
+                c.y, c.bottom()
+            );
+        }
+    }
+}
+
+#[test]
+fn fit_content_render_width_matches_content_rect_width() {
+    // The content.width in RenderedSurface must equal the width the surface
+    // rendered at. Any mismatch means the surface sized itself for one width
+    // and drew into another.
+    use coda_tui::surface::settings::SettingsSurface;
+
+    let theme = Theme::default();
+    let area = Rect::new(0, 0, 80, 24);
+
+    let mut stack = SurfaceStack::default();
+    let surface = SettingsSurface::new(&settings());
+    stack.push(Box::new(surface));
+
+    for rendered in stack.render(area, &theme) {
+        for line in &rendered.lines {
+            let width: usize = line
+                .spans
+                .iter()
+                .map(|s| coda_render::text::width(&s.content))
+                .sum();
+            assert!(
+                width <= rendered.content.width as usize,
+                "a rendered line ({width} cells) overflowed the content area ({} cells)",
+                rendered.content.width,
+            );
+        }
+    }
+}

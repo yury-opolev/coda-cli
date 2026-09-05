@@ -229,6 +229,10 @@ impl Surface for McpEditorSurface {
         }
     }
 
+    fn placement(&self) -> super::Placement {
+        super::Placement::FitContent { preferred_width: 72 }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
         let outcome = self.form.handle_key(key);
         self.rebuild_if_transport_changed();
