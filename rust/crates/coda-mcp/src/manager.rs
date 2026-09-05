@@ -24,8 +24,10 @@ use std::time::Duration;
 
 use tokio::sync::RwLock;
 
+use coda_auth::store::CredentialStore;
 use coda_tool::Tool;
 
+use crate::auth::{McpAuthMode, McpAuthProvider, McpOAuthProvider, StaticBearerAuthProvider};
 use crate::client::{McpClient, McpServerInfo, McpToolCallError, McpToolInfo, DEFAULT_CONNECT_TIMEOUT};
 use crate::config::{self, McpConnectable, McpHttpConnectable};
 use crate::error::{McpConnectError, McpError};
@@ -126,7 +128,7 @@ struct ServerEntry {
 #[derive(Clone)]
 enum ServerSpec {
     Stdio(Box<McpConnectable>),
-    Http(Box<config::McpHttpConnectable>),
+    Http(Box<config::McpHttpConnectable>, Option<Arc<dyn CredentialStore>>),
 }
 
 /// Connects configured MCP servers and exposes their tools.
@@ -151,15 +153,19 @@ impl McpClientManager {
     ///
     /// This method is designed to be called once at startup; calling it again
     /// adds more servers without removing existing ones.
+    ///
+    /// Resolve secret references before calling this method. Pass a
+    /// `credential_store` to enable cached OAuth credentials for HTTP servers.
     pub async fn connect_all(
         &self,
         user_mcp: &Path,
         project_mcp: &Path,
+        credential_store: Option<Arc<dyn CredentialStore>>,
     ) -> Vec<McpConnectError> {
         let connectable = config::load_connectable(user_mcp, project_mcp);
         let http_connectable = config::load_http_connectable(user_mcp, project_mcp);
         let mut errors = self.connect_many(connectable, None).await;
-        errors.extend(self.connect_http_many(http_connectable, None).await);
+        errors.extend(self.connect_http_many(http_connectable, None, credential_store).await);
         errors
     }
 
@@ -209,10 +215,16 @@ impl McpClientManager {
     }
 
     /// Connect HTTP servers from a supplied list.
+    ///
+    /// Pass a `credential_store` to enable OAuth (cached-token mode) and to
+    /// build static bearer providers from resolved secret references.
+    /// `None` is accepted but results in an explicit error for servers that
+    /// require authentication — never silently unauthenticated.
     pub async fn connect_http_many(
         &self,
         servers: Vec<McpHttpConnectable>,
         connect_timeout_override: Option<Duration>,
+        credential_store: Option<Arc<dyn CredentialStore>>,
     ) -> Vec<McpConnectError> {
         let connect_timeout = connect_timeout_override.unwrap_or(DEFAULT_HTTP_CONNECT_TIMEOUT);
         let tool_timeout = self.tool_timeout;
@@ -221,8 +233,9 @@ impl McpClientManager {
             .into_iter()
             .map(|cfg| {
                 let name = cfg.name.clone();
+                let store = credential_store.clone();
                 async move {
-                    let result = connect_one_http(&cfg, connect_timeout, tool_timeout).await;
+                    let result = connect_one_http(&cfg, connect_timeout, tool_timeout, store.as_ref()).await;
                     (name, result)
                 }
             })
@@ -388,8 +401,8 @@ impl McpClientManager {
             ServerSpec::Stdio(cfg) => {
                 connect_one_stdio(cfg, connect_timeout, tool_timeout).await
             }
-            ServerSpec::Http(cfg) => {
-                connect_one_http(cfg, connect_timeout, tool_timeout).await
+            ServerSpec::Http(cfg, store) => {
+                connect_one_http(cfg, connect_timeout, tool_timeout, store.as_ref()).await
             }
         };
 
@@ -441,12 +454,69 @@ async fn connect_one_http(
     config: &McpHttpConnectable,
     connect_timeout: Duration,
     tool_timeout: Duration,
+    credential_store: Option<&Arc<dyn CredentialStore>>,
 ) -> Result<ServerEntry, McpError> {
+    let auth: Option<Arc<dyn McpAuthProvider>> = match config.auth.mode {
+        McpAuthMode::None => None,
+        McpAuthMode::Bearer => {
+            match config.auth.bearer_token.as_ref().filter(|t| !t.expose().is_empty()) {
+                Some(token) => {
+                    Some(Arc::new(StaticBearerAuthProvider::new(token.expose().clone())))
+                }
+                None => {
+                    return Err(McpError::Http(
+                        "auth.mode is 'bearer' but no token is configured or the token \
+                         resolved to an empty value; check the auth.token field or the \
+                         credential store entry it references"
+                            .into(),
+                    ));
+                }
+            }
+        }
+        McpAuthMode::OAuth => {
+            match credential_store {
+                Some(store) => {
+                    // Non-interactive: use cached tokens from the credential store.
+                    // A 401 that cannot be resolved silently fails without opening a
+                    // browser; the user must authenticate via /mcp or `coda auth`.
+                    match reqwest::Url::parse(&config.url) {
+                        Ok(url) => {
+                            let http = reqwest::Client::new();
+                            let provider = McpOAuthProvider::new(
+                                http,
+                                &url,
+                                Arc::clone(store),
+                                config.auth.clone(),
+                                false, // headless: no browser
+                                None,
+                                None,
+                            );
+                            Some(Arc::new(provider) as Arc<dyn McpAuthProvider>)
+                        }
+                        Err(_) => {
+                            // URL will be validated (and will fail) in McpHttpClient::connect;
+                            // skip building the provider rather than duplicating the error.
+                            None
+                        }
+                    }
+                }
+                None => {
+                    return Err(McpError::Http(
+                        "auth.mode is 'oauth' but no credential store is available; \
+                         authenticate via `coda auth` or the /mcp commands first, then \
+                         restart the engine"
+                            .into(),
+                    ));
+                }
+            }
+        }
+    };
+
     let client = McpHttpClient::connect(
         &config.name,
         &config.url,
         &config.headers,
-        None, // auth provider would be injected by the caller in a future PR
+        auth,
         connect_timeout,
         tool_timeout,
     )
@@ -454,8 +524,197 @@ async fn connect_one_http(
     Ok(ServerEntry {
         client: AnyClient::Http(client),
         _process: None,
-        spec: ServerSpec::Http(Box::new(config.clone())),
+        spec: ServerSpec::Http(Box::new(config.clone()), credential_store.cloned()),
     })
+}
+
+// ── Test support (hermetic in-memory fake server) ────────────────────────────
+
+/// In-memory fake MCP server for hermetic integration tests, including in
+/// downstream crates via the `test-support` feature.
+///
+/// No process is spawned and no network is used: a fake server task is wired to
+/// a real [`McpClient`] over in-memory duplex pipes, so the full transport,
+/// handshake, `tools/list` and `tools/call` paths are exercised for real.
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use serde_json::{json, Value};
+    use tokio::io::{
+        duplex, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+    };
+
+    use super::{AnyClient, McpClientManager, ServerEntry, ServerSpec};
+    use crate::client::McpClient;
+    use crate::config::McpConnectable;
+
+    /// Handle to a running fake server, reporting how many `tools/call`
+    /// requests actually reached it. Used to prove that a denied tool never
+    /// causes a remote call.
+    #[derive(Clone)]
+    pub struct FakeServerHandle {
+        call_count: Arc<AtomicUsize>,
+    }
+
+    impl FakeServerHandle {
+        /// The number of `tools/call` requests the fake server has received.
+        pub fn call_count(&self) -> usize {
+            self.call_count.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Connect a fake in-memory stdio MCP server to `manager` under
+    /// `server_name`, advertising `tools` (a JSON array in MCP `tools/list`
+    /// shape). Every `tools/call` returns `result_text` and increments the
+    /// returned handle's counter.
+    pub async fn connect_fake_server(
+        manager: &Arc<McpClientManager>,
+        server_name: &str,
+        tools: Value,
+        result_text: impl Into<String>,
+    ) -> FakeServerHandle {
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let result_text = result_text.into();
+
+        let (server_out, client_in) = duplex(64 * 1024);
+        let (client_out, server_in) = duplex(64 * 1024);
+
+        let counter = Arc::clone(&call_count);
+        tokio::spawn(async move {
+            fake_server_loop(server_in, server_out, tools, result_text, counter).await;
+        });
+
+        let client = McpClient::connect(
+            client_in,
+            client_out,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("fake MCP server handshake must succeed");
+
+        let mut guard = manager.servers.write().await;
+        guard.insert(
+            server_name.to_string(),
+            ServerEntry {
+                client: AnyClient::Stdio(client),
+                _process: None,
+                spec: ServerSpec::Stdio(Box::new(McpConnectable {
+                    name: server_name.to_string(),
+                    command: "fake-in-memory".into(),
+                    args: Vec::new(),
+                    env: Default::default(),
+                })),
+            },
+        );
+
+        FakeServerHandle { call_count }
+    }
+
+    async fn fake_server_loop<R, W>(
+        mut reader: R,
+        mut writer: W,
+        tools: Value,
+        result_text: String,
+        counter: Arc<AtomicUsize>,
+    ) where
+        R: AsyncRead + Unpin,
+        W: AsyncWrite + Unpin,
+    {
+        while let Some(msg) = read_line(&mut reader).await {
+            let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+            let id = msg.get("id").cloned();
+            match method {
+                "initialize" => {
+                    write_line(
+                        &mut writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "protocolVersion": "2025-06-18",
+                                "serverInfo": { "name": "fake", "version": "1" },
+                                "capabilities": {}
+                            }
+                        }),
+                    )
+                    .await;
+                }
+                // Client notification; no response expected.
+                "notifications/initialized" => {}
+                "tools/list" => {
+                    write_line(
+                        &mut writer,
+                        json!({ "jsonrpc": "2.0", "id": id, "result": { "tools": tools } }),
+                    )
+                    .await;
+                }
+                "tools/call" => {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    write_line(
+                        &mut writer,
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": id,
+                            "result": {
+                                "content": [{ "type": "text", "text": result_text }],
+                                "isError": false
+                            }
+                        }),
+                    )
+                    .await;
+                }
+                "shutdown" => {
+                    if id.is_some() {
+                        write_line(
+                            &mut writer,
+                            json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                        )
+                        .await;
+                    }
+                    break;
+                }
+                _ => {
+                    // Answer any other request so the client never blocks.
+                    if id.is_some() {
+                        write_line(
+                            &mut writer,
+                            json!({ "jsonrpc": "2.0", "id": id, "result": {} }),
+                        )
+                        .await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Read one newline-delimited JSON value. `None` on EOF.
+    async fn read_line<R: AsyncRead + Unpin>(reader: &mut R) -> Option<Value> {
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match reader.read_exact(&mut byte).await {
+                Ok(_) => {
+                    if byte[0] == b'\n' {
+                        break;
+                    }
+                    line.push(byte[0]);
+                }
+                Err(_) => return None, // EOF or closed pipe
+            }
+        }
+        serde_json::from_slice::<Value>(line.trim_ascii()).ok()
+    }
+
+    /// Write one newline-delimited JSON value.
+    async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, value: Value) {
+        let s = serde_json::to_string(&value).expect("serialise fake response");
+        let _ = writer.write_all(format!("{s}\n").as_bytes()).await;
+        let _ = writer.flush().await;
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

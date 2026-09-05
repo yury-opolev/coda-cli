@@ -41,6 +41,7 @@ use coda_llm::{
     ChatRequest, Content, CopilotClient, CopilotConfig,
     CredentialSource, Effort, LlmClient, Message, Role,
 };
+use coda_mcp::McpClientManager;
 use coda_proto::messages::PROTOCOL_VERSION;
 use serde::Serialize;
 use serde_json::{Value, json};
@@ -53,6 +54,7 @@ use crate::dispatch::{
     ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams, SteerParams,
 };
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
+use crate::mcp::McpBundle;
 use crate::session::{Session, SteeringLogEntry};
 use crate::sink::ServeSink;
 
@@ -333,6 +335,12 @@ pub struct ServeHost {
     user_hooks: Vec<UserHook>,
     /// SubagentHost, HookRunner, ScheduleRuntime — built lazily on first prompt.
     session_services: tokio::sync::Mutex<Option<Arc<SessionServices>>>,
+    /// Live MCP manager for connected servers; `None` when MCP is disabled or
+    /// no servers are configured. Retained so the servers can be shut down.
+    mcp_manager: Option<Arc<McpClientManager>>,
+    /// MCP connection/config failures to surface to the user on `initialize`,
+    /// once a client is listening. Drained when emitted.
+    pending_mcp_notices: Mutex<Vec<String>>,
     /// Set by `session/interrupt` when no cancel token is yet published.
     /// Cleared and applied immediately when the next turn publishes its token.
     pending_interrupt: Mutex<bool>,
@@ -340,13 +348,20 @@ pub struct ServeHost {
 
 impl ServeHost {
     /// Production constructor — client starts as `None` until `initialize`.
+    ///
+    /// MCP is intentionally **not** connected here: MCP startup is async and
+    /// must be completed before the host is built. In `serve_stdio`, call
+    /// `connect_mcp` first and pass the resulting [`McpBundle`] to
+    /// [`ServeHost::new_with_optional_client_and_mcp`] instead. This
+    /// constructor is only used in tests and in contexts where no MCP is
+    /// needed.
     pub fn new(
         sink: Arc<ServeSink>,
         prompt_channel: Arc<PromptChannel>,
         working_dir: String,
     ) -> Arc<Self> {
         // No pre-built client: model resolved from settings.defaultProvider fallback.
-        Self::build(None, sink, prompt_channel, working_dir, None)
+        Self::build(None, sink, prompt_channel, working_dir, None, McpBundle::disabled())
     }
 
     /// Test constructor — pre-built client is injected directly.
@@ -358,7 +373,37 @@ impl ServeHost {
     ) -> Arc<Self> {
         // Finding 3: resolve model from the credential that is actually connected.
         let provider_id = client.provider_id().to_owned();
-        Self::build(Some(client), sink, prompt_channel, working_dir, Some(&provider_id))
+        Self::build(Some(client), sink, prompt_channel, working_dir, Some(&provider_id), McpBundle::disabled())
+    }
+
+    /// Construct with an optional client and a pre-connected MCP bundle.
+    ///
+    /// This is the production entry used by the stdio transport: the MCP
+    /// servers are connected before the host is built (connecting is async;
+    /// the registry is immutable once assembled), then handed in here.
+    pub(crate) fn new_with_optional_client_and_mcp(
+        client: Option<Arc<dyn LlmClient>>,
+        sink: Arc<ServeSink>,
+        prompt_channel: Arc<PromptChannel>,
+        working_dir: String,
+        mcp: McpBundle,
+    ) -> Arc<Self> {
+        let provider_id = client.as_ref().map(|c| c.provider_id().to_owned());
+        Self::build(client, sink, prompt_channel, working_dir, provider_id.as_deref(), mcp)
+    }
+
+    /// Test constructor — injects a client together with an MCP bundle so
+    /// integration tests can exercise the full MCP tool path hermetically.
+    #[cfg(test)]
+    pub(crate) fn new_with_client_and_mcp(
+        client: Arc<dyn LlmClient>,
+        sink: Arc<ServeSink>,
+        prompt_channel: Arc<PromptChannel>,
+        working_dir: String,
+        mcp: McpBundle,
+    ) -> Arc<Self> {
+        let provider_id = client.provider_id().to_owned();
+        Self::build(Some(client), sink, prompt_channel, working_dir, Some(&provider_id), mcp)
     }
 
     fn build(
@@ -367,6 +412,7 @@ impl ServeHost {
         prompt_channel: Arc<PromptChannel>,
         working_dir: String,
         connected_provider: Option<&str>,
+        mcp: McpBundle,
     ) -> Arc<Self> {
         let wire_perm = Arc::new(WirePermissionPrompt { channel: Arc::clone(&prompt_channel) });
         // The mode state is held by the host rather than buried inside the
@@ -380,7 +426,15 @@ impl ServeHost {
         );
         let user_question = Arc::new(WireUserQuestion { channel: Arc::clone(&prompt_channel) });
         let plan_approver = Arc::new(WirePlanApprover { channel: Arc::clone(&prompt_channel) });
-        let tools = Arc::new(ToolRegistry::new(built_in_tools()));
+
+        // Built-ins first, then MCP tools + management tools. The registry is
+        // last-write-wins on name collision; MCP names are `mcp__…`-prefixed so
+        // they cannot shadow a built-in. This same shared registry is handed to
+        // the subagent host, so subagents see the MCP tools too.
+        let McpBundle { tools: mcp_tools, manager: mcp_manager, notices: mcp_notices } = mcp;
+        let tools = Arc::new(ToolRegistry::new(
+            built_in_tools().into_iter().chain(mcp_tools),
+        ));
 
         // Resolve startup model from the connected provider (Finding 3).
         let startup = crate::settings::resolve_for_provider(connected_provider);
@@ -418,6 +472,8 @@ impl ServeHost {
             hook_trust_store,
             user_hooks,
             session_services: tokio::sync::Mutex::new(None),
+            mcp_manager,
+            pending_mcp_notices: Mutex::new(mcp_notices),
             pending_interrupt: Mutex::new(false),
         })
     }
@@ -623,6 +679,18 @@ impl ServeBackend for ServeHost {
             server_info: "coda".into(),
             telemetry_log_path: None,
         };
+
+        // Surface any MCP connection/config failures now that a client is
+        // listening. A broken optional server must be reported, never hidden,
+        // and never turned into a hard failure of the session.
+        let notices: Vec<String> = {
+            let mut pending = self.pending_mcp_notices.lock().expect("mcp notices poisoned");
+            std::mem::take(&mut *pending)
+        };
+        for message in notices {
+            self.sink.emit(AgentEvent::Error { message });
+        }
+
         serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
     }
 
@@ -634,6 +702,10 @@ impl ServeBackend for ServeHost {
         let services = self.session_services.lock().await.clone();
         if let Some(svc) = services {
             svc.schedule_runtime.shutdown().await;
+        }
+        // Shut down any connected MCP servers so child processes do not leak.
+        if let Some(manager) = &self.mcp_manager {
+            manager.shutdown().await;
         }
         Ok(json!({ "ok": true }))
     }
@@ -1420,7 +1492,10 @@ pub(crate) fn build_anthropic(key: &str) -> Option<Arc<dyn LlmClient>> {
 ///
 /// The keyring and encrypted-file stores remain as fallbacks for credentials
 /// written by the Rust build itself, and for non-Windows hosts.
-fn credential_store() -> Arc<dyn CredentialStore> {
+///
+/// `pub(crate)` so that `mcp.rs` can use the same store for MCP secret
+/// resolution without duplicating platform-selection logic.
+pub(crate) fn credential_store() -> Arc<dyn CredentialStore> {
     #[cfg(windows)]
     {
         let dpapi = DpapiStore::default_location();
@@ -2822,5 +2897,238 @@ mod tests {
             assert_eq!(result["ok"], false, "{blank:?} was accepted");
         }
         assert_eq!(host.current_model(), before, "the model was blanked");
+    }
+
+    // ── MCP engine integration ────────────────────────────────────────────────
+
+    /// Builds an MCP bundle backed by an in-memory fake server advertising one
+    /// tool named `tool_name` that returns `result_text`. Returns the bundle,
+    /// the live manager, and a handle counting how many `tools/call` requests
+    /// actually reach the server. Fully hermetic: no process, no network.
+    async fn fake_mcp_bundle(
+        tool_name: &str,
+        result_text: &str,
+    ) -> (McpBundle, Arc<McpClientManager>, coda_mcp::manager::test_support::FakeServerHandle) {
+        use coda_mcp::manager::test_support::connect_fake_server;
+
+        let manager = Arc::new(McpClientManager::new());
+        let tools_json = serde_json::json!([{
+            "name": tool_name,
+            "description": "fake echo tool",
+            "inputSchema": { "type": "object", "properties": {} }
+        }]);
+        let handle = connect_fake_server(&manager, "fake-server", tools_json, result_text).await;
+
+        let mut tools = manager.tools().await;
+        tools.extend(coda_mcp::management_tools::mcp_management_tools(Arc::clone(&manager)));
+
+        let bundle = McpBundle {
+            tools,
+            manager: Some(Arc::clone(&manager)),
+            notices: Vec::new(),
+        };
+        (bundle, manager, handle)
+    }
+
+    fn host_with_mcp(client: Arc<dyn LlmClient>, mcp: McpBundle) -> Arc<ServeHost> {
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        ServeHost::new_with_client_and_mcp(client, sink, ch, ".".into(), mcp)
+    }
+
+    /// The primary blocker: with MCP wired, an advertised tool must be
+    /// registered as a deferred (tool_search-discoverable) tool, reach the
+    /// model as a callable tool, pass the permission gate, and execute against
+    /// the remote server.
+    #[tokio::test]
+    async fn mcp_tool_is_registered_deferred_and_executes_through_permission_gate() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+
+        let (bundle, _manager, handle) = fake_mcp_bundle("echo", "fake-result").await;
+        let tool_name = coda_mcp::tool::namespaced_name("fake-server", "echo");
+
+        let client = ScriptedClient::new(vec![
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: "call-1".into(),
+                    name: tool_name.clone(),
+                    input_json: "{}".into(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done {
+                    stop_reason: Some("tool_use".into()),
+                    usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::ZERO },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("done".into()),
+                StreamEvent::Done {
+                    stop_reason: Some("end_turn".into()),
+                    usage: Usage { input_tokens: 20, output_tokens: 5, ..Usage::ZERO },
+                },
+            ],
+        ]);
+
+        let host = host_with_mcp(client, bundle);
+
+        // The tool is in the same registry that is cloned into the subagent
+        // host (build_session_services does `Arc::clone(&self.tools)`), so this
+        // also proves subagents see it.
+        let registered =
+            host.tools.resolve(&tool_name).expect("mcp tool must be registered in the engine");
+        assert!(registered.should_defer(), "mcp tools must be deferred (tool_search only)");
+        assert!(!registered.is_read_only(), "mcp tools must never be read-only");
+
+        // Allow the tool to run.
+        host.permission_mode.set(PermissionMode::BypassPermissions);
+
+        let result = host
+            .session_prompt(PromptParams { text: Some("use echo".into()), images: None })
+            .await
+            .expect("session_prompt must succeed");
+        assert_eq!(result["ok"], true, "prompt must succeed: {result:?}");
+
+        assert_eq!(
+            handle.call_count(),
+            1,
+            "the allowed tool must reach the remote server exactly once"
+        );
+
+        let history = host.session.history.lock().expect("history poisoned").clone();
+        let content = history
+            .iter()
+            .find_map(|msg| {
+                msg.content.iter().find_map(|b| match b {
+                    Content::ToolResult { tool_use_id, content, .. } if tool_use_id == "call-1" => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .expect("the MCP tool result must be in history");
+        assert!(
+            content.contains("fake-result"),
+            "the tool result must carry the remote output: {content:?}"
+        );
+    }
+
+    /// The permission gate must gate MCP tools: a denial (here via Plan mode)
+    /// must stop the tool before any remote call is made.
+    #[tokio::test]
+    async fn denied_mcp_tool_never_reaches_the_remote_server() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::{Content, Correlation, Usage};
+
+        let (bundle, _manager, handle) = fake_mcp_bundle("echo", "should-not-run").await;
+        let tool_name = coda_mcp::tool::namespaced_name("fake-server", "echo");
+
+        let client = ScriptedClient::new(vec![
+            vec![
+                StreamEvent::ToolUse(Content::ToolUse {
+                    id: "call-1".into(),
+                    name: tool_name.clone(),
+                    input_json: "{}".into(),
+                    correlation: Correlation::default(),
+                }),
+                StreamEvent::Done {
+                    stop_reason: Some("tool_use".into()),
+                    usage: Usage { input_tokens: 10, output_tokens: 5, ..Usage::ZERO },
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("understood".into()),
+                StreamEvent::Done {
+                    stop_reason: Some("end_turn".into()),
+                    usage: Usage { input_tokens: 20, output_tokens: 5, ..Usage::ZERO },
+                },
+            ],
+        ]);
+
+        let host = host_with_mcp(client, bundle);
+
+        // Plan mode denies mutating tools without an interactive prompt.
+        host.permission_mode.set(PermissionMode::Plan);
+
+        host.session_prompt(PromptParams { text: Some("use echo".into()), images: None })
+            .await
+            .expect("session_prompt must succeed even when a tool is denied");
+
+        assert_eq!(
+            handle.call_count(),
+            0,
+            "a denied tool must NEVER reach the remote server"
+        );
+
+        let history = host.session.history.lock().expect("history poisoned").clone();
+        let content = history
+            .iter()
+            .find_map(|msg| {
+                msg.content.iter().find_map(|b| match b {
+                    Content::ToolResult { tool_use_id, content, .. } if tool_use_id == "call-1" => {
+                        Some(content.clone())
+                    }
+                    _ => None,
+                })
+            })
+            .expect("a denied tool must still produce a ToolResult block");
+        assert!(
+            content.contains("Permission denied"),
+            "denied tool result must say so: {content:?}"
+        );
+    }
+
+    /// `shutdown` must tear down the MCP servers so their child processes do
+    /// not leak; after it, the servers are gone.
+    #[tokio::test]
+    async fn shutdown_disconnects_mcp_servers() {
+        let (bundle, manager, _handle) = fake_mcp_bundle("echo", "x").await;
+        let client = ScriptedClient::new(vec![]);
+        let host = host_with_mcp(client, bundle);
+
+        // Before shutdown the server answers.
+        assert!(
+            manager.call_tool("fake-server", "echo", &serde_json::json!({})).await.is_ok(),
+            "server must be connected before shutdown"
+        );
+
+        host.shutdown().await.expect("shutdown must succeed");
+
+        assert!(
+            manager.call_tool("fake-server", "echo", &serde_json::json!({})).await.is_err(),
+            "after shutdown the MCP server must be disconnected"
+        );
+    }
+
+    /// MCP connection/config failures collected at startup must be surfaced to
+    /// the user via an `event/error` notification on `initialize`, and drained
+    /// so they are not repeated.
+    #[tokio::test]
+    async fn mcp_connection_failures_are_surfaced_on_initialize() {
+        let bundle = McpBundle {
+            tools: Vec::new(),
+            manager: None,
+            notices: vec!["MCP server 'broken' failed to start and was skipped: boom".into()],
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let client = ScriptedClient::new(vec![]);
+        let host = ServeHost::new_with_client_and_mcp(client, sink, ch, ".".into(), bundle);
+
+        host.initialize(InitParams::default()).await.expect("initialize");
+
+        let frame = rx.try_recv().expect("a notice must be emitted on initialize");
+        let text = String::from_utf8(frame).expect("utf8");
+        assert!(text.contains("event/error"), "notice must be an event/error: {text}");
+        assert!(text.contains("broken"), "notice must name the failing server: {text}");
+
+        // Drained: a second initialize emits nothing further.
+        host.initialize(InitParams::default()).await.expect("second initialize");
+        assert!(
+            rx.try_recv().is_err(),
+            "startup notices must be surfaced once, not on every initialize"
+        );
     }
 }

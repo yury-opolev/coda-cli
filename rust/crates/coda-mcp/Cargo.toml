@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 description = "MCP (Model Context Protocol) client for the Coda agent."
 
+[features]
+## Exposes an in-memory fake MCP server for hermetic integration tests in
+## downstream crates (e.g. coda-serve). Never enabled in production builds.
+test-support = []
+
 [dependencies]
 coda-proto.workspace = true
 coda-tool.workspace = true

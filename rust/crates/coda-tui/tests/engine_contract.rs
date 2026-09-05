@@ -27,6 +27,10 @@ fn engine_command() -> Option<EngineCommand> {
         Ok(status) if status.success() => Some(
             EngineCommand::new(program)
                 .arg("serve")
+                // Keep the contract test hermetic: never auto-start the
+                // developer's real MCP servers just because they exist in
+                // ~/.coda/.mcp.json.
+                .env("CODA_SERVE_DISABLE_MCP", "1")
                 .working_dir(std::env::temp_dir()),
         ),
         _ => None,
