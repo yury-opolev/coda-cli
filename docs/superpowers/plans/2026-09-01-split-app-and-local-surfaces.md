@@ -457,7 +457,7 @@ git commit -m "Give each browser its own row actions"
       compile error until it says what its rows do.)*
 - [x] No behaviour change: every existing test passes unmodified except where a
       test moved file with the code it covers.
-- [ ] `.\build.ps1 -Deploy` produces a working `coda-rs.exe` at the bumped version.
+- [ ] `.\build.ps1 -Deploy` installs the native `coda` at the bumped version via the `Coda.Cli` .NET tool.
 
 ### Deviation: how "not dispatched by kind" is measured
 

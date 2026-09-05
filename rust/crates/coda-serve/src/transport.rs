@@ -34,7 +34,11 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
         .unwrap_or_else(|_| ".".into());
     // Full credential probe at startup (env + keyring).
     let client = crate::host::try_build_client(None).await;
-    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir).await
+    // Connect enabled MCP servers before the host is built so their tools are
+    // in the registry from the first turn. Disabled/failed servers are handled
+    // inside `connect_mcp` and never block startup.
+    let mcp = crate::mcp::connect_mcp(&working_dir).await;
+    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir, mcp).await
 }
 
 /// Runs the engine on the given reader/writer pair.
@@ -47,7 +51,8 @@ where
     let working_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    serve_inner(reader, writer, None, working_dir).await
+    // Tests never touch the real MCP config: MCP is disabled for the pipe path.
+    serve_inner(reader, writer, None, working_dir, crate::mcp::McpBundle::disabled()).await
 }
 
 /// Runs the engine with a pre-built client (used by integration tests so
@@ -63,7 +68,7 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    serve_inner(reader, writer, Some(client), working_dir.to_string()).await
+    serve_inner(reader, writer, Some(client), working_dir.to_string(), crate::mcp::McpBundle::disabled()).await
 }
 
 async fn serve_inner<R, W>(
@@ -71,6 +76,7 @@ async fn serve_inner<R, W>(
     writer: W,
     client: Option<Arc<dyn LlmClient>>,
     working_dir: String,
+    mcp: crate::mcp::McpBundle,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -80,10 +86,13 @@ where
     let prompt_channel = Arc::new(PromptChannel::new(outgoing_tx.clone()));
     let sink = Arc::new(ServeSink::new(outgoing_tx.clone()));
 
-    let backend = match client {
-        Some(c) => ServeHost::new_with_client(c, sink, Arc::clone(&prompt_channel), working_dir),
-        None => ServeHost::new(sink, Arc::clone(&prompt_channel), working_dir),
-    };
+    let backend = ServeHost::new_with_optional_client_and_mcp(
+        client,
+        sink,
+        Arc::clone(&prompt_channel),
+        working_dir,
+        mcp,
+    );
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
 

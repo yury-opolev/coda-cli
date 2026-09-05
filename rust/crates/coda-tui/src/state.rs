@@ -8,6 +8,7 @@ use coda_proto::events::ToolCallStatus;
 use coda_proto::{Correlation, Event};
 use coda_render::tool::{CallStatus, ToolActivity, ToolCall, ToolDisplayMode};
 
+use crate::hint::HintQueue;
 use crate::transcript::{same_call, ActivityKey, Block, NoticeLevel, PermissionDecision, Transcript};
 
 /// What the agent is currently doing, shown in the status line.
@@ -197,13 +198,13 @@ pub struct UiState {
     /// same state twice gives the same picture and the render tests stay
     /// deterministic.
     pub spinner: usize,
-    /// A passing message for the line above the composer.
+    /// Priority queue of transient hint-line messages.
     ///
     /// For things worth saying once and not worth keeping — "copied 412
-    /// characters". Putting them in the transcript instead made a permanent
-    /// record of an ephemeral fact, and pushed the conversation up the screen
-    /// to do it.
-    pub hint: Option<String>,
+    /// characters", "press Ctrl+C again to exit".  The highest-priority
+    /// non-expired entry wins; when all entries age out the draw layer falls
+    /// back to scroll guidance.
+    pub hints: HintQueue,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
 }
@@ -230,7 +231,7 @@ impl UiState {
             assistant_buffer: None,
             buffer_rewritten_by_hook: false,
             spinner: 0,
-            hint: None,
+            hints: HintQueue::new(),
 
             clock: default_timestamp,
         }

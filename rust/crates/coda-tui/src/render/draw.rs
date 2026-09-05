@@ -3,6 +3,8 @@
 //! The screen is three stacked regions — transcript, composer, status — with an
 //! optional scrollbar down the right edge and overlays drawn on top.
 
+use std::time::Instant;
+
 use coda_render::text;
 use coda_render::theme::{Role, Theme};
 use coda_render::RenderLine;
@@ -220,8 +222,9 @@ pub fn draw(
     viewport: &Viewport,
     rows: &[RenderLine],
     theme: &Theme,
+    now: Instant,
 ) {
-    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None);
+    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None, now);
 }
 
 /// Draws the whole screen, optionally showing a pin row at the top of the
@@ -243,6 +246,7 @@ pub fn draw_with_pin(
     theme: &Theme,
     pin_text: Option<&str>,
     selection: Option<&crate::selection::TranscriptSelection>,
+    now: Instant,
 ) -> (u16, u16) {
     let area = frame.area();
     frame.render_widget(
@@ -268,7 +272,7 @@ pub fn draw_with_pin(
         draw_scrollbar(frame, scrollbar, viewport, theme);
     }
     if let Some(hint) = regions.hint {
-        draw_hint(frame, hint, state, viewport, theme);
+        draw_hint(frame, hint, state, viewport, theme, now);
     }
     draw_composer(frame, regions.composer, composer, theme);
     // After the composer, so it floats above it rather than under it.
@@ -323,9 +327,12 @@ fn draw_header(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
 /// Being scrolled away outranks a passing notice, and shows the way back for
 /// as long as it applies — not only while something new is arriving. A reader
 /// who has stopped following has no other indication that the view is frozen,
-/// and a stale "copied" message must not hide it.
-fn draw_hint(frame: &mut Frame, area: Rect, state: &UiState, viewport: &Viewport, theme: &Theme) {
-    let (text, role) = if !viewport.is_following() {
+/// and a stale "copied" message must not hide it. Armed cancellation/exit
+/// chords take precedence over both so their confirmation is always visible.
+fn draw_hint(frame: &mut Frame, area: Rect, state: &UiState, viewport: &Viewport, theme: &Theme, now: Instant) {
+    let (text, role) = if let Some(chord) = state.hints.current_chord(now) {
+        (chord.to_string(), Role::Notification)
+    } else if !viewport.is_following() {
         let catch_up = "Ctrl+End to catch up";
         // Lines, not messages. The count is rows of rendered transcript, and
         // calling five rows "5 new" reads as five messages — which is how a
@@ -338,7 +345,7 @@ fn draw_hint(frame: &mut Frame, area: Rect, state: &UiState, viewport: &Viewport
         };
         (text, Role::PendingUser)
     } else {
-        match state.hint.as_deref() {
+        match state.hints.current(now) {
             Some(hint) => (hint.to_string(), Role::Notification),
             None => (String::new(), Role::Notification),
         }
@@ -873,6 +880,33 @@ mod tests {
     }
 
     #[test]
+    fn chord_hint_overrides_scroll_guidance_until_expiry() {
+        let now = Instant::now();
+        let ttl = std::time::Duration::from_millis(1500);
+        let mut state = UiState::new();
+        state.hints.push_transient("Copied text", now);
+        state.hints.push_chord("Press Ctrl+C again to exit.", ttl, now);
+        let mut viewport = Viewport::new();
+        viewport.update(100, 10);
+        viewport.scroll_up(5);
+        let mut terminal = ratatui::Terminal::new(
+            ratatui::backend::TestBackend::new(80, 1),
+        ).unwrap();
+        for (at, expected) in [
+            (now, "Press Ctrl+C again to exit."),
+            (now + ttl, "Ctrl+End to catch up"),
+        ] {
+            terminal.draw(|frame| {
+                draw_hint(frame, frame.area(), &state, &viewport, &theme(), at);
+            }).unwrap();
+            let rendered: String = terminal.backend().buffer().content()
+                .iter().map(|cell| cell.symbol()).collect();
+            assert!(rendered.contains(expected), "{rendered}");
+            assert!(!rendered.contains("Copied text"));
+        }
+    }
+
+    #[test]
     fn the_composer_stops_growing_at_its_cap() {
         let regions = layout(area(80, 40), 50, false);
         assert_eq!(regions.composer.height, COMPOSER_MAX_ROWS + 2);
@@ -1092,4 +1126,3 @@ mod tests {
         }
     }
 }
-

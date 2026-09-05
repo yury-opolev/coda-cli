@@ -9,6 +9,7 @@ license.workspace = true
 coda-proto = { workspace = true }
 coda-agent = { workspace = true }
 coda-tool = { workspace = true }
+coda-mcp = { workspace = true }
 coda-llm = { workspace = true }
 coda-auth = { workspace = true }
 
@@ -27,3 +28,4 @@ directories = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "macros", "time"] }
 tempfile = "3"
+coda-mcp = { workspace = true, features = ["test-support"] }

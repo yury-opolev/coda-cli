@@ -319,6 +319,7 @@ impl App {
                 break;
             }
             self.tick_spinner();
+            self.dirty |= self.state.hints.prune(std::time::Instant::now());
             self.maybe_redraw(guard)?;
             self.arm_spinner_wakeup();
         }
@@ -462,6 +463,7 @@ impl App {
             self.copy_selection_via_pointer();
             self.selection.clear();
             self.armed = None;
+            self.state.hints.clear_chord();
             self.dirty = true;
             return;
         }
@@ -473,6 +475,7 @@ impl App {
         // consecutive presses of the same key.
         if !matches!(action, Action::Arm(_)) {
             self.armed = None;
+            self.state.hints.clear_chord();
         }
 
         match action {
@@ -583,14 +586,19 @@ impl App {
             }
             Action::Arm(chord) => {
                 self.armed = Some((chord, std::time::Instant::now()));
-                let hint = match chord {
+                let hint_text = match chord {
                     keymap::Chord::Exit if self.state.is_busy() => {
                         "Press Ctrl+C again to stop the turn."
                     }
                     keymap::Chord::Exit => "Press Ctrl+C again to exit.",
                     keymap::Chord::Interrupt => "Press Esc again to stop the turn.",
                 };
-                self.notice(hint, NoticeLevel::Info);
+                self.state.hints.push_chord(
+                    hint_text,
+                    keymap::CHORD_WINDOW,
+                    std::time::Instant::now(),
+                );
+                self.dirty = true;
             }
             Action::Quit => self.state.should_quit = true,
             Action::Repaint => {
@@ -998,18 +1006,43 @@ impl App {
         }
     }
 
-    /// Wakes the loop when the next indicator frame is due.
+    /// Wakes the loop when the next indicator frame or hint expiry is due.
     ///
     /// Without this the loop blocks in `select!` until an event arrives, and
     /// the indicator freezes during precisely the long waits it exists to
     /// cover. Never displaces an already-armed deadline, which is a redraw
     /// falling due sooner.
+    ///
+    /// Also arms a wakeup for the next hint expiry so transient messages
+    /// disappear on time even when no other events are arriving.
     fn arm_spinner_wakeup(&mut self) {
-        if !self.state.activity.is_animated() || self.frame_deadline.is_some() {
+        if self.frame_deadline.is_some() {
             return;
         }
-        self.frame_deadline =
-            Some(tokio::time::Instant::now() + Duration::from_millis(SPINNER_FRAME_MS));
+        let now = std::time::Instant::now();
+
+        let mut deadline: Option<std::time::Instant> = None;
+
+        // Spinner wakeup (only when animated).
+        if self.state.activity.is_animated() {
+            let spinner_due = now + Duration::from_millis(SPINNER_FRAME_MS);
+            deadline = Some(match deadline {
+                Some(d) => d.min(spinner_due),
+                None => spinner_due,
+            });
+        }
+
+        // Hint expiry wakeup.
+        if let Some(expiry) = self.state.hints.next_expiry(now) {
+            deadline = Some(match deadline {
+                Some(d) => d.min(expiry),
+                None => expiry,
+            });
+        }
+
+        if let Some(d) = deadline {
+            self.frame_deadline = Some(tokio::time::Instant::from_std(d));
+        }
     }
 
     fn maybe_redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
@@ -1120,7 +1153,7 @@ impl App {
         guard.terminal().hide_cursor()?;
         guard.terminal().draw(|frame| {
             origin = draw::draw_with_pin(
-                frame, state, composer, viewport, rows, theme, pin, selection,
+                frame, state, composer, viewport, rows, theme, pin, selection, std::time::Instant::now(),
             );
             // Surfaces draw last and bottom-up, so a detail sits over its list
             // and the whole stack sits over the shell. Rendered as a second
@@ -1183,7 +1216,7 @@ impl App {
     /// record of the conversation; "copied 412 characters" is not part of it,
     /// and putting it there pushed the conversation up the screen to say so.
     pub(super) fn hint(&mut self, text: impl Into<String>) {
-        self.state.hint = Some(text.into());
+        self.state.hints.push_transient(text, std::time::Instant::now());
         self.dirty = true;
     }
 
@@ -1511,4 +1544,3 @@ fn is_critical_event(event: &UiEvent) -> bool {
         UiEvent::CommandOutput { .. } | UiEvent::DiffOutput { .. } => true,
     }
 }
-

@@ -768,6 +768,7 @@ dependencies = [
  "coda-agent",
  "coda-auth",
  "coda-llm",
+ "coda-mcp",
  "coda-proto",
  "coda-tool",
  "directories",

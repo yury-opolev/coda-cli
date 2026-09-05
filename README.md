@@ -1,16 +1,19 @@
 # Coda
 
-**Coda is a native C# / .NET 10 agentic coding assistant for the terminal.** You
+**Coda is a native Rust/ratatui agentic coding assistant for the terminal.** You
 talk to it in plain language; it reads and edits your code, runs commands, searches
 the web, and drives multi-step work to completion through an **agentic tool-use
 loop** — with you in control of what it's allowed to do. It connects to Claude
 (via Claude.ai subscription OAuth or an Anthropic API key) and to GitHub Copilot,
 talking to the Anthropic Messages API natively.
 
-Coda ships two front-ends over one engine: an **interactive TUI** for humans, and a
-**programmatic `coda serve` API** so an orchestrator can drive Coda as a coding
-subagent. The same engine is also embeddable in-process as a .NET library
-(`Coda.Sdk`).
+Coda ships two front-ends over one engine: an **interactive TUI** (built with
+[ratatui](https://ratatui.rs)) for humans, and a **programmatic `coda serve` API**
+so an orchestrator can drive Coda as a coding subagent.
+
+> The engine is written in C# / .NET 10 and is also embeddable in-process as a
+> .NET library (`Coda.Sdk`). The C# TUI is the legacy front-end; the Rust/ratatui
+> TUI is the primary going-forward distribution.
 
 > **API reference:** the programmatic interface — the `coda serve` JSON-RPC
 > protocol, its transports/authentication, and the embeddable `Coda.Sdk` — is
@@ -19,38 +22,46 @@ subagent. The same engine is also embeddable in-process as a .NET library
 
 ## Quick start
 
-> **Prerequisites:** Windows (the TUI uses DPAPI for credential storage) and the
-> [.NET 10 SDK](https://dotnet.microsoft.com/download).
+> **Prerequisites:** Windows (the TUI uses DPAPI for credential storage). A
+> [.NET 10 SDK](https://dotnet.microsoft.com/download) is only needed if you
+> install via the `.NET global tool` method; the standalone binary has no
+> runtime dependency.
 
 ```powershell
-# 1. Clone and install as a global tool named `coda`:
+# Option A — install as a .NET global tool named `coda` (needs .NET 10 SDK):
 git clone https://github.com/yury-opolev/coda-cli.git
 cd coda-cli
-./publish.ps1 -Flavor tool
+./rust/build.ps1 -NoBump      # build the Rust binary (requires Rust toolchain)
+./publish.ps1 -Flavor tool    # pack the launcher nupkg
 dotnet tool install --global --add-source ./publish/tool Coda.Cli
+
+# Option B — standalone native binary (no .NET needed at all):
+git clone https://github.com/yury-opolev/coda-cli.git
+cd coda-cli
+./rust/build.ps1 -NoBump
+./publish.ps1 -Flavor self-contained   # -> publish/self-contained/coda.exe
+# Add publish/self-contained to your PATH, or copy coda.exe somewhere on PATH.
 
 # 2. Run it (first launch walks you through provider sign-in):
 coda
 ```
 
-`coda` is now on your PATH (via `%USERPROFILE%\.dotnet\tools`). On first launch the
-**setup wizard** has you pick a provider (Claude.ai subscription, an Anthropic API
-key, or GitHub Copilot), signs you in, and verifies the connection. Then just type.
+`coda` is now on your PATH. On first launch the **setup wizard** has you pick a
+provider (Claude.ai subscription, an Anthropic API key, or GitHub Copilot), signs
+you in, and verifies the connection. Then just type.
 
-To upgrade later, bump + repack + update:
+To upgrade later (option A):
 
 ```powershell
-./build.ps1                  # bump the build number
-./publish.ps1 -Flavor tool
+./rust/build.ps1 -NoBump     # rebuild the Rust binary
+./publish.ps1 -Flavor tool   # repack
 dotnet tool update --global --add-source ./publish/tool Coda.Cli
 ```
 
-**Prefer a standalone exe** (no .NET runtime needed)? Build a self-contained binary
-and put it on your PATH instead:
-
-```powershell
-./publish.ps1 -Flavor self-contained   # -> publish/self-contained/coda.exe (~36 MB)
-```
+> **Note:** the `.NET global tool` package (`Coda.Cli`) contains a thin .NET
+> launcher that locates and runs the bundled native Rust binary. The .NET runtime
+> is used only for that launcher shim — the TUI, engine, and `coda serve` are all
+> native Rust with no .NET runtime dependency.
 
 Check the version of any install with `coda --version`. Coda keeps all its own
 state under **`~/.coda/`** (settings, sessions, credentials, …), separate from the
@@ -114,7 +125,21 @@ Coda is its own product, independent of any vendor's official CLI.
 
 ## Coda — the interactive TUI
 
-The terminal front-end targets **Terminal.Gui v2** and follows the **Warm Ember** interaction model.
+The primary TUI is built with **[ratatui](https://ratatui.rs)** (Rust). Run the
+Rust binary directly:
+
+```powershell
+# Build (without bumping version) and run:
+./rust/build.ps1 -NoBump
+.\rust\target\release\coda.exe
+```
+
+> **Legacy C# TUI (Terminal.Gui v2):** The original C# front-end is still present
+> in `src/Coda.Tui` and remains buildable/runnable. It is no longer the primary
+> distribution but is retained as a reference implementation. Use
+> `./build.ps1 -Legacy` and `dotnet run --project src/Coda.Tui` to build and run it.
+
+The TUI follows the **Warm Ember** interaction model.
 **Full-screen mode is the default interactive engine on a supported terminal**: a scrollable,
 virtualized transcript fills the **full
 width** of the screen, an **operational status row** (turn, tool, waiting, approval, and key-hint state) sits
@@ -129,11 +154,11 @@ buffer and remains available as an **explicit compatibility** choice via `--tui=
 and a **plain** renderer is always available.
 
 ```powershell
-# Build (bumps the version), then run the TUI:
-./build.ps1
+# Legacy C# TUI — build (bumps the version) and run:
+./build.ps1 -Legacy
 dotnet run --project src/Coda.Tui -c Release
 
-# Choose the interactive engine explicitly:
+# Choose the interactive engine explicitly (legacy C#):
 dotnet run --project src/Coda.Tui -- --tui=fullscreen   # retained, virtualized full-screen transcript
 dotnet run --project src/Coda.Tui -- --tui=inline       # optional: same retained transcript, primary buffer (terminal history)
 dotnet run --project src/Coda.Tui -- --tui=auto         # default: full-screen on a supported terminal, else plain

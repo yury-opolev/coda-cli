@@ -15,6 +15,7 @@
 pub mod catalog;
 pub mod dispatch;
 pub mod host;
+mod mcp;
 pub mod prompts;
 pub mod session;
 pub mod settings;

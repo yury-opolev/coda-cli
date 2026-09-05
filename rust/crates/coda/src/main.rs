@@ -100,6 +100,14 @@ struct ServeArgs {
     /// Working directory for the session.
     #[arg(long, value_name = "DIR")]
     cwd: Option<PathBuf>,
+
+    /// Disable all MCP servers for this session (user and project).
+    #[arg(long)]
+    no_mcp: bool,
+
+    /// Disable only the project `<cwd>/.mcp.json` layer; user servers still load.
+    #[arg(long)]
+    no_project_mcp: bool,
 }
 
 #[derive(Debug, Args)]
@@ -165,6 +173,15 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     if let Some(dir) = &args.cwd {
         std::env::set_current_dir(dir)
             .with_context(|| format!("failed to enter {}", dir.display()))?;
+    }
+    // Translate the MCP flags into the env vars the engine reads at startup.
+    // A flag only ever sets the toggle; it never clears one the environment
+    // already provided, so `CODA_SERVE_DISABLE_MCP=1 coda serve` still works.
+    if args.no_mcp {
+        std::env::set_var("CODA_SERVE_DISABLE_MCP", "1");
+    }
+    if args.no_project_mcp {
+        std::env::set_var("CODA_DISABLE_PROJECT_MCP", "1");
     }
     coda_serve::serve_stdio().await
 }

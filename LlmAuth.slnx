@@ -4,6 +4,7 @@
     <Project Path="samples/LlmAuth.Sample/LlmAuth.Sample.csproj" />
   </Folder>
   <Folder Name="/src/">
+    <Project Path="src/Coda.Launcher/Coda.Launcher.csproj" />
     <Project Path="src/Coda.Common/Coda.Common.csproj" />
     <Project Path="src/Coda.JsonRpc/Coda.JsonRpc.csproj" />
     <Project Path="src/Coda.Agent/Coda.Agent.csproj" />

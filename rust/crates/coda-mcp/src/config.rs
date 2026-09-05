@@ -126,6 +126,47 @@ pub fn load_connectable(user_mcp: &Path, project_mcp: &Path) -> Vec<McpConnectab
         .collect()
 }
 
+/// Like [`load_connectable`] but also returns config error notices for files
+/// that exist but are unreadable or malformed.
+///
+/// - Missing files → silently empty (healthy)
+/// - Unreadable or invalid-JSON files → included notice, servers still connect
+/// - Valid files → notices empty
+///
+/// Used by the engine at startup so users learn about broken configs without
+/// having to compare the config file and the server list themselves.
+pub fn load_connectable_checked(
+    user_mcp: &Path,
+    project_mcp: &Path,
+) -> (Vec<McpConnectable>, Vec<String>) {
+    let (user_servers, user_notice) = load_file_checked(user_mcp, McpScope::User);
+    let (project_servers, project_notice) = load_file_checked(project_mcp, McpScope::Project);
+
+    let mut notices = Vec::new();
+    if let Some(n) = user_notice {
+        notices.push(n);
+    }
+    if let Some(n) = project_notice {
+        notices.push(n);
+    }
+
+    // Project shadows user by name (same logic as load_all).
+    let mut merged: Vec<McpConnectable> = user_servers
+        .into_iter()
+        .filter(|u| !project_servers.iter().any(|p| p.name == u.name))
+        .filter(|s| !s.disabled)
+        .filter_map(|s| s.command.map(|cmd| McpConnectable { name: s.name, command: cmd, args: s.args, env: s.env }))
+        .collect();
+    let project_connectable: Vec<McpConnectable> = project_servers
+        .into_iter()
+        .filter(|s| !s.disabled)
+        .filter_map(|s| s.command.map(|cmd| McpConnectable { name: s.name, command: cmd, args: s.args, env: s.env }))
+        .collect();
+    merged.extend(project_connectable);
+
+    (merged, notices)
+}
+
 /// Load only enabled HTTP servers, project shadowing user.
 ///
 /// Used by `McpClientManager` to connect HTTP MCP servers at startup.
@@ -140,6 +181,39 @@ pub fn load_http_connectable(user_mcp: &Path, project_mcp: &Path) -> Vec<McpHttp
             auth: s.auth,
         })
         .collect()
+}
+
+/// Like [`load_http_connectable`] but also returns config error notices for
+/// files that exist but are unreadable or malformed.
+pub fn load_http_connectable_checked(
+    user_mcp: &Path,
+    project_mcp: &Path,
+) -> (Vec<McpHttpConnectable>, Vec<String>) {
+    let (user_http, user_notice) = load_http_file_checked(user_mcp);
+    let (project_http, project_notice) = load_http_file_checked(project_mcp);
+
+    let mut notices = Vec::new();
+    if let Some(n) = user_notice {
+        notices.push(n);
+    }
+    if let Some(n) = project_notice {
+        notices.push(n);
+    }
+
+    let mut merged: Vec<McpHttpConnectable> = user_http
+        .into_iter()
+        .filter(|u| !project_http.iter().any(|p| p.name == u.name))
+        .filter(|s| !s.disabled)
+        .map(|s| McpHttpConnectable { name: s.name, url: s.url, headers: s.headers, auth: s.auth })
+        .collect();
+    let project_connectables: Vec<McpHttpConnectable> = project_http
+        .into_iter()
+        .filter(|s| !s.disabled)
+        .map(|s| McpHttpConnectable { name: s.name, url: s.url, headers: s.headers, auth: s.auth })
+        .collect();
+    merged.extend(project_connectables);
+
+    (merged, notices)
 }
 
 // ── Internal HTTP server storage ──────────────────────────────────────────────
@@ -167,22 +241,51 @@ struct RawHttpEntry {
 }
 
 fn load_http_file(path: &Path) -> Vec<RawHttpEntry> {
+    load_http_file_checked(path).0
+}
+
+/// Like [`load_http_file`] but returns a config error notice when the file
+/// exists but is unreadable or malformed.
+fn load_http_file_checked(path: &Path) -> (Vec<RawHttpEntry>, Option<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return Vec::new(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("MCP config '{}' could not be read: {e}", path.display())),
+            );
+        }
     };
     let doc: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return Vec::new(),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("MCP config '{}' contains invalid JSON: {e}", path.display())),
+            );
+        }
     };
-    let servers = match doc.get("mcpServers").and_then(Value::as_object) {
-        Some(s) => s,
-        None => return Vec::new(),
+    let servers = match doc.get("mcpServers") {
+        None => return (Vec::new(), None),
+        Some(v) => match v.as_object() {
+            None => {
+                return (
+                    Vec::new(),
+                    Some(format!(
+                        "MCP config '{}': 'mcpServers' must be an object",
+                        path.display()
+                    )),
+                );
+            }
+            Some(s) => s,
+        },
     };
-    servers
+    let entries = servers
         .iter()
         .filter_map(|(name, def)| parse_http_entry(name, def))
-        .collect()
+        .collect();
+    (entries, None)
 }
 
 fn parse_http_entry(name: &str, def: &Value) -> Option<RawHttpEntry> {
@@ -282,25 +385,55 @@ pub fn resolve_paths(project_root: &Path) -> (PathBuf, PathBuf) {
 /// Parse the `mcpServers` map from a `.mcp.json` file. Non-existent files and
 /// parse errors are silently treated as empty (matching C# `McpConfig.Parse`).
 fn load_file(path: &Path, scope: McpScope) -> Vec<McpRawServer> {
+    load_file_checked(path, scope).0
+}
+
+/// Parse a `.mcp.json` file, distinguishing absent files from malformed ones.
+///
+/// - File absent → `(empty, None)` — healthy
+/// - File exists but unreadable → `(empty, Some(notice))`
+/// - File exists but invalid JSON → `(empty, Some(notice))`
+/// - `mcpServers` key present but not an object → `(empty, Some(notice))`
+/// - Valid file → `(entries, None)`
+fn load_file_checked(path: &Path, scope: McpScope) -> (Vec<McpRawServer>, Option<String>) {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return Vec::new(), // not found or unreadable → treat as empty
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (Vec::new(), None),
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("MCP config '{}' could not be read: {e}", path.display())),
+            );
+        }
     };
-
     let doc: Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return Vec::new(), // malformed JSON → treat as empty
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("MCP config '{}' contains invalid JSON: {e}", path.display())),
+            );
+        }
     };
-
-    let servers = match doc.get("mcpServers").and_then(Value::as_object) {
-        Some(s) => s,
-        None => return Vec::new(),
-    };
-
-    servers
-        .iter()
-        .filter_map(|(name, def)| parse_entry(name, def, scope))
-        .collect()
+    match doc.get("mcpServers") {
+        None => (Vec::new(), None),
+        Some(v) => match v.as_object() {
+            None => (
+                Vec::new(),
+                Some(format!(
+                    "MCP config '{}': 'mcpServers' must be an object",
+                    path.display(),
+                )),
+            ),
+            Some(servers) => {
+                let entries = servers
+                    .iter()
+                    .filter_map(|(name, def)| parse_entry(name, def, scope))
+                    .collect();
+                (entries, None)
+            }
+        },
+    }
 }
 
 /// Parse one server definition from a JSON value into a `McpRawServer`.

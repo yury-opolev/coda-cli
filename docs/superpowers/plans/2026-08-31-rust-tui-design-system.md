@@ -2340,4 +2340,4 @@ git commit -m "Guard every surface against drawing outside its area"
 - [ ] `overlay.rs`, `settings_form.rs` and `draw_prompt` are gone.
 - [ ] `app.rs` no longer routes keys for prompts, browsers or forms.
 - [ ] Every surface renders at 40×10 without exceeding its area.
-- [ ] `.\build.ps1 -Deploy` produces a working `coda-rs.exe` at the bumped version.
+- [ ] `.\build.ps1 -Deploy` installs the native `coda` at the bumped version via the `Coda.Cli` .NET tool.

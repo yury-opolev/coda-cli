@@ -1,0 +1,57 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <!-- .NET global tool packaging.
+       PackageId and ToolCommandName are unchanged from the C# Coda.Tui package so
+       dotnet tool update is a seamless upgrade path.
+       The tool shim invokes this launcher DLL, which locates and runs the bundled
+       native Rust executable. The .NET runtime is only used for the thin launcher
+       wrapper, not for the TUI or engine logic. -->
+  <PropertyGroup>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>coda</ToolCommandName>
+    <PackageId>Coda.Cli</PackageId>
+    <Authors>Coda</Authors>
+    <Description>Coda — an agentic coding assistant CLI. Thin .NET launcher that runs the bundled native Rust/ratatui binary.</Description>
+    <PackageTags>cli;agent;coding-assistant;llm;rust</PackageTags>
+  </PropertyGroup>
+
+  <!-- Native payload path. Override with -p:NativePayloadDir=... to point at a
+       pre-built binary (e.g. from a cross-compilation step). -->
+  <PropertyGroup>
+    <NativePayloadDir Condition="'$(NativePayloadDir)' == ''">$(MSBuildThisFileDirectory)..\..\rust\target\release\</NativePayloadDir>
+    <NativePayloadExe>$(NativePayloadDir)coda.exe</NativePayloadExe>
+  </PropertyGroup>
+
+  <!-- Bundle the win-x64 native binary into the NuGet package. -->
+  <ItemGroup Condition="Exists('$(NativePayloadExe)')">
+    <None Include="$(NativePayloadExe)">
+      <PackagePath>tools/net10.0/any/runtimes/win-x64/native/coda.exe</PackagePath>
+      <Pack>true</Pack>
+    </None>
+  </ItemGroup>
+
+  <!-- Copy the native binary alongside the launcher DLL so a local build run
+       (dotnet run) and isolated tool-path installs find it at the expected path. -->
+  <Target Name="CopyNativePayloadToOutput" AfterTargets="Build"
+          Condition="Exists('$(NativePayloadExe)')">
+    <Copy SourceFiles="$(NativePayloadExe)"
+          DestinationFiles="$(OutputPath)runtimes\win-x64\native\coda.exe"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!-- Fail the pack (not the build) when the native payload is absent so a
+       broken nupkg is never accidentally produced. -->
+  <!-- Build the Rust binary first: cd rust; cargo build -p coda (release profile) -->
+  <Target Name="CheckNativePayloadForPack" BeforeTargets="GenerateNuspec">
+    <Error Condition="!Exists('$(NativePayloadExe)')"
+           Text="Native payload not found at '$(NativePayloadExe)'. Build the Rust binary first: cd rust &amp;&amp; cargo build --package coda --release (or: ./rust/build.ps1 -NoBump)" />
+  </Target>
+
+</Project>

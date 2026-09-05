@@ -36,7 +36,7 @@ fn main() {
     let rows = state.transcript.render(regions.transcript.width as usize, state.display_mode);
     let mut viewport = Viewport::new();
     viewport.update(rows.len(), regions.transcript.height as usize);
-    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme)).unwrap();
+    terminal.draw(|f| draw::draw(f, &state, &composer, &viewport, &rows, &theme, std::time::Instant::now())).unwrap();
 
     let models: Vec<coda_proto::messages::WireModel> = serde_json::from_value(serde_json::json!([
         { "id": "claude-opus-5", "displayName": "Claude Opus 5", "contextLimit": 200000 },
@@ -53,7 +53,7 @@ fn main() {
     )));
     terminal
         .draw(|f| {
-            draw::draw(f, &state, &composer, &viewport, &rows, &theme);
+            draw::draw(f, &state, &composer, &viewport, &rows, &theme, std::time::Instant::now());
             for rendered in stack.render(f.area(), &theme) {
                 draw::draw_surface(f, &rendered, &theme);
             }

@@ -19,7 +19,7 @@
   ./build.ps1 -Configuration Debug  # debug build (still bumps)
   ./build.ps1 -Test                 # build then run the full test suite
   ./build.ps1 -NoBump               # build without incrementing
-  ./build.ps1 -Deploy               # build, then install as coda-rs.exe
+  ./build.ps1 -Deploy               # build, then install/update the coda global tool
 #>
 [CmdletBinding()]
 param(
@@ -87,21 +87,25 @@ if ($reported.Trim() -ne $semVer) {
 }
 
 if ($Deploy) {
-    $dest = Join-Path $env:USERPROFILE '.dotnet\tools\coda-rs.exe'
-    try {
-        Copy-Item $exe $dest -Force -ErrorAction Stop
-        Write-Host "Deployed to $dest" -ForegroundColor Green
+    # Use the publish.ps1 tool flavor so the global tool shim is updated through
+    # the standard dotnet tool mechanism. This ensures the nupkg and shim stay in
+    # sync rather than overwriting only the binary behind the shim.
+    $publishScript = Join-Path $repoRoot 'publish.ps1'
+    Write-Host "Packing and updating the Coda.Cli global tool..." -ForegroundColor Cyan
+    & $publishScript -Flavor tool -Configuration $Configuration
+    if ($LASTEXITCODE -ne 0) { throw "publish.ps1 -Flavor tool failed." }
+
+    $nupkgDir = Join-Path $repoRoot 'publish\tool'
+    $toolsDir = Join-Path $env:USERPROFILE '.dotnet\tools'
+
+    $installed = & dotnet tool list --global
+    if ($LASTEXITCODE -ne 0) { throw "Could not list installed global tools." }
+    $operation = if ($installed -match '^coda\.cli\s') { 'update' } else { 'install' }
+    & dotnet tool $operation --global Coda.Cli --source $nupkgDir --version $semVer
+    if ($LASTEXITCODE -ne 0) {
+        throw "dotnet tool $operation failed; Coda was not deployed."
     }
-    catch [System.IO.IOException] {
-        # Windows locks a running executable, so this fires whenever a coda-rs
-        # session is open. Say so plainly: the raw "used by another process" is
-        # easy to misread as a build failure when the build in fact succeeded.
-        Write-Host ""
-        Write-Host "Build succeeded, but $dest is in use." -ForegroundColor Yellow
-        Write-Host "Close any running coda-rs session and deploy with:" -ForegroundColor Yellow
-        Write-Host "  Copy-Item '$exe' '$dest' -Force" -ForegroundColor Yellow
-        Write-Host ""
-    }
+    Write-Host "Deployed: coda $semVer (global tool at $toolsDir\coda)" -ForegroundColor Green
 }
 
 Write-Host "Build succeeded: $semVer" -ForegroundColor Green
