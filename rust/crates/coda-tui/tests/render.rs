@@ -834,3 +834,130 @@ fn the_completion_popup_highlights_a_candidate_as_soon_as_it_opens() {
         marked[0]
     );
 }
+
+#[test]
+fn the_header_names_the_session_so_resume_can_be_typed_from_it() {
+    // The exit summary prints `coda --resume <id>`, but only on the way out.
+    // During the session the id was nowhere on screen, so getting back to a
+    // conversation meant hunting through scrollback for it.
+    let state = session();
+    let composer = Composer::new();
+    let screen = render(&state, &composer, 100, 24);
+
+    let header = &screen[0];
+    assert!(
+        header.contains("test-session"),
+        "the header does not name the session: {header:?}"
+    );
+    assert!(
+        header.contains(coda_tui::branding::version()),
+        "the header does not give the version: {header:?}"
+    );
+}
+
+#[test]
+fn the_hint_line_reports_what_arrived_while_scrolled_away() {
+    // The whole point of holding position: say what was missed, and how to
+    // catch up, rather than yanking the reader to the bottom.
+    use coda_render::theme::{ColorDepth, Theme};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut state = session();
+    for i in 0..200 {
+        state.apply(UiEvent::Engine(Event::AssistantText {
+            delta: format!("line {i}\n"),
+        }));
+    }
+
+    let composer = Composer::new();
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true);
+    let rows = state
+        .transcript
+        .render(regions.transcript.width as usize, state.display_mode);
+
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), regions.transcript.height as usize);
+    viewport.scroll_up(30);
+    assert!(!viewport.is_following(), "scrolling up must detach");
+
+    // More arrives while the reader is away.
+    let anchor = viewport.offset();
+    viewport.update_with_anchor(rows.len() + 12, regions.transcript.height as usize, anchor);
+
+    terminal
+        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme))
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    let screen: Vec<String> = (0..24)
+        .map(|y| {
+            (0..100)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect();
+
+    let hint = screen
+        .iter()
+        .find(|row| row.contains("new lines below"))
+        .unwrap_or_else(|| panic!("nothing told the reader anything arrived:\n{}", screen.join("\n")));
+    assert!(hint.contains("12"), "the count is wrong: {hint:?}");
+    assert!(hint.contains("Ctrl+End"), "no way to catch up was offered: {hint:?}");
+}
+
+#[test]
+fn the_way_back_stays_offered_while_scrolled_away() {
+    // Not only while something is arriving. A reader who has stopped
+    // following has no other sign that the view is frozen, so the way back
+    // has to stay on screen for as long as it applies.
+    use coda_render::theme::{ColorDepth, Theme};
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut state = session();
+    for i in 0..200 {
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: format!("line {i}\n") }));
+    }
+
+    let composer = Composer::new();
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true);
+    let rows = state
+        .transcript
+        .render(regions.transcript.width as usize, state.display_mode);
+
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), regions.transcript.height as usize);
+    viewport.scroll_up(30);
+    assert_eq!(viewport.unread(), 0, "nothing has arrived yet");
+
+    terminal
+        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme))
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    let screen: Vec<String> = (0..24)
+        .map(|y| (0..100).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    let hint = screen
+        .iter()
+        .find(|row| row.contains("Ctrl+End"))
+        .unwrap_or_else(|| panic!("no way back was offered:\n{}", screen.join("\n")));
+    assert!(!hint.contains("new lines below"), "claimed arrivals that did not happen: {hint:?}");
+
+    // Centred: it belongs to the screen, not to the column of text below it.
+    let left = hint.len() - hint.trim_start().len();
+    let right = hint.len() - hint.trim_end().len();
+    assert!(
+        left.abs_diff(right) <= 1,
+        "the hint is not centred (left {left}, right {right})"
+    );
+}

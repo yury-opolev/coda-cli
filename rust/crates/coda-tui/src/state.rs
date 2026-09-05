@@ -184,6 +184,13 @@ pub struct UiState {
     /// same state twice gives the same picture and the render tests stay
     /// deterministic.
     pub spinner: usize,
+    /// A passing message for the line above the composer.
+    ///
+    /// For things worth saying once and not worth keeping — "copied 412
+    /// characters". Putting them in the transcript instead made a permanent
+    /// record of an ephemeral fact, and pushed the conversation up the screen
+    /// to do it.
+    pub hint: Option<String>,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
 }
@@ -210,6 +217,7 @@ impl UiState {
             assistant_buffer: None,
             buffer_rewritten_by_hook: false,
             spinner: 0,
+            hint: None,
 
             clock: default_timestamp,
         }

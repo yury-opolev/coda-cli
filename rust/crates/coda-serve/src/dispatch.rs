@@ -116,6 +116,19 @@ pub struct SetEffortParams {
     pub effort: Option<String>,
 }
 
+/// `session/setModel` — the model used for subsequent turns.
+///
+/// The agent is rebuilt from `current_model()` on every turn, so a change here
+/// takes effect on the next one. Before this existed the only way to switch was
+/// to write the setting and restart the engine, which cost the running session
+/// and failed outright when it had not been saved to disk yet.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetModelParams {
+    #[serde(default)]
+    pub model: String,
+}
+
 /// `session/setPermissionMode` — the live mode for the running session.
 #[derive(Debug, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -212,6 +225,8 @@ pub trait ServeBackend: Send + Sync {
     async fn session_models(&self, p: ModelsParams) -> Result<Value, RpcError>;
     async fn session_set_goal(&self, p: SetGoalParams) -> Result<Value, RpcError>;
     async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError>;
+    /// Switches the model for subsequent turns.
+    async fn session_set_model(&self, p: SetModelParams) -> Result<Value, RpcError>;
     async fn session_set_permission_mode(
         &self,
         p: SetPermissionModeParams,
@@ -267,6 +282,7 @@ pub async fn dispatch(
         "session/models" => backend.session_models(optional(params)).await,
         "session/setGoal" => backend.session_set_goal(optional(params)).await,
         "session/setEffort" => backend.session_set_effort(optional(params)).await,
+        "session/setModel" => backend.session_set_model(required(params)?).await,
         "session/setPermissionMode" => {
             backend.session_set_permission_mode(required(params)?).await
         }
@@ -344,6 +360,10 @@ mod tests {
                 _ => Ok(json!({ "ok": false, "applied": "default" })),
             }
         }
+        async fn session_set_model(&self, _p: SetModelParams) -> Result<Value, RpcError> {
+            Ok(json!({ "ok": true }))
+        }
+
         async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError> {
             match p.effort.as_deref() {
                 Some("bad") => Ok(json!({ "ok": false })),
@@ -692,6 +712,13 @@ mod tests {
     ) -> Result<Value, RpcError> {
         Ok(serde_json::json!({ "ok": true, "applied": "default" }))
     }
+
+    async fn session_set_model(&self, _p: SetModelParams) -> Result<Value, RpcError> {
+
+        Ok(json!({ "ok": true }))
+
+    }
+
 
     async fn session_set_effort(&self, _p: SetEffortParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })

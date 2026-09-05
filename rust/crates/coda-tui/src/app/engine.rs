@@ -233,7 +233,22 @@ impl App {
         }
 
         let params = serde_json::to_value(params).unwrap_or_default();
-        match connection.request(method::INITIALIZE, Some(params)).await {
+        let mut result = connection.request(method::INITIALIZE, Some(params)).await;
+
+        // A session that has not been written to disk yet cannot be resumed:
+        // the engine refuses an id it cannot find, which is right for
+        // `--resume` but wrong here. Restarting early in a conversation — a
+        // model switch before anything has been saved — then failed outright
+        // and the switch quietly did not take. Retry without the id so the
+        // restart succeeds, and say what was given up.
+        let lost_history = matches!(&result, Err(error) if is_session_not_found(error));
+        if lost_history {
+            let fresh = serde_json::to_value(messages::InitializeParams::new("coda-tui"))
+                .unwrap_or_default();
+            result = connection.request(method::INITIALIZE, Some(fresh)).await;
+        }
+
+        match result {
             Ok(value) => {
                 let initialized: messages::InitializeResult =
                     serde_json::from_value(value).unwrap_or(messages::InitializeResult {
@@ -248,7 +263,15 @@ impl App {
                 if !initialized.session_id.is_empty() {
                     self.state.session_id = Some(initialized.session_id);
                 }
-                self.notice("Engine restarted.", NoticeLevel::Info);
+                if lost_history {
+                    self.notice(
+                        "Engine restarted, but this session had not been saved yet, so it \
+                         starts without the earlier conversation.",
+                        NoticeLevel::Warning,
+                    );
+                } else {
+                    self.notice("Engine restarted.", NoticeLevel::Info);
+                }
             }
             Err(error) => self.notice(
                 format!("The restarted engine rejected the handshake: {error}"),
@@ -256,4 +279,14 @@ impl App {
             ),
         }
     }
+}
+
+/// Whether a failed handshake was the engine refusing an unknown session.
+///
+/// Singled out because it is the one failure worth retrying: the session is
+/// simply not on disk yet, and starting fresh beats leaving the restart
+/// undone. Every other error still surfaces as an error.
+fn is_session_not_found(error: &coda_client::ClientError) -> bool {
+    const SESSION_NOT_FOUND: i64 = -32002;
+    matches!(error, coda_client::ClientError::Rpc(e) if e.code == SESSION_NOT_FOUND)
 }

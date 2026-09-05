@@ -11,7 +11,6 @@ use coda_proto::messages::{self, method};
 use super::App;
 use crate::browsers as rows;
 use crate::config::{PluginState, Settings};
-use crate::state::UiEvent;
 use crate::config;
 use crate::overlay::Browser;
 use crate::surface::browser::{BrowserKind, BrowserSurface, RowActions};
@@ -376,12 +375,28 @@ impl App {
     /// restarting the engine against the same session id therefore performs a
     /// real switch, with the conversation preserved.
     pub(super) async fn switch_model(&mut self, model: &str) {
-        // The provider the engine actually connected with, when it has said.
-        // Falling back to `defaultProvider` is a guess: settings can nominate
-        // a provider whose credential is not present, in which case the engine
-        // connects with a different one and reads a different key. Writing to
-        // the nominated one then saves the choice where nothing reads it, and
-        // the model silently reverts on the next start.
+        // Ask the engine directly. It rebuilds its agent from the current
+        // model on every turn, so this takes effect on the next one — no
+        // restart, nothing to invalidate, and the running conversation is
+        // kept. Writing the setting and bouncing the process was a workaround
+        // for the missing call; it cost the session, and failed outright when
+        // the session had not been written to disk yet.
+        let result = self
+            .connection
+            .request(
+                method::SET_MODEL,
+                Some(serde_json::json!({ "model": model })),
+            )
+            .await;
+        if let Err(error) = result {
+            return self.notice(
+                format!("Could not switch the model: {error}"),
+                NoticeLevel::Error,
+            );
+        }
+
+        // Persisted too, so the choice survives the next start. The engine
+        // reads it at startup; the call above only covers this session.
         let connected = self.connected_provider.clone();
         let paths = self.paths.clone();
         let provider = match connected {
@@ -427,15 +442,10 @@ impl App {
         }
 
         self.close_browser();
-        self.apply(UiEvent::ModelChanged {
-            id: model.to_string(),
-            context_limit: None,
-        });
-        self.notice(
-            format!("Model set to {model}. Restarting the engine…"),
-            NoticeLevel::Info,
-        );
-        self.restart_engine().await;
+        self.notice(format!("Model set to {model}."), NoticeLevel::Info);
+        // Ask the engine what is now active: it reports the display name and
+        // context limit, so the status line does not degrade to the raw id.
+        self.load_models().await;
     }
 
 

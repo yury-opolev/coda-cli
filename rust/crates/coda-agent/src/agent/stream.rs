@@ -36,6 +36,15 @@ pub(crate) struct StreamAccumulator {
     thinking_burst_open: bool,
     /// Marks when the current thinking burst opened, for `elapsed_ms`.
     thinking_burst_start: Option<Instant>,
+    /// When the current stretch of the stream began — the stream itself, or
+    /// the last text or tool that interrupted it.
+    ///
+    /// The fallback start for a burst that produced no deltas. A provider that
+    /// encrypts its reasoning sends none, so the burst clock never started and
+    /// the turn reported "Thought" with no duration at all, as though no time
+    /// had passed. Measuring from the previous activity is an honest estimate:
+    /// nothing else was happening in between.
+    segment_start: Option<Instant>,
 }
 
 impl StreamAccumulator {
@@ -67,9 +76,13 @@ pub(crate) async fn drive_stream(
     acc: &mut StreamAccumulator,
 ) -> Result<(), LlmError> {
     while let Some(event) = stream.next().await {
+        // The stream's own start, for a thinking burst that never emits a
+        // delta to open one.
+        acc.segment_start.get_or_insert_with(Instant::now);
         match event? {
             StreamEvent::TextDelta(text) => {
                 acc.text.push_str(&text);
+                acc.segment_start = Some(Instant::now());
                 sink.emit(AgentEvent::AssistantText { delta: text });
             }
 
@@ -90,11 +103,17 @@ pub(crate) async fn drive_stream(
                 Content::Thinking { .. } => {
                     // Signed or unsigned — both close the burst and emit.
                     // Unsigned blocks will be filtered out at history assembly.
+                    //
+                    // Falls back to the segment start, so reasoning that
+                    // arrived encrypted still reports how long it took rather
+                    // than claiming no time passed.
                     let elapsed_ms = acc
                         .thinking_burst_start
                         .take()
+                        .or(acc.segment_start)
                         .map(|t| t.elapsed().as_millis() as i64)
                         .unwrap_or(0);
+                    acc.segment_start = Some(Instant::now());
                     acc.thinking_burst_open = false;
                     // Mismatch: thinking_tokens is always None; token counts
                     // arrive in the Done event, not per-burst.
@@ -110,6 +129,7 @@ pub(crate) async fn drive_stream(
             },
 
             StreamEvent::ToolUse(block) => {
+                acc.segment_start = Some(Instant::now());
                 acc.tool_uses.push(block);
             }
 
@@ -710,6 +730,77 @@ mod tests {
             complete_count,
             1,
             "ThinkingComplete must be emitted for a burst left open at stream end"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_reasoning_still_reports_how_long_it_took() {
+        // A provider that encrypts its reasoning sends no ThinkingDelta, so
+        // the burst clock never started and the turn reported "Thought" with
+        // no duration -- as though no time had passed at all. Measuring from
+        // the start of the stream is honest: nothing else was happening.
+        use crate::events::CollectingSink;
+
+        let signed = Content::Thinking { text: String::new(), signature: Some("sig".into()) };
+        let stream = make_stream(vec![
+            Ok(StreamEvent::ThinkingDone(signed)),
+            Ok(done_event()),
+        ]);
+
+        let mut acc = StreamAccumulator::default();
+        // Give the clock something to measure. Without a fallback start this
+        // is still reported as zero however long the turn actually took.
+        acc.segment_start = Some(Instant::now() - std::time::Duration::from_millis(1500));
+
+        let sink = CollectingSink::new();
+        drive_stream(stream, &sink, &mut acc).await.unwrap();
+
+        let elapsed = sink
+            .take()
+            .into_iter()
+            .find_map(|e| match e {
+                AgentEvent::ThinkingComplete { elapsed_ms, .. } => Some(elapsed_ms),
+                _ => None,
+            })
+            .expect("no ThinkingComplete was emitted");
+        assert!(
+            elapsed >= 1500,
+            "reasoning with no deltas reported {elapsed}ms, so the header says \"Thought\" with no time"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_burst_that_streamed_is_timed_from_its_first_delta() {
+        // The fallback must not displace the real measurement: a burst with
+        // deltas is timed from the first of them, not from the stream start.
+        use crate::events::CollectingSink;
+
+        let signed = Content::Thinking { text: "reasoning".into(), signature: Some("sig".into()) };
+        let stream = make_stream(vec![
+            Ok(StreamEvent::ThinkingDelta("reasoning".into())),
+            Ok(StreamEvent::ThinkingDone(signed)),
+            Ok(done_event()),
+        ]);
+
+        let mut acc = StreamAccumulator::default();
+        // An hour ago. If this were used the burst would claim to have taken
+        // an hour.
+        acc.segment_start = Some(Instant::now() - std::time::Duration::from_secs(3600));
+
+        let sink = CollectingSink::new();
+        drive_stream(stream, &sink, &mut acc).await.unwrap();
+
+        let elapsed = sink
+            .take()
+            .into_iter()
+            .find_map(|e| match e {
+                AgentEvent::ThinkingComplete { elapsed_ms, .. } => Some(elapsed_ms),
+                _ => None,
+            })
+            .expect("no ThinkingComplete was emitted");
+        assert!(
+            elapsed < 60_000,
+            "the burst was timed from the stream start, not its first delta: {elapsed}ms"
         );
     }
 }

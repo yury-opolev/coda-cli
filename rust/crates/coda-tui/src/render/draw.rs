@@ -6,7 +6,7 @@
 use coda_render::text;
 use coda_render::theme::{Role, Theme};
 use coda_render::RenderLine;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
@@ -32,49 +32,89 @@ const COMPOSER_MAX_ROWS: u16 = 10;
 /// The regions the screen is divided into.
 #[derive(Debug, Clone, Copy)]
 pub struct Regions {
+    /// Session identity, when there is room for it.
+    pub header: Option<Rect>,
     pub transcript: Rect,
     pub scrollbar: Option<Rect>,
+    /// One line for transient status, above the composer.
+    pub hint: Option<Rect>,
     pub composer: Rect,
     pub status: Rect,
 }
+
+/// Below this many rows the header and hint are dropped.
+///
+/// They are context; the transcript is the content. On a short terminal the
+/// content wins — chrome degrades rather than squeezing the conversation into
+/// nothing.
+const MIN_ROWS_FOR_CHROME: u16 = 12;
 
 /// Splits the frame into its regions.
 ///
 /// The composer grows with its content up to a cap, after which it scrolls
 /// internally rather than crowding out the transcript.
 pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
+    let chrome = area.height >= MIN_ROWS_FOR_CHROME;
+    // The header and hint rows, when present.
+    let extra = if chrome { 2 } else { 0 };
+
     let composer_rows = (composer_lines as u16)
         .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
         // Leave at least three transcript rows however tall the composer is.
-        // The composer costs its rows plus both half-block edges, and the
-        // status bar one more, so the budget is `height - 3 - 2 - 1`.
-        .min(area.height.saturating_sub(6).max(COMPOSER_MIN_ROWS));
+        // The composer costs its rows plus both half-block edges, the status
+        // bar one more, and the chrome two when it is shown.
+        .min(
+            area.height
+                .saturating_sub(6 + extra)
+                .max(COMPOSER_MIN_ROWS),
+        );
+
+    let mut constraints: Vec<Constraint> = Vec::new();
+    if chrome {
+        constraints.push(Constraint::Length(1));
+    }
+    constraints.push(Constraint::Min(1));
+    if chrome {
+        constraints.push(Constraint::Length(1));
+    }
+    // + the panel's top and bottom half-block edges
+    constraints.push(Constraint::Length(composer_rows + 2));
+    constraints.push(Constraint::Length(1));
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Min(1),
-            // + the panel's top and bottom half-block edges
-            Constraint::Length(composer_rows + 2),
-            Constraint::Length(1),
-        ])
+        .constraints(constraints)
         .split(area);
 
-    let (transcript, scrollbar) = if scrollable && chunks[0].width > SCROLLBAR_WIDTH {
+    let mut next = 0usize;
+    let mut take = || {
+        let rect = chunks[next];
+        next += 1;
+        rect
+    };
+    let header = chrome.then(&mut take);
+    let transcript_area = take();
+    let hint = chrome.then(&mut take);
+    let composer = take();
+    let status = take();
+
+    let (transcript, scrollbar) = if scrollable && transcript_area.width > SCROLLBAR_WIDTH {
         let split = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([Constraint::Min(1), Constraint::Length(SCROLLBAR_WIDTH)])
-            .split(chunks[0]);
+            .split(transcript_area);
         (split[0], Some(split[1]))
     } else {
-        (chunks[0], None)
+        (transcript_area, None)
     };
 
     Regions {
+        header,
         transcript,
         scrollbar,
-        composer: chunks[1],
-        status: chunks[2],
+        hint,
+        composer,
+        status,
     }
 }
 
@@ -221,8 +261,14 @@ pub fn draw_with_pin(
         pin_text,
         selection,
     );
+    if let Some(header) = regions.header {
+        draw_header(frame, header, state, theme);
+    }
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
+    }
+    if let Some(hint) = regions.hint {
+        draw_hint(frame, hint, state, viewport, theme);
     }
     draw_composer(frame, regions.composer, composer, theme);
     // After the composer, so it floats above it rather than under it.
@@ -235,6 +281,73 @@ pub fn draw_with_pin(
     // order of these calls.
 
     content
+}
+
+/// Abbreviates a token count so the status bar stays one line.
+///
+/// Thousands are what these numbers are read in; the exact digit is noise
+/// beside knowing whether it is 8k or 800k.
+fn compact_count(tokens: i64) -> String {
+    match tokens {
+        n if n >= 1_000_000 => format!("{:.1}M", n as f64 / 1_000_000.0),
+        n if n >= 10_000 => format!("{}k", n / 1_000),
+        n if n >= 1_000 => format!("{:.1}k", n as f64 / 1_000.0),
+        n => n.to_string(),
+    }
+}
+
+/// Draws the identity line: what this is, and which session.
+fn draw_header(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
+    let mut text = format!(" coda {}", crate::branding::version());
+    if let Some(id) = &state.session_id {
+        text.push_str(&format!("  {}  session {id}", glyphs::RULE_VERTICAL));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            text,
+            theme.style(Role::Notification),
+        ))),
+        area,
+    );
+}
+
+/// Draws the transient status line above the composer.
+///
+/// Always reserved, even when empty: a line that appears and disappears
+/// reflows the transcript underneath it, so the conversation would jump every
+/// time something was copied.
+///
+/// Centred, because it belongs to the whole screen rather than to the column
+/// of text beneath it, and a short message pinned left reads as debris.
+///
+/// Being scrolled away outranks a passing notice, and shows the way back for
+/// as long as it applies — not only while something new is arriving. A reader
+/// who has stopped following has no other indication that the view is frozen,
+/// and a stale "copied" message must not hide it.
+fn draw_hint(frame: &mut Frame, area: Rect, state: &UiState, viewport: &Viewport, theme: &Theme) {
+    let (text, role) = if !viewport.is_following() {
+        let catch_up = "Ctrl+End to catch up";
+        // Lines, not messages. The count is rows of rendered transcript, and
+        // calling five rows "5 new" reads as five messages — which is how a
+        // single command's output came to look like a conversation the reader
+        // had missed.
+        let text = match viewport.unread() {
+            0 => catch_up.to_string(),
+            1 => format!("1 new line below {} {catch_up}", glyphs::RULE_VERTICAL),
+            unread => format!("{unread} new lines below {} {catch_up}", glyphs::RULE_VERTICAL),
+        };
+        (text, Role::PendingUser)
+    } else {
+        match state.hint.as_deref() {
+            Some(hint) => (hint.to_string(), Role::Notification),
+            None => (String::new(), Role::Notification),
+        }
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(text, theme.style(role))))
+            .alignment(Alignment::Center),
+        area,
+    );
 }
 
 /// Draws the completion popup just above the composer.
@@ -592,6 +705,27 @@ fn draw_status(
         ));
     }
 
+    // Tokens in and out. The direction matters: a long context re-sent every
+    // turn reads very differently from a long reply, and a single total hides
+    // which one is growing.
+    //
+    // No cost estimate yet. The C# reads per-model prices from its model
+    // catalogue; the Rust catalogue carries no cost data, and a made-up
+    // number is worse than none because it would be believed.
+    if state.usage.input_tokens > 0 || state.usage.output_tokens > 0 {
+        spans.push(Span::styled(
+            format!(
+                "{} {} {} in {} {} out ",
+                glyphs::RULE_VERTICAL,
+                glyphs::ARROW_DOWN,
+                compact_count(state.usage.input_tokens),
+                glyphs::ARROW_UP,
+                compact_count(state.usage.output_tokens),
+            ),
+            theme.style(Role::Notification),
+        ));
+    }
+
     if state.interrupting {
         spans.push(Span::styled(
             format!("{} interrupting… ", glyphs::RULE_VERTICAL),
@@ -693,18 +827,45 @@ mod tests {
     }
 
     #[test]
-    fn layout_reserves_rows_for_the_composer_and_status() {
+    fn layout_reserves_rows_for_the_chrome_composer_and_status() {
         let regions = layout(area(80, 24), 1, false);
+        assert_eq!(regions.header.expect("header").height, 1);
+        assert_eq!(regions.hint.expect("hint").height, 1);
         assert_eq!(regions.status.height, 1);
         assert_eq!(regions.composer.height, 3); // one row plus both edges
-        assert_eq!(regions.transcript.height, 20);
+        assert_eq!(regions.transcript.height, 18);
     }
 
     #[test]
     fn the_composer_grows_with_its_content() {
         let regions = layout(area(80, 24), 5, false);
         assert_eq!(regions.composer.height, 7);
-        assert_eq!(regions.transcript.height, 16);
+        assert_eq!(regions.transcript.height, 14);
+    }
+
+    #[test]
+    fn a_short_terminal_drops_the_chrome_rather_than_the_conversation() {
+        // Header and hint are context; the transcript is the content. On a
+        // short terminal they go, rather than squeezing the conversation into
+        // nothing to keep decoration.
+        let regions = layout(area(80, MIN_ROWS_FOR_CHROME - 1), 1, false);
+        assert!(regions.header.is_none());
+        assert!(regions.hint.is_none());
+        assert!(regions.transcript.height >= 3, "the transcript was starved");
+        assert_eq!(regions.status.height, 1, "the status bar must survive");
+    }
+
+    #[test]
+    fn the_hint_line_is_reserved_even_with_nothing_to_say() {
+        // A line that comes and goes reflows the transcript under it, so the
+        // conversation would jump every time something was copied.
+        let quiet = layout(area(80, 24), 1, false);
+        let busy = layout(area(80, 24), 1, false);
+        assert_eq!(
+            quiet.transcript.height, busy.transcript.height,
+            "the transcript height depends on what the hint line says"
+        );
+        assert_eq!(quiet.hint.expect("hint").height, 1);
     }
 
     #[test]

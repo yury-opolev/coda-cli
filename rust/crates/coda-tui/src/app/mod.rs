@@ -159,10 +159,25 @@ impl App {
         command: EngineCommand,
         theme: Theme,
     ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
+        Self::connect_to_session(command, theme, None).await
+    }
+
+    /// Connects to an engine, resuming `session_id` when one is given.
+    ///
+    /// Resuming is part of the handshake rather than something done afterwards
+    /// because the engine seeds its history from the stored transcript while
+    /// initialising; asking later would leave the first turn without it.
+    pub async fn connect_to_session(
+        command: EngineCommand,
+        theme: Theme,
+        session_id: Option<String>,
+    ) -> Result<(Self, Engine, mpsc::UnboundedReceiver<Inbound>)> {
         let (engine, inbound) = Engine::spawn(command.clone()).context("failed to start the engine")?;
         let connection = engine.connection();
 
-        let params = serde_json::to_value(messages::InitializeParams::new("coda-tui"))?;
+        let mut init = messages::InitializeParams::new("coda-tui");
+        init.session_id = session_id;
+        let params = serde_json::to_value(init)?;
         let result = connection
             .request(method::INITIALIZE, Some(params))
             .await
@@ -534,22 +549,28 @@ impl App {
             Action::CompletionCancel => self.composer.clear_completions(),
 
             Action::ScrollUp => {
-                self.capture_anchor_if_following();
                 self.viewport.scroll_up(1);
+                self.remember_position();
             }
-            Action::ScrollDown => self.viewport.scroll_down(1),
+            Action::ScrollDown => {
+                self.viewport.scroll_down(1);
+                self.remember_position();
+            }
             Action::PageUp => {
-                self.capture_anchor_if_following();
                 self.viewport.page_up();
+                self.remember_position();
             }
-            Action::PageDown => self.viewport.page_down(),
+            Action::PageDown => {
+                self.viewport.page_down();
+                self.remember_position();
+            }
             Action::ScrollTop => {
-                self.capture_anchor_if_following();
                 self.viewport.scroll_to_top();
+                self.remember_position();
             }
             Action::ScrollBottom => {
-                self.detached_anchor = None;
                 self.viewport.scroll_to_bottom();
+                self.remember_position();
             }
 
             Action::Interrupt => {
@@ -1084,6 +1105,15 @@ impl App {
         // The transcript origin is captured from the draw so mouse-to-row
         // translation always matches the layout that was actually rendered.
         let mut origin = self.transcript_origin;
+        // Hidden for the duration of the write. Ratatui shows the cursor after
+        // painting, at whatever position the frame asked for, but never hides
+        // it beforehand — so while cells are being written the hardware cursor
+        // is dragged across the screen by the writes and the terminal blinks
+        // it wherever it happens to be. Visible as flicker away from the
+        // caret, and worse now the working indicator forces a frame every
+        // 110ms. Whatever sets a cursor position — the composer, or a focused
+        // field in a surface — shows it again at the end of the frame.
+        guard.terminal().hide_cursor()?;
         guard.terminal().draw(|frame| {
             origin = draw::draw_with_pin(
                 frame, state, composer, viewport, rows, theme, pin, selection,
@@ -1143,11 +1173,29 @@ impl App {
 
     /// Captures a viewport anchor from the current offset if the viewport is
     /// currently following (about to be detached by a scroll).
-    fn capture_anchor_if_following(&mut self) {
-        if !self.viewport.is_following() {
-            return;
-        }
-        self.detached_anchor = self.compute_anchor();
+    /// Shows a passing message on the line above the composer.
+    ///
+    /// For facts worth saying once and not worth keeping. The transcript is a
+    /// record of the conversation; "copied 412 characters" is not part of it,
+    /// and putting it there pushed the conversation up the screen to say so.
+    pub(super) fn hint(&mut self, text: impl Into<String>) {
+        self.state.hint = Some(text.into());
+        self.dirty = true;
+    }
+
+    /// Records where the user is now, so a reflow can put them back.
+    ///
+    /// Recomputed after *every* scroll, not only when the viewport first
+    /// detaches. An anchor captured once describes where the user was at that
+    /// moment, so every later scroll was undone by the next arriving event —
+    /// the transcript jumped back to wherever they had first scrolled away
+    /// from, which reads as the panel moving on its own.
+    fn remember_position(&mut self) {
+        self.detached_anchor = if self.viewport.is_following() {
+            None
+        } else {
+            self.compute_anchor()
+        };
     }
 
     /// Computes a `ViewportAnchor` from the current viewport offset and block layout.
