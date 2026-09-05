@@ -33,7 +33,7 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
     viewport.update(rows.len(), regions.transcript.height as usize);
 
     terminal
-        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme))
+        .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme, std::time::Instant::now()))
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -256,6 +256,7 @@ fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
                     &Theme::default(),
                     None,
                     selection,
+                    std::time::Instant::now(),
                 );
             })
             .expect("draw");
@@ -302,6 +303,7 @@ fn drawing_reports_the_transcript_origin_for_mouse_mapping() {
                 &Theme::default(),
                 None,
                 None,
+                std::time::Instant::now(),
             );
         })
         .expect("draw");
@@ -433,7 +435,7 @@ fn render_with_browser(browser: &coda_tui::overlay::Browser, width: u16, height:
 
     terminal
         .draw(|frame| {
-            draw::draw(frame, &state, &composer, &viewport, &[], &theme);
+            draw::draw(frame, &state, &composer, &viewport, &[], &theme, std::time::Instant::now());
             // Browsers are surfaces now; drive the stack the way the app does.
             let mut stack = coda_tui::surface::stack::SurfaceStack::default();
             stack.push(Box::new(coda_tui::surface::browser::BrowserSurface::new(
@@ -889,7 +891,7 @@ fn the_hint_line_reports_what_arrived_while_scrolled_away() {
     viewport.update_with_anchor(rows.len() + 12, regions.transcript.height as usize, anchor);
 
     terminal
-        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme))
+        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme, std::time::Instant::now()))
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -939,7 +941,7 @@ fn the_way_back_stays_offered_while_scrolled_away() {
     assert_eq!(viewport.unread(), 0, "nothing has arrived yet");
 
     terminal
-        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme))
+        .draw(|frame| draw::draw(frame, &state, &composer, &viewport, &rows, &theme, std::time::Instant::now()))
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
