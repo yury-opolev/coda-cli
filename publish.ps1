@@ -1,57 +1,184 @@
 <#
 .SYNOPSIS
-  Publishes the Coda CLI (src/Coda.Tui) at the CURRENT version (version.json — no
-  bump). Produces one or more distributable flavors under ./publish:
+  Publishes Coda at the CURRENT version (version.json — no bump).
 
-    self-contained       Single coda.exe, bundles the .NET runtime (no install
-                         needed). Largest file. -> publish/self-contained/coda.exe
-    framework-dependent  Single coda.exe, needs the .NET 10 runtime installed.
-                         Much smaller.          -> publish/framework-dependent/coda.exe
-    tool                 .NET global tool package (Coda.Cli, command `coda`).
-                         Install/upgrade via `dotnet tool`. -> publish/tool/*.nupkg
+  DEFAULT (Rust/ratatui — primary distribution):
+    self-contained   Native Rust binary, no runtime needed.
+                     -> publish/self-contained/coda.exe
+    framework-dependent  Alias for self-contained; the Rust binary has no
+                     framework dependency.
+                     -> publish/framework-dependent/coda.exe
+    tool             .NET global tool package (Coda.Cli, command `coda`).
+                     The package wraps a thin .NET launcher that runs the
+                     bundled native binary — the TUI engine is pure Rust.
+                     -> publish/tool/*.nupkg
 
-  Versions are stamped from version.json via the same version.props the build
-  uses, so published artifacts report the current version through `coda --version`.
+  LEGACY (-Legacy switch, C# / .NET):
+    self-contained   Single coda.exe bundling the .NET runtime (no install
+                     needed). Largest file.
+                     -> publish/self-contained/coda.exe
+    framework-dependent  Single coda.exe requiring .NET 10 runtime.
+                     -> publish/framework-dependent/coda.exe
+    tool             .NET global tool package backed by C# Coda.Tui.
+                     -> publish/tool/*.nupkg
 
 .EXAMPLE
-  ./publish.ps1                         # all three flavors, win-x64, Release
-  ./publish.ps1 -Flavor self-contained  # just the standalone exe
-  ./publish.ps1 -Flavor tool            # just the global-tool nupkg
-  ./publish.ps1 -Runtime win-arm64      # target Windows on ARM
-  ./publish.ps1 -Flavor self-contained -Runtime linux-x64   # Linux build
-  ./publish.ps1 -Flavor self-contained -Runtime osx-arm64   # macOS (Apple Silicon)
+  ./publish.ps1                         # Rust: all three flavors, win-x64
+  ./publish.ps1 -Flavor self-contained  # Rust: just the standalone exe
+  ./publish.ps1 -Flavor tool            # Rust: just the global-tool nupkg
+  ./publish.ps1 -Legacy                 # C#: all three flavors
+  ./publish.ps1 -Legacy -Flavor tool    # C#: just the global-tool nupkg
 
 .NOTES
-  Cross-platform: Coda runs on Windows, Linux, and macOS. Pick the target with
-  -Runtime (win-x64 / win-arm64 / linux-x64 / osx-x64 / osx-arm64). On Windows
-  credentials are encrypted with DPAPI; on Linux/macOS they use an AES-GCM file
-  store with 0600 permissions (FileTokenStore). Both default to ~/.coda/credentials.
+  Build the Rust binary before publishing:
+    ./rust/build.ps1 -NoBump   # or: cd rust; cargo build --package coda --release
 
-.NOTES
-  Install the global tool from the produced package:
-    dotnet tool install  --global --add-source ./publish/tool Coda.Cli
-  Upgrade it later:
-    dotnet tool update   --global --add-source ./publish/tool Coda.Cli
+  Install or upgrade the global tool from the produced package:
+    dotnet tool install --global --add-source ./publish/tool Coda.Cli
+    dotnet tool update  --global --add-source ./publish/tool Coda.Cli
 #>
 [CmdletBinding()]
 param(
     [ValidateSet('all', 'self-contained', 'framework-dependent', 'tool')]
     [string]$Flavor = 'all',
+    [ValidateSet('Release', 'Debug')]
     [string]$Configuration = 'Release',
-    [string]$Runtime = 'win-x64'
+    [string]$Runtime = 'win-x64',
+    # Publish the legacy C# / .NET implementation instead of the default Rust.
+    [switch]$Legacy
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
-$project = Join-Path $root 'src/Coda.Tui/Coda.Tui.csproj'
 $publishRoot = Join-Path $root 'publish'
 
-# --- Resolve and stamp the current version (no bump) ---------------------------
+# --- Resolve the current version (no bump) ------------------------------------
 $version = Get-Content (Join-Path $root 'version.json') -Raw | ConvertFrom-Json
 $semVer = "{0}.{1}.{2}" -f [int]$version.major, [int]$version.minor, [int]$version.build
 $asmVer = "$semVer.0"
-Write-Host "Publishing Coda $semVer ($Configuration, $Runtime)" -ForegroundColor Cyan
 
+function Reset-OutputDir {
+    param([string]$OutputDir)
+    if (Test-Path $OutputDir) { Remove-Item -Recurse -Force $OutputDir }
+    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
+}
+
+if ($Legacy) {
+    # =========================================================================
+    # Legacy path: C# / .NET Coda.Tui
+    # =========================================================================
+    $project = Join-Path $root 'src/Coda.Tui/Coda.Tui.csproj'
+
+    Write-Host "Publishing Coda $semVer — Legacy C# ($Configuration, $Runtime)" -ForegroundColor Cyan
+
+    @"
+<Project>
+  <!-- GENERATED by publish.ps1 from version.json. Do not edit. -->
+  <PropertyGroup>
+    <Version>$semVer</Version>
+    <AssemblyVersion>$asmVer</AssemblyVersion>
+    <FileVersion>$asmVer</FileVersion>
+    <InformationalVersion>$semVer</InformationalVersion>
+  </PropertyGroup>
+</Project>
+"@ | Set-Content (Join-Path $root 'version.props') -Encoding utf8
+
+    $versionArgs = @("/p:Version=$semVer", "/p:AssemblyVersion=$asmVer", "/p:FileVersion=$asmVer")
+
+    function Invoke-Checked {
+        param([string[]]$Arguments)
+        & dotnet @Arguments
+        if ($LASTEXITCODE -ne 0) { throw "dotnet $($Arguments -join ' ') failed (exit $LASTEXITCODE)." }
+    }
+
+    function Rename-PublishedExe {
+        param([string]$OutputDir)
+        $src = Join-Path $OutputDir 'Coda.Tui.exe'
+        $dst = Join-Path $OutputDir 'coda.exe'
+        if (-not (Test-Path $src)) {
+            $src = Join-Path $OutputDir 'Coda.Tui'
+            $dst = Join-Path $OutputDir 'coda'
+        }
+        if (Test-Path $src) { Move-Item -Path $src -Destination $dst -Force }
+        Get-ChildItem -Path $OutputDir -Filter '*.pdb' -ErrorAction SilentlyContinue | Remove-Item -Force
+    }
+
+    function Publish-LegacySelfContained {
+        $out = Join-Path $publishRoot 'self-contained'
+        Reset-OutputDir $out
+        Write-Host "==> legacy self-contained -> $out" -ForegroundColor Yellow
+        Invoke-Checked (@('publish', $project, '-c', $Configuration, '-r', $Runtime,
+            '--self-contained', 'true', '/p:PublishSingleFile=true',
+            '/p:EnableCompressionInSingleFile=true',
+            '/p:IncludeNativeLibrariesForSelfExtract=true', '-o', $out) + $versionArgs)
+        Rename-PublishedExe $out
+    }
+
+    function Publish-LegacyFrameworkDependent {
+        $out = Join-Path $publishRoot 'framework-dependent'
+        Reset-OutputDir $out
+        Write-Host "==> legacy framework-dependent -> $out" -ForegroundColor Yellow
+        Invoke-Checked (@('publish', $project, '-c', $Configuration, '-r', $Runtime,
+            '--self-contained', 'false', '/p:PublishSingleFile=true', '-o', $out) + $versionArgs)
+        Rename-PublishedExe $out
+    }
+
+    function Publish-LegacyTool {
+        $out = Join-Path $publishRoot 'tool'
+        Reset-OutputDir $out
+        Write-Host "==> legacy global tool (Coda.Cli / C#) -> $out" -ForegroundColor Yellow
+        Invoke-Checked (@('pack', $project, '-c', $Configuration, '-o', $out) + $versionArgs)
+    }
+
+    switch ($Flavor) {
+        'self-contained'      { Publish-LegacySelfContained }
+        'framework-dependent' { Publish-LegacyFrameworkDependent }
+        'tool'                { Publish-LegacyTool }
+        'all' {
+            Publish-LegacySelfContained
+            Publish-LegacyFrameworkDependent
+            Publish-LegacyTool
+        }
+    }
+
+    Write-Host "Published Coda $semVer (legacy C#)." -ForegroundColor Green
+    return
+}
+
+# =============================================================================
+# Default path: Rust / ratatui primary distribution
+# =============================================================================
+Write-Host "Publishing Coda $semVer — Rust/ratatui ($Runtime)" -ForegroundColor Cyan
+
+if ($Runtime -ne 'win-x64') {
+    throw "The Rust distribution currently packages win-x64 only; requested '$Runtime'."
+}
+$nativeDir = Join-Path $root "rust\target\$($Configuration.ToLowerInvariant())"
+$rustExe = Join-Path $nativeDir 'coda.exe'
+if (-not (Test-Path $rustExe)) {
+    throw "Rust binary not found at $rustExe. Build it first: .\build.ps1 -Configuration $Configuration -NoBump"
+}
+
+# Do not label a stale or differently targeted payload with the current version/RID.
+$reader = [System.IO.BinaryReader]::new([System.IO.File]::OpenRead($rustExe))
+try {
+    $reader.BaseStream.Position = 0x3c
+    $peOffset = $reader.ReadInt32()
+    $reader.BaseStream.Position = $peOffset
+    if ($reader.ReadUInt32() -ne 0x00004550 -or $reader.ReadUInt16() -ne 0x8664) {
+        throw "Native payload must be a Windows x64 executable: $rustExe"
+    }
+}
+finally {
+    $reader.Dispose()
+}
+$reported = & $rustExe --version
+if ($LASTEXITCODE -ne 0 -or "$reported".Trim() -ne "coda $semVer") {
+    throw "Native payload version '$reported' does not match coda $semVer. Rebuild before publishing."
+}
+
+# Regenerate version.props so the launcher project gets the right version stamp.
+$asmVer = "$semVer.0"
 @"
 <Project>
   <!-- GENERATED by publish.ps1 from version.json. Do not edit. -->
@@ -64,92 +191,41 @@ Write-Host "Publishing Coda $semVer ($Configuration, $Runtime)" -ForegroundColor
 </Project>
 "@ | Set-Content (Join-Path $root 'version.props') -Encoding utf8
 
-$versionArgs = @("/p:Version=$semVer", "/p:AssemblyVersion=$asmVer", "/p:FileVersion=$asmVer")
-
-function Invoke-Checked {
-    param([string[]]$Arguments)
-    & dotnet @Arguments
-    if ($LASTEXITCODE -ne 0) { throw "dotnet $($Arguments -join ' ') failed (exit $LASTEXITCODE)." }
-}
-
-# The exe ships as `coda.exe`. We rename the published single file rather than
-# overriding AssemblyName, because that property propagates to every referenced
-# project and makes them all build an assembly named "coda" (restore then fails
-# with "Ambiguous project name 'coda'").
-function Rename-PublishedExe {
-    param([string]$OutputDir)
-    # Windows publishes Coda.Tui.exe; Linux/macOS publish an extension-less Coda.Tui.
-    $src = Join-Path $OutputDir 'Coda.Tui.exe'
-    $dst = Join-Path $OutputDir 'coda.exe'
-    if (-not (Test-Path $src)) {
-        $src = Join-Path $OutputDir 'Coda.Tui'
-        $dst = Join-Path $OutputDir 'coda'
-    }
-    if (Test-Path $src) {
-        Move-Item -Path $src -Destination $dst -Force
-    }
-    # Drop loose debug symbols so the folder is just the shippable exe.
-    Get-ChildItem -Path $OutputDir -Filter '*.pdb' -ErrorAction SilentlyContinue | Remove-Item -Force
-}
-
-# Wipe a flavor's output directory so each run is reproducible (no stale runtime
-# DLLs from a different -Runtime, no accumulating .nupkg versions).
-function Reset-OutputDir {
-    param([string]$OutputDir)
-    if (Test-Path $OutputDir) {
-        Remove-Item -Recurse -Force $OutputDir
-    }
-    New-Item -ItemType Directory -Path $OutputDir -Force | Out-Null
-}
-
-# --- Self-contained single-file exe (no runtime install required) --------------
-function Publish-SelfContained {
+function Publish-RustSelfContained {
     $out = Join-Path $publishRoot 'self-contained'
     Reset-OutputDir $out
-    Write-Host "==> self-contained -> $out" -ForegroundColor Yellow
-    Invoke-Checked (@(
-        'publish', $project, '-c', $Configuration, '-r', $Runtime,
-        '--self-contained', 'true',
-        '/p:PublishSingleFile=true',
-        '/p:EnableCompressionInSingleFile=true',
-        '/p:IncludeNativeLibrariesForSelfExtract=true',
-        '-o', $out
-    ) + $versionArgs)
-    Rename-PublishedExe $out
+    Write-Host "==> self-contained (Rust) -> $out" -ForegroundColor Yellow
+    Copy-Item $rustExe (Join-Path $out 'coda.exe') -Force
 }
 
-# --- Framework-dependent single-file exe (needs .NET 10 runtime) ---------------
-function Publish-FrameworkDependent {
+function Publish-RustFrameworkDependent {
+    # The Rust binary has no .NET framework dependency. This flavor is kept for
+    # compatibility with scripts that expect it; it produces the same binary.
     $out = Join-Path $publishRoot 'framework-dependent'
     Reset-OutputDir $out
-    Write-Host "==> framework-dependent -> $out" -ForegroundColor Yellow
-    Invoke-Checked (@(
-        'publish', $project, '-c', $Configuration, '-r', $Runtime,
-        '--self-contained', 'false',
-        '/p:PublishSingleFile=true',
-        '-o', $out
-    ) + $versionArgs)
-    Rename-PublishedExe $out
+    Write-Host "==> framework-dependent (Rust — same binary, no framework needed) -> $out" -ForegroundColor Yellow
+    Copy-Item $rustExe (Join-Path $out 'coda.exe') -Force
 }
 
-# --- .NET global tool package --------------------------------------------------
-function Publish-Tool {
+function Publish-RustTool {
     $out = Join-Path $publishRoot 'tool'
     Reset-OutputDir $out
-    Write-Host "==> global tool (Coda.Cli) -> $out" -ForegroundColor Yellow
-    Invoke-Checked (@(
-        'pack', $project, '-c', $Configuration, '-o', $out
-    ) + $versionArgs)
+    Write-Host "==> global tool (Coda.Cli / Rust launcher) -> $out" -ForegroundColor Yellow
+    $launcherProject = Join-Path $root 'src\Coda.Launcher\Coda.Launcher.csproj'
+    & dotnet pack $launcherProject -c $Configuration -o $out `
+        /p:Version=$semVer /p:AssemblyVersion=$asmVer /p:FileVersion=$asmVer `
+        "/p:NativePayloadDir=$nativeDir\"
+    if ($LASTEXITCODE -ne 0) { throw "dotnet pack failed (exit $LASTEXITCODE)." }
 }
 
 switch ($Flavor) {
-    'self-contained'      { Publish-SelfContained }
-    'framework-dependent' { Publish-FrameworkDependent }
-    'tool'                { Publish-Tool }
+    'self-contained'      { Publish-RustSelfContained }
+    'framework-dependent' { Publish-RustFrameworkDependent }
+    'tool'                { Publish-RustTool }
     'all' {
-        Publish-SelfContained
-        Publish-FrameworkDependent
-        Publish-Tool
+        Publish-RustSelfContained
+        Publish-RustFrameworkDependent
+        Publish-RustTool
     }
 }
 
