@@ -197,7 +197,7 @@ fn styled_runs(row: &RenderLine, theme: &Theme, base: Style) -> Vec<Span<'static
 }
 
 fn style_for(role: Role, row: &RenderLine, theme: &Theme, base: Style) -> Style {
-    let mut style = Style::default().fg(theme.fg(role));
+    let mut style = theme.style(role);
     if let Some(background) = row.background {
         style = style.bg(theme.fg(background));
     } else if let Some(bg) = base.bg {
@@ -833,6 +833,7 @@ mod tests {
     use super::*;
     use coda_render::theme::ColorDepth;
     use coda_render::{Gutter, Span as RenderSpan};
+    use ratatui::style::Modifier;
 
     fn theme() -> Theme {
         Theme::warm_ember().with_depth(ColorDepth::TrueColor)
@@ -1027,6 +1028,30 @@ mod tests {
         assert_eq!(plain_text(&line), "日本語");
         for span in &line.spans {
             assert!(span.content.chars().count() > 0);
+        }
+    }
+
+    #[test]
+    fn completed_thinking_styles_survive_terminal_conversion() {
+        let theme = Theme::default();
+        let rows = crate::transcript::Block::Thinking {
+            text: "Some **reasoning** with `code`.".into(),
+            elapsed_ms: 1000,
+            tokens: None,
+            complete: true,
+            expanded: true,
+        }
+        .render(80, coda_render::tool::ToolDisplayMode::Summary);
+
+        for (index, row) in rows.iter().enumerate() {
+            let line = to_line(row, &theme, 80);
+            assert!(line.spans.iter().all(|span| {
+                span.style.add_modifier.contains(Modifier::ITALIC)
+                    && span.style.fg == Some(theme.fg(Role::Notification))
+            }));
+            assert!(line.spans.iter().all(|span| {
+                span.style.add_modifier.contains(Modifier::DIM) == (index > 0)
+            }));
         }
     }
 

@@ -24,6 +24,8 @@ pub enum Gutter {
     AgentComplete,
     /// Wrapped continuation of a top-level row.
     Continuation,
+    /// Continuous rule beside expanded reasoning, including blank rows.
+    ThinkingBody,
     /// A nested row with more siblings below.
     Child,
     /// The final nested row in a group.
@@ -41,6 +43,7 @@ impl Gutter {
             Gutter::AgentActive => " \u{25CB} ",      // ○
             Gutter::AgentComplete => " \u{25CF} ",    // ●
             Gutter::Continuation => "   ",
+            Gutter::ThinkingBody => "\u{2502} ",
             Gutter::Child => "   \u{2502} ",          // │
             Gutter::LastChild => "   \u{2514} ",      // └
             Gutter::ChildContinuation => "     ",
@@ -55,6 +58,7 @@ impl Gutter {
             Gutter::AgentActive => " o ",
             Gutter::AgentComplete => " * ",
             Gutter::Continuation => "   ",
+            Gutter::ThinkingBody => "| ",
             Gutter::Child => "   | ",
             Gutter::LastChild => "   \\ ",
             Gutter::ChildContinuation => "     ",
@@ -65,6 +69,7 @@ impl Gutter {
     pub fn cells(self) -> usize {
         match self {
             Gutter::None => 0,
+            Gutter::ThinkingBody => 2,
             Gutter::UserMarker
             | Gutter::AgentActive
             | Gutter::AgentComplete
@@ -80,7 +85,7 @@ impl Gutter {
     pub fn is_marker(self) -> bool {
         matches!(
             self,
-            Gutter::UserMarker | Gutter::AgentActive | Gutter::AgentComplete
+            Gutter::UserMarker | Gutter::AgentActive | Gutter::AgentComplete | Gutter::ThinkingBody
         )
     }
 
@@ -88,6 +93,7 @@ impl Gutter {
     pub fn continuation(self) -> Gutter {
         match self {
             Gutter::None => Gutter::None,
+            Gutter::ThinkingBody => Gutter::ThinkingBody,
             Gutter::UserMarker
             | Gutter::AgentActive
             | Gutter::AgentComplete
@@ -257,6 +263,20 @@ mod tests {
             assert_eq!(width(gutter.prefix()), CHILD_CELLS, "{gutter:?}");
             assert_eq!(width(gutter.ascii_prefix()), CHILD_CELLS, "{gutter:?}");
         }
+    }
+
+    #[test]
+    fn thinking_rule_continues_through_wrapping_and_blank_rows() {
+        let gutter = Gutter::ThinkingBody;
+        assert_eq!(gutter.cells(), 2);
+        assert_eq!(width(gutter.prefix()), gutter.cells());
+        assert_eq!(width(gutter.ascii_prefix()), gutter.cells());
+        assert_eq!(gutter.continuation(), gutter);
+        assert!(gutter.is_marker());
+        assert_eq!(
+            RenderLine::new("", Role::ThinkingBody).with_gutter(gutter).text,
+            "\u{2502} "
+        );
     }
 
     #[test]
