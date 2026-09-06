@@ -570,6 +570,7 @@ pub struct ServeHost {
     working_dir: String,
     model: Mutex<String>,
     effort: Mutex<Option<Effort>>,
+    pending_startup_effort: Mutex<Option<StartupEffort>>,
     /// Session-only, per-model reasoning-effort overrides.
     ///
     /// Keyed by model id. Presence of a key means "the user made an explicit
@@ -823,6 +824,10 @@ impl ServeHost {
             working_dir,
             model: Mutex::new(startup_model),
             effort: Mutex::new(initial_effort),
+            pending_startup_effort: Mutex::new(match startup_opts.effort {
+                StartupEffort::Unset => None,
+                override_ => Some(override_),
+            }),
             effort_overrides: Mutex::new(HashMap::new()),
             effort_lock: tokio::sync::Mutex::new(()),
             goal_params: Mutex::new(startup_goals),
@@ -854,6 +859,27 @@ impl ServeHost {
 
     fn current_effort(&self) -> Option<Effort> {
         *self.effort.lock().expect("effort poisoned")
+    }
+
+    async fn apply_pending_startup_effort(&self) -> Result<(), RpcError> {
+        let pending = *self.pending_startup_effort.lock().expect("startup effort poisoned");
+        let Some(pending) = pending else { return Ok(()) };
+        let level = match pending {
+            StartupEffort::Level(level) => Some(level.as_str().to_owned()),
+            StartupEffort::Auto => None,
+            StartupEffort::Unset => return Ok(()),
+        };
+        let result = self.session_set_effort(SetEffortParams {
+            effort: level, ..Default::default()
+        }).await?;
+        if result.get("ok").and_then(Value::as_bool) != Some(true) {
+            return Err(RpcError::invalid_params(format!(
+                "startup effort was not applied: {}",
+                result.get("note").and_then(Value::as_str).unwrap_or("unsupported level"),
+            )));
+        }
+        *self.pending_startup_effort.lock().expect("startup effort poisoned") = None;
+        Ok(())
     }
 
     /// Test-only: set the current model without going through the RPC path.
@@ -1137,6 +1163,7 @@ impl ServeBackend for ServeHost {
                 *self.client.lock().await = Some(c);
             }
         }
+        self.apply_pending_startup_effort().await?;
         let resp = InitializeResponse {
             protocol_version: PROTOCOL_VERSION.into(),
             session_id: self.active_session_id(),
@@ -1177,6 +1204,7 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_prompt(&self, p: PromptParams) -> Result<Value, RpcError> {
+        self.apply_pending_startup_effort().await?;
         // Validate images BEFORE claiming the turn slot so a bad image
         // never leaves the host stuck in "busy" state.
         if let Some(images) = p.images.as_deref() {
@@ -4426,6 +4454,33 @@ mod tests {
         };
         let (host, _client) = make_capturing_host_with_options(opts);
         assert_eq!(host.current_effort(), Some(Effort::High));
+    }
+
+    #[tokio::test]
+    async fn startup_effort_is_resolved_against_the_connected_model_on_initialize() {
+        let opts = StartupOptions {
+            model: Some("claude-sonnet-4.6".into()),
+            effort: StartupEffort::Level(Effort::Max),
+            ..StartupOptions::default()
+        };
+        let (host, _) = make_capturing_host_with_options(opts);
+        host.initialize(InitParams::default()).await.unwrap();
+        assert_eq!(host.current_effort(), Some(Effort::High));
+        assert!(host.pending_startup_effort.lock().unwrap().is_none());
+        assert_eq!(host.model_reasoning_capability().await.unwrap()["current"], "high");
+    }
+
+    #[tokio::test]
+    async fn startup_effort_rejects_a_known_unsupported_model_before_prompt() {
+        let opts = StartupOptions {
+            model: Some("claude-haiku-4.5".into()),
+            effort: StartupEffort::Level(Effort::High),
+            ..StartupOptions::default()
+        };
+        let (host, client) = make_capturing_host_with_options(opts);
+        assert!(host.initialize(InitParams::default()).await.is_err());
+        assert!(host.apply_pending_startup_effort().await.is_err());
+        assert!(client.last_system_prompt().is_none());
     }
 
     /// Apply-order invariant (Finding C1): the CLI applies model/provider

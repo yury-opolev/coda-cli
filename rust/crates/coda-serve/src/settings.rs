@@ -106,7 +106,7 @@ pub fn resolve_for_provider_at(path: &Path, provider: Option<&str>) -> StartupMo
 }
 
 fn resolve_for_provider_from(value: &Value, provider: Option<&str>) -> StartupModel {
-    let provider_id = provider.unwrap_or(FALLBACK_PROVIDER).to_owned();
+    let provider_id = crate::host::canonical_provider(provider.unwrap_or(FALLBACK_PROVIDER));
 
     let by_provider = value
         .get("modelByProvider")
@@ -166,6 +166,29 @@ pub fn resolve() -> StartupModel {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn provider_aliases_use_the_canonical_saved_model() {
+        let settings = json!({
+            "defaultModel": "wrong-fallback",
+            "modelByProvider": {
+                "github-copilot": "copilot-saved",
+                "claude-ai": "subscription-saved",
+                "anthropic": "api-saved"
+            }
+        });
+        for (alias, canonical, expected) in [
+            ("copilot", "github-copilot", "copilot-saved"),
+            ("github", "github-copilot", "copilot-saved"),
+            ("claude", "claude-ai", "subscription-saved"),
+            ("subscription", "claude-ai", "subscription-saved"),
+            ("api-key", "anthropic", "api-saved"),
+        ] {
+            let resolved = resolve_for_provider_from(&settings, Some(alias));
+            assert_eq!(resolved.provider_id, canonical);
+            assert_eq!(resolved.model, expected, "{alias}");
+        }
+    }
 
     #[test]
     fn the_model_comes_from_the_provider_specific_map() {
