@@ -22,9 +22,11 @@ pub const FALLBACK_MODEL: &str = "claude-opus-5";
 /// The provider assumed when settings say nothing and no credential is connected.
 pub const FALLBACK_PROVIDER: &str = "github-copilot";
 
-/// Locates `~/.coda/settings.json`.
+/// Locates `~/.coda/settings.json`, honoring the `CODA_HOME` profile-root
+/// override so serve reads the same isolated profile the credential and catalog
+/// paths do.
 fn settings_path() -> Option<PathBuf> {
-    directories::UserDirs::new().map(|d| d.home_dir().join(".coda").join("settings.json"))
+    Some(coda_auth::coda_dir().join("settings.json"))
 }
 
 /// The provider and model the engine should start with.

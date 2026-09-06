@@ -31,6 +31,14 @@ pub struct EngineCommand {
     pub working_dir: Option<PathBuf>,
     /// Extra environment variables.
     pub env: Vec<(OsString, OsString)>,
+    /// Environment variables to remove from the child's inherited environment.
+    ///
+    /// Adding a variable cannot express "make sure this inherited secret is
+    /// gone" — an empty value is still a present, empty variable, which some
+    /// readers treat differently from absence. Removal is required to isolate a
+    /// child from inherited credentials (`ANTHROPIC_API_KEY`) and configuration
+    /// (`CODA_SERVE_*`) so a test environment cannot leak into it.
+    pub env_remove: Vec<OsString>,
 }
 
 impl Default for EngineCommand {
@@ -40,6 +48,7 @@ impl Default for EngineCommand {
             args: vec![OsString::from("serve")],
             working_dir: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
         }
     }
 }
@@ -53,6 +62,7 @@ impl EngineCommand {
             args: Vec::new(),
             working_dir: None,
             env: Vec::new(),
+            env_remove: Vec::new(),
         }
     }
 
@@ -77,6 +87,16 @@ impl EngineCommand {
 
     pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
         self.env.push((key.into(), value.into()));
+        self
+    }
+
+    /// Removes an inherited environment variable from the child.
+    ///
+    /// Use this to strip credentials and configuration the child must not see
+    /// (e.g. `ANTHROPIC_API_KEY`, `CODA_SERVE_API_KEY`, other `CODA_SERVE_*`),
+    /// which setting an empty value cannot guarantee.
+    pub fn env_remove(mut self, key: impl Into<OsString>) -> Self {
+        self.env_remove.push(key.into());
         self
     }
 }
@@ -110,6 +130,9 @@ impl Engine {
         }
         for (key, value) in &command.env {
             builder.env(key, value);
+        }
+        for key in &command.env_remove {
+            builder.env_remove(key);
         }
 
         let mut child = builder

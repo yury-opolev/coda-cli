@@ -66,4 +66,19 @@ public sealed class CredentialStoreLocationTests : IDisposable
             Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda", "credentials");
         Assert.Equal(expected, CredentialStoreLocation.Default);
     }
+
+    [Fact]
+    public void Explicit_profile_does_not_import_or_delete_legacy_credentials()
+    {
+        Directory.CreateDirectory(this.legacy);
+        var sentinel = Path.Combine(this.legacy, "sentinel.cred");
+        File.WriteAllText(sentinel, "isolated-test-fixture");
+
+        Assert.Equal(this.target,
+            CredentialStoreLocation.ResolveDefault(this.legacy, this.target, explicitProfile: true));
+
+        Assert.True(Directory.Exists(this.target));
+        Assert.Empty(Directory.EnumerateFileSystemEntries(this.target));
+        Assert.Equal("isolated-test-fixture", File.ReadAllText(sentinel));
+    }
 }

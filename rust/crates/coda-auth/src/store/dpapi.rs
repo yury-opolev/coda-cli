@@ -132,12 +132,10 @@ pub struct DpapiStore {
 }
 
 impl DpapiStore {
-    /// Uses `~/.coda/credentials`, the same directory as the C# build.
+    /// Uses `~/.coda/credentials` (or `<CODA_HOME>/.coda/credentials` when the
+    /// profile root is overridden), the same directory as the C# build.
     pub fn default_location() -> Self {
-        let base = directories::UserDirs::new()
-            .map(|d| d.home_dir().to_path_buf())
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        Self { directory: base.join(".coda").join("credentials") }
+        Self { directory: crate::home::coda_dir().join("credentials") }
     }
 
     pub fn with_directory(directory: impl Into<std::path::PathBuf>) -> Self {

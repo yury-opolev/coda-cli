@@ -40,7 +40,7 @@ public static partial class SkillLoader
     {
         var userBase = userSkillsDir
             ?? Environment.GetEnvironmentVariable("CODA_USER_SKILLS_DIR")
-            ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda");
+            ?? Coda.Common.CodaPaths.CodaDirectory;
 
         // Reuse the Claude CLI's skills read-only, so users don't have to duplicate
         // them. The location is overridable via CODA_CLAUDE_SKILLS_DIR (point it at a
@@ -48,7 +48,7 @@ public static partial class SkillLoader
         var claudeSkillsPath = claudeSkillsDir
             ?? Environment.GetEnvironmentVariable("CODA_CLAUDE_SKILLS_DIR")
             ?? Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                Coda.Common.CodaPaths.HomeDirectory,
                 ".claude",
                 "skills");
 

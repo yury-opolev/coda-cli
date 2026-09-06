@@ -98,9 +98,23 @@ impl ModelCatalog {
         Self { providers }
     }
 
-    /// The catalogue to use: the refreshed cache if there is one, else the
-    /// snapshot shipped with the binary.
+    /// The catalogue to use, in the same source order as the C# engine so the
+    /// two agree: an explicit `CODA_MODELS_PATH` file, then the refreshed cache
+    /// if there is one, else the snapshot shipped with the binary.
     pub fn load() -> Self {
+        // An explicit path wins — the deterministic, offline-safe seam the C#
+        // engine also honors (`CODA_MODELS_PATH`), used by the parity harness to
+        // pin both engines to one fixture catalogue.
+        if let Some(explicit) = std::env::var_os("CODA_MODELS_PATH") {
+            if !explicit.is_empty() {
+                if let Ok(text) = std::fs::read_to_string(&explicit) {
+                    let catalog = Self::parse(&text);
+                    if !catalog.is_empty() {
+                        return catalog;
+                    }
+                }
+            }
+        }
         if let Some(cached) = cache_path().and_then(|p| std::fs::read_to_string(p).ok()) {
             let catalog = Self::parse(&cached);
             // A cache that parsed to nothing is a corrupt or truncated write,
@@ -144,10 +158,9 @@ impl ModelCatalog {
 }
 
 /// Where a live refresh leaves its copy, matching the C# path exactly so the
-/// two engines share one cache.
+/// two engines share one cache. Honors the `CODA_HOME` profile-root override.
 fn cache_path() -> Option<PathBuf> {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".coda").join("cache").join("models.json"))
+    Some(coda_auth::coda_dir().join("cache").join("models.json"))
 }
 
 #[cfg(test)]

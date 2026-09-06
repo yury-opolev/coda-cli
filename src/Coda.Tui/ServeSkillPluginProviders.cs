@@ -39,9 +39,7 @@ public static class ServeSkillPluginProviders
     public static Func<CodaSession, IReadOnlyList<ServePluginInfo>> BuildPluginsProvider() =>
         sess =>
         {
-            var codaDir = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                ".coda");
+            var codaDir = Coda.Common.CodaPaths.CodaDirectory;
             var stateStore = new PluginStateStore(codaDir);
             var trustStore = new PluginTrustStore();
 

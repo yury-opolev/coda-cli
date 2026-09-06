@@ -473,7 +473,7 @@ public static class ServeRunner
                 var plugins = PluginLoader.Load(workingDirectory);
                 // Construct trust store and refuse project-scoped plugins without workspace trust
                 // (serve: no interactive prompt, workspace trust must have been pre-granted).
-                var serveHomeDir = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                var serveHomeDir = Coda.Common.CodaPaths.HomeDirectory;
                 var servePluginTrustStore = new PluginTrustStore(serveHomeDir);
                 var pluginComposition = PluginComponentComposer.Compose(plugins, workingDirectory, trustStore: servePluginTrustStore);
                 var pluginRegistry = pluginComposition.Agents.Count > 0

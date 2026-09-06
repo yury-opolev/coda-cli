@@ -1291,14 +1291,16 @@ impl ServeBackend for ServeHost {
             // No client yet: return a catalog so the user can see model options
             // rather than an empty list that looks like "no models exist".
             // Finding 2: never collapse "could not determine" into "none exist".
+            let provider_id = self.connected_provider().await;
             let mut catalog = catalog_models();
-            self.annotate_effort(&mut catalog, crate::settings::FALLBACK_PROVIDER, &active);
+            self.annotate_effort(&mut catalog, &provider_id, &active);
             let catalog = serde_json::to_value(&catalog)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(json!({
                 "source": "catalog",
                 "models": catalog,
                 "model": active,
+                "providerId": provider_id,
             }));
         };
         let provider_id = client.provider_id().to_owned();
@@ -2342,10 +2344,10 @@ fn validate_base64(s: &str) -> Result<(), String> {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Read the user's settings.json as a JSON value (best-effort; empty object on failure).
+/// Honors the `CODA_HOME` profile-root override.
 fn load_settings_value() -> Value {
-    directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".coda").join("settings.json"))
-        .and_then(|p| std::fs::read_to_string(p).ok())
+    std::fs::read_to_string(coda_auth::coda_dir().join("settings.json"))
+        .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| Value::Object(Default::default()))
 }
@@ -2409,10 +2411,9 @@ fn load_lsp_configs(
 pub(crate) fn load_user_hooks(working_dir: &str) -> Vec<UserHook> {
     let mut hooks = Vec::new();
 
-    // User-scoped: ~/.coda/settings.json
-    if let Some(path) = directories::UserDirs::new()
-        .map(|d| d.home_dir().join(".coda").join("settings.json"))
+    // User-scoped: ~/.coda/settings.json (honors the CODA_HOME override)
     {
+        let path = coda_auth::coda_dir().join("settings.json");
         for mut h in load_hooks_from_file(&path) {
             h.scope = HookScope::User; // stamped by loader, not from JSON
             hooks.push(h);

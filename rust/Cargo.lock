@@ -771,7 +771,6 @@ dependencies = [
  "coda-mcp",
  "coda-proto",
  "coda-tool",
- "directories",
  "serde",
  "serde_json",
  "tempfile",

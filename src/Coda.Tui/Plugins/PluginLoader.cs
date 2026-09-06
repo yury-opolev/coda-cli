@@ -31,9 +31,7 @@ public static class PluginLoader
         PluginStateStore? stateStore = null,
         TimeProvider? clock = null)
     {
-        var userBase = userCodaDir ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".coda");
+        var userBase = userCodaDir ?? Coda.Common.CodaPaths.CodaDirectory;
 
         // Purge expired orphans on every load (14-day grace period).
         PluginOrphanManager.PurgeExpired(userBase, clock ?? TimeProvider.System);
@@ -94,9 +92,7 @@ public static class PluginLoader
         string? userCodaDir = null,
         PluginStateStore? stateStore = null)
     {
-        var userBase = userCodaDir ?? Path.Combine(
-            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-            ".coda");
+        var userBase = userCodaDir ?? Coda.Common.CodaPaths.CodaDirectory;
 
         var plugins = Load(workingDirectory, userCodaDir, stateStore);
         var result = new List<string>(plugins.Count * 2);

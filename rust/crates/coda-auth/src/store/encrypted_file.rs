@@ -212,9 +212,7 @@ fn set_owner_only_file(path: &Path) -> Result<(), AuthError> {
 }
 
 fn default_credentials_dir() -> PathBuf {
-    directories::BaseDirs::new()
-        .map(|dirs| dirs.home_dir().join(".coda").join("credentials"))
-        .unwrap_or_else(|| PathBuf::from(".coda/credentials"))
+    crate::home::coda_dir().join("credentials")
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────

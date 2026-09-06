@@ -157,13 +157,104 @@ Two independent checks, both green:
 - **Contract tests** (`coda-tui/tests/engine_contract.rs`) run against either
   engine via `CODA_ENGINE`. Six tests, identical assertions, both pass.
 - **Differential tests** (`coda-diff`) drive both engines with an identical
-  request sequence and compare normalised responses. **Zero divergences**;
-  `KNOWN_GAPS` is empty.
+  request sequence and compare normalised responses. **Zero undeclared
+  divergences** on the shared protocol; `KNOWN_GAPS` is empty. The one
+  capability-dependent behavioural difference (`session/setEffort` on an
+  indeterminate model, below) is pinned explicitly, not swept into an exclusion.
 
 The differential suite covers the deterministic surface — handshake, history,
 models, listings, errors, goals, effort, schedules. It excludes live model
 turns on purpose: a provider's output is not reproducible, and a flaky parity
 test is worse than none.
+
+#### Hermetic isolation (no real profile, no auth, no network)
+
+The comparison is only honest if it is hermetic, and `serve` reads far more than
+its working directory: both engines probe `~/.coda` (settings, credentials, the
+model cache, skills, plugins, hooks) and, given a credential, fetch models over
+the network. On Windows setting `USERPROFILE` does **not** redirect these — both
+the Rust `directories` crate and C# `SpecialFolder.UserProfile` resolve the
+profile from the user token, not the environment (verified empirically). So the
+harness closes every seam with explicit application-level overrides:
+
+- **Home / settings / credentials / cache / skills / plugins** → an empty temp
+  root via `CODA_HOME` (the Rust engine's profile-root override) and
+  `CODA_SETTINGS_DIR` (the C# settings seam). The credential directory it
+  creates is empty, so neither engine finds a credential or builds a live
+  client, and no OS keyring is probed.
+- **Model catalogue** → pinned to a small deterministic fixture via
+  `CODA_MODELS_PATH` (honored by both engines), with the background models.dev
+  refresh disabled via `CODA_DISABLE_MODELS_FETCH`. With no credential the model
+  list resolves from that fixture, so both report `source: "catalog"` with the
+  same ids — never a live, network-derived list.
+- **Inherited credentials/config** (`ANTHROPIC_API_KEY`, `CODA_SERVE_API_KEY`
+  and every other `CODA_SERVE_*`) are **removed** from the child environment —
+  not blanked, because an empty variable is still present.
+
+The C# engine resolves its provider only from `--provider` or a stored
+credential (a settings `defaultProvider` is not a selector), so under the
+credential-free profile it is started with `serve --provider github-copilot`;
+this is offline-safe (with an empty credential store the copilot client throws
+locally before any HTTP call). The Rust engine needs no such flag and is not
+given one, so it never runs the provider credential probe.
+
+Isolation is then **verified, not assumed**: `session/models` must report
+`source: "catalog"`, the sentinel fixture model, the fixture provider, and
+exactly the fixture catalogue's ids on *both* engines — a leak into the real
+`~/.coda`, a live client, or a network fetch would change one of those.
+
+#### Running the differential suite
+
+The installed `coda` on `PATH` is now the **Rust** engine, so the C# reference
+must be built and named explicitly — resolving it from `PATH` would compare the
+Rust engine against itself. Both engines share `version.json`, so an equal
+`--version` is expected and is never used to tell them apart; identity is
+established by artifact (a .NET `Coda.Tui` metadata sibling, plus a
+path/content guard that rejects the *same* binary on both sides).
+
+```powershell
+# 1. Build the legacy C# reference into an isolated directory. This does NOT
+#    bump the version and leaves the primary publish/tool outputs untouched
+#    (avoid `.\build.ps1 -Legacy`, which bumps unless given -NoBump):
+dotnet publish src\Coda.Tui\Coda.Tui.csproj -c Release -o artifacts\legacy-parity
+
+# 2. Build the Rust engine:
+cd rust; cargo build --release -p coda
+
+# 3. Unit tests (normalisation, extension projection, identity guard) run in the
+#    routine suite; the cross-engine comparison is a separate opt-in:
+cargo test -p coda-diff                       # unit tests; parity test reported "ignored"
+$env:CODA_CSHARP_ENGINE = "..\artifacts\legacy-parity\Coda.Tui.exe"
+cargo test -p coda-diff --test parity -- --ignored --nocapture
+```
+
+`CODA_RUST_ENGINE` overrides the Rust binary (default: `target/release/coda.exe`);
+`CODA_CSHARP_ENGINE` accepts the `Coda.Tui.exe` apphost or the `Coda.Tui.dll`
+(run through `dotnet`). The opt-in test is `#[ignore]` so a routine
+`cargo test --workspace` never runs it, and it **fails loudly** — never
+skips-with-success — when opted in without a valid reference.
+
+**Rust protocol extensions.** The Rust engine is a *superset* of the C# contract
+on three methods: `session/models` rows carry `reasoningLevels`/`inputCost`/
+`outputCost`/`effort`; `model/reasoningCapability` adds `current`/
+`indeterminate`/`model`/`providerId`; `session/setEffort` adds the effective
+`current` level. `session/setSystemPrompt` is Rust-only (the C# engine returns
+`-32601`). These are declared explicitly in `RUST_EXTENSIONS`, projected out of
+the common comparison so the shared contract is compared for exact equality, and
+independently shape-checked by the extension schema tests — they are *verified*,
+not blanket-ignored. The active `model`/`providerId` on `session/models` are
+now sent by both engines and are compared as common fields.
+
+**One documented directional divergence.** Applying a *valid* effort level
+(`session/setEffort` with e.g. `medium`) requires the active model's reasoning
+capability. Under the isolated profile the `github-copilot` model is
+*indeterminate* (no live model list confirms its levels), and the engines
+legitimately differ: the C# engine will not apply a level it cannot verify
+(`ok:false`), while the Rust engine is optimistic under indeterminacy
+(`ok:true`). This depends on a live model list, so — like live model output — it
+is out of scope for the deterministic comparison; the parity test pins both
+directions (`assert_indeterminate_effort_divergence`) so a change on either side
+fails loudly rather than being absorbed by a blanket exclusion.
 
 Differential testing has been worth more than its cost. Three times a Rust
 unit test had pinned the *wrong* value and so agreed with a bug —
