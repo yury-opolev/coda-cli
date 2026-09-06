@@ -24,6 +24,8 @@ pub enum Role {
     Code,
     Tool,
     Notification,
+    ThinkingHeader,
+    ThinkingBody,
     Question,
     Warning,
     Error,
@@ -386,7 +388,7 @@ impl Theme {
             Role::Heading => c.heading,
             Role::Code => c.code,
             Role::Tool => c.tool,
-            Role::Notification => c.dim,
+            Role::Notification | Role::ThinkingHeader | Role::ThinkingBody => c.dim,
             Role::Question => c.warn,
             Role::Warning => c.warn,
             Role::Error => c.error,
@@ -447,14 +449,19 @@ impl Theme {
         self.color(role).resolve(self.depth.truecolor())
     }
 
-    /// A foreground-only style for a role.
+    /// A foreground style with the role's semantic text modifiers.
     pub fn style(&self, role: Role) -> Style {
-        Style::default().fg(self.fg(role))
+        let style = Style::default().fg(self.fg(role));
+        match role {
+            Role::ThinkingHeader => style.add_modifier(Modifier::ITALIC),
+            Role::ThinkingBody => style.add_modifier(Modifier::ITALIC | Modifier::DIM),
+            _ => style,
+        }
     }
 
     /// A style with both foreground and background set.
     pub fn style_on(&self, role: Role, background: Role) -> Style {
-        Style::default().fg(self.fg(role)).bg(self.fg(background))
+        self.style(role).bg(self.fg(background))
     }
 
     /// The base style for the transcript surface.
@@ -504,6 +511,23 @@ mod tests {
     }
 
     #[test]
+    fn thinking_styles_are_muted_and_italic_in_every_theme_and_depth() {
+        for theme in [Theme::warm_ember(), Theme::cool_dark()] {
+            for depth in [ColorDepth::TrueColor, ColorDepth::Ansi16] {
+                let theme = theme.clone().with_depth(depth);
+                let header = theme.style(Role::ThinkingHeader);
+                let body = theme.style_on(Role::ThinkingBody, Role::Background);
+                assert_eq!(header.fg, Some(theme.fg(Role::Notification)));
+                assert_eq!(body.fg, header.fg);
+                assert_eq!(header.add_modifier, Modifier::ITALIC);
+                assert_eq!(body.add_modifier, Modifier::ITALIC | Modifier::DIM);
+                assert_eq!(body.bg, Some(theme.fg(Role::Background)));
+                assert_eq!(theme.style(Role::Assistant).add_modifier, Modifier::empty());
+            }
+        }
+    }
+
+    #[test]
     fn every_theme_defines_a_distinct_focus_band() {
         for theme in [Theme::warm_ember(), Theme::cool_dark()] {
             assert_ne!(
@@ -537,6 +561,8 @@ mod tests {
             Role::Code,
             Role::Tool,
             Role::Notification,
+            Role::ThinkingHeader,
+            Role::ThinkingBody,
             Role::Question,
             Role::Warning,
             Role::Error,

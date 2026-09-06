@@ -83,10 +83,9 @@ pub enum Block {
     Assistant { text: String, complete: bool },
     /// Model reasoning.
     ///
-    /// Foldable: collapsed it shows the header and the last line of reasoning,
-    /// which is the part that says where the model got to. Expanding is a
-    /// deliberate click, never automatic — reasoning that unfolds itself
-    /// buries the answer the user is actually waiting for.
+    /// Foldable: collapsed live blocks preview the last line of reasoning;
+    /// completed blocks show only their header. Expansion is explicit unless
+    /// Full display mode is selected.
     Thinking {
         text: String,
         elapsed_ms: i64,
@@ -367,16 +366,33 @@ fn render_thinking(
         }
     };
 
+    if complete {
+        let mut out: Vec<RenderLine> = text::wrap(&status, width)
+            .into_iter()
+            .map(|chunk| RenderLine::new(chunk, Role::ThinkingHeader))
+            .collect();
+        if open {
+            let gutter = if width > Gutter::ThinkingBody.cells() {
+                Gutter::ThinkingBody
+            } else {
+                Gutter::None
+            };
+            let body_width = width.saturating_sub(gutter.cells()).max(1);
+            for line in markdown::render(body, body_width) {
+                // Keep Markdown layout, but reasoning stays visually subordinate
+                // instead of inheriting answer/code/link colors.
+                out.push(RenderLine::new(line.text, Role::ThinkingBody).with_gutter(gutter));
+            }
+        }
+        return out;
+    }
+
     let mut out: Vec<RenderLine> = text::wrap(&status, content)
         .into_iter()
         .enumerate()
         .map(|(i, chunk)| {
             RenderLine::new(chunk, Role::Notification).with_gutter(if i == 0 {
-                if complete {
-                    Gutter::AgentComplete
-                } else {
-                    Gutter::AgentActive
-                }
+                Gutter::AgentActive
             } else {
                 Gutter::Continuation
             })
@@ -837,25 +853,64 @@ mod tests {
     }
 
     #[test]
-    fn a_collapsed_thinking_block_previews_one_line_whatever_the_mode() {
-        // Compact used to show the last five lines. The fold replaces that:
-        // one line collapsed, everything expanded. Two different partial views
-        // was a distinction nobody could act on.
+    fn completed_collapsed_thinking_shows_only_its_header() {
         let body = (1..=10).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n");
-        let rows = texts(
-            &Block::Thinking {
-                text: body,
+        for mode in [ToolDisplayMode::Compact, ToolDisplayMode::Summary] {
+            let rows = texts(
+                &Block::Thinking {
+                    text: body.clone(),
+                    elapsed_ms: 1000,
+                    tokens: None,
+                    complete: true,
+                    expanded: false,
+                }
+                .render(80, mode),
+            );
+
+            assert_eq!(
+                rows,
+                vec![format!("{} Thought for 1s", glyphs::FOLD_COLLAPSED)]
+            );
+        }
+    }
+
+    #[test]
+    fn completed_expanded_thinking_has_a_continuous_rule() {
+        let rows = Block::Thinking {
+            text: "first paragraph with enough words to wrap\n\nsecond paragraph".into(),
+            elapsed_ms: 1000,
+            tokens: None,
+            complete: true,
+            expanded: true,
+        }
+        .render(24, ToolDisplayMode::Summary);
+
+        assert_eq!(rows[0].text, format!("{} Thought for 1s", glyphs::FOLD_EXPANDED));
+        assert!(rows.len() > 4, "expected wrapping and a paragraph break: {rows:?}");
+        assert!(rows[1..].iter().all(|row| row.text.starts_with("\u{2502} ")));
+        assert!(rows.iter().all(|row| text::width(&row.text) <= 24));
+        assert!(rows.iter().any(|row| row.text.trim_end() == "\u{2502}"));
+    }
+
+    #[test]
+    fn completed_thinking_omits_the_rule_when_no_text_would_fit() {
+        for width in [1, 2, 3] {
+            let rows = Block::Thinking {
+                text: "reasoning".into(),
                 elapsed_ms: 1000,
                 tokens: None,
                 complete: true,
-                expanded: false,
+                expanded: true,
             }
-            .render(80, ToolDisplayMode::Compact),
-        );
+            .render(width, ToolDisplayMode::Summary);
 
-        assert_eq!(rows.len(), 2, "expected a header and one preview: {rows:?}");
-        assert!(rows[1].contains("line 10"));
-        assert!(!rows.iter().any(|r| r.contains("line 6")));
+            assert!(rows.iter().all(|row| text::width(&row.text) <= width));
+            let body: String = rows.iter()
+                .filter(|row| row.role == Role::ThinkingBody)
+                .map(|row| row.text.trim_start_matches("\u{2502} "))
+                .collect();
+            assert_eq!(body, "reasoning");
+        }
     }
 
     #[test]
