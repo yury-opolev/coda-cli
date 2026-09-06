@@ -26,6 +26,7 @@ mod slash;
 mod clipboard;
 mod effort;
 mod engine;
+mod startup_cli;
 
 use crate::config::{self, Paths, Settings};
 use crate::commands;

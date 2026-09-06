@@ -174,18 +174,73 @@ assumptions; only cross-checking against the reference breaks the circularity.
 
 ### What remains
 
-- session resume, transcript export/import, and the setup/onboarding wizard;
+- session transcript export/import and the setup/onboarding wizard;
 - five slash commands (`/compact` is wired; `/resume`, `/fork`, `/rewind`,
   `/import`, `/login`, `/logout` need session-state or auth RPCs);
 - the 30 FPS frame throttle and the assistant-buffering mode, including its
   withhold-on-interrupt rule;
-- session-level wiring for a few engine features that exist and are tested but
-  are not yet constructed by `coda-serve`: the `ScheduleRuntime`, the
-  hook-free subagent factory for `agent`-type hooks, and `SubagentRegistry`
-  injection into `SubagentHost`;
 - **real-model validation.** The engine has been exercised by its own tests and
   by the parity suite, not by sustained real use. That is the one gap no test
   closes.
+
+**Not yet supported (flags accepted-and-rejected, never silently ignored):**
+
+- `--yolo-safe` — classifier-gated bypass mode is not wired; the flag aborts
+  with an explicit error message rather than silently mapping to unrestricted bypass.
+- `--image` / MCP editor UI — image input and MCP editor integration are
+  not yet implemented.
+- Session telemetry, transport extras beyond what the serve protocol carries.
+
+### CLI reference (Rust parity flags)
+
+All startup overrides are session-only and never written to `settings.json`.
+
+```
+coda [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
+     [--permission-mode <MODE>] [--yolo]
+     [--goal <TEXT>] [--goal-timeout <DUR>] [--max-continuations <N>]
+     [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
+     [--continue|-c] [--resume|-r [<ID>]] [--fork|-f [<ID>]]
+
+coda run -p "<task>" [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
+     [--permission-mode <MODE>] [--yolo]
+     [--goal <TEXT>] [--goal-timeout <DUR>] [--max-continuations <N>]
+     [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
+     [--continue|-c] [--resume|-r [<ID>]] [--fork|-f [<ID>]]
+     [--json] [--cwd <DIR>]
+
+coda serve [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
+     [--permission-mode <MODE>] [--yolo]
+     [--goal <TEXT>] [--goal-timeout <DUR>] [--max-continuations <N>]
+     [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
+     [--api-key <KEY>] [--endpoint <URL>]
+     [--cwd <DIR>] [--no-mcp] [--no-project-mcp]
+```
+
+`--endpoint` requires `--api-key`; using it without one is rejected at parse
+time. `--goal-timeout` and `--max-continuations` require `--goal`. `--yolo`
+and `--permission-mode` are mutually exclusive.
+
+Behaviour notes:
+
+- `--provider <ID>` selects the credential for that account at engine startup
+  and **fails closed** if it is unavailable — it never silently connects a
+  different provider. Aliases resolve to the canonical `coda_auth` ids:
+  `anthropic` / `api-key` → Anthropic console key, `claude` / `subscription`
+  → `claude-ai`, `copilot` / `github` → `github-copilot`. Without `--model`
+  the saved default model for that provider is used.
+- `--effort` is applied **after** the model is settled (it is recorded
+  per-model, so applying it before a model switch would silently drop it).
+  `--effort auto` explicitly clears effort rather than falling back to the
+  saved per-model preference.
+- `--system-prompt` / `--system-prompt-file` **fully replace** the engine's
+  built-in system prompt for the session; the text is not appended to it.
+- `--endpoint` is retained for the whole session: a later `initialize(apiKey)`
+  rebuilds the client at the configured endpoint rather than reverting to the
+  default host.
+- Invalid startup values (bad `--effort`, unknown `--permission-mode`, a
+  non-positive `--goal-timeout`, or a negative `--max-continuations`) fail
+  startup with an error instead of being silently defaulted or clamped.
 
 ## The two seams
 

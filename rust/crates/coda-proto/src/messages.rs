@@ -29,6 +29,7 @@ pub mod method {
     /// Switches the model for subsequent turns, without restarting.
     pub const SET_MODEL: &str = "session/setModel";
     pub const SET_PERMISSION_MODE: &str = "session/setPermissionMode";
+    pub const SET_SYSTEM_PROMPT: &str = "session/setSystemPrompt";
     pub const REASONING_CAPABILITY: &str = "model/reasoningCapability";
 
     pub const SCHEDULE_LIST: &str = "session/scheduleList";
@@ -391,6 +392,26 @@ pub struct SetPermissionModeResult {
     /// The mode actually in force after the call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applied: Option<String>,
+}
+
+/// Sets a session-only custom system prompt that **fully replaces** the
+/// engine's built-in system prompt (it is not appended to it). Session-only:
+/// never written to settings.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSystemPromptParams {
+    /// The full system prompt text. `None` or empty string clears any override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct SetSystemPromptResult {
+    #[serde(default)]
+    pub ok: bool,
+    /// Non-empty when the prompt was cleared via a None/empty `text`.
+    #[serde(default)]
+    pub cleared: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

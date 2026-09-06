@@ -105,6 +105,12 @@ impl AnthropicClient {
         format!("{}/v1/messages", self.config.base_url.trim_end_matches('/'))
     }
 
+    /// The configured base URL (without the `/v1/messages` suffix). Exposed so
+    /// callers can confirm an explicit endpoint override was retained.
+    pub fn base_url(&self) -> &str {
+        &self.config.base_url
+    }
+
     /// Build a POST request applying auth headers.
     ///
     /// `dynamic_auth` (fetched from the credential source before the retry loop)
