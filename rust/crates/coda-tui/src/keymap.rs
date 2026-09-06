@@ -219,6 +219,7 @@ fn resolve_composer(
         KeyCode::Char('u') if ctrl => Action::DeleteToLineStart,
         KeyCode::Char('k') if ctrl => Action::DeleteToLineEnd,
         KeyCode::Char('v') if ctrl || alt => Action::Paste,
+        KeyCode::Insert if shift => Action::Paste,
         KeyCode::Char('y') if ctrl => Action::Copy,
         KeyCode::Char('a') if ctrl => Action::MoveLineStart,
         KeyCode::Char('e') if ctrl => Action::MoveLineEnd,
@@ -400,6 +401,26 @@ mod tests {
         assert_eq!(
             resolve(with(KeyCode::Char('v'), KeyModifiers::ALT), composing()),
             Action::Paste
+        );
+    }
+
+    #[test]
+    fn shift_insert_pastes() {
+        assert_eq!(
+            resolve(with(KeyCode::Insert, KeyModifiers::SHIFT), composing()),
+            Action::Paste,
+            "Shift+Insert must paste"
+        );
+    }
+
+    #[test]
+    fn bare_insert_does_nothing() {
+        // Unmodified Insert has no binding; it must not paste or do anything
+        // else unexpected.
+        assert_eq!(
+            resolve(key(KeyCode::Insert), composing()),
+            Action::None,
+            "unmodified Insert must remain unbound"
         );
     }
 

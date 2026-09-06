@@ -231,8 +231,13 @@ mid-sentence stays literal text and is sent to the model together with the prose
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
 the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a
 selection exists, `Ctrl+C` **or a right-click** copies it and clears the selection; a **right-click**
-with no selection pastes at the clicked caret; `Alt+V` (or `Ctrl+V`) pastes at the caret, attaching a copied **image** when the clipboard holds one and falling back to text otherwise — use `Alt+V` if your terminal claims `Ctrl+V` for its own paste, as Windows Terminal does, since its paste reads text only and an image-only clipboard then produces nothing. Pasting a **path to an image file** attaches that image instead of inserting the path, so Explorer's `Shift`+right-click → **Copy as path** followed by an ordinary paste works even through a terminal's own `Ctrl+V`; and a **middle-click**
-opens the editor context menu. The **session id** in the header, and the body of the modal browsers
+with no selection pastes at the clicked caret. `Alt+V`, `Ctrl+V`, or `Shift+Insert`
+attaches a copied **image** as an `[Image N]` placeholder, falling back to text when
+no image is available. Use `Alt+V` if the terminal intercepts `Ctrl+V`: terminal
+paste events carry text only. Use `/image <path>` to attach a file. Images are capped
+at 5 MiB before base64 encoding. Removing a placeholder excludes that image from
+the next prompt; drafts with images must wait until the current turn finishes.
+The **session id** in the header, and the body of the modal browsers
 (`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
 and copied the same way. In each browser the **list pane** uses a TableView widget that highlights the selected row; drag-select with `Ctrl+C` is available in the **detail pane** where a full `SelectableTextView` is rendered. **`Shift`-drag** hands native selection and copy to the terminal where
 supported. `--no-mouse` leaves selection and copy native to the terminal, and every action stays

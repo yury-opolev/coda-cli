@@ -26,6 +26,7 @@ mod slash;
 mod clipboard;
 mod effort;
 mod engine;
+mod image;
 mod startup_cli;
 
 use crate::config::{self, Paths, Settings};
@@ -620,11 +621,13 @@ impl App {
                     self.composer.clear_completions();
                 } else {
                     self.composer.clear();
+                    self.staged_images.clear();
                 }
             }
             Action::ClearTranscript => self.apply(UiEvent::Cleared),
             Action::Copy => self.copy_to_clipboard(),
-            Action::Paste | Action::Confirm | Action::None => self.dirty = false,
+            Action::Paste => self.paste_image_from_clipboard(),
+            Action::Confirm | Action::None => self.dirty = false,
         }
     }
 
@@ -651,9 +654,8 @@ impl App {
 
     async fn submit(&mut self) {
         let text = self.composer.take_submission();
-        // A prompt needs text, staged images, or both.
-        let has_content = !text.trim().is_empty() || !self.staged_images.is_empty();
-        if !has_content {
+        if text.trim().is_empty() {
+            self.staged_images.clear();
             return;
         }
 
@@ -666,7 +668,13 @@ impl App {
 
         // A message typed mid-turn is steered into the running turn rather
         // than dropped or forced to wait for it to finish.
+        let images = image::images_for_draft(&self.staged_images, &text);
         if self.state.is_busy() {
+            if !images.is_empty() {
+                self.composer.set_text(text);
+                self.notice("Images cannot be steered into a running turn. Send this draft after it finishes.", NoticeLevel::Warning);
+                return;
+            }
             self.steer(text).await;
             return;
         }
@@ -678,19 +686,27 @@ impl App {
         } else {
             text.clone()
         };
-        self.apply(UiEvent::Submitted { text: display });
-
-        let params = serde_json::to_value(messages::PromptParams {
-            text: if text.is_empty() { None } else { Some(text) },
-            images: std::mem::take(&mut self.staged_images),
-        })
-        .unwrap_or_default();
+        let params = match serde_json::to_value(messages::PromptParams {
+            text: Some(text.clone()),
+            images,
+        }) {
+            Ok(params) => params,
+            Err(error) => {
+                self.composer.set_text(text);
+                self.notice(format!("Could not prepare prompt: {error}"), NoticeLevel::Error);
+                return;
+            }
+        };
         match self.connection.send_request(method::PROMPT, Some(params)) {
-            Ok(receiver) => self.turn = Some(receiver),
-            Err(error) => self.apply(UiEvent::TurnFinished {
-                interrupted: false,
-                error: Some(error.to_string()),
-            }),
+            Ok(receiver) => {
+                self.staged_images.clear();
+                self.apply(UiEvent::Submitted { text: display });
+                self.turn = Some(receiver);
+            }
+            Err(error) => {
+                self.composer.set_text(text);
+                self.notice(format!("Could not send prompt; draft retained: {error}"), NoticeLevel::Error);
+            }
         }
     }
 

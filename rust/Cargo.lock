@@ -812,6 +812,7 @@ dependencies = [
  "futures",
  "futures-lite 2.6.1",
  "insta",
+ "png",
  "pretty_assertions",
  "ratatui",
  "serde",
