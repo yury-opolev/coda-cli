@@ -101,6 +101,14 @@ impl Surface for FormSurface {
         self.hints.clone()
     }
 
+    fn placement(&self) -> super::Placement {
+        // Size the modal to the form rather than to a percentage of the
+        // terminal: short forms (2-3 controls) appear compact, and tall ones
+        // scroll rather than wasting vertical space or hiding off-screen
+        // controls below the visible area.
+        super::Placement::FitContent { preferred_width: 72 }
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
         match self.form.handle_key(key) {
             FormOutcome::Consumed => SurfaceOutcome::Handled,

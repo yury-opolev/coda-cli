@@ -56,6 +56,9 @@ impl App {
             "schedule" if invocation.args.is_empty() => {
                 self.open_browser(BrowserKind::Schedules).await
             }
+            // Bare /effort opens the interactive picker at the current setting.
+            // An explicit argument applies and saves through the same validated path.
+            "effort" => self.open_effort_picker(invocation.first().map(str::to_owned)).await,
             "skills" => self.open_browser(BrowserKind::Skills).await,
             "plugins" => self.open_browser(BrowserKind::Plugins).await,
             "hooks" => self.open_browser(BrowserKind::Hooks).await,
@@ -119,6 +122,9 @@ impl App {
                 None => (method::MODELS, Some(serde_json::json!({ "refresh": false }))),
             },
             "effort" => (
+                // "effort" is now handled in run_command as an interactive
+                // picker; this arm is only reached from a serve-mode context
+                // that bypasses the picker. Keep the RPC path as a fallback.
                 method::SET_EFFORT,
                 Some(serde_json::json!({ "effort": invocation.first() })),
             ),
@@ -300,4 +306,3 @@ mod tests {
         assert!(text.contains("  a"), "got {text:?}");
     }
 }
-

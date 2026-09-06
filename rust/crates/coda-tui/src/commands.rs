@@ -66,8 +66,8 @@ pub const COMMANDS: &[CommandSpec] = &[
     CommandSpec {
         name: "effort",
         aliases: &[],
-        args: "<low|medium|high|max|auto>",
-        summary: "Set the reasoning effort level.",
+        args: "[low|medium|high|xhigh|max|auto]",
+        summary: "Open the effort picker, or apply and save a level.",
         scope: Scope::Engine,
     },
     CommandSpec {

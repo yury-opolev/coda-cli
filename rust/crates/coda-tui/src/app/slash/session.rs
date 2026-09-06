@@ -389,19 +389,8 @@ impl App {
 
         match result {
             Ok(Ok((media_type, bytes))) => {
-                let label = self.staged_images.len() + 1;
-                self.staged_images.push(messages::WireImage {
-                    media_type,
-                    base64: base64_encode(&bytes),
-                });
-                // Insert the label token into the composer so the user can see
-                // where the attachment sits in the composed message.
+                let label = self.stage_image_bytes(&media_type, &bytes);
                 let token = format!("[Image {label}]");
-                if !self.composer.is_empty() {
-                    self.composer.insert(" ");
-                }
-                self.composer.insert(&token);
-
                 let size_kb = bytes.len() as f64 / 1024.0;
                 self.notice(
                     format!(
@@ -441,23 +430,6 @@ fn image_media_type(extension: &str) -> Option<&'static str> {
         "webp" => Some("image/webp"),
         _ => None,
     }
-}
-
-/// Encodes bytes as standard (RFC 4648) base64 with `=` padding.
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((data.len() + 2) / 3 * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
-        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(TABLE[((n >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((n >> 12) & 0x3F) as usize] as char);
-        out.push(if chunk.len() > 1 { TABLE[((n >> 6) & 0x3F) as usize] as char } else { '=' });
-        out.push(if chunk.len() > 2 { TABLE[(n & 0x3F) as usize] as char } else { '=' });
-    }
-    out
 }
 
 /// Renders transcript blocks as a Markdown document for `/export`.
@@ -508,23 +480,6 @@ pub fn build_markdown_export(blocks: &[crate::transcript::Block]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn base64_encodes_rfc_4648_test_vectors() {
-        // RFC 4648 §10 test vectors.
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"f"), "Zg==");
-        assert_eq!(base64_encode(b"fo"), "Zm8=");
-        assert_eq!(base64_encode(b"foo"), "Zm9v");
-        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
-        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
-        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
-    }
-
-    #[test]
-    fn base64_encodes_a_longer_string() {
-        assert_eq!(base64_encode(b"Hello, World!"), "SGVsbG8sIFdvcmxkIQ==");
-    }
 
     #[test]
     fn image_media_type_maps_supported_extensions() {

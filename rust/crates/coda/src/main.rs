@@ -63,7 +63,7 @@ struct InteractiveArgs {
     engine_args: Vec<String>,
 
     /// Working directory for the session. Defaults to the current directory.
-    #[arg(long, short = 'C', value_name = "DIR")]
+    #[arg(long, short = 'C', value_name = "DIR", visible_alias = "cwd")]
     directory: Option<PathBuf>,
 
     /// Write a debug log to this file.
@@ -93,6 +93,70 @@ struct InteractiveArgs {
     /// Without an id, copies the most recent one.
     #[arg(long, short = 'f', value_name = "ID", num_args = 0..=1)]
     fork: Option<Option<String>>,
+
+    /// Initial reasoning-effort level: low, medium, high, xhigh, or max.
+    ///
+    /// Applied as a session-only override; does not persist to settings. The
+    /// engine uses the saved per-model preference when this is not given.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
+    effort: Option<String>,
+
+    /// Model to use for this session (session-only override, not saved).
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+
+    /// Provider to use (selects the model saved for that provider in settings).
+    /// Has no effect when `--model` is also given.
+    #[arg(long, value_name = "PROVIDER")]
+    provider: Option<String>,
+
+    /// Permission mode: default, acceptEdits, plan, or bypassPermissions.
+    ///
+    /// Session-only override. Aliases: ask=default, edits=acceptEdits, yolo=bypassPermissions.
+    #[arg(long, value_name = "MODE", conflicts_with = "yolo")]
+    permission_mode: Option<String>,
+
+    /// Shorthand for `--permission-mode bypassPermissions`.
+    /// Session-only override; does not persist to settings.
+    #[arg(long, conflicts_with = "permission_mode")]
+    yolo: bool,
+
+    /// Reject with an error — `--yolo-safe` is not yet implemented.
+    #[arg(long, hide = true)]
+    yolo_safe: bool,
+
+    /// Goal statement the model must fulfil before stopping.
+    /// Session-only; the engine judges each turn against this goal.
+    #[arg(long, value_name = "TEXT")]
+    goal: Option<String>,
+
+    /// Maximum wall-clock time allowed for the goal. Format: `30m`, `2h`, `90s`.
+    #[arg(
+        long,
+        visible_alias = "goal-max-duration",
+        value_name = "DURATION",
+        requires = "goal"
+    )]
+    goal_timeout: Option<String>,
+
+    /// Maximum number of continuation turns the goal supervisor may grant.
+    #[arg(
+        long,
+        visible_alias = "goal-max-continuations",
+        value_name = "N",
+        requires = "goal"
+    )]
+    max_continuations: Option<i32>,
+
+    /// Custom system prompt for this session (session-only, not saved).
+    /// Mutually exclusive with `--system-prompt-file`.
+    #[arg(long, value_name = "TEXT", conflicts_with = "system_prompt_file")]
+    system_prompt: Option<String>,
+
+    /// Read the custom system prompt from this file (UTF-8).
+    /// Mutually exclusive with `--system-prompt`.
+    #[arg(long, value_name = "FILE", conflicts_with = "system_prompt")]
+    system_prompt_file: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -108,6 +172,72 @@ struct ServeArgs {
     /// Disable only the project `<cwd>/.mcp.json` layer; user servers still load.
     #[arg(long)]
     no_project_mcp: bool,
+
+    /// Initial reasoning-effort level: low, medium, high, xhigh, max, or auto.
+    ///
+    /// Wired through to the engine startup so a session opened over the raw
+    /// serve seam honours the same override the interactive and headless modes
+    /// accept.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
+    effort: Option<String>,
+
+    /// Model to use for the session (session-only override, not saved).
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+
+    /// Provider hint — used to select the model saved for that provider.
+    /// Has no effect when `--model` is also given.
+    #[arg(long, value_name = "PROVIDER")]
+    provider: Option<String>,
+
+    /// Permission mode: default, acceptEdits, plan, or bypassPermissions.
+    #[arg(long, value_name = "MODE", conflicts_with = "yolo")]
+    permission_mode: Option<String>,
+
+    /// Shorthand for `--permission-mode bypassPermissions`.
+    #[arg(long, conflicts_with = "permission_mode")]
+    yolo: bool,
+
+    /// Goal statement the model must fulfil before stopping.
+    #[arg(long, value_name = "TEXT")]
+    goal: Option<String>,
+
+    /// Maximum wall-clock time for the goal. Format: `30m`, `2h`, `90s`.
+    #[arg(
+        long,
+        visible_alias = "goal-max-duration",
+        value_name = "DURATION",
+        requires = "goal"
+    )]
+    goal_timeout: Option<String>,
+
+    /// Maximum continuation turns the goal supervisor may grant.
+    #[arg(
+        long,
+        visible_alias = "goal-max-continuations",
+        value_name = "N",
+        requires = "goal"
+    )]
+    max_continuations: Option<i32>,
+
+    /// Custom system prompt for this session (session-only, not saved).
+    /// Mutually exclusive with `--system-prompt-file`.
+    #[arg(long, value_name = "TEXT", conflicts_with = "system_prompt_file")]
+    system_prompt: Option<String>,
+
+    /// Read the custom system prompt from this file (UTF-8).
+    /// Mutually exclusive with `--system-prompt`.
+    #[arg(long, value_name = "FILE", conflicts_with = "system_prompt")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Anthropic API key for this session. When provided, the engine uses it
+    /// instead of searching the credential store.
+    #[arg(long, value_name = "KEY", env = "CODA_SERVE_API_KEY")]
+    api_key: Option<String>,
+
+    /// Custom API endpoint base URL (e.g. a proxy). Requires `--api-key`.
+    #[arg(long, value_name = "URL", requires = "api_key")]
+    endpoint: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -131,12 +261,117 @@ struct RunArgs {
     json: bool,
 
     /// Working directory for the session.
-    #[arg(long, value_name = "DIR")]
+    #[arg(long, value_name = "DIR", visible_alias = "directory")]
     cwd: Option<PathBuf>,
 
     /// Executable used to launch the engine. Defaults to this binary.
     #[arg(long, env = "CODA_ENGINE")]
     engine: Option<PathBuf>,
+
+    /// Initial reasoning-effort level: low, medium, high, xhigh, or max.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
+    effort: Option<String>,
+
+    /// Model to use for this run (session-only override, not saved).
+    #[arg(long, value_name = "MODEL")]
+    model: Option<String>,
+
+    /// Provider hint — used to select the model saved for that provider.
+    #[arg(long, value_name = "PROVIDER")]
+    provider: Option<String>,
+
+    /// Permission mode: default, acceptEdits, plan, or bypassPermissions.
+    #[arg(long, value_name = "MODE", conflicts_with = "yolo")]
+    permission_mode: Option<String>,
+
+    /// Shorthand for `--permission-mode bypassPermissions`.
+    #[arg(long, conflicts_with = "permission_mode")]
+    yolo: bool,
+
+    /// Goal statement for the run.
+    #[arg(long, value_name = "TEXT")]
+    goal: Option<String>,
+
+    /// Maximum wall-clock time for the goal. Format: `30m`, `2h`, `90s`.
+    #[arg(
+        long,
+        visible_alias = "goal-max-duration",
+        value_name = "DURATION",
+        requires = "goal"
+    )]
+    goal_timeout: Option<String>,
+
+    /// Maximum continuation turns the goal supervisor may grant.
+    #[arg(
+        long,
+        visible_alias = "goal-max-continuations",
+        value_name = "N",
+        requires = "goal"
+    )]
+    max_continuations: Option<i32>,
+
+    /// Custom system prompt for this run (session-only, not saved).
+    /// Mutually exclusive with `--system-prompt-file`.
+    #[arg(long, value_name = "TEXT", conflicts_with = "system_prompt_file")]
+    system_prompt: Option<String>,
+
+    /// Read the custom system prompt from this file (UTF-8).
+    /// Mutually exclusive with `--system-prompt`.
+    #[arg(long, value_name = "FILE", conflicts_with = "system_prompt")]
+    system_prompt_file: Option<PathBuf>,
+
+    /// Continue the most recent session in this directory.
+    #[arg(long = "continue", short = 'c', conflicts_with_all = ["resume", "fork"])]
+    continue_latest: bool,
+
+    /// Resume a session. Without an id, the most recent one.
+    #[arg(long, short = 'r', value_name = "ID", num_args = 0..=1, conflicts_with = "fork")]
+    resume: Option<Option<String>>,
+
+    /// Open a copy of a session, leaving the original untouched.
+    #[arg(long, short = 'f', value_name = "ID", num_args = 0..=1)]
+    fork: Option<Option<String>>,
+}
+
+/// Validates a `--effort` value at the parser layer so a syntactically invalid
+/// level is rejected before any engine is spawned or terminal entered.
+///
+/// Accepts the five levels plus `auto` (clear to automatic). The value is
+/// lower-cased so `HIGH` and `high` are the same flag.
+fn parse_effort_level(raw: &str) -> Result<String, String> {
+    let level = raw.trim().to_ascii_lowercase();
+    match level.as_str() {
+        "low" | "medium" | "high" | "xhigh" | "max" | "auto" => Ok(level),
+        _ => Err(format!(
+            "invalid effort '{raw}' (expected one of: low, medium, high, xhigh, max, auto)"
+        )),
+    }
+}
+
+/// Resolves the system prompt from either an inline string or a file.
+///
+/// The two are mutually exclusive (enforced by clap). A file is read as
+/// UTF-8; a non-UTF-8 file is a hard error rather than a silent lossy read.
+/// Returns `None` when neither flag was given.
+fn resolve_system_prompt(
+    inline: Option<&str>,
+    file: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    if let Some(text) = inline {
+        return Ok(Some(text.to_owned()));
+    }
+    if let Some(path) = file {
+        let content = std::fs::read(path)
+            .with_context(|| format!("failed to read system prompt file: {}", path.display()))?;
+        let text = String::from_utf8(content).with_context(|| {
+            format!(
+                "system prompt file is not valid UTF-8: {}",
+                path.display()
+            )
+        })?;
+        return Ok(Some(text));
+    }
+    Ok(None)
 }
 
 fn main() -> Result<()> {
@@ -183,14 +418,79 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     if args.no_project_mcp {
         std::env::set_var("CODA_DISABLE_PROJECT_MCP", "1");
     }
+    // Wire the startup effort override through the env-var seam the engine
+    // reads at build time (parallel to the MCP flags above).
+    if let Some(level) = &args.effort {
+        std::env::set_var("CODA_SERVE_EFFORT", level);
+    }
+    // Startup model override.
+    if let Some(model) = &args.model {
+        std::env::set_var("CODA_SERVE_MODEL", model);
+    }
+    // Provider selection: the engine chooses the requested account at startup
+    // and fails closed if it is unavailable (never a different provider).
+    if let Some(provider) = &args.provider {
+        std::env::set_var("CODA_SERVE_PROVIDER", provider);
+    }
+    // Permission mode: `--yolo` is shorthand for bypassPermissions.
+    let perm_mode = if args.yolo {
+        Some("bypassPermissions".to_owned())
+    } else {
+        args.permission_mode.clone()
+    };
+    if let Some(mode) = &perm_mode {
+        std::env::set_var("CODA_SERVE_PERMISSION_MODE", mode);
+    }
+    // Goal parameters.
+    if let Some(goal) = &args.goal {
+        std::env::set_var("CODA_SERVE_GOAL", goal);
+    }
+    if let Some(timeout) = &args.goal_timeout {
+        std::env::set_var("CODA_SERVE_GOAL_TIMEOUT", timeout);
+    }
+    if let Some(n) = args.max_continuations {
+        std::env::set_var("CODA_SERVE_GOAL_MAX_CONTINUATIONS", n.to_string());
+    }
+    // System prompt (inline or from file, mutually exclusive).
+    let system_prompt = resolve_system_prompt(
+        args.system_prompt.as_deref(),
+        args.system_prompt_file.as_deref(),
+    )?;
+    if let Some(prompt) = &system_prompt {
+        std::env::set_var("CODA_SERVE_SYSTEM_PROMPT", prompt);
+    }
+    // API key and endpoint for explicit credential override.
+    // The endpoint requires the key (enforced by clap `requires`).
+    if let Some(key) = &args.api_key {
+        // Don't log or forward; only set the env var the transport reads.
+        std::env::set_var("CODA_SERVE_API_KEY", key);
+    }
+    if let Some(url) = &args.endpoint {
+        std::env::set_var("CODA_SERVE_ENDPOINT", url);
+    }
     coda_serve::serve_stdio().await
 }
 
 async fn run_interactive(args: InteractiveArgs) -> Result<()> {
+    // `--yolo-safe` is not yet implemented — reject explicitly rather than
+    // accept-and-ignore, which would create a false sense of safety.
+    if args.yolo_safe {
+        anyhow::bail!(
+            "--yolo-safe is not supported in this build; \
+             use --permission-mode acceptEdits or --yolo instead"
+        );
+    }
+
     let working_dir = match &args.directory {
         Some(dir) => dir.clone(),
         None => std::env::current_dir().context("failed to read the current directory")?,
     };
+
+    // Resolve the system prompt before touching the terminal.
+    let system_prompt = resolve_system_prompt(
+        args.system_prompt.as_deref(),
+        args.system_prompt_file.as_deref(),
+    )?;
 
     let engine = resolve_engine(args.engine.clone())?;
     let mut command = EngineCommand::new(engine.as_os_str())
@@ -198,6 +498,13 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
         .working_dir(&working_dir);
     for arg in &args.engine_args {
         command = command.arg(OsString::from(arg));
+    }
+    // Forward an explicit `--provider` to the engine so it selects that account
+    // at startup and fails closed when it is unavailable — never silently
+    // connecting a different provider (Finding C2). Passed as a child-only env
+    // var so the parent process environment is untouched.
+    if let Some(ref provider) = args.provider {
+        command = command.env("CODA_SERVE_PROVIDER", provider.as_str());
     }
 
     let theme = Theme::default().with_depth(ColorDepth::detect());
@@ -215,6 +522,62 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
     // instead of a blank alternate screen.
     let (mut app, engine_process, inbound) =
         App::connect_to_session(command, theme, resuming.clone()).await?;
+
+    // Helper: abort cleanly if any pre-launch RPC fails.
+    macro_rules! apply_or_abort {
+        ($fut:expr) => {{
+            if let Err(err) = $fut {
+                let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
+                return Err(err);
+            }
+        }};
+    }
+
+    // All startup overrides run before the terminal opens so any rejection
+    // surfaces as a normal error rather than appearing behind an alternate screen.
+    //
+    // Order matters (Finding C1): the model/provider (the active identity) is
+    // established FIRST, and reasoning-effort is applied LAST. Effort is
+    // recorded per-model, so applying it before a model switch would leave the
+    // explicit level attached to the previous model and silently dropped.
+    if let Some(ref model) = args.model {
+        apply_or_abort!(app.apply_cli_model(model).await);
+    } else if let Some(ref provider) = args.provider {
+        // --provider without --model: look up the saved model for this provider.
+        let provider_model = coda_serve::settings::resolve_for_provider(Some(provider.as_str())).model;
+        apply_or_abort!(app.apply_cli_model(&provider_model).await);
+    }
+    // Verify the engine actually connected the requested provider. A custom
+    // engine that ignored the request, or a native engine that fell back, is
+    // caught here and fails the launch rather than talking to the wrong account.
+    if let Some(ref provider) = args.provider {
+        apply_or_abort!(app.verify_cli_provider(provider).await);
+    }
+    let perm_mode = if args.yolo {
+        Some("bypassPermissions".to_owned())
+    } else {
+        args.permission_mode.clone()
+    };
+    if let Some(ref mode) = perm_mode {
+        apply_or_abort!(app.apply_cli_permission_mode(mode).await);
+    }
+    if args.goal.is_some() || args.goal_timeout.is_some() || args.max_continuations.is_some() {
+        apply_or_abort!(
+            app.apply_cli_goal(
+                args.goal.as_deref(),
+                args.goal_timeout.as_deref(),
+                args.max_continuations,
+            )
+            .await
+        );
+    }
+    if let Some(ref prompt) = system_prompt {
+        apply_or_abort!(app.apply_cli_system_prompt(prompt).await);
+    }
+    // Effort last, after the active model is settled (Finding C1).
+    if let Some(ref level) = args.effort {
+        apply_or_abort!(app.apply_cli_effort(level).await);
+    }
 
     // The banner is seeded into the transcript rather than printed to the raw
     // console: printed before the alternate screen it would be wiped the
@@ -260,21 +623,140 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
         None => std::env::current_dir().context("failed to read the current directory")?,
     };
 
+    // Resolve system prompt before spawning the engine.
+    let system_prompt = resolve_system_prompt(
+        args.system_prompt.as_deref(),
+        args.system_prompt_file.as_deref(),
+    )?;
+
+    // Resolve the session intent (resume/continue/fork).
+    let intent = SessionIntent::from_flags(
+        args.continue_latest,
+        args.resume.clone(),
+        args.fork.clone(),
+    );
+    let session_id = coda_tui::startup::resolve(&intent, &working_dir).await?;
+
     let engine = resolve_engine(args.engine.clone())?;
-    let command = EngineCommand::new(engine.as_os_str())
+    let mut command = EngineCommand::new(engine.as_os_str())
         .arg("serve")
         .working_dir(&working_dir);
+    // Forward an explicit `--provider` so the engine selects that account at
+    // startup and fails closed if unavailable (Finding C2).
+    if let Some(ref provider) = args.provider {
+        command = command.env("CODA_SERVE_PROVIDER", provider.as_str());
+    }
 
     let (engine_process, mut inbound) =
         coda_client::Engine::spawn(command).context("failed to start the engine")?;
     let connection = engine_process.connection();
 
-    let init = serde_json::to_value(InitializeParams::new("coda-run"))
+    let mut init = InitializeParams::new("coda-run");
+    if let Some(ref sid) = session_id {
+        init = init.resume(sid.clone());
+    }
+    let init_val = serde_json::to_value(init)
         .context("failed to serialise the handshake")?;
     connection
-        .request(method::INITIALIZE, Some(init))
+        .request(method::INITIALIZE, Some(init_val))
         .await
         .context("the engine handshake failed")?;
+
+    // Helper: apply an RPC that must succeed before the prompt is sent.
+    // A rejection or transport error shuts down the engine and returns an error.
+    macro_rules! must_apply {
+        ($method:expr, $params:expr, $flag:expr) => {{
+            let response = connection
+                .request($method, Some($params))
+                .await
+                .with_context(|| format!("failed to apply {}", $flag))?;
+            let ok = response.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+            if !ok {
+                let note = response
+                    .get("note")
+                    .or_else(|| response.get("error"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("rejected");
+                let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
+                anyhow::bail!("{} was not applied: {note}", $flag);
+            }
+        }};
+    }
+
+    // Apply startup overrides with the active identity (model/provider) FIRST
+    // and reasoning-effort LAST (Finding C1): effort is recorded per-model, so
+    // applying it before a model switch would attach it to the wrong model and
+    // silently drop it.
+    if let Some(ref model) = args.model {
+        must_apply!(
+            method::SET_MODEL,
+            serde_json::json!({ "model": model }),
+            format!("--model {model}")
+        );
+    } else if let Some(ref provider) = args.provider {
+        let provider_model =
+            coda_serve::settings::resolve_for_provider(Some(provider.as_str())).model;
+        must_apply!(
+            method::SET_MODEL,
+            serde_json::json!({ "model": provider_model }),
+            format!("--provider {provider}")
+        );
+    }
+    // Verify the engine connected the requested provider; fail closed on a
+    // mismatch rather than running against a different account (Finding C2).
+    if let Some(ref provider) = args.provider {
+        let cap = connection
+            .request(method::REASONING_CAPABILITY, None)
+            .await
+            .with_context(|| format!("failed to verify --provider {provider}"))?;
+        let active = cap.get("providerId").and_then(|v| v.as_str()).unwrap_or("");
+        let want = coda_serve::host::canonical_provider(provider);
+        if !coda_serve::host::canonical_provider(active).eq_ignore_ascii_case(&want) {
+            let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
+            anyhow::bail!(
+                "requested provider '{provider}' but the engine connected '{active}'; \
+                 refusing to run against a different account"
+            );
+        }
+    }
+    let perm_mode = if args.yolo {
+        Some("bypassPermissions".to_owned())
+    } else {
+        args.permission_mode.clone()
+    };
+    if let Some(ref mode) = perm_mode {
+        must_apply!(
+            method::SET_PERMISSION_MODE,
+            serde_json::json!({ "mode": mode }),
+            format!("--permission-mode {mode}")
+        );
+    }
+    if args.goal.is_some() || args.goal_timeout.is_some() || args.max_continuations.is_some() {
+        must_apply!(
+            method::SET_GOAL,
+            serde_json::json!({
+                "goal": args.goal,
+                "maxDuration": args.goal_timeout,
+                "maxContinuations": args.max_continuations,
+            }),
+            "--goal"
+        );
+    }
+    if let Some(ref prompt_text) = system_prompt {
+        must_apply!(
+            method::SET_SYSTEM_PROMPT,
+            serde_json::json!({ "text": prompt_text }),
+            "--system-prompt"
+        );
+    }
+    // Effort last, after the active model is settled (Finding C1).
+    if let Some(ref level) = args.effort {
+        must_apply!(
+            method::SET_EFFORT,
+            serde_json::json!({ "effort": level }),
+            format!("--effort {level}")
+        );
+    }
 
     let params = serde_json::to_value(PromptParams::text(&args.prompt))
         .context("failed to serialise the prompt")?;
@@ -415,6 +897,51 @@ mod tests {
         }
     }
 
+    /// A syntactically invalid `--effort` is rejected by the parser, before any
+    /// engine is spawned or terminal entered (Finding 5).
+    #[test]
+    fn run_rejects_an_invalid_effort_level() {
+        assert!(
+            Cli::try_parse_from(["coda", "run", "-p", "x", "--effort", "ludicrous"]).is_err(),
+            "an unknown effort level must fail at parse time"
+        );
+    }
+
+    #[test]
+    fn run_accepts_and_lowercases_a_valid_effort_level() {
+        let cli =
+            Cli::try_parse_from(["coda", "run", "-p", "x", "--effort", "XHIGH"]).expect("parse");
+        match cli.command {
+            Some(Command::Run(args)) => assert_eq!(args.effort.as_deref(), Some("xhigh")),
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_an_effort_level() {
+        let cli = Cli::try_parse_from(["coda", "serve", "--effort", "high"]).expect("parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.effort.as_deref(), Some("high")),
+            other => panic!("expected serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interactive_rejects_an_invalid_effort_level() {
+        assert!(
+            Cli::try_parse_from(["coda", "--effort", "ludicrous"]).is_err(),
+            "an unknown effort level must fail at parse time for interactive mode too"
+        );
+    }
+
+    #[test]
+    fn effort_level_parser_accepts_the_documented_set() {
+        for level in ["low", "medium", "high", "xhigh", "max", "auto"] {
+            assert_eq!(parse_effort_level(level).as_deref(), Ok(level));
+        }
+        assert!(parse_effort_level("nonsense").is_err());
+    }
+
     /// Without `--engine`, the engine is this executable, so a standalone
     /// binary needs nothing else on the system.
     #[test]
@@ -515,5 +1042,193 @@ mod tests {
             SessionIntent::from_flags(args.continue_latest, args.resume, args.fork),
             SessionIntent::New
         );
+    }
+
+    // ─── New parity flag tests ──────────────────────────────────────────────
+
+    fn run(args: &[&str]) -> RunArgs {
+        let mut argv = vec!["coda", "run", "-p", "x"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Run(a)) => a,
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    fn serve(args: &[&str]) -> ServeArgs {
+        let mut argv = vec!["coda", "serve"];
+        argv.extend_from_slice(args);
+        match Cli::try_parse_from(argv).expect("parse").command {
+            Some(Command::Serve(a)) => a,
+            other => panic!("expected serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn run_accepts_model_flag() {
+        let a = run(&["--model", "claude-opus-5"]);
+        assert_eq!(a.model.as_deref(), Some("claude-opus-5"));
+    }
+
+    #[test]
+    fn run_accepts_provider_flag() {
+        let a = run(&["--provider", "anthropic"]);
+        assert_eq!(a.provider.as_deref(), Some("anthropic"));
+    }
+
+    #[test]
+    fn run_accepts_permission_mode_flag() {
+        let a = run(&["--permission-mode", "acceptEdits"]);
+        assert_eq!(a.permission_mode.as_deref(), Some("acceptEdits"));
+    }
+
+    #[test]
+    fn run_yolo_sets_bypass_shorthand() {
+        let a = run(&["--yolo"]);
+        assert!(a.yolo);
+        assert!(!a.permission_mode.is_some());
+    }
+
+    #[test]
+    fn run_yolo_and_permission_mode_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from(["coda", "run", "-p", "x", "--yolo", "--permission-mode", "plan"])
+                .is_err(),
+            "--yolo and --permission-mode must conflict"
+        );
+    }
+
+    #[test]
+    fn run_accepts_goal_flag() {
+        let a = run(&["--goal", "complete the task"]);
+        assert_eq!(a.goal.as_deref(), Some("complete the task"));
+    }
+
+    #[test]
+    fn run_goal_timeout_requires_goal() {
+        assert!(
+            Cli::try_parse_from(["coda", "run", "-p", "x", "--goal-timeout", "30m"]).is_err(),
+            "--goal-timeout without --goal must fail"
+        );
+    }
+
+    #[test]
+    fn run_accepts_goal_with_timeout_and_continuations() {
+        let a = run(&["--goal", "ship it", "--goal-timeout", "2h", "--max-continuations", "5"]);
+        assert_eq!(a.goal.as_deref(), Some("ship it"));
+        assert_eq!(a.goal_timeout.as_deref(), Some("2h"));
+        assert_eq!(a.max_continuations, Some(5));
+    }
+
+    #[test]
+    fn run_goal_max_duration_alias_works() {
+        let a = run(&["--goal", "x", "--goal-max-duration", "30m"]);
+        assert_eq!(a.goal_timeout.as_deref(), Some("30m"));
+    }
+
+    #[test]
+    fn run_goal_max_continuations_alias_works() {
+        let a = run(&["--goal", "x", "--goal-max-continuations", "3"]);
+        assert_eq!(a.max_continuations, Some(3));
+    }
+
+    #[test]
+    fn run_accepts_system_prompt_flag() {
+        let a = run(&["--system-prompt", "Be terse."]);
+        assert_eq!(a.system_prompt.as_deref(), Some("Be terse."));
+    }
+
+    #[test]
+    fn run_system_prompt_and_file_are_mutually_exclusive() {
+        assert!(
+            Cli::try_parse_from([
+                "coda", "run", "-p", "x",
+                "--system-prompt", "text",
+                "--system-prompt-file", "file.txt"
+            ])
+            .is_err(),
+            "--system-prompt and --system-prompt-file must conflict"
+        );
+    }
+
+    #[test]
+    fn run_accepts_resume_continue_fork() {
+        let a = run(&["--resume", "abc123"]);
+        assert_eq!(
+            SessionIntent::from_flags(a.continue_latest, a.resume, a.fork),
+            SessionIntent::Resume("abc123".into())
+        );
+        let a = run(&["--continue"]);
+        assert_eq!(
+            SessionIntent::from_flags(a.continue_latest, a.resume, a.fork),
+            SessionIntent::Latest
+        );
+        let a = run(&["--fork"]);
+        assert_eq!(
+            SessionIntent::from_flags(a.continue_latest, a.resume, a.fork),
+            SessionIntent::Fork(None)
+        );
+    }
+
+    #[test]
+    fn serve_accepts_model_flag() {
+        let a = serve(&["--model", "gpt-5"]);
+        assert_eq!(a.model.as_deref(), Some("gpt-5"));
+    }
+
+    #[test]
+    fn serve_yolo_flag_is_accepted() {
+        let a = serve(&["--yolo"]);
+        assert!(a.yolo);
+    }
+
+    #[test]
+    fn serve_api_key_and_endpoint_accepted() {
+        let a = serve(&["--api-key", "sk-test", "--endpoint", "https://proxy.example.com"]);
+        assert_eq!(a.api_key.as_deref(), Some("sk-test"));
+        assert_eq!(a.endpoint.as_deref(), Some("https://proxy.example.com"));
+    }
+
+    #[test]
+    fn serve_endpoint_requires_api_key() {
+        assert!(
+            Cli::try_parse_from(["coda", "serve", "--endpoint", "https://x.com"]).is_err(),
+            "--endpoint without --api-key must fail"
+        );
+    }
+
+    #[test]
+    fn interactive_accepts_model_and_system_prompt() {
+        let a = interactive(&["--model", "gpt-5", "--system-prompt", "Be helpful."]);
+        assert_eq!(a.model.as_deref(), Some("gpt-5"));
+        assert_eq!(a.system_prompt.as_deref(), Some("Be helpful."));
+    }
+
+    #[test]
+    fn resolve_system_prompt_inline_wins() {
+        let result = resolve_system_prompt(Some("inline text"), None).expect("resolve");
+        assert_eq!(result.as_deref(), Some("inline text"));
+    }
+
+    #[test]
+    fn resolve_system_prompt_none_when_neither_given() {
+        let result = resolve_system_prompt(None, None).expect("resolve");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_system_prompt_from_file() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("coda-test-sp-{}.txt", std::process::id()));
+        std::fs::write(&path, "from file").expect("write");
+        let result = resolve_system_prompt(None, Some(&path)).expect("resolve");
+        assert_eq!(result.as_deref(), Some("from file"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn resolve_system_prompt_file_not_found_is_error() {
+        let result = resolve_system_prompt(None, Some(std::path::Path::new("no-such-file.txt")));
+        assert!(result.is_err(), "missing file must be an error");
     }
 }}

@@ -167,6 +167,10 @@ impl Surface for SettingsSurface {
         self.inner.hints()
     }
 
+    fn placement(&self) -> super::Placement {
+        self.inner.placement()
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
         self.inner.dispatch(key)
     }

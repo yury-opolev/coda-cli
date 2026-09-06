@@ -176,30 +176,106 @@ impl App {
             }
         }
     }
-    /// Pastes the clipboard into the composer for a right-click with nothing
-    /// selected.
+    /// Pastes from the clipboard, preferring an image attachment over plain
+    /// text when the clipboard carries image data.
     ///
-    /// Refused while a prompt is up, so a pointer can never type into a
-    /// composer the user cannot see — the same guard the C# applies.
-    pub(super) fn paste_from_pointer(&mut self) {
-        // Any open surface blocks it, not just a prompt or a browser: a
-        // pointer must never type into a composer the user cannot see.
+    /// Image path:
+    /// 1. Read raw RGBA pixels from the clipboard.
+    /// 2. Validate dimensions and pixel count (cap: 16 M pixels).
+    /// 3. Encode to PNG.
+    /// 4. Enforce the 5 MB encoded-size limit.
+    /// 5. Stage as a `WireImage` and insert `[Image N]` token in the composer.
+    ///
+    /// Text fallback: taken only when the clipboard has no image
+    /// (`ContentNotAvailable`), *not* on other clipboard errors — a partial
+    /// read should not silently downgrade to text.
+    ///
+    /// Refuses while any surface is open: the composer is not visible then,
+    /// and pasting into an invisible field is never right.
+    pub(super) fn paste_image_from_clipboard(&mut self) {
+        // Any open surface blocks the paste: no field to paste into is visible.
         if !self.surfaces.is_empty() {
             return;
         }
-        match arboard::Clipboard::new().and_then(|mut c| c.get_text()) {
-            Ok(text) if !text.is_empty() => {
-                self.composer.insert(&text);
-            }
-            Ok(_) => {}
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
             Err(err) => {
                 self.notice(
-                    format!("Could not read the clipboard: {err}"),
+                    format!("Could not access the clipboard: {err}"),
+                    NoticeLevel::Warning,
+                );
+                return;
+            }
+        };
+
+        match clipboard.get_image() {
+            Ok(img) => {
+                match crate::app::image::rgba_to_png(img.width, img.height, &img.bytes) {
+                    Ok(png_bytes) => {
+                        if png_bytes.len() > crate::app::image::MAX_IMAGE_BYTES {
+                            let size_mb = png_bytes.len() as f64 / (1024.0 * 1024.0);
+                            self.notice(
+                                format!(
+                                    "Clipboard image too large ({size_mb:.1} MB encoded). Maximum is 5 MB."
+                                ),
+                                NoticeLevel::Warning,
+                            );
+                        } else {
+                            let label = self.stage_image_bytes("image/png", &png_bytes);
+                            let size_kb = png_bytes.len() as f64 / 1024.0;
+                            self.notice(
+                                format!(
+                                    "Pasted clipboard image as [Image {label}] ({size_kb:.1} KB). \
+                                     It will be sent with your next message."
+                                ),
+                                NoticeLevel::Info,
+                            );
+                            self.dirty = true;
+                        }
+                    }
+                    Err(err) => {
+                        self.notice(
+                            format!("Could not encode clipboard image: {err}"),
+                            NoticeLevel::Warning,
+                        );
+                    }
+                }
+            }
+            // No image on the clipboard — fall back to text.
+            Err(arboard::Error::ContentNotAvailable) => {
+                match clipboard.get_text() {
+                    Ok(text) if !text.is_empty() => {
+                        self.composer.insert(&text);
+                        self.dirty = true;
+                    }
+                    Ok(_) => {}
+                    Err(arboard::Error::ContentNotAvailable) => {}
+                    Err(err) => {
+                        self.notice(
+                            format!("Could not read the clipboard: {err}"),
+                            NoticeLevel::Warning,
+                        );
+                    }
+                }
+            }
+            // A real clipboard error (not just "no image") — report it and
+            // stop; do not silently fall back to a text read.
+            Err(err) => {
+                self.notice(
+                    format!("Could not read clipboard image: {err}"),
                     NoticeLevel::Warning,
                 );
             }
         }
     }
+
+    /// Right-click paste: delegates to the unified clipboard paste which
+    /// prefers image over text, and includes the open-surface guard.
+    pub(super) fn paste_from_pointer(&mut self) {
+        self.paste_image_from_clipboard();
+    }
+
     pub(super) fn copy_to_clipboard(&mut self) {
         // A selection wins over the visible screen: if the user has selected
         // something, copying everything on screen instead is silently the

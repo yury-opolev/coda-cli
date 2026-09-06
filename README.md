@@ -174,19 +174,17 @@ dotnet run --project src/Coda.Tui -- --permission-mode plan
 
 ### Exact startup system prompts
 
-The interactive TUI and `coda serve` accept one exact root-prompt source:
+The interactive TUI, `coda run`, and `coda serve` accept one root-prompt source:
 
 ```text
 coda [interactive options] [--system-prompt <text> | --system-prompt-file <path>]
 coda serve [serve options] [--system-prompt <text> | --system-prompt-file <path>]
+coda run -p <task> [--system-prompt <text> | --system-prompt-file <path>]
 ```
 
-The options are mutually exclusive and accepted once only; a missing value, duplicate, or
-`--system-prompt=<text>` / `--system-prompt-file=<path>` form fails before startup. `coda run`
-does **not** accept either option. A file path relative to the process startup directory is
-resolved there, not relative to `--cwd`; it is read once, before session or transport side effects,
-as strict UTF-8 (an optional UTF-8 BOM is removed). Its whitespace, line endings, and trailing
-newline are otherwise preserved.
+The options are mutually exclusive. A missing value or unreadable/non-UTF-8 file
+fails before the first prompt. The supplied text replaces the root system prompt
+for this session and is not written to settings.
 
 An explicit value is a complete replacement for the root system prompt: Coda's built-in prompt,
 `CLAUDE.md`/project context, output-style suffix, and provider prefix are not appended. Empty and
@@ -231,8 +229,13 @@ mid-sentence stays literal text and is sent to the model together with the prose
 selection (the role markers and tree connectors in the gutter are never copied). A selection is kept if
 the clipboard is unavailable, so you can retry. In the **composer**, **left-drag** selects text; when a
 selection exists, `Ctrl+C` **or a right-click** copies it and clears the selection; a **right-click**
-with no selection pastes at the clicked caret; `Alt+V` (or `Ctrl+V`) pastes at the caret, attaching a copied **image** when the clipboard holds one and falling back to text otherwise — use `Alt+V` if your terminal claims `Ctrl+V` for its own paste, as Windows Terminal does, since its paste reads text only and an image-only clipboard then produces nothing. Pasting a **path to an image file** attaches that image instead of inserting the path, so Explorer's `Shift`+right-click → **Copy as path** followed by an ordinary paste works even through a terminal's own `Ctrl+V`; and a **middle-click**
-opens the editor context menu. The **session id** in the header, and the body of the modal browsers
+with no selection pastes at the clicked caret. `Alt+V`, `Ctrl+V`, or `Shift+Insert`
+attaches a copied **image** as an `[Image N]` placeholder, falling back to text when
+no image is available. Use `Alt+V` if the terminal intercepts `Ctrl+V`: terminal
+paste events carry text only. Use `/image <path>` to attach a file. Images are capped
+at 5 MiB before base64 encoding. Removing a placeholder excludes that image from
+the next prompt; drafts with images must wait until the current turn finishes.
+The **session id** in the header, and the body of the modal browsers
 (`/model`, `/skills`, `/mcp`, `/tasks`, `/schedule`, `/plugins`), can be selected with a **left-drag**
 and copied the same way. In each browser the **list pane** uses a TableView widget that highlights the selected row; drag-select with `Ctrl+C` is available in the **detail pane** where a full `SelectableTextView` is rendered. **`Shift`-drag** hands native selection and copy to the terminal where
 supported. `--no-mouse` leaves selection and copy native to the terminal, and every action stays
@@ -264,7 +267,7 @@ Inside the REPL:
 /tasks                    open the live task browser (prints a textual snapshot in plain/Spectre)
 /provider [id]            show or switch the active provider
 /model [id]               show or set the chat model
-/effort [low|medium|high|max|auto]  show or set reasoning effort (Claude only)
+/effort [low|medium|high|xhigh|max|auto]  choose or set model-specific reasoning effort
 /context                  show context-window usage broken down by category
 /goal [<text> | off]      set/clear the autonomous goal (--timeout, --max-turns)
 /log [<level> | stderr on|off]  show or set telemetry logging level
@@ -359,24 +362,24 @@ the model in use, and states in its header where the list came from — live fro
 models.dev catalog, or the built-in fallback — warning when it is the built-in list. `/model <id>`
 still applies a model directly without opening the browser.
 
-The **MCP browser** additionally offers `a` add · `e` edit · `Space` enable/disable · `u`
-re-authenticate · `Delete` remove. Its editor is a real form: `Tab`/`Shift+Tab` and `Up`/`Down` move
-between fields, text fields have a cursor and full editing, fixed-value fields are selectors, and the
-fields shown change with the transport — a stdio server has a command, arguments and environment; an
-HTTP server has a URL, headers and auth. List fields always show at least one empty row, so you can
-type the first argument straight away; `Ctrl+N` adds another row below the current one, `Ctrl+R`
-removes the current row — clearing it rather than removing it when it is the last one — and
-`Alt+Up`/`Alt+Down` reorder. Rows left blank are discarded on save. Secrets are never typed into the
-form: they are entered through a masked prompt and shown only as `*****`.
+The **MCP browser** offers add, edit, enable/disable, and remove actions. In its
+editor, arguments are a JSON array such as `["-y", "server"]`, and environment
+variables are a JSON object such as `{ "TOKEN": "coda-secret:store/key" }`.
+This preserves spaces, quotes, empty arguments, and multiline environment values.
+Use Tab/Shift+Tab to move between fields and Ctrl+Enter to save from a multiline
+field. Secret references stay unresolved; browser summaries show variable names,
+not values. Existing headers, auth, and unknown settings survive edits and scope
+moves, and name collisions are rejected rather than overwriting another server.
+Transport changes rewrite the command/URL shape. Restart the engine to apply
+configuration changes to its live MCP connections.
 
-Changing an existing server's **transport** rewrites it to the other shape and drops the fields that
-do not apply, so saving such a change asks for confirmation first and names what will be lost.
-- **`/effort [low|medium|high|max|auto]`** sets the reasoning effort level. It is
-  sent to the Anthropic API as `output_config.effort` (with the
-  `effort-2025-11-24` beta) and is honored only by models that support it
-  (`opus-4-8`, `sonnet-4-6`); `max` is Opus-only and clamps to `high` elsewhere.
-  Effort is session-scoped; `auto` clears it (model default). GitHub Copilot has
-  no effort equivalent, so the setting is ignored there.
+- **`/effort`** opens a horizontal Faster / Smarter picker for the active model.
+  Left/Right changes the selection, Enter applies and saves a per-provider/model
+  preference, `s` applies for this session only, `a` selects automatic, and Esc
+  cancels. Only supported levels are selectable; unknown capability is labelled
+  explicitly. `/effort <level>` applies and saves directly; `auto` clears the
+  explicit preference. In the model browser, `e` activates the highlighted model
+  and opens its effort picker. `--effort <level>` is a session-only startup override.
 - **`/context`** shows how the model's 200k context window is being used, broken
   down into **System prompt / System tools / MCP tools / Messages / Autocompact
   buffer / Free space** with a grid visualization and per-category token counts.
@@ -836,22 +839,25 @@ the built-in defaults.
 
 ### Headless CLI flags
 
-All supervisor features are also reachable from `coda run`:
+Rust `coda run` supports these controls (see [`rust/README.md`](rust/README.md)
+for the full startup flag set):
 
 | Flag | Effect |
 |---|---|
 | `--yolo` | Blanket-allow bypass — every mutating action runs without a prompt. |
-| `--yolo-safe` | Bypass + classifier — risky actions are escalated instead of blindly allowed. Prefer over `--yolo` when running unattended. |
-| `--goal "<objective>"` | Enable the autonomous goal loop; the agent works until the judge decides the goal is met (or the budget is exhausted). The goal status prints to stderr (and to the `--json` result as `goalStatus`); an unmet goal yields a non-zero exit code. |
-| `--goal-timeout <duration>` | Wall-clock budget for the goal run: `30m`, `2h`, `1d`, or `hh:mm:ss` (requires `--goal`; default 24h). A bare integer is rejected — use a unit. |
-| `--session-memory` | Enable the background SessionMemory watcher. |
-| `--max-continuations <n>` | Turn backstop. For a goal run it sets the goal turn budget (default 60000); otherwise it bounds non-goal stop-hook continuations (default 10). |
-| `--effort <level>` | Reasoning effort (`low`/`medium`/`high`/`max`/`auto`). Claude-only; `max` is Opus-only. |
+| `--permission-mode <mode>` | Select the session's permission mode without changing saved defaults. |
+| `--goal "<objective>"` | Enable the autonomous goal loop, subject to its duration and continuation budgets. |
+| `--goal-timeout <duration>` | Positive wall-clock budget such as `30m` or `2h`; requires `--goal`. Alias: `--goal-max-duration`. |
+| `--max-continuations <n>` | Nonnegative goal continuation budget; requires `--goal`. Alias: `--goal-max-continuations`. |
+| `--effort <level>` | Session-only reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`/`auto`), validated against model capability. |
+
+Legacy-only options such as `--yolo-safe` and `--session-memory` are not supported
+by the Rust CLI; they are rejected rather than silently enabled.
 
 Example:
 
 ```powershell
-coda run -p "refactor all tests to use xUnit v3 assertions" --yolo-safe --goal "all tests pass" --goal-timeout 2h --session-memory
+coda run -p "refactor the assertions" --permission-mode acceptEdits --goal "consistent assertions" --goal-timeout 2h
 ```
 
 Driven over `coda serve`, the goal is set on session create or dynamically with

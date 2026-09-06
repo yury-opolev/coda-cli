@@ -18,6 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 pub mod browser;
+pub mod effort;
 pub mod form;
 pub mod mcp_editor;
 pub mod prompt;
@@ -44,6 +45,18 @@ pub enum Side {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
     Modal { width_pct: u16, height_pct: u16 },
+    /// A bordered modal whose outer size is computed from the surface's own
+    /// content rather than from a percentage of the terminal.
+    ///
+    /// The stack calls [`Surface::desired_size`] at `preferred_width` (capped
+    /// to the available content width) and builds the modal around the result.
+    /// This ensures the width used to measure is always the width rendered at,
+    /// which is how oversized modals and mismatched-width double-renders are
+    /// both avoided.
+    ///
+    /// Degrades to [`Placement::Full`] when the terminal is too small to hold
+    /// the minimum modal chrome, matching the behaviour of `Modal`.
+    FitContent { preferred_width: u16 },
     Full,
     Split { side: Side, width_pct: u16 },
     Inline { max_rows: u16 },
@@ -64,6 +77,14 @@ impl Placement {
             }
             .resolve(area),
             Placement::Modal { .. }
+                if area.width < MIN_MODAL_WIDTH || area.height < MIN_MODAL_HEIGHT =>
+            {
+                Placement::Full
+            }
+            // FitContent degrades on the same chrome thresholds as Modal.
+            // Better to go full-screen than to clip the actionable footer or
+            // hide a focused control off the bottom.
+            Placement::FitContent { .. }
                 if area.width < MIN_MODAL_WIDTH || area.height < MIN_MODAL_HEIGHT =>
             {
                 Placement::Full
@@ -137,6 +158,34 @@ pub enum SurfaceAction {
     /// Explain that a skill cannot be toggled from the browser.
     ExplainSkillToggle,
 
+    /// Set the reasoning-effort level for the session.
+    ///
+    /// `persist` distinguishes "Enter" (save to settings) from "s" (session
+    /// only, no disk write). `for_model` is the `(provider, model)` identity
+    /// at the moment the picker was opened, so the apply handler can write
+    /// the per-model preference without a race if the model changed while the
+    /// picker was visible.
+    SetEffort {
+        effort: String,
+        persist: bool,
+        for_model: (String, String),
+    },
+
+    /// Open the effort picker for the current session model.
+    ///
+    /// Raised by the bare `/effort` slash command and row actions where full
+    /// async is not available; the application opens the picker against the
+    /// model currently in effect.
+    OpenEffortPicker,
+
+    /// Switch to the given model, then open the effort picker for it.
+    ///
+    /// Raised by the model browser's `e` key: it identifies the row so the
+    /// picker edits *that* model's effort, not whatever happened to be current.
+    /// The switch is intentional and visible (the picker title names the
+    /// model), never a silent edit of a different model.
+    OpenEffortPickerForModel(String),
+
     /// A browser row action that needs the engine or the filesystem.
     ///
     /// Carries the browser's kind, so the host knows what the row refers to
@@ -197,6 +246,30 @@ pub trait Surface {
         None
     }
 
+    /// The preferred content size (width, height) at most `max_width` wide,
+    /// **excluding chrome** (border + hints footer).
+    ///
+    /// Used by [`Placement::FitContent`] so the stack can size the modal to
+    /// exactly what the surface needs rather than to a percentage of the
+    /// terminal.
+    ///
+    /// The default implementation probes [`render`] at `max_width` and returns
+    /// the line count as the height. Both width and height are then clamped and
+    /// the border is added back by the stack, so surfaces that know their own
+    /// dimensions can override for efficiency.
+    ///
+    /// **Important**: the width returned must equal the width that will be
+    /// passed to [`render`], because the stack uses this value to construct the
+    /// content `Rect`. Returning a different width would cause the surface to
+    /// render into an area it did not size itself for.
+    fn desired_size(&self, max_width: u16, theme: &Theme) -> (u16, u16) {
+        // Probe with a tall area so the surface does not clip itself. The
+        // half-max avoids overflow in callers that multiply this.
+        let probe = Rect::new(0, 0, max_width.max(1), u16::MAX / 2);
+        let lines = self.render(probe, theme);
+        (max_width, lines.len() as u16)
+    }
+
     /// Recovers the concrete type, so the action interpreter can read typed
     /// values back out of the surface that emitted an action.
     fn as_any(&self) -> &dyn std::any::Any;
@@ -228,7 +301,10 @@ pub mod chrome {
     /// contiguous with the shell — bordering those would draw a box around the
     /// whole terminal, or a rail down the middle of a pane that has no edge.
     pub fn is_bordered(placement: Placement) -> bool {
-        matches!(placement, Placement::Modal { .. })
+        matches!(
+            placement,
+            Placement::Modal { .. } | Placement::FitContent { .. }
+        )
     }
 
     /// The area inside the border and padding.
@@ -280,9 +356,34 @@ pub mod chrome {
             rows,
         )
     }
+
+    /// Computes the outer region for a [`Placement::FitContent`] modal given
+    /// the surface's preferred content size (excluding chrome) and available
+    /// terminal area.
+    ///
+    /// The modal is centered, capped to `area`, and always at least 1×1. The
+    /// same `hints` text used to measure hint rows here must be the one passed
+    /// to [`content`] and [`footer`] so the three regions stay consistent.
+    pub fn fit_content_region(content_size: (u16, u16), hints: &str, area: Rect) -> Rect {
+        let (cw, ch) = content_size;
+        let h_rows = hint_rows(hints, cw);
+        let want_w = cw.saturating_add(BORDER_COLS * 2);
+        let want_h = ch.saturating_add(h_rows).saturating_add(BORDER_ROWS);
+        let w = want_w.min(area.width).max(1);
+        let h = want_h.min(area.height).max(1);
+        let x = area.x + area.width.saturating_sub(w) / 2;
+        let y = area.y + area.height.saturating_sub(h) / 2;
+        Rect::new(x, y, w, h)
+    }
 }
 
 /// Turns a resolved placement into a concrete region of `area`.
+///
+/// For [`Placement::FitContent`], the stack calls [`chrome::fit_content_region`]
+/// with the surface's own [`Surface::desired_size`] instead of this function,
+/// because only the stack has access to the surface. This fallback is provided
+/// for callers outside the stack (tests, future uses) and returns a centered
+/// region at the preferred width spanning the full terminal height.
 pub fn region_for(placement: Placement, area: Rect) -> Rect {
     match placement {
         Placement::Full => area,
@@ -302,6 +403,15 @@ pub fn region_for(placement: Placement, area: Rect) -> Rect {
                 w,
                 h,
             )
+        }
+        Placement::FitContent { preferred_width } => {
+            // The stack uses desired_size instead. This fallback centers the
+            // preferred width and spans the full terminal height.
+            let w = preferred_width.saturating_add(chrome::BORDER_COLS * 2)
+                .min(area.width)
+                .max(1);
+            let x = area.x + area.width.saturating_sub(w) / 2;
+            Rect::new(x, area.y, w, area.height)
         }
         Placement::Split { side, width_pct } => {
             let w = ((area.width as u32 * width_pct as u32 / 100) as u16)
@@ -488,6 +598,7 @@ mod tests {
             width_pct: 70,
             height_pct: 70
         }));
+        assert!(chrome::is_bordered(Placement::FitContent { preferred_width: 60 }));
         assert!(!chrome::is_bordered(Placement::Full));
         assert!(!chrome::is_bordered(Placement::Inline { max_rows: 4 }));
         assert!(!chrome::is_bordered(Placement::Split {
@@ -519,5 +630,185 @@ mod tests {
             area,
         );
         assert_eq!((region.width, region.height), (1, 1));
+    }
+
+    // ── FitContent geometry ──────────────────────────────────────────────────
+
+    #[test]
+    fn fit_content_region_sizes_to_content_not_to_terminal_percentage() {
+        // The whole point of FitContent: 3 lines of content in a 24-row terminal
+        // should produce a 3+border row modal, not a 16-row (70%) one.
+        let area = Rect::new(0, 0, 80, 24);
+        let region = chrome::fit_content_region((60, 3), "Esc: close", area);
+        // inner height = content_h + hint_rows; outer = inner + BORDER_ROWS
+        // hint_rows("Esc: close", 60) = 1
+        let expected_h = 3 + 1 + chrome::BORDER_ROWS; // 6
+        assert_eq!(
+            region.height, expected_h,
+            "short content should produce a compact modal, not {}", region.height
+        );
+        // width: content 60 + 2*BORDER_COLS = 64
+        assert_eq!(region.width, 60 + chrome::BORDER_COLS * 2);
+    }
+
+    #[test]
+    fn fit_content_region_caps_to_terminal_when_content_is_tall() {
+        // A 200-line form must not escape the screen.
+        let area = Rect::new(0, 0, 80, 24);
+        let region = chrome::fit_content_region((60, 200), "Esc: close", area);
+        assert_eq!(region.height, area.height);
+        assert!(region.bottom() <= area.bottom());
+    }
+
+    #[test]
+    fn fit_content_region_caps_to_terminal_when_content_is_wide() {
+        // A very wide preferred_width must not escape the screen.
+        let area = Rect::new(0, 0, 80, 24);
+        let region = chrome::fit_content_region((200, 5), "Esc: close", area);
+        assert!(region.right() <= area.right());
+        assert_eq!(region.width, area.width);
+    }
+
+    #[test]
+    fn fit_content_region_is_centered() {
+        let area = Rect::new(0, 0, 80, 24);
+        let region = chrome::fit_content_region((20, 4), "", area);
+        let outer_w = 20 + chrome::BORDER_COLS * 2; // 24
+        let expected_x = (80 - outer_w) / 2; // 28
+        assert_eq!(region.x, expected_x, "region is not horizontally centered");
+        let outer_h = 4 + chrome::BORDER_ROWS; // 6 (no hints)
+        let expected_y = (24 - outer_h) / 2; // 9
+        assert_eq!(region.y, expected_y, "region is not vertically centered");
+    }
+
+    #[test]
+    fn fit_content_region_survives_zero_content() {
+        // Zero-content surface: should still produce a drawable (1x1) region.
+        let area = Rect::new(0, 0, 80, 24);
+        let region = chrome::fit_content_region((0, 0), "", area);
+        assert!(region.width >= 1 && region.height >= 1);
+    }
+
+    #[test]
+    fn fit_content_degrades_to_full_on_tiny_terminal() {
+        // Below MIN_MODAL_WIDTH/MIN_MODAL_HEIGHT the surface cannot afford its
+        // chrome; degrading to Full beats clipping the actionable footer.
+        let tiny = Rect::new(0, 0, 10, 4);
+        assert_eq!(
+            Placement::FitContent { preferred_width: 60 }.resolve(tiny),
+            Placement::Full
+        );
+    }
+
+    #[test]
+    fn fit_content_survives_normal_terminal() {
+        let area = Rect::new(0, 0, 80, 24);
+        assert!(matches!(
+            Placement::FitContent { preferred_width: 60 }.resolve(area),
+            Placement::FitContent { .. }
+        ));
+    }
+
+    #[test]
+    fn fit_content_content_and_footer_partition_inner_exactly() {
+        // Same invariant as Modal: content + footer = inner, no gap, no overlap.
+        let area = Rect::new(0, 0, 80, 24);
+        let region = chrome::fit_content_region((60, 5), "Tab: next    Esc: cancel", area);
+        let p = Placement::FitContent { preferred_width: 60 };
+        let inner = chrome::inner(region, p);
+        let hints = "Tab: next    Esc: cancel";
+        let content = chrome::content(region, hints, p);
+        let footer = chrome::footer(region, hints, p);
+
+        assert_eq!(content.y, inner.y);
+        assert_eq!(content.bottom(), footer.y, "content and footer must be adjacent");
+        assert_eq!(footer.bottom(), inner.bottom());
+        assert_eq!(content.height + footer.height, inner.height);
+    }
+
+    #[test]
+    fn desired_size_default_counts_rendered_lines() {
+        // The default desired_size calls render, so a surface that produces N
+        // lines at a given width must report N as its preferred height.
+        struct Lines(u16);
+        impl Surface for Lines {
+            fn as_any(&self) -> &dyn std::any::Any { self }
+            fn title(&self) -> String { "Lines".into() }
+            fn hints(&self) -> String { String::new() }
+            fn handle_key(&mut self, _: KeyEvent) -> SurfaceOutcome { SurfaceOutcome::Handled }
+            fn render(&self, area: Rect, _: &Theme) -> Vec<Line<'static>> {
+                (0..self.0.min(area.height)).map(|i| Line::from(format!("line {i}"))).collect()
+            }
+        }
+
+        let surface = Lines(5);
+        let (w, h) = surface.desired_size(60, &Theme::default());
+        assert_eq!(w, 60);
+        assert_eq!(h, 5, "desired_size must count what render produces");
+    }
+
+    #[test]
+    fn stack_render_width_is_consistent_for_fit_content() {
+        // The content area passed to render must have the same width as the
+        // one used to compute desired_size. A mismatch causes the surface to
+        // lay itself out for one width and be drawn at another.
+        use crate::surface::stack::SurfaceStack;
+
+        struct WidthRecorder {
+            last_width: std::cell::Cell<u16>,
+        }
+        impl Surface for WidthRecorder {
+            fn as_any(&self) -> &dyn std::any::Any { self }
+            fn title(&self) -> String { "Recorder".into() }
+            fn hints(&self) -> String { "Esc: close".into() }
+            fn placement(&self) -> Placement { Placement::FitContent { preferred_width: 60 } }
+            fn handle_key(&mut self, _: KeyEvent) -> SurfaceOutcome { SurfaceOutcome::Handled }
+            fn desired_size(&self, max_width: u16, _: &Theme) -> (u16, u16) {
+                (max_width, 3)
+            }
+            fn render(&self, area: Rect, _: &Theme) -> Vec<Line<'static>> {
+                self.last_width.set(area.width);
+                vec![Line::from("content")]
+            }
+        }
+
+        let mut stack = SurfaceStack::default();
+        let recorder = Box::new(WidthRecorder {
+            last_width: std::cell::Cell::new(0),
+        });
+        // We need to inspect the recorder after rendering. Use `as_any` from
+        // the rendered surface's perspective — but since we can't after push,
+        // verify via the rendered content rect width.
+        stack.push(recorder);
+
+        let area = Rect::new(0, 0, 80, 24);
+        let rendered = stack.render(area, &Theme::default());
+        assert_eq!(rendered.len(), 1);
+
+        // content.width must equal the width desired_size received (60).
+        // BORDER_COLS * 2 = 4, so available content width = 80 - 4 = 76.
+        // preferred_width = 60 < 76, so content width = 60.
+        let content_w = rendered[0].content.width;
+        assert_eq!(
+            content_w, 60,
+            "content.width ({content_w}) did not match preferred_width (60)"
+        );
+    }
+
+    #[test]
+    fn fit_content_region_stays_inside_area() {
+        // Matches the invariant tested for other placements.
+        let area = Rect::new(0, 0, 80, 24);
+        for (cw, ch) in [(0u16, 0u16), (60, 5), (200, 200), (80, 24)] {
+            let region = chrome::fit_content_region((cw, ch), "Esc: close", area);
+            assert!(
+                region.right() <= area.right() && region.bottom() <= area.bottom(),
+                "region escaped area for content ({cw}x{ch}): {region:?}"
+            );
+            assert!(
+                region.width >= 1 && region.height >= 1,
+                "region vanished for content ({cw}x{ch})"
+            );
+        }
     }
 }

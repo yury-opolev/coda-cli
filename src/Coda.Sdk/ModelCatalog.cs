@@ -65,9 +65,9 @@ public sealed class ModelCatalog
         _ => null,
     };
 
-    /// <summary>Default on-disk cache path for a refreshed catalog.</summary>
+    /// <summary>Default on-disk cache path for a refreshed catalog. Honors the <c>CODA_HOME</c> profile-root override.</summary>
     public static string CachePath => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), ".coda", "cache", "models.json");
+        Coda.Common.CodaPaths.CodaDirectory, "cache", "models.json");
 
     /// <summary>Look up a model's metadata for a provider, tolerant of version-suffix differences.</summary>
     public CatalogModel? Get(string providerId, string modelId)

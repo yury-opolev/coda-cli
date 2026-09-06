@@ -175,6 +175,7 @@ pub struct UiState {
     pub usage: Usage,
     pub session_id: Option<String>,
     pub model: Option<String>,
+    pub effort: Option<String>,
     pub display_mode: ToolDisplayMode,
     /// Messages typed while a turn was running.
     pub queued: Vec<QueuedMessage>,
@@ -223,6 +224,7 @@ impl UiState {
             usage: Usage::default(),
             session_id: None,
             model: None,
+            effort: None,
             display_mode: ToolDisplayMode::default(),
             queued: Vec::new(),
             prompt: None,

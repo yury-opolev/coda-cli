@@ -196,7 +196,9 @@ impl App {
         use SurfaceAction as A;
         match kind {
             BrowserKind::Models => {
-                RowActions::new().on_activate(|id| A::SwitchModel(id.to_string()))
+                RowActions::new()
+                    .on_activate(|id| A::SwitchModel(id.to_string()))
+                    .on_key('e', |id| A::OpenEffortPickerForModel(id.to_string()))
             }
             BrowserKind::Sessions => {
                 RowActions::new().on_activate(|id| A::ResumeSession(id.to_string()))

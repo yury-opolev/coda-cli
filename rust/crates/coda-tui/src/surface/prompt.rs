@@ -137,6 +137,15 @@ impl Surface for PromptSurface {
         }
     }
 
+    fn placement(&self) -> super::Placement {
+        // A permission prompt has short content: a tool name and a path. A
+        // plan-approval prompt has a plan that can be long but scrolls.
+        // FitContent keeps the modal compact for short prompts and scrolls
+        // longer ones without ever allocating 70% of the terminal for three
+        // lines.
+        super::Placement::FitContent { preferred_width: 60 }
+    }
+
     fn modality(&self) -> Modality {
         Modality::Exclusive
     }

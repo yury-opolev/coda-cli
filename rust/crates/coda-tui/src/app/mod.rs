@@ -24,7 +24,10 @@ use tokio::sync::oneshot;
 mod browsers;
 mod slash;
 mod clipboard;
+mod effort;
 mod engine;
+mod image;
+mod startup_cli;
 
 use crate::config::{self, Paths, Settings};
 use crate::commands;
@@ -148,6 +151,12 @@ pub struct App {
     transcript_origin: (u16, u16),
     /// Screen cell of the composer's first text column, for click-to-caret.
     composer_origin: (u16, u16),
+    /// The effort level currently applied to the session.
+    ///
+    /// `None` means auto / not set. Updated when the picker confirms a choice.
+    /// Used to pre-select the picker at the setting already in effect rather
+    /// than defaulting to "high" every time.
+    session_effort: Option<String>,
 }
 
 
@@ -224,6 +233,7 @@ impl App {
             selection: crate::selection::TranscriptSelection::new(),
             transcript_origin: (0, 0),
             composer_origin: (0, 0),
+            session_effort: None,
         };
 
         Ok((app, engine, inbound))
@@ -384,6 +394,7 @@ impl App {
             // without reaching for a catalogue of its own.
             self.state.usage.price_per_million = price;
         }
+        self.refresh_effort().await;
     }
 
     // -- Terminal input -----------------------------------------------------
@@ -610,11 +621,13 @@ impl App {
                     self.composer.clear_completions();
                 } else {
                     self.composer.clear();
+                    self.staged_images.clear();
                 }
             }
             Action::ClearTranscript => self.apply(UiEvent::Cleared),
             Action::Copy => self.copy_to_clipboard(),
-            Action::Paste | Action::Confirm | Action::None => self.dirty = false,
+            Action::Paste => self.paste_image_from_clipboard(),
+            Action::Confirm | Action::None => self.dirty = false,
         }
     }
 
@@ -641,9 +654,8 @@ impl App {
 
     async fn submit(&mut self) {
         let text = self.composer.take_submission();
-        // A prompt needs text, staged images, or both.
-        let has_content = !text.trim().is_empty() || !self.staged_images.is_empty();
-        if !has_content {
+        if text.trim().is_empty() {
+            self.staged_images.clear();
             return;
         }
 
@@ -656,7 +668,13 @@ impl App {
 
         // A message typed mid-turn is steered into the running turn rather
         // than dropped or forced to wait for it to finish.
+        let images = image::images_for_draft(&self.staged_images, &text);
         if self.state.is_busy() {
+            if !images.is_empty() {
+                self.composer.set_text(text);
+                self.notice("Images cannot be steered into a running turn. Send this draft after it finishes.", NoticeLevel::Warning);
+                return;
+            }
             self.steer(text).await;
             return;
         }
@@ -668,19 +686,27 @@ impl App {
         } else {
             text.clone()
         };
-        self.apply(UiEvent::Submitted { text: display });
-
-        let params = serde_json::to_value(messages::PromptParams {
-            text: if text.is_empty() { None } else { Some(text) },
-            images: std::mem::take(&mut self.staged_images),
-        })
-        .unwrap_or_default();
+        let params = match serde_json::to_value(messages::PromptParams {
+            text: Some(text.clone()),
+            images,
+        }) {
+            Ok(params) => params,
+            Err(error) => {
+                self.composer.set_text(text);
+                self.notice(format!("Could not prepare prompt: {error}"), NoticeLevel::Error);
+                return;
+            }
+        };
         match self.connection.send_request(method::PROMPT, Some(params)) {
-            Ok(receiver) => self.turn = Some(receiver),
-            Err(error) => self.apply(UiEvent::TurnFinished {
-                interrupted: false,
-                error: Some(error.to_string()),
-            }),
+            Ok(receiver) => {
+                self.staged_images.clear();
+                self.apply(UiEvent::Submitted { text: display });
+                self.turn = Some(receiver);
+            }
+            Err(error) => {
+                self.composer.set_text(text);
+                self.notice(format!("Could not send prompt; draft retained: {error}"), NoticeLevel::Error);
+            }
         }
     }
 
@@ -866,13 +892,7 @@ impl App {
     /// Builds the exit summary from the session's final state.
     pub fn exit_summary(&self, duration: std::time::Duration) -> crate::branding::ExitSummary {
         let snapshot = self.session_snapshot();
-        let settings = Settings::load(&self.paths).ok();
-        let effort = match (&snapshot.provider, &snapshot.model) {
-            (Some(p), Some(m)) => settings
-                .as_ref()
-                .and_then(|s| s.effort_for(p, m).map(str::to_owned)),
-            _ => None,
-        };
+        let effort = self.session_effort.clone();
 
         crate::branding::ExitSummary {
             duration,
@@ -1334,20 +1354,12 @@ impl App {
                 };
 
                 let draft = editor.draft();
-                // A rename leaves the old entry behind unless it is retired,
-                // and the loader would then serve two servers under one name.
-                let renamed_from = editor
-                    .original_name()
-                    .filter(|old| *old != draft.name)
-                    .map(str::to_string);
+                let original = editor.original().cloned();
 
                 let paths = self.paths.clone();
                 let name = draft.name.clone();
                 let saved = tokio::task::spawn_blocking(move || {
-                    if let Some(old) = renamed_from {
-                        config::delete_mcp_server(&paths, &old)?;
-                    }
-                    config::save_mcp_server(&paths, &draft)
+                    config::save_mcp_server(&paths, &draft, original.as_ref())
                 })
                 .await;
 
@@ -1414,14 +1426,22 @@ impl App {
                 self.surfaces.pop();
                 self.answer_prompt(allowed, answer);
             }
+            SurfaceAction::SetEffort { effort, persist, for_model } => {
+                self.apply_set_effort(effort, persist, for_model).await;
+            }
+            SurfaceAction::OpenEffortPicker => {
+                // Close the browser first so the picker opens cleanly above it.
+                self.retire_browser_surface();
+                self.open_effort_picker(None).await;
+            }
+            SurfaceAction::OpenEffortPickerForModel(model) => {
+                // Switch to the row's model first (intentional, visible), then
+                // open the picker for it. Switching closes the browser.
+                self.switch_model(&model).await;
+                self.open_effort_for_model(None, Some(&model)).await;
+            }
         }
     }
-
-
-
-
-
-
 
     /// Checks for a first run and surfaces the setup wizard notice.
     fn check_first_run(&mut self) {

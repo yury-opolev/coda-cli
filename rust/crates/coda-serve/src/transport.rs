@@ -32,13 +32,47 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     let working_dir = std::env::current_dir()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
-    // Full credential probe at startup (env + keyring).
-    let client = crate::host::try_build_client(None).await;
+
+    // Parse and validate every startup variable exactly once. An invalid
+    // explicit value fails startup here rather than silently defaulting deep
+    // inside the host (Findings I2/I4).
+    let startup = crate::host::StartupOptions::from_env()
+        .map_err(|e| anyhow::anyhow!("invalid startup configuration: {e}"))?;
+
+    // Select the initial credential:
+    // 1. An explicitly-requested `--provider` selects *that* account and fails
+    //    closed if it is unavailable — never a different provider (Finding C2).
+    // 2. Otherwise an explicit key (+ optional endpoint) is used directly; an
+    //    endpoint without a key was already rejected by `validate`.
+    // 3. Otherwise the normal credential probe runs (env + keyring).
+    let client = if let Some(provider) = startup.provider.as_deref() {
+        Some(
+            crate::host::build_client_for_provider(
+                provider,
+                startup.api_key.as_deref(),
+                startup.endpoint.as_deref(),
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!("provider selection failed: {e}"))?,
+        )
+    } else {
+        match (
+            startup.api_key.as_deref().filter(|k| !k.trim().is_empty()),
+            startup.endpoint.as_deref().filter(|e| !e.trim().is_empty()),
+        ) {
+            (Some(key), endpoint) => crate::host::build_anthropic_at(key, endpoint),
+            (None, _) => {
+                // Full credential probe at startup (env + keyring).
+                crate::host::try_build_client(None).await
+            }
+        }
+    };
+
     // Connect enabled MCP servers before the host is built so their tools are
     // in the registry from the first turn. Disabled/failed servers are handled
     // inside `connect_mcp` and never block startup.
     let mcp = crate::mcp::connect_mcp(&working_dir).await;
-    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir, mcp).await
+    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir, mcp, startup).await
 }
 
 /// Runs the engine on the given reader/writer pair.
@@ -52,7 +86,15 @@ where
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_else(|_| ".".into());
     // Tests never touch the real MCP config: MCP is disabled for the pipe path.
-    serve_inner(reader, writer, None, working_dir, crate::mcp::McpBundle::disabled()).await
+    serve_inner(
+        reader,
+        writer,
+        None,
+        working_dir,
+        crate::mcp::McpBundle::disabled(),
+        crate::host::StartupOptions::default(),
+    )
+    .await
 }
 
 /// Runs the engine with a pre-built client (used by integration tests so
@@ -68,7 +110,15 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    serve_inner(reader, writer, Some(client), working_dir.to_string(), crate::mcp::McpBundle::disabled()).await
+    serve_inner(
+        reader,
+        writer,
+        Some(client),
+        working_dir.to_string(),
+        crate::mcp::McpBundle::disabled(),
+        crate::host::StartupOptions::default(),
+    )
+    .await
 }
 
 async fn serve_inner<R, W>(
@@ -77,6 +127,7 @@ async fn serve_inner<R, W>(
     client: Option<Arc<dyn LlmClient>>,
     working_dir: String,
     mcp: crate::mcp::McpBundle,
+    startup: crate::host::StartupOptions,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -92,6 +143,7 @@ where
         Arc::clone(&prompt_channel),
         working_dir,
         mcp,
+        startup,
     );
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));

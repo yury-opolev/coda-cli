@@ -114,6 +114,13 @@ pub struct SetGoalParams {
 pub struct SetEffortParams {
     #[serde(default)]
     pub effort: Option<String>,
+    /// Canonical model the caller believed was active; when it no longer
+    /// matches the live model the engine rejects the call without mutating.
+    #[serde(default)]
+    pub expected_model: Option<String>,
+    /// Provider the caller believed was connected; guarded like `expected_model`.
+    #[serde(default)]
+    pub expected_provider: Option<String>,
 }
 
 /// `session/setModel` — the model used for subsequent turns.
@@ -135,6 +142,15 @@ pub struct SetModelParams {
 pub struct SetPermissionModeParams {
     #[serde(default)]
     pub mode: String,
+}
+
+/// `session/setSystemPrompt` — override the system prompt for this session only.
+/// `None` or empty text clears any existing override.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SetSystemPromptParams {
+    #[serde(default)]
+    pub text: Option<String>,
 }
 
 /// `session/scheduleCreate` — `prompt` is required on the wire.
@@ -231,6 +247,8 @@ pub trait ServeBackend: Send + Sync {
         &self,
         p: SetPermissionModeParams,
     ) -> Result<Value, RpcError>;
+    /// Sets a session-only custom system prompt. Never written to disk.
+    async fn session_set_system_prompt(&self, p: SetSystemPromptParams) -> Result<Value, RpcError>;
     async fn model_reasoning_capability(&self) -> Result<Value, RpcError>;
     async fn session_schedule_list(&self) -> Result<Value, RpcError>;
     async fn session_schedule_create(&self, p: ScheduleCreateParams) -> Result<Value, RpcError>;
@@ -285,6 +303,9 @@ pub async fn dispatch(
         "session/setModel" => backend.session_set_model(required(params)?).await,
         "session/setPermissionMode" => {
             backend.session_set_permission_mode(required(params)?).await
+        }
+        "session/setSystemPrompt" => {
+            backend.session_set_system_prompt(optional(params)).await
         }
         "model/reasoningCapability" => backend.model_reasoning_capability().await,
         "session/scheduleList" => backend.session_schedule_list().await,
@@ -362,6 +383,10 @@ mod tests {
         }
         async fn session_set_model(&self, _p: SetModelParams) -> Result<Value, RpcError> {
             Ok(json!({ "ok": true }))
+        }
+        async fn session_set_system_prompt(&self, p: SetSystemPromptParams) -> Result<Value, RpcError> {
+            let cleared = p.text.as_deref().map(str::trim).unwrap_or("").is_empty();
+            Ok(json!({ "ok": true, "cleared": cleared }))
         }
 
         async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError> {
@@ -719,6 +744,9 @@ mod tests {
 
     }
 
+    async fn session_set_system_prompt(&self, _p: SetSystemPromptParams) -> Result<Value, RpcError> {
+        Err(RpcError { code: self.0, message: self.1.into() })
+    }
 
     async fn session_set_effort(&self, _p: SetEffortParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })

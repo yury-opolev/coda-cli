@@ -157,7 +157,10 @@ fn workspace_relative(path: &Path, workspace: &Path) -> Option<String> {
 
 /// Every directory scanned, in precedence order (lowest first).
 fn search_paths(workspace: &Path) -> Vec<(PathBuf, SkillOrigin)> {
-    let home = directories::UserDirs::new().map(|d| d.home_dir().to_path_buf());
+    // Honors the `CODA_HOME` profile-root override so the user (`~/.coda`) and
+    // Claude (`~/.claude`) skill roots are redirected together under an isolated
+    // profile.
+    let home = Some(coda_auth::coda_home());
     let mut paths = Vec::new();
 
     // Foreign ecosystems, lowest precedence.

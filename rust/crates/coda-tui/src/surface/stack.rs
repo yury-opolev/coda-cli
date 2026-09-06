@@ -5,7 +5,7 @@
 //! open. Rendering runs bottom-up so a detail view sits over the list that
 //! opened it.
 
-use super::{region_for, Modality, Surface, SurfaceAction, SurfaceOutcome};
+use super::{Modality, Surface, SurfaceAction, SurfaceOutcome};
 use coda_render::theme::Theme;
 use crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::Rect;
@@ -135,9 +135,29 @@ impl SurfaceStack {
             .enumerate()
             .map(|(index, surface)| {
                 let placement = surface.placement().resolve(area);
-                let region = region_for(placement, area);
                 let hints = surface.hints();
-                let content = super::chrome::content(region, &hints, placement);
+
+                // FitContent is sized by the surface's own desired_size rather
+                // than by a percentage of the terminal. The width used to measure
+                // is always the width the surface renders at, so there is no
+                // mismatch between the height computed for sizing and the height
+                // the content is actually drawn into.
+                let (region, content) = if let super::Placement::FitContent { preferred_width } =
+                    placement
+                {
+                    let max_content_w = preferred_width
+                        .min(area.width.saturating_sub(super::chrome::BORDER_COLS * 2))
+                        .max(1);
+                    let size = surface.desired_size(max_content_w, theme);
+                    let region = super::chrome::fit_content_region(size, &hints, area);
+                    let content = super::chrome::content(region, &hints, placement);
+                    (region, content)
+                } else {
+                    let region = super::region_for(placement, area);
+                    let content = super::chrome::content(region, &hints, placement);
+                    (region, content)
+                };
+
                 // Only the top surface gets a caret: two visible carets would
                 // be worse than none, and the terminal only has one.
                 let cursor = (index == top)

@@ -13,10 +13,42 @@ namespace LlmAuth;
 public static class CredentialStoreLocation
 {
     /// <summary>The current default credential directory: <c>~/.coda/credentials</c>.</summary>
+    /// <remarks>
+    /// Honors the <c>CODA_HOME</c> profile-root override (then the legacy
+    /// <c>CODA_SETTINGS_DIR</c>), so credentials are redirected together with the
+    /// rest of the profile under an isolated home. Setting <c>USERPROFILE</c>
+    /// does not work on Windows — <see cref="Environment.SpecialFolder.UserProfile"/>
+    /// resolves via the user token, not the environment.
+    /// </remarks>
     public static string Default => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+        HomeDirectory,
         ".coda",
         "credentials");
+
+    /// <summary>
+    /// The profile root: <c>CODA_HOME</c>, then <c>CODA_SETTINGS_DIR</c>, then the OS user profile.
+    /// Mirrors <c>Coda.Common.CodaPaths.HomeDirectory</c> (duplicated here because
+    /// <c>LlmAuth</c> is a leaf assembly with no reference to <c>Coda.Common</c>).
+    /// </summary>
+    private static string HomeDirectory
+    {
+        get
+        {
+            var codaHome = Environment.GetEnvironmentVariable("CODA_HOME");
+            if (!string.IsNullOrEmpty(codaHome))
+            {
+                return codaHome;
+            }
+
+            var settingsDir = Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR");
+            if (!string.IsNullOrEmpty(settingsDir))
+            {
+                return settingsDir;
+            }
+
+            return Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+        }
+    }
 
     /// <summary>The pre-<c>~/.coda</c> credential directory credentials are migrated from.</summary>
     public static string Legacy => Path.Combine(
@@ -30,8 +62,25 @@ public static class CredentialStoreLocation
     /// </summary>
     public static string ResolveDefault()
     {
-        Migrate(Legacy, Default);
-        return Default;
+        var explicitProfile =
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CODA_HOME")) ||
+            !string.IsNullOrEmpty(Environment.GetEnvironmentVariable("CODA_SETTINGS_DIR"));
+        return ResolveDefault(Legacy, Default, explicitProfile);
+    }
+
+    internal static string ResolveDefault(string legacy, string target, bool explicitProfile)
+    {
+        // An explicitly isolated profile must never import or delete the user's
+        // legacy credentials, even when its new credentials directory is empty.
+        if (explicitProfile)
+        {
+            Directory.CreateDirectory(target);
+        }
+        else
+        {
+            Migrate(legacy, target);
+        }
+        return target;
     }
 
     /// <summary>
