@@ -1440,6 +1440,9 @@ impl App {
                 self.switch_model(&model).await;
                 self.open_effort_for_model(None, Some(&model)).await;
             }
+            SurfaceAction::AdjustModelEffort { model, direction } => {
+                self.adjust_model_effort(model, direction).await;
+            }
         }
     }
 

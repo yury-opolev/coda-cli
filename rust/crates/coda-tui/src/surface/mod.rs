@@ -186,6 +186,9 @@ pub enum SurfaceAction {
     /// model), never a silent edit of a different model.
     OpenEffortPickerForModel(String),
 
+    /// Adjust the highlighted model without activating it.
+    AdjustModelEffort { model: String, direction: i32 },
+
     /// A browser row action that needs the engine or the filesystem.
     ///
     /// Carries the browser's kind, so the host knows what the row refers to

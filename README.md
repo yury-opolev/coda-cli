@@ -357,8 +357,12 @@ second `Esc` closes the browser.
 
 **Detail bindings:** `Esc` or `q` returns to the list, with the same movement and paging keys.
 
-The **model browser** shows each model's id, display name, context window and reasoning levels, marks
-the model in use, and states in its header where the list came from — live from the provider, the
+The **model browser** shows each model's id, display name, context window and current
+effort. The active model has a bold `current` marker independent of the highlighted
+navigation row. Left/Right adjusts and saves the highlighted model's effort in
+the arrow-flanked effort column without switching models; Enter selects the model.
+Only known supported levels are offered, and the list keeps your selection and
+filter after an edit. The header states where the list came from — live from the provider, the
 models.dev catalog, or the built-in fallback — warning when it is the built-in list. `/model <id>`
 still applies a model directly without opening the browser.
 

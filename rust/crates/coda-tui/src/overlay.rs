@@ -36,6 +36,8 @@ pub struct Item {
     pub cells: Vec<String>,
     /// Lines shown in the detail view.
     pub detail: Vec<String>,
+    /// Active item, distinct from the row carrying keyboard focus.
+    pub is_current: bool,
 }
 
 impl Item {
@@ -44,11 +46,17 @@ impl Item {
             id: id.into(),
             cells,
             detail: Vec::new(),
+            is_current: false,
         }
     }
 
     pub fn with_detail(mut self, detail: Vec<String>) -> Self {
         self.detail = detail;
+        self
+    }
+
+    pub fn with_current(mut self, current: bool) -> Self {
+        self.is_current = current;
         self
     }
 
@@ -105,6 +113,7 @@ pub struct Browser {
     view: View,
     /// `Some` while filter entry is active.
     filter: Option<String>,
+    applied_filter: Option<String>,
     detail_scroll: usize,
     status: String,
     footer: String,
@@ -124,6 +133,7 @@ impl Browser {
             selected: 0,
             view: View::List,
             filter: None,
+            applied_filter: None,
             detail_scroll: 0,
             status: String::new(),
             footer: String::new(),
@@ -216,6 +226,22 @@ impl Browser {
         self.clamp();
     }
 
+    /// Restore navigation after fetching new rows, without losing a search.
+    pub fn restore_navigation_from(&mut self, previous: &Browser) {
+        self.filter = previous.filter.clone();
+        self.applied_filter = previous.applied_filter.clone();
+        self.reindex();
+        self.selected = previous.selected;
+        if let Some(id) = previous.selected_id() {
+            self.select_by_id(id);
+        }
+        self.clamp();
+        if self.has_detail && self.selected_id() == previous.selected_id() {
+            self.view = previous.view;
+            self.detail_scroll = previous.detail_scroll;
+        }
+    }
+
     pub fn items(&self) -> &[Item] {
         &self.items
     }
@@ -271,6 +297,7 @@ impl Browser {
         let needle = self
             .filter
             .as_deref()
+            .or(self.applied_filter.as_deref())
             .map(str::trim)
             .filter(|f| !f.is_empty())
             .map(str::to_lowercase);
@@ -513,20 +540,16 @@ impl Browser {
         use crossterm::event::KeyCode;
 
         match code {
-            // Leaving filter entry keeps the filter applied, matching the C#
-            // browsers: Esc exits the mode, it does not undo the narrowing.
+            // Esc clears the filter; Enter accepts it while leaving edit mode.
             KeyCode::Esc => {
-                if self.filter.as_deref().is_some_and(str::is_empty) {
-                    self.filter = None;
-                } else {
-                    self.filter = None;
-                    self.reindex();
-                    self.clamp();
-                }
+                self.filter = None;
+                self.applied_filter = None;
+                self.reindex();
+                self.clamp();
                 Intent::Redraw
             }
             KeyCode::Enter => {
-                self.filter = None;
+                self.applied_filter = self.filter.take().filter(|value| !value.trim().is_empty());
                 Intent::Redraw
             }
             KeyCode::Backspace => {
@@ -580,6 +603,22 @@ mod tests {
         assert_eq!(browser.view(), View::List);
         assert_eq!(browser.selected_id(), Some("alpha"));
         assert_eq!(browser.len(), 3);
+    }
+
+    #[test]
+    fn refreshing_rows_preserves_committed_filter_and_selected_identity() {
+        let mut previous = browser();
+        previous.handle(key(KeyCode::Char('/')));
+        previous.handle(key(KeyCode::Char('b')));
+        previous.handle(key(KeyCode::Enter));
+        let mut refreshed = browser();
+        refreshed.restore_navigation_from(&previous);
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed.selected_id(), Some("beta"));
+        assert!(!refreshed.is_filtering());
+        refreshed.set_items(previous.items().to_vec());
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed.selected_id(), Some("beta"));
     }
 
     #[test]

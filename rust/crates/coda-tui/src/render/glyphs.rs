@@ -117,6 +117,7 @@ pub const ARROWS_VERTICAL: &str = "\u{2191}\u{2193}"; // "↑↓"
 
 /// Separates a thing from its outcome: "question → answer".
 pub const ARROW_RIGHT: &str = "\u{2192}"; // →
+pub const ARROW_LEFT: &str = "\u{2190}"; // ←
 
 /// Fold markers for a collapsible block, sized to one cell.
 ///

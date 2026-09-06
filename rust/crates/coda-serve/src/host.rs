@@ -56,6 +56,7 @@ use crate::dispatch::{
     ServeBackend, SetEffortParams, SetGoalParams, SetModelParams, SetPermissionModeParams,
     SetSystemPromptParams, SteerParams,
 };
+use crate::dispatch::AdjustEffortParams;
 use crate::prompts::{PromptChannel, WirePermissionPrompt, WirePlanApprover, WireUserQuestion};
 use crate::mcp::McpBundle;
 use crate::session::{Session, SteeringLogEntry};
@@ -171,6 +172,30 @@ struct SetEffortResponse {
     note: String,
 }
 
+/// Result of `model/adjustEffort`: the target model's per-model effort after
+/// stepping one rung.
+///
+/// `model`/`providerId` are the *canonical* identity the client persists the
+/// per-model preference under, so a caller never keys a save by a display name
+/// or a stale guess. `current` reports the *effective* level actually in force
+/// for the target (omitted when automatic). `active` says whether the target is
+/// the running model — an inactive edit changes only the stored preference.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelEffortResult {
+    ok: bool,
+    model: String,
+    provider_id: String,
+    /// The effective level after the step; omitted / `null` means automatic.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<String>,
+    /// Whether the target model is the currently active one.
+    active: bool,
+    /// Always present (may be empty), mirroring `setEffort`'s note contract:
+    /// a boundary clamp or a refusal explains itself here rather than lying
+    /// with a phantom level change.
+    note: String,
+}
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompactResponse {
@@ -954,6 +979,24 @@ impl ServeHost {
         }
     }
 
+    /// The effort intent for `model`, as an [`Effort`], shared by the model-list
+    /// annotation and the arrow-stepping RPC.
+    ///
+    /// The active model reports its live *effective* level (never a stale
+    /// persisted value); any other row reports the intent that would apply — the
+    /// session override if one exists, otherwise the saved preference. `None`
+    /// means automatic / none.
+    fn target_effort(&self, provider: &str, model: &str, active: &str) -> Option<Effort> {
+        if model.eq_ignore_ascii_case(active) {
+            return self.current_effort();
+        }
+        if let Some(explicit) = self.effort_overrides.lock().expect("effort poisoned").get(model) {
+            return *explicit;
+        }
+        let settings = load_settings_value();
+        effort_from_settings(&settings, provider, model)
+    }
+
     /// The effort level to surface for `model` on a model-list row.
     ///
     /// The active model shows its live *effective* level so a browser never
@@ -961,14 +1004,51 @@ impl ServeHost {
     /// apply — the session override if one exists, otherwise the saved
     /// preference. `None` means automatic / none.
     fn effort_hint_for(&self, provider: &str, model: &str, active: &str) -> Option<String> {
-        if model.eq_ignore_ascii_case(active) {
-            return self.current_effort().map(|e| e.as_str().to_owned());
+        self.target_effort(provider, model, active).map(|e| e.as_str().to_owned())
+    }
+
+    /// The canonical id of `model` if the engine knows it — the active model,
+    /// the live list, or the catalogue.
+    ///
+    /// Returning `None` for an unknown id is what stops a typo from creating a
+    /// per-model override the user can neither see nor clear; the caller turns
+    /// that into an `invalid_params` rejection.
+    async fn resolve_known_model(&self, model: &str) -> Option<String> {
+        let active = self.current_model();
+        if model.eq_ignore_ascii_case(&active) {
+            return Some(active);
         }
-        if let Some(explicit) = self.effort_overrides.lock().expect("effort poisoned").get(model) {
-            return explicit.map(|e| e.as_str().to_owned());
+        if let Some(client) = self.client.lock().await.clone() {
+            if let Ok(models) = client.list_models().await {
+                if let Some(m) = models.iter().find(|m| m.id.eq_ignore_ascii_case(model)) {
+                    return Some(m.id.clone());
+                }
+            }
         }
-        let settings = load_settings_value();
-        effort_from_settings(&settings, provider, model).map(|e| e.as_str().to_owned())
+        catalog_models()
+            .into_iter()
+            .find(|m| m.id.eq_ignore_ascii_case(model))
+            .map(|m| m.id)
+    }
+
+    /// Serialises a [`ModelEffortResult`] into a wire value.
+    fn effort_result(
+        ok: bool,
+        model: &str,
+        provider: &str,
+        current: Option<String>,
+        active: bool,
+        note: String,
+    ) -> Result<Value, RpcError> {
+        let resp = ModelEffortResult {
+            ok,
+            model: model.to_owned(),
+            provider_id: provider.to_owned(),
+            current,
+            active,
+            note,
+        };
+        serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
     }
 
     /// Stamps each row of a model list with the effort in force for it.
@@ -1601,6 +1681,128 @@ impl ServeBackend for ServeHost {
     }
 
     // ── Stubs ─────────────────────────────────────────────────────────────────
+
+    async fn model_adjust_effort(&self, p: AdjustEffortParams) -> Result<Value, RpcError> {
+        // Direction is a single rung either way; anything else is a client bug,
+        // not a level the engine can honour.
+        let step: i32 = match p.direction {
+            -1 => -1,
+            1 => 1,
+            other => {
+                return Err(RpcError::invalid_params(format!(
+                    "direction must be -1 or 1, got {other}"
+                )));
+            }
+        };
+        let model = p.model.trim().to_owned();
+        if model.is_empty() {
+            return Err(RpcError::invalid_params("model is required"));
+        }
+
+        // Hold the effort lock across selection, capability, current read and
+        // commit: a concurrent `set_model`/`set_effort` must not retarget us
+        // midway and let us write a level resolved against a different model.
+        let _guard = self.effort_lock.lock().await;
+
+        let provider = self.connected_provider().await;
+        let active = self.current_model();
+
+        // Provider guard: a picker opened while one provider was connected must
+        // never silently reconfigure a different provider's model. Reject
+        // without mutating anything.
+        if let Some(expected) = p.expected_provider.as_deref() {
+            if !expected.eq_ignore_ascii_case(&provider) {
+                let current = self
+                    .target_effort(&provider, &model, &active)
+                    .map(|e| e.as_str().to_owned());
+                return Self::effort_result(
+                    false,
+                    &model,
+                    &provider,
+                    current,
+                    model.eq_ignore_ascii_case(&active),
+                    format!("active provider is now {provider}, not {expected}; effort not changed"),
+                );
+            }
+        }
+
+        // The target must be a model the engine actually knows, so a typo cannot
+        // create an unreachable per-model override.
+        let Some(canonical) = self.resolve_known_model(&model).await else {
+            return Err(RpcError::invalid_params(format!("unknown model: {model}")));
+        };
+        let is_active = canonical.eq_ignore_ascii_case(&active);
+
+        let (capability, indeterminate) = self.resolve_capability(&canonical).await;
+
+        // Without a known level set there is nothing to step through: refuse
+        // with a useful note rather than guess a ladder. `indeterminate` (a
+        // Copilot model before its list is fetched) is distinct from a positive
+        // "unsupported", so the note says which.
+        if !capability.supported || capability.levels.is_empty() {
+            let note = if indeterminate {
+                format!("reasoning levels for {canonical} are not known yet")
+            } else {
+                format!("model {canonical} does not support reasoning effort")
+            };
+            let current = self
+                .target_effort(&provider, &canonical, &active)
+                .map(|e| e.as_str().to_owned());
+            return Self::effort_result(false, &canonical, &provider, current, is_active, note);
+        }
+
+        // The ladder the arrows walk: automatic first (when the model allows
+        // it), then each supported level lowest to highest.
+        let mut ladder: Vec<Option<Effort>> = Vec::new();
+        if capability.supports_auto {
+            ladder.push(None);
+        }
+        for level in &capability.levels {
+            if let Some(effort) = Effort::parse(level) {
+                ladder.push(Some(effort));
+            }
+        }
+
+        // The current rung: the target's intent (active → live effective,
+        // otherwise override or saved), normalised through the capability so
+        // the value is always one the ladder contains and the index is valid.
+        let requested = self.target_effort(&provider, &canonical, &active);
+        let current = resolve_effective_effort(&capability, indeterminate, requested);
+        let cur_idx = ladder.iter().position(|rung| *rung == current).unwrap_or(0);
+
+        let last = ladder.len().saturating_sub(1);
+        let new_idx = if step < 0 { cur_idx.saturating_sub(1) } else { (cur_idx + 1).min(last) };
+        let new_effort = ladder[new_idx];
+
+        // Commit. Record the target's OWN override — an explicit auto (`None`)
+        // included, so it stays distinct from "unset" and survives a switch
+        // away and back. Only touch the live level when the target is the
+        // active model: editing an inactive row must never disturb what runs.
+        self.effort_overrides
+            .lock()
+            .expect("effort poisoned")
+            .insert(canonical.clone(), new_effort);
+        if is_active {
+            *self.effort.lock().expect("effort poisoned") = new_effort;
+        }
+
+        // At a boundary the level is unchanged; say so rather than imply a move.
+        let note = if new_idx == cur_idx {
+            let bound = if step < 0 { "lowest" } else { "highest" };
+            format!("already at the {bound} level")
+        } else {
+            String::new()
+        };
+        Self::effort_result(
+            true,
+            &canonical,
+            &provider,
+            new_effort.map(|e| e.as_str().to_owned()),
+            is_active,
+            note,
+        )
+    }
+
 
     async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {
         // Copilot models advertise their levels at runtime, so consult the
@@ -2502,13 +2704,18 @@ fn catalog_models() -> Vec<WireModel> {
             if seen.iter().any(|m| m.id == model.id) {
                 continue;
             }
+            // Anthropic advertises nothing at runtime, so derive the level set
+            // from the static id rules; a Copilot model's levels are only known
+            // once the live list is fetched, so leave them empty (indeterminate)
+            // in the catalogue fallback rather than guess.
+            let reasoning_levels = resolve_reasoning(provider, &model.id, None).levels;
             seen.push(WireModel {
                 id: model.id,
                 display_name: model.display_name,
                 context_limit: model.context_limit,
                 input_cost: model.cost.map(|c| c.input),
                 output_cost: model.cost.map(|c| c.output),
-                reasoning_levels: Vec::new(),
+                reasoning_levels,
                 effort: None,
             });
         }
@@ -3029,6 +3236,266 @@ mod tests {
             Some(Effort::High),
             "model-a's original effort must survive a stale rejection"
         );
+    }
+
+    // ── model/adjustEffort: arrow stepping without activating the model ──────
+
+    use coda_llm::ModelInfo;
+
+    /// A Copilot-shaped client that advertises a fixed model list with
+    /// reasoning levels, so capability resolves *determinately* (not the
+    /// indeterminate fallback `make_host` yields) and the models are "known".
+    struct LevelsClient {
+        models: Vec<ModelInfo>,
+    }
+    impl LevelsClient {
+        fn arc(models: Vec<ModelInfo>) -> Arc<Self> {
+            Arc::new(Self { models })
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for LevelsClient {
+        fn provider_id(&self) -> &str {
+            // Match FALLBACK_PROVIDER so effort_from_settings keys line up and
+            // capability resolves via the Copilot advertised-levels path.
+            "github-copilot"
+        }
+        async fn stream(
+            &self,
+            _: coda_llm::ChatRequest,
+        ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+            unreachable!("adjustEffort never streams")
+        }
+        async fn list_models(&self) -> Result<Vec<ModelInfo>, coda_llm::LlmError> {
+            Ok(self.models.clone())
+        }
+    }
+
+    fn model_with_levels(id: &str, levels: &[&str]) -> ModelInfo {
+        let mut m = ModelInfo::new(id);
+        m.reasoning_levels = levels.iter().map(|s| (*s).to_owned()).collect();
+        m
+    }
+
+    fn levels_host(models: Vec<ModelInfo>, active: &str) -> Arc<ServeHost> {
+        let client = LevelsClient::arc(models);
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_client(client, sink, ch, ".".into());
+        host.set_model_for_test(active);
+        host
+    }
+
+    /// Editing an inactive model steps only that model's stored preference: the
+    /// active model, its live effort, and the history are all left untouched.
+    #[tokio::test]
+    async fn adjust_inactive_model_leaves_active_untouched() {
+        let host = levels_host(
+            vec![
+                model_with_levels("model-a", &["low", "medium", "high"]),
+                model_with_levels("model-b", &["low", "medium", "high"]),
+            ],
+            "model-a",
+        );
+        // Give the active model A a concrete level.
+        host.session_set_effort(SetEffortParams {
+            effort: Some("high".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        assert_eq!(host.current_effort(), Some(Effort::High));
+        let history_before = host.session.history.lock().unwrap().len();
+
+        // Step inactive B up from auto → low.
+        let r = host
+            .model_adjust_effort(AdjustEffortParams {
+                model: "model-b".into(),
+                direction: 1,
+                expected_provider: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["model"], "model-b");
+        assert_eq!(r["providerId"], "github-copilot");
+        assert_eq!(r["current"], "low");
+        assert_eq!(r["active"], false, "B is not the active model");
+
+        // The active model and its live effort are unchanged.
+        assert_eq!(host.current_model(), "model-a");
+        assert_eq!(host.current_effort(), Some(Effort::High), "A's live effort must not move");
+        assert_eq!(host.session.history.lock().unwrap().len(), history_before);
+
+        // Switching to B now applies the edited override.
+        host.session_set_model(SetModelParams { model: "model-b".into() })
+            .await
+            .unwrap();
+        assert_eq!(host.current_effort(), Some(Effort::Low), "B's edited override applies on switch");
+    }
+
+    /// Editing the active model applies immediately to the live level.
+    #[tokio::test]
+    async fn adjust_active_model_applies_immediately() {
+        let host = levels_host(vec![model_with_levels("model-a", &["low", "medium", "high"])], "model-a");
+        // From auto, +1 → low.
+        let r = host
+            .model_adjust_effort(AdjustEffortParams {
+                model: "model-a".into(),
+                direction: 1,
+                expected_provider: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["active"], true);
+        assert_eq!(r["current"], "low");
+        assert_eq!(host.current_effort(), Some(Effort::Low), "the active model's live effort must move");
+    }
+
+    /// The ladder is `[auto, levels…]`; stepping never wraps and never emits a
+    /// level the model does not advertise.
+    #[tokio::test]
+    async fn adjust_walks_auto_then_levels_and_clamps_at_bounds() {
+        let host = levels_host(vec![model_with_levels("model-a", &["low", "medium", "high"])], "model-a");
+        let up = |dir: i32| AdjustEffortParams {
+            model: "model-a".into(),
+            direction: dir,
+            expected_provider: None,
+        };
+
+        // auto -1 clamps at the bottom (still auto), and says so.
+        let r = host.model_adjust_effort(up(-1)).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert!(r.get("current").is_none(), "auto is reported as absent, not a phantom level");
+        assert!(r["note"].as_str().unwrap().contains("lowest"));
+
+        // Walk all the way up: low, medium, high.
+        for expected in ["low", "medium", "high"] {
+            let r = host.model_adjust_effort(up(1)).await.unwrap();
+            assert_eq!(r["current"], expected);
+            assert_eq!(r["note"], "", "a real step carries no boundary note");
+        }
+        // At the top, +1 clamps and reports the unchanged level truthfully.
+        let r = host.model_adjust_effort(up(1)).await.unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["current"], "high", "no change=true lie: the top level is reported");
+        assert!(r["note"].as_str().unwrap().contains("highest"));
+        assert_eq!(host.current_effort(), Some(Effort::High));
+    }
+
+    /// A model that advertises a single level still steps between auto and that
+    /// level, and never produces an invalid level.
+    #[tokio::test]
+    async fn adjust_single_level_model_toggles_auto_and_the_level() {
+        let host = levels_host(vec![model_with_levels("solo", &["high"])], "solo");
+        let step = |dir: i32| AdjustEffortParams {
+            model: "solo".into(),
+            direction: dir,
+            expected_provider: None,
+        };
+        let r = host.model_adjust_effort(step(1)).await.unwrap();
+        assert_eq!(r["current"], "high");
+        let r = host.model_adjust_effort(step(1)).await.unwrap();
+        assert_eq!(r["current"], "high", "clamped at the single top rung");
+        let r = host.model_adjust_effort(step(-1)).await.unwrap();
+        assert!(r.get("current").is_none(), "back down to auto");
+    }
+
+    /// An `expectedProvider` that no longer matches rejects without mutating.
+    #[tokio::test]
+    async fn adjust_provider_mismatch_rejects_without_mutation() {
+        let host = levels_host(vec![model_with_levels("model-a", &["low", "high"])], "model-a");
+        let r = host
+            .model_adjust_effort(AdjustEffortParams {
+                model: "model-a".into(),
+                direction: 1,
+                expected_provider: Some("anthropic".into()),
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], false, "a stale provider must be rejected");
+        assert!(
+            !host.effort_overrides.lock().unwrap().contains_key("model-a"),
+            "a rejected call must not record an override"
+        );
+        assert_eq!(host.current_effort(), None, "the live level must be untouched");
+    }
+
+    /// An unknown model id (a typo) is rejected as invalid params, not silently
+    /// stored.
+    #[tokio::test]
+    async fn adjust_unknown_model_is_invalid_params() {
+        let host = levels_host(vec![model_with_levels("model-a", &["low", "high"])], "model-a");
+        let err = host
+            .model_adjust_effort(AdjustEffortParams {
+                model: "model-zzz-typo".into(),
+                direction: 1,
+                expected_provider: None,
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, -32602);
+        assert!(!host.effort_overrides.lock().unwrap().contains_key("model-zzz-typo"));
+    }
+
+    /// An invalid direction is rejected as invalid params before any mutation.
+    #[tokio::test]
+    async fn adjust_invalid_direction_is_invalid_params() {
+        let host = levels_host(vec![model_with_levels("model-a", &["low", "high"])], "model-a");
+        for bad in [0, 2, -2, 5] {
+            let err = host
+                .model_adjust_effort(AdjustEffortParams {
+                    model: "model-a".into(),
+                    direction: bad,
+                    expected_provider: None,
+                })
+                .await
+                .unwrap_err();
+            assert_eq!(err.code, -32602, "direction {bad} must be rejected");
+        }
+    }
+
+    /// A model with no known level set (indeterminate) is refused with a useful
+    /// note rather than a guessed ladder — and nothing is mutated.
+    #[tokio::test]
+    async fn adjust_indeterminate_model_refuses_with_note() {
+        // The active model is known (resolve_known_model accepts the active
+        // model) but the client advertises NO list for it, so a Copilot
+        // model's capability is genuinely indeterminate — not a positive
+        // "unsupported".
+        let host = levels_host(vec![], "mystery");
+        let r = host
+            .model_adjust_effort(AdjustEffortParams {
+                model: "mystery".into(),
+                direction: 1,
+                expected_provider: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], false);
+        assert!(r["note"].as_str().unwrap().contains("not known"));
+        assert!(!host.effort_overrides.lock().unwrap().contains_key("mystery"));
+    }
+
+    /// The result reports the canonical (model, providerId) identity so a client
+    /// persists the per-model save under exactly the engine's key, even when the
+    /// request used different casing.
+    #[tokio::test]
+    async fn adjust_reports_canonical_identity_for_persistence() {
+        let host = levels_host(vec![model_with_levels("Model-A", &["low", "high"])], "Model-A");
+        let r = host
+            .model_adjust_effort(AdjustEffortParams {
+                model: "model-a".into(), // different casing than the known id
+                direction: 1,
+                expected_provider: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["model"], "Model-A", "the canonical id, not the request casing");
+        assert_eq!(r["providerId"], "github-copilot");
     }
 
     #[tokio::test]

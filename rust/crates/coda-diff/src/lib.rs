@@ -782,6 +782,24 @@ pub fn validate_extension_schema(method: &str, value: &Value) -> Vec<String> {
         "session/setEffort" => {
             require_string_or_null(value, "current", method, &mut problems);
         }
+        // `model/adjustEffort` is a Rust-only method (the C# engine never had
+        // it), so it is not a projected *extension* of a shared method — but its
+        // response shape is still verified here so a regression in the new
+        // surface is caught. `current` is optional (omitted / null for auto);
+        // everything else is required.
+        "model/adjustEffort" => {
+            require_bool(value, "ok", method, &mut problems);
+            require_nonempty_string(value, "model", method, &mut problems);
+            require_nonempty_string(value, "providerId", method, &mut problems);
+            require_bool(value, "active", method, &mut problems);
+            require_string(value, "note", method, &mut problems);
+            // current is optional; when present it must be a string or null.
+            if let Some(current) = value.get("current") {
+                if !(current.is_string() || current.is_null()) {
+                    problems.push(format!("{method}: `current` must be a string or null"));
+                }
+            }
+        }
         "session/models" => {
             let Some(rows) = value.get("models").and_then(Value::as_array) else {
                 problems.push("session/models: `models` is not an array".into());
@@ -850,6 +868,16 @@ fn require_string_or_null(v: &Value, key: &str, method: &str, problems: &mut Vec
     match v.get(key) {
         Some(x) if x.is_string() || x.is_null() => {}
         Some(_) => problems.push(format!("{method}: `{key}` must be a string or null")),
+        None => problems.push(format!("{method}: required extension `{key}` is missing")),
+    }
+}
+
+/// Requires a string that may be empty (e.g. `note`, which is always present
+/// but empty on a plain success).
+fn require_string(v: &Value, key: &str, method: &str, problems: &mut Vec<String>) {
+    match v.get(key) {
+        Some(x) if x.is_string() => {}
+        Some(_) => problems.push(format!("{method}: `{key}` must be a string")),
         None => problems.push(format!("{method}: required extension `{key}` is missing")),
     }
 }
@@ -1200,6 +1228,35 @@ mod tests {
         assert!(validate_extension_schema("session/setEffort", &json!({ "current": null })).is_empty());
         assert!(!validate_extension_schema("session/setEffort", &json!({ "current": 7 })).is_empty());
         assert!(!validate_extension_schema("session/setEffort", &json!({ "ok": true })).is_empty());
+    }
+
+    #[test]
+    fn adjust_effort_validates_its_response_shape() {
+        // A plain success with an explicit level.
+        let ok = json!({
+            "ok": true, "model": "m", "providerId": "github-copilot",
+            "current": "high", "active": true, "note": "",
+        });
+        assert!(validate_extension_schema("model/adjustEffort", &ok).is_empty());
+        // current is optional (omitted for auto) and may be null.
+        let auto = json!({
+            "ok": true, "model": "m", "providerId": "github-copilot",
+            "active": false, "note": "already at the lowest level",
+        });
+        assert!(validate_extension_schema("model/adjustEffort", &auto).is_empty());
+        let null_current = json!({
+            "ok": false, "model": "m", "providerId": "p",
+            "current": null, "active": false, "note": "x",
+        });
+        assert!(validate_extension_schema("model/adjustEffort", &null_current).is_empty());
+    }
+
+    #[test]
+    fn adjust_effort_rejects_missing_or_mistyped_fields() {
+        // model missing, active as a string, note as a number, current mistyped.
+        let bad = json!({ "ok": true, "providerId": "p", "active": "yes", "note": 1, "current": 3 });
+        let problems = validate_extension_schema("model/adjustEffort", &bad);
+        assert!(problems.len() >= 4, "each malformed field must be reported: {problems:?}");
     }
 
     #[test]

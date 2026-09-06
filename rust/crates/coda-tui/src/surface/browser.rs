@@ -16,7 +16,7 @@ use super::{Surface, SurfaceAction, SurfaceOutcome};
 use crate::overlay::{Browser, Intent, View};
 use coda_render::text;
 use coda_render::theme::{Role, Theme};
-use crossterm::event::KeyEvent;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 
@@ -50,6 +50,7 @@ pub struct RowActions {
     /// Per-browser keys acting on the browser rather than a row, such as `n`
     /// to add a server.
     pub bare_keys: Vec<(char, Box<dyn Fn() -> SurfaceAction>)>,
+    pub horizontal: Option<Box<dyn Fn(&str, i32) -> SurfaceAction>>,
 }
 
 impl RowActions {
@@ -64,6 +65,11 @@ impl RowActions {
 
     pub fn on_toggle(mut self, f: impl Fn(&str) -> SurfaceAction + 'static) -> Self {
         self.toggle = Some(Box::new(f));
+        self
+    }
+
+    pub fn on_horizontal(mut self, f: impl Fn(&str, i32) -> SurfaceAction + 'static) -> Self {
+        self.horizontal = Some(Box::new(f));
         self
     }
 
@@ -131,6 +137,7 @@ impl std::fmt::Debug for RowActions {
         f.debug_struct("RowActions")
             .field("activate", &self.activate.is_some())
             .field("toggle", &self.toggle.is_some())
+            .field("horizontal", &self.horizontal.is_some())
             .field("keys", &self.declared_keys())
             .finish()
     }
@@ -212,6 +219,21 @@ impl Surface for BrowserSurface {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> SurfaceOutcome {
+        if key.kind != KeyEventKind::Release && key.modifiers == KeyModifiers::NONE
+            && self.browser.view() == View::List && !self.browser.is_filtering()
+        {
+            let direction = match key.code {
+                KeyCode::Left => Some(-1),
+                KeyCode::Right => Some(1),
+                _ => None,
+            };
+            if let (Some(direction), Some(action)) = (direction, &self.actions.horizontal) {
+                return match self.browser.selected_id() {
+                    Some(id) => SurfaceOutcome::Emit(action(id, direction)),
+                    None => SurfaceOutcome::Handled,
+                };
+            }
+        }
         let intent = self.browser.handle(key);
         match intent {
             Intent::Redraw => SurfaceOutcome::Handled,
@@ -284,13 +306,18 @@ impl Surface for BrowserSurface {
 
                 for (offset, item) in items.iter().skip(scroll).take(body).enumerate() {
                     let is_selected = scroll + offset == selected;
-                    let style = if is_selected {
+                    let mut style = if is_selected {
                         theme
                             .style(Role::SelectionText)
                             .bg(theme.fg(Role::SelectionBackground))
+                    } else if item.is_current {
+                        theme.style(Role::Heading)
                     } else {
                         theme.style(Role::ComposerText)
                     };
+                    if item.is_current {
+                        style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                    }
                     lines.push(Line::from(Span::styled(
                         self.browser.format_columns(item, &widths),
                         style,
@@ -348,6 +375,38 @@ mod tests {
             SurfaceOutcome::Handled
         ));
         assert_eq!(s.browser().selected_id(), Some("b"));
+    }
+
+    #[test]
+    fn model_effort_arrows_dispatch_the_highlighted_row_not_the_active_one() {
+        let mut s = surface().with_actions(RowActions::new().on_horizontal(|id, direction|
+            SurfaceAction::AdjustModelEffort { model: id.into(), direction }));
+        s.handle_key(key(KeyCode::Down));
+        for (code, expected) in [(KeyCode::Left, -1), (KeyCode::Right, 1)] {
+            assert!(matches!(s.handle_key(key(code)),
+                SurfaceOutcome::Emit(SurfaceAction::AdjustModelEffort { model, direction })
+                if model == "b" && direction == expected));
+        }
+        assert!(matches!(
+            s.handle_key(KeyEvent::new(KeyCode::Right, KeyModifiers::CONTROL)),
+            SurfaceOutcome::Ignored,
+        ));
+        s.handle_key(key(KeyCode::Char('/')));
+        assert!(!matches!(s.handle_key(key(KeyCode::Right)), SurfaceOutcome::Emit(_)));
+    }
+
+    #[test]
+    fn current_model_stays_emphasized_when_another_row_is_selected() {
+        let mut s = surface();
+        let mut items = s.browser().items().to_vec();
+        items[0].is_current = true;
+        s.browser_mut().set_items(items);
+        s.handle_key(key(KeyCode::Down));
+        let lines = s.render(Rect::new(0, 0, 70, 6), &Theme::default());
+        let active = &lines[1].spans[0].style;
+        let selected = &lines[2].spans[0].style;
+        assert!(active.add_modifier.contains(ratatui::style::Modifier::BOLD));
+        assert_ne!(active, selected, "active model must remain distinct from navigation focus");
     }
 
     #[test]

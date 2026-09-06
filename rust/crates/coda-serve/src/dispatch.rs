@@ -123,6 +123,30 @@ pub struct SetEffortParams {
     pub expected_provider: Option<String>,
 }
 
+/// `model/adjustEffort` — steps a *specific* model's reasoning-effort level up
+/// or down by one rung, server-authoritatively.
+///
+/// Unlike `session/setEffort`, this never activates or changes the active model:
+/// it edits the target model's own per-model preference, and only touches the
+/// live level when the target happens to be the active model. The engine owns
+/// the ladder (`[auto?, levels…]`) and clamps at the ends rather than wrapping.
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct AdjustEffortParams {
+    /// The model whose effort to step. Must be a model the engine knows (live
+    /// list or catalogue), not an arbitrary string.
+    #[serde(default)]
+    pub model: String,
+    /// `-1` steps toward automatic/lower, `+1` toward higher. Any other value
+    /// is rejected as invalid params.
+    #[serde(default)]
+    pub direction: i32,
+    /// The provider the caller believed was connected; when it no longer
+    /// matches, the call is rejected without mutating anything.
+    #[serde(default)]
+    pub expected_provider: Option<String>,
+}
+
 /// `session/setModel` — the model used for subsequent turns.
 ///
 /// The agent is rebuilt from `current_model()` on every turn, so a change here
@@ -241,6 +265,9 @@ pub trait ServeBackend: Send + Sync {
     async fn session_models(&self, p: ModelsParams) -> Result<Value, RpcError>;
     async fn session_set_goal(&self, p: SetGoalParams) -> Result<Value, RpcError>;
     async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError>;
+    /// Steps a specific model's reasoning-effort level up or down one rung,
+    /// without activating or changing the active model.
+    async fn model_adjust_effort(&self, p: AdjustEffortParams) -> Result<Value, RpcError>;
     /// Switches the model for subsequent turns.
     async fn session_set_model(&self, p: SetModelParams) -> Result<Value, RpcError>;
     async fn session_set_permission_mode(
@@ -300,6 +327,7 @@ pub async fn dispatch(
         "session/models" => backend.session_models(optional(params)).await,
         "session/setGoal" => backend.session_set_goal(optional(params)).await,
         "session/setEffort" => backend.session_set_effort(optional(params)).await,
+        "model/adjustEffort" => backend.model_adjust_effort(required(params)?).await,
         "session/setModel" => backend.session_set_model(required(params)?).await,
         "session/setPermissionMode" => {
             backend.session_set_permission_mode(required(params)?).await
@@ -393,6 +421,15 @@ mod tests {
             match p.effort.as_deref() {
                 Some("bad") => Ok(json!({ "ok": false })),
                 _ => Ok(json!({ "ok": true })),
+            }
+        }
+        async fn model_adjust_effort(&self, p: AdjustEffortParams) -> Result<Value, RpcError> {
+            match p.direction {
+                -1 | 1 => Ok(json!({
+                    "ok": true, "model": p.model, "providerId": "test",
+                    "active": false, "note": "",
+                })),
+                other => Err(RpcError::invalid_params(format!("bad direction {other}"))),
             }
         }
         async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {
@@ -544,6 +581,39 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(r["ok"], true);
+    }
+
+    #[tokio::test]
+    async fn dispatches_model_adjust_effort_routes_and_returns_ok() {
+        let r = dispatch(
+            "model/adjustEffort",
+            Some(json!({ "model": "m", "direction": 1 })),
+            &FakeBackend,
+        )
+        .await
+        .unwrap();
+        assert_eq!(r["ok"], true);
+        assert_eq!(r["model"], "m");
+    }
+
+    /// An invalid `direction` is a protocol error (-32602), not an `ok:false`.
+    #[tokio::test]
+    async fn dispatches_model_adjust_effort_invalid_direction_is_error() {
+        let err = dispatch(
+            "model/adjustEffort",
+            Some(json!({ "model": "m", "direction": 2 })),
+            &FakeBackend,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code, -32602);
+    }
+
+    /// `model/adjustEffort` requires params (model + direction).
+    #[tokio::test]
+    async fn dispatches_model_adjust_effort_requires_params() {
+        let err = dispatch("model/adjustEffort", None, &FakeBackend).await.unwrap_err();
+        assert_eq!(err.code, -32602);
     }
 
     /// `session/setEffort` with an unsupported value returns `ok:false`, NOT an error.
@@ -749,6 +819,9 @@ mod tests {
     }
 
     async fn session_set_effort(&self, _p: SetEffortParams) -> Result<Value, RpcError> {
+            Err(RpcError { code: self.0, message: self.1.into() })
+        }
+        async fn model_adjust_effort(&self, _p: AdjustEffortParams) -> Result<Value, RpcError> {
             Err(RpcError { code: self.0, message: self.1.into() })
         }
         async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {
