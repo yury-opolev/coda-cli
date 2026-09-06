@@ -26,6 +26,9 @@ pub mod method {
     pub const MODELS: &str = "session/models";
     pub const SET_GOAL: &str = "session/setGoal";
     pub const SET_EFFORT: &str = "session/setEffort";
+    /// Steps a specific model's reasoning effort up/down one rung without
+    /// activating or changing the active model (`ServeMethods.AdjustModelEffort`).
+    pub const ADJUST_MODEL_EFFORT: &str = "model/adjustEffort";
     /// Switches the model for subsequent turns, without restarting.
     pub const SET_MODEL: &str = "session/setModel";
     pub const SET_PERMISSION_MODE: &str = "session/setPermissionMode";
@@ -428,6 +431,58 @@ pub struct SetEffortResult {
     pub current: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
+}
+
+/// Parameters for `model/adjustEffort`.
+///
+/// Steps the *target* model's reasoning effort one rung up (`+1`) or down
+/// (`-1`) along the engine-owned ladder `[auto?, levels…]`. Unlike
+/// [`SetEffortParams`] this never activates or changes the active model — it
+/// edits the target's own per-model preference and only touches the live level
+/// when the target happens to be active.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelAdjustEffortParams {
+    /// The model to step. Must be a model the engine knows (live list or
+    /// catalogue), not an arbitrary string.
+    pub model: String,
+    /// `-1` toward automatic/lower, `+1` toward higher. Any other value is
+    /// rejected with `-32602`.
+    pub direction: i32,
+    /// The provider the caller believed was connected; when it no longer
+    /// matches, the engine rejects the call without mutating anything.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_provider: Option<String>,
+}
+
+/// Result of `model/adjustEffort`.
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct ModelEffortResult {
+    #[serde(default)]
+    pub ok: bool,
+    /// The canonical model id the preference was keyed under — never a display
+    /// name — so a client persists the per-model save under exactly the key the
+    /// engine reads it back with.
+    #[serde(default)]
+    pub model: String,
+    /// The provider that model is served by, paired with `model` for the
+    /// canonical `(provider, model)` identity.
+    #[serde(default)]
+    pub provider_id: String,
+    /// The effective level in force for the target after the step. `None` means
+    /// automatic / none — a boundary or an unchanged step reports the truth,
+    /// never a phantom level change.
+    #[serde(default)]
+    pub current: Option<String>,
+    /// Whether the target is the currently active model. An inactive edit
+    /// changes only the stored preference, leaving the running model untouched.
+    #[serde(default)]
+    pub active: bool,
+    /// Always present (may be empty): a clamp at a bound or a refusal explains
+    /// itself here.
+    #[serde(default)]
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]

@@ -46,22 +46,12 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
-/// Formats the reasoning-effort summary for the model browser's effort column.
-///
-/// Shows the range of levels the model supports ("low – max", "low – xhigh")
-/// or an empty string when the provider reported nothing. An empty string is
-/// not "unsupported" — it means the model list did not include level data.
-fn effort_summary(levels: &[String]) -> String {
-    if levels.is_empty() {
-        return String::new();
+fn effort_cell(model: &WireModel) -> String {
+    let current = model.effort.as_deref().unwrap_or("auto");
+    if model.reasoning_levels.is_empty() {
+        return model.effort.clone().unwrap_or_else(|| "-".into());
     }
-    let first = levels.first().map(String::as_str).unwrap_or("");
-    let last = levels.last().map(String::as_str).unwrap_or("");
-    if first == last {
-        first.to_string()
-    } else {
-        format!("{first} – {last}")
-    }
+    format!("{} {current} {}", crate::render::glyphs::ARROW_LEFT, crate::render::glyphs::ARROW_RIGHT)
 }
 
 /// The model picker.
@@ -69,14 +59,14 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
     let mut browser = Browser::new(
         format!("Models — {} models — {source}", models.len()),
         vec![
-            Column::new("", 1),
+            Column::new("", 9),
             Column::new("id", 40),
             Column::new("name", 30),
             Column::new("context", 7),
-            Column::new("effort", 24),
+            Column::new("effort", 12),
         ],
     )
-    .with_footer("↑/↓ k/j move · Enter select · e effort · r reload · / filter · Esc q close")
+    .with_footer("↑/↓ k/j move · Left/Right save effort · Enter select model · e effort picker · r reload · / filter · Esc q close")
     .with_extra_keys(&['e'])
     .without_detail();
 
@@ -88,16 +78,19 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
                 Item::new(
                     &model.id,
                     vec![
-                        if is_current { glyph::CURRENT } else { " " }.to_string(),
+                        if is_current { format!("{} current", glyph::CURRENT) } else { " ".into() },
                         model.id.clone(),
                         model.display_name.clone().unwrap_or_default(),
                         context_size(model.context_limit),
-                        model.effort.clone().unwrap_or_else(|| effort_summary(&model.reasoning_levels)),
+                        effort_cell(model),
                     ],
-                )
+                ).with_current(is_current)
             })
             .collect(),
     );
+    if let Some(current) = current {
+        browser.select_by_id(current);
+    }
     browser
 }
 
@@ -554,7 +547,28 @@ mod tests {
 
         let rows = browser.visible_items();
         assert_eq!(rows[0].cells[0], " ");
-        assert_eq!(rows[1].cells[0], glyph::CURRENT);
+        assert_eq!(rows[1].cells[0], format!("{} current", glyph::CURRENT));
+        assert!(rows[1].is_current);
+        assert_eq!(browser.selected_id(), Some("b"));
+    }
+
+    #[test]
+    fn model_effort_cell_shows_actual_value_between_arrows() {
+        let mut row = model("canonical-id", Some("Display Name"), None);
+        row.reasoning_levels = vec!["low".into(), "high".into()];
+        row.effort = Some("high".into());
+        let browser = models(&[row], Some("canonical-id"), "live");
+        assert_eq!(browser.items()[0].cells[4], format!(
+            "{} high {}", crate::render::glyphs::ARROW_LEFT, crate::render::glyphs::ARROW_RIGHT,
+        ));
+        assert!(browser.items()[0].is_current);
+    }
+
+    #[test]
+    fn unknown_model_effort_does_not_advertise_adjustment_arrows() {
+        let row = model("unknown", None, None);
+        let browser = models(&[row], None, "catalog");
+        assert!(!browser.items()[0].cells[4].contains(crate::render::glyphs::ARROW_RIGHT));
     }
 
     #[test]

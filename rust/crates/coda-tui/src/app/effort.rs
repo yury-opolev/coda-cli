@@ -18,6 +18,53 @@ fn identity(capability: &messages::ReasoningCapabilityResult) -> Option<(String,
 }
 
 impl App {
+    pub(super) async fn adjust_model_effort(&mut self, model: String, direction: i32) {
+        let result = match self.fetch::<messages::ModelEffortResult>(
+            method::ADJUST_MODEL_EFFORT,
+            Some(serde_json::json!({
+                "model": model,
+                "direction": direction,
+                "expectedProvider": self.connected_provider,
+            })),
+        ).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.notice(format!("Could not adjust effort: {error}"), NoticeLevel::Error);
+                return;
+            }
+        };
+        if !result.ok {
+            self.reload_browser_with_status(format!("Effort unchanged: {}", result.note)).await;
+            return;
+        }
+        if result.model != model || result.provider_id.is_empty() {
+            self.notice("The engine returned an unexpected model identity; effort was not saved.", NoticeLevel::Error);
+            return;
+        }
+        if result.active {
+            self.remember_effort(result.current.clone());
+        }
+        let label = result.current.clone().unwrap_or_else(|| "auto".into());
+        let paths = self.paths.clone();
+        let saved = tokio::task::spawn_blocking(move ||
+            save_effort(&paths, &result.provider_id, &result.model, result.current.as_deref())
+        ).await;
+        let status = match saved {
+            Ok(Ok(())) => format!("{model}: effort {label} saved"),
+            Ok(Err(error)) => {
+                let status = format!("{model}: effort {label} is session-only; could not save: {error}");
+                self.notice(status.clone(), NoticeLevel::Warning);
+                status
+            }
+            Err(error) => {
+                let status = format!("{model}: effort {label} is session-only; save failed: {error}");
+                self.notice(status.clone(), NoticeLevel::Warning);
+                status
+            }
+        };
+        self.reload_browser_with_status(status).await;
+    }
+
     fn remember_effort(&mut self, current: Option<String>) {
         let label = current.unwrap_or_else(|| "auto".into());
         self.session_effort = Some(label.clone());

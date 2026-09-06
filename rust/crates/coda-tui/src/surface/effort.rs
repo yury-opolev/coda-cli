@@ -7,7 +7,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::{layout::Rect, text::{Line, Span}};
 
 pub const LEVELS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-pub const PREFERRED_WIDTH: u16 = 54;
+pub const PREFERRED_WIDTH: u16 = 58;
+const SIDE_PADDING: usize = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PickerCapability {
@@ -105,17 +106,36 @@ impl Surface for EffortPickerSurface {
     }
 
     fn render(&self, area: Rect, theme: &Theme) -> Vec<Line<'static>> {
+        let padding = SIDE_PADDING.min((area.width as usize).saturating_sub(1) / 2);
+        let width = (area.width as usize).saturating_sub(padding * 2);
+        let padded = |content: Vec<Line<'static>>| {
+            let mut lines = vec![Line::raw("")];
+            for mut line in content {
+                if line.width() > width {
+                    line = Line::styled(
+                        coda_render::text::truncate_with_ellipsis(&line.to_string(), width),
+                        theme.style(Role::Notification),
+                    );
+                }
+                if !line.spans.is_empty() {
+                    line.spans.insert(0, Span::raw(" ".repeat(padding)));
+                    line.spans.push(Span::raw(" ".repeat(padding)));
+                }
+                lines.push(line);
+            }
+            lines.push(Line::raw(""));
+            lines
+        };
         if self.capability == PickerCapability::Unsupported {
-            return vec![Line::raw("This model does not support reasoning effort.")];
+            return padded(vec![Line::raw("This model does not support reasoning effort.")]);
         }
         let selected_style = theme.style(Role::FocusText);
         let normal_style = theme.style(Role::Notification);
         let mut lines = vec![Line::styled(
             if self.selected.is_none() { "Automatic (model default)" } else { "Faster / Smarter" },
             normal_style,
-        )];
+        ), Line::raw("")];
         let count = self.levels.len().max(1);
-        let width = area.width as usize;
         if width >= count * 8 {
             let cell = width / count;
             let mut scale = Vec::new();
@@ -146,7 +166,7 @@ impl Surface for EffortPickerSurface {
         if self.capability == PickerCapability::Indeterminate {
             lines.push(Line::styled("Model capability not yet known.", normal_style));
         }
-        lines
+        padded(lines)
     }
 
     fn as_any(&self) -> &dyn std::any::Any { self }
@@ -189,8 +209,8 @@ mod tests {
         assert!(surface.selected.is_none());
         assert_eq!(emitted(&mut surface, KeyCode::Enter), ("auto".into(), true));
         let text = surface.render(Rect::new(0, 0, 54, 8), &Theme::default());
-        assert!(text[0].to_string().contains("Automatic"));
-        assert!(!text[1].to_string().contains(glyphs::CHEVRON_UP));
+        assert!(text.iter().any(|line| line.to_string().contains("Automatic")));
+        assert!(!text.iter().any(|line| line.to_string().contains(glyphs::CHEVRON_UP)));
     }
 
     #[test]
@@ -234,6 +254,21 @@ mod tests {
             assert!(lines.iter().any(|line| line.to_string().contains(level)));
         }
         assert!(lines.iter().all(|line| line.width() <= 20));
+    }
+
+    #[test]
+    fn effort_scale_has_vertical_and_two_column_side_padding() {
+        let surface = picker(Some("high"), LEVELS);
+        let lines = surface.render(Rect::new(0, 0, PREFERRED_WIDTH, 12), &Theme::default());
+        assert!(lines.first().unwrap().to_string().trim().is_empty());
+        assert!(lines.last().unwrap().to_string().trim().is_empty());
+        let scale = lines.iter().position(|line| line.to_string().contains(glyphs::RULE)).unwrap();
+        assert!(lines[scale - 1].to_string().trim().is_empty());
+        for line in lines.iter().filter(|line| !line.to_string().trim().is_empty()) {
+            let text = line.to_string();
+            assert!(text.starts_with("  ") && text.ends_with("  "), "{text:?}");
+            assert!(line.width() <= PREFERRED_WIDTH as usize);
+        }
     }
 
     #[test]

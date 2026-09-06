@@ -70,11 +70,12 @@ impl App {
                     )
                     .await
                 {
-                    Ok(result) => rows::models(
-                        &result.models,
-                        self.state.model.as_deref(),
-                        &result.source,
-                    ),
+                    Ok(result) => {
+                        if let Some(provider) = &result.provider_id {
+                            self.connected_provider = Some(provider.clone());
+                        }
+                        rows::models(&result.models, result.model.as_deref(), &result.source)
+                    }
                     Err(error) => {
                         self.browser_failed("models", error);
                         return None;
@@ -198,6 +199,7 @@ impl App {
             BrowserKind::Models => {
                 RowActions::new()
                     .on_activate(|id| A::SwitchModel(id.to_string()))
+                    .on_horizontal(|id, direction| A::AdjustModelEffort { model: id.into(), direction })
                     .on_key('e', |id| A::OpenEffortPickerForModel(id.to_string()))
             }
             BrowserKind::Sessions => {
@@ -346,22 +348,24 @@ impl App {
     }
 
     pub(super) async fn reload_browser(&mut self) {
+        self.reload_browser_with_status("reloaded".into()).await;
+    }
+
+    pub(super) async fn reload_browser_with_status(&mut self, status: String) {
         let Some(kind) = self.browser_kind() else {
             return;
         };
-        let selected = self
-            .browser()
-            .and_then(|b| b.selected_id().map(str::to_string));
+        let previous = self.browser().cloned();
 
         // Fetch before retiring. If the engine hiccups the old browser stays
         // exactly as it was, rather than vanishing and losing the user's place.
         let Some(mut browser) = self.build_browser(kind).await else {
             return;
         };
-        if let Some(id) = selected {
-            browser.select_by_id(&id);
+        if let Some(previous) = previous {
+            browser.restore_navigation_from(&previous);
         }
-        browser.set_status("reloaded");
+        browser.set_status(status);
 
         self.retire_browser_surface();
         self.surfaces
@@ -553,4 +557,3 @@ impl App {
         }
     }
 }
-
