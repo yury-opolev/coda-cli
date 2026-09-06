@@ -430,13 +430,18 @@ fn the_event_loop_drives_the_working_indicator() {
         .unwrap_or(body.len());
     let run = &body[..end];
 
-    for required in ["tick_spinner", "arm_spinner_wakeup"] {
+    for required in ["tick_spinner", "tick_thinking", "arm_spinner_wakeup"] {
         assert!(
             run.contains(required),
-            "App::run never calls {required}, so the working indicator does not \
-             animate. It would draw one frame and hold it."
+            "App::run never calls {required}, so the working indicator or \
+             thinking timer would freeze between engine events."
         );
     }
+    let thinking_tick = run.split("if self.state.tick_thinking").nth(1)
+        .expect("thinking clock must report when the displayed second changes");
+    let update = thinking_tick.split('}').next().expect("thinking tick body");
+    assert!(update.contains("self.laid_out_width = 0"));
+    assert!(update.contains("self.dirty = true"));
 }
 
 /// A transcript change must pass through the reducer, or it will not be drawn.

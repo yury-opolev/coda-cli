@@ -360,9 +360,15 @@ fn render_thinking(
             seconds => format!("{fold} Thought for {seconds}s"),
         }
     } else {
+        let seconds = elapsed_ms.max(0) / 1000;
+        let duration = if seconds < 60 {
+            format!("{seconds}s")
+        } else {
+            format!("{}:{:02}", seconds / 60, seconds % 60)
+        };
         match tokens {
-            Some(tokens) => format!("{fold} Thinking… {seconds}s · {tokens} tok"),
-            None => format!("{fold} Thinking… {seconds}s"),
+            Some(tokens) => format!("{fold} Thinking... {duration} · {tokens} tok"),
+            None => format!("{fold} Thinking... {duration}"),
         }
     };
 
@@ -763,9 +769,34 @@ mod tests {
         // The header, then one line of preview -- the last, because that is
         // where the model actually got to.
         assert_eq!(rows.len(), 2, "expected a header and one preview: {rows:?}");
-        assert!(rows[0].contains("Thinking… 3s · 120 tok"));
+        assert!(rows[0].contains("Thinking... 3s · 120 tok"));
         assert!(rows[1].contains("where it got to"));
         assert!(!rows.iter().any(|r| r.contains("first thought")));
+    }
+
+    #[test]
+    fn live_thinking_formats_seconds_then_minutes_and_seconds() {
+        for (elapsed_ms, expected) in [
+            (0, "0s"),
+            (999, "0s"),
+            (1000, "1s"),
+            (59_999, "59s"),
+            (60_000, "1:00"),
+            (65_000, "1:05"),
+            (3_661_000, "61:01"),
+        ] {
+            for expanded in [false, true] {
+                let rows = Block::Thinking {
+                    text: "reasoning".into(),
+                    elapsed_ms,
+                    tokens: None,
+                    complete: false,
+                    expanded,
+                }
+                .render(80, ToolDisplayMode::Summary);
+                assert!(rows[0].text.ends_with(&format!("Thinking... {expected}")), "{rows:?}");
+            }
+        }
     }
 
     #[test]
