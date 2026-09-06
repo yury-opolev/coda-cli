@@ -208,6 +208,7 @@ pub struct UiState {
     pub hints: HintQueue,
     /// Timestamp source, injected so tests are deterministic.
     clock: fn() -> String,
+    thinking_started_at: Option<std::time::Instant>,
 }
 
 impl Default for UiState {
@@ -236,6 +237,7 @@ impl UiState {
             hints: HintQueue::new(),
 
             clock: default_timestamp,
+            thinking_started_at: None,
         }
     }
 
@@ -255,10 +257,33 @@ impl UiState {
         )
     }
 
+    /// Updates live elapsed time; returns whether its displayed second changed.
+    pub(crate) fn tick_thinking(&mut self, now: std::time::Instant) -> bool {
+        let Some(started) = self.thinking_started_at else {
+            return false;
+        };
+        let Some(Block::Thinking { elapsed_ms, .. }) = self.transcript.open_tail() else {
+            self.thinking_started_at = None;
+            return false;
+        };
+        let elapsed = now
+            .saturating_duration_since(started)
+            .as_millis()
+            .min(i64::MAX as u128) as i64;
+        let changed = *elapsed_ms / 1000 != elapsed / 1000;
+        *elapsed_ms = elapsed;
+        changed
+    }
+
     /// Advances the state by one event.
     pub fn apply(&mut self, event: UiEvent) {
+        self.apply_at(event, std::time::Instant::now());
+    }
+
+    fn apply_at(&mut self, event: UiEvent, now: std::time::Instant) {
+        self.tick_thinking(now);
         match event {
-            UiEvent::Engine(event) => self.apply_engine(event),
+            UiEvent::Engine(event) => self.apply_engine(event, now),
             UiEvent::Connected { session_id } => {
                 self.session_id = Some(session_id);
                 self.activity = Activity::Ready;
@@ -374,9 +399,12 @@ impl UiState {
                 }
             }
         }
+        if !matches!(self.transcript.open_tail(), Some(Block::Thinking { .. })) {
+            self.thinking_started_at = None;
+        }
     }
 
-    fn apply_engine(&mut self, event: Event) {
+    fn apply_engine(&mut self, event: Event, now: std::time::Instant) {
         match event {
             Event::AssistantText { delta } => {
                 if delta.is_empty() {
@@ -424,6 +452,7 @@ impl UiState {
                             complete: false,
                             expanded: false,
                         });
+                        self.thinking_started_at = Some(now);
                     }
                 }
             }
@@ -1961,6 +1990,64 @@ mod tests {
                 assert!(complete);
             }
             other => panic!("expected a thinking block: {other:?}"),
+        }
+    }
+    #[test]
+    fn live_thinking_clock_advances_without_deltas_and_keeps_its_start() {
+        use std::time::{Duration, Instant};
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Engine(Event::Thinking { delta: "first".into() }), start);
+        assert!(!state.tick_thinking(start + Duration::from_millis(999)));
+        assert!(state.tick_thinking(start + Duration::from_secs(1)));
+        state.apply_at(
+            UiEvent::Engine(Event::Thinking { delta: " second".into() }),
+            start + Duration::from_secs(30),
+        );
+        assert!(state.tick_thinking(start + Duration::from_secs(65)));
+        let rows = state.transcript.render(80, ToolDisplayMode::Summary);
+        assert!(rows.iter().any(|row| row.text.contains("Thinking... 1:05")));
+    }
+
+    #[test]
+    fn live_thinking_clock_stops_at_completion_and_restarts_for_each_burst() {
+        use std::time::{Duration, Instant};
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Engine(Event::Thinking { delta: "first".into() }), start);
+        assert!(state.tick_thinking(start + Duration::from_secs(5)));
+        state.apply_at(
+            UiEvent::Engine(Event::ThinkingComplete { elapsed_ms: 4500, thinking_tokens: None }),
+            start + Duration::from_secs(6),
+        );
+        assert!(!state.tick_thinking(start + Duration::from_secs(10)));
+        assert!(matches!(state.transcript.blocks()[0], Block::Thinking { elapsed_ms: 4500, .. }));
+        state.apply_at(
+            UiEvent::Engine(Event::Thinking { delta: "second".into() }),
+            start + Duration::from_secs(20),
+        );
+        assert!(!state.tick_thinking(start + Duration::from_millis(20_999)));
+        assert!(state.tick_thinking(start + Duration::from_secs(21)));
+        assert!(matches!(state.transcript.blocks()[1], Block::Thinking { elapsed_ms: 1000, .. }));
+    }
+
+    #[test]
+    fn live_thinking_clock_freezes_on_implicit_completion_and_clears_on_reset() {
+        use std::time::{Duration, Instant};
+        for event in [
+            UiEvent::TurnFinished { interrupted: true, error: None },
+            UiEvent::Engine(Event::AssistantText { delta: "answer".into() }),
+            UiEvent::Cleared,
+        ] {
+            let mut state = state();
+            let start = Instant::now();
+            state.apply_at(UiEvent::Engine(Event::Thinking { delta: "reasoning".into() }), start);
+            state.apply_at(event, start + Duration::from_secs(3));
+            assert!(!state.tick_thinking(start + Duration::from_secs(10)));
+            if let Some(Block::Thinking { complete, elapsed_ms, .. }) = state.transcript.blocks().first() {
+                assert!(*complete);
+                assert_eq!(*elapsed_ms, 3000);
+            }
         }
     }
 }

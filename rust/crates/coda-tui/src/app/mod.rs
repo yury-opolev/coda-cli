@@ -329,6 +329,10 @@ impl App {
                 break;
             }
             self.tick_spinner();
+            if self.state.tick_thinking(std::time::Instant::now()) {
+                self.laid_out_width = 0;
+                self.dirty = true;
+            }
             self.dirty |= self.state.hints.prune(std::time::Instant::now());
             self.maybe_redraw(guard)?;
             self.arm_spinner_wakeup();
