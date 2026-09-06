@@ -152,16 +152,17 @@ fn append_assistant_input(input: &mut Vec<Value>, message: &crate::message::Mess
     }
 }
 
-/// Maps effort to the three levels the Responses API accepts.
+/// Maps a validated effort level to the string the Responses API carries.
 ///
-/// OpenAI's Responses endpoint does not have a "max" level, so `Effort::Max`
-/// is clamped to "high".
+/// This is a faithful pass-through: the level name is sent verbatim. The host
+/// is the single place that clamps a requested level against the model's
+/// advertised capability (`resolve_applied_level`), so by the time an effort
+/// reaches here it is already a level the model declared it supports. Collapsing
+/// `xhigh`/`max` to `high` here would be dishonest — it would tell the user an
+/// effective level the wire never actually requested. A model that tops out at
+/// `high` never sees `xhigh`/`max`, because the host drops or clamps them first.
 fn map_effort(effort: Effort) -> &'static str {
-    match effort {
-        Effort::Low => "low",
-        Effort::Medium => "medium",
-        Effort::High | Effort::Max => "high",
-    }
+    effort.as_str()
 }
 
 /// A function call being accumulated across streaming events.
@@ -482,12 +483,33 @@ mod tests {
     }
 
     #[test]
-    fn max_effort_maps_to_high() {
+    fn effort_level_is_sent_to_the_wire_verbatim() {
+        // The wire is honest: whatever level reaches `build` (already clamped by
+        // the host against the model's advertised capability) is sent as-is. It
+        // must never silently downgrade the level the user was told is in force.
+        for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max] {
+            let body = build(
+                &ChatRequest::new("gpt-4o", vec![Message::user("hi")])
+                    .with_effort(Some(effort)),
+            );
+            assert_eq!(
+                body["reasoning"]["effort"], effort.as_str(),
+                "{} must be sent verbatim, not collapsed",
+                effort.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn xhigh_is_not_dishonestly_reported_as_high() {
+        // Regression: xhigh used to collapse to "high" on the wire while the
+        // capability layer reported "xhigh" as effective — an outbound lie.
         let body = build(
             &ChatRequest::new("gpt-4o", vec![Message::user("hi")])
-                .with_effort(Some(Effort::Max)),
+                .with_effort(Some(Effort::Xhigh)),
         );
-        assert_eq!(body["reasoning"]["effort"], "high");
+        assert_eq!(body["reasoning"]["effort"], "xhigh");
+        assert_ne!(body["reasoning"]["effort"], "high");
     }
 
     #[test]

@@ -24,6 +24,7 @@ use tokio::sync::oneshot;
 mod browsers;
 mod slash;
 mod clipboard;
+mod effort;
 mod engine;
 
 use crate::config::{self, Paths, Settings};
@@ -148,6 +149,12 @@ pub struct App {
     transcript_origin: (u16, u16),
     /// Screen cell of the composer's first text column, for click-to-caret.
     composer_origin: (u16, u16),
+    /// The effort level currently applied to the session.
+    ///
+    /// `None` means auto / not set. Updated when the picker confirms a choice.
+    /// Used to pre-select the picker at the setting already in effect rather
+    /// than defaulting to "high" every time.
+    session_effort: Option<String>,
 }
 
 
@@ -224,6 +231,7 @@ impl App {
             selection: crate::selection::TranscriptSelection::new(),
             transcript_origin: (0, 0),
             composer_origin: (0, 0),
+            session_effort: None,
         };
 
         Ok((app, engine, inbound))
@@ -384,6 +392,7 @@ impl App {
             // without reaching for a catalogue of its own.
             self.state.usage.price_per_million = price;
         }
+        self.refresh_effort().await;
     }
 
     // -- Terminal input -----------------------------------------------------
@@ -866,13 +875,7 @@ impl App {
     /// Builds the exit summary from the session's final state.
     pub fn exit_summary(&self, duration: std::time::Duration) -> crate::branding::ExitSummary {
         let snapshot = self.session_snapshot();
-        let settings = Settings::load(&self.paths).ok();
-        let effort = match (&snapshot.provider, &snapshot.model) {
-            (Some(p), Some(m)) => settings
-                .as_ref()
-                .and_then(|s| s.effort_for(p, m).map(str::to_owned)),
-            _ => None,
-        };
+        let effort = self.session_effort.clone();
 
         crate::branding::ExitSummary {
             duration,
@@ -1414,14 +1417,22 @@ impl App {
                 self.surfaces.pop();
                 self.answer_prompt(allowed, answer);
             }
+            SurfaceAction::SetEffort { effort, persist, for_model } => {
+                self.apply_set_effort(effort, persist, for_model).await;
+            }
+            SurfaceAction::OpenEffortPicker => {
+                // Close the browser first so the picker opens cleanly above it.
+                self.retire_browser_surface();
+                self.open_effort_picker(None).await;
+            }
+            SurfaceAction::OpenEffortPickerForModel(model) => {
+                // Switch to the row's model first (intentional, visible), then
+                // open the picker for it. Switching closes the browser.
+                self.switch_model(&model).await;
+                self.open_effort_for_model(None, Some(&model)).await;
+            }
         }
     }
-
-
-
-
-
-
 
     /// Checks for a first run and surfaces the setup wizard notice.
     fn check_first_run(&mut self) {

@@ -46,6 +46,24 @@ fn yes_no(value: bool) -> &'static str {
     }
 }
 
+/// Formats the reasoning-effort summary for the model browser's effort column.
+///
+/// Shows the range of levels the model supports ("low – max", "low – xhigh")
+/// or an empty string when the provider reported nothing. An empty string is
+/// not "unsupported" — it means the model list did not include level data.
+fn effort_summary(levels: &[String]) -> String {
+    if levels.is_empty() {
+        return String::new();
+    }
+    let first = levels.first().map(String::as_str).unwrap_or("");
+    let last = levels.last().map(String::as_str).unwrap_or("");
+    if first == last {
+        first.to_string()
+    } else {
+        format!("{first} – {last}")
+    }
+}
+
 /// The model picker.
 pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Browser {
     let mut browser = Browser::new(
@@ -58,7 +76,8 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
             Column::new("effort", 24),
         ],
     )
-    .with_footer("↑/↓ k/j move · Enter select · r reload · / filter · Esc q close")
+    .with_footer("↑/↓ k/j move · Enter select · e effort · r reload · / filter · Esc q close")
+    .with_extra_keys(&['e'])
     .without_detail();
 
     browser.set_items(
@@ -73,7 +92,7 @@ pub fn models(models: &[WireModel], current: Option<&str>, source: &str) -> Brow
                         model.id.clone(),
                         model.display_name.clone().unwrap_or_default(),
                         context_size(model.context_limit),
-                        String::new(),
+                        model.effort.clone().unwrap_or_else(|| effort_summary(&model.reasoning_levels)),
                     ],
                 )
             })

@@ -128,6 +128,7 @@ fn thinking_budget(effort: Effort, max_tokens: u32) -> Option<u32> {
         Effort::Low => 2_048,
         Effort::Medium => 8_192,
         Effort::High => 16_384,
+        Effort::Xhigh => 24_576,
         Effort::Max => 32_768,
     };
 
@@ -657,6 +658,7 @@ mod tests {
             (Effort::Low, 2048),
             (Effort::Medium, 8192),
             (Effort::High, 16384),
+            (Effort::Xhigh, 24576),
             (Effort::Max, 32768),
         ] {
             let request = request_with(vec![Message::user("hi")])
@@ -704,7 +706,7 @@ mod tests {
     #[test]
     fn a_requested_thinking_budget_is_always_below_the_response_limit() {
         for max_tokens in [2048u32, 4096, 8192, 64_000] {
-            for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Max] {
+            for effort in [Effort::Low, Effort::Medium, Effort::High, Effort::Xhigh, Effort::Max] {
                 let request = request_with(vec![Message::user("hi")])
                     .with_max_tokens(max_tokens)
                     .with_effort(Some(effort));

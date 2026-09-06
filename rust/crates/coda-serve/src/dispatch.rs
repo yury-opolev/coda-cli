@@ -114,6 +114,13 @@ pub struct SetGoalParams {
 pub struct SetEffortParams {
     #[serde(default)]
     pub effort: Option<String>,
+    /// Canonical model the caller believed was active; when it no longer
+    /// matches the live model the engine rejects the call without mutating.
+    #[serde(default)]
+    pub expected_model: Option<String>,
+    /// Provider the caller believed was connected; guarded like `expected_model`.
+    #[serde(default)]
+    pub expected_provider: Option<String>,
 }
 
 /// `session/setModel` — the model used for subsequent turns.

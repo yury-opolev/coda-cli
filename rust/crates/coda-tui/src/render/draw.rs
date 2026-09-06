@@ -705,6 +705,13 @@ fn draw_status(
         ));
     }
 
+    if let Some(effort) = &state.effort {
+        spans.push(Span::styled(
+            format!("{} effort {effort} ", glyphs::RULE_VERTICAL),
+            theme.style(Role::Notification),
+        ));
+    }
+
     if let Some(percent) = state.usage.percent_used() {
         spans.push(Span::styled(
             format!("{} context {percent}% ", glyphs::RULE_VERTICAL),

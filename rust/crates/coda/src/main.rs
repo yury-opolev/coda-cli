@@ -93,6 +93,13 @@ struct InteractiveArgs {
     /// Without an id, copies the most recent one.
     #[arg(long, short = 'f', value_name = "ID", num_args = 0..=1)]
     fork: Option<Option<String>>,
+
+    /// Initial reasoning-effort level: low, medium, high, xhigh, or max.
+    ///
+    /// Applied as a session-only override; does not persist to settings. The
+    /// engine uses the saved per-model preference when this is not given.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -108,6 +115,14 @@ struct ServeArgs {
     /// Disable only the project `<cwd>/.mcp.json` layer; user servers still load.
     #[arg(long)]
     no_project_mcp: bool,
+
+    /// Initial reasoning-effort level: low, medium, high, xhigh, max, or auto.
+    ///
+    /// Wired through to the engine startup so a session opened over the raw
+    /// serve seam honours the same override the interactive and headless modes
+    /// accept.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
+    effort: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -137,6 +152,25 @@ struct RunArgs {
     /// Executable used to launch the engine. Defaults to this binary.
     #[arg(long, env = "CODA_ENGINE")]
     engine: Option<PathBuf>,
+
+    /// Initial reasoning-effort level: low, medium, high, xhigh, or max.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
+    effort: Option<String>,
+}
+
+/// Validates a `--effort` value at the parser layer so a syntactically invalid
+/// level is rejected before any engine is spawned or terminal entered.
+///
+/// Accepts the five levels plus `auto` (clear to automatic). The value is
+/// lower-cased so `HIGH` and `high` are the same flag.
+fn parse_effort_level(raw: &str) -> Result<String, String> {
+    let level = raw.trim().to_ascii_lowercase();
+    match level.as_str() {
+        "low" | "medium" | "high" | "xhigh" | "max" | "auto" => Ok(level),
+        _ => Err(format!(
+            "invalid effort '{raw}' (expected one of: low, medium, high, xhigh, max, auto)"
+        )),
+    }
 }
 
 fn main() -> Result<()> {
@@ -183,6 +217,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     if args.no_project_mcp {
         std::env::set_var("CODA_DISABLE_PROJECT_MCP", "1");
     }
+    // Wire the startup effort override through the env-var seam the engine
+    // reads at build time (parallel to the MCP flags above).
+    if let Some(level) = &args.effort {
+        std::env::set_var("CODA_SERVE_EFFORT", level);
+    }
     coda_serve::serve_stdio().await
 }
 
@@ -215,6 +254,17 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
     // instead of a blank alternate screen.
     let (mut app, engine_process, inbound) =
         App::connect_to_session(command, theme, resuming.clone()).await?;
+
+    // Apply a CLI-supplied effort override, session-only (no disk write).
+    // This runs before the terminal opens so a rejected level (e.g. one the
+    // current model cannot honour) surfaces as a normal error rather than a
+    // warning behind an alternate screen.
+    if let Some(ref level) = args.effort {
+        if let Err(err) = app.apply_cli_effort(level).await {
+            let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
+            return Err(err);
+        }
+    }
 
     // The banner is seeded into the transcript rather than printed to the raw
     // console: printed before the alternate screen it would be wiped the
@@ -275,6 +325,28 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
         .request(method::INITIALIZE, Some(init))
         .await
         .context("the engine handshake failed")?;
+
+    // Apply a CLI-supplied effort override before sending the prompt. A
+    // rejection (ok:false) or RPC failure aborts here, before the prompt is
+    // sent, rather than silently running the task at a different effort.
+    if let Some(ref level) = args.effort {
+        let response = connection
+            .request(
+                method::SET_EFFORT,
+                Some(serde_json::json!({ "effort": level })),
+            )
+            .await
+            .context("failed to set the requested effort")?;
+        let ok = response.get("ok").and_then(|b| b.as_bool()).unwrap_or(false);
+        if !ok {
+            let note = response
+                .get("note")
+                .and_then(|n| n.as_str())
+                .unwrap_or("unsupported level");
+            let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
+            anyhow::bail!("--effort {level} was not applied: {note}");
+        }
+    }
 
     let params = serde_json::to_value(PromptParams::text(&args.prompt))
         .context("failed to serialise the prompt")?;
@@ -413,6 +485,51 @@ mod tests {
             Some(Command::Run(args)) => assert_eq!(args.prompt, "--explain this"),
             other => panic!("expected run, got {other:?}"),
         }
+    }
+
+    /// A syntactically invalid `--effort` is rejected by the parser, before any
+    /// engine is spawned or terminal entered (Finding 5).
+    #[test]
+    fn run_rejects_an_invalid_effort_level() {
+        assert!(
+            Cli::try_parse_from(["coda", "run", "-p", "x", "--effort", "ludicrous"]).is_err(),
+            "an unknown effort level must fail at parse time"
+        );
+    }
+
+    #[test]
+    fn run_accepts_and_lowercases_a_valid_effort_level() {
+        let cli =
+            Cli::try_parse_from(["coda", "run", "-p", "x", "--effort", "XHIGH"]).expect("parse");
+        match cli.command {
+            Some(Command::Run(args)) => assert_eq!(args.effort.as_deref(), Some("xhigh")),
+            other => panic!("expected run, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_an_effort_level() {
+        let cli = Cli::try_parse_from(["coda", "serve", "--effort", "high"]).expect("parse");
+        match cli.command {
+            Some(Command::Serve(args)) => assert_eq!(args.effort.as_deref(), Some("high")),
+            other => panic!("expected serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn interactive_rejects_an_invalid_effort_level() {
+        assert!(
+            Cli::try_parse_from(["coda", "--effort", "ludicrous"]).is_err(),
+            "an unknown effort level must fail at parse time for interactive mode too"
+        );
+    }
+
+    #[test]
+    fn effort_level_parser_accepts_the_documented_set() {
+        for level in ["low", "medium", "high", "xhigh", "max", "auto"] {
+            assert_eq!(parse_effort_level(level).as_deref(), Ok(level));
+        }
+        assert!(parse_effort_level("nonsense").is_err());
     }
 
     /// Without `--engine`, the engine is this executable, so a standalone

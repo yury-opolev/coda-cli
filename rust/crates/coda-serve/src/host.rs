@@ -37,9 +37,11 @@ use coda_auth::{
 use coda_auth::provider::copilot::CopilotConfig as AuthCopilotConfig;
 use coda_auth::store::{CredentialStore, DpapiStore, KeyringStore, EncryptedFileStore};
 use coda_llm::anthropic::{AnthropicClient, AnthropicConfig};
+use coda_llm::reasoning::COPILOT_PROVIDER_ID;
 use coda_llm::{
     ChatRequest, Content, CopilotClient, CopilotConfig,
-    CredentialSource, Effort, LlmClient, Message, Role,
+    CredentialSource, Effort, LlmClient, Message, ReasoningCapability, Role,
+    resolve_applied_level, resolve_reasoning,
 };
 use coda_mcp::McpClientManager;
 use coda_proto::messages::PROTOCOL_VERSION;
@@ -123,6 +125,20 @@ pub struct WireModel {
     /// US dollars per million output tokens, when the catalogue knows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub output_cost: Option<f64>,
+    /// Reasoning-effort levels the model advertises, lowest to highest.
+    ///
+    /// Omitted (rather than serialised as `[]`) when empty, matching the
+    /// behaviour of the Copilot API for models that report nothing.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub reasoning_levels: Vec<String>,
+    /// The effort level in force for this model right now.
+    ///
+    /// For the active model this is the live effective level (after clamps and
+    /// any per-model session override); for other rows it is the session
+    /// override or saved preference. Omitted when automatic / none, so a client
+    /// shows the current level rather than a stale persisted one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -143,6 +159,10 @@ struct SetEffortResponse {
     ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     applied: Option<String>,
+    /// The effective effort level after the call, reflecting any clamp or
+    /// auto-clear. Omitted when no effort is set (cleared or never set).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current: Option<String>,
     /// Always present. The C# host emits `note: ""` on success rather than
     /// omitting it — only *null* properties are dropped, and an empty string
     /// is not null. A client that distinguishes "absent" from "empty" would
@@ -318,6 +338,23 @@ pub struct ServeHost {
     working_dir: String,
     model: Mutex<String>,
     effort: Mutex<Option<Effort>>,
+    /// Session-only, per-model reasoning-effort overrides.
+    ///
+    /// Keyed by model id. Presence of a key means "the user made an explicit
+    /// choice for this model this session"; a value of `None` means they chose
+    /// automatic. This is deliberately distinct from *absence* of a key, which
+    /// means "no session override — fall back to the saved preference". The
+    /// stored `Effort` is the level the user *requested*, re-resolved against
+    /// each model's capability so switching models never carries a stale level.
+    effort_overrides: Mutex<HashMap<String, Option<Effort>>>,
+    /// Serialises model/effort mutations so a `set_effort` that awaits a
+    /// capability lookup cannot interleave with a concurrent `set_model`.
+    ///
+    /// Held for the whole of `session_set_model` and `session_set_effort`, it
+    /// makes the pair atomic with respect to each other: the model the effort
+    /// was resolved against is guaranteed to still be the active model when the
+    /// resolved level is committed, so a race can never write a stale level.
+    effort_lock: tokio::sync::Mutex<()>,
     goal_params: Mutex<GoalParams>,
     current_cancel: Mutex<Option<CancellationToken>>,
     /// `true` while a `session/prompt` or `session/compact` is running.
@@ -449,6 +486,13 @@ impl ServeHost {
         let user_hooks = load_user_hooks(&working_dir);
         let hook_trust_store = Arc::new(InMemoryHookTrustStore::new());
 
+        // Load the per-model effort saved by the TUI. The key mirrors the TUI's
+        // `Settings::effort_for` format so the two sides agree on where to read
+        // and write. A `coda serve --effort <level>` startup override (passed
+        // via env from the CLI seam) takes precedence when present.
+        let initial_effort = startup_effort_override()
+            .or_else(|| effort_from_settings(&settings_json, &startup.provider_id, &startup.model));
+
         Arc::new(Self {
             session: Session::new(session_id.clone()),
             sink,
@@ -461,7 +505,9 @@ impl ServeHost {
             todos: Arc::new(TodoStore::new()),
             working_dir,
             model: Mutex::new(startup.model),
-            effort: Mutex::new(None),
+            effort: Mutex::new(initial_effort),
+            effort_overrides: Mutex::new(HashMap::new()),
+            effort_lock: tokio::sync::Mutex::new(()),
             goal_params: Mutex::new(GoalParams::default()),
             current_cancel: Mutex::new(None),
             turn_active: Mutex::new(false),
@@ -489,6 +535,102 @@ impl ServeHost {
 
     fn current_effort(&self) -> Option<Effort> {
         *self.effort.lock().expect("effort poisoned")
+    }
+
+    /// Test-only: set the current model without going through the RPC path.
+    #[cfg(test)]
+    fn set_model_for_test(&self, model: &str) {
+        *self.model.lock().expect("model poisoned") = model.to_owned();
+    }
+
+    /// Resolves the reasoning capability of a model, together with whether the
+    /// answer is *indeterminate* rather than a positive statement.
+    ///
+    /// Copilot models advertise their levels at runtime, so the truth comes
+    /// from the model listing. Before that listing is available (client not yet
+    /// wired, or the request failed) the answer is *unknown*, not "unsupported"
+    /// — conflating the two silently drops the user's configured effort. For a
+    /// Copilot model the second element is `true` in exactly that case.
+    /// Anthropic models resolve from static id rules and are never
+    /// indeterminate.
+    async fn resolve_capability(&self, model: &str) -> (ReasoningCapability, bool) {
+        let (provider, advertised) = match self.client.lock().await.clone() {
+            Some(client) => {
+                let provider = client.provider_id().to_owned();
+                let advertised = client.list_models().await.ok().and_then(|models| {
+                    models
+                        .into_iter()
+                        .find(|m| m.id.eq_ignore_ascii_case(model))
+                        .map(|m| m.reasoning_levels)
+                });
+                (provider, advertised)
+            }
+            None => (crate::settings::FALLBACK_PROVIDER.to_owned(), None),
+        };
+
+        let indeterminate =
+            provider.eq_ignore_ascii_case(COPILOT_PROVIDER_ID) && advertised.is_none();
+        let capability = resolve_reasoning(&provider, model, advertised.as_deref());
+        (capability, indeterminate)
+    }
+
+    /// Recomputes the effective effort for `model` from the session override or
+    /// the saved preference, validated against the model's capability.
+    ///
+    /// Called when the model changes so the level in force always matches the
+    /// new model: a session override for it wins over the saved preference, an
+    /// explicit "automatic" override clears the level, and a level the new
+    /// model cannot honour is clamped or dropped rather than sent verbatim.
+    async fn apply_effort_for_model(&self, model: &str) {
+        let provider = self.connected_provider().await;
+
+        // A session override wins; otherwise fall back to the saved preference.
+        let requested: Option<Effort> = {
+            let overrides = self.effort_overrides.lock().expect("effort poisoned");
+            match overrides.get(model) {
+                Some(explicit) => *explicit,
+                None => {
+                    let settings = load_settings_value();
+                    effort_from_settings(&settings, &provider, model)
+                }
+            }
+        };
+
+        let (capability, indeterminate) = self.resolve_capability(model).await;
+        let effective = resolve_effective_effort(&capability, indeterminate, requested);
+        *self.effort.lock().expect("effort poisoned") = effective;
+    }
+
+    /// The provider id of the connected client, or the fallback before wiring.
+    async fn connected_provider(&self) -> String {
+        match self.client.lock().await.clone() {
+            Some(c) => c.provider_id().to_owned(),
+            None => crate::settings::FALLBACK_PROVIDER.to_owned(),
+        }
+    }
+
+    /// The effort level to surface for `model` on a model-list row.
+    ///
+    /// The active model shows its live *effective* level so a browser never
+    /// displays a stale persisted value; other rows show the intent that would
+    /// apply — the session override if one exists, otherwise the saved
+    /// preference. `None` means automatic / none.
+    fn effort_hint_for(&self, provider: &str, model: &str, active: &str) -> Option<String> {
+        if model.eq_ignore_ascii_case(active) {
+            return self.current_effort().map(|e| e.as_str().to_owned());
+        }
+        if let Some(explicit) = self.effort_overrides.lock().expect("effort poisoned").get(model) {
+            return explicit.map(|e| e.as_str().to_owned());
+        }
+        let settings = load_settings_value();
+        effort_from_settings(&settings, provider, model).map(|e| e.as_str().to_owned())
+    }
+
+    /// Stamps each row of a model list with the effort in force for it.
+    fn annotate_effort(&self, models: &mut [WireModel], provider: &str, active: &str) {
+        for m in models.iter_mut() {
+            m.effort = self.effort_hint_for(provider, &m.id, active);
+        }
     }
 
     fn build_goal_supervisor(&self, client: Arc<dyn LlmClient>) -> Option<GoalSupervisor> {
@@ -825,7 +967,9 @@ impl ServeBackend for ServeHost {
             // No client yet: return a catalog so the user can see model options
             // rather than an empty list that looks like "no models exist".
             // Finding 2: never collapse "could not determine" into "none exist".
-            let catalog = serde_json::to_value(&catalog_models())
+            let mut catalog = catalog_models();
+            self.annotate_effort(&mut catalog, crate::settings::FALLBACK_PROVIDER, &active);
+            let catalog = serde_json::to_value(&catalog)
                 .map_err(|e| RpcError::internal(e.to_string()))?;
             return Ok(json!({
                 "source": "catalog",
@@ -843,7 +987,7 @@ impl ServeBackend for ServeHost {
                 // without this join a live list has none and the cost quietly
                 // disappears whenever the network is up.
                 let catalog = crate::catalog::ModelCatalog::load();
-                let wire: Vec<WireModel> = models
+                let mut wire: Vec<WireModel> = models
                     .into_iter()
                     .map(|m| {
                         let priced = catalog.find(Some(&provider_id), &m.id);
@@ -852,10 +996,13 @@ impl ServeBackend for ServeHost {
                             context_limit: m.context_limit.map(|n| n as i64),
                             input_cost: priced.and_then(|c| c.cost).map(|c| c.input),
                             output_cost: priced.and_then(|c| c.cost).map(|c| c.output),
+                            reasoning_levels: m.reasoning_levels,
+                            effort: None,
                             id: m.id,
                         }
                     })
                     .collect();
+                self.annotate_effort(&mut wire, &provider_id, &active);
                 let v = serde_json::to_value(&wire)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({
@@ -869,7 +1016,9 @@ impl ServeBackend for ServeHost {
             // transient network failure or an expired token does not present
             // the user with zero models (Finding 2).
             _ => {
-                let catalog = serde_json::to_value(&catalog_models())
+                let mut catalog = catalog_models();
+                self.annotate_effort(&mut catalog, &provider_id, &active);
+                let catalog = serde_json::to_value(&catalog)
                     .map_err(|e| RpcError::internal(e.to_string()))?;
                 Ok(json!({
                     "source": "catalog",
@@ -937,6 +1086,12 @@ impl ServeBackend for ServeHost {
             }));
         }
 
+        // Serialise against `session_set_effort`: holding this for the whole
+        // operation guarantees the effort we re-resolve below is committed
+        // against the same model, and that a concurrent `set_effort` sees a
+        // consistent (model, effort) pair rather than a half-applied switch.
+        let _guard = self.effort_lock.lock().await;
+
         // Takes effect on the next turn: the agent is rebuilt from
         // `current_model()` each time, so there is nothing to invalidate and
         // nothing to restart. The running turn keeps the model it started
@@ -944,43 +1099,139 @@ impl ServeBackend for ServeHost {
         // leave one exchange split across two models.
         *self.model.lock().expect("model poisoned") = requested.to_owned();
 
+        // The effort in force is per-model: re-resolve it for the new model so
+        // switching never carries a stale level from the previous one. A
+        // session override for the new model wins; otherwise the saved
+        // preference applies, validated against what the new model can honour.
+        self.apply_effort_for_model(requested).await;
+
         Ok(json!({
             "ok": true,
             "model": requested,
+            "effort": self.current_effort().map(|e| e.as_str().to_owned()),
         }))
     }
 
     async fn session_set_effort(&self, p: SetEffortParams) -> Result<Value, RpcError> {
-        match p.effort.as_deref() {
-            None => {
-                *self.effort.lock().expect("effort poisoned") = None;
-                serde_json::to_value(&SetEffortResponse {
-                    ok: true,
+        // Serialise against `session_set_model` so the model this effort is
+        // resolved and committed against cannot change underneath us. Without
+        // this, the `resolve_capability` await below could straddle a model
+        // switch and write a level resolved for the previous model.
+        let _guard = self.effort_lock.lock().await;
+
+        let model = self.current_model();
+        let current = || self.current_effort().map(|e| e.as_str().to_owned());
+
+        // Canonical-identity guard. The picker was opened for a specific
+        // (provider, model); if the active identity has since changed, the
+        // request is stale — reject it *without mutating* anything, rather than
+        // silently reconfiguring whatever model happens to be active now.
+        if let Some(expected) = p.expected_model.as_deref() {
+            if !expected.eq_ignore_ascii_case(&model) {
+                let resp = SetEffortResponse {
+                    ok: false,
                     applied: None,
-                    note: String::new(),
-                })
-                .map_err(|e| RpcError::internal(e.to_string()))
+                    current: current(),
+                    note: format!(
+                        "active model is now {model}, not {expected}; effort not changed"
+                    ),
+                };
+                return serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()));
             }
-            Some(raw) => match Effort::parse(raw) {
-                Some(e) => {
-                    *self.effort.lock().expect("effort poisoned") = Some(e);
-                    let resp = SetEffortResponse {
-                        ok: true,
-                        applied: Some(e.as_str().into()),
-                        note: String::new(),
-                    };
-                    serde_json::to_value(&resp).map_err(|err| RpcError::internal(err.to_string()))
-                }
-                None => {
-                    // Unsupported value → ok:false, NOT an error.
-                    let resp = SetEffortResponse {
-                        ok: false,
-                        applied: None,
-                        note: format!("unsupported effort: {raw}"),
-                    };
-                    serde_json::to_value(&resp).map_err(|err| RpcError::internal(err.to_string()))
-                }
-            },
+        }
+        if let Some(expected) = p.expected_provider.as_deref() {
+            let provider = self.connected_provider().await;
+            if !expected.eq_ignore_ascii_case(&provider) {
+                let resp = SetEffortResponse {
+                    ok: false,
+                    applied: None,
+                    current: current(),
+                    note: format!(
+                        "active provider is now {provider}, not {expected}; effort not changed"
+                    ),
+                };
+                return serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()));
+            }
+        }
+
+        let (capability, indeterminate) = self.resolve_capability(&model).await;
+
+        // "auto" and a missing value both mean "clear to automatic". Recorded
+        // as an *explicit* override (value `None`) so switching away and back
+        // restores automatic rather than silently re-reading the saved level.
+        let is_auto = matches!(
+            p.effort.as_deref().map(str::trim),
+            None | Some("") | Some("auto") | Some("Auto") | Some("AUTO")
+        );
+        if is_auto {
+            self.effort_overrides
+                .lock()
+                .expect("effort poisoned")
+                .insert(model, None);
+            *self.effort.lock().expect("effort poisoned") = None;
+            return serde_json::to_value(&SetEffortResponse {
+                ok: true,
+                applied: None,
+                current: None,
+                note: String::new(),
+            })
+            .map_err(|e| RpcError::internal(e.to_string()));
+        }
+
+        let raw = p.effort.as_deref().unwrap_or_default().trim();
+
+        // Syntactically invalid → ok:false, current unchanged.
+        let Some(requested) = Effort::parse(raw) else {
+            let resp = SetEffortResponse {
+                ok: false,
+                applied: None,
+                current: current(),
+                note: format!("unsupported effort: {raw}"),
+            };
+            return serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()));
+        };
+
+        // Validate against the model's capability. Indeterminate capability is
+        // accepted optimistically (do not lie by dropping the user's choice);
+        // a known capability clamps `max`→`high` and rejects anything the model
+        // cannot honour, so `current` reports the *effective* level, never a
+        // success-shaped value the backend would quietly ignore.
+        match resolve_effective_effort(&capability, indeterminate, Some(requested)) {
+            Some(effective) => {
+                self.effort_overrides
+                    .lock()
+                    .expect("effort poisoned")
+                    .insert(model.clone(), Some(requested));
+                *self.effort.lock().expect("effort poisoned") = Some(effective);
+                let note = if effective == requested {
+                    String::new()
+                } else {
+                    format!("{} applies as {} on {}", requested.as_str(), effective.as_str(), model)
+                };
+                let resp = SetEffortResponse {
+                    ok: true,
+                    applied: Some(effective.as_str().into()),
+                    current: Some(effective.as_str().into()),
+                    note,
+                };
+                serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+            }
+            None => {
+                // Known-unsupported for this model: reject rather than fake it.
+                let note = if !capability.supported {
+                    format!("model {model} does not support reasoning effort")
+                } else {
+                    let highest = capability.levels.last().map(String::as_str).unwrap_or("?");
+                    format!("{raw} not supported (model stops at {highest})")
+                };
+                let resp = SetEffortResponse {
+                    ok: false,
+                    applied: None,
+                    current: current(),
+                    note,
+                };
+                serde_json::to_value(&resp).map_err(|e| RpcError::internal(e.to_string()))
+            }
         }
     }
 
@@ -989,32 +1240,25 @@ impl ServeBackend for ServeHost {
     async fn model_reasoning_capability(&self) -> Result<Value, RpcError> {
         // Copilot models advertise their levels at runtime, so consult the
         // model listing; Anthropic models resolve from static rules on the id.
-        // Passing the advertised list is what makes this correct for Copilot —
-        // resolving without it reports every such model unsupported and
-        // silently discards the user's configured effort.
+        // The `indeterminate` flag distinguishes "unknown yet" (Copilot before
+        // the model list arrives) from a positive "unsupported", so the picker
+        // can refuse to lie in either direction.
         let model = self.current_model();
-        let advertised: Option<Vec<String>> = match self.client.lock().await.clone() {
-            Some(client) => client.list_models().await.ok().and_then(|models| {
-                models
-                    .into_iter()
-                    .find(|m| m.id.eq_ignore_ascii_case(&model))
-                    .map(|m| m.reasoning_levels)
-            }),
-            None => None,
-        };
-
-        // Use the connected credential's provider, not settings.defaultProvider.
-        let provider = match self.client.lock().await.clone() {
-            Some(c) => c.provider_id().to_owned(),
-            None => crate::settings::FALLBACK_PROVIDER.to_owned(),
-        };
-        let capability = coda_llm::resolve_reasoning(&provider, &model, advertised.as_deref());
+        let provider_id = self.connected_provider().await;
+        let (capability, indeterminate) = self.resolve_capability(&model).await;
         Ok(json!({
             "supported": capability.supported,
             // The C# sends an empty list when unsupported rather than the
             // levels it would otherwise have reported.
             "levels": if capability.supported { capability.levels } else { Vec::new() },
             "supportsAuto": capability.supports_auto,
+            "current": self.current_effort().map(|e| e.as_str().to_owned()),
+            "indeterminate": indeterminate,
+            // Canonical identity so the picker persists a per-model preference
+            // under the same (provider, model) key the engine reads back, never
+            // a display name.
+            "model": model,
+            "providerId": provider_id,
         }))
     }
 
@@ -1666,6 +1910,53 @@ fn load_settings_value() -> Value {
         .unwrap_or_else(|| Value::Object(Default::default()))
 }
 
+/// Reads the per-model effort the TUI saved under `effortByModel`.
+///
+/// The key format mirrors the TUI's `Settings::effort_for` key, so both sides
+/// agree on where to read and write without either depending on the other.
+fn effort_from_settings(settings: &Value, provider: &str, model: &str) -> Option<Effort> {
+    let key = format!("{provider}/{model}");
+    let raw = settings
+        .get("effortByModel")?
+        .get(&key)?
+        .as_str()?;
+    Effort::parse(raw)
+}
+
+/// The startup effort override from `coda serve --effort <level>`.
+///
+/// The CLI translates the flag into `CODA_SERVE_EFFORT` (the same env-var seam
+/// the MCP flags use), so the engine picks it up without the transport signature
+/// having to grow a parameter. `auto` (and any unparseable value) yields `None`,
+/// leaving the saved preference to apply.
+fn startup_effort_override() -> Option<Effort> {
+    let raw = std::env::var("CODA_SERVE_EFFORT").ok()?;
+    Effort::parse(raw.trim())
+}
+
+/// Resolves a *requested* effort to the level actually in force for a model.
+///
+/// The three cases mirror the picker's mental model:
+///
+/// - `None` requested → `None` in force (automatic).
+/// - a level, capability *indeterminate* → keep the requested level rather than
+///   drop it; the truth is not yet known and dropping it would silently lose a
+///   user's choice (the exact bug the C# `ResolveStoredLevel` warns about).
+/// - a level, capability *known* → clamp/reject via [`resolve_applied_level`],
+///   so `max` on a high-only model becomes `high` and an unsupported level
+///   falls back to automatic rather than being sent verbatim.
+fn resolve_effective_effort(
+    capability: &ReasoningCapability,
+    indeterminate: bool,
+    requested: Option<Effort>,
+) -> Option<Effort> {
+    let requested = requested?;
+    if indeterminate {
+        return Some(requested);
+    }
+    resolve_applied_level(capability, Some(requested.as_str())).and_then(|s| Effort::parse(&s))
+}
+
 /// Build the merged LSP server config from settings + plugins.
 fn load_lsp_configs(
     settings: &Value,
@@ -1759,6 +2050,8 @@ fn catalog_models() -> Vec<WireModel> {
                 context_limit: model.context_limit,
                 input_cost: model.cost.map(|c| c.input),
                 output_cost: model.cost.map(|c| c.output),
+                reasoning_levels: Vec::new(),
+                effort: None,
             });
         }
     }
@@ -2041,7 +2334,7 @@ mod tests {
     async fn set_effort_valid_returns_ok_true() {
         let host = make_host();
         let r = host
-            .session_set_effort(SetEffortParams { effort: Some("high".into()) })
+            .session_set_effort(SetEffortParams { effort: Some("high".into()), ..Default::default() })
             .await
             .unwrap();
         assert_eq!(r["ok"], true);
@@ -2057,7 +2350,7 @@ mod tests {
     async fn set_effort_clear_omits_applied() {
         let host = make_host();
         let r =
-            host.session_set_effort(SetEffortParams { effort: None }).await.unwrap();
+            host.session_set_effort(SetEffortParams { effort: None, ..Default::default() }).await.unwrap();
         assert_eq!(r["ok"], true);
         assert!(r.get("applied").is_none());
     }
@@ -2066,10 +2359,283 @@ mod tests {
     async fn set_effort_unsupported_is_ok_false_not_error() {
         let host = make_host();
         let r = host
-            .session_set_effort(SetEffortParams { effort: Some("ludicrous".into()) })
+            .session_set_effort(SetEffortParams { effort: Some("ludicrous".into()), ..Default::default() })
             .await
             .unwrap();
         assert_eq!(r["ok"], false, "unsupported effort must yield ok:false, not an Err");
+    }
+
+    #[tokio::test]
+    async fn xhigh_effort_is_accepted_and_reported_in_current() {
+        let host = make_host();
+        let r = host
+            .session_set_effort(SetEffortParams { effort: Some("xhigh".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true, "xhigh must be accepted");
+        assert_eq!(r["applied"], "xhigh");
+        assert_eq!(r["current"], "xhigh", "current must echo applied on success");
+    }
+
+    #[tokio::test]
+    async fn failed_set_effort_reports_current_unchanged() {
+        let host = make_host();
+        // Establish "high" first.
+        host.session_set_effort(SetEffortParams { effort: Some("high".into()), ..Default::default() })
+            .await
+            .unwrap();
+        // Now try an invalid level.
+        let r = host
+            .session_set_effort(SetEffortParams { effort: Some("ludicrous".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], false);
+        // current should still reflect the pre-existing "high".
+        assert_eq!(r["current"], "high", "current must not change on failure");
+    }
+
+    #[test]
+    fn effort_from_settings_reads_saved_value() {
+        let settings = serde_json::json!({
+            "effortByModel": {
+                "github-copilot/claude-opus-5": "xhigh"
+            }
+        });
+        assert_eq!(
+            effort_from_settings(&settings, "github-copilot", "claude-opus-5"),
+            Some(Effort::Xhigh)
+        );
+    }
+
+    #[test]
+    fn effort_from_settings_returns_none_when_not_saved() {
+        let settings = serde_json::json!({ "effortByModel": {} });
+        assert!(effort_from_settings(&settings, "github-copilot", "claude-opus-5").is_none());
+    }
+
+    #[test]
+    fn effort_from_settings_returns_none_for_invalid_value() {
+        let settings = serde_json::json!({
+            "effortByModel": {
+                "github-copilot/claude-opus-5": "ludicrous"
+            }
+        });
+        assert!(effort_from_settings(&settings, "github-copilot", "claude-opus-5").is_none());
+    }
+
+    // ── resolve_effective_effort (Finding 6) ────────────────────────────────
+
+    #[test]
+    fn effective_effort_keeps_supported_level_verbatim() {
+        let opus = resolve_reasoning("anthropic", "claude-opus-4.8", None);
+        assert_eq!(
+            resolve_effective_effort(&opus, false, Some(Effort::Xhigh)),
+            Some(Effort::Xhigh),
+            "xhigh is a real Opus level and must not be clamped"
+        );
+    }
+
+    #[test]
+    fn effective_effort_clamps_max_to_high_where_max_is_unavailable() {
+        let sonnet = resolve_reasoning("anthropic", "claude-sonnet-4.6", None);
+        assert_eq!(
+            resolve_effective_effort(&sonnet, false, Some(Effort::Max)),
+            Some(Effort::High),
+            "max must clamp to high, matching the documented fallback"
+        );
+    }
+
+    #[test]
+    fn effective_effort_drops_a_level_the_model_cannot_honour() {
+        let levels = vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()];
+        let copilot = resolve_reasoning("github-copilot", "some-model", Some(&levels));
+        assert_eq!(
+            resolve_effective_effort(&copilot, false, Some(Effort::Xhigh)),
+            None,
+            "xhigh must not be faked as high on a high-only model"
+        );
+    }
+
+    #[test]
+    fn effective_effort_keeps_the_request_when_capability_is_indeterminate() {
+        let unknown = ReasoningCapability::unsupported();
+        assert_eq!(
+            resolve_effective_effort(&unknown, true, Some(Effort::Xhigh)),
+            Some(Effort::Xhigh),
+            "indeterminate capability must not silently drop the user's choice"
+        );
+    }
+
+    #[test]
+    fn effective_effort_auto_stays_auto() {
+        let opus = resolve_reasoning("anthropic", "claude-opus-4.8", None);
+        assert_eq!(resolve_effective_effort(&opus, false, None), None);
+    }
+
+    // ── session_set_model applies per-model effort (Finding 2) ──────────────
+
+    #[tokio::test]
+    async fn switching_models_does_not_carry_a_stale_effort() {
+        // make_host has no client, so capability is indeterminate (Copilot) and
+        // valid levels are accepted optimistically. Set an override on model A,
+        // switch to B: B has no override and no saved preference, so the level
+        // in force must clear rather than leak A's choice.
+        let host = make_host();
+        host.set_model_for_test("model-a");
+        host.session_set_effort(SetEffortParams { effort: Some("high".into()), ..Default::default() })
+            .await
+            .unwrap();
+        assert_eq!(host.current_effort(), Some(Effort::High));
+
+        host.session_set_model(SetModelParams { model: "model-b".into() })
+            .await
+            .unwrap();
+        assert_eq!(host.current_effort(), None, "B must not inherit A's effort");
+    }
+
+    #[tokio::test]
+    async fn a_per_model_session_override_is_restored_on_return() {
+        let host = make_host();
+        host.set_model_for_test("model-a");
+        host.session_set_effort(SetEffortParams { effort: Some("high".into()), ..Default::default() })
+            .await
+            .unwrap();
+
+        host.session_set_model(SetModelParams { model: "model-b".into() })
+            .await
+            .unwrap();
+        assert_eq!(host.current_effort(), None);
+
+        // Returning to A restores its session override, not automatic.
+        host.session_set_model(SetModelParams { model: "model-a".into() })
+            .await
+            .unwrap();
+        assert_eq!(host.current_effort(), Some(Effort::High));
+    }
+
+    #[tokio::test]
+    async fn explicit_auto_override_is_distinct_from_no_override() {
+        let host = make_host();
+        host.set_model_for_test("model-a");
+        // Explicit auto on A.
+        host.session_set_effort(SetEffortParams { effort: Some("auto".into()), ..Default::default() })
+            .await
+            .unwrap();
+        host.session_set_model(SetModelParams { model: "model-b".into() })
+            .await
+            .unwrap();
+        // Returning to A keeps the explicit auto (still None), and the override
+        // map records the key so it is not re-read from saved settings.
+        host.session_set_model(SetModelParams { model: "model-a".into() })
+            .await
+            .unwrap();
+        assert_eq!(host.current_effort(), None);
+        assert!(
+            host.effort_overrides.lock().unwrap().contains_key("model-a"),
+            "explicit auto must be recorded as an override, not treated as absent"
+        );
+    }
+
+    // ── canonical-identity guard (stale rejection without mutation) ──────────
+
+    #[tokio::test]
+    async fn stale_expected_model_is_rejected_without_mutation() {
+        let host = make_host();
+        host.set_model_for_test("model-a");
+        host.session_set_effort(SetEffortParams { effort: Some("high".into()), ..Default::default() })
+            .await
+            .unwrap();
+        // The user switched to model-b, but a picker opened for model-a now
+        // tries to apply. The engine must refuse and leave the level untouched.
+        host.set_model_for_test("model-b");
+        let r = host
+            .session_set_effort(SetEffortParams {
+                effort: Some("low".into()),
+                expected_model: Some("model-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], false, "a stale expected model must be rejected");
+        // No mutation: model-b never had an override recorded, and model-a's
+        // level is unchanged.
+        assert!(
+            !host.effort_overrides.lock().unwrap().contains_key("model-b"),
+            "a rejected call must not record an override for the active model"
+        );
+        host.session_set_model(SetModelParams { model: "model-a".into() })
+            .await
+            .unwrap();
+        assert_eq!(
+            host.current_effort(),
+            Some(Effort::High),
+            "model-a's original effort must survive a stale rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_matching_expected_model_is_applied() {
+        let host = make_host();
+        host.set_model_for_test("model-a");
+        let r = host
+            .session_set_effort(SetEffortParams {
+                effort: Some("high".into()),
+                expected_model: Some("model-a".into()),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(r["ok"], true, "a matching identity must be accepted");
+        assert_eq!(host.current_effort(), Some(Effort::High));
+    }
+
+    // ── reasoning capability carries canonical identity ─────────────────────
+
+    #[tokio::test]
+    async fn reasoning_capability_reports_canonical_model_and_provider() {
+        let host = make_host();
+        host.set_model_for_test("claude-opus-5");
+        let r = host.model_reasoning_capability().await.unwrap();
+        assert_eq!(r["model"], "claude-opus-5", "the canonical model id must be reported");
+        assert!(r["providerId"].is_string(), "a provider id must accompany the model");
+    }
+
+    // ── model list surfaces the active model's live effort ──────────────────
+
+    #[tokio::test]
+    async fn model_list_stamps_the_active_row_with_current_effort() {
+        let host = make_host();
+        host.set_model_for_test("model-a");
+        host.session_set_effort(SetEffortParams { effort: Some("high".into()), ..Default::default() })
+            .await
+            .unwrap();
+        let mut rows = vec![
+            WireModel {
+                id: "model-a".into(),
+                display_name: None,
+                context_limit: None,
+                input_cost: None,
+                output_cost: None,
+                reasoning_levels: Vec::new(),
+                effort: None,
+            },
+            WireModel {
+                id: "model-b".into(),
+                display_name: None,
+                context_limit: None,
+                input_cost: None,
+                output_cost: None,
+                reasoning_levels: Vec::new(),
+                effort: None,
+            },
+        ];
+        host.annotate_effort(&mut rows, "github-copilot", "model-a");
+        assert_eq!(
+            rows[0].effort.as_deref(),
+            Some("high"),
+            "the active row must carry the live effective effort"
+        );
+        assert_eq!(rows[1].effort, None, "an unset non-active row carries no effort");
     }
 
     #[tokio::test]
@@ -2097,6 +2663,8 @@ mod tests {
             context_limit: None,
             input_cost: None,
             output_cost: None,
+            reasoning_levels: Vec::new(),
+            effort: None,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert!(v.get("displayName").is_none());

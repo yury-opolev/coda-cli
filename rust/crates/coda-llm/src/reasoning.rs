@@ -133,6 +133,8 @@ mod tests {
         let cap = resolve_anthropic("claude-sonnet-4.6");
         assert!(cap.supported);
         assert!(!cap.levels.iter().any(|l| l == "max"), "sonnet must not advertise max");
+        // xhigh IS in the Sonnet level set.
+        assert!(cap.levels.iter().any(|l| l == "xhigh"), "sonnet must advertise xhigh");
     }
 
     #[test]
@@ -192,6 +194,32 @@ mod tests {
         let levels = vec!["low".to_owned()];
         let cap = resolve_copilot(Some(&levels));
         assert_eq!(resolve_applied_level(&cap, Some("xhigh")), None);
+    }
+
+    /// xhigh is a valid Anthropic level for Opus and Sonnet; it must not be
+    /// rejected as unknown.
+    #[test]
+    fn xhigh_resolves_on_anthropic_opus_and_sonnet() {
+        for model in ["claude-opus-4.8", "claude-sonnet-4.6"] {
+            let cap = resolve_anthropic(model);
+            assert_eq!(
+                resolve_applied_level(&cap, Some("xhigh")).as_deref(),
+                Some("xhigh"),
+                "{model} must accept xhigh"
+            );
+        }
+    }
+
+    /// A Copilot model that only advertises up to "high" must reject "xhigh".
+    #[test]
+    fn xhigh_rejected_when_copilot_model_stops_at_high() {
+        let levels = vec!["low".to_owned(), "medium".to_owned(), "high".to_owned()];
+        let cap = resolve_copilot(Some(&levels));
+        assert_eq!(
+            resolve_applied_level(&cap, Some("xhigh")),
+            None,
+            "xhigh must be dropped when the model stops at high"
+        );
     }
 
     #[test]

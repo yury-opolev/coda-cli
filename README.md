@@ -264,7 +264,7 @@ Inside the REPL:
 /tasks                    open the live task browser (prints a textual snapshot in plain/Spectre)
 /provider [id]            show or switch the active provider
 /model [id]               show or set the chat model
-/effort [low|medium|high|max|auto]  show or set reasoning effort (Claude only)
+/effort [low|medium|high|xhigh|max|auto]  choose or set model-specific reasoning effort
 /context                  show context-window usage broken down by category
 /goal [<text> | off]      set/clear the autonomous goal (--timeout, --max-turns)
 /log [<level> | stderr on|off]  show or set telemetry logging level
@@ -371,12 +371,13 @@ form: they are entered through a masked prompt and shown only as `*****`.
 
 Changing an existing server's **transport** rewrites it to the other shape and drops the fields that
 do not apply, so saving such a change asks for confirmation first and names what will be lost.
-- **`/effort [low|medium|high|max|auto]`** sets the reasoning effort level. It is
-  sent to the Anthropic API as `output_config.effort` (with the
-  `effort-2025-11-24` beta) and is honored only by models that support it
-  (`opus-4-8`, `sonnet-4-6`); `max` is Opus-only and clamps to `high` elsewhere.
-  Effort is session-scoped; `auto` clears it (model default). GitHub Copilot has
-  no effort equivalent, so the setting is ignored there.
+- **`/effort`** opens a horizontal Faster / Smarter picker for the active model.
+  Left/Right changes the selection, Enter applies and saves a per-provider/model
+  preference, `s` applies for this session only, `a` selects automatic, and Esc
+  cancels. Only supported levels are selectable; unknown capability is labelled
+  explicitly. `/effort <level>` applies and saves directly; `auto` clears the
+  explicit preference. In the model browser, `e` activates the highlighted model
+  and opens its effort picker. `--effort <level>` is a session-only startup override.
 - **`/context`** shows how the model's 200k context window is being used, broken
   down into **System prompt / System tools / MCP tools / Messages / Autocompact
   buffer / Free space** with a grid visualization and per-category token counts.
@@ -846,7 +847,7 @@ All supervisor features are also reachable from `coda run`:
 | `--goal-timeout <duration>` | Wall-clock budget for the goal run: `30m`, `2h`, `1d`, or `hh:mm:ss` (requires `--goal`; default 24h). A bare integer is rejected — use a unit. |
 | `--session-memory` | Enable the background SessionMemory watcher. |
 | `--max-continuations <n>` | Turn backstop. For a goal run it sets the goal turn budget (default 60000); otherwise it bounds non-goal stop-hook continuations (default 10). |
-| `--effort <level>` | Reasoning effort (`low`/`medium`/`high`/`max`/`auto`). Claude-only; `max` is Opus-only. |
+| `--effort <level>` | Session-only reasoning effort (`low`/`medium`/`high`/`xhigh`/`max`/`auto`), validated against model capability. |
 
 Example:
 

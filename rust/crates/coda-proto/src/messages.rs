@@ -308,6 +308,21 @@ pub struct WireModel {
     /// US dollars per million output tokens, when the catalogue knows.
     #[serde(default)]
     pub output_cost: Option<f64>,
+    /// Reasoning-effort levels the model advertises, lowest to highest.
+    ///
+    /// Empty when the provider reported nothing; this is *not* the same as
+    /// "unsupported" — the caller must not conclude absence means unsupported.
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
+    /// The effort level effectively in force for this model right now.
+    ///
+    /// For the *active* model this is the live effective level (after clamps
+    /// and any per-model session override), so a browser can show what is
+    /// actually in force rather than a possibly-stale persisted value. For
+    /// other rows it is the session override or saved preference, when known.
+    /// `None` means automatic / none.
+    #[serde(default)]
+    pub effort: Option<String>,
 }
 
 impl WireModel {
@@ -341,9 +356,21 @@ pub struct SetGoalResult {
 }
 
 #[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SetEffortParams {
-    /// `"low"`, `"medium"`, `"high"`, `"max"`, `"auto"`, or `None` to clear.
+    /// `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"`, `"auto"`, or `None` to clear.
     pub effort: Option<String>,
+    /// The model the caller believed was active when it built this request.
+    ///
+    /// When present, the engine rejects the call (without mutating anything) if
+    /// the active model has since changed, so a picker opened for one model can
+    /// never silently reconfigure another. `None` skips the guard.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_model: Option<String>,
+    /// The provider the caller believed was connected. Guarded exactly like
+    /// `expected_model`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected_provider: Option<String>,
 }
 
 /// Switches the live permission mode for the running session.
@@ -372,6 +399,12 @@ pub struct SetEffortResult {
     pub ok: bool,
     #[serde(default)]
     pub applied: Option<String>,
+    /// The effective current effort level after the call.
+    ///
+    /// Matches `applied` on success; on failure reflects whatever was in force
+    /// before the (rejected) call. Absent when no effort is set at all.
+    #[serde(default)]
+    pub current: Option<String>,
     #[serde(default)]
     pub note: Option<String>,
 }
@@ -385,6 +418,31 @@ pub struct ReasoningCapabilityResult {
     pub levels: Vec<String>,
     #[serde(default)]
     pub supports_auto: bool,
+    /// The effort level currently in force on the session, if any.
+    ///
+    /// `None` means "automatic / not set" — an honest, unambiguous default the
+    /// picker uses to pre-select rather than always defaulting to `high`.
+    #[serde(default)]
+    pub current: Option<String>,
+    /// `true` when the capability could not be determined yet (for example a
+    /// Copilot model before the model list has been fetched).
+    ///
+    /// Distinct from `supported: false`, which is a positive statement that the
+    /// model has no reasoning effort. Callers must treat the two differently:
+    /// indeterminate is "unknown, do not lie", unsupported is "known absent".
+    #[serde(default)]
+    pub indeterminate: bool,
+    /// The canonical model id the capability describes.
+    ///
+    /// This is the engine's own id for the active model, never a display name,
+    /// so a caller can persist a per-model preference under exactly the key the
+    /// engine reads it back with. `None` when the engine could not identify it.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// The provider that model is served by, paired with `model` to form the
+    /// canonical `(provider, model)` identity the picker persists against.
+    #[serde(default)]
+    pub provider_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

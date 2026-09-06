@@ -163,6 +163,11 @@ pub enum Effort {
     Low,
     Medium,
     High,
+    /// Extended high reasoning, between `High` and `Max`.
+    ///
+    /// Supported on Anthropic Opus and Sonnet models. OpenAI/Copilot providers
+    /// that do not expose a native `xhigh` wire level map this to `high`.
+    Xhigh,
     Max,
 }
 
@@ -172,6 +177,7 @@ impl Effort {
             "low" => Some(Effort::Low),
             "medium" => Some(Effort::Medium),
             "high" => Some(Effort::High),
+            "xhigh" => Some(Effort::Xhigh),
             "max" => Some(Effort::Max),
             _ => None,
         }
@@ -182,6 +188,7 @@ impl Effort {
             Effort::Low => "low",
             Effort::Medium => "medium",
             Effort::High => "high",
+            Effort::Xhigh => "xhigh",
             Effort::Max => "max",
         }
     }
@@ -447,9 +454,17 @@ mod tests {
     #[test]
     fn parses_effort_levels_case_insensitively() {
         assert_eq!(Effort::parse("HIGH"), Some(Effort::High));
+        assert_eq!(Effort::parse("XHIGH"), Some(Effort::Xhigh));
         assert_eq!(Effort::parse(" max "), Some(Effort::Max));
         assert_eq!(Effort::parse("auto"), None);
         assert_eq!(Effort::parse(""), None);
+    }
+
+    #[test]
+    fn xhigh_roundtrips_through_parse_and_as_str() {
+        assert_eq!(Effort::Xhigh.as_str(), "xhigh");
+        assert_eq!(Effort::parse("xhigh"), Some(Effort::Xhigh));
+        assert_eq!(Effort::parse("XHIGH"), Some(Effort::Xhigh));
     }
 
     #[test]

@@ -18,6 +18,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 
 pub mod browser;
+pub mod effort;
 pub mod form;
 pub mod mcp_editor;
 pub mod prompt;
@@ -156,6 +157,34 @@ pub enum SurfaceAction {
     ExplainScheduleCreation,
     /// Explain that a skill cannot be toggled from the browser.
     ExplainSkillToggle,
+
+    /// Set the reasoning-effort level for the session.
+    ///
+    /// `persist` distinguishes "Enter" (save to settings) from "s" (session
+    /// only, no disk write). `for_model` is the `(provider, model)` identity
+    /// at the moment the picker was opened, so the apply handler can write
+    /// the per-model preference without a race if the model changed while the
+    /// picker was visible.
+    SetEffort {
+        effort: String,
+        persist: bool,
+        for_model: (String, String),
+    },
+
+    /// Open the effort picker for the current session model.
+    ///
+    /// Raised by the bare `/effort` slash command and row actions where full
+    /// async is not available; the application opens the picker against the
+    /// model currently in effect.
+    OpenEffortPicker,
+
+    /// Switch to the given model, then open the effort picker for it.
+    ///
+    /// Raised by the model browser's `e` key: it identifies the row so the
+    /// picker edits *that* model's effort, not whatever happened to be current.
+    /// The switch is intentional and visible (the picker title names the
+    /// model), never a silent edit of a different model.
+    OpenEffortPickerForModel(String),
 
     /// A browser row action that needs the engine or the filesystem.
     ///
