@@ -187,9 +187,42 @@ assumptions; only cross-checking against the reference breaks the circularity.
 
 - `--yolo-safe` — classifier-gated bypass mode is not wired; the flag aborts
   with an explicit error message rather than silently mapping to unrestricted bypass.
-- `--image` / MCP editor UI — image input and MCP editor integration are
-  not yet implemented.
+- `--image` — image input is not yet implemented.
 - Session telemetry, transport extras beyond what the serve protocol carries.
+
+### MCP editor (`/mcp add` / `/mcp edit`)
+
+The editor stores servers in `.mcp.json` for the chosen scope (user or project).
+Fields are driven by transport — stdio shows Command, Arguments and Environment;
+HTTP shows URL and Environment — so the form never offers fields the loader
+would discard.
+
+**Arguments** are edited as a JSON array (e.g. `["-y", "server"]`). This
+preserves arguments that contain spaces, quotes, backslashes or Unicode exactly,
+without any shell-quoting heuristics that would silently corrupt Windows paths.
+
+**Environment** is edited as a JSON object mapping names to string values, e.g.
+`{ "API_KEY": "coda-secret:store/key" }`. A JSON object is used rather than
+`KEY=VALUE` lines so values containing `=`, leading/trailing whitespace,
+newlines or Unicode round-trip exactly. The editor shows the *unresolved*
+values as written in `.mcp.json` — `coda-secret:store/key` references appear
+as-is and are never resolved to actual secrets in the UI. Names must be
+non-empty and free of whitespace, `=` and NUL; on Windows they are treated
+case-insensitively. Press `Ctrl+Enter` (or `Tab` out of a text box, then
+`Enter`) to save.
+
+**Saving** is keyed to the exact `(scope, name)` the editor opened on, so a
+user entry shadowed by a project entry of the same name is never confused for
+its neighbour. Within one scope the write is atomic; a move across scopes
+writes the destination first and only then removes the source, reporting the
+half-done state if that removal fails. Adding, renaming or moving onto a name
+that already exists in the target scope is rejected as a collision. Unknown
+fields (auth, headers, future settings) are preserved from the exact original
+across every save, edit and move, and the transport marker (`type`) is
+rewritten to match the chosen transport so a switched server cannot keep a
+contradictory one.
+
+Restart the engine after saving to connect the new or updated server.
 
 ### CLI reference (Rust parity flags)
 

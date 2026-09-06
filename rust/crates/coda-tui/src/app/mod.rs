@@ -1354,20 +1354,12 @@ impl App {
                 };
 
                 let draft = editor.draft();
-                // A rename leaves the old entry behind unless it is retired,
-                // and the loader would then serve two servers under one name.
-                let renamed_from = editor
-                    .original_name()
-                    .filter(|old| *old != draft.name)
-                    .map(str::to_string);
+                let original = editor.original().cloned();
 
                 let paths = self.paths.clone();
                 let name = draft.name.clone();
                 let saved = tokio::task::spawn_blocking(move || {
-                    if let Some(old) = renamed_from {
-                        config::delete_mcp_server(&paths, &old)?;
-                    }
-                    config::save_mcp_server(&paths, &draft)
+                    config::save_mcp_server(&paths, &draft, original.as_ref())
                 })
                 .await;
 

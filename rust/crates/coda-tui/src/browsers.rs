@@ -670,6 +670,7 @@ mod tests {
                 args: vec![],
                 url: None,
                 enabled: true,
+                env_raw: vec![("DATA".into(), String::new())],
                 env_keys: vec!["DATA".into()],
             },
             McpServer {
@@ -680,6 +681,7 @@ mod tests {
                 args: vec![],
                 url: Some("https://example.com".into()),
                 enabled: false,
+                env_raw: vec![],
                 env_keys: vec![],
             },
         ];
@@ -704,6 +706,7 @@ mod tests {
             args: vec![],
             url: None,
             enabled: true,
+            env_raw: vec![("API_TOKEN".into(), "redacted".into())],
             env_keys: vec!["API_TOKEN".into()],
         }];
 

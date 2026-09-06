@@ -533,9 +533,10 @@ impl Scope {
 
 /// One configured MCP server — a display-only view.
 ///
-/// Actual `env` values are intentionally absent so the TUI never stores
-/// or displays secrets. The parsing is delegated to `coda_mcp::config` so
-/// the file-format logic lives in exactly one place.
+/// `env_raw` carries the *unresolved* values as written in `.mcp.json`
+/// (e.g. `coda-secret:store/key` references). They are safe to show in the
+/// editor because they are never resolved here — actual secrets stay in the
+/// credential store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct McpServer {
     pub name: String,
@@ -546,7 +547,11 @@ pub struct McpServer {
     pub args: Vec<String>,
     pub url: Option<String>,
     pub enabled: bool,
-    /// Environment variable names only; values may hold secrets.
+    /// Raw (unresolved) environment variable values as configured in `.mcp.json`,
+    /// sorted by key. References such as `coda-secret:store/key` are shown
+    /// as-is; they are never resolved here.
+    pub env_raw: Vec<(String, String)>,
+    /// Environment variable names only; kept for fast display and listing.
     pub env_keys: Vec<String>,
 }
 
@@ -585,8 +590,9 @@ fn raw_to_display(raw: coda_mcp::config::McpRawServer) -> McpServer {
         coda_mcp::config::McpScope::User => Scope::User,
     };
     let transport = raw.transport(); // call before moving fields
-    let mut env_keys: Vec<String> = raw.env.into_keys().collect();
-    env_keys.sort(); // stable order for tests that check exact equality
+    let mut env_pairs: Vec<(String, String)> = raw.env.into_iter().collect();
+    env_pairs.sort_by(|a, b| a.0.cmp(&b.0)); // stable order
+    let env_keys: Vec<String> = env_pairs.iter().map(|(k, _)| k.clone()).collect();
     McpServer {
         name: raw.name,
         scope,
@@ -595,7 +601,30 @@ fn raw_to_display(raw: coda_mcp::config::McpRawServer) -> McpServer {
         args: raw.args,
         url: raw.url,
         enabled: !raw.disabled,
+        env_raw: env_pairs,
         env_keys,
+    }
+}
+
+/// The immutable identity a server was opened on.
+///
+/// Captured when the editor opens and passed unchanged to [`save_mcp_server`]
+/// so a save always knows *exactly* which on-disk entry it is replacing —
+/// scope included. A name alone cannot distinguish a user entry that is
+/// shadowed by a project entry of the same name, and acting on the wrong one
+/// would delete an unrelated server.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpServerId {
+    pub scope: Scope,
+    pub name: String,
+}
+
+impl McpServerId {
+    pub fn new(scope: Scope, name: impl Into<String>) -> Self {
+        Self {
+            scope,
+            name: name.into(),
+        }
     }
 }
 
@@ -612,10 +641,18 @@ pub struct McpDraft {
     /// `"stdio"` or `"http"`.
     pub transport: String,
     pub command: String,
-    /// Whitespace-separated on screen, a list on disk.
+    /// Arguments as a JSON array string, e.g. `["-y", "server"]`.
+    /// An empty string means no arguments.
     pub args: String,
     pub url: String,
     pub enabled: bool,
+    /// Environment variables as a JSON object mapping names to string values,
+    /// e.g. `{ "API_KEY": "coda-secret:store/key" }`. A JSON object is used
+    /// rather than `KEY=VALUE` lines so values may contain newlines, `=`,
+    /// leading/trailing whitespace or Unicode and still round-trip exactly.
+    /// Values are the *unresolved* text from `.mcp.json`; `coda-secret:`
+    /// references are shown verbatim and never resolved into the UI.
+    pub env: String,
 }
 
 impl McpDraft {
@@ -631,14 +668,29 @@ impl McpDraft {
 
     /// A draft describing an existing server.
     pub fn from_server(server: &McpServer) -> Self {
+        let args = if server.args.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(&server.args).unwrap_or_default()
+        };
+        let env = if server.env_raw.is_empty() {
+            String::new()
+        } else {
+            let mut map = Map::new();
+            for (k, v) in &server.env_raw {
+                map.insert(k.clone(), Value::String(v.clone()));
+            }
+            serde_json::to_string_pretty(&Value::Object(map)).unwrap_or_default()
+        };
         Self {
             name: server.name.clone(),
             scope: server.scope,
             transport: server.transport.to_string(),
             command: server.command.clone().unwrap_or_default(),
-            args: server.args.join(" "),
+            args,
             url: server.url.clone().unwrap_or_default(),
             enabled: server.enabled,
+            env,
         }
     }
 
@@ -655,91 +707,322 @@ impl McpDraft {
         }
         match self.transport.as_str() {
             "stdio" if self.command.trim().is_empty() => {
-                Some("A stdio server needs a command.".to_string())
+                return Some("A stdio server needs a command.".to_string());
             }
             "http" if self.url.trim().is_empty() => {
-                Some("An HTTP server needs a URL.".to_string())
+                return Some("An HTTP server needs a URL.".to_string());
             }
             "http" if !self.url.starts_with("http://") && !self.url.starts_with("https://") => {
-                Some("The URL must start with http:// or https://.".to_string())
+                return Some("The URL must start with http:// or https://.".to_string());
             }
-            _ => None,
+            _ => {}
         }
+        if self.transport == "stdio" {
+            if let Err(e) = parse_args_json(&self.args) {
+                return Some(e);
+            }
+        }
+        if let Err(e) = parse_env_json(&self.env) {
+            return Some(e);
+        }
+        None
     }
 }
 
+/// Parses a JSON array text into a list of argument strings.
+///
+/// An empty string or `[]` is accepted and means no arguments.
+fn parse_args_json(text: &str) -> Result<Vec<String>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "[]" {
+        return Ok(Vec::new());
+    }
+    let arr: Vec<serde_json::Value> = serde_json::from_str(trimmed).map_err(|_| {
+        r#"Arguments must be a valid JSON array, e.g. ["-y", "server"]."#.to_string()
+    })?;
+    arr.into_iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "Each argument must be a string.".to_string())
+        })
+        .collect()
+}
+
+/// Parses the environment JSON object into an ordered list of name/value pairs.
+///
+/// An empty string or `{}` means no environment variables. Values are taken
+/// verbatim, so whitespace, `=`, newlines and Unicode survive untouched.
+///
+/// Names must be non-empty and contain no whitespace, NUL or `=`. Values must
+/// contain no NUL. On Windows environment names are case-insensitive, so
+/// `Path` and `PATH` collide; elsewhere they are distinct. Error messages
+/// never echo a value, so a secret-bearing entry cannot leak into a notice.
+fn parse_env_json(text: &str) -> Result<Vec<(String, String)>, String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || trimmed == "{}" {
+        return Ok(Vec::new());
+    }
+    let value: Value = serde_json::from_str(trimmed)
+        .map_err(|_| r#"Environment must be a JSON object, e.g. {"KEY": "value"}."#.to_string())?;
+    let Value::Object(obj) = value else {
+        return Err(r#"Environment must be a JSON object, e.g. {"KEY": "value"}."#.to_string());
+    };
+
+    let mut entries = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for (key, val) in &obj {
+        if key.is_empty() {
+            return Err("Environment variable name cannot be empty.".to_string());
+        }
+        if key.chars().any(char::is_whitespace) {
+            return Err(format!(
+                "Environment variable name cannot contain whitespace: {key:?}"
+            ));
+        }
+        if key.contains('\0') {
+            return Err(format!(
+                "Environment variable name cannot contain a NUL byte: {key:?}"
+            ));
+        }
+        if key.contains('=') {
+            return Err(format!("Environment variable name cannot contain '=': {key:?}"));
+        }
+        let Value::String(v) = val else {
+            // Deliberately does not print the value: it may be a secret.
+            return Err(format!("Environment variable {key:?} must be a string."));
+        };
+        if v.contains('\0') {
+            return Err(format!(
+                "Environment variable {key:?} has a value containing a NUL byte."
+            ));
+        }
+        // Windows environment names are case-insensitive; other platforms are
+        // not. Normalise the dedup key accordingly.
+        let dedup = if cfg!(windows) {
+            key.to_uppercase()
+        } else {
+            key.clone()
+        };
+        if !seen.insert(dedup) {
+            return Err(format!(
+                "Duplicate environment variable (names are case-insensitive on Windows): {key}"
+            ));
+        }
+        entries.push((key.clone(), v.clone()));
+    }
+    Ok(entries)
+}
+
+/// Removes a named server from a single `.mcp.json` file if it is present.
+fn remove_server_from_file(path: &Path, name: &str) -> Result<(), ConfigError> {
+    let mut doc = read_json(path)?;
+    if let Some(servers) = doc.get_mut("mcpServers").and_then(Value::as_object_mut) {
+        if servers.remove(name).is_some() {
+            return write_json(path, &doc);
+        }
+    }
+    Ok(())
+}
+
+/// The `.mcp.json` path that backs a given scope.
+fn mcp_path_for(paths: &Paths, scope: Scope) -> PathBuf {
+    match scope {
+        Scope::User => paths.user_mcp(),
+        Scope::Project => paths.project_mcp(),
+    }
+}
+
+/// Reads a `.mcp.json` document and rejects a shape the editor cannot safely
+/// rewrite, *before* any write happens.
+///
+/// A root that is not an object, or an `mcpServers` that is present but not an
+/// object, would otherwise be silently reset to an empty object and the user's
+/// data destroyed. Erroring here leaves the (unusual) file untouched.
+fn read_mcp_document(path: &Path) -> Result<Value, ConfigError> {
+    let doc = read_json(path)?;
+    if !doc.is_object() {
+        return Err(ConfigError::Invalid(format!(
+            "{} is not a valid MCP config (expected a JSON object at the top level).",
+            path.display()
+        )));
+    }
+    if let Some(servers) = doc.get("mcpServers") {
+        if !servers.is_object() {
+            return Err(ConfigError::Invalid(format!(
+                "{} has a malformed \"mcpServers\" (expected a JSON object).",
+                path.display()
+            )));
+        }
+    }
+    Ok(doc)
+}
+
+/// Keys the save owns outright and rebuilds from the draft every time.
+///
+/// Everything else on an entry (`auth`, `headers`, future settings) is treated
+/// as opaque and carried across untouched. `type` is owned because a stale
+/// `"type": "http"` left on a server switched to stdio would make the loader
+/// treat it as HTTP; it is rewritten from the chosen transport instead.
+const MANAGED_ENTRY_KEYS: &[&str] = &["command", "args", "url", "type", "disabled", "enabled", "env"];
+
 /// Writes a server into the `.mcp.json` for its scope.
 ///
-/// Replaces an entry of the same name, and removes it from the other scope's
-/// file when the scope changed — otherwise a rename-by-scope would leave two
-/// servers with one name and the loader would pick whichever it saw first.
-pub fn save_mcp_server(paths: &Paths, draft: &McpDraft) -> Result<(), ConfigError> {
+/// `original` is the immutable `(scope, name)` the editor opened on, or `None`
+/// for a brand-new server. It — not the draft's current name/scope — decides
+/// which on-disk entry is being replaced, so a user entry shadowed by a
+/// project entry of the same name is never confused for its neighbour.
+///
+/// Behaviour:
+/// - **Add** (`original` is `None`): the name must not already exist in the
+///   target scope. The opposite scope is left completely untouched, so a
+///   deliberately shadowed pair is preserved.
+/// - **Edit / rename in the same scope**: a single atomic write replaces the
+///   old entry (and drops the old name on a rename).
+/// - **Move across scopes**: the destination is written *first*; only after it
+///   is safely on disk is the source entry removed. If that removal fails the
+///   call reports the half-done state rather than claiming success.
+///
+/// Unknown fields are preserved from the *exact* original entry (its own
+/// scope's file), so auth, headers and future settings survive an edit or a
+/// cross-scope move. Renaming or moving onto an existing name is a collision
+/// and is rejected before anything is written.
+pub fn save_mcp_server(
+    paths: &Paths,
+    draft: &McpDraft,
+    original: Option<&McpServerId>,
+) -> Result<(), ConfigError> {
     if let Some(problem) = draft.validation_error() {
         return Err(ConfigError::Invalid(problem));
     }
 
-    let (target, other) = match draft.scope {
-        Scope::User => (paths.user_mcp(), paths.project_mcp()),
-        Scope::Project => (paths.project_mcp(), paths.user_mcp()),
+    let dest_path = mcp_path_for(paths, draft.scope);
+    let cross_file = original.map_or(false, |id| id.scope != draft.scope);
+
+    // Read and validate every file we will touch *before* writing any of them,
+    // so a malformed source or destination aborts without corrupting either.
+    let mut dest_doc = read_mcp_document(&dest_path)?;
+    let source_doc = match original {
+        Some(id) if cross_file => Some(read_mcp_document(&mcp_path_for(paths, id.scope))?),
+        _ => None,
     };
 
+    // The exact entry being replaced, read from its own scope's file. For a
+    // same-scope edit that is the destination doc; for a move it is the source.
+    let source_entry: Option<Map<String, Value>> = original.and_then(|id| {
+        let doc = source_doc.as_ref().unwrap_or(&dest_doc);
+        doc.get("mcpServers")
+            .and_then(Value::as_object)
+            .and_then(|servers| servers.get(&id.name))
+            .and_then(Value::as_object)
+            .cloned()
+    });
+
+    // Parse args and env — already validated above, so unwrap is safe.
+    let parsed_args = parse_args_json(&draft.args).expect("already validated");
+    let args_values: Vec<Value> = parsed_args.into_iter().map(Value::String).collect();
+    let env_entries = parse_env_json(&draft.env).expect("already validated");
+
+    // Build the new JSON entry from the managed fields.
     let mut entry = Map::new();
-    match draft.transport.as_str() {
-        "http" => {
-            entry.insert("url".into(), Value::String(draft.url.trim().to_string()));
-        }
-        _ => {
-            entry.insert(
-                "command".into(),
-                Value::String(draft.command.trim().to_string()),
-            );
-            let args: Vec<Value> = draft
-                .args
-                .split_whitespace()
-                .map(|a| Value::String(a.to_string()))
-                .collect();
-            if !args.is_empty() {
-                entry.insert("args".into(), Value::Array(args));
-            }
+    let is_http = draft.transport.as_str() == "http";
+    if is_http {
+        entry.insert("url".into(), Value::String(draft.url.trim().to_string()));
+    } else {
+        entry.insert(
+            "command".into(),
+            Value::String(draft.command.trim().to_string()),
+        );
+        if !args_values.is_empty() {
+            entry.insert("args".into(), Value::Array(args_values));
         }
     }
     if !draft.enabled {
         entry.insert("disabled".into(), Value::Bool(true));
     }
-
-    // Preserve any keys this build does not model, so editing a server written
-    // by a newer version does not quietly strip its settings.
-    let mut document = read_json(&target)?;
-    let servers = document
-        .as_object_mut()
-        .expect("mcp document is always an object")
-        .entry("mcpServers".to_string())
-        .or_insert_with(|| Value::Object(Map::new()));
-    if !servers.is_object() {
-        *servers = Value::Object(Map::new());
+    if !env_entries.is_empty() {
+        let mut env_map = Map::new();
+        for (k, v) in &env_entries {
+            env_map.insert(k.clone(), Value::String(v.clone()));
+        }
+        entry.insert("env".into(), Value::Object(env_map));
     }
-    let servers = servers.as_object_mut().expect("just ensured");
 
-    if let Some(Value::Object(existing)) = servers.get(&draft.name) {
+    // Carry across every unmodelled field from the exact original entry, then
+    // rewrite `type` from the chosen transport so a switched server can never
+    // keep a transport marker that contradicts its fields.
+    if let Some(existing) = &source_entry {
         for (key, value) in existing {
-            if !matches!(key.as_str(), "command" | "args" | "url" | "disabled") {
+            if !MANAGED_ENTRY_KEYS.contains(&key.as_str()) {
                 entry.entry(key.clone()).or_insert(value.clone());
             }
         }
     }
-    servers.insert(draft.name.clone(), Value::Object(entry));
-    write_json(&target, &document)?;
+    if is_http {
+        // Preserve an explicit HTTP transport spelling if it had one, else be
+        // explicit about the transport we are writing.
+        let type_ = source_entry
+            .as_ref()
+            .and_then(|e| e.get("type"))
+            .and_then(Value::as_str)
+            .filter(|t| matches!(*t, "http" | "streamable-http"))
+            .unwrap_or("http")
+            .to_string();
+        entry.insert("type".into(), Value::String(type_));
+    }
+    // stdio intentionally writes no `type`: its absence is what the loader
+    // reads as stdio, and any inherited `type` was dropped above.
 
-    // The same name in the other scope would shadow or be shadowed.
-    let mut other_document = read_json(&other)?;
-    if let Some(servers) = other_document
-        .get_mut("mcpServers")
-        .and_then(Value::as_object_mut)
-    {
-        if servers.remove(&draft.name).is_some() {
-            write_json(&other, &other_document)?;
+    let servers = dest_doc
+        .as_object_mut()
+        .expect("validated as object")
+        .entry("mcpServers".to_string())
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .expect("validated as object");
+
+    // A destination entry under the new name that is *not* the very server we
+    // opened on is somebody else — refuse to overwrite it.
+    let editing_same_slot =
+        original.map_or(false, |id| !cross_file && id.name == draft.name);
+    if servers.contains_key(&draft.name) && !editing_same_slot {
+        return Err(ConfigError::Invalid(format!(
+            "A server named '{}' already exists in the {} scope.",
+            draft.name,
+            draft.scope.label()
+        )));
+    }
+
+    servers.insert(draft.name.clone(), Value::Object(entry));
+
+    // A same-scope rename drops the old name in the same write so the file
+    // never transiently holds two entries for one logical server.
+    if let Some(id) = original {
+        if !cross_file && id.name != draft.name {
+            servers.remove(&id.name);
         }
     }
+
+    // Write the destination. On a same-scope edit this is the whole operation;
+    // if it fails the original entry is still intact.
+    write_json(&dest_path, &dest_doc)?;
+
+    // A move writes the destination first and only then retires the source. If
+    // the source removal fails the new copy is already safe, so we report the
+    // half-done state instead of a bare success or a misleading error.
+    if cross_file {
+        let id = original.expect("cross_file implies an original");
+        let source_path = mcp_path_for(paths, id.scope);
+        if let Err(err) = remove_server_from_file(&source_path, &id.name) {
+            return Err(ConfigError::Invalid(format!(
+                "Saved '{}' to the {} scope, but removing the old copy from the {} scope failed: {err}",
+                draft.name,
+                draft.scope.label(),
+                id.scope.label()
+            )));
+        }
+    }
+
     Ok(())
 }
 
@@ -1386,16 +1669,17 @@ mod mcp_editing_tests {
             scope: Scope::User,
             transport: "stdio".into(),
             command: "npx".into(),
-            args: "-y server-everything".into(),
+            args: "[\"-y\",\"server-everything\"]".into(),
             url: String::new(),
             enabled: true,
+            env: String::new(),
         }
     }
 
     #[test]
     fn a_saved_server_reads_back_the_way_it_was_written() {
         let (_dir, paths) = temp();
-        save_mcp_server(&paths, &stdio("everything")).expect("save");
+        save_mcp_server(&paths, &stdio("everything"), None).expect("save");
 
         let servers = load_mcp_servers(&paths).expect("load");
         let saved = servers.iter().find(|s| s.name == "everything").expect("saved");
@@ -1415,7 +1699,7 @@ mod mcp_editing_tests {
             args: String::new(),
             ..stdio("remote")
         };
-        save_mcp_server(&paths, &draft).expect("save");
+        save_mcp_server(&paths, &draft, None).expect("save");
 
         let servers = load_mcp_servers(&paths).expect("load");
         let saved = servers.iter().find(|s| s.name == "remote").expect("saved");
@@ -1425,20 +1709,81 @@ mod mcp_editing_tests {
     }
 
     #[test]
-    fn changing_scope_does_not_leave_the_old_entry_behind() {
-        // Two files defining one name means the loader serves whichever it saw
-        // first, and disabling one would appear to do nothing.
+    fn changing_scope_moves_the_entry_and_leaves_nothing_behind() {
+        // Moving a server to another scope is an *edit* with an explicit
+        // identity: two files defining one name means the loader serves
+        // whichever it saw first, and disabling one would appear to do nothing.
         let (_dir, paths) = temp();
-        save_mcp_server(&paths, &stdio("moving")).expect("save to user");
+        save_mcp_server(&paths, &stdio("moving"), None).expect("save to user");
 
         let mut moved = stdio("moving");
         moved.scope = Scope::Project;
-        save_mcp_server(&paths, &moved).expect("save to project");
+        save_mcp_server(&paths, &moved, Some(&McpServerId::new(Scope::User, "moving")))
+            .expect("move to project");
 
         let servers = load_mcp_servers(&paths).expect("load");
         let matching: Vec<_> = servers.iter().filter(|s| s.name == "moving").collect();
         assert_eq!(matching.len(), 1, "the server exists in both scopes");
         assert_eq!(matching[0].scope, Scope::Project);
+    }
+
+    #[test]
+    fn adding_a_name_that_already_exists_in_the_scope_is_rejected() {
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("dup"), None).expect("first add");
+        // A brand-new add (no identity) must not clobber an existing server.
+        assert!(
+            save_mcp_server(&paths, &stdio("dup"), None).is_err(),
+            "adding an existing name was allowed"
+        );
+    }
+
+    #[test]
+    fn adding_does_not_disturb_a_shadowed_entry_in_the_other_scope() {
+        // A project entry may deliberately shadow a user entry of the same
+        // name; adding to one scope must never delete the other.
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("shared"), None).expect("user add");
+        let mut project = stdio("shared");
+        project.scope = Scope::Project;
+        save_mcp_server(&paths, &project, None).expect("project add");
+
+        // Both files still define the server.
+        let user_doc = read_json(&paths.user_mcp()).expect("read user");
+        let project_doc = read_json(&paths.project_mcp()).expect("read project");
+        assert!(!user_doc["mcpServers"]["shared"].is_null(), "user copy was removed");
+        assert!(
+            !project_doc["mcpServers"]["shared"].is_null(),
+            "project copy was removed"
+        );
+    }
+
+    #[test]
+    fn editing_a_shadowed_entry_touches_only_that_scope() {
+        // A user entry and a project entry share a name. Editing the user one
+        // must change only the user file and leave the project entry intact.
+        let (_dir, paths) = temp();
+        let mut user = stdio("shadowed");
+        user.command = "user-cmd".into();
+        save_mcp_server(&paths, &user, None).expect("user add");
+        let mut project = stdio("shadowed");
+        project.scope = Scope::Project;
+        project.command = "project-cmd".into();
+        save_mcp_server(&paths, &project, None).expect("project add");
+
+        let mut edited = user.clone();
+        edited.command = "user-cmd-2".into();
+        save_mcp_server(&paths, &edited, Some(&McpServerId::new(Scope::User, "shadowed")))
+            .expect("edit user copy");
+
+        let user_doc = read_json(&paths.user_mcp()).expect("read user");
+        let project_doc = read_json(&paths.project_mcp()).expect("read project");
+        assert_eq!(user_doc["mcpServers"]["shadowed"]["command"], "user-cmd-2");
+        assert_eq!(
+            project_doc["mcpServers"]["shadowed"]["command"],
+            "project-cmd",
+            "the opposite-scope entry was disturbed"
+        );
     }
 
     #[test]
@@ -1457,7 +1802,12 @@ mod mcp_editing_tests {
         )
         .expect("seed");
 
-        save_mcp_server(&paths, &stdio("everything")).expect("save");
+        save_mcp_server(
+            &paths,
+            &stdio("everything"),
+            Some(&McpServerId::new(Scope::User, "everything")),
+        )
+        .expect("save");
 
         let document = read_json(&path).expect("read");
         let entry = &document["mcpServers"]["everything"];
@@ -1474,7 +1824,7 @@ mod mcp_editing_tests {
         let (_dir, paths) = temp();
         let mut draft = stdio("off");
         draft.enabled = false;
-        save_mcp_server(&paths, &draft).expect("save");
+        save_mcp_server(&paths, &draft, None).expect("save");
 
         let servers = load_mcp_servers(&paths).expect("load");
         assert!(!servers.iter().find(|s| s.name == "off").expect("saved").enabled);
@@ -1483,7 +1833,7 @@ mod mcp_editing_tests {
     #[test]
     fn deleting_removes_it_from_disk() {
         let (_dir, paths) = temp();
-        save_mcp_server(&paths, &stdio("gone")).expect("save");
+        save_mcp_server(&paths, &stdio("gone"), None).expect("save");
         assert!(delete_mcp_server(&paths, "gone").expect("delete"));
         assert!(!load_mcp_servers(&paths).expect("load").iter().any(|s| s.name == "gone"));
         assert!(!delete_mcp_server(&paths, "gone").expect("delete again"));
@@ -1506,7 +1856,491 @@ mod mcp_editing_tests {
             ),
         ] {
             assert!(draft.validation_error().is_some(), "{why} was accepted");
-            assert!(save_mcp_server(&paths, &draft).is_err(), "{why} reached the file");
+            assert!(save_mcp_server(&paths, &draft, None).is_err(), "{why} reached the file");
         }
+    }
+
+    // -- Args round-trip tests -----------------------------------------------
+
+    #[test]
+    fn args_with_spaces_survive_a_round_trip() {
+        // split_whitespace would shatter "C:\Program Files\server.js" into
+        // three tokens; the JSON array preserves it as one argument.
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            args: r#"["node","C:\\Program Files\\server.js","--port","8080"]"#.into(),
+            ..stdio("spaced")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "spaced").expect("saved");
+        assert_eq!(
+            saved.args,
+            vec!["node", r"C:\Program Files\server.js", "--port", "8080"]
+        );
+    }
+
+    #[test]
+    fn empty_args_survive_a_round_trip() {
+        let (_dir, paths) = temp();
+        let draft = McpDraft { args: String::new(), ..stdio("noargs") };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "noargs").expect("saved");
+        assert!(saved.args.is_empty(), "empty args did not round-trip");
+    }
+
+    #[test]
+    fn args_with_unicode_and_quotes_survive_a_round_trip() {
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            args: r#"["--name","héllo wörld","--flag","it's \"quoted\""]"#.into(),
+            ..stdio("unicode")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "unicode").expect("saved");
+        assert_eq!(saved.args[0], "--name");
+        assert_eq!(saved.args[1], "héllo wörld");
+        assert_eq!(saved.args[3], r#"it's "quoted""#);
+    }
+
+    #[test]
+    fn invalid_args_json_is_rejected() {
+        let draft = McpDraft { args: "not json".into(), ..stdio("x") };
+        assert!(draft.validation_error().is_some(), "invalid JSON was accepted");
+    }
+
+    #[test]
+    fn non_string_args_are_rejected() {
+        let draft = McpDraft { args: "[1, 2, 3]".into(), ..stdio("x") };
+        assert!(draft.validation_error().is_some(), "non-string elements were accepted");
+    }
+
+    // -- Env round-trip tests ------------------------------------------------
+
+    #[test]
+    fn env_values_survive_a_round_trip() {
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            env: r#"{ "API_KEY": "secret123", "BASE_URL": "https://api.example.com" }"#.into(),
+            ..stdio("env-test")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "env-test").expect("saved");
+        assert!(saved.env_keys.contains(&"API_KEY".to_string()));
+        assert!(saved.env_keys.contains(&"BASE_URL".to_string()));
+        assert_eq!(
+            saved.env_raw.iter().find(|(k, _)| k == "API_KEY").map(|(_, v)| v.as_str()),
+            Some("secret123")
+        );
+    }
+
+    #[test]
+    fn env_value_containing_equals_is_preserved() {
+        // Values that themselves contain '=' must survive verbatim.
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            env: r#"{ "CONN": "host=localhost;port=5432" }"#.into(),
+            ..stdio("eq-val")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "eq-val").expect("saved");
+        assert_eq!(
+            saved.env_raw.iter().find(|(k, _)| k == "CONN").map(|(_, v)| v.as_str()),
+            Some("host=localhost;port=5432")
+        );
+    }
+
+    #[test]
+    fn env_value_whitespace_and_unicode_survive_verbatim() {
+        // Leading/trailing whitespace and Unicode must not be trimmed or
+        // mangled — the old KEY=VALUE parser trimmed the whole line.
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            env: r#"{ "PADDED": "  spaced value  ", "GREET": "héllo wörld" }"#.into(),
+            ..stdio("ws")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "ws").expect("saved");
+        assert_eq!(
+            saved.env_raw.iter().find(|(k, _)| k == "PADDED").map(|(_, v)| v.as_str()),
+            Some("  spaced value  "),
+            "value whitespace was stripped"
+        );
+        assert_eq!(
+            saved.env_raw.iter().find(|(k, _)| k == "GREET").map(|(_, v)| v.as_str()),
+            Some("héllo wörld")
+        );
+    }
+
+    #[test]
+    fn env_multiline_value_round_trips() {
+        // A JSON object represents newlines directly, unlike KEY=VALUE lines.
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            env: "{ \"PEM\": \"line1\\nline2\\nline3\" }".into(),
+            ..stdio("multiline")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "multiline").expect("saved");
+        assert_eq!(
+            saved.env_raw.iter().find(|(k, _)| k == "PEM").map(|(_, v)| v.as_str()),
+            Some("line1\nline2\nline3")
+        );
+    }
+
+    #[test]
+    fn env_secret_reference_is_preserved_not_resolved() {
+        let (_dir, paths) = temp();
+        let draft = McpDraft {
+            env: r#"{ "TOKEN": "coda-secret:store/my-key" }"#.into(),
+            ..stdio("secret-ref")
+        };
+        save_mcp_server(&paths, &draft, None).expect("save");
+        let doc = read_json(&paths.user_mcp()).expect("read");
+        assert_eq!(
+            doc["mcpServers"]["secret-ref"]["env"]["TOKEN"],
+            "coda-secret:store/my-key",
+            "the secret reference was resolved or altered"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn env_names_are_case_insensitive_on_windows() {
+        let draft = McpDraft {
+            env: r#"{ "Path": "a", "PATH": "b" }"#.into(),
+            ..stdio("x")
+        };
+        assert!(
+            draft.validation_error().is_some(),
+            "case-only duplicate was accepted on Windows"
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn env_names_are_case_sensitive_off_windows() {
+        let draft = McpDraft {
+            env: r#"{ "Path": "a", "PATH": "b" }"#.into(),
+            ..stdio("x")
+        };
+        assert!(
+            draft.validation_error().is_none(),
+            "case-only names were wrongly rejected off Windows"
+        );
+    }
+
+    #[test]
+    fn env_name_with_whitespace_is_rejected() {
+        let draft = McpDraft { env: r#"{ "BAD KEY": "v" }"#.into(), ..stdio("x") };
+        assert!(draft.validation_error().is_some(), "whitespace name was accepted");
+    }
+
+    #[test]
+    fn empty_env_key_is_rejected() {
+        let draft = McpDraft { env: r#"{ "": "value" }"#.into(), ..stdio("x") };
+        assert!(draft.validation_error().is_some(), "empty key was accepted");
+    }
+
+    #[test]
+    fn non_object_env_is_rejected() {
+        let draft = McpDraft { env: r#"["not","an","object"]"#.into(), ..stdio("x") };
+        assert!(draft.validation_error().is_some(), "a non-object env was accepted");
+    }
+
+    #[test]
+    fn non_string_env_value_is_rejected() {
+        let draft = McpDraft { env: r#"{ "N": 42 }"#.into(), ..stdio("x") };
+        assert!(draft.validation_error().is_some(), "a non-string value was accepted");
+    }
+
+    #[test]
+    fn env_error_does_not_echo_the_value() {
+        // A malformed object must not leak the secret-bearing value into the
+        // error message.
+        let draft = McpDraft {
+            env: r#"{ "TOKEN": 12345 }"#.into(),
+            ..stdio("x")
+        };
+        let err = draft.validation_error().expect("should be rejected");
+        assert!(!err.contains("12345"), "the value leaked into the error: {err}");
+    }
+
+    #[test]
+    fn empty_env_text_means_no_env_vars() {
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("noenv"), None).expect("save");
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "noenv").expect("saved");
+        assert!(saved.env_keys.is_empty());
+        assert!(saved.env_raw.is_empty());
+    }
+
+    // -- Rename and collision tests ------------------------------------------
+
+    #[test]
+    fn rename_retains_env_auth_and_unknown_fields() {
+        let (_dir, paths) = temp();
+        let path = paths.user_mcp();
+        super::write_json(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    "old-name": {
+                        "command": "node",
+                        "env": { "KEY": "val" },
+                        "auth": { "type": "bearer", "token": "tok" },
+                        "futureSetting": 42
+                    }
+                }
+            }),
+        )
+        .expect("seed");
+        let renamed = McpDraft {
+            name: "new-name".into(),
+            args: String::new(),
+            ..stdio("old-name")
+        };
+        save_mcp_server(&paths, &renamed, Some(&McpServerId::new(Scope::User, "old-name")))
+            .expect("save");
+
+        let doc = super::read_json(&path).expect("read");
+        // Old name must be gone.
+        assert!(doc["mcpServers"]["old-name"].is_null(), "old name persists");
+        // New entry must exist with preserved fields.
+        let entry = &doc["mcpServers"]["new-name"];
+        assert!(!entry.is_null(), "new name missing");
+        assert_eq!(entry["auth"]["type"], "bearer", "auth was stripped on rename");
+        assert_eq!(entry["futureSetting"], 42, "unknown field was stripped");
+    }
+
+    #[test]
+    fn rename_to_existing_name_is_rejected() {
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("alpha"), None).expect("save alpha");
+        save_mcp_server(&paths, &stdio("beta"), None).expect("save beta");
+
+        let collide = McpDraft { name: "beta".into(), ..stdio("alpha") };
+        assert!(
+            save_mcp_server(&paths, &collide, Some(&McpServerId::new(Scope::User, "alpha"))).is_err(),
+            "collision was not detected"
+        );
+        // Both originals must still exist.
+        let servers = load_mcp_servers(&paths).expect("load");
+        assert!(servers.iter().any(|s| s.name == "alpha"), "alpha was destroyed");
+        assert!(servers.iter().any(|s| s.name == "beta"), "beta was destroyed");
+    }
+
+    #[test]
+    fn moving_onto_an_existing_name_in_the_other_scope_is_rejected() {
+        // A cross-scope move whose destination name is already taken must be
+        // refused before either file is touched — collision detection has to
+        // cover moves, not just same-scope renames.
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("srv"), None).expect("user srv");
+        let mut project = stdio("srv");
+        project.scope = Scope::Project;
+        project.command = "project-cmd".into();
+        save_mcp_server(&paths, &project, None).expect("project srv");
+
+        // Move the user srv into the project scope, where "srv" already exists.
+        let mut moved = stdio("srv");
+        moved.scope = Scope::Project;
+        assert!(
+            save_mcp_server(&paths, &moved, Some(&McpServerId::new(Scope::User, "srv"))).is_err(),
+            "the move clobbered an existing project server"
+        );
+        // Both originals survive untouched.
+        let user_doc = read_json(&paths.user_mcp()).expect("read user");
+        let project_doc = read_json(&paths.project_mcp()).expect("read project");
+        assert!(!user_doc["mcpServers"]["srv"].is_null(), "user srv was destroyed");
+        assert_eq!(
+            project_doc["mcpServers"]["srv"]["command"],
+            "project-cmd",
+            "project srv was overwritten"
+        );
+    }
+
+    #[test]
+    fn failed_validation_leaves_old_entry_intact() {
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("existing"), None).expect("initial save");
+
+        // Try to save an invalid draft under the same name.
+        let bad = McpDraft { command: String::new(), ..stdio("existing") };
+        assert!(save_mcp_server(&paths, &bad, Some(&McpServerId::new(Scope::User, "existing"))).is_err());
+
+        // Original must still be intact.
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "existing").expect("should exist");
+        assert_eq!(saved.command.as_deref(), Some("npx"), "original command was overwritten");
+    }
+
+    #[test]
+    fn a_malformed_source_file_aborts_before_overwriting() {
+        // An edit whose file is not the shape we can rewrite must error and
+        // leave the (unusual) file exactly as it was, not reset it to {}.
+        let (_dir, paths) = temp();
+        let path = paths.user_mcp();
+        std::fs::create_dir_all(path.parent().unwrap()).expect("mkdir");
+        std::fs::write(&path, r#"{"mcpServers": ["not","an","object"]}"#).expect("seed");
+
+        let draft = stdio("whatever");
+        assert!(
+            save_mcp_server(&paths, &draft, Some(&McpServerId::new(Scope::User, "whatever"))).is_err(),
+            "a malformed mcpServers was silently overwritten"
+        );
+        // The original bytes are still there.
+        let text = std::fs::read_to_string(&path).expect("read");
+        assert!(text.contains("[\"not\",\"an\",\"object\"]") || text.contains("not"), "the file was reset: {text}");
+    }
+
+    #[test]
+    fn switching_http_to_stdio_removes_the_http_type_marker() {
+        // A stale `"type": "http"` left on a server switched to stdio would
+        // make the loader treat it as HTTP. It must be rewritten away.
+        let (_dir, paths) = temp();
+        let path = paths.user_mcp();
+        super::write_json(
+            &path,
+            &serde_json::json!({
+                "mcpServers": {
+                    "switch": { "type": "http", "url": "https://example.com/mcp", "headers": { "X": "1" } }
+                }
+            }),
+        )
+        .expect("seed");
+
+        // Re-open as stdio with a command.
+        let to_stdio = McpDraft {
+            name: "switch".into(),
+            scope: Scope::User,
+            transport: "stdio".into(),
+            command: "npx".into(),
+            args: String::new(),
+            url: String::new(),
+            enabled: true,
+            env: String::new(),
+        };
+        save_mcp_server(&paths, &to_stdio, Some(&McpServerId::new(Scope::User, "switch")))
+            .expect("switch to stdio");
+
+        let doc = read_json(&path).expect("read");
+        let entry = &doc["mcpServers"]["switch"];
+        assert!(entry.get("type").is_none(), "the http type marker survived");
+        assert!(entry.get("url").is_none(), "the url survived a switch to stdio");
+        assert_eq!(entry["command"], "npx");
+        // It must now load as a stdio server.
+        let servers = load_mcp_servers(&paths).expect("load");
+        let saved = servers.iter().find(|s| s.name == "switch").expect("saved");
+        assert_eq!(saved.transport, "stdio", "the server still loads as HTTP");
+    }
+
+    #[test]
+    fn cross_scope_move_preserves_auth_and_headers() {
+        // Unknown fields live only in the source file, so a move must read the
+        // *source* entry to carry auth/headers across — not the (empty)
+        // destination.
+        let (_dir, paths) = temp();
+        let user_path = paths.user_mcp();
+        super::write_json(
+            &user_path,
+            &serde_json::json!({
+                "mcpServers": {
+                    "api": {
+                        "type": "http",
+                        "url": "https://api.example.com/mcp",
+                        "headers": { "X-Api": "abc" },
+                        "auth": { "type": "bearer", "token": "tok" },
+                        "futureSetting": 7
+                    }
+                }
+            }),
+        )
+        .expect("seed");
+
+        let moved = McpDraft {
+            name: "api".into(),
+            scope: Scope::Project,
+            transport: "http".into(),
+            command: String::new(),
+            args: String::new(),
+            url: "https://api.example.com/mcp".into(),
+            enabled: true,
+            env: String::new(),
+        };
+        save_mcp_server(&paths, &moved, Some(&McpServerId::new(Scope::User, "api")))
+            .expect("cross-scope move");
+
+        let project_doc = read_json(&paths.project_mcp()).expect("read project");
+        let entry = &project_doc["mcpServers"]["api"];
+        assert_eq!(entry["headers"]["X-Api"], "abc", "headers were lost on the move");
+        assert_eq!(entry["auth"]["token"], "tok", "auth was lost on the move");
+        assert_eq!(entry["futureSetting"], 7, "unknown field was lost on the move");
+        // The source copy is gone.
+        let user_doc = read_json(&user_path).expect("read user");
+        assert!(user_doc["mcpServers"]["api"].is_null(), "the source copy survived");
+    }
+
+    #[test]
+    fn cross_scope_rename_writes_destination_before_removing_source() {
+        // The new entry must be reachable even if the remove of the old file
+        // were to fail. We test the happy path: source is removed and only one
+        // copy remains.
+        let (_dir, paths) = temp();
+        save_mcp_server(&paths, &stdio("move-me"), None).expect("save in user scope");
+
+        let moved = McpDraft {
+            name: "moved".into(),
+            scope: Scope::Project,
+            args: String::new(),
+            ..stdio("move-me")
+        };
+        save_mcp_server(&paths, &moved, Some(&McpServerId::new(Scope::User, "move-me")))
+            .expect("cross-scope rename");
+
+        let servers = load_mcp_servers(&paths).expect("load");
+        let by_name: Vec<_> = servers.iter().filter(|s| s.name == "moved" || s.name == "move-me").collect();
+        assert_eq!(by_name.len(), 1, "expected exactly one server after rename, got {}", by_name.len());
+        assert_eq!(by_name[0].name, "moved");
+        assert_eq!(by_name[0].scope, Scope::Project);
+    }
+
+    #[test]
+    fn from_server_round_trips_env_raw_values() {
+        let server = super::McpServer {
+            name: "s".into(),
+            scope: Scope::User,
+            transport: "stdio",
+            command: Some("cmd".into()),
+            args: vec!["-x".into()],
+            url: None,
+            enabled: true,
+            env_raw: vec![
+                ("API_KEY".into(), "coda-secret:store/my-key".into()),
+                ("BASE_URL".into(), "https://api.example.com".into()),
+            ],
+            env_keys: vec!["API_KEY".into(), "BASE_URL".into()],
+        };
+        let draft = McpDraft::from_server(&server);
+        // Env comes back as a JSON object with the secret reference intact.
+        let parsed = super::parse_env_json(&draft.env).expect("env round-trips");
+        assert_eq!(
+            parsed.iter().find(|(k, _)| k == "API_KEY").map(|(_, v)| v.as_str()),
+            Some("coda-secret:store/my-key"),
+            "secret ref was resolved or dropped"
+        );
+        assert_eq!(
+            parsed.iter().find(|(k, _)| k == "BASE_URL").map(|(_, v)| v.as_str()),
+            Some("https://api.example.com")
+        );
+        // Args should be a JSON array.
+        assert_eq!(draft.args, "[\"-x\"]");
     }
 }
