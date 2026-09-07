@@ -38,6 +38,7 @@ impl ResponseStream {
         while let Some(event) = self.next().await {
             match event? {
                 StreamEvent::TextDelta(text) => response.text.push_str(&text),
+                StreamEvent::ThinkingStarted => {}
                 StreamEvent::ThinkingDelta(text) => response.thinking.push_str(&text),
                 StreamEvent::ThinkingDone(block) => response.blocks.push(block),
                 StreamEvent::ToolUse(block) => response.blocks.push(block),

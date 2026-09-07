@@ -28,7 +28,7 @@ pub fn build(request: &ChatRequest) -> Value {
     }
 
     if let Some(effort) = request.effort {
-        body["reasoning"] = json!({ "effort": map_effort(effort) });
+        body["reasoning"] = json!({ "effort": map_effort(effort), "summary": "auto" });
     }
 
     if !request.tools.is_empty() {
@@ -173,20 +173,54 @@ struct PartialToolCall {
     arguments: String,
 }
 
+#[derive(Debug, Default)]
+struct PartialReasoning {
+    text: String,
+    id: Option<String>,
+    encrypted_content: Option<String>,
+    started: bool,
+    complete: bool,
+}
+
+impl PartialReasoning {
+    fn start(&mut self) -> Vec<StreamEvent> {
+        if self.started {
+            return Vec::new();
+        }
+        self.started = true;
+        vec![StreamEvent::ThinkingStarted]
+    }
+
+    fn finish(&mut self) -> Option<StreamEvent> {
+        if !self.started || self.complete {
+            return None;
+        }
+        self.complete = true;
+        let signature = self.encrypted_content.take().map(|encrypted| {
+            json!({
+                "id": self.id.take().unwrap_or_default(),
+                "encrypted_content": encrypted,
+            }).to_string()
+        });
+        Some(StreamEvent::ThinkingDone(Content::Thinking {
+            text: std::mem::take(&mut self.text),
+            signature,
+        }))
+    }
+}
+
 /// Decodes the OpenAI Responses API streaming protocol.
 ///
 /// Tool calls accumulate across `response.output_item.added` (id/name) and
 /// `response.function_call_arguments.delta` (argument fragments), then flush
 /// all at once on `response.completed` / `response.incomplete`.
 ///
-/// Reasoning text accumulates across `response.reasoning_summary_text.delta`
-/// events and is emitted as a `ThinkingDone` block at completion.
+/// Reasoning starts with its output item, before summary text, and finishes
+/// with that item. Terminal events flush any reasoning not explicitly closed.
 #[derive(Debug, Default)]
 pub struct ResponsesDecoder {
     tool_calls: BTreeMap<usize, PartialToolCall>,
-    reasoning_text: String,
-    reasoning_item_id: Option<String>,
-    reasoning_encrypted_content: Option<String>,
+    reasoning: BTreeMap<usize, PartialReasoning>,
     stop_reason: Option<String>,
     usage: Usage,
     finished: bool,
@@ -208,6 +242,9 @@ impl ResponsesDecoder {
     /// The JSON `type` field is authoritative; the SSE event name is only used
     /// as a fallback so that future API changes that rename events still work.
     pub fn decode(&mut self, event_type: &str, data: &str) -> Result<Vec<StreamEvent>, LlmError> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
         // Some streams close with `data: [DONE]` after the terminal event.
         if data.trim() == "[DONE]" {
             return Ok(Vec::new());
@@ -236,8 +273,14 @@ impl ResponsesDecoder {
                 if chunk.is_empty() {
                     return Ok(Vec::new());
                 }
-                self.reasoning_text.push_str(chunk);
-                Ok(vec![StreamEvent::ThinkingDelta(chunk.to_string())])
+                let entry = self.reasoning.entry(output_index(&value)).or_default();
+                if entry.complete {
+                    return Ok(Vec::new());
+                }
+                let mut events = entry.start();
+                entry.text.push_str(chunk);
+                events.push(StreamEvent::ThinkingDelta(chunk.to_string()));
+                Ok(events)
             }
 
             "response.output_item.added" | "response.output_item.done" => {
@@ -251,12 +294,33 @@ impl ResponsesDecoder {
                     let entry = self.tool_calls.entry(index).or_default();
                     read_tool_call(item, entry);
                 } else if item_type == "reasoning" {
+                    let entry = self.reasoning.entry(output_index(&value)).or_default();
+                    if entry.complete {
+                        return Ok(Vec::new());
+                    }
+                    let mut events = entry.start();
                     if let Some(id) = item.get("id").and_then(Value::as_str) {
-                        self.reasoning_item_id = Some(id.to_string());
+                        entry.id = Some(id.to_string());
                     }
                     if let Some(enc) = item.get("encrypted_content").and_then(Value::as_str) {
-                        self.reasoning_encrypted_content = Some(enc.to_string());
+                        entry.encrypted_content = Some(enc.to_string());
                     }
+                    // Some providers include the summary only on the completed
+                    // item. Do not replay it when deltas already supplied it.
+                    if entry.text.is_empty() {
+                        if let Some(summary) = item.get("summary").and_then(Value::as_array) {
+                            entry.text = summary.iter()
+                                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                .collect::<Vec<_>>().join("\n\n");
+                            if !entry.text.is_empty() {
+                                events.push(StreamEvent::ThinkingDelta(entry.text.clone()));
+                            }
+                        }
+                    }
+                    if kind == "response.output_item.done" {
+                        events.extend(entry.finish());
+                    }
+                    return Ok(events);
                 }
                 Ok(Vec::new())
             }
@@ -305,7 +369,7 @@ impl ResponsesDecoder {
     }
 
     fn flush_events(&mut self) -> Vec<StreamEvent> {
-        let mut events = Vec::new();
+        let mut events: Vec<_> = self.reasoning.values_mut().filter_map(PartialReasoning::finish).collect();
 
         for tc in self.tool_calls.values() {
             events.push(StreamEvent::ToolUse(Content::ToolUse {
@@ -317,23 +381,6 @@ impl ResponsesDecoder {
                     tc.arguments.clone()
                 },
                 correlation: Correlation::default(),
-            }));
-        }
-
-        // The signature carries the reasoning item id + encrypted_content as a
-        // JSON string so `append_assistant_input` can reconstruct the full
-        // `reasoning` input item for stateless replay on the next turn.
-        if !self.reasoning_text.is_empty() {
-            let signature = self.reasoning_encrypted_content.as_ref().map(|enc| {
-                json!({
-                    "id": self.reasoning_item_id.as_deref().unwrap_or(""),
-                    "encrypted_content": enc,
-                })
-                .to_string()
-            });
-            events.push(StreamEvent::ThinkingDone(Content::Thinking {
-                text: self.reasoning_text.clone(),
-                signature,
             }));
         }
 
@@ -607,6 +654,76 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_start_is_visible_before_any_summary_text_arrives() {
+        let mut decoder = ResponsesDecoder::new();
+        let events = decoder.decode("response.output_item.added", &json!({
+            "output_index": 0,
+            "item": {"type": "reasoning", "id": "r1", "summary": []}
+        }).to_string()).unwrap();
+        assert!(!events.is_empty(), "the provider has started reasoning, but the UI receives nothing");
+        assert!(!decoder.finished());
+    }
+
+    #[test]
+    fn reasoning_item_done_preserves_encrypted_only_thinking_before_answer() {
+        let (events, _) = run(&[
+            ("response.output_item.added", json!({"output_index":0,"item":{"type":"reasoning","id":"r1","summary":[]}})),
+            ("response.output_item.done", json!({"output_index":0,"item":{"type":"reasoning","id":"r1","summary":[],"encrypted_content":"opaque"}})),
+            ("response.output_text.delta", json!({"delta":"answer"})),
+            ("response.completed", json!({"response":{}})),
+        ]);
+        let thinking: Vec<_> = events.iter().enumerate()
+            .filter(|(_, event)| matches!(event, StreamEvent::ThinkingDone(_))).collect();
+        assert_eq!(thinking.len(), 1, "encrypted reasoning must not be dropped or completed twice");
+        let answer = events.iter().position(|event| matches!(event, StreamEvent::TextDelta(_))).unwrap();
+        assert!(thinking[0].0 < answer, "thinking must finish before the answer starts");
+        let StreamEvent::ThinkingDone(Content::Thinking { text, signature }) = thinking[0].1 else {
+            panic!("expected thinking");
+        };
+        assert!(text.is_empty());
+        let signature: Value = serde_json::from_str(signature.as_deref().unwrap()).unwrap();
+        assert_eq!(signature["encrypted_content"], "opaque");
+    }
+
+    #[test]
+    fn reasoning_items_complete_independently_and_do_not_repeat_summary() {
+        let (events, _) = run(&[
+            ("response.output_item.added", json!({"output_index":0,"item":{"type":"reasoning","id":"r1"}})),
+            ("response.reasoning_summary_text.delta", json!({"output_index":0,"delta":"first"})),
+            ("response.output_item.done", json!({"output_index":0,"item":{"type":"reasoning","id":"r1","summary":[{"type":"summary_text","text":"first"}],"encrypted_content":"one"}})),
+            ("response.output_item.added", json!({"output_index":2,"item":{"type":"reasoning","id":"r2"}})),
+            ("response.output_item.done", json!({"output_index":2,"item":{"type":"reasoning","id":"r2","summary":[{"type":"summary_text","text":"second"}],"encrypted_content":"two"}})),
+            ("response.completed", json!({"response":{}})),
+        ]);
+        let started = events.iter().filter(|e| matches!(e, StreamEvent::ThinkingStarted)).count();
+        assert_eq!(started, 2);
+        let deltas: Vec<_> = events.iter().filter_map(|e| match e {
+            StreamEvent::ThinkingDelta(text) => Some(text.as_str()),
+            _ => None,
+        }).collect();
+        assert_eq!(deltas, ["first", "second"]);
+        let blocks: Vec<_> = events.iter().filter_map(|e| match e {
+            StreamEvent::ThinkingDone(Content::Thinking { text, signature }) =>
+                Some((text.as_str(), serde_json::from_str::<Value>(signature.as_deref().unwrap()).unwrap())),
+            _ => None,
+        }).collect();
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "first");
+        assert_eq!(blocks[0].1["id"], "r1");
+        assert_eq!(blocks[1].0, "second");
+        assert_eq!(blocks[1].1["id"], "r2");
+    }
+
+    #[test]
+    fn reasoning_effort_opts_in_to_visible_summary() {
+        let request = ChatRequest::new("gpt-6-astra", vec![Message::user("hello")])
+            .with_effort(Some(Effort::Xhigh));
+        let body = build(&request);
+        assert_eq!(body["reasoning"], json!({"effort":"xhigh","summary":"auto"}));
+        assert!(build(&ChatRequest::new("gpt-4o", vec![])).get("reasoning").is_none());
+    }
+
+    #[test]
     fn decodes_reasoning_summary_delta_as_thinking() {
         let (events, _) = run(&[
             ("response.reasoning_summary_text.delta", json!({ "type": "response.reasoning_summary_text.delta", "delta": "let me " })),
@@ -623,7 +740,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_emits_tool_calls_then_thinking_then_done() {
+    fn completed_closes_thinking_before_tools_and_done() {
         let (events, decoder) = run(&[
             ("response.output_item.added", json!({ "type": "response.output_item.added", "output_index": 0, "item": { "type": "function_call", "call_id": "c1", "name": "read_file" } })),
             ("response.function_call_arguments.delta", json!({ "type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{}" })),
@@ -635,7 +752,7 @@ mod tests {
         let tool = events.iter().position(|e| matches!(e, StreamEvent::ToolUse(_))).unwrap();
         let thinking = events.iter().position(|e| matches!(e, StreamEvent::ThinkingDone(_))).unwrap();
         let done = events.iter().position(|e| matches!(e, StreamEvent::Done { .. })).unwrap();
-        assert!(tool < thinking, "tool calls before thinking done");
+        assert!(thinking < tool, "thinking closes before tool execution");
         assert!(thinking < done, "thinking done before final Done");
 
         let Some(StreamEvent::Done { usage, stop_reason }) = events.last() else { panic!() };
