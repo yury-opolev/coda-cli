@@ -288,6 +288,10 @@ Fields are driven by transport — stdio shows Command, Arguments and Environmen
 HTTP shows URL and Environment — so the form never offers fields the loader
 would discard.
 
+Existing UTF-8 `.mcp.json` and TUI settings files are accepted with or without
+a leading byte-order mark (BOM), including files written by the C# version.
+Loading does not rewrite the file; malformed JSON still reports an error.
+
 **Arguments** are edited as a JSON array (e.g. `["-y", "server"]`). This
 preserves arguments that contain spaces, quotes, backslashes or Unicode exactly,
 without any shell-quoting heuristics that would silently corrupt Windows paths.
@@ -365,6 +369,96 @@ Behaviour notes:
 - Invalid startup values (bad `--effort`, unknown `--permission-mode`, a
   non-positive `--goal-timeout`, or a negative `--max-continuations`) fail
   startup with an error instead of being silently defaulted or clamped.
+
+### GitHub Enterprise Copilot
+
+Enterprise tenants serve device-code auth, token exchange, and inference from
+their own hosts. The engine resolves the full endpoint set from a single domain
+name; no per-URL configuration is needed.
+
+**Setting the domain**
+
+The domain can be set in two ways, with the environment variable taking
+precedence if both are present:
+
+```powershell
+# 1. Process environment — wins over the saved setting when non-blank:
+$env:GH_COPILOT_ENTERPRISE_DOMAIN = "octocorp.ghe.com"
+coda
+
+# 2. Persisted in settings — read at startup on every run:
+#    Write "githubEnterpriseDomain": "octocorp.ghe.com" to ~/.coda/settings.json
+#    The exact key is camelCase; an existing C# profile needs no migration.
+```
+
+The Rust engine reads `githubEnterpriseDomain` directly from
+`~/.coda/settings.json` at startup (BOM-tolerant, honors `CODA_HOME`). No
+C# layer or environment mutation is involved; the resolver passes a combined
+lookup to `AuthCopilotConfig::from_env_lookup`: env wins if non-blank,
+otherwise the saved setting is used.
+Unreadable or malformed settings stop Copilot client construction rather than
+silently selecting public endpoints.
+
+**What the domain configures**
+
+| Derived URL | Value |
+|---|---|
+| Device-code request | `https://<domain>/login/device/code` |
+| OAuth token endpoint | `https://<domain>/login/oauth/access_token` |
+| Copilot token exchange | `https://api.<domain>/copilot_internal/v2/token` |
+| Inference base URL | `https://copilot-api.<domain>` |
+
+The client id and editor identity headers (`editor-version`, `editor-plugin-version`,
+`copilot-integration-id`, `user-agent`) are shared with the public github.com
+configuration and do not need to be overridden for most enterprise tenants.
+
+**Per-endpoint overrides**
+
+A tenant that proxies only one endpoint can override it without restating the
+rest:
+
+```powershell
+$env:GH_COPILOT_ENTERPRISE_DOMAIN = "octocorp.ghe.com"
+$env:GH_COPILOT_API_BASE_URL      = "https://proxy.internal/copilot"
+```
+
+Full override variables: `GH_COPILOT_API_BASE_URL`, `GH_COPILOT_COPILOT_TOKEN_URL`,
+`GH_COPILOT_DEVICE_CODE_URL`, `GH_COPILOT_TOKEN_URL`, `GH_COPILOT_CLIENT_ID`,
+`GH_COPILOT_EDITOR_VERSION`, `GH_COPILOT_PLUGIN_VERSION`,
+`GH_COPILOT_INTEGRATION_ID`, `GH_COPILOT_USER_AGENT`.
+Set `GH_COPILOT_USE_EXCHANGE=false` to skip the Copilot token exchange and use
+the raw GitHub OAuth token directly (reduces model entitlement on most tenants).
+
+**Domain validation**
+
+The domain must be a bare `host[:port]` — no scheme, path, query, fragment, or
+embedded credentials. A value like `evil.com/@octocorp.ghe.com` or
+`octocorp.ghe.com/path` is rejected at startup with an explicit error rather
+than falling back to the public github.com default, which would silently send
+the enterprise token to the wrong host.
+
+If you accidentally paste the inference host (`copilot-api.octocorp.ghe.com`)
+instead of the GHE host, the `copilot-api.` prefix is stripped automatically
+so every derived URL stays consistent.
+
+**Startup credential diagnostics**
+
+Unlike a missing credential (which is silent — "not signed in"), a
+token-exchange failure or keyring error at startup is reported as a
+provider-specific message on the first prompt:
+
+```
+GitHub Copilot credential error: token refresh failed (HTTP 401).
+Check credentials and provider configuration, then restart Coda.
+```
+
+Response bodies, raw store/transport error text, and credential-bearing URLs
+are never included. Messages identify the failure category and HTTP status
+when available. To recover, check credentials, configuration, and connectivity,
+then restart Coda.
+
+The diagnostic is scoped to the current engine instance — a failed probe on
+one session does not contaminate another.
 
 ## The two seams
 
@@ -467,4 +561,3 @@ the obvious alternative is exploitable:
 - **The turn slot is released by a `Drop` guard.** A serve task is cancellable;
   releasing only on the `Ok`/`Err` paths would leave the slot claimed forever
   after a client disconnects mid-turn, refusing every later prompt as busy.
-

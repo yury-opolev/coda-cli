@@ -131,12 +131,33 @@ impl App {
             return;
         }
 
-        // No argument — display the configured provider and any model-by-provider entries.
+        // No argument — show provider status from two sources:
+        //   1. Engine-reported session provider (self.connected_provider): the provider
+        //      the engine actually found a credential for and connected with. This is
+        //      NOT independently verified as currently authenticated — it is what the
+        //      engine reported at model-list time.
+        //   2. Saved defaultProvider from settings: what the user has configured as
+        //      the startup default. May differ from the session provider if the engine
+        //      fell back to a different credential.
+        //
+        // These are kept separate deliberately: conflating them would falsely imply
+        // the configured default is authenticated, or that the session provider is
+        // the user's explicit choice.
+        let session_provider = self.connected_provider.clone();
         let read_result = tokio::task::spawn_blocking(move || config::Settings::load(&paths)).await;
         match read_result {
             Ok(Ok(settings)) => {
-                let provider = settings.default_provider().unwrap_or("(none)");
-                let mut out = format!("Active provider: {provider}\n");
+                let configured = settings.default_provider().unwrap_or("(none)");
+                let mut out = String::new();
+
+                match session_provider.as_deref() {
+                    Some(p) => out.push_str(&format!(
+                        "Session provider: {p} (reported by engine; authentication state unverified)\n"
+                    )),
+                    None => out.push_str("Session provider: (none — engine has not reported a connected provider)\n"),
+                }
+                out.push_str(&format!("Configured default: {configured}\n"));
+
                 let providers_seen: Vec<String> = settings
                     .raw()
                     .get("modelByProvider")
@@ -144,15 +165,14 @@ impl App {
                     .map(|obj| obj.keys().cloned().collect())
                     .unwrap_or_default();
                 if !providers_seen.is_empty() {
-                    out.push_str("Configured providers:");
+                    out.push_str("Configured providers (from modelByProvider):");
                     for p in &providers_seen {
-                        let mark = if p == provider { " (active)" } else { "" };
-                        out.push_str(&format!("\n  {p}{mark}"));
+                        out.push_str(&format!("\n  {p}"));
                     }
                 } else {
                     out.push_str("Use /provider <id> to switch (e.g. github-copilot, claude-ai).");
                 }
-                self.output(out);
+                self.output(out.trim_end().to_string());
             }
             Ok(Err(e)) => self.notice(format!("Could not read settings: {e}"), NoticeLevel::Error),
             Err(_) => self.notice("Settings read was interrupted.", NoticeLevel::Error),

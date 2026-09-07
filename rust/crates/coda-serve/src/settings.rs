@@ -1,9 +1,9 @@
 //! Minimal settings reader for the engine.
 //!
-//! The engine needs only the active provider and its model. The TUI has a
+//! The engine needs the active provider, model, and Copilot routing. The TUI has a
 //! richer settings module, but the dependency direction forbids
 //! `coda-serve → coda-tui`, and pulling the whole front-end config surface in
-//! here to read two fields would be worse than a small focused reader.
+//! here would be worse than a small focused reader.
 //!
 //! Deliberately read-only: the engine never writes settings. Writes belong to
 //! the front-end, which already preserves unknown keys and writes atomically.
@@ -11,6 +11,7 @@
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
+use coda_auth::provider::copilot::CopilotConfig as AuthCopilotConfig;
 
 /// The model used when settings say nothing.
 ///
@@ -98,10 +99,7 @@ pub fn resolve_for_provider(provider: Option<&str>) -> StartupModel {
 /// Like [`resolve_for_provider`] but reads from an explicit file path.
 /// Exposed for testing; production callers use [`resolve_for_provider`].
 pub fn resolve_for_provider_at(path: &Path, provider: Option<&str>) -> StartupModel {
-    let value = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_default();
+    let value = read_settings_json(path).unwrap_or_default();
     resolve_for_provider_from(&value, provider)
 }
 
@@ -138,9 +136,7 @@ pub fn model_for_provider(provider: &str) -> String {
 
 /// Reads the startup model from a specific settings file.
 pub fn resolve_at(path: &Path) -> StartupModel {
-    let parsed = std::fs::read_to_string(path)
-        .ok()
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let parsed = read_settings_json(path);
     match parsed {
         Some(value) => resolve_from(&value),
         // A missing or corrupt settings file must not stop the engine starting.
@@ -160,6 +156,112 @@ pub fn resolve() -> StartupModel {
             model: FALLBACK_MODEL.into(),
         },
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Enterprise Copilot configuration resolver
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum CopilotConfigError {
+    #[error("cannot read settings.json; check file access before retrying")]
+    ReadSettings,
+    #[error("settings.json contains invalid JSON")]
+    ParseSettings,
+    #[error("settings.json must contain an object with a string or null githubEnterpriseDomain")]
+    InvalidSettings,
+    #[error("invalid Copilot endpoint configuration")]
+    Endpoint(#[from] coda_auth::AuthError),
+}
+
+/// Resolves the [`AuthCopilotConfig`] by layering:
+///
+/// 1. `GH_COPILOT_ENTERPRISE_DOMAIN` (and other `GH_COPILOT_*` overrides) from
+///    the **process environment** — non-blank env value wins unconditionally.
+/// 2. `githubEnterpriseDomain` from the **saved settings file** — read from
+///    `~/.coda/settings.json` (path respects `CODA_HOME`).
+/// 3. Public github.com defaults when neither source has a domain.
+///
+/// **No environment mutation.** This function never writes to the process
+/// environment; it passes a custom lookup closure to
+/// [`AuthCopilotConfig::from_env_lookup`] instead, which is already the
+/// testable seam.
+///
+/// An absent file permits public defaults. An unreadable or invalid file fails
+/// closed so losing the saved enterprise domain never redirects its credentials.
+pub(crate) fn resolve_copilot_config() -> Result<AuthCopilotConfig, CopilotConfigError> {
+    let path = settings_path();
+    resolve_copilot_config_from(
+        path.as_deref(),
+        |key| std::env::var(key).ok().filter(|v| !v.is_empty()),
+    )
+}
+
+/// Testable core of [`resolve_copilot_config`].
+///
+/// Accepts an explicit file path (so tests can use temp files) and an explicit
+/// env lookup (so tests never write real process-environment variables).
+pub(crate) fn resolve_copilot_config_from(
+    settings_path: Option<&Path>,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<AuthCopilotConfig, CopilotConfigError> {
+    // Read the saved domain once; it may be used inside the closure below.
+    let settings = settings_path.map(read_settings_json_checked).transpose()?.flatten();
+    let saved_domain = match settings.as_ref() {
+        None => None,
+        Some(Value::Object(object)) => match object.get("githubEnterpriseDomain") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(domain)) => Some(domain.clone()),
+            _ => return Err(CopilotConfigError::InvalidSettings),
+        },
+        _ => return Err(CopilotConfigError::InvalidSettings),
+    };
+
+    // Build the effective env lookup: env wins if non-blank; otherwise fall
+    // back to the saved domain for the enterprise-domain key only.
+    Ok(AuthCopilotConfig::from_env_lookup(|key| {
+        let env_val = env(key).filter(|v| !v.trim().is_empty());
+        if env_val.is_some() {
+            return env_val;
+        }
+        // Only the enterprise-domain key has a settings fallback; every other
+        // GH_COPILOT_* variable is pure environment-override.
+        if key == "GH_COPILOT_ENTERPRISE_DOMAIN" {
+            return saved_domain.clone().filter(|v| !v.trim().is_empty());
+        }
+        None
+    })?)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Read `path` as JSON, tolerating a leading UTF-8 BOM (`\u{feff}`).
+///
+/// Returns `None` when the file is absent, unreadable, or contains invalid JSON.
+/// `coda-mcp` and `coda-tui` apply the same single-expression strip; no shared
+/// helper is introduced — the expression is one line.
+fn read_settings_json(path: &Path) -> Option<Value> {
+    read_settings_json_checked(path).ok().flatten()
+}
+
+fn read_settings_json_checked(path: &Path) -> Result<Option<Value>, CopilotConfigError> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(CopilotConfigError::ReadSettings),
+    };
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    serde_json::from_str(text)
+        .map(Some)
+        .map_err(|_| CopilotConfigError::ParseSettings)
+}
+
+/// Returns the raw settings document, using an empty object when unavailable.
+/// Used by the host for effort / LSP settings that also live in `settings.json`.
+pub(crate) fn load_settings_json(path: &Path) -> Value {
+    read_settings_json(path).unwrap_or_else(|| Value::Object(Default::default()))
 }
 
 #[cfg(test)]
@@ -364,5 +466,144 @@ mod tests {
     fn resolve_for_provider_none_uses_fallback_provider() {
         let resolved = resolve_for_provider(None);
         assert_eq!(resolved.provider_id, FALLBACK_PROVIDER);
+    }
+
+    // ── resolve_copilot_config_from tests ─────────────────────────────────────
+
+    fn no_env(_key: &str) -> Option<String> { None }
+
+    fn env_of(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
+        let owned: Vec<(String, String)> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |key| owned.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+    }
+
+    fn temp_settings(content: &str) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, content).expect("write settings");
+        (dir, path)
+    }
+
+    /// No env, no saved domain → public default endpoints.
+    #[test]
+    fn no_env_no_saved_domain_produces_public_default() {
+        let config = resolve_copilot_config_from(None, no_env).expect("config");
+        assert_eq!(config.api_base_url, "https://api.githubcopilot.com");
+        assert_eq!(config.device_code_url, "https://github.com/login/device/code");
+    }
+
+    /// Saved domain with no env → enterprise endpoints used.
+    #[test]
+    fn saved_domain_with_no_env_produces_enterprise_config() {
+        let (_dir, path) = temp_settings(
+            r#"{"githubEnterpriseDomain": "octocorp.ghe.com"}"#,
+        );
+        let config = resolve_copilot_config_from(Some(&path), no_env).expect("config");
+        assert_eq!(config.api_base_url, "https://copilot-api.octocorp.ghe.com");
+        assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+    }
+
+    /// Env override wins over saved domain when both are set.
+    #[test]
+    fn env_override_wins_over_saved_domain() {
+        let (_dir, path) = temp_settings(
+            r#"{"githubEnterpriseDomain": "saved.ghe.com"}"#,
+        );
+        let config = resolve_copilot_config_from(
+            Some(&path),
+            env_of(&[("GH_COPILOT_ENTERPRISE_DOMAIN", "env.ghe.com")]),
+        )
+        .expect("config");
+        assert_eq!(
+            config.api_base_url, "https://copilot-api.env.ghe.com",
+            "env var must win over saved domain"
+        );
+        assert_eq!(config.device_code_url, "https://env.ghe.com/login/device/code");
+    }
+
+    /// Empty env var does NOT override saved domain.
+    #[test]
+    fn blank_env_var_does_not_suppress_saved_domain() {
+        let (_dir, path) = temp_settings(
+            r#"{"githubEnterpriseDomain": "octocorp.ghe.com"}"#,
+        );
+        let config = resolve_copilot_config_from(
+            Some(&path),
+            env_of(&[("GH_COPILOT_ENTERPRISE_DOMAIN", "")]),
+        )
+        .expect("config");
+        assert_eq!(
+            config.api_base_url, "https://copilot-api.octocorp.ghe.com",
+            "blank env var must not suppress saved domain"
+        );
+    }
+
+    /// A settings file with a BOM is parsed correctly.
+    #[test]
+    fn bom_settings_file_is_parsed_correctly() {
+        // U+FEFF BOM followed by valid JSON.
+        let content = "\u{feff}{\"githubEnterpriseDomain\": \"bom.ghe.com\"}";
+        let (_dir, path) = temp_settings(content);
+        let config = resolve_copilot_config_from(Some(&path), no_env).expect("config");
+        assert_eq!(config.api_base_url, "https://copilot-api.bom.ghe.com");
+    }
+
+    /// An invalid saved domain (contains a path) fails rather than silently
+    /// routing to the public github.com default, which would send enterprise
+    /// credentials to the wrong host.
+    #[test]
+    fn invalid_saved_domain_fails_rather_than_falling_back_to_public() {
+        let (_dir, path) = temp_settings(
+            r#"{"githubEnterpriseDomain": "evil.com/path"}"#,
+        );
+        let result = resolve_copilot_config_from(Some(&path), no_env);
+        assert!(
+            result.is_err(),
+            "a domain with a path component must be rejected, not silently defaulted to public"
+        );
+    }
+
+    /// An unreadable enterprise setting must never silently select public routing.
+    #[test]
+    fn malformed_copilot_settings_fail_closed() {
+        for content in [
+            "{ this is not json",
+            "\u{feff}\u{feff}{}",
+            "[]",
+            r#"{"githubEnterpriseDomain":123}"#,
+        ] {
+            let (_dir, path) = temp_settings(content);
+            assert!(resolve_copilot_config_from(Some(&path), no_env).is_err());
+        }
+        let dir = tempfile::TempDir::new().unwrap();
+        assert!(resolve_copilot_config_from(Some(dir.path()), no_env).is_err());
+    }
+
+    /// Missing settings file falls back to public default.
+    #[test]
+    fn absent_settings_file_falls_back_to_public_default() {
+        let config =
+            resolve_copilot_config_from(Some(Path::new("nonexistent/settings.json")), no_env)
+                .expect("absent settings must not error");
+        assert_eq!(config.api_base_url, "https://api.githubcopilot.com");
+    }
+
+    /// An explicit GH_COPILOT_API_BASE_URL env override applies on top of a
+    /// saved enterprise domain (endpoint-level precedence).
+    #[test]
+    fn endpoint_env_override_applies_on_top_of_saved_domain() {
+        let (_dir, path) = temp_settings(
+            r#"{"githubEnterpriseDomain": "octocorp.ghe.com"}"#,
+        );
+        let config = resolve_copilot_config_from(
+            Some(&path),
+            env_of(&[("GH_COPILOT_API_BASE_URL", "https://proxy.internal/copilot")]),
+        )
+        .expect("config");
+        // Enterprise domain is still used for auth endpoints...
+        assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+        // ...but the inference base URL is overridden.
+        assert_eq!(config.api_base_url, "https://proxy.internal/copilot");
     }
 }

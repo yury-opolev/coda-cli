@@ -115,11 +115,16 @@ pub enum ConfigError {
 /// Reads a JSON document, treating a missing file as an empty object.
 fn read_json(path: &Path) -> Result<Value, ConfigError> {
     match std::fs::read_to_string(path) {
-        Ok(text) if text.trim().is_empty() => Ok(Value::Object(Map::new())),
-        Ok(text) => serde_json::from_str(&text).map_err(|source| ConfigError::Parse {
-            path: path.to_path_buf(),
-            source,
-        }),
+        Ok(text) => {
+            let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            if text.trim().is_empty() {
+                return Ok(Value::Object(Map::new()));
+            }
+            serde_json::from_str(text).map_err(|source| ConfigError::Parse {
+                path: path.to_path_buf(),
+                source,
+            })
+        }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(Value::Object(Map::new()))
         }
@@ -1205,6 +1210,43 @@ mod tests {
     fn write(path: &Path, value: Value) {
         std::fs::create_dir_all(path.parent().unwrap()).expect("parent");
         std::fs::write(path, serde_json::to_string_pretty(&value).unwrap()).expect("write");
+    }
+
+    #[test]
+    fn json_config_accepts_optional_utf8_bom_without_rewriting() {
+        let (_dir, paths) = temp_paths();
+        for path in [paths.settings(), paths.user_mcp(), paths.project_mcp()] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            for prefix in ["", "\u{feff}"] {
+                let content = format!("{prefix}{{\"preserved\":\"value\"}}");
+                std::fs::write(&path, &content).unwrap();
+                assert_eq!(read_json(&path).unwrap(), json!({"preserved": "value"}));
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+            }
+        }
+    }
+
+    #[test]
+    fn bom_prefixed_settings_preserve_model_selection() {
+        let (_dir, paths) = temp_paths();
+        std::fs::write(
+            paths.settings(),
+            "\u{feff}{\"modelByProvider\":{\"github-copilot\":\"claude-opus-5\"}}",
+        ).unwrap();
+        assert_eq!(
+            Settings::load(&paths).unwrap().model_for("github-copilot"),
+            Some("claude-opus-5"),
+        );
+    }
+
+    #[test]
+    fn json_config_bom_does_not_hide_malformed_content() {
+        let (_dir, paths) = temp_paths();
+        for content in ["\u{feff}{broken", "\u{feff}\u{feff}{}", " \u{feff}{}"] {
+            std::fs::write(paths.settings(), content).unwrap();
+            assert!(matches!(read_json(&paths.settings()), Err(ConfigError::Parse { .. })));
+            assert_eq!(std::fs::read_to_string(paths.settings()).unwrap(), content);
+        }
     }
 
     #[test]
