@@ -157,6 +157,11 @@ pub struct App {
     /// Used to pre-select the picker at the setting already in effect rather
     /// than defaulting to "high" every time.
     session_effort: Option<String>,
+    /// The engine's own diagnostic log path, as reported by its
+    /// `initialize` response (`telemetryLogPath`). `None` when the engine
+    /// has no healthy diagnostic destination — surfaced by `/log`, not
+    /// silently treated as "logging is off".
+    engine_log_path: Option<String>,
 }
 
 
@@ -193,6 +198,12 @@ impl App {
             .context("the engine rejected the handshake")?;
         let initialized: messages::InitializeResult = serde_json::from_value(result)
             .context("the engine returned an unexpected initialize result")?;
+        if let Some(ctx) = coda_diagnostics::current() {
+            crate::diagnostics::record_engine_log_path(
+                &ctx.with_session(initialized.session_id.clone()),
+                initialized.telemetry_log_path.as_deref(),
+            );
+        }
 
         let mut state = UiState::new();
         state.apply(UiEvent::Connected {
@@ -234,6 +245,7 @@ impl App {
             transcript_origin: (0, 0),
             composer_origin: (0, 0),
             session_effort: None,
+            engine_log_path: initialized.telemetry_log_path,
         };
 
         Ok((app, engine, inbound))

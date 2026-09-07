@@ -17,6 +17,8 @@ coda-client.workspace = true
 coda-agent.workspace = true
 coda-render.workspace = true
 coda-mcp.workspace = true
+coda-auth.workspace = true
+coda-diagnostics.workspace = true
 futures.workspace = true
 futures-lite = "2"
 
@@ -32,8 +34,6 @@ unicode-segmentation.workspace = true
 clap.workspace = true
 directories.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-appender.workspace = true
 arboard.workspace = true
 png.workspace = true
 chrono.workspace = true

@@ -188,6 +188,11 @@ pub(crate) async fn stream_with_retries(
     let mut overflow_retried = false;
     let mut transport_retries = 0u32;
     let mut schema_evictions = 0u32;
+    // Counts outer stream attempts (connect + consume), purely for the
+    // optional `ModelRequestStart`/`ModelRequestEnd` debug-detail pair below
+    // — distinct from the HTTP-level `attempt` recorded inside
+    // `send_with_retry`.
+    let mut outer_attempt: u32 = 0;
 
     loop {
         // Respect caller cancel before each attempt.
@@ -195,15 +200,61 @@ pub(crate) async fn stream_with_retries(
             return Err(LlmError::Cancelled);
         }
 
-        let stream = client.stream(request.clone()).await?;
+        // A fresh internal request id per outer stream attempt, scoping both
+        // the connection and its consumption so HTTP-attempt diagnostics
+        // (recorded inside `send_with_retry`, in-context) and stream/transport
+        // failure diagnostics (recorded here, at the consumer) correlate under
+        // the same request id — without a process-global "current request".
+        let attempt_ctx = coda_diagnostics::current()
+            .map(|ctx| ctx.with_request(uuid::Uuid::new_v4().to_string()));
+        outer_attempt += 1;
+        // Optional detail only (gated to Debug/Trace by
+        // `Event::minimum_verbosity`); essential lifecycle/failure events
+        // below are unaffected and always present.
+        if let Some(ctx) = &attempt_ctx {
+            ctx.record(coda_diagnostics::Event::ModelRequestStart { attempt: outer_attempt });
+        }
+        let attempt_started = Instant::now();
+
+        let stream_result = match &attempt_ctx {
+            Some(ctx) => coda_diagnostics::scope(ctx.clone(), client.stream(request.clone())).await,
+            None => client.stream(request.clone()).await,
+        };
+        let stream = match stream_result {
+            Ok(stream) => stream,
+            Err(err) => {
+                // Bypasses the retry arms below by design: `client.stream()`
+                // already exhausted the HTTP-level retry policy internally
+                // (`send_with_retry`) before ever returning an error here.
+                record_stream_failure(attempt_ctx.as_ref(), &err);
+                record_model_request_end(attempt_ctx.as_ref(), outer_attempt, attempt_started, "failed");
+                return Err(err);
+            }
+        };
 
         // Race the stream against caller cancel.  Cancellation works by DROPPING
         // the ResponseStream: the transport layer sees the receiver disappear and
         // aborts the in-flight HTTP request.
-        let drive_result = tokio::select! {
-            r = drive_stream(stream, sink, &mut acc) => r,
-            _ = cancel.cancelled() => return Err(LlmError::Cancelled),
+        let drive_fut = async {
+            tokio::select! {
+                r = drive_stream(stream, sink, &mut acc) => r,
+                _ = cancel.cancelled() => Err(LlmError::Cancelled),
+            }
         };
+        let drive_result = match &attempt_ctx {
+            Some(ctx) => coda_diagnostics::scope(ctx.clone(), drive_fut).await,
+            None => drive_fut.await,
+        };
+        record_model_request_end(
+            attempt_ctx.as_ref(),
+            outer_attempt,
+            attempt_started,
+            match &drive_result {
+                Ok(()) => "success",
+                Err(LlmError::Cancelled) => "cancelled",
+                Err(_) => "error",
+            },
+        );
 
         match drive_result {
             Ok(()) => {
@@ -315,9 +366,55 @@ pub(crate) async fn stream_with_retries(
                 }
             }
 
-            Err(err) => return Err(err),
+            Err(err) => {
+                record_stream_failure(attempt_ctx.as_ref(), &err);
+                return Err(err);
+            }
         }
     }
+}
+
+/// Records the optional (Debug/Trace-only) end of one outer per-model-request
+/// attempt. `outcome` is a small closed classification, never the
+/// underlying error's `Display`/`Debug`. A no-op when there is no ambient
+/// context — this is purely additive detail, never essential.
+fn record_model_request_end(
+    ctx: Option<&coda_diagnostics::DiagnosticContext>,
+    attempt: u32,
+    started: Instant,
+    outcome: &'static str,
+) {
+    let Some(ctx) = ctx else { return };
+    ctx.record(coda_diagnostics::Event::ModelRequestEnd {
+        attempt,
+        duration_ms: started.elapsed().as_millis() as u64,
+        outcome,
+    });
+}
+
+/// Records a stream/transport/protocol failure under `ctx`'s identity, using
+/// only closed classification and bounded, allowlisted detail — never the
+/// error's `Display`/`Debug`, which can carry provider text or a
+/// credential-bearing URL. A no-op when there is no ambient context or the
+/// "failure" is an ordinary user-initiated cancellation.
+fn record_stream_failure(ctx: Option<&coda_diagnostics::DiagnosticContext>, err: &LlmError) {
+    let Some(ctx) = ctx else { return };
+    let category = coda_llm::diagnostics::category(err);
+    let event = match err {
+        LlmError::Cancelled => return,
+        LlmError::Transport(_) => coda_diagnostics::Event::TransportFailure { category },
+        LlmError::Protocol(_) => coda_diagnostics::Event::ProtocolFailure { category },
+        _ => coda_diagnostics::Event::StreamFailure {
+            category,
+            status: coda_llm::diagnostics::status(err),
+            // Unavailable here: the HTTP-attempt request id (when the
+            // provider sent one) was already recorded in-context by
+            // `send_with_retry`; never invented at this layer.
+            provider_request_id: None,
+            parameter: coda_llm::diagnostics::parameter(err),
+        },
+    };
+    ctx.record(event);
 }
 
 /// Returns `true` when the error suggests the context window was exceeded.
@@ -843,6 +940,309 @@ mod tests {
         assert!(
             elapsed < 60_000,
             "the burst was timed from the stream start, not its first delta: {elapsed}ms"
+        );
+    }
+
+    // ── diagnostics: terminal stream/transport failures ─────────────────────
+
+    #[tokio::test]
+    async fn a_terminal_transport_failure_is_recorded_privacy_safely_with_full_correlation() {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+
+        struct AlwaysFailsClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for AlwaysFailsClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Transport(
+                    "connection reset while talking to https://user:sk-live-secret@example.com".into(),
+                ))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = AlwaysFailsClient;
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let result = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                None,
+                &mut blocked,
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "the terminal transport error must still surface to the caller");
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let failure = lines
+            .iter()
+            .find(|l| l["kind"] == "transport_failure")
+            .expect("a transport_failure record was written");
+        assert_eq!(failure["session_id"], "sess-1");
+        assert_eq!(failure["turn_id"], "turn-1");
+        assert!(failure["request_id"].is_string(), "each attempt gets its own request id");
+        assert_eq!(failure["category"], "transport");
+
+        // Privacy: the raw error text (which embeds a credential) must never
+        // appear anywhere in the log, at any field.
+        assert!(!content.contains("sk-live-secret"));
+        assert!(!content.contains("connection reset"));
+    }
+
+    // ── diagnostics: --diagnostic-verbosity gates optional detail only ──────
+
+    #[tokio::test]
+    async fn normal_verbosity_omits_optional_model_request_detail_but_keeps_essentials() {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+
+        struct AlwaysFailsClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for AlwaysFailsClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Transport("transport down".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = AlwaysFailsClient;
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let _ = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                None,
+                &mut blocked,
+            ),
+        )
+        .await;
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("model_request_start") && !content.contains("model_request_end"),
+            "optional per-model-request detail must be omitted at Normal verbosity: {content}"
+        );
+        assert!(
+            content.contains("transport_failure"),
+            "essential failure events must remain present at every verbosity: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_verbosity_includes_optional_model_request_detail() {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+
+        struct AlwaysFailsClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for AlwaysFailsClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Transport("transport down".into()))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Debug,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = AlwaysFailsClient;
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let _ = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                None,
+                &mut blocked,
+            ),
+        )
+        .await;
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            content.contains("model_request_start"),
+            "optional detail must appear at Debug verbosity: {content}"
+        );
+        assert!(
+            content.contains("model_request_end"),
+            "optional detail must appear at Debug verbosity: {content}"
+        );
+        assert!(
+            content.contains("transport_failure"),
+            "essential failure events remain present alongside optional detail: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_is_not_recorded_as_a_failure() {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+
+        struct HangingClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for HangingClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Cancelled)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = HangingClient;
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig::default();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let _ = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                None,
+                &mut blocked,
+            ),
+        )
+        .await;
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !content.contains("transport_failure")
+                && !content.contains("stream_failure")
+                && !content.contains("protocol_failure"),
+            "cancellation is a normal user action, not a diagnostic failure: {content}"
         );
     }
 }

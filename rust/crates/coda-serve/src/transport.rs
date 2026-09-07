@@ -37,7 +37,10 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     // explicit value fails startup here rather than silently defaulting deep
     // inside the host (Findings I2/I4).
     let startup = crate::host::StartupOptions::from_env()
-        .map_err(|e| anyhow::anyhow!("invalid startup configuration: {e}"))?;
+        .map_err(|e| {
+            coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "configuration" });
+            anyhow::anyhow!("invalid startup configuration: {e}")
+        })?;
 
     // Select the initial credential:
     // 1. An explicitly-requested `--provider` selects *that* account and fails
@@ -53,7 +56,10 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
             startup.endpoint.as_deref(),
         )
         .await
-        .map_err(|e| anyhow::anyhow!("provider selection failed: {e}"))?;
+        .map_err(|e| {
+            coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "provider_selection" });
+            anyhow::anyhow!("provider selection failed: {e}")
+        })?;
         (Some(result), None)
     } else {
         match (
@@ -67,6 +73,9 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
             }
         }
     };
+    if copilot_diagnostic.is_some() {
+        coda_diagnostics::record(coda_diagnostics::Event::StartupFailure { category: "copilot_configuration_or_credentials" });
+    }
 
     // Connect enabled MCP servers before the host is built so their tools are
     // in the registry from the first turn. Disabled/failed servers are handled
@@ -140,6 +149,12 @@ where
     let prompt_channel = Arc::new(PromptChannel::new(outgoing_tx.clone()));
     let sink = Arc::new(ServeSink::new(outgoing_tx.clone()));
 
+    // Captured here, on the same task the process entrypoint's
+    // `coda_diagnostics::scope` established it on — this is the last point
+    // before the per-request dispatch tasks are spawned, past which the
+    // ambient task-local context would no longer be visible.
+    let diagnostics = coda_diagnostics::current();
+
     let backend = ServeHost::new_with_optional_client_and_mcp(
         client,
         sink,
@@ -148,6 +163,7 @@ where
         mcp,
         startup,
         copilot_diagnostic,
+        diagnostics,
     );
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
@@ -230,7 +246,11 @@ fn dispatch_frame(
     let message: Message = match serde_json::from_slice(frame) {
         Ok(m) => m,
         Err(e) => {
-            tracing::warn!(%e, payload = %String::from_utf8_lossy(frame), "unparseable frame");
+            // Scrubbed: no `payload` field. An unparseable frame's raw bytes
+            // came straight off the wire and can contain a prompt, a tool
+            // result, or anything else the JSON-RPC layer was carrying — only
+            // its length is safe to note.
+            tracing::warn!(%e, frame_bytes = frame.len(), "unparseable frame");
             return;
         }
     };

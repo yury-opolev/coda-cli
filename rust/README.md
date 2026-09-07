@@ -42,6 +42,7 @@ That means:
 | `coda-mcp` | MCP stdio client, server manager, and the shared `.mcp.json` config. |
 | `coda-auth` | OAuth/PKCE and device-code flows, DPAPI/keyring/encrypted-file stores, single-flight refresh. |
 | `coda-serve` | The engine host: pure method dispatch, the event bridge, server-initiated prompts, and the stdio transport. |
+| `coda-diagnostics` | Leaf crate: the bounded, rotating JSONL diagnostic writer and the scoped async `DiagnosticContext`. Depends on nothing engine-specific (no `coda-auth`/`coda-agent`), so any process can wire it in at its own entry point. |
 | `coda-diff` | Differential tests asserting the C# and Rust engines answer identically. |
 | `coda` | The shipping binary: interactive, `serve` and `run` modes. |
 
@@ -76,12 +77,15 @@ $env:CODA_ENGINE = "C:\path\to\coda.exe"; cargo test -p coda-tui --test engine_c
 ```powershell
 cargo run -p coda-tui                      # uses `coda` from PATH
 cargo run -p coda-tui -- --engine ./coda.exe -C C:\some\repo
-cargo run -p coda-tui -- --log-file coda.log --log-filter debug
+cargo run -p coda-tui -- --log-file coda.log --diagnostic-verbosity debug
 ```
 
 Because stdout carries the protocol, engine diagnostics go to stderr and are
-kept in a bounded ring for crash reporting. Use `--log-file` for client-side
-tracing; logging to stdout would corrupt the display.
+kept in a bounded ring for crash reporting, never persisted routinely. Every
+launch — `coda`, `coda run`, `coda serve`, and standalone `coda-tui` — also
+writes a bounded, privacy-safe operational diagnostic log by default, with no
+flags required; see [Operational diagnostics](#operational-diagnostics) below
+for the full contract.
 
 ## Design notes
 
@@ -335,6 +339,12 @@ runaway-loop backstop, not a limit of 500 individual tool calls: one iteration
 can execute several calls. Reaching it ends the turn with a recoverable notice.
 Goal-driven runs retain their separate budget controls.
 
+YOLO (`--yolo` or `bypassPermissions`) also permits built-in file tools to
+access paths outside the working directory, matching C# Coda. The main agent
+and subagents share the live mode: returning to Default, Plan, or AcceptEdits
+restores the outside-directory restriction for subsequent tool calls.
+Explicit tool restrictions remain in force.
+
 All startup overrides are session-only and never written to `settings.json`.
 
 ```
@@ -343,6 +353,7 @@ coda [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
      [--goal <TEXT>] [--goal-timeout <DUR>] [--max-continuations <N>]
      [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
      [--continue|-c] [--resume|-r [<ID>]] [--fork|-f [<ID>]]
+     [--log-file <FILE>] [--diagnostic-verbosity normal|debug|trace]
 
 coda run -p "<task>" [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
      [--permission-mode <MODE>] [--yolo]
@@ -350,6 +361,7 @@ coda run -p "<task>" [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
      [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
      [--continue|-c] [--resume|-r [<ID>]] [--fork|-f [<ID>]]
      [--json] [--cwd <DIR>]
+     [--log-file <FILE>] [--diagnostic-verbosity normal|debug|trace]
 
 coda serve [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
      [--permission-mode <MODE>] [--yolo]
@@ -357,6 +369,7 @@ coda serve [--model <ID>] [--provider <ID>] [--effort <LEVEL>]
      [--system-prompt <TEXT>] [--system-prompt-file <FILE>]
      [--api-key <KEY>] [--endpoint <URL>]
      [--cwd <DIR>] [--no-mcp] [--no-project-mcp]
+     [--log-file <FILE>] [--diagnostic-verbosity normal|debug|trace]
 ```
 
 `--endpoint` requires `--api-key`; using it without one is rejected at parse
@@ -383,6 +396,9 @@ Behaviour notes:
 - Invalid startup values (bad `--effort`, unknown `--permission-mode`, a
   non-positive `--goal-timeout`, or a negative `--max-continuations`) fail
   startup with an error instead of being silently defaulted or clamped.
+- `--log-file`/`--diagnostic-verbosity` are always available and never opt
+  in the essential diagnostic log itself, which is written regardless — see
+  [Operational diagnostics](#operational-diagnostics).
 
 ### GitHub Enterprise Copilot
 
@@ -473,6 +489,97 @@ then restart Coda.
 
 The diagnostic is scoped to the current engine instance — a failed probe on
 one session does not contaminate another.
+
+## Operational diagnostics
+
+Every ordinary launch — `coda` (interactive), `coda run`, `coda serve`, and
+standalone `coda-tui` — writes a small, bounded, privacy-safe JSONL log by
+default. This is **not** opt-in and is not controlled by the legacy
+`telemetry.enabled` setting: essential lifecycle and failure records are
+always written, because a session that fails silently is worse than one that
+leaves bounded operational metadata. It lives in the `coda-diagnostics`
+crate (a leaf with no `coda-auth`/`coda-agent` dependency), which every
+process wires in at its own entry point.
+
+**What it is not**: a tracing sink. The previous behavior — an opt-in
+`tracing_subscriber` file writer enabled by `--log-file` — has been replaced
+outright, not layered underneath. Existing `tracing::warn!`/`debug!` call
+sites in the transport/retry/stderr code this work touched had their payload
+fields (raw frame bytes, provider error text, stderr content) scrubbed, but
+`tracing` itself has no default subscriber and is not a diagnostics channel.
+
+**Default location**: `<CODA_HOME or OS home>/.coda/logs/diagnostics/`. Each
+process creates its own uniquely-named file,
+`coda-<utc-timestamp>-<pid>-<uuid>.jsonl`; two processes never share a file.
+
+**Bounds**: each segment is capped at 5 MiB, with at most 4 segments retained
+per process stream (rotated like `logrotate`: `.1`, `.2`, `.3`); each JSON
+record is capped at 8 KiB, enforced *before* writing — an oversized record is
+replaced with a minimal, still-valid `record_dropped` marker rather than
+truncated JSON. Inactive default-directory files are swept on startup and
+rotation: older
+than 7 days, or oldest-first once the inactive total exceeds 100 MiB. An
+OS-backed advisory lease (a `.lock` sidecar, via `fs2`) protects a long-idle
+but still-live stream from being mistaken for garbage; retention only ever
+touches recognized `coda-*.jsonl` filenames, never a symlink or an unrelated
+file.
+New Unix diagnostic directories are created with mode `0700`; new data and
+lease files use `0600`. Existing parent-directory permissions are not changed.
+
+**Verbosity**: `--diagnostic-verbosity normal|debug|trace` on every entry
+point. The legacy `--log-filter`/`CODA_LOG` (a `tracing` `EnvFilter` string)
+is still accepted as a **compatibility hint** — only its loudest named level
+(`trace` > `debug` > anything else) maps to a verbosity default, and it never
+enables arbitrary raw tracing output. An explicit `--diagnostic-verbosity`
+always wins.
+Debug and Trace add model-request start/end records; essential lifecycle,
+HTTP failure/retry, and error records remain present at Normal verbosity.
+
+**Explicit destinations**: `--log-file <path>` still works, but its contract
+changed to match a real log file's: it *appends* rather than truncates, and a
+second writer pointed at the same path fails clearly (an OS-backed exclusive
+lock on a stable `<path>.lock` sidecar, released automatically even on a
+crash). An invalid explicit destination is a hard startup error. An
+unavailable *default* directory is the opposite — nonfatal: the app stays
+usable, logging enters a degraded state, and a one-time, payload-free warning
+is printed (never silently swallowed).
+
+**Parent/child correlation**: a frontend (`coda`/`coda-tui`) that launches an
+engine child forwards its run id, its resolved directory (an explicit
+destination's own directory, or the default directory — never the parent's
+exact file), and its verbosity via `CODA_DIAG_RUN_ID`/`CODA_DIAG_DIR`/
+`CODA_DIAG_VERBOSITY`. The child always writes its own distinct file there,
+sharing the run id so the two can be correlated after the fact. The engine
+reports its own resolved log path back over the wire
+(`InitializeResult.telemetryLogPath`, previously always `null`); `/log` shows
+both the frontend's own path/mode/verbosity/health and the engine's reported
+path — real state, not just the legacy telemetry settings (which `/log`
+still shows separately, clearly labeled, since they do not control this).
+
+**What is recorded**: a fixed envelope (schema version, UTC time, product
+version, process role/PID, run id, and optional session/turn/internal-request
+id, canonical provider/model) around a closed set of typed events — process
+and engine start/end, session initialized/resumed, turn start/end/failure,
+HTTP attempt/result/retry/recovery, and streamed/transport/protocol failure.
+HTTP metadata (status, a validated bounded provider request id, duration) is
+captured in the shared retry loop *before* the response body is consumed —
+the only place it is available. A recognized missing-parameter provider error
+(the `input[N].summary` shape a couple of endpoints report) may record that
+exact bounded path from a structured `error.param` field; anything else is
+category-and-status only.
+
+**What is never recorded, at any verbosity**: prompts, system prompts, tool
+names/arguments/results, response/request bodies or headers, encrypted
+reasoning, raw `stderr`, or any error's `Display`/`Debug` text — several of
+those can carry credential-bearing URLs or arbitrary provider text, which is
+exactly why they are excluded structurally (typed fields only, no free-text
+`message`) rather than filtered by log level.
+
+**Not the same as a content audit.** A content-audit sidecar (when and where
+one exists) is a deliberately separate mechanism for capturing conversation
+content; this crate does not wire one up, and no session is guaranteed to
+have one. Operational logs exclude conversation content, but still contain
+local paths and session/provider identifiers; review them before sharing.
 
 ## The two seams
 

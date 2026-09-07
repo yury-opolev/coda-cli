@@ -324,6 +324,30 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_replay_from_decoded_and_persisted_history_has_summary() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::copilot::responses::{build, ResponsesDecoder};
+        use coda_llm::ChatRequest;
+
+        let mut decoder = ResponsesDecoder::new();
+        let events = decoder.decode("response.output_item.done",
+            r#"{"output_index":0,"item":{"type":"reasoning","id":"r1","encrypted_content":"opaque","summary":[]}}"#,
+        ).unwrap();
+        let blocks: Vec<_> = events.into_iter().filter_map(|event| match event {
+            StreamEvent::ThinkingDone(block) => Some(block),
+            _ => None,
+        }).collect();
+        assert_eq!(blocks.len(), 1);
+        let original = vec![Message::new(Role::Assistant, blocks)];
+        let restored = round_trip(&original);
+        assert_eq!(restored, original);
+        let request = build(&ChatRequest::new("gpt-6-astra", restored));
+        assert_eq!(request["input"][0]["summary"], json!([]));
+        assert_eq!(request["input"][0]["id"], "r1");
+        assert_eq!(request["input"][0]["encrypted_content"], "opaque");
+    }
+
+    #[test]
     fn thinking_block_round_trips() {
         let msgs = vec![Message::new(
             Role::Assistant,

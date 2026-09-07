@@ -25,7 +25,7 @@ use coda_llm::Message;
 use crate::agent::{AgentError, AgentLoopBuilder};
 use crate::events::{AgentSink, CollectingSink};
 use crate::hooks::HookRunner;
-use crate::permission::PermissionPrompt;
+use crate::permission::{PermissionModeState, PermissionPrompt};
 use crate::tasks::{TaskExecutionMode, TaskKind, TaskManager};
 use crate::tool::{ToolRegistry, ToolQuarantine};
 
@@ -41,6 +41,7 @@ use super::{
 pub struct SubagentHost {
     client: Arc<dyn coda_llm::LlmClient>,
     permission_prompt: Arc<dyn PermissionPrompt>,
+    permission_mode: Arc<PermissionModeState>,
     /// The full tool registry; restricted per spawn via `resolve_child_tools`.
     tools: Arc<ToolRegistry>,
     quarantine: Arc<ToolQuarantine>,
@@ -58,6 +59,7 @@ impl SubagentHost {
     pub fn new(
         client: Arc<dyn coda_llm::LlmClient>,
         permission_prompt: Arc<dyn PermissionPrompt>,
+        permission_mode: Arc<PermissionModeState>,
         tools: Arc<ToolRegistry>,
         quarantine: Arc<ToolQuarantine>,
         task_manager: Arc<TaskManager>,
@@ -71,6 +73,7 @@ impl SubagentHost {
         Arc::new(Self {
             client,
             permission_prompt,
+            permission_mode,
             tools,
             quarantine,
             task_manager,
@@ -86,6 +89,7 @@ impl SubagentHost {
     pub fn with_defaults(
         client: Arc<dyn coda_llm::LlmClient>,
         permission_prompt: Arc<dyn PermissionPrompt>,
+        permission_mode: Arc<PermissionModeState>,
         tools: Arc<ToolRegistry>,
         task_manager: Arc<TaskManager>,
         working_directory: impl Into<String>,
@@ -93,6 +97,7 @@ impl SubagentHost {
         Self::new(
             client,
             permission_prompt,
+            permission_mode,
             tools,
             Arc::new(ToolQuarantine::new()),
             task_manager,
@@ -227,6 +232,7 @@ impl SubagentHost {
             self.permission_prompt.clone(),
             Arc::new(child_tools),
         )
+        .with_permission_mode_state(Arc::clone(&self.permission_mode))
         .with_model(model)
         .with_system_prompt(final_system)
         .with_max_tokens(self.base_max_tokens)
@@ -351,6 +357,7 @@ impl SubagentHost {
         Self {
             client: self.client.clone(),
             permission_prompt: self.permission_prompt.clone(),
+            permission_mode: self.permission_mode.clone(),
             tools: self.tools.clone(),
             quarantine: self.quarantine.clone(),
             task_manager: self.task_manager.clone(),
@@ -635,6 +642,7 @@ mod tests {
         let host = SubagentHost::new(
             Arc::new(OkClient),
             Arc::new(AllowAll),
+            Arc::new(PermissionModeState::new(crate::permission::PermissionMode::Default)),
             Arc::new(crate::tool::ToolRegistry::new(
                 [] as [Arc<dyn crate::tool::Tool>; 0],
             )),
@@ -710,6 +718,7 @@ mod tests {
         let host = SubagentHost::new(
             Arc::new(OkClient),
             Arc::new(AllowAll),
+            Arc::new(PermissionModeState::new(crate::permission::PermissionMode::Default)),
             Arc::new(crate::tool::ToolRegistry::new(
                 [] as [Arc<dyn crate::tool::Tool>; 0],
             )),

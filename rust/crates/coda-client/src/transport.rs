@@ -267,8 +267,11 @@ fn dispatch(
         Ok(message) => message,
         Err(error) => {
             // A malformed frame is the peer's problem, not a reason to tear the
-            // session down; log it and keep reading.
-            tracing::warn!(%error, payload = %String::from_utf8_lossy(frame), "unparsable frame");
+            // session down; log it and keep reading. Scrubbed: no `payload`
+            // field — the raw bytes came straight off the engine's protocol
+            // stream and can contain a prompt or tool result; only their
+            // length is safe to note.
+            tracing::warn!(%error, frame_bytes = frame.len(), "unparsable frame");
             return;
         }
     };

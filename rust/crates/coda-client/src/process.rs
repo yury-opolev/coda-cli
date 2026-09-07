@@ -139,6 +139,10 @@ impl Engine {
             .spawn()
             .map_err(|source| ClientError::Spawn { program, source })?;
 
+        if let Some(ctx) = coda_diagnostics::current() {
+            ctx.record(coda_diagnostics::Event::EngineStart { pid: child.id() });
+        }
+
         let stdin = child.stdin.take().ok_or(ClientError::MissingStdio("stdin"))?;
         let stdout = child
             .stdout
@@ -193,13 +197,23 @@ impl Engine {
         drop(self.connection);
         self.tasks.reader.abort();
 
-        match tokio::time::timeout(grace, self.child.wait()).await {
+        let result = match tokio::time::timeout(grace, self.child.wait()).await {
             Ok(result) => result.map(|_| ()),
             Err(_) => {
                 tracing::warn!("engine did not exit within the grace period; killing it");
                 self.child.kill().await
             }
+        };
+
+        if let Some(ctx) = coda_diagnostics::current() {
+            // Exit code and correlation only — never the stderr ring, however
+            // plausible its contents look; that stays a narrowly-scoped,
+            // explicit crash-diagnostic feature, not routine logging.
+            let exit_code = self.child.try_wait().ok().flatten().and_then(|s| s.code());
+            ctx.record(coda_diagnostics::Event::EngineEnd { exit_code });
         }
+
+        result
     }
 }
 
@@ -209,7 +223,12 @@ async fn drain_stderr(
 ) {
     let mut lines = BufReader::new(stderr).lines();
     while let Ok(Some(line)) = lines.next_line().await {
-        tracing::debug!(target: "coda::engine::stderr", "{line}");
+        // Scrubbed: no raw stderr content in tracing — it can contain
+        // anything the engine process wrote, including provider error text
+        // or a credential-bearing URL. The ring buffer below still retains
+        // the actual lines for on-demand crash diagnostics (an explicit,
+        // narrowly-scoped feature, not routine logging).
+        tracing::debug!(target: "coda::engine::stderr", bytes = line.len(), "engine stderr line received");
         let mut ring = ring.lock().expect("stderr ring poisoned");
         if ring.len() == STDERR_RING_LINES {
             ring.pop_front();
