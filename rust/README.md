@@ -330,6 +330,11 @@ reasoning summary; encrypted reasoning content is never displayed.
 
 ### CLI reference (Rust parity flags)
 
+Normal turns allow up to 500 tool-use iterations, matching C# Coda. This is a
+runaway-loop backstop, not a limit of 500 individual tool calls: one iteration
+can execute several calls. Reaching it ends the turn with a recoverable notice.
+Goal-driven runs retain their separate budget controls.
+
 All startup overrides are session-only and never written to `settings.json`.
 
 ```

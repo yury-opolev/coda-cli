@@ -761,7 +761,7 @@ impl AgentLoopBuilder {
             model: "claude-opus-4-5".into(),
             system_prompt: None,
             max_tokens: 4096,
-            max_iterations: 20,
+            max_iterations: 500,
             effort: None,
             working_directory: String::new(),
             granted_directories: None,
@@ -798,6 +798,7 @@ impl AgentLoopBuilder {
         self
     }
 
+    /// Overrides the default 500-iteration per-turn runaway-loop backstop.
     pub fn with_max_iterations(mut self, n: usize) -> Self {
         self.max_iterations = n;
         self
@@ -1505,6 +1506,36 @@ mod tests {
     }
 
     // ── §8 item 25: max_iterations soft stop ─────────────────────────────────
+
+    #[tokio::test]
+    async fn default_max_iterations_matches_csharp_backstop() {
+        for tool_rounds in [21, 501] {
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let sink = CollectingSink::new();
+            let mut responses: Vec<_> = (0..tool_rounds)
+                .map(|i| vec![Ok(tool_use_event(&format!("t{i}"), "tool_a")), Ok(done())])
+                .collect();
+            responses.push(vec![Ok(StreamEvent::TextDelta("completed".into())), Ok(done())]);
+            let client = MockLlmClient::new(responses);
+            let tools = Arc::new(ToolRegistry::new([
+                dyn_tool(MockTool::new("tool_a", true, Arc::clone(&log))),
+            ]));
+            let agent = AgentLoopBuilder::new(client, Arc::new(AllowAll), tools)
+                .with_tool_max_duration(None)
+                .build();
+            let mut history = vec![Message::user("go")];
+            agent.run(&mut history, &sink, None, CancellationToken::new()).await.unwrap();
+
+            assert_eq!(log.lock().unwrap().len(), tool_rounds.min(500));
+            let limited = sink.take().iter().any(|event| {
+                matches!(event, AgentEvent::LimitReached { kind, .. } if kind == "max_tool_iterations")
+            });
+            assert_eq!(limited, tool_rounds > 500);
+            if !limited {
+                assert_eq!(history.last().unwrap().text(), "completed");
+            }
+        }
+    }
 
     #[tokio::test]
     async fn max_iterations_emits_limit_reached_and_closing_message() {
@@ -2597,7 +2628,5 @@ mod tests {
         assert!(!has_rr, "no ResponseRewritten event must be emitted when hook returns no change");
     }
 }
-
-
 
 
