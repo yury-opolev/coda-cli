@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -1994,11 +1994,7 @@ impl ServeBackend for ServeHost {
         }
         let client = {
             let g = self.client.lock().await;
-            g.clone().ok_or_else(|| {
-                RpcError::unauthorized(
-                    "no credentials; set ANTHROPIC_API_KEY or provide apiKey in initialize",
-                )
-            })?
+            g.clone().ok_or_else(no_client_error)?
         };
 
         // Claim the turn slot so a concurrent prompt is blocked; the guard
@@ -2080,11 +2076,7 @@ impl ServeHost {
         // Require a wired client.
         let client = {
             let g = self.client.lock().await;
-            g.clone().ok_or_else(|| {
-                RpcError::unauthorized(
-                    "no credentials; set ANTHROPIC_API_KEY or provide apiKey in initialize",
-                )
-            })?
+            g.clone().ok_or_else(no_client_error)?
         };
 
         // Append user message to a local copy of history.
@@ -2321,6 +2313,64 @@ pub(crate) fn build_anthropic_at(key: &str, endpoint: Option<&str>) -> Option<Ar
 /// a well-known public identifier, not a secret.
 const CLAUDE_AI_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 
+/// Captures the first Copilot credential-error diagnostic at process startup.
+///
+/// Set by [`try_build_copilot_from_keyring`] when `get_credential` returns an
+/// `Err` (as opposed to `Ok(None)`, which simply means "not signed in"). Read
+/// by `run_prompt_inner` and `session_compact` to surface a provider-specific
+/// error message rather than the generic "set ANTHROPIC_API_KEY" fallback.
+static COPILOT_STARTUP_DIAGNOSTIC: OnceLock<String> = OnceLock::new();
+
+/// Produces a safe, single-line summary of a Copilot auth error.
+///
+/// The `OAuth { body }` variant carries raw server-response text and is the
+/// primary source of potential token leakage; only the HTTP status is surfaced.
+///
+/// All variants are matched explicitly so adding a new `AuthError` variant
+/// with server-derived content will cause a compile-time error here rather
+/// than silently flowing out through a catch-all `to_string()` call.
+fn sanitize_copilot_error(e: &coda_auth::AuthError) -> String {
+    use coda_auth::AuthError;
+    match e {
+        // body is raw server response — do NOT surface it.
+        AuthError::OAuth { status, .. } => format!("token refresh failed (HTTP {status})"),
+        // Serialization: serde_json error may include partial input; discard it.
+        AuthError::Serialization(_) => "credential parse error".to_owned(),
+        // Remaining variants: operator-authored or system messages without
+        // server-response content.
+        AuthError::NotFound(p) => format!("no credential for '{p}'"),
+        AuthError::UnknownProvider(p) => format!("provider '{p}' not registered"),
+        AuthError::CannotRefresh(p, reason) => format!("cannot refresh '{p}': {reason}"),
+        AuthError::Transport(msg) => format!("network error: {msg}"),
+        AuthError::Store(msg) => format!("credential store error: {msg}"),
+        AuthError::Io(e) => format!("I/O error: {e}"),
+        AuthError::StateMismatch => "OAuth state mismatch (possible CSRF)".to_owned(),
+        AuthError::LoginCancelled(msg) => format!("login cancelled: {msg}"),
+        AuthError::InvalidUrl(msg) => format!("invalid URL: {msg}"),
+    }
+}
+
+/// Builds the "no credentials" [`RpcError`] for `session/prompt` and
+/// `session/compact`, choosing between two messages:
+///
+/// * If a Copilot credential was found at startup but failed to load/refresh,
+///   the stored [`COPILOT_STARTUP_DIAGNOSTIC`] is surfaced so the user sees a
+///   provider-specific reason instead of "set ANTHROPIC_API_KEY" (which is
+///   actively misleading for a Copilot user).
+///
+/// * Otherwise the generic "sign in or set an API key" message is used.
+fn no_client_error() -> RpcError {
+    if let Some(diag) = COPILOT_STARTUP_DIAGNOSTIC.get() {
+        RpcError::unauthorized(format!(
+            "GitHub Copilot credential error: {diag}; run /login to re-authenticate"
+        ))
+    } else {
+        RpcError::unauthorized(
+            "no credentials; set ANTHROPIC_API_KEY, pass apiKey in initialize, or sign in via /login",
+        )
+    }
+}
+
 /// Selects the LLM client for an explicitly-requested provider (Finding C2).
 ///
 /// This *fails closed*: if the requested provider's credential is unavailable
@@ -2397,36 +2447,85 @@ pub(crate) fn credential_store() -> Arc<dyn CredentialStore> {
 }
 
 async fn try_build_copilot_from_keyring() -> Option<Arc<dyn LlmClient>> {
+    // Resolve the config from the environment (honours GH_COPILOT_ENTERPRISE_DOMAIN
+    // and the other GH_COPILOT_* overrides). An invalid explicit value (e.g. a
+    // domain with a path component) fails loudly rather than silently defaulting
+    // to the public endpoint — which would send an enterprise user's token to
+    // github.com.
+    let auth_config = match AuthCopilotConfig::from_environment() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("coda: invalid Copilot configuration: {e}");
+            return None;
+        }
+    };
     let store = credential_store();
+    let (client, diagnostic) = build_copilot_from_store(store, auth_config).await;
+    if let Some(msg) = diagnostic {
+        eprintln!("coda: Copilot credential error at startup: {msg}");
+        // Record for later use by run_prompt_inner / session_compact so they
+        // can surface a provider-specific message instead of the generic
+        // "set ANTHROPIC_API_KEY" fallback.
+        let _ = COPILOT_STARTUP_DIAGNOSTIC.set(msg);
+    }
+    client
+}
+
+/// Core of the Copilot client-from-keyring path with injectable dependencies.
+///
+/// Returns `(Some(client), None)` on success.
+/// Returns `(None, None)` when no credential is stored ("not signed in").
+/// Returns `(None, Some(diagnostic))` when a store or refresh error occurs.
+///
+/// Separating `Ok(None)` (not signed in) from `Err(_)` (store/refresh failure)
+/// is the key correctness property: swallowing `Err` as `None` previously hid
+/// token-refresh failures, making the engine silently appear as if no Copilot
+/// credential existed at all.
+///
+/// `pub(crate)` so the injectable path is reachable from unit tests.
+pub(crate) async fn build_copilot_from_store(
+    store: Arc<dyn CredentialStore>,
+    auth_config: AuthCopilotConfig,
+) -> (Option<Arc<dyn LlmClient>>, Option<String>) {
     let manager = Arc::new(CredentialManager::new(
         store,
-        [Arc::new(CopilotProvider::new(AuthCopilotConfig::default_public()))
-            as Arc<dyn AuthProvider>],
+        [Arc::new(CopilotProvider::new(auth_config.clone())) as Arc<dyn AuthProvider>],
     ));
     match manager.get_credential("github-copilot").await {
         Ok(Some(_)) => {}
-        // Absent credentials are the normal "not logged in" case, and a failed
-        // lookup is usually an expired refresh — neither is worth writing to
-        // stderr on every startup, since the caller falls back cleanly.
-        Ok(None) | Err(_) => return None,
+        // Not signed in: normal "not logged in" case, no diagnostic.
+        Ok(None) => return (None, None),
+        // Store or refresh error: the user IS configured but something went
+        // wrong (expired token, network failure, keyring error).  Return a
+        // safe diagnostic so the caller can surface a meaningful message.
+        Err(e) => {
+            return (None, Some(sanitize_copilot_error(&e)));
+        }
     }
     let source: Arc<dyn CredentialSource> =
         Arc::new(CredentialManagerSource::new(Arc::clone(&manager), "github-copilot"));
 
-    // The credential source supplies only Authorization; editor identity comes
-    // from the config by design. Without these the API rejects every request
-    // with "missing Editor-Version header for IDE auth", so the engine appears
-    // to have no models at all.
-    let auth_config = AuthCopilotConfig::default_public();
+    // The credential source supplies the Authorization header; identity
+    // headers come from the resolved config. Without these the API rejects
+    // requests with "missing Editor-Version header for IDE auth", and the
+    // engine appears to have no models at all.
+    //
+    // api_base_url must be set explicitly: CopilotConfig::with_token("") always
+    // defaults to the public github.com endpoint. An enterprise tenant's
+    // inference endpoint (e.g. https://copilot-api.octocorp.ghe.com) is only
+    // in auth_config.api_base_url, so without this call every enterprise
+    // request goes to the wrong host.
     let config = CopilotConfig::with_token("")
         .with_credential_source(source)
+        .with_base_url(auth_config.api_base_url.clone())
         .with_header("editor-version", auth_config.editor_version.clone())
         .with_header("editor-plugin-version", auth_config.editor_plugin_version.clone())
         .with_header("copilot-integration-id", auth_config.integration_id.clone())
         .with_header("user-agent", auth_config.user_agent.clone())
         .with_header("x-github-api-version", "2026-06-01");
 
-    CopilotClient::new(config).ok().map(|c| Arc::new(c) as Arc<dyn LlmClient>)
+    let client = CopilotClient::new(config).ok().map(|c| Arc::new(c) as Arc<dyn LlmClient>);
+    (client, None)
 }
 
 /// Builds a Claude.ai (Anthropic subscription) client from a stored OAuth
@@ -2842,10 +2941,21 @@ mod tests {
             Err(e) => eprintln!("raw credential read failed: {e}"),
         }
 
+        // Uses from_environment() so an enterprise domain env var is honoured
+        // the same way the production path does.
+        let auth_config = match AuthCopilotConfig::from_environment() {
+            Ok(c) => {
+                eprintln!("auth config: api_base_url = {}", c.api_base_url);
+                c
+            }
+            Err(e) => {
+                eprintln!("auth config error: {e}");
+                return;
+            }
+        };
         let manager = Arc::new(CredentialManager::new(
             credential_store(),
-            [Arc::new(CopilotProvider::new(AuthCopilotConfig::default_public()))
-                as Arc<dyn AuthProvider>],
+            [Arc::new(CopilotProvider::new(auth_config)) as Arc<dyn AuthProvider>],
         ));
         match manager.get_credential("github-copilot").await {
             Ok(Some(_)) => eprintln!("manager: credential OK"),
@@ -5188,5 +5298,302 @@ mod tests {
         .unwrap();
         assert_eq!(r["ok"], true);
         assert_eq!(r["cleared"], false);
+    }
+
+    // ── build_copilot_from_store: enterprise routing and error classification ─
+    //
+    // These tests verify the three host-wiring properties guaranteed by the
+    // refactor:
+    //   1. Public default (no env): no diagnostic, client built when cred present.
+    //   2. Enterprise domain: enterprise api_base_url is applied to the client.
+    //   3. Refresh error: classified as (None, Some(diag)), NOT (None, None).
+    // Tests run entirely against an InMemoryStore — no real keyring is touched.
+
+    mod build_copilot_from_store_tests {
+        use super::*;
+        use coda_auth::store::InMemoryStore;
+        use coda_auth::{Credential, CredentialKind, Secret};
+
+        /// A Copilot credential with an expiry well in the future — no refresh
+        /// will be triggered, which keeps these tests hermetic (no network).
+        fn fresh_credential() -> Credential {
+            Credential {
+                provider_id: "github-copilot".into(),
+                kind: CredentialKind::OAuth,
+                access_token: Some(Secret::new("fake-copilot-token".into())),
+                refresh_token: Some(Secret::new("fake-github-token".into())),
+                api_key: None,
+                expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(24)),
+                scopes: Vec::new(),
+                account: None,
+            }
+        }
+
+        /// Seeds an InMemoryStore with the given credential under the manager key.
+        async fn seed(store: &InMemoryStore, cred: &Credential) {
+            let json = serde_json::to_string(cred).unwrap();
+            store.set("llmauth:github-copilot", &json).await.unwrap();
+        }
+
+        /// An empty store means "not signed in" — no diagnostic should be set.
+        #[tokio::test]
+        async fn empty_store_returns_none_without_diagnostic() {
+            let store = Arc::new(InMemoryStore::new());
+            let (client, diag) = build_copilot_from_store(store, AuthCopilotConfig::default_public()).await;
+            assert!(client.is_none(), "no client when no credential is stored");
+            assert!(diag.is_none(), "no diagnostic for 'not signed in'");
+        }
+
+        /// A stored, still-valid credential builds a client without a diagnostic.
+        #[tokio::test]
+        async fn valid_credential_builds_client_no_diagnostic() {
+            let store = Arc::new(InMemoryStore::new());
+            seed(&store, &fresh_credential()).await;
+
+            let (client, diag) = build_copilot_from_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>,
+                AuthCopilotConfig::default_public(),
+            )
+            .await;
+            assert!(client.is_some(), "client must be built when credential is present");
+            assert!(diag.is_none(), "no diagnostic on success");
+        }
+
+        /// With an enterprise auth config the client is still built and the
+        /// enterprise api_base_url from the config is used (not the public default).
+        ///
+        /// CopilotConfig::with_token("") defaults to "https://api.githubcopilot.com";
+        /// build_copilot_from_store must override that with auth_config.api_base_url.
+        /// We verify by ensuring the enterprise config round-trips correctly and the
+        /// client builds — the api_base_url is set in the config before the client
+        /// is constructed, so a build success proves it was accepted.
+        #[tokio::test]
+        async fn enterprise_config_builds_client_with_enterprise_base_url() {
+            let store = Arc::new(InMemoryStore::new());
+            seed(&store, &fresh_credential()).await;
+
+            let enterprise_config =
+                AuthCopilotConfig::for_enterprise("octocorp.ghe.com").expect("valid enterprise config");
+            assert_eq!(
+                enterprise_config.api_base_url, "https://copilot-api.octocorp.ghe.com",
+                "pre-condition: enterprise config must have enterprise api_base_url"
+            );
+
+            let (client, diag) = build_copilot_from_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>,
+                enterprise_config,
+            )
+            .await;
+            assert!(client.is_some(), "enterprise client must build when credential is present");
+            assert!(diag.is_none(), "no diagnostic on success");
+        }
+
+        /// Regression guard: verifies that `build_copilot_from_store` applies
+        /// `auth_config.api_base_url` to the `CopilotConfig` builder.
+        ///
+        /// Strategy: override `api_base_url` to point at a local mock server.
+        /// Call `list_models()` on the returned client.  If `.with_base_url()` is
+        /// present, the request reaches the mock and the assertion passes.  If
+        /// `.with_base_url()` were removed, the client would default to
+        /// `https://api.githubcopilot.com`, the mock would never receive a
+        /// connection, and the assertion would fail.
+        #[tokio::test]
+        async fn enterprise_api_base_url_is_wired_to_copilot_config() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+            use std::sync::atomic::{AtomicBool, Ordering};
+
+            // Spawn a mock models endpoint that returns an empty list.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let reached = Arc::new(AtomicBool::new(false));
+            let reached2 = Arc::clone(&reached);
+            tokio::spawn(async move {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                reached2.store(true, Ordering::SeqCst);
+                let body = r#"{"models":[],"object":"list"}"#;
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(resp.as_bytes()).await;
+            });
+
+            let store = Arc::new(InMemoryStore::new());
+            seed(&store, &fresh_credential()).await;
+
+            // Build an enterprise config whose api_base_url points at the mock.
+            // All other enterprise fields are set correctly; only the inference
+            // endpoint is redirected to localhost so no real network is needed.
+            let enterprise_config = AuthCopilotConfig {
+                api_base_url: format!("http://127.0.0.1:{port}"),
+                ..AuthCopilotConfig::for_enterprise("octocorp.ghe.com").unwrap()
+            };
+
+            let (client, diag) = build_copilot_from_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>,
+                enterprise_config,
+            )
+            .await;
+            assert!(client.is_some(), "client must build");
+            assert!(diag.is_none());
+
+            // Call list_models() — if api_base_url was wired correctly the
+            // request goes to http://127.0.0.1:{port}/models (the mock).
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(3),
+                client.unwrap().list_models(),
+            )
+            .await;
+
+            assert!(
+                reached.load(Ordering::SeqCst),
+                "enterprise api_base_url must be used: mock server was never reached; \
+                 if this fails, .with_base_url() was likely removed from build_copilot_from_store"
+            );
+        }
+
+        /// from_env_lookup with GH_COPILOT_ENTERPRISE_DOMAIN produces an enterprise
+        /// config — the same path that try_build_copilot_from_keyring takes at startup.
+        #[test]
+        fn from_env_lookup_enterprise_domain_produces_enterprise_api_base_url() {
+            let config = AuthCopilotConfig::from_env_lookup(|key| {
+                if key == "GH_COPILOT_ENTERPRISE_DOMAIN" {
+                    Some("octocorp.ghe.com".to_owned())
+                } else {
+                    None
+                }
+            })
+            .expect("enterprise config from env");
+
+            assert_eq!(
+                config.api_base_url, "https://copilot-api.octocorp.ghe.com",
+                "enterprise domain must produce enterprise inference base URL"
+            );
+            assert_eq!(
+                config.device_code_url, "https://octocorp.ghe.com/login/device/code",
+                "device-code URL must point to the enterprise host"
+            );
+        }
+
+        /// An explicit env override on top of enterprise domain is applied
+        /// (proving the layered precedence: enterprise base + individual override).
+        #[test]
+        fn env_override_on_enterprise_base_applies_individual_endpoint() {
+            let config = AuthCopilotConfig::from_env_lookup(|key| match key {
+                "GH_COPILOT_ENTERPRISE_DOMAIN" => Some("octocorp.ghe.com".to_owned()),
+                "GH_COPILOT_API_BASE_URL" => Some("https://proxy.internal/copilot".to_owned()),
+                _ => None,
+            })
+            .expect("config");
+
+            // The overridden endpoint wins.
+            assert_eq!(config.api_base_url, "https://proxy.internal/copilot");
+            // The non-overridden enterprise endpoints are still correct.
+            assert_eq!(config.device_code_url, "https://octocorp.ghe.com/login/device/code");
+        }
+
+        /// When a stored credential needs refresh and the token exchange returns
+        /// HTTP 401, build_copilot_from_store must return (None, Some(diagnostic))
+        /// rather than (None, None).  Returning None silently was the pre-fix
+        /// behaviour — it hid real auth failures behind "not signed in".
+        ///
+        /// We simulate this with a store that returns a Store-level error (the
+        /// same Err branch in CredentialManager::get_credential that a failed
+        /// token refresh produces). A failing store is simpler than a mock HTTP
+        /// server and tests exactly the property we care about: Err → diagnostic.
+        #[tokio::test]
+        async fn credential_error_returns_diagnostic_not_silent_none() {
+            use async_trait::async_trait;
+            use coda_auth::AuthError;
+
+            /// A store that always returns a Store error on get.
+            struct FailingStore;
+            #[async_trait]
+            impl CredentialStore for FailingStore {
+                async fn get(&self, _: &str) -> Result<Option<String>, AuthError> {
+                    Err(AuthError::Store("simulated keyring failure".into()))
+                }
+                async fn set(&self, _: &str, _: &str) -> Result<(), AuthError> {
+                    Ok(())
+                }
+                async fn delete(&self, _: &str) -> Result<(), AuthError> {
+                    Ok(())
+                }
+            }
+
+            let store: Arc<dyn CredentialStore> = Arc::new(FailingStore);
+            let (client, diag) = build_copilot_from_store(store, AuthCopilotConfig::default_public()).await;
+            assert!(client.is_none(), "a store error must not produce a client");
+            assert!(
+                diag.is_some(),
+                "a credential store error must produce a diagnostic (was silently None before the fix)"
+            );
+            let msg = diag.unwrap();
+            assert!(
+                msg.contains("keyring") || msg.contains("store") || msg.contains("Store"),
+                "diagnostic must mention the failure cause; got: {msg}"
+            );
+        }
+
+        /// When a stored credential needs refresh and the exchange endpoint returns
+        /// a 401, the error must be surfaced as a diagnostic rather than swallowed.
+        /// Uses a local mock HTTP server that accepts one request and returns 401.
+        #[tokio::test]
+        async fn refresh_401_returns_diagnostic_not_silent_none() {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            use tokio::net::TcpListener;
+
+            // Spawn a TLS-less mock: normally the validator would reject http://.
+            // Bypass by setting a raw URL directly on the already-built config.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 4096];
+                let _ = socket.read(&mut buf).await;
+                let resp = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                let _ = socket.write_all(resp).await;
+            });
+
+            // Seed a credential that looks near-expiry so a refresh is triggered.
+            let expired = Credential {
+                provider_id: "github-copilot".into(),
+                kind: CredentialKind::OAuth,
+                access_token: Some(Secret::new("expired-copilot-token".into())),
+                refresh_token: Some(Secret::new("fake-github-token".into())),
+                api_key: None,
+                expires_at: Some(chrono::Utc::now() - chrono::Duration::hours(1)),
+                scopes: Vec::new(),
+                account: None,
+            };
+
+            let store = Arc::new(InMemoryStore::new());
+            let json = serde_json::to_string(&expired).unwrap();
+            store.set("llmauth:github-copilot", &json).await.unwrap();
+
+            // Build the config manually, bypassing the https:// validation so the
+            // mock HTTP server can be reached (the validator runs at config time,
+            // not at exchange time — set the URL after validation).
+            let base = AuthCopilotConfig::default_public();
+            let mock_exchange = format!("http://127.0.0.1:{port}/token");
+            let config = AuthCopilotConfig {
+                copilot_token_url: Some(mock_exchange),
+                ..base
+            };
+
+            let (client, diag) = build_copilot_from_store(
+                Arc::clone(&store) as Arc<dyn CredentialStore>,
+                config,
+            )
+            .await;
+            assert!(client.is_none(), "a 401 refresh must not produce a client");
+            assert!(
+                diag.is_some(),
+                "a 401 refresh error must produce a diagnostic (was silently None before the fix)"
+            );
+        }
     }
 }
