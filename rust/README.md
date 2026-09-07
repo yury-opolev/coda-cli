@@ -319,6 +319,15 @@ contradictory one.
 
 Restart the engine after saving to connect the new or updated server.
 
+### Thinking display
+
+The chat shows `Thinking... 9s` (then `Thinking... 1:05`) as soon as the
+provider announces a reasoning block, without waiting for summary text.
+Completion changes it to a foldable `Thought` header when visible text exists.
+Encrypted-only reasoning remains a header without an empty expand control.
+Copilot Responses requests with an explicit effort also request the provider's
+reasoning summary; encrypted reasoning content is never displayed.
+
 ### CLI reference (Rust parity flags)
 
 All startup overrides are session-only and never written to `settings.json`.

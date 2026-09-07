@@ -1993,6 +1993,32 @@ mod tests {
         }
     }
     #[test]
+    fn bodyless_thinking_start_displays_and_ticks_until_the_item_finishes() {
+        use std::time::{Duration, Instant};
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Engine(Event::Thinking { delta: String::new() }), start);
+        assert_eq!(state.activity, Activity::Thinking);
+        assert!(!state.transcript.is_foldable(0));
+        for mode in [ToolDisplayMode::Summary, ToolDisplayMode::Compact, ToolDisplayMode::Full] {
+            let rows = state.transcript.render(80, mode);
+            assert!(rows.iter().any(|row| row.text.contains("Thinking... 0s")));
+        }
+        assert!(state.tick_thinking(start + Duration::from_secs(65)));
+        assert!(state.transcript.render(80, ToolDisplayMode::Summary).iter()
+            .any(|row| row.text.contains("Thinking... 1:05")));
+        state.apply_at(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 65_000, thinking_tokens: None,
+        }), start + Duration::from_secs(65));
+        state.apply_at(UiEvent::Engine(Event::AssistantText { delta: "answer".into() }),
+            start + Duration::from_secs(66));
+        assert!(!state.tick_thinking(start + Duration::from_secs(70)));
+        assert!(matches!(&state.transcript.blocks()[0],
+            Block::Thinking { complete: true, elapsed_ms: 65_000, .. }));
+        assert_eq!(state.transcript.blocks().len(), 2);
+    }
+
+    #[test]
     fn live_thinking_clock_advances_without_deltas_and_keeps_its_start() {
         use std::time::{Duration, Instant};
         let mut state = state();

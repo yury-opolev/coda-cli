@@ -18,6 +18,8 @@ use crate::message::{Content, Correlation, Usage};
 pub enum StreamEvent {
     /// A fragment of assistant text.
     TextDelta(String),
+    /// The provider opened a reasoning block, possibly before any visible text.
+    ThinkingStarted,
     /// A fragment of reasoning.
     ThinkingDelta(String),
     /// A completed reasoning block, with the signature that must be replayed.
@@ -106,10 +108,7 @@ impl AnthropicDecoder {
                 }
                 Ok(Vec::new())
             }
-            "content_block_start" => {
-                self.start_block(&value);
-                Ok(Vec::new())
-            }
+            "content_block_start" => Ok(self.start_block(&value)),
             "content_block_delta" => Ok(self.apply_delta(&value)),
             "content_block_stop" => Ok(self.stop_block(&value)),
             "message_delta" => {
@@ -151,12 +150,12 @@ impl AnthropicDecoder {
         }
     }
 
-    fn start_block(&mut self, value: &Value) {
+    fn start_block(&mut self, value: &Value) -> Vec<StreamEvent> {
         let Some(index) = value.get("index").and_then(Value::as_u64) else {
-            return;
+            return Vec::new();
         };
         let Some(block) = value.get("content_block") else {
-            return;
+            return Vec::new();
         };
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
         let string =
@@ -177,10 +176,18 @@ impl AnthropicDecoder {
                 name: string("name"),
                 input: String::new(),
             },
-            _ => return,
+            _ => return Vec::new(),
         };
 
+        let mut events = Vec::new();
+        if let Partial::Thinking { text, .. } = &partial {
+            events.push(StreamEvent::ThinkingStarted);
+            if !text.is_empty() {
+                events.push(StreamEvent::ThinkingDelta(text.clone()));
+            }
+        }
         self.blocks.insert(index, partial);
+        events
     }
 
     fn apply_delta(&mut self, value: &Value) -> Vec<StreamEvent> {
@@ -425,6 +432,21 @@ mod tests {
             panic!("expected a tool use");
         };
         assert_eq!(input_json, r#"{"x":1}"#, "fragments leaked between blocks");
+    }
+
+    #[test]
+    fn thinking_start_is_emitted_before_text_but_redacted_blocks_stay_opaque() {
+        for (kind, expected) in [
+            ("thinking", vec![StreamEvent::ThinkingStarted]),
+            ("redacted_thinking", vec![]),
+            ("text", vec![]),
+        ] {
+            let mut decoder = AnthropicDecoder::new();
+            let events = decoder.decode("content_block_start", &json!({
+                "index":0, "content_block":{"type":kind}
+            }).to_string()).unwrap();
+            assert_eq!(events, expected);
+        }
     }
 
     #[test]

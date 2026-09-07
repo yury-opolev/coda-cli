@@ -31,7 +31,7 @@ pub(crate) struct StreamAccumulator {
     pub redacted_thinking_blocks: Vec<Content>,
     pub stop_reason: Option<String>,
     pub usage: Option<Usage>,
-    /// True while a thinking burst is in progress (between ThinkingDelta and
+    /// True while a thinking burst is in progress (from ThinkingStarted/Delta to
     /// the corresponding ThinkingDone).
     thinking_burst_open: bool,
     /// Marks when the current thinking burst opened, for `elapsed_ms`.
@@ -84,6 +84,16 @@ pub(crate) async fn drive_stream(
                 acc.text.push_str(&text);
                 acc.segment_start = Some(Instant::now());
                 sink.emit(AgentEvent::AssistantText { delta: text });
+            }
+
+            StreamEvent::ThinkingStarted => {
+                if !acc.thinking_burst_open {
+                    acc.thinking_burst_start = Some(Instant::now());
+                    acc.thinking_burst_open = true;
+                    // The existing wire event opens a bodyless UI block; no
+                    // placeholder reasoning text or protocol extension is needed.
+                    sink.emit(AgentEvent::Thinking { delta: String::new() });
+                }
             }
 
             StreamEvent::ThinkingDelta(text) => {
@@ -402,6 +412,38 @@ mod tests {
     }
 
     // §8 item 3: assistant block order helpers — verify thinking blocks accumulate.
+    #[tokio::test]
+    async fn reasoning_start_reaches_ui_while_provider_is_still_silent() {
+        use coda_llm::copilot::responses::ResponsesDecoder;
+        struct ChannelSink(mpsc::UnboundedSender<AgentEvent>);
+        impl AgentSink for ChannelSink {
+            fn emit(&self, event: AgentEvent) {
+                self.0.send(event).unwrap();
+            }
+        }
+        let mut decoder = ResponsesDecoder::new();
+        let events = decoder.decode("response.output_item.added",
+            r#"{"output_index":0,"item":{"type":"reasoning","id":"r1","summary":[]}}"#,
+        ).unwrap();
+        let (provider_tx, provider_rx) = mpsc::channel(16);
+        for event in events {
+            provider_tx.send(Ok(event)).await.unwrap();
+        }
+        let (ui_tx, mut ui_rx) = mpsc::unbounded_channel();
+        let sink = ChannelSink(ui_tx);
+        let mut acc = StreamAccumulator::default();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::select! {
+                event = ui_rx.recv() => event.expect("UI event"),
+                result = drive_stream(ResponseStream::new(provider_rx), &sink, &mut acc) =>
+                    panic!("provider is still open: {result:?}"),
+            }
+        }).await.expect("UI must receive thinking before any summary or answer");
+        assert!(matches!(event, AgentEvent::Thinking { delta } if delta.is_empty()));
+        assert!(acc.thinking_burst_open);
+        drop(provider_tx);
+    }
+
     #[tokio::test]
     async fn drive_stream_accumulates_signed_thinking() {
         use crate::events::NullSink;
