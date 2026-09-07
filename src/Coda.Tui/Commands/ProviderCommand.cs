@@ -1,8 +1,6 @@
 using Coda.Tui.Rendering;
 using Coda.Tui.Repl;
 using Coda.Tui.Setup;
-using LlmAuth;
-using LlmAuth.Providers.ClaudeAi;
 using Spectre.Console;
 
 namespace Coda.Tui.Commands;
@@ -48,12 +46,13 @@ public sealed class ProviderCommand : ISlashCommand
                 return CommandResult.Continue;
             }
 
-            // Non-interactive: query the actual connected credential state now,
-            // not the session-start snapshot in ActiveProviderId.  Showing
-            // "active" without checking authentication status is misleading —
-            // the provider might be a no-credential fallback or have an expired
-            // token, yet still appear as "active" to the user.
-            await RenderProviderStatusAsync(context, cancellationToken).ConfigureAwait(false);
+            context.Console.MarkupLine($"Active provider: {Theme.AccentMarkup(context.ActiveProvider.DisplayName)} {Theme.DimMarkup($"({context.ActiveProvider.Id})")}");
+            context.Console.MarkupLine(Theme.DimMarkup("Available:"));
+            foreach (var provider in context.Providers)
+            {
+                context.Console.MarkupLine($"  {Theme.AccentMarkup(provider.Id)} {Theme.DimMarkup($"— {provider.DisplayName}")}");
+            }
+
             return CommandResult.Continue;
         }
 
@@ -69,48 +68,6 @@ public sealed class ProviderCommand : ISlashCommand
         // was previously connected; no defaultProvider settings pointer is written.
         await ConnectAndPublishAsync(context, resolved, cancellationToken).ConfigureAwait(false);
         return CommandResult.Continue;
-    }
-
-    /// <summary>
-    /// Show the actual sign-in status of every provider, using the credential
-    /// store at call time rather than the stale session snapshot.  This avoids
-    /// the misleading "Active provider: X" label when X was merely the first
-    /// registered provider used as a no-credential fallback.
-    /// </summary>
-    private static async Task RenderProviderStatusAsync(CommandContext context, CancellationToken cancellationToken)
-    {
-        // Which provider currently has a stored credential (raw check, no refresh).
-        var connectedId = await context.Credentials.GetConnectedProviderIdAsync(cancellationToken)
-            .ConfigureAwait(false);
-
-        foreach (var provider in context.Providers)
-        {
-            bool signedIn;
-            if (provider.LoginKind == LoginKind.ApiKey)
-            {
-                signedIn = !string.IsNullOrEmpty(
-                    Environment.GetEnvironmentVariable(ApiKeyProvider.EnvVarName));
-            }
-            else
-            {
-                signedIn = string.Equals(provider.Id, connectedId, StringComparison.OrdinalIgnoreCase);
-            }
-
-            var marker = signedIn ? Theme.SuccessMarkup("●") : Theme.DimMarkup("○");
-            var statusLabel = signedIn ? Theme.SuccessMarkup("signed in") : Theme.DimMarkup("not signed in");
-            // "in use" reflects the running session's choice; "signed in" reflects
-            // what the credential store says, so both can be true independently.
-            var inUse = string.Equals(provider.Id, context.Session.ActiveProviderId, StringComparison.OrdinalIgnoreCase)
-                ? Theme.AccentMarkup(" (in use)") : string.Empty;
-
-            context.Console.MarkupLine(
-                $"  {marker} {Theme.AccentMarkup(provider.DisplayName)} {Theme.DimMarkup($"({provider.Id})")}: {statusLabel}{inUse}");
-        }
-
-        if (connectedId is null)
-        {
-            context.Console.MarkupLine(Theme.WarnMarkup("No provider is signed in. Run /login to authenticate."));
-        }
     }
 
     /// <summary>

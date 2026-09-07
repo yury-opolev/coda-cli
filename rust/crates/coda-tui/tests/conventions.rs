@@ -140,7 +140,8 @@ fn glyph_literals_live_only_in_the_glyph_table() {
         .filter(|(path, _)| !path.replace('\\', "/").ends_with("render/glyphs.rs"))
         .filter_map(|(path, source)| {
             let code = without_comments(&without_test_modules(&source));
-            code.contains("\\u{").then_some(path)
+            // A file's UTF-8 BOM is an encoding marker, not a rendered glyph.
+            code.replace("\\u{feff}", "").contains("\\u{").then_some(path)
         })
         .collect();
 

@@ -378,20 +378,26 @@ name; no per-URL configuration is needed.
 
 **Setting the domain**
 
+The domain can be set in two ways, with the environment variable taking
+precedence if both are present:
+
 ```powershell
-# Process environment (takes precedence over the saved setting):
+# 1. Process environment — wins over the saved setting when non-blank:
 $env:GH_COPILOT_ENTERPRISE_DOMAIN = "octocorp.ghe.com"
 coda
 
-# Or save it once via the TUI's /enterprise command so every session picks it
-# up automatically:
-/enterprise domain octocorp.ghe.com
+# 2. Persisted in settings — read at startup on every run:
+#    Write "githubEnterpriseDomain": "octocorp.ghe.com" to ~/.coda/settings.json
+#    The exact key is camelCase; an existing C# profile needs no migration.
 ```
 
-The saved `githubEnterpriseDomain` in `~/.coda/settings.json` is applied at
-startup by the C# layer (via `CopilotEnvironment.ApplyEnterpriseDomain`) before
-the engine is launched, so an explicit `GH_COPILOT_ENTERPRISE_DOMAIN` variable
-always wins.
+The Rust engine reads `githubEnterpriseDomain` directly from
+`~/.coda/settings.json` at startup (BOM-tolerant, honors `CODA_HOME`). No
+C# layer or environment mutation is involved; the resolver passes a combined
+lookup to `AuthCopilotConfig::from_env_lookup`: env wins if non-blank,
+otherwise the saved setting is used.
+Unreadable or malformed settings stop Copilot client construction rather than
+silently selecting public endpoints.
 
 **What the domain configures**
 
@@ -437,18 +443,22 @@ so every derived URL stays consistent.
 
 **Startup credential diagnostics**
 
-Unlike a missing credential (silent "not signed in"), a token-exchange failure
-or keyring error at startup is now reported as a provider-specific message:
+Unlike a missing credential (which is silent — "not signed in"), a
+token-exchange failure or keyring error at startup is reported as a
+provider-specific message on the first prompt:
 
 ```
-GitHub Copilot credential error: token refresh failed (HTTP 401);
-run /login to re-authenticate
+GitHub Copilot credential error: token refresh failed (HTTP 401).
+Check credentials and provider configuration, then restart Coda.
 ```
 
-Response bodies are never included in this message. If you see this, run
-`/login` to perform a fresh device-code login. The raw error code (HTTP status,
-store error text, etc.) is sufficient to diagnose the issue without leaking
-token material.
+Response bodies, raw store/transport error text, and credential-bearing URLs
+are never included. Messages identify the failure category and HTTP status
+when available. To recover, check credentials, configuration, and connectivity,
+then restart Coda.
+
+The diagnostic is scoped to the current engine instance — a failed probe on
+one session does not contaminate another.
 
 ## The two seams
 

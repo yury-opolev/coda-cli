@@ -257,7 +257,7 @@ fn load_http_file_checked(path: &Path) -> (Vec<RawHttpEntry>, Option<String>) {
             );
         }
     };
-    let doc: Value = match serde_json::from_str(&text) {
+    let doc: Value = match serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -406,7 +406,7 @@ fn load_file_checked(path: &Path, scope: McpScope) -> (Vec<McpRawServer>, Option
             );
         }
     };
-    let doc: Value = match serde_json::from_str(&text) {
+    let doc: Value = match serde_json::from_str(text.strip_prefix('\u{feff}').unwrap_or(&text)) {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -559,6 +559,40 @@ mod tests {
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn checked_mcp_readers_accept_optional_utf8_bom_without_rewriting() {
+        let dir = TempDir::new();
+        let json = r#"{"mcpServers":{"stdio":{"command":"example"},"http":{"type":"http","url":"http://localhost:3000/mcp"}}}"#;
+        for prefix in ["", "\u{feff}"] {
+            let content = format!("{prefix}{json}");
+            let path = dir.write("bom.mcp.json", &content);
+            let (servers, notice) = load_file_checked(&path, McpScope::User);
+            assert!(notice.is_none(), "{notice:?}");
+            assert_eq!(servers.len(), 2);
+            let (http, notice) = load_http_file_checked(&path);
+            assert!(notice.is_none(), "{notice:?}");
+            assert_eq!(http.len(), 1);
+            assert_eq!(http[0].url, "http://localhost:3000/mcp");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+        }
+    }
+
+    #[test]
+    fn checked_mcp_readers_still_reject_malformed_bom_documents() {
+        let dir = TempDir::new();
+        for content in [
+            "\u{feff}{broken",
+            "\u{feff}\u{feff}{}",
+            " \u{feff}{}",
+            "\u{feff}{\"mcpServers\":[]}",
+        ] {
+            let path = dir.write("invalid.mcp.json", content);
+            assert!(load_file_checked(&path, McpScope::User).1.is_some());
+            assert!(load_http_file_checked(&path).1.is_some());
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
         }
     }
 

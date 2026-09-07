@@ -44,26 +44,26 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     //    closed if it is unavailable — never a different provider (Finding C2).
     // 2. Otherwise an explicit key (+ optional endpoint) is used directly; an
     //    endpoint without a key was already rejected by `validate`.
-    // 3. Otherwise the normal credential probe runs (env + keyring).
-    let client = if let Some(provider) = startup.provider.as_deref() {
-        Some(
-            crate::host::build_client_for_provider(
-                provider,
-                startup.api_key.as_deref(),
-                startup.endpoint.as_deref(),
-            )
-            .await
-            .map_err(|e| anyhow::anyhow!("provider selection failed: {e}"))?,
+    // 3. Otherwise the normal credential probe runs (env + keyring); only the
+    //    keyring path can produce a diagnostic (Copilot credential error).
+    let (client, copilot_diagnostic) = if let Some(provider) = startup.provider.as_deref() {
+        let result = crate::host::build_client_for_provider(
+            provider,
+            startup.api_key.as_deref(),
+            startup.endpoint.as_deref(),
         )
+        .await
+        .map_err(|e| anyhow::anyhow!("provider selection failed: {e}"))?;
+        (Some(result), None)
     } else {
         match (
             startup.api_key.as_deref().filter(|k| !k.trim().is_empty()),
             startup.endpoint.as_deref().filter(|e| !e.trim().is_empty()),
         ) {
-            (Some(key), endpoint) => crate::host::build_anthropic_at(key, endpoint),
+            (Some(key), endpoint) => (crate::host::build_anthropic_at(key, endpoint), None),
             (None, _) => {
-                // Full credential probe at startup (env + keyring).
-                crate::host::try_build_client(None).await
+                // Full credential probe: env first (no diagnostic), then keyring (may have one).
+                crate::host::try_build_client_with_diagnostic(None).await
             }
         }
     };
@@ -72,7 +72,7 @@ pub async fn serve_stdio() -> anyhow::Result<()> {
     // in the registry from the first turn. Disabled/failed servers are handled
     // inside `connect_mcp` and never block startup.
     let mcp = crate::mcp::connect_mcp(&working_dir).await;
-    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir, mcp, startup).await
+    serve_inner(tokio::io::stdin(), tokio::io::stdout(), client, working_dir, mcp, startup, copilot_diagnostic).await
 }
 
 /// Runs the engine on the given reader/writer pair.
@@ -93,6 +93,7 @@ where
         working_dir,
         crate::mcp::McpBundle::disabled(),
         crate::host::StartupOptions::default(),
+        None,
     )
     .await
 }
@@ -117,6 +118,7 @@ where
         working_dir.to_string(),
         crate::mcp::McpBundle::disabled(),
         crate::host::StartupOptions::default(),
+        None,
     )
     .await
 }
@@ -128,6 +130,7 @@ async fn serve_inner<R, W>(
     working_dir: String,
     mcp: crate::mcp::McpBundle,
     startup: crate::host::StartupOptions,
+    copilot_diagnostic: Option<String>,
 ) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -144,6 +147,7 @@ where
         working_dir,
         mcp,
         startup,
+        copilot_diagnostic,
     );
 
     let writer_task = tokio::spawn(write_loop(writer, outgoing_rx));
