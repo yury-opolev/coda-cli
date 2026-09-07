@@ -260,9 +260,16 @@ impl App {
 
                 self.connection = connection;
                 self.restarted = Some((engine, inbound));
+                if let Some(ctx) = coda_diagnostics::current() {
+                    crate::diagnostics::record_engine_log_path(
+                        &ctx.with_session(initialized.session_id.clone()),
+                        initialized.telemetry_log_path.as_deref(),
+                    );
+                }
                 if !initialized.session_id.is_empty() {
                     self.state.session_id = Some(initialized.session_id);
                 }
+                self.engine_log_path = initialized.telemetry_log_path;
                 if lost_history {
                     self.notice(
                         "Engine restarted, but this session had not been saved yet, so it \

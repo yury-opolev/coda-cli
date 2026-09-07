@@ -35,13 +35,31 @@ pub struct Cli {
     #[arg(long, value_name = "FILE")]
     pub log_file: Option<PathBuf>,
 
-    /// Log filter, e.g. `debug` or `coda_client=trace`.
+    /// Legacy compatibility hint: a `tracing` `EnvFilter` string. Only its
+    /// loudest named level is used, as a fallback default for
+    /// `--diagnostic-verbosity`.
     #[arg(long, env = "CODA_LOG", default_value = "warn")]
     pub log_filter: String,
+
+    /// Diagnostic detail level for the essential operational log: normal,
+    /// debug, or trace. Takes precedence over `--log-filter`/`CODA_LOG`.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_diagnostic_verbosity)]
+    pub diagnostic_verbosity: Option<String>,
 
     /// Disable mouse capture, which some terminals handle poorly.
     #[arg(long)]
     pub no_mouse: bool,
+}
+
+/// Validates a `--diagnostic-verbosity` value at the parser layer.
+fn parse_diagnostic_verbosity(raw: &str) -> Result<String, String> {
+    let level = raw.trim().to_ascii_lowercase();
+    match level.as_str() {
+        "normal" | "debug" | "trace" => Ok(level),
+        _ => Err(format!(
+            "invalid diagnostic verbosity '{raw}' (expected one of: normal, debug, trace)"
+        )),
+    }
 }
 
 impl Cli {

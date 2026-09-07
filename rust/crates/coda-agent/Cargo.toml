@@ -12,6 +12,7 @@ coda-llm.workspace = true
 coda-tool.workspace = true
 coda-proto.workspace = true
 coda-client.workspace = true
+coda-diagnostics.workspace = true
 
 anyhow.workspace = true
 thiserror.workspace = true

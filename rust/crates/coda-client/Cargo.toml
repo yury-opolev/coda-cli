@@ -9,6 +9,7 @@ description = "Client that drives a `coda serve` engine process over JSON-RPC 2.
 
 [dependencies]
 coda-proto.workspace = true
+coda-diagnostics.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -19,3 +20,4 @@ bytes.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+tempfile = "3"

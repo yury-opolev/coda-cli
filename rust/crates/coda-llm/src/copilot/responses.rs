@@ -103,8 +103,8 @@ fn append_assistant_input(input: &mut Vec<Value>, message: &crate::message::Mess
     // signature stores a JSON object with `id` and `encrypted_content`.
     for block in &message.content {
         if let Content::Thinking {
+            text,
             signature: Some(sig),
-            ..
         } = block
         {
             if let Ok(doc) = serde_json::from_str::<Value>(sig) {
@@ -116,6 +116,11 @@ fn append_assistant_input(input: &mut Vec<Value>, message: &crate::message::Mess
                         "type": "reasoning",
                         "id": id,
                         "encrypted_content": enc,
+                        "summary": if text.is_empty() {
+                            Vec::new()
+                        } else {
+                            vec![json!({"type": "summary_text", "text": text})]
+                        },
                     }));
                 }
             }
@@ -601,6 +606,28 @@ mod tests {
         let part = &body["input"][0]["content"][0];
         assert_eq!(part["type"], "input_image");
         assert_eq!(part["image_url"], "data:image/png;base64,abc");
+    }
+
+    #[test]
+    fn reasoning_replay_includes_required_summary_for_each_saved_item() {
+        let message = Message::new(Role::Assistant, vec![
+            Content::Thinking {
+                text: String::new(),
+                signature: Some(json!({"id":"r1","encrypted_content":"opaque-one"}).to_string()),
+            },
+            Content::Thinking {
+                text: "First paragraph.\n\nSecond paragraph.".into(),
+                signature: Some(json!({"id":"r2","encrypted_content":"opaque-two"}).to_string()),
+            },
+        ]);
+        let body = build(&ChatRequest::new("gpt-6-astra", vec![message]));
+        assert_eq!(body["input"][0], json!({
+            "type":"reasoning", "id":"r1", "encrypted_content":"opaque-one", "summary":[],
+        }));
+        assert_eq!(body["input"][1], json!({
+            "type":"reasoning", "id":"r2", "encrypted_content":"opaque-two",
+            "summary":[{"type":"summary_text","text":"First paragraph.\n\nSecond paragraph."}],
+        }));
     }
 
     #[test]

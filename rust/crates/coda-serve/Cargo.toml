@@ -12,6 +12,7 @@ coda-tool = { workspace = true }
 coda-mcp = { workspace = true }
 coda-llm = { workspace = true }
 coda-auth = { workspace = true }
+coda-diagnostics = { workspace = true }
 
 tokio = { workspace = true, features = ["io-std"] }
 tokio-util = { workspace = true }

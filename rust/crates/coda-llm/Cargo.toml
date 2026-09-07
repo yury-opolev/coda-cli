@@ -8,6 +8,8 @@ repository.workspace = true
 description = "Provider clients and the neutral chat model for the Coda engine."
 
 [dependencies]
+coda-diagnostics.workspace = true
+
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -16,6 +18,7 @@ tokio.workspace = true
 tracing.workspace = true
 bytes.workspace = true
 reqwest.workspace = true
+regex.workspace = true
 futures-util = { version = "0.3", default-features = false }
 async-stream = "0.3"
 async-trait = "0.1"
@@ -23,3 +26,4 @@ async-trait = "0.1"
 [dev-dependencies]
 pretty_assertions.workspace = true
 tokio = { workspace = true, features = ["net", "macros", "rt-multi-thread", "io-util", "time"] }
+tempfile = "3"

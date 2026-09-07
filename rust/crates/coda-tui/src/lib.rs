@@ -7,6 +7,7 @@ pub mod cli;
 pub mod commands;
 pub mod composer;
 pub mod config;
+pub mod diagnostics;
 pub mod hint;
 pub mod keymap;
 pub mod render;

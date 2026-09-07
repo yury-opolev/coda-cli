@@ -661,6 +661,12 @@ pub struct ServeHost {
     /// `defaultProvider` field in `settings.json`. Does not imply authentication
     /// succeeded — only that this provider was expected.
     startup_configured_provider: Option<String>,
+    /// The process-level diagnostic root (role/run_id/logger only — no
+    /// session or turn identity, which is layered on explicitly per
+    /// request/turn via [`coda_diagnostics::scope`] and never stored here as
+    /// mutable state). `None` in every test/library context that never
+    /// established one; diagnostics are then simply skipped.
+    diagnostics: Option<coda_diagnostics::DiagnosticContext>,
 }
 
 impl ServeHost {
@@ -688,6 +694,7 @@ impl ServeHost {
             McpBundle::disabled(),
             StartupOptions::default(),
             None,
+            None,
         )
     }
 
@@ -709,6 +716,7 @@ impl ServeHost {
             McpBundle::disabled(),
             StartupOptions::default(),
             None,
+            None,
         )
     }
 
@@ -724,6 +732,12 @@ impl ServeHost {
     /// credential probe (see [`build_copilot_from_store`]).  It is scoped to
     /// this host instance; a failed probe on one host never contaminates
     /// another.
+    ///
+    /// `diagnostics` is the process-level root diagnostic context, captured
+    /// by the transport from the ambient [`coda_diagnostics::current`] on the
+    /// same task the process entrypoint established it on (never read here
+    /// via a global — that context is not visible across the `tokio::spawn`
+    /// boundary between the transport and per-request dispatch tasks).
     pub(crate) fn new_with_optional_client_and_mcp(
         client: Option<Arc<dyn LlmClient>>,
         sink: Arc<ServeSink>,
@@ -732,6 +746,7 @@ impl ServeHost {
         mcp: McpBundle,
         startup: StartupOptions,
         copilot_diagnostic: Option<String>,
+        diagnostics: Option<coda_diagnostics::DiagnosticContext>,
     ) -> Arc<Self> {
         let provider_id = client.as_ref().map(|c| c.provider_id().to_owned());
         Self::build(
@@ -743,6 +758,7 @@ impl ServeHost {
             mcp,
             startup,
             copilot_diagnostic,
+            diagnostics,
         )
     }
 
@@ -765,6 +781,7 @@ impl ServeHost {
             Some(&provider_id),
             mcp,
             StartupOptions::default(),
+            None,
             None,
         )
     }
@@ -789,6 +806,7 @@ impl ServeHost {
             McpBundle::disabled(),
             startup,
             None,
+            None,
         )
     }
 
@@ -801,6 +819,7 @@ impl ServeHost {
         mcp: McpBundle,
         startup_opts: StartupOptions,
         copilot_diagnostic: Option<String>,
+        diagnostics: Option<coda_diagnostics::DiagnosticContext>,
     ) -> Arc<Self> {
         let wire_perm = Arc::new(WirePermissionPrompt { channel: Arc::clone(&prompt_channel) });
         // Startup permission mode override comes from the validated options
@@ -910,6 +929,7 @@ impl ServeHost {
             pending_interrupt: Mutex::new(false),
             startup_copilot_diagnostic: copilot_diagnostic,
             startup_configured_provider,
+            diagnostics,
         })
     }
 
@@ -1180,6 +1200,7 @@ impl ServeHost {
         let hook_free_subagent = SubagentHost::with_defaults(
             Arc::clone(&client),
             Arc::clone(&self.permission_prompt),
+            Arc::clone(&self.permission_mode),
             Arc::clone(&self.tools),
             Arc::clone(&self.task_manager),
             self.working_dir.clone(),
@@ -1208,6 +1229,7 @@ impl ServeHost {
         let main_subagent = SubagentHost::new(
             Arc::clone(&client),
             Arc::clone(&self.permission_prompt),
+            Arc::clone(&self.permission_mode),
             Arc::clone(&self.tools),
             Arc::new(ToolQuarantine::new()),
             Arc::clone(&self.task_manager),
@@ -1283,6 +1305,7 @@ impl Drop for TurnGuard<'_> {
 #[async_trait]
 impl ServeBackend for ServeHost {
     async fn initialize(&self, p: InitParams) -> Result<Value, RpcError> {
+        let mut resumed = false;
         // If the client supplied a session_id, attempt to resume it.
         // Security: session_id comes from an untrusted wire message — validate it
         // before using it as a file-system key.
@@ -1299,12 +1322,22 @@ impl ServeBackend for ServeHost {
                     // Adopt the resumed id so future saves go to the right file.
                     *self.current_session_id.lock().expect("session_id poisoned") =
                         req_id.clone();
+                    resumed = true;
                 }
                 None => {
                     // Session not found in the working directory.
                     return Err(RpcError::session_not_found());
                 }
             }
+        }
+
+        if let Some(ctx) = &self.diagnostics {
+            let session_ctx = ctx.with_session(self.active_session_id());
+            session_ctx.record(if resumed {
+                coda_diagnostics::Event::SessionResumed
+            } else {
+                coda_diagnostics::Event::SessionInitialized
+            });
         }
 
         // Wire an explicitly provided API key; otherwise leave client as-is
@@ -1324,13 +1357,18 @@ impl ServeBackend for ServeHost {
             }
         }
         self.apply_pending_startup_effort().await?;
+        let telemetry_log_path = self
+            .diagnostics
+            .as_ref()
+            .and_then(|ctx| ctx.logger().status().path)
+            .map(|p| p.display().to_string());
         let resp = InitializeResponse {
             protocol_version: PROTOCOL_VERSION.into(),
             session_id: self.active_session_id(),
             // Must match the C# engine verbatim: clients key off this string,
             // so reporting the crate name here would be a silent parity break.
             server_info: "coda".into(),
-            telemetry_log_path: None,
+            telemetry_log_path,
         };
 
         // Surface any MCP connection/config failures now that a client is
@@ -1364,6 +1402,13 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_prompt(&self, p: PromptParams) -> Result<Value, RpcError> {
+        let provider = self.connected_provider().await;
+        let turn_ctx = self.diagnostics.as_ref().map(|ctx| {
+            ctx.with_session(self.active_session_id())
+                .with_turn(uuid::Uuid::new_v4().to_string())
+                .with_provider_model(Some(provider), Some(self.current_model()))
+        });
+        let run = async {
         self.apply_pending_startup_effort().await?;
         // Validate images BEFORE claiming the turn slot so a bad image
         // never leaves the host stuck in "busy" state.
@@ -1396,6 +1441,25 @@ impl ServeBackend for ServeHost {
         };
 
         self.run_prompt_inner(p).await
+        };
+        match turn_ctx {
+            Some(ctx) => {
+                ctx.record(coda_diagnostics::Event::TurnStart);
+                let result = coda_diagnostics::scope(ctx.clone(), run).await;
+                if let Err(error) = &result {
+                    ctx.record(coda_diagnostics::Event::TurnFailed {
+                        category: match error.code {
+                            -32001 => "unauthorized",
+                            -32602 => "invalid_params",
+                            _ => "preflight",
+                        },
+                        status: None,
+                    });
+                }
+                result
+            }
+            None => run.await,
+        }
     }
 
     async fn session_interrupt(&self) -> Result<Value, RpcError> {
@@ -2198,6 +2262,7 @@ impl ServeHost {
             Arc::clone(&self.permission_prompt),
             Arc::clone(&self.tools),
         )
+        .with_permission_mode_state(Arc::clone(&self.permission_mode))
         .with_model(self.current_model())
         .with_working_directory(&self.working_dir)
         .with_effort(self.current_effort())
@@ -2224,9 +2289,18 @@ impl ServeHost {
 
         let agent = agent.build();
 
+        let turn_ctx = coda_diagnostics::current().map(|ctx| {
+            ctx
+                .with_provider_model(Some(client.provider_id().to_owned()), Some(self.current_model()))
+        });
+
         // Run through TurnSink to capture stop_reason.
         let turn_sink = TurnSink::new(Arc::clone(&self.sink));
-        let run_result = agent.run(&mut history, turn_sink.as_ref(), goal, cancel).await;
+        let run_fut = agent.run(&mut history, turn_sink.as_ref(), goal, cancel);
+        let run_result = match &turn_ctx {
+            Some(ctx) => coda_diagnostics::scope(ctx.clone(), run_fut).await,
+            None => run_fut.await,
+        };
         let stop_reason = turn_sink.take_stop_reason();
 
         // Clear cancel token.
@@ -2249,6 +2323,22 @@ impl ServeHost {
             Err(AgentError::Cancelled) => (true, true, None, None),
             Err(e) => (false, false, None, Some(e.to_string())),
         };
+
+        if let Some(ctx) = &turn_ctx {
+            match &run_result {
+                Ok(_) => ctx.record(coda_diagnostics::Event::TurnEnd { stop_reason: stop_reason.clone() }),
+                Err(AgentError::Cancelled) => {
+                    ctx.record(coda_diagnostics::Event::TurnEnd { stop_reason: Some("cancelled".into()) })
+                }
+                Err(AgentError::Llm(llm_err)) => ctx.record(coda_diagnostics::Event::TurnFailed {
+                    category: coda_llm::diagnostics::category(llm_err),
+                    status: coda_llm::diagnostics::status(llm_err),
+                }),
+                Err(AgentError::Other(_)) => {
+                    ctx.record(coda_diagnostics::Event::TurnFailed { category: "other", status: None })
+                }
+            }
+        }
 
         // Emit TurnComplete BEFORE the response is sent (ordering guarantee).
         self.sink.emit(AgentEvent::TurnComplete {
@@ -2986,6 +3076,170 @@ mod tests {
             host.try_claim_turn().is_some(),
             "dropping the turn must release the slot, or the session wedges forever"
         );
+    }
+
+    // ── diagnostics wiring ───────────────────────────────────────────────────
+
+    fn test_diagnostics(dir: &std::path::Path) -> coda_diagnostics::DiagnosticContext {
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+    }
+
+    fn recorded_lines(ctx: &coda_diagnostics::DiagnosticContext) -> Vec<serde_json::Value> {
+        let path = ctx.logger().status().path.expect("a log path");
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect()
+    }
+
+    /// A host built without a diagnostics root (every other test in this
+    /// module) must omit `telemetryLogPath` — this is the existing contract
+    /// asserted by `initialize_always_succeeds`/`transport.rs`'s tests, and it
+    /// must keep holding for hosts that never opted into real diagnostics.
+    #[tokio::test]
+    async fn a_host_with_a_diagnostics_root_reports_its_real_log_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_diagnostics(dir.path());
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_optional_client_and_mcp(
+            None,
+            sink,
+            ch,
+            ".".into(),
+            crate::mcp::McpBundle::disabled(),
+            StartupOptions::default(),
+            None,
+            Some(ctx.clone()),
+        );
+
+        let result = host.initialize(InitParams::default()).await.unwrap();
+        let reported = result["telemetryLogPath"].as_str().expect("a real path is reported");
+        let expected = ctx.logger().status().path.unwrap();
+        assert_eq!(reported, expected.display().to_string());
+
+        let lines = recorded_lines(&ctx);
+        assert!(lines.iter().any(|l| l["kind"] == "session_initialized"));
+    }
+
+    #[tokio::test]
+    async fn a_successful_turn_records_start_and_end_with_full_correlation() {
+        use coda_llm::anthropic::StreamEvent;
+        use coda_llm::Usage;
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_diagnostics(dir.path());
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::TextDelta("hi".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: Usage::ZERO },
+        ]]);
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_optional_client_and_mcp(
+            Some(client),
+            sink,
+            ch,
+            ".".into(),
+            crate::mcp::McpBundle::disabled(),
+            StartupOptions::default(),
+            None,
+            Some(ctx.clone()),
+        );
+
+        host.initialize(InitParams::default()).await.unwrap();
+        let result = host
+            .session_prompt(PromptParams { text: Some("hello".into()), images: None })
+            .await
+            .expect("prompt succeeds");
+        assert!(result["ok"].as_bool().unwrap_or(false));
+
+        let lines = recorded_lines(&ctx);
+        let start = lines.iter().find(|l| l["kind"] == "turn_start").expect("turn_start recorded");
+        let end = lines.iter().find(|l| l["kind"] == "turn_end").expect("turn_end recorded");
+        assert!(start["session_id"].as_str().is_some());
+        assert!(start["turn_id"].as_str().is_some());
+        assert_eq!(start["turn_id"], end["turn_id"], "start/end share the same turn id");
+        assert_eq!(end["stop_reason"], "end_turn");
+        assert_eq!(start["provider"], "scripted");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_records_a_safe_turn_failed_with_no_raw_error_text() {
+        use async_trait::async_trait;
+
+        struct AlwaysFailsClient;
+        #[async_trait]
+        impl LlmClient for AlwaysFailsClient {
+            fn provider_id(&self) -> &str {
+                "scripted"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Api {
+                    status: 400,
+                    message: "Missing required parameter: 'input[22].summary'. secret=sk-live-abc".into(),
+                    kind: coda_llm::FailureKind::Permanent,
+                    retry_after: None,
+                    body: Some(
+                        r#"{"error":{"type":"invalid_request_error","param":"input[22].summary","message":"Missing required parameter: 'input[22].summary'. secret=sk-live-abc"}}"#
+                            .into(),
+                    ),
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_diagnostics(dir.path());
+        let client: Arc<dyn LlmClient> = Arc::new(AlwaysFailsClient);
+
+        let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let sink = Arc::new(ServeSink::new(tx.clone()));
+        let ch = Arc::new(PromptChannel::new(tx));
+        let host = ServeHost::new_with_optional_client_and_mcp(
+            Some(client),
+            sink,
+            ch,
+            ".".into(),
+            crate::mcp::McpBundle::disabled(),
+            StartupOptions::default(),
+            None,
+            Some(ctx.clone()),
+        );
+
+        host.initialize(InitParams::default()).await.unwrap();
+        let result = host
+            .session_prompt(PromptParams { text: Some("hello".into()), images: None })
+            .await
+            .expect("session_prompt returns a response even on turn failure");
+        assert!(!result["ok"].as_bool().unwrap_or(true));
+
+        let lines = recorded_lines(&ctx);
+        let failure = lines.iter().find(|l| l["kind"] == "turn_failed").expect("turn_failed recorded");
+        assert_eq!(failure["status"], 400);
+        assert_eq!(failure["category"], "client_error");
+
+        let content = std::fs::read_to_string(ctx.logger().status().path.unwrap()).unwrap();
+        assert!(!content.contains("sk-live-abc"), "raw error text must never be persisted");
+        assert!(!content.contains("Missing required parameter"));
     }
 
     /// Two concurrent prompts must not both run: the loser is refused rather
@@ -4266,6 +4520,154 @@ mod tests {
         let sink = Arc::new(ServeSink::new(tx.clone()));
         let ch = Arc::new(PromptChannel::new(tx));
         ServeHost::new_with_client(client, sink, ch, working_dir.into())
+    }
+
+    fn outside_read_turn(path: &std::path::Path, id: &str) -> Vec<coda_llm::anthropic::StreamEvent> {
+        use coda_llm::anthropic::StreamEvent;
+        vec![
+            StreamEvent::ToolUse(coda_llm::Content::ToolUse {
+                id: id.into(), name: "read_file".into(),
+                input_json: serde_json::json!({"path":path}).to_string(),
+                correlation: Default::default(),
+            }),
+            StreamEvent::Done { stop_reason: Some("tool_use".into()), usage: coda_llm::Usage::ZERO },
+        ]
+    }
+
+    fn file_test_done() -> Vec<coda_llm::anthropic::StreamEvent> {
+        use coda_llm::anthropic::StreamEvent;
+        vec![
+            StreamEvent::TextDelta("done".into()),
+            StreamEvent::Done { stop_reason: Some("end_turn".into()), usage: coda_llm::Usage::ZERO },
+        ]
+    }
+
+    #[tokio::test]
+    async fn yolo_file_access_matches_startup_and_rpc_permission_modes() {
+        for mode in [PermissionMode::Default, PermissionMode::Plan, PermissionMode::AcceptEdits, PermissionMode::BypassPermissions] {
+            for via_rpc in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let repo = dir.path().join("repo");
+                std::fs::create_dir(&repo).unwrap();
+                let outside = dir.path().join("outside.txt");
+                std::fs::write(&outside, "outside fixture").unwrap();
+                let client = ScriptedClient::new(vec![outside_read_turn(&outside, "read"), file_test_done()]);
+                let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                let host = ServeHost::new_with_optional_client_and_mcp(
+                    Some(client), Arc::new(ServeSink::new(tx.clone())), Arc::new(PromptChannel::new(tx)),
+                    repo.to_string_lossy().into_owned(), McpBundle::disabled(),
+                    StartupOptions { permission_mode: if via_rpc { None } else { Some(mode) }, ..Default::default() },
+                    None, None,
+                );
+                if via_rpc {
+                    host.session_set_permission_mode(SetPermissionModeParams {
+                        mode: wire_permission_mode(mode).into(),
+                    }).await.unwrap();
+                }
+                assert_eq!(host.session_prompt(PromptParams { text: Some("read fixture".into()), images: None }).await.unwrap()["ok"], true);
+                let history = host.session.history.lock().unwrap();
+                let (content, failed) = history.iter().flat_map(|m| &m.content).find_map(|block| match block {
+                    coda_llm::Content::ToolResult { content, is_error, .. } => Some((content, *is_error)),
+                    _ => None,
+                }).unwrap();
+                assert_eq!(failed, mode != PermissionMode::BypassPermissions, "{mode:?}, rpc={via_rpc}: {content}");
+                if !failed { assert!(content.contains("outside fixture")); }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn yolo_file_access_allows_builtin_write_outside_repo() {
+        use coda_llm::anthropic::StreamEvent;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let outside = dir.path().join("created.txt");
+        let client = ScriptedClient::new(vec![vec![
+            StreamEvent::ToolUse(coda_llm::Content::ToolUse {
+                id: "write".into(), name: "write_file".into(),
+                input_json: json!({"path":outside,"content":"written outside"}).to_string(),
+                correlation: Default::default(),
+            }),
+            StreamEvent::Done { stop_reason: Some("tool_use".into()), usage: coda_llm::Usage::ZERO },
+        ], file_test_done()]);
+        let host = make_host_in_dir(repo.to_str().unwrap(), client);
+        host.session_set_permission_mode(SetPermissionModeParams { mode: "bypassPermissions".into() }).await.unwrap();
+        host.session_prompt(PromptParams { text: Some("write fixture".into()), images: None }).await.unwrap();
+        assert_eq!(std::fs::read_to_string(outside).unwrap(), "written outside");
+    }
+
+    #[tokio::test]
+    async fn yolo_file_access_switches_both_directions_within_one_turn() {
+        struct SwitchingClient {
+            inner: Arc<ScriptedClient>,
+            host: Mutex<std::sync::Weak<ServeHost>>,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        #[async_trait]
+        impl LlmClient for SwitchingClient {
+            fn provider_id(&self) -> &str { "scripted" }
+            async fn stream(&self, request: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 1 || call == 2 {
+                    let host = self.host.lock().unwrap().upgrade().unwrap();
+                    host.session_set_permission_mode(SetPermissionModeParams {
+                        mode: if call == 1 { "bypassPermissions" } else { "default" }.into(),
+                    }).await.unwrap();
+                }
+                self.inner.stream(request).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "fixture").unwrap();
+        let client = Arc::new(SwitchingClient {
+            inner: ScriptedClient::new(vec![
+                outside_read_turn(&outside, "first"), outside_read_turn(&outside, "second"),
+                outside_read_turn(&outside, "third"), file_test_done(),
+            ]),
+            host: Mutex::new(std::sync::Weak::new()),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let host = make_host_in_dir(repo.to_str().unwrap(), client.clone());
+        *client.host.lock().unwrap() = Arc::downgrade(&host);
+        host.session_prompt(PromptParams { text: Some("read fixture".into()), images: None }).await.unwrap();
+        let history = host.session.history.lock().unwrap();
+        let failed: Vec<_> = history.iter().flat_map(|m| &m.content).filter_map(|block| match block {
+            coda_llm::Content::ToolResult { is_error, .. } => Some(*is_error), _ => None,
+        }).collect();
+        assert_eq!(failed, [true, false, true]);
+    }
+
+    #[tokio::test]
+    async fn yolo_file_access_is_shared_with_existing_subagent_host() {
+        use coda_agent::events::{AgentEvent, CollectingSink};
+        use coda_agent::subagents::SubagentRequest;
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "fixture").unwrap();
+        let client = ScriptedClient::new(vec![
+            outside_read_turn(&outside, "first"), file_test_done(),
+            outside_read_turn(&outside, "second"), file_test_done(),
+        ]);
+        let host = make_host_in_dir(repo.to_str().unwrap(), client.clone());
+        let services = host.build_session_services(client);
+        for mode in [PermissionMode::BypassPermissions, PermissionMode::Default] {
+            host.permission_mode.set(mode);
+            let sink = Arc::new(CollectingSink::new());
+            services.subagent_host.spawn(
+                SubagentRequest::foreground("general-purpose", "read fixture", "test", 1),
+                sink.clone(), CancellationToken::new(),
+            ).await.unwrap();
+            let results: Vec<_> = sink.take().into_iter().filter_map(|event| match event {
+                AgentEvent::ToolResult { is_error, .. } => Some(is_error), _ => None,
+            }).collect();
+            assert_eq!(results, [mode != PermissionMode::BypassPermissions]);
+        }
     }
 
     #[tokio::test]
@@ -5851,6 +6253,7 @@ mod tests {
                 crate::mcp::McpBundle::disabled(),
                 StartupOptions::default(),
                 Some("test: token refresh failed (HTTP 401)".into()),
+                None,
             );
 
             // Host 2: built with a successful client and no diagnostic.

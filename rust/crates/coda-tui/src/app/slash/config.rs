@@ -284,6 +284,12 @@ impl App {
 
         let log_dir = self.paths.logs();
 
+        // Real frontend diagnostic status and the engine's own reported log
+        // path — computed here, on this task, so the ambient
+        // `coda_diagnostics` context (a `tokio::task_local`) is still
+        // visible; it would not be inside `spawn_blocking`'s separate task.
+        let diagnostics_report = self.diagnostics_status_report();
+
         let result = tokio::task::spawn_blocking(move || -> Result<String, config::ConfigError> {
             let mut settings = config::Settings::load(&paths)?;
             match op {
@@ -293,7 +299,9 @@ impl App {
                         .map(str::to_string)
                         .unwrap_or_else(|| log_dir.display().to_string());
                     Ok(format!(
-                        "Telemetry: {}\nLog level:  {}\nStderr:     {}\nLog dir:    {}\nChanges apply to the next session.",
+                        "{diagnostics_report}\n\
+                         Legacy telemetry settings (do not affect essential diagnostics above):\n\
+                         Telemetry: {}\nLog level:  {}\nStderr:     {}\nLog dir:    {}\nChanges apply to the next session.",
                         if settings.log_enabled() { "enabled" } else { "disabled" },
                         settings.log_level(),
                         if settings.log_to_stderr() { "on" } else { "off" },
@@ -317,7 +325,10 @@ impl App {
                     let stderr = settings.log_to_stderr();
                     settings.set_telemetry(false, &level, stderr);
                     settings.save()?;
-                    Ok("Telemetry disabled. Applies to the next session.".to_string())
+                    Ok("Legacy telemetry disabled (applies to the next session). \
+                        Essential operational diagnostics are unaffected — use \
+                        `/log` to see their current path/health."
+                        .to_string())
                 }
                 LogOp::Stderr(on) => {
                     let enabled = settings.log_enabled();
@@ -339,6 +350,15 @@ impl App {
             Ok(Err(e)) => self.notice(format!("Settings error: {e}"), NoticeLevel::Error),
             Err(_) => self.notice("Settings operation was interrupted.", NoticeLevel::Error),
         }
+    }
+
+    /// The actual discoverable diagnostic state: this frontend's own writer
+    /// (path/mode/verbosity/health) plus the engine's reported log path —
+    /// never the legacy, currently-unused telemetry settings, which do not
+    /// control it.
+    fn diagnostics_status_report(&self) -> String {
+        let status = coda_diagnostics::current().map(|ctx| ctx.logger().status());
+        crate::diagnostics::status_report(status.as_ref(), self.engine_log_path.as_deref())
     }
 }
 
@@ -388,4 +408,3 @@ mod tests {
         assert_eq!(parse_permission_mode(""), None);
     }
 }
-

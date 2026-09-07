@@ -127,6 +127,13 @@ impl App {
                     initialized.session_id.clone()
                 };
                 self.state.session_id = Some(actual_id.clone());
+                if let Some(ctx) = coda_diagnostics::current() {
+                    crate::diagnostics::record_engine_log_path(
+                        &ctx.with_session(actual_id.clone()),
+                        initialized.telemetry_log_path.as_deref(),
+                    );
+                }
+                self.engine_log_path = initialized.telemetry_log_path;
 
                 let escaped = coda_render::text::sanitize(&actual_id);
                 self.notice(
@@ -581,4 +588,3 @@ mod tests {
         );
     }
 }
-

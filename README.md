@@ -68,6 +68,18 @@ state under **`~/.coda/`** (settings, sessions, credentials, …), separate from
 Claude CLI's `~/.claude/` — though it will read your existing `CLAUDE.md` and
 `.mcp.json` if present. See [Configuration & storage](#configuration--storage).
 
+## Diagnostic logs (Rust)
+
+Rust Coda enables local operational diagnostics automatically for interactive,
+headless, and engine processes. Logs live under `~/.coda/logs/diagnostics`
+(respecting `CODA_HOME`); `/log` shows the frontend and engine log paths.
+`--log-file <path>` overrides the destination, and
+`--diagnostic-verbosity normal|debug|trace` controls additional safe detail.
+Logs rotate and expire; prompts, tool payloads, credentials, and encrypted
+reasoning are excluded. Conversation transcripts and content-audit sidecars
+are separate. See [the Rust diagnostics guide](rust/README.md#operational-diagnostics)
+for limits, failure behavior, and compatibility with older logging flags.
+
 ## What Coda can do
 
 - **Agentic tool loop** — the model plans and acts using built-in tools:

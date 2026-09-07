@@ -70,9 +70,17 @@ struct InteractiveArgs {
     #[arg(long, value_name = "FILE")]
     log_file: Option<PathBuf>,
 
-    /// Log filter, e.g. `debug` or `coda_client=trace`.
+    /// Legacy compatibility hint: a `tracing` `EnvFilter` string (e.g. `debug`
+    /// or `coda_client=trace`). Only its loudest named level (`trace` >
+    /// `debug` > anything else) is used, as a fallback default for
+    /// `--diagnostic-verbosity`. It does not enable arbitrary raw tracing.
     #[arg(long, env = "CODA_LOG", default_value = "warn")]
     log_filter: String,
+
+    /// Diagnostic detail level for the essential operational log: normal,
+    /// debug, or trace. Takes precedence over `--log-filter`/`CODA_LOG`.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_diagnostic_verbosity)]
+    diagnostic_verbosity: Option<String>,
 
     /// Disable mouse capture, which some terminals handle poorly.
     #[arg(long)]
@@ -173,6 +181,21 @@ struct ServeArgs {
     #[arg(long)]
     no_project_mcp: bool,
 
+    /// Write a debug log to this file.
+    #[arg(long, value_name = "FILE")]
+    log_file: Option<PathBuf>,
+
+    /// Legacy compatibility hint: a `tracing` `EnvFilter` string. Only its
+    /// loudest named level is used, as a fallback default for
+    /// `--diagnostic-verbosity`.
+    #[arg(long, env = "CODA_LOG", default_value = "warn")]
+    log_filter: String,
+
+    /// Diagnostic detail level for the essential operational log: normal,
+    /// debug, or trace. Takes precedence over `--log-filter`/`CODA_LOG`.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_diagnostic_verbosity)]
+    diagnostic_verbosity: Option<String>,
+
     /// Initial reasoning-effort level: low, medium, high, xhigh, max, or auto.
     ///
     /// Wired through to the engine startup so a session opened over the raw
@@ -268,6 +291,21 @@ struct RunArgs {
     #[arg(long, env = "CODA_ENGINE")]
     engine: Option<PathBuf>,
 
+    /// Write a debug log to this file.
+    #[arg(long, value_name = "FILE")]
+    log_file: Option<PathBuf>,
+
+    /// Legacy compatibility hint: a `tracing` `EnvFilter` string. Only its
+    /// loudest named level is used, as a fallback default for
+    /// `--diagnostic-verbosity`.
+    #[arg(long, env = "CODA_LOG", default_value = "warn")]
+    log_filter: String,
+
+    /// Diagnostic detail level for the essential operational log: normal,
+    /// debug, or trace. Takes precedence over `--log-filter`/`CODA_LOG`.
+    #[arg(long, value_name = "LEVEL", value_parser = parse_diagnostic_verbosity)]
+    diagnostic_verbosity: Option<String>,
+
     /// Initial reasoning-effort level: low, medium, high, xhigh, or max.
     #[arg(long, value_name = "LEVEL", value_parser = parse_effort_level)]
     effort: Option<String>,
@@ -348,6 +386,36 @@ fn parse_effort_level(raw: &str) -> Result<String, String> {
     }
 }
 
+/// Validates a `--diagnostic-verbosity` value at the parser layer.
+fn parse_diagnostic_verbosity(raw: &str) -> Result<String, String> {
+    let level = raw.trim().to_ascii_lowercase();
+    match level.as_str() {
+        "normal" | "debug" | "trace" => Ok(level),
+        _ => Err(format!(
+            "invalid diagnostic verbosity '{raw}' (expected one of: normal, debug, trace)"
+        )),
+    }
+}
+
+/// Resolves and opens this process's diagnostic logger for `coda`'s three
+/// entrypoints (interactive/run/serve). Delegates to `coda_tui::diagnostics`,
+/// which is shared with the standalone `coda-tui` binary — both `coda`
+/// (no subcommand) and `coda-tui` are the same `ProcessRole::Tui` frontend.
+fn init_diagnostics(
+    role: coda_diagnostics::ProcessRole,
+    explicit_file: Option<PathBuf>,
+    explicit_verbosity: Option<&str>,
+    legacy_filter: &str,
+) -> Result<(coda_diagnostics::DiagnosticContext, PathBuf)> {
+    coda_tui::diagnostics::init(role, explicit_file, explicit_verbosity, legacy_filter)
+}
+
+/// Sets the environment variables a spawned engine child reads to correlate
+/// its own diagnostic log with this process's run id and directory.
+fn forward_diagnostics_env(command: EngineCommand, ctx: &coda_diagnostics::DiagnosticContext, directory: &std::path::Path) -> EngineCommand {
+    coda_tui::diagnostics::forward_env(command, ctx, directory)
+}
+
 /// Resolves the system prompt from either an inline string or a file.
 ///
 /// The two are mutually exclusive (enforced by clap). A file is read as
@@ -383,14 +451,59 @@ fn main() -> Result<()> {
         .context("failed to start the async runtime")?;
 
     match cli.command {
-        Some(Command::Serve(args)) => runtime.block_on(run_serve(args)),
+        Some(Command::Serve(args)) => {
+            let (ctx, _forward_dir) = init_diagnostics(
+                coda_diagnostics::ProcessRole::Serve,
+                args.log_file.clone(),
+                args.diagnostic_verbosity.as_deref(),
+                &args.log_filter,
+            )?;
+            let result = runtime.block_on(coda_diagnostics::scope(ctx.clone(), run_serve(args)));
+            ctx.record(coda_diagnostics::Event::ProcessEnd {
+                exit_code: if result.is_ok() { 0 } else { 1 },
+            });
+            result
+        }
         Some(Command::Run(args)) => {
-            let code = runtime.block_on(run_headless(args))?;
-            std::process::exit(code);
+            let (ctx, forward_dir) = init_diagnostics(
+                coda_diagnostics::ProcessRole::Run,
+                args.log_file.clone(),
+                args.diagnostic_verbosity.as_deref(),
+                &args.log_filter,
+            )?;
+            let result = runtime.block_on(coda_diagnostics::scope(
+                ctx.clone(),
+                run_headless(args, ctx.clone(), forward_dir),
+            ));
+            match result {
+                Ok(code) => {
+                    // Recorded explicitly: `process::exit` skips `Drop`, so
+                    // this is the only chance to note the process ending.
+                    ctx.record(coda_diagnostics::Event::ProcessEnd { exit_code: code });
+                    std::process::exit(code);
+                }
+                Err(err) => {
+                    ctx.record(coda_diagnostics::Event::StartupFailure { category: "headless_setup" });
+                    ctx.record(coda_diagnostics::Event::ProcessEnd { exit_code: 1 });
+                    Err(err)
+                }
+            }
         }
         None => {
-            let _logging = init_logging(&cli.interactive)?;
-            runtime.block_on(run_interactive(cli.interactive))
+            let (ctx, forward_dir) = init_diagnostics(
+                coda_diagnostics::ProcessRole::Tui,
+                cli.interactive.log_file.clone(),
+                cli.interactive.diagnostic_verbosity.as_deref(),
+                &cli.interactive.log_filter,
+            )?;
+            let result = runtime.block_on(coda_diagnostics::scope(
+                ctx.clone(),
+                run_interactive(cli.interactive, ctx.clone(), forward_dir),
+            ));
+            ctx.record(coda_diagnostics::Event::ProcessEnd {
+                exit_code: if result.is_ok() { 0 } else { 1 },
+            });
+            result
         }
     }
 }
@@ -471,7 +584,11 @@ async fn run_serve(args: ServeArgs) -> Result<()> {
     coda_serve::serve_stdio().await
 }
 
-async fn run_interactive(args: InteractiveArgs) -> Result<()> {
+async fn run_interactive(
+    args: InteractiveArgs,
+    diagnostics: coda_diagnostics::DiagnosticContext,
+    engine_log_dir: PathBuf,
+) -> Result<()> {
     // `--yolo-safe` is not yet implemented — reject explicitly rather than
     // accept-and-ignore, which would create a false sense of safety.
     if args.yolo_safe {
@@ -496,6 +613,7 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
     let mut command = EngineCommand::new(engine.as_os_str())
         .arg("serve")
         .working_dir(&working_dir);
+    command = forward_diagnostics_env(command, &diagnostics, &engine_log_dir);
     for arg in &args.engine_args {
         command = command.arg(OsString::from(arg));
     }
@@ -614,7 +732,11 @@ async fn run_interactive(args: InteractiveArgs) -> Result<()> {
 /// Streams assistant text to stdout as it arrives so a long task shows
 /// progress rather than appearing hung. With `--json` a single object is
 /// emitted at the end instead, so the output stays machine-parseable.
-async fn run_headless(args: RunArgs) -> Result<i32> {
+async fn run_headless(
+    args: RunArgs,
+    diagnostics: coda_diagnostics::DiagnosticContext,
+    engine_log_dir: PathBuf,
+) -> Result<i32> {
     use coda_client::Inbound;
     use coda_proto::messages::{method, InitializeParams, PromptParams};
 
@@ -641,6 +763,7 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
     let mut command = EngineCommand::new(engine.as_os_str())
         .arg("serve")
         .working_dir(&working_dir);
+    command = forward_diagnostics_env(command, &diagnostics, &engine_log_dir);
     // Forward an explicit `--provider` so the engine selects that account at
     // startup and fails closed if unavailable (Finding C2).
     if let Some(ref provider) = args.provider {
@@ -657,10 +780,14 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
     }
     let init_val = serde_json::to_value(init)
         .context("failed to serialise the handshake")?;
-    connection
+    let initialized: coda_proto::messages::InitializeResult = serde_json::from_value(connection
         .request(method::INITIALIZE, Some(init_val))
         .await
-        .context("the engine handshake failed")?;
+        .context("the engine handshake failed")?)?;
+    let diagnostics = diagnostics.with_session(initialized.session_id.clone());
+    coda_tui::diagnostics::record_engine_log_path(
+        &diagnostics, initialized.telemetry_log_path.as_deref(),
+    );
 
     // Helper: apply an RPC that must succeed before the prompt is sent.
     // A rejection or transport error shuts down the engine and returns an error.
@@ -760,13 +887,16 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
 
     let params = serde_json::to_value(PromptParams::text(&args.prompt))
         .context("failed to serialise the prompt")?;
-    let pending = connection.send_request(method::PROMPT, Some(params))?;
+    let mut pending = connection.send_request(method::PROMPT, Some(params))?;
 
     // Drain notifications until the turn ends, collecting assistant text.
     let mut reply = String::new();
     let mut failure: Option<String> = None;
+    let mut response = None;
     loop {
-        match inbound.recv().await {
+        tokio::select! {
+        biased;
+        incoming = inbound.recv() => match incoming {
             Some(Inbound::Notification { method, params }) => {
                 let event = coda_proto::events::Event::parse(&method, params.as_ref());
                 match event {
@@ -790,10 +920,35 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
             // and a permission prompt denies rather than silently allowing.
             Some(Inbound::Request { .. }) => {}
             None => break,
+        },
+        received = &mut pending => {
+            // A preflight RPC rejection emits no turn-complete notification.
+            response = Some(received);
+            break;
+        }
         }
     }
 
-    let result = pending.await.ok().and_then(|r| r.ok());
+    let received = match response {
+        Some(response) => response,
+        None => pending.await,
+    };
+    let result = match received {
+        Ok(Ok(value)) => Some(value),
+        Ok(Err(error)) => {
+            failure.get_or_insert(error.message);
+            None
+        }
+        Err(_) => {
+            failure.get_or_insert("engine disconnected before returning the turn result".into());
+            None
+        }
+    };
+    // `shutdown` closes the child's stdin by dropping the engine's *own*
+    // internal connection/sender; this clone must go first, or the writer
+    // task (and the child's stdin) stays alive and the engine sits blocked
+    // reading for the whole grace period before being force-killed.
+    drop(connection);
     let _ = engine_process.shutdown(std::time::Duration::from_secs(5)).await;
 
     let ok = result
@@ -823,36 +978,6 @@ async fn run_headless(args: RunArgs) -> Result<i32> {
     }
 
     Ok(if ok && error.is_none() { 0 } else { 1 })
-}
-
-/// Sets up logging. Returns a guard that must be held for the process lifetime.
-fn init_logging(
-    args: &InteractiveArgs,
-) -> Result<Option<tracing_appender::non_blocking::WorkerGuard>> {
-    use tracing_subscriber::EnvFilter;
-
-    let Some(path) = &args.log_file else {
-        return Ok(None);
-    };
-
-    let directory = path.parent().filter(|p| !p.as_os_str().is_empty());
-    if let Some(directory) = directory {
-        std::fs::create_dir_all(directory).with_context(|| {
-            format!("failed to create the log directory {}", directory.display())
-        })?;
-    }
-
-    let file = std::fs::File::create(path)
-        .with_context(|| format!("failed to create the log file {}", path.display()))?;
-    let (writer, guard) = tracing_appender::non_blocking(file);
-
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::new(&args.log_filter))
-        .with_writer(writer)
-        .with_ansi(false)
-        .init();
-
-    Ok(Some(guard))
 }
 
 #[cfg(test)]
