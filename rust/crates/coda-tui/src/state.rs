@@ -132,6 +132,8 @@ pub enum UiEvent {
     Submitted { text: String },
     /// The submission was queued because a turn was already running.
     Queued { text: String, id: Option<String> },
+    /// The engine atomically withdrew these entries before delivery.
+    SteeringRecalled { message_ids: Vec<String> },
     /// A turn finished, from the `session/prompt` response.
     TurnFinished { interrupted: bool, error: Option<String> },
     /// The user asked to interrupt.
@@ -381,6 +383,13 @@ impl UiState {
                     text,
                     queued_at: (self.clock)(),
                 });
+            }
+            UiEvent::SteeringRecalled { message_ids } => {
+                let retained = |message: &QueuedMessage| {
+                    !message.id.as_ref().is_some_and(|id| message_ids.contains(id))
+                };
+                self.queued.retain(retained);
+                self.unsent.retain(retained);
             }
             UiEvent::TurnFinished { interrupted, error } => {
                 self.close_open_and_flush();
@@ -1747,6 +1756,28 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn recalled_ids_remove_only_the_confirmed_pending_messages() {
+        let mut state = state();
+        state.apply(UiEvent::Submitted { text: "go".into() });
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "a".into() }));
+        for id in ["delivered", "recalled", "still-pending"] {
+            state.apply(UiEvent::Queued { text: id.into(), id: Some(id.into()) });
+        }
+        state.apply(UiEvent::Engine(Event::SteeringDelivered { message_ids: vec!["delivered".into()] }));
+        state.apply(UiEvent::SteeringRecalled { message_ids: vec!["recalled".into()] });
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "b".into() }));
+        assert_eq!(state.queued.len(), 1);
+        assert_eq!(state.queued[0].id.as_deref(), Some("still-pending"));
+        assert!(state.transcript.blocks().iter().any(|block|
+            matches!(block, Block::Assistant { text, .. } if text == "ab")));
+        assert!(!state.transcript.blocks().iter().any(|block|
+            matches!(block, Block::User { text, .. } if text == "recalled")));
+        state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+        assert_eq!(state.unsent.len(), 1);
+        assert_eq!(state.unsent[0].text, "still-pending");
     }
 
     #[test]

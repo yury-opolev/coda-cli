@@ -22,11 +22,12 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
 
     let mut viewport = Viewport::new();
-    let regions = draw::layout(
+    let regions = draw::layout_with_pending(
         ratatui::layout::Rect::new(0, 0, width, height),
         composer.line_count(),
         false,
         state.is_busy(),
+        state.queued.len() + state.unsent.len(),
     );
     let rows = state
         .transcript
@@ -64,11 +65,12 @@ fn draw_at(
     let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
     let mut viewport = Viewport::new();
-    let regions = draw::layout(
+    let regions = draw::layout_with_pending(
         ratatui::layout::Rect::new(0, 0, width, height),
         composer.line_count(),
         false,
         state.is_busy(),
+        state.queued.len() + state.unsent.len(),
     );
     let rows = state
         .transcript
@@ -1125,11 +1127,17 @@ fn the_pinned_row_names_the_queue_instead_of_a_transcript_bubble() {
         .find(|r| r.contains("Working"))
         .expect("pinned row");
     assert!(row.contains("1 queued"), "{row:?}");
+    let regions = draw::layout_with_pending(
+        ratatui::layout::Rect::new(0, 0, 80, 24), composer.line_count(), false,
+        state.is_busy(), state.queued.len(),
+    );
     assert!(
-        !screen.iter().any(|r| r.contains("steer this in")),
+        !screen[regions.transcript.y as usize..regions.transcript.bottom() as usize]
+            .iter().any(|r| r.contains("steer this in")),
         "a queued message must never appear as a transcript bubble:\n{}",
         screen.join("\n")
     );
+    assert!(screen.iter().any(|r| r.contains("[pending] steer this in")));
 }
 
 #[test]
@@ -1224,6 +1232,40 @@ fn a_narrow_header_with_no_room_for_the_id_has_no_selection_effect() {
 }
 
 // -- Cards presentation (C), through the real draw path ----------------------
+
+#[test]
+fn pending_text_is_visible_without_splitting_streaming_reply() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "question".into() });
+    state.apply(UiEvent::Engine(Event::AssistantText { delta: "first ".into() }));
+    state.apply(UiEvent::Queued { text: "please adjust the title".into(), id: Some("q1".into()) });
+    state.apply(UiEvent::Engine(Event::AssistantText { delta: "second".into() }));
+    let screen = render(&state, &Composer::new(), 80, 24);
+    assert!(screen.iter().any(|line| line.contains("[pending] please adjust the title")), "{}", screen.join("\n"));
+    assert!(screen.iter().any(|line| line.contains("first second")));
+    assert!(screen.iter().any(|line| line.contains("Up") && line.contains("reclaim")));
+    assert!(screen.iter().any(|line| line.contains("Responding")));
+}
+
+#[test]
+fn pending_previews_are_bounded_and_keep_activity_visible() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "question".into() });
+    for n in 0..8 {
+        state.apply(UiEvent::Queued {
+            text: format!("message {n}\nwith a second line and 日本語"),
+            id: Some(format!("q{n}")),
+        });
+    }
+    let screen = render(&state, &Composer::new(), 80, 24);
+    assert_eq!(screen.iter().filter(|line| line.contains("[pending]")).count(), 3);
+    assert!(screen.iter().any(|line| line.contains("+5 more")));
+    assert!(screen.iter().any(|line| line.contains("Working")));
+    for (width, height) in [(40, 8), (1, 1)] {
+        let screen = render(&state, &Composer::new(), width, height);
+        assert_eq!(screen.len(), height as usize);
+    }
+}
 
 #[test]
 fn cards_style_uses_blank_spacing_between_conversation_turns() {

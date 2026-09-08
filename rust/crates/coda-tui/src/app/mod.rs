@@ -27,6 +27,7 @@ mod clipboard;
 mod effort;
 mod engine;
 mod image;
+mod queue;
 mod startup_cli;
 
 use crate::config::{self, Paths, Settings};
@@ -563,6 +564,9 @@ impl App {
             }
 
             Action::HistoryPrevious => {
+                if self.recall_pending_into_composer().await {
+                    return;
+                }
                 if self.recall_unsent_into_composer() {
                     return;
                 }
@@ -732,37 +736,6 @@ impl App {
             Err(error) => {
                 self.composer.set_text(text);
                 self.notice(format!("Could not send prompt; draft retained: {error}"), NoticeLevel::Error);
-            }
-        }
-    }
-
-    async fn steer(&mut self, text: String) {
-        let params = serde_json::to_value(messages::SteerParams { text: text.clone() }).ok();
-        let response = self.connection.request(method::STEER, params).await;
-
-        let result = response
-            .ok()
-            .and_then(|value| serde_json::from_value::<messages::SteerResult>(value).ok());
-
-        match result {
-            Some(r) if r.ok => {
-                self.apply(UiEvent::Queued { text, id: r.message_id });
-            }
-            Some(_) => {
-                // Engine accepted the call but rejected the steer (ok:false).
-                // Showing the message as "queued" would be misleading because it
-                // will never be delivered; surface a warning instead.
-                self.notice(
-                    "The engine could not queue the message right now.",
-                    NoticeLevel::Warning,
-                );
-            }
-            None => {
-                // RPC error or unexpected response shape — message not delivered.
-                self.notice(
-                    "Failed to deliver the steering message to the engine.",
-                    NoticeLevel::Error,
-                );
             }
         }
     }
@@ -1130,11 +1103,12 @@ impl App {
 
     fn redraw(&mut self, guard: &mut TerminalGuard) -> Result<()> {
         let size = guard.terminal().size()?;
-        let regions = draw::layout(
+        let regions = draw::layout_with_pending(
             ratatui::layout::Rect::new(0, 0, size.width, size.height),
             self.composer.line_count(),
             self.viewport.is_scrollable(),
             self.state.is_busy(),
+            self.state.queued.len() + self.state.unsent.len(),
         );
         let width = regions.transcript.width as usize;
         let height = regions.transcript.height as usize;
@@ -1576,6 +1550,7 @@ fn is_critical_event(event: &UiEvent) -> bool {
         | UiEvent::ThinkingFoldToggled { .. }
         | UiEvent::Submitted { .. }
         | UiEvent::Queued { .. }
+        | UiEvent::SteeringRecalled { .. }
         | UiEvent::InterruptRequested => true,
         UiEvent::Engine(inner) => match inner {
             Event::TurnComplete { .. }
