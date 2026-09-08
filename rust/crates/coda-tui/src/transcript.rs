@@ -76,7 +76,7 @@ pub enum TranscriptStyle {
     Plain,
     /// Groups one delivered user message and everything that follows — the
     /// reply, its tools, its reasoning, any notices — until the next
-    /// delivered user message, into a visually bordered card.
+    /// delivered user message, into a card separated by blank spacing.
     ///
     /// Presentation only: the underlying `Vec<Block>` and provider history
     /// are unchanged: cards are chrome rows inserted around the same blocks
@@ -84,13 +84,13 @@ pub enum TranscriptStyle {
     Cards,
 }
 
-/// A full-width horizontal rule marking a card boundary.
+/// Blank spacing marking a card boundary.
 ///
 /// Wholly decorative (`is_chrome`): it must never enter a copy, and a click
 /// on it must never resolve to a fold, no matter what the block-start
 /// arithmetic around it happens to look like.
-fn card_rule(width: usize) -> RenderLine {
-    RenderLine::new(glyphs::RULE.repeat(width.max(1)), Role::Notification).as_chrome()
+fn card_separator() -> RenderLine {
+    RenderLine::separator().as_chrome()
 }
 
 /// One logical unit of the transcript.
@@ -697,26 +697,25 @@ impl Transcript {
         let mut rows: Vec<RenderLine> = Vec::new();
         let mut starts: Vec<usize> = Vec::with_capacity(self.blocks.len() + 1);
         // Whether a card is currently open, so the transcript's very last
-        // card can be closed with a border after the loop rather than only
+        // card can be closed with spacing after the loop rather than only
         // between two cards.
         let mut card_open = false;
 
         for block in &self.blocks {
             // A card starts at each delivered user message (every `User`
             // block is delivered: a pending one is never pushed here at all,
-            // see `UiState`). One rule row serves as both the previous
-            // card's closing border and this one's opening border, so cards
-            // read as divided rows rather than accumulating blank chrome.
+            // see `UiState`). One blank boundary row serves both cards,
+            // preserving grouping without drawing a horizontal divider.
             // Banners, session boundaries and anything before the first user
             // message are drawn plainly, never inside a card.
             if style == TranscriptStyle::Cards && matches!(block, Block::User { .. }) {
-                rows.push(card_rule(width));
+                rows.push(card_separator());
                 card_open = true;
             }
 
             // Recorded *after* any chrome for this block, so it always
             // points at the block's true first content row — never at a
-            // border pushed in front of it.
+            // blank boundary pushed in front of it.
             starts.push(rows.len());
             let block_rows = block.render(width, mode);
             if !block_rows.is_empty() {
@@ -726,7 +725,7 @@ impl Transcript {
         }
 
         if style == TranscriptStyle::Cards && card_open {
-            rows.push(card_rule(width));
+            rows.push(card_separator());
         }
 
         starts.push(rows.len()); // sentinel
@@ -1586,7 +1585,7 @@ mod tests {
     }
 
     #[test]
-    fn a_card_border_spans_the_full_requested_width() {
+    fn a_card_boundary_is_blank_at_every_width() {
         for width in [1usize, 10, 40, 120] {
             let mut transcript = Transcript::new();
             transcript.push(user_block("hi"));
@@ -1595,8 +1594,8 @@ mod tests {
                 ToolDisplayMode::Summary,
                 TranscriptStyle::Cards,
             );
-            let border = rows.iter().find(|r| r.is_chrome).expect("a border row");
-            assert_eq!(text::width(&border.text), width.max(1));
+            let boundary = rows.iter().find(|r| r.is_chrome).expect("a card boundary");
+            assert!(boundary.text.is_empty());
         }
     }
 }

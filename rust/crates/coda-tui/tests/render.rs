@@ -1226,7 +1226,7 @@ fn a_narrow_header_with_no_room_for_the_id_has_no_selection_effect() {
 // -- Cards presentation (C), through the real draw path ----------------------
 
 #[test]
-fn cards_style_draws_a_visible_border_between_two_conversation_turns() {
+fn cards_style_uses_blank_spacing_between_conversation_turns() {
     use coda_tui::transcript::TranscriptStyle;
 
     let mut state = session();
@@ -1284,11 +1284,9 @@ fn cards_style_draws_a_visible_border_between_two_conversation_turns() {
         .iter()
         .filter(|r| !r.is_empty() && r.chars().all(|c| c == '\u{2500}'))
         .count();
-    assert!(
-        border_rows >= 2,
-        "expected at least two visible card borders (dividing and closing), got {border_rows}:\n{}",
-        screen.join("\n")
-    );
-    assert!(screen.iter().any(|r| r.contains("first question")));
-    assert!(screen.iter().any(|r| r.contains("second question")));
+    assert_eq!(border_rows, 0, "card dividers should be blank:\n{}", screen.join("\n"));
+    let answer = screen.iter().position(|r| r.contains("first answer")).unwrap();
+    let next_question = screen.iter().position(|r| r.contains("second question")).unwrap();
+    assert!(next_question > answer + 1);
+    assert!(screen[answer + 1..next_question].iter().all(|r| r.trim().is_empty()));
 }
