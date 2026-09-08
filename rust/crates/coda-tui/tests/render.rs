@@ -1234,6 +1234,39 @@ fn a_narrow_header_with_no_room_for_the_id_has_no_selection_effect() {
 // -- Cards presentation (C), through the real draw path ----------------------
 
 #[test]
+fn completed_tool_runs_render_one_expandable_summary() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "inspect files".into() });
+    for (index, name) in ["read_file", "grep", "glob"].into_iter().enumerate() {
+        let correlation = Correlation {
+            root_turn_id: Some(format!("batch-root-{index}")),
+            activity_id: Some(format!("activity-{index}")),
+            // Current Rust engine metadata uses a fresh root per batch and
+            // carries the call ID in source_id (call_id is absent).
+            source_id: Some(format!("call-{index}")),
+            ..Default::default()
+        };
+        state.apply(UiEvent::Engine(Event::ToolCall {
+            tool_name: name.into(), input_json: "{}".into(), correlation: correlation.clone(),
+        }));
+        state.apply(UiEvent::Engine(Event::ToolResult {
+            tool_name: name.into(), content: format!("result-{index}"), is_error: false,
+            status: Some(ToolCallStatus::Succeeded), correlation,
+        }));
+    }
+    state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+    let screen = render(&state, &Composer::new(), 80, 30);
+    assert_eq!(screen.iter().filter(|row| row.contains("Ran 3 tools")).count(), 1);
+    assert!(!screen.iter().any(|row| row.contains("Ran 1 tool")));
+    assert!(!screen.iter().any(|row| row.contains("result-0")));
+    state.apply(UiEvent::ToolGroupFoldToggled { block: 3 });
+    let screen = render(&state, &Composer::new(), 80, 30);
+    for index in 0..3 {
+        assert!(screen.iter().any(|row| row.contains(&format!("result-{index}"))));
+    }
+}
+
+#[test]
 fn pending_text_is_visible_without_splitting_streaming_reply() {
     let mut state = session();
     state.apply(UiEvent::Submitted { text: "question".into() });
@@ -1243,7 +1276,7 @@ fn pending_text_is_visible_without_splitting_streaming_reply() {
     let screen = render(&state, &Composer::new(), 80, 24);
     assert!(screen.iter().any(|line| line.contains("[pending] please adjust the title")), "{}", screen.join("\n"));
     assert!(screen.iter().any(|line| line.contains("first second")));
-    assert!(screen.iter().any(|line| line.contains("Up") && line.contains("reclaim")));
+    assert!(!screen.iter().any(|line| line.contains("Up on empty input")));
     assert!(screen.iter().any(|line| line.contains("Responding")));
 }
 

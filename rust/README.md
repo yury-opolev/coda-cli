@@ -612,6 +612,12 @@ protocol does not imply them, and getting them wrong is silently wrong:
 - Finalising a batch **resolves unfinished calls** (pending becomes skipped,
   running becomes cancelled), otherwise an interrupted turn shows tools
   apparently still running.
+- In Summary mode, adjacent completed tool batches within a UI turn share
+  one **Ran N tools** header. Click it to expand their individual arguments
+  and results. Failed, cancelled and skipped calls remain visible in the
+  summary. Running batches and intervening messages/reasoning/approval
+  blocks stay separate; `/tools compact` and `/tools full` retain their
+  detailed views.
 - Pending message text is shown in a bounded `[pending]` preview area above
   the composer, separate from streaming replies and the pinned activity row.
   **Up on an empty composer** atomically reclaims all still-pending messages
