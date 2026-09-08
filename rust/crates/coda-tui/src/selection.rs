@@ -113,16 +113,15 @@ impl TranscriptSelection {
         }
         let mut parts: Vec<String> = Vec::new();
         for (i, row) in rows.iter().enumerate() {
-            if row.is_separator {
+            if row.is_separator || row.is_chrome {
                 continue;
             }
             let w = text::width(&row.text);
             let Some((start_cell, end_cell)) = self.range_for_row(i, w) else {
                 continue;
             };
-            // Skip gutter chrome.
-            let gutter_cells = row.gutter.cells();
-            let content_start = start_cell.max(gutter_cells);
+            // Skip gutter and any decorative chrome (e.g. a card's rail).
+            let content_start = start_cell.max(row.content_start());
             if content_start >= end_cell {
                 parts.push(String::new());
                 continue;
@@ -173,12 +172,11 @@ pub fn copy_visible_text(rows: &[RenderLine], range: std::ops::Range<usize>) -> 
     let visible = rows.get(range).unwrap_or(&[]);
     let parts: Vec<&str> = visible
         .iter()
-        .filter(|r| !r.is_separator)
+        .filter(|r| !r.is_separator && !r.is_chrome)
         .map(|r| {
-            let gutter_cells = r.gutter.cells();
-            // The gutter prefix is literally prepended to `text`, so we skip
-            // those bytes by slicing at the cell boundary.
-            skip_gutter_prefix(&r.text, gutter_cells)
+            // The gutter/chrome prefix is literally prepended to `text`, so we
+            // skip those bytes by slicing at the cell boundary.
+            skip_gutter_prefix(&r.text, r.content_start())
         })
         .collect();
     parts.join("\n")
@@ -305,5 +303,42 @@ mod tests {
         // cells: A=0..1, 文=1..3, B=3..4
         assert_eq!(slice_by_cells(s, 1, 3), "\u{6587}");
         assert_eq!(slice_by_cells(s, 0, 1), "A");
+    }
+
+    #[test]
+    fn copy_text_never_includes_a_chrome_row() {
+        let rows = vec![
+            RenderLine::new("\u{2500}".repeat(10), Role::Notification).as_chrome(),
+            RenderLine::new("hello", Role::Assistant),
+        ];
+        let mut sel = TranscriptSelection::new();
+        sel.begin(pos(0, 0));
+        sel.update(pos(1, 4));
+        let text = sel.copy_text(&rows);
+        assert_eq!(text, "hello", "a chrome border row leaked into the copy");
+    }
+
+    #[test]
+    fn copy_text_skips_a_cards_left_rail_but_keeps_its_content() {
+        use coda_render::Gutter;
+        let row = RenderLine::new("  hi", Role::Assistant)
+            .with_gutter(Gutter::UserMarker)
+            .with_chrome_cells(2);
+        let rows = vec![row];
+        let mut sel = TranscriptSelection::new();
+        sel.begin(pos(0, 0));
+        sel.update(pos(0, 20));
+        let text = sel.copy_text(&rows);
+        assert_eq!(text, "hi", "the rail cells leaked into the copy: {text:?}");
+    }
+
+    #[test]
+    fn copy_visible_text_excludes_chrome_rows() {
+        let rows = vec![
+            RenderLine::new("\u{2500}".repeat(10), Role::Notification).as_chrome(),
+            RenderLine::new("world", Role::Assistant),
+        ];
+        let text = copy_visible_text(&rows, 0..2);
+        assert_eq!(text, "world");
     }
 }

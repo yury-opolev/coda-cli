@@ -153,6 +153,21 @@ pub struct RenderLine {
     pub right_text: Option<String>,
     /// A blank row inserted between blocks.
     pub is_separator: bool,
+    /// A wholly decorative row (a card border, a spacing rule).
+    ///
+    /// Distinct from [`RenderLine::is_separator`], which marks the blank
+    /// in-between row every block already gets: this marks a *visible*
+    /// decoration such as a card border. Both are chrome, in the sense that
+    /// neither is conversation content, so both are excluded from copy and
+    /// can never be the header row a fold click resolves to.
+    pub is_chrome: bool,
+    /// Extra decorative cells prepended beyond the gutter (a card's left
+    /// rail), excluded from copy/selection like the gutter itself.
+    ///
+    /// Zero by default, which reproduces the exact old gutter-only behaviour:
+    /// copy bounds are opt-in for callers that actually embed decoration,
+    /// rather than a new rule every existing row must account for.
+    pub chrome_cells: usize,
 }
 
 impl RenderLine {
@@ -169,7 +184,32 @@ impl RenderLine {
             background: None,
             right_text: None,
             is_separator: false,
+            is_chrome: false,
+            chrome_cells: 0,
         }
+    }
+
+    /// Marks this row as wholly decorative (a card border/spacing rule).
+    pub fn as_chrome(mut self) -> Self {
+        self.is_chrome = true;
+        self
+    }
+
+    /// Reserves `cells` decorative columns beyond the gutter (a card rail),
+    /// excluded from copy/selection.
+    pub fn with_chrome_cells(mut self, cells: usize) -> Self {
+        self.chrome_cells = cells;
+        self
+    }
+
+    /// The first cell of this row's actual content, skipping both the gutter
+    /// and any decorative chrome prepended in front of it.
+    ///
+    /// The single place copy/selection should look to find where content
+    /// begins, so a card's left rail can never be pasted just because some
+    /// caller forgot to add gutter and chrome cells together correctly.
+    pub fn content_start(&self) -> usize {
+        self.gutter.cells() + self.chrome_cells
     }
 
     /// The blank row that separates two transcript blocks.
@@ -376,5 +416,27 @@ mod tests {
     fn an_empty_span_is_reported_as_empty() {
         assert!(Span::new(4, 4, Role::Code).is_empty());
         assert!(!Span::new(4, 5, Role::Code).is_empty());
+    }
+
+    #[test]
+    fn a_plain_row_is_not_chrome_and_has_no_extra_copy_cells() {
+        let line = RenderLine::new("hello", Role::Assistant);
+        assert!(!line.is_chrome);
+        assert_eq!(line.chrome_cells, 0);
+        assert_eq!(line.content_start(), 0);
+    }
+
+    #[test]
+    fn as_chrome_marks_a_row_wholly_decorative() {
+        let line = RenderLine::new("\u{2500}".repeat(80), Role::Notification).as_chrome();
+        assert!(line.is_chrome);
+    }
+
+    #[test]
+    fn content_start_adds_chrome_cells_to_the_gutter_width() {
+        let line = RenderLine::new("hi", Role::Assistant)
+            .with_gutter(Gutter::UserMarker)
+            .with_chrome_cells(2);
+        assert_eq!(line.content_start(), MARKER_CELLS + 2);
     }
 }

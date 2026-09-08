@@ -40,6 +40,13 @@ pub struct Regions {
     pub scrollbar: Option<Rect>,
     /// One line for transient status, above the composer.
     pub hint: Option<Rect>,
+    /// One line, directly above the composer, showing what a running turn
+    /// is doing right now.
+    ///
+    /// Present only while a turn is busy. Outranks the decorative `header`
+    /// and `hint` rows for the space it needs: a tiny terminal drops those
+    /// first, because live progress is content and they are chrome.
+    pub activity: Option<Rect>,
     pub composer: Rect,
     pub status: Rect,
 }
@@ -54,17 +61,21 @@ const MIN_ROWS_FOR_CHROME: u16 = 12;
 /// Splits the frame into its regions.
 ///
 /// The composer grows with its content up to a cap, after which it scrolls
-/// internally rather than crowding out the transcript.
-pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
+/// internally rather than crowding out the transcript. `busy` reserves the
+/// pinned activity row directly above the composer; it is independent of
+/// `MIN_ROWS_FOR_CHROME` so live progress still shows on a terminal too short
+/// for the decorative header and hint rows.
+pub fn layout(area: Rect, composer_lines: usize, scrollable: bool, busy: bool) -> Regions {
     let chrome = area.height >= MIN_ROWS_FOR_CHROME;
     // The header and hint rows, when present.
-    let extra = if chrome { 2 } else { 0 };
+    let extra = if chrome { 2 } else { 0 } + if busy { 1 } else { 0 };
 
     let composer_rows = (composer_lines as u16)
         .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
         // Leave at least three transcript rows however tall the composer is.
         // The composer costs its rows plus both half-block edges, the status
-        // bar one more, and the chrome two when it is shown.
+        // bar one more, and the chrome two (plus one live-activity row when
+        // busy) when they are shown.
         .min(
             area.height
                 .saturating_sub(6 + extra)
@@ -76,6 +87,9 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Min(1));
+    if busy {
+        constraints.push(Constraint::Length(1));
+    }
     if chrome {
         constraints.push(Constraint::Length(1));
     }
@@ -96,6 +110,7 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
     };
     let header = chrome.then(&mut take);
     let transcript_area = take();
+    let activity = busy.then(&mut take);
     let hint = chrome.then(&mut take);
     let composer = take();
     let status = take();
@@ -115,6 +130,7 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool) -> Regions {
         transcript,
         scrollbar,
         hint,
+        activity,
         composer,
         status,
     }
@@ -224,7 +240,7 @@ pub fn draw(
     theme: &Theme,
     now: Instant,
 ) {
-    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None, now);
+    draw_with_pin(frame, state, composer, viewport, rows, theme, None, None, false, now);
 }
 
 /// Draws the whole screen, optionally showing a pin row at the top of the
@@ -246,6 +262,7 @@ pub fn draw_with_pin(
     theme: &Theme,
     pin_text: Option<&str>,
     selection: Option<&crate::selection::TranscriptSelection>,
+    header_id_selected: bool,
     now: Instant,
 ) -> (u16, u16) {
     let area = frame.area();
@@ -254,7 +271,7 @@ pub fn draw_with_pin(
         area,
     );
 
-    let regions = layout(area, composer.line_count(), viewport.is_scrollable());
+    let regions = layout(area, composer.line_count(), viewport.is_scrollable(), state.is_busy());
 
     let content = draw_transcript_with_pin(
         frame,
@@ -266,10 +283,13 @@ pub fn draw_with_pin(
         selection,
     );
     if let Some(header) = regions.header {
-        draw_header(frame, header, state, theme);
+        draw_header(frame, header, state, theme, header_id_selected);
     }
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
+    }
+    if let Some(activity) = regions.activity {
+        draw_activity(frame, activity, state, theme, now);
     }
     if let Some(hint) = regions.hint {
         draw_hint(frame, hint, state, viewport, theme, now);
@@ -301,18 +321,121 @@ fn compact_count(tokens: i64) -> String {
 }
 
 /// Draws the identity line: what this is, and which session.
-fn draw_header(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
+fn draw_header(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme, id_selected: bool) {
     let mut text = format!(" coda {}", crate::branding::version());
     if let Some(id) = &state.session_id {
         text.push_str(&format!("  {}  session {id}", glyphs::RULE_VERTICAL));
     }
+    let line = Line::from(Span::styled(text, theme.style(Role::Notification)));
+    let line = if id_selected {
+        match header_id_rect(area, state) {
+            Some(rect) => {
+                let start = (rect.x - area.x) as usize;
+                let end = start + rect.width as usize;
+                highlight_span(line, start, end, theme)
+            }
+            None => line,
+        }
+    } else {
+        line
+    };
+    frame.render_widget(Paragraph::new(line), area);
+}
+
+/// The screen rectangle the session id occupies within the header, or `None`
+/// when there is no session id or no room to show it.
+///
+/// Shared by drawing (to highlight a selection) and by pointer hit-testing (to
+/// know whether a click landed on the id), so the two positions can never
+/// silently drift apart. Pure and terminal-free: `App` calls it with the
+/// header rect from `layout()` alone, without needing an actual frame.
+pub fn header_id_rect(area: Rect, state: &UiState) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    let id = state.session_id.as_deref()?;
+    let prefix = format!(
+        " coda {}  {}  session ",
+        crate::branding::version(),
+        glyphs::RULE_VERTICAL
+    );
+    let prefix_width = text::width(&prefix);
+    if prefix_width >= area.width as usize {
+        // The header itself is too narrow to have reached the id at all.
+        return None;
+    }
+    let available = area.width as usize - prefix_width;
+    let id_width = text::width(id).min(available);
+    if id_width == 0 {
+        return None;
+    }
+    Some(Rect::new(
+        area.x + prefix_width as u16,
+        area.y,
+        id_width as u16,
+        1,
+    ))
+}
+
+/// Draws the pinned activity row: what a running turn is doing, and for how
+/// long, directly above the composer.
+///
+/// Composed fresh every frame from `state` and `now` rather than cached, so
+/// its elapsed time can advance on the existing spinner/timer wakeup without
+/// forcing a full transcript relayout — the one thing a plain per-second tick
+/// must never cost.
+fn draw_activity(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme, now: Instant) {
+    let Some(text) = compose_activity(state, now) else {
+        return;
+    };
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            text,
-            theme.style(Role::Notification),
-        ))),
+        Paragraph::new(Line::from(Span::styled(text, theme.style(state.activity.role())))),
         area,
     );
+}
+
+/// Builds the pinned activity row's text, or `None` when nothing is running.
+///
+/// The one spinner: the status bar no longer animates, so this is the only
+/// place a running turn's motion is shown. Reasoning time and last-response
+/// tokens are appended only once actually known — an unstarted reasoning
+/// segment or an unreported response never gets a guessed number.
+pub fn compose_activity(state: &UiState, now: Instant) -> Option<String> {
+    if !state.is_busy() {
+        return None;
+    }
+    let progress = state.turn_progress.as_ref()?;
+    let spinner = if state.activity.is_animated() {
+        format!("{} ", glyphs::SPINNER[state.spinner % glyphs::SPINNER.len()])
+    } else {
+        String::new()
+    };
+    let elapsed = crate::transcript::format_duration(progress.elapsed_ms(now) / 1000);
+    let mut text = format!("{spinner}{} {elapsed}", progress.phase().label());
+
+    if let Some(reasoning_ms) = progress.reasoning_ms(now) {
+        if reasoning_ms > 0 {
+            text.push_str(&format!(
+                " {} reasoned {}",
+                glyphs::RULE_VERTICAL,
+                crate::transcript::format_duration(reasoning_ms / 1000)
+            ));
+        }
+    }
+
+    if let Some((_, output_tokens)) = progress.last_response_tokens() {
+        text.push_str(&format!(
+            " {} last response {output_tokens} tok out",
+            glyphs::RULE_VERTICAL
+        ));
+    }
+
+    if !state.queued.is_empty() {
+        let n = state.queued.len();
+        text.push_str(&format!(" {} {n} queued", glyphs::RULE_VERTICAL));
+    }
+
+    Some(text)
 }
 
 /// Draws the transient status line above the composer.
@@ -686,15 +809,11 @@ fn draw_status(
     viewport: &Viewport,
     theme: &Theme,
 ) {
+    // Static only: the pinned activity row above the composer owns the one
+    // animated spinner now, so this never claims motion a second time in a
+    // second place.
     let mut spans = vec![Span::styled(
-        // The spinner sits inside the activity span so it takes the activity's
-        // colour: one indicator, one meaning, one role.
-        if state.activity.is_animated() {
-            let frame = glyphs::SPINNER[state.spinner % glyphs::SPINNER.len()];
-            format!(" {frame} {} ", state.activity.label())
-        } else {
-            format!(" {} ", state.activity.label())
-        },
+        format!(" {} ", state.activity.label()),
         theme.style(state.activity.role()),
     )];
 
@@ -833,6 +952,7 @@ mod tests {
     use super::*;
     use coda_render::theme::ColorDepth;
     use coda_render::{Gutter, Span as RenderSpan};
+    use crate::state::UiEvent;
     use ratatui::style::Modifier;
 
     fn theme() -> Theme {
@@ -849,7 +969,7 @@ mod tests {
 
     #[test]
     fn layout_reserves_rows_for_the_chrome_composer_and_status() {
-        let regions = layout(area(80, 24), 1, false);
+        let regions = layout(area(80, 24), 1, false, false);
         assert_eq!(regions.header.expect("header").height, 1);
         assert_eq!(regions.hint.expect("hint").height, 1);
         assert_eq!(regions.status.height, 1);
@@ -859,7 +979,7 @@ mod tests {
 
     #[test]
     fn the_composer_grows_with_its_content() {
-        let regions = layout(area(80, 24), 5, false);
+        let regions = layout(area(80, 24), 5, false, false);
         assert_eq!(regions.composer.height, 7);
         assert_eq!(regions.transcript.height, 14);
     }
@@ -869,7 +989,7 @@ mod tests {
         // Header and hint are context; the transcript is the content. On a
         // short terminal they go, rather than squeezing the conversation into
         // nothing to keep decoration.
-        let regions = layout(area(80, MIN_ROWS_FOR_CHROME - 1), 1, false);
+        let regions = layout(area(80, MIN_ROWS_FOR_CHROME - 1), 1, false, false);
         assert!(regions.header.is_none());
         assert!(regions.hint.is_none());
         assert!(regions.transcript.height >= 3, "the transcript was starved");
@@ -880,8 +1000,8 @@ mod tests {
     fn the_hint_line_is_reserved_even_with_nothing_to_say() {
         // A line that comes and goes reflows the transcript under it, so the
         // conversation would jump every time something was copied.
-        let quiet = layout(area(80, 24), 1, false);
-        let busy = layout(area(80, 24), 1, false);
+        let quiet = layout(area(80, 24), 1, false, false);
+        let busy = layout(area(80, 24), 1, false, false);
         assert_eq!(
             quiet.transcript.height, busy.transcript.height,
             "the transcript height depends on what the hint line says"
@@ -918,21 +1038,21 @@ mod tests {
 
     #[test]
     fn the_composer_stops_growing_at_its_cap() {
-        let regions = layout(area(80, 40), 50, false);
+        let regions = layout(area(80, 40), 50, false, false);
         assert_eq!(regions.composer.height, COMPOSER_MAX_ROWS + 2);
     }
 
     #[test]
     fn the_composer_never_starves_the_transcript() {
-        let regions = layout(area(80, 8), 50, false);
+        let regions = layout(area(80, 8), 50, false, false);
         assert!(regions.transcript.height >= 3, "transcript was squeezed out");
     }
 
     #[test]
     fn a_scrollbar_column_is_reserved_only_when_scrollable() {
-        assert!(layout(area(80, 24), 1, false).scrollbar.is_none());
+        assert!(layout(area(80, 24), 1, false, false).scrollbar.is_none());
 
-        let regions = layout(area(80, 24), 1, true);
+        let regions = layout(area(80, 24), 1, true, false);
         let scrollbar = regions.scrollbar.expect("a scrollbar");
         assert_eq!(scrollbar.width, SCROLLBAR_WIDTH);
         assert_eq!(regions.transcript.width, 79);
@@ -940,7 +1060,7 @@ mod tests {
 
     #[test]
     fn a_very_narrow_frame_drops_the_scrollbar() {
-        let regions = layout(area(1, 24), 1, true);
+        let regions = layout(area(1, 24), 1, true, false);
         assert!(regions.scrollbar.is_none());
     }
 
@@ -1040,6 +1160,7 @@ mod tests {
             tokens: None,
             complete: true,
             expanded: true,
+            done_at: None,
         }
         .render(80, coda_render::tool::ToolDisplayMode::Summary);
 
@@ -1147,16 +1268,115 @@ mod tests {
     fn layout_is_valid_at_every_reasonable_terminal_size() {        for width in [10u16, 40, 80, 200] {
             for height in [5u16, 10, 24, 60] {
                 for lines in [1usize, 3, 20] {
-                    let regions = layout(area(width, height), lines, true);
-                    let total = regions.transcript.height
-                        + regions.composer.height
-                        + regions.status.height;
-                    assert!(
-                        total <= height,
-                        "regions overflow at {width}x{height} with {lines} composer lines"
-                    );
+                    for busy in [false, true] {
+                        let regions = layout(area(width, height), lines, true, busy);
+                        let total = regions.transcript.height
+                            + regions.composer.height
+                            + regions.status.height;
+                        assert!(
+                            total <= height,
+                            "regions overflow at {width}x{height} with {lines} composer lines, busy={busy}"
+                        );
+                    }
                 }
             }
         }
+    }
+
+    #[test]
+    fn layout_never_panics_at_extreme_terminal_sizes() {
+        // 1x1 and a short-but-usable 40x8 must degrade gracefully rather than
+        // panic or overlap; a normal 80x24 must keep every region distinct.
+        for (width, height) in [(1u16, 1u16), (40, 8), (80, 24)] {
+            for busy in [false, true] {
+                let regions = layout(area(width, height), 1, true, busy);
+                assert!(regions.transcript.height <= height);
+                assert!(regions.composer.height <= height);
+                assert!(regions.status.height <= height);
+            }
+        }
+    }
+
+    #[test]
+    fn a_busy_turn_reserves_the_activity_row_even_when_chrome_is_dropped() {
+        // 40x8 is below MIN_ROWS_FOR_CHROME, so header/hint disappear, but
+        // live activity is content, not decoration, and must still show.
+        let regions = layout(area(40, 8), 1, false, true);
+        assert!(regions.header.is_none(), "chrome should be dropped at this height");
+        assert!(regions.hint.is_none());
+        assert!(regions.activity.is_some(), "the pinned activity row must survive a short terminal");
+    }
+
+    #[test]
+    fn the_activity_row_is_absent_when_nothing_is_busy() {
+        let regions = layout(area(80, 24), 1, false, false);
+        assert!(regions.activity.is_none());
+    }
+
+    #[test]
+    fn header_id_rect_is_none_without_a_session_id() {
+        let state = UiState::new();
+        assert!(header_id_rect(area(80, 1), &state).is_none());
+    }
+
+    #[test]
+    fn header_id_rect_is_none_when_the_header_is_too_narrow_to_reach_it() {
+        let mut state = UiState::new();
+        state.apply(UiEvent::Connected { session_id: "abcdef-0123456789".into() });
+        assert!(header_id_rect(area(5, 1), &state).is_none(), "no room, no hit region");
+    }
+
+    #[test]
+    fn header_id_rect_covers_exactly_the_id_text() {
+        let mut state = UiState::new();
+        state.apply(UiEvent::Connected { session_id: "sid-123".into() });
+        let rect = header_id_rect(area(80, 1), &state).expect("room for the id");
+        assert_eq!(rect.width as usize, text::width("sid-123"));
+        assert_eq!(rect.y, 0);
+    }
+
+    #[test]
+    fn header_id_rect_clips_to_the_available_width_but_stays_present() {
+        // The rect narrows to what is visible; the *copy* payload (tested in
+        // app::clipboard) still uses the full stored id regardless.
+        let mut state = UiState::new();
+        state.apply(UiEvent::Connected { session_id: "a-very-long-session-identifier-indeed".into() });
+        let narrow = header_id_rect(area(30, 1), &state).expect("still some room");
+        let wide = header_id_rect(area(200, 1), &state).expect("plenty of room");
+        assert!(narrow.width < wide.width, "a narrower header must clip the hit rect");
+    }
+
+    #[test]
+    fn compose_activity_is_none_when_idle() {
+        let state = UiState::new();
+        assert_eq!(compose_activity(&state, Instant::now()), None);
+    }
+
+    #[test]
+    fn compose_activity_shows_zero_seconds_the_instant_a_turn_is_submitted() {
+        // Before any engine event at all — the whole point of starting the
+        // clock locally rather than waiting for the first response.
+        let mut state = UiState::new();
+        state.apply(crate::state::UiEvent::Submitted { text: "go".into() });
+        let text = compose_activity(&state, Instant::now()).expect("a busy turn composes a row");
+        assert!(text.contains("Working"), "{text:?}");
+        assert!(text.contains('0'), "expected a zero-second reading: {text:?}");
+    }
+
+    #[test]
+    fn compose_activity_never_shows_a_fake_token_count() {
+        let mut state = UiState::new();
+        state.apply(crate::state::UiEvent::Submitted { text: "go".into() });
+        let text = compose_activity(&state, Instant::now()).expect("busy");
+        assert!(!text.contains("tok"), "no Usage event arrived yet: {text:?}");
+    }
+
+    #[test]
+    fn compose_activity_mentions_the_queue_once_something_is_queued() {
+        let mut state = UiState::new();
+        state.apply(crate::state::UiEvent::Submitted { text: "go".into() });
+        state.apply(crate::state::UiEvent::Queued { text: "later".into(), id: Some("s1".into()) });
+        let text = compose_activity(&state, Instant::now()).expect("busy");
+        assert!(text.contains("1 queued"), "{text:?}");
     }
 }

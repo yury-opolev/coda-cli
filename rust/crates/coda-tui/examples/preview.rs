@@ -32,7 +32,7 @@ fn main() {
 
     let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
     let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, width, height), composer.line_count(), false);
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, width, height), composer.line_count(), false, state.is_busy());
     let rows = state.transcript.render(regions.transcript.width as usize, state.display_mode);
     let mut viewport = Viewport::new();
     viewport.update(rows.len(), regions.transcript.height as usize);

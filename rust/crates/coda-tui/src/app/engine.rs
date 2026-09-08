@@ -270,6 +270,9 @@ impl App {
                     self.state.session_id = Some(initialized.session_id);
                 }
                 self.engine_log_path = initialized.telemetry_log_path;
+                self.header_id_selected = false;
+                self.selection.clear();
+                self.dragging = false;
                 if lost_history {
                     self.notice(
                         "Engine restarted, but this session had not been saved yet, so it \

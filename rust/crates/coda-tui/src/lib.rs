@@ -14,6 +14,7 @@ pub mod render;
 pub use render::draw;
 pub mod overlay;
 pub mod pin;
+pub mod progress;
 pub mod selection;
 pub mod setup;
 pub mod startup;

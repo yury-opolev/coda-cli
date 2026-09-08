@@ -138,8 +138,8 @@ pub struct App {
     engine_command: EngineCommand,
     /// A freshly started engine waiting for the run loop to swap it in.
     restarted: Option<(Engine, mpsc::UnboundedReceiver<Inbound>)>,
-    /// Images staged by `/image` to be sent with the next user turn.
-    staged_images: Vec<messages::WireImage>,
+    /// Images staged by `/image`/clipboard paste; identified by marker, not position.
+    staged_images: Vec<image::StagedImage>,
     /// The active drag-selection over the transcript, if any.
     selection: crate::selection::TranscriptSelection,
     /// Screen row where the transcript area starts, captured at draw time.
@@ -162,6 +162,10 @@ pub struct App {
     /// has no healthy diagnostic destination — surfaced by `/log`, not
     /// silently treated as "logging is off".
     engine_log_path: Option<String>,
+    /// Where the header's session id is drawn; shared by drawing and hit-testing.
+    header_id_rect: Option<ratatui::layout::Rect>,
+    /// Whether the header's session id is selected (all-or-nothing).
+    header_id_selected: bool,
 }
 
 
@@ -246,6 +250,8 @@ impl App {
             composer_origin: (0, 0),
             session_effort: None,
             engine_log_path: initialized.telemetry_log_path,
+            header_id_rect: None,
+            header_id_selected: false,
         };
 
         Ok((app, engine, inbound))
@@ -485,10 +491,11 @@ impl App {
         // session they cannot quit with the key that normally quits it.
         if key.code == KeyCode::Char('c')
             && key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-            && self.selection.has_selection()
+            && (self.selection.has_selection() || self.header_id_selected)
         {
             self.copy_selection_via_pointer();
             self.selection.clear();
+            self.header_id_selected = false;
             self.armed = None;
             self.state.hints.clear_chord();
             self.dirty = true;
@@ -556,6 +563,9 @@ impl App {
             }
 
             Action::HistoryPrevious => {
+                if self.recall_unsent_into_composer() {
+                    return;
+                }
                 self.composer.history_previous();
             }
             Action::HistoryNext => {
@@ -1029,6 +1039,8 @@ impl App {
             // wherever the last one stopped.
             self.state.spinner = 0;
             self.spinner_at = None;
+            // Not animated is not the same as not busy: keep the pinned row's clock advancing while waiting.
+            self.dirty |= self.state.is_busy();
             return;
         }
 
@@ -1059,8 +1071,9 @@ impl App {
 
         let mut deadline: Option<std::time::Instant> = None;
 
-        // Spinner wakeup (only when animated).
-        if self.state.activity.is_animated() {
+        // Wakeup while busy, animated or not: the pinned row's elapsed clock
+        // must advance through a silent wait too.
+        if self.state.is_busy() {
             let spinner_due = now + Duration::from_millis(SPINNER_FRAME_MS);
             deadline = Some(match deadline {
                 Some(d) => d.min(spinner_due),
@@ -1121,6 +1134,7 @@ impl App {
             ratatui::layout::Rect::new(0, 0, size.width, size.height),
             self.composer.line_count(),
             self.viewport.is_scrollable(),
+            self.state.is_busy(),
         );
         let width = regions.transcript.width as usize;
         let height = regions.transcript.height as usize;
@@ -1133,13 +1147,14 @@ impl App {
             regions.composer.x + draw::COMPOSER_TEXT_COLUMN,
             regions.composer.y + 1,
         );
+        // Same rect drawing will use, so a click can never target stale layout.
+        self.header_id_rect = regions.header.and_then(|h| draw::header_id_rect(h, &self.state));
 
         if width != self.laid_out_width {
             let was_following = self.viewport.is_following();
-            let (rows, starts) = self
-                .state
-                .transcript
-                .render_with_block_starts(width, self.state.display_mode);
+            let style = crate::transcript::TranscriptStyle::Cards;
+            let (rows, starts) =
+                self.state.transcript.render_with_block_starts_styled(width, self.state.display_mode, style);
             self.rows = rows;
             self.block_starts = starts;
             self.laid_out_width = width;
@@ -1189,7 +1204,7 @@ impl App {
         guard.terminal().hide_cursor()?;
         guard.terminal().draw(|frame| {
             origin = draw::draw_with_pin(
-                frame, state, composer, viewport, rows, theme, pin, selection, std::time::Instant::now(),
+                frame, state, composer, viewport, rows, theme, pin, selection, self.header_id_selected, std::time::Instant::now(),
             );
             // Surfaces draw last and bottom-up, so a detail sits over its list
             // and the whole stack sits over the shell. Rendered as a second

@@ -9,6 +9,7 @@ use coda_proto::{Correlation, Event};
 use coda_render::tool::{CallStatus, ToolActivity, ToolCall, ToolDisplayMode};
 
 use crate::hint::HintQueue;
+use crate::progress::TurnProgress;
 use crate::transcript::{same_call, ActivityKey, Block, NoticeLevel, PermissionDecision, Transcript};
 
 /// What the agent is currently doing, shown in the status line.
@@ -100,6 +101,8 @@ impl Usage {
 pub struct QueuedMessage {
     pub id: Option<String>,
     pub text: String,
+    /// When this was queued, for display and for ordering recovery.
+    pub queued_at: String,
 }
 
 /// A prompt from the engine awaiting a user decision.
@@ -179,6 +182,31 @@ pub struct UiState {
     pub display_mode: ToolDisplayMode,
     /// Messages typed while a turn was running.
     pub queued: Vec<QueuedMessage>,
+    /// Queued messages that never reached the model before the turn ended
+    /// (cancelled, errored, or simply finished first).
+    ///
+    /// Kept — not dropped — so a message the user cared enough to type is
+    /// recoverable with a single keystroke rather than silently lost. This is
+    /// the one canonical store for their text once the turn ends; the notice
+    /// shown alongside it is just a pointer to this list, not a second copy.
+    pub unsent: Vec<QueuedMessage>,
+    /// Delivered-but-not-yet-materialised transcript blocks.
+    ///
+    /// A steering delivery can be reported while the transcript's tail block
+    /// (e.g. an in-progress assistant reply) is still open. Inserting the
+    /// delivered `User` block immediately would become the new tail and split
+    /// the reply the moment more text arrived. Instead it waits here until
+    /// the tail actually closes, so "a" then a mid-stream delivery then "b"
+    /// still lands as one assistant block, with the delivered message
+    /// appended right after in chronological order.
+    pending_deliveries: Vec<Block>,
+    /// The turn's own clock and phase, for the pinned activity row.
+    ///
+    /// `Some` from a successful local `Submitted` until the next one starts;
+    /// `None` before the first turn and briefly at startup. Independent of
+    /// `activity` so the row can show a truthful phase and elapsed time
+    /// without changing what the status bar has always meant.
+    pub turn_progress: Option<TurnProgress>,
     /// The prompt currently blocking the turn, if any.
     pub prompt: Option<PendingPrompt>,
     /// Set once the user has asked to quit.
@@ -228,6 +256,9 @@ impl UiState {
             effort: None,
             display_mode: ToolDisplayMode::default(),
             queued: Vec::new(),
+            unsent: Vec::new(),
+            pending_deliveries: Vec::new(),
+            turn_progress: None,
             prompt: None,
             should_quit: false,
             interrupting: false,
@@ -255,6 +286,41 @@ impl UiState {
             self.activity,
             Activity::Working | Activity::Thinking | Activity::Waiting
         )
+    }
+
+    /// Restores the most recently unsent message's text, removing it from
+    /// the recovery list.
+    ///
+    /// LIFO: the last thing that failed to send is the most likely thing the
+    /// user wants back. Returns `None` when nothing is recoverable, so the
+    /// caller can fall back to ordinary history recall.
+    pub fn recall_unsent(&mut self) -> Option<String> {
+        self.unsent.pop().map(|m| m.text)
+    }
+
+    /// Closes whatever block is open, then appends any transcript inserts
+    /// that were deferred while it was open.
+    ///
+    /// Every place that ends a block — a new one starting, a turn ending —
+    /// calls this instead of `Transcript::close_open` directly, so a
+    /// delivered steering message can never be lost or reordered: it always
+    /// lands immediately after the reply it interrupted, whenever that reply
+    /// actually finishes.
+    fn close_open_and_flush(&mut self) {
+        self.transcript.close_open();
+        for block in self.pending_deliveries.drain(..) {
+            self.transcript.push(block);
+        }
+    }
+
+    /// Appends a delivered user message, deferring it if the transcript's
+    /// tail is still open so it cannot split an in-progress reply.
+    fn insert_delivered_user(&mut self, block: Block) {
+        if self.transcript.open_tail().is_some() {
+            self.pending_deliveries.push(block);
+        } else {
+            self.transcript.push(block);
+        }
     }
 
     /// Updates live elapsed time; returns whether its displayed second changed.
@@ -289,7 +355,7 @@ impl UiState {
                 self.activity = Activity::Ready;
             }
             UiEvent::Submitted { text } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.transcript.push(Block::User {
                     text,
                     timestamp: (self.clock)(),
@@ -298,28 +364,34 @@ impl UiState {
                 });
                 self.activity = Activity::Working;
                 self.interrupting = false;
+                // Started before any engine or network event, so the pinned
+                // row has a truthful "0s, Working" to show on the very first
+                // frame rather than waiting for the first response.
+                self.turn_progress = Some(TurnProgress::start(now));
             }
             UiEvent::Queued { text, id } => {
+                // Kept only here — never mirrored into the transcript as a
+                // pending bubble. The old behaviour pushed a pending `User`
+                // block immediately, which became the new tail and split
+                // whatever assistant block was streaming into two. The
+                // actual delivered message is appended later, at the safe
+                // boundary the engine reports via `SteeringDelivered`.
                 self.queued.push(QueuedMessage {
-                    id: id.clone(),
-                    text: text.clone(),
-                });
-                self.transcript.push(Block::User {
+                    id,
                     text,
-                    timestamp: (self.clock)(),
-                    pending: true,
-                    queue_id: id,
+                    queued_at: (self.clock)(),
                 });
             }
             UiEvent::TurnFinished { interrupted, error } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.transcript.finalize_activities(None);
-                // Anything still queued never reached the model.
-                self.transcript.remove_pending_user();
-                self.queued.clear();
+                self.strand_unsent_queue();
                 self.activity = Activity::Ready;
                 self.interrupting = false;
                 self.prompt = None;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.finish(now);
+                }
 
                 if interrupted {
                     self.notice("Interrupted.", NoticeLevel::Warning);
@@ -335,10 +407,16 @@ impl UiState {
             UiEvent::PromptRequested(prompt) => {
                 self.prompt = Some(prompt);
                 self.activity = Activity::Waiting;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_awaiting_approval(now);
+                }
             }
             UiEvent::PromptAnswered { allowed, answer } => {
                 let prompt = self.prompt.take();
                 self.activity = Activity::Working;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_resumed();
+                }
 
                 match prompt {
                     Some(PendingPrompt::Permission { tool, preview }) => {
@@ -369,17 +447,20 @@ impl UiState {
                 }
             }
             UiEvent::CommandOutput { text } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.transcript.push(Block::CommandOutput { text });
             }
             UiEvent::DiffOutput { text } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.transcript.push(Block::Diff { raw: text });
             }
             UiEvent::Notice { text, level } => self.notice(text, level),
             UiEvent::Cleared => {
                 self.transcript.clear();
                 self.queued.clear();
+                self.unsent.clear();
+                self.pending_deliveries.clear();
+                self.turn_progress = None;
             }
             UiEvent::ModelChanged { id, context_limit } => {
                 self.model = Some(id);
@@ -411,6 +492,9 @@ impl UiState {
                     return;
                 }
                 self.activity = Activity::Working;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_responding(now);
+                }
                 // Buffering mode: accumulate instead of streaming to the transcript.
                 if let Some(buf) = self.assistant_buffer.as_mut() {
                     buf.push_str(&delta);
@@ -419,7 +503,7 @@ impl UiState {
                 match self.transcript.open_tail() {
                     Some(Block::Assistant { text, .. }) => text.push_str(&delta),
                     _ => {
-                        self.transcript.close_open();
+                        self.close_open_and_flush();
                         self.transcript.push(Block::Assistant {
                             text: delta,
                             complete: false,
@@ -436,6 +520,13 @@ impl UiState {
                 }
             }
             Event::Thinking { delta } => {
+                // Progress tracks reasoning independently of the transcript
+                // buffering rule below: whether or not the *text* is shown,
+                // the model genuinely started reasoning, and the pinned row
+                // must say so. An empty first delta still counts.
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_thinking_start(now);
+                }
                 // Suppress thinking display during a buffered turn (C# rule).
                 if self.assistant_buffer.is_some() {
                     return;
@@ -444,13 +535,14 @@ impl UiState {
                 match self.transcript.open_tail() {
                     Some(Block::Thinking { text, .. }) => text.push_str(&delta),
                     _ => {
-                        self.transcript.close_open();
+                        self.close_open_and_flush();
                         self.transcript.push(Block::Thinking {
                             text: delta,
                             elapsed_ms: 0,
                             tokens: None,
                             complete: false,
                             expanded: false,
+                            done_at: None,
                         });
                         self.thinking_started_at = Some(now);
                     }
@@ -460,32 +552,39 @@ impl UiState {
                 elapsed_ms,
                 thinking_tokens,
             } => {
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_thinking_end(now);
+                }
                 // Suppress during buffered turn.
                 if self.assistant_buffer.is_some() {
                     return;
                 }
+                let done_at = (self.clock)();
                 if let Some(Block::Thinking {
                     elapsed_ms: elapsed,
                     tokens,
                     complete,
+                    done_at: done_at_field,
                     ..
                 }) = self.transcript.open_tail()
                 {
                     *elapsed = elapsed_ms;
                     *tokens = thinking_tokens;
                     *complete = true;
+                    *done_at_field = Some(done_at);
                 } else {
                     // No block to finish, because none was ever started: a
                     // provider that encrypts its reasoning sends no deltas at
                     // all, only a signed block at the end whose text is empty.
                     // Without this the turn showed no sign of having reasoned.
-                    self.transcript.close_open();
+                    self.close_open_and_flush();
                     self.transcript.push(Block::Thinking {
                         text: String::new(),
                         elapsed_ms,
                         tokens: thinking_tokens,
                         complete: true,
                         expanded: false,
+                        done_at: Some(done_at),
                     });
                 }
                 self.activity = Activity::Working;
@@ -496,6 +595,9 @@ impl UiState {
                 correlation,
             } => {
                 self.activity = Activity::Working;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_tool_call_started(now);
+                }
                 let key = ActivityKey::from_correlation(&correlation);
                 let index = self.batch_for_new_call(&key);
                 if let Some(Block::Tools { activity, calls, .. }) =
@@ -563,11 +665,9 @@ impl UiState {
                 root_turn_id,
                 ..
             } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.transcript.finalize_activities(root_turn_id.as_deref());
-                // Anything still queued never reached the model.
-                self.transcript.remove_pending_user();
-                self.queued.clear();
+                self.strand_unsent_queue();
 
                 // Flush or withhold the assistant buffer.
                 // Rule (from C# UiReducer.HandleTurnCompleted / HandleTurnInterrupted):
@@ -584,6 +684,9 @@ impl UiState {
 
                 self.activity = Activity::Ready;
                 self.interrupting = false;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.finish(now);
+                }
                 if interrupted {
                     self.notice("Interrupted.", NoticeLevel::Warning);
                 }
@@ -594,20 +697,40 @@ impl UiState {
             } => {
                 self.usage.input_tokens = input_tokens;
                 self.usage.output_tokens = output_tokens;
+                if let Some(progress) = self.turn_progress.as_mut() {
+                    progress.on_usage(input_tokens, output_tokens);
+                }
             }
             Event::Error { message } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.notice(message, NoticeLevel::Error);
             }
             Event::LimitReached { message, .. } => {
-                self.transcript.close_open();
+                self.close_open_and_flush();
                 self.notice(message, NoticeLevel::Warning);
             }
             Event::SteeringDelivered { message_ids } => {
-                // Delivered messages stop being "pending" in the transcript.
-                self.queued
-                    .retain(|m| !m.id.as_ref().is_some_and(|id| message_ids.contains(id)));
-                self.transcript.mark_delivered(&message_ids);
+                // Delivered messages stop being "queued": each becomes a real
+                // `User` block. Matching by id (never position) means a
+                // duplicate notification finds nothing left to deliver and is
+                // a no-op, and delivering the middle of three queued messages
+                // promotes only that one.
+                let mut delivered: Vec<QueuedMessage> = Vec::new();
+                self.queued.retain(|m| {
+                    let matched = m.id.as_ref().is_some_and(|id| message_ids.contains(id));
+                    if matched {
+                        delivered.push(m.clone());
+                    }
+                    !matched
+                });
+                for message in delivered {
+                    self.insert_delivered_user(Block::User {
+                        text: message.text,
+                        timestamp: (self.clock)(),
+                        pending: false,
+                        queue_id: message.id,
+                    });
+                }
             }
             Event::TaskCompleted {
                 description,
@@ -700,7 +823,7 @@ impl UiState {
             }
         }
 
-        self.transcript.close_open();
+        self.close_open_and_flush();
         self.transcript.push(Block::Tools {
             activity: ToolActivity::default(),
             key: key.clone(),
@@ -754,6 +877,33 @@ impl UiState {
             text: text.into(),
             level,
         });
+    }
+
+    /// Moves anything still queued when a turn ends into the recoverable
+    /// `unsent` list, and says so once.
+    ///
+    /// Never silently drops a message the user typed: it did not reach the
+    /// model, but it is not lost either. `unsent` is the one place its text
+    /// lives from here on — the notice only names how many, so recovering it
+    /// later never risks reading a stale copy.
+    fn strand_unsent_queue(&mut self) {
+        if self.queued.is_empty() {
+            return;
+        }
+        let stranded = std::mem::take(&mut self.queued);
+        self.unsent.extend(stranded);
+        let n = self.unsent.len();
+        self.notice(
+            if n == 1 {
+                "1 message was not sent — press Up on an empty message box to recover it."
+                    .to_string()
+            } else {
+                format!(
+                    "{n} messages were not sent — press Up on an empty message box to recover them."
+                )
+            },
+            NoticeLevel::Warning,
+        );
     }
 
     /// Flushes the assistant buffer as a completed block when non-empty.
@@ -955,16 +1105,39 @@ mod tests {
                 elapsed_ms,
                 tokens,
                 complete,
+                done_at,
                 ..
             } => {
                 assert_eq!(text, "hmm...");
                 assert_eq!(*elapsed_ms, 2500);
                 assert_eq!(*tokens, Some(90));
                 assert!(complete);
+                assert_eq!(done_at.as_deref(), Some("09:41"));
             }
             other => panic!("expected a thinking block, got {other:?}"),
         }
         assert_eq!(state.activity, Activity::Working);
+    }
+
+    #[test]
+    fn a_signed_only_thinking_completion_still_records_a_done_time() {
+        // A provider that encrypts its reasoning sends no deltas at all —
+        // only the completion. It must still show a truthful, frozen local
+        // done time even though no visible text or duration was ever streamed.
+        let mut state = state();
+        state.apply(UiEvent::Engine(Event::ThinkingComplete {
+            elapsed_ms: 0,
+            thinking_tokens: None,
+        }));
+
+        match &state.transcript.blocks()[0] {
+            Block::Thinking { text, complete, done_at, .. } => {
+                assert!(text.is_empty());
+                assert!(complete);
+                assert_eq!(done_at.as_deref(), Some("09:41"));
+            }
+            other => panic!("expected a thinking block, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1200,22 +1373,24 @@ mod tests {
     }
 
     #[test]
-    fn queued_messages_appear_as_pending_user_blocks() {
+    fn queued_messages_do_not_appear_in_the_transcript() {
         let mut state = state();
+        let before = state.transcript.blocks().len();
         state.apply(UiEvent::Queued {
             text: "later".into(),
             id: Some("s1".into()),
         });
 
         assert_eq!(state.queued.len(), 1);
-        assert!(matches!(
-            state.transcript.blocks().last(),
-            Some(Block::User { pending: true, .. })
-        ));
+        assert_eq!(
+            state.transcript.blocks().len(),
+            before,
+            "queuing must not touch the transcript at all"
+        );
     }
 
     #[test]
-    fn delivered_steering_clears_the_pending_marker() {
+    fn delivered_steering_appends_a_real_user_block() {
         let mut state = state();
         state.apply(UiEvent::Queued {
             text: "later".into(),
@@ -1228,8 +1403,80 @@ mod tests {
         assert!(state.queued.is_empty());
         assert!(matches!(
             state.transcript.blocks().last(),
-            Some(Block::User { pending: false, .. })
+            Some(Block::User { pending: false, text, .. }) if text == "later"
         ));
+    }
+
+    #[test]
+    fn a_duplicate_delivery_notification_does_not_duplicate_the_block() {
+        let mut state = state();
+        state.apply(UiEvent::Queued {
+            text: "later".into(),
+            id: Some("s1".into()),
+        });
+        state.apply(UiEvent::Engine(Event::SteeringDelivered {
+            message_ids: vec!["s1".into()],
+        }));
+        let count_after_first = state.transcript.blocks().len();
+        state.apply(UiEvent::Engine(Event::SteeringDelivered {
+            message_ids: vec!["s1".into()],
+        }));
+
+        assert_eq!(
+            state.transcript.blocks().len(),
+            count_after_first,
+            "a duplicate ack must not insert the message twice"
+        );
+    }
+
+    #[test]
+    fn a_message_delivered_mid_stream_does_not_split_the_assistant_reply() {
+        // a -> Queued(m) -> b must render as one assistant block "ab", with
+        // the delivered message appearing only once that block closes.
+        let mut state = state();
+        state.apply(UiEvent::Submitted { text: "go".into() });
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "a".into() }));
+        state.apply(UiEvent::Queued {
+            text: "steered".into(),
+            id: Some("s1".into()),
+        });
+        // Delivered while the assistant block is still open.
+        state.apply(UiEvent::Engine(Event::SteeringDelivered {
+            message_ids: vec!["s1".into()],
+        }));
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: "b".into() }));
+
+        let assistant_texts: Vec<&str> = state
+            .transcript
+            .blocks()
+            .iter()
+            .filter_map(|b| match b {
+                Block::Assistant { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistant_texts, vec!["ab"], "the reply must stay one block");
+
+        state.apply(UiEvent::Engine(Event::TurnComplete {
+            stop_reason: Some("end_turn".into()),
+            interrupted: false,
+            root_turn_id: None,
+            activity_id: None,
+        }));
+
+        // The delivered message now appears, in order, after the reply it interrupted.
+        let kinds: Vec<&str> = state
+            .transcript
+            .blocks()
+            .iter()
+            .map(|b| match b {
+                Block::User { text, .. } if text == "go" => "user:go",
+                Block::Assistant { text, .. } if text == "ab" => "assistant:ab",
+                Block::User { text, .. } if text == "steered" => "user:steered",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(kinds, vec!["user:go", "assistant:ab", "user:steered"]);
     }
 
     #[test]
@@ -1503,7 +1750,21 @@ mod tests {
     }
 
     #[test]
-    fn undelivered_queued_messages_are_dropped_when_the_turn_ends() {
+    fn unsent_messages_preserve_prior_turns_until_recalled() {
+        let mut state = state();
+        for text in ["first unsent", "second unsent"] {
+            state.apply(UiEvent::Submitted { text: "go".into() });
+            state.apply(UiEvent::Queued { text: text.into(), id: Some(text.into()) });
+            state.apply(UiEvent::TurnFinished { interrupted: false, error: None });
+        }
+        assert_eq!(state.unsent.len(), 2);
+        assert_eq!(state.recall_unsent().as_deref(), Some("second unsent"));
+        assert_eq!(state.recall_unsent().as_deref(), Some("first unsent"));
+        assert_eq!(state.recall_unsent(), None);
+    }
+
+    #[test]
+    fn undelivered_queued_messages_become_recoverable_when_the_turn_ends() {
         let mut state = state();
         state.apply(UiEvent::Submitted { text: "go".into() });
         state.apply(UiEvent::Queued {
@@ -1518,14 +1779,40 @@ mod tests {
         }));
 
         assert!(state.queued.is_empty());
+        assert_eq!(state.unsent.len(), 1);
+        assert_eq!(state.unsent[0].text, "never delivered");
         assert!(
             !state
                 .transcript
                 .blocks()
                 .iter()
                 .any(|b| matches!(b, Block::User { pending: true, .. })),
-            "an undelivered message was left in the transcript"
+            "an undelivered message must never appear as a pending bubble"
         );
+        assert!(
+            state
+                .transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::Notice { level: NoticeLevel::Warning, .. })),
+            "losing a message silently is exactly what must not happen"
+        );
+
+        // Recoverable, not auto-resent: it is still sitting there for Up to restore.
+        assert_eq!(state.recall_unsent().as_deref(), Some("never delivered"));
+        assert!(state.unsent.is_empty());
+    }
+
+    #[test]
+    fn recall_unsent_pops_the_most_recent_message_first() {
+        let mut state = state();
+        state.unsent = vec![
+            QueuedMessage { id: None, text: "first".into(), queued_at: String::new() },
+            QueuedMessage { id: None, text: "second".into(), queued_at: String::new() },
+        ];
+        assert_eq!(state.recall_unsent().as_deref(), Some("second"));
+        assert_eq!(state.recall_unsent().as_deref(), Some("first"));
+        assert_eq!(state.recall_unsent(), None);
     }
 
     #[test]
@@ -1544,21 +1831,16 @@ mod tests {
             message_ids: vec!["s2".into()],
         }));
 
-        let pending: Vec<&str> = state
-            .transcript
-            .blocks()
-            .iter()
-            .filter_map(|b| match b {
-                Block::User {
-                    text,
-                    pending: true,
-                    ..
-                } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-
-        assert_eq!(pending, vec!["s1", "s3"], "the wrong message was promoted");
+        assert!(
+            state
+                .transcript
+                .blocks()
+                .iter()
+                .any(|b| matches!(b, Block::User { text, pending: false, .. } if text == "s2")),
+            "the delivered message must appear as a real user block"
+        );
+        let still_queued: Vec<&str> = state.queued.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(still_queued, vec!["s1", "s3"], "the wrong message was delivered");
     }
 
     #[test]
@@ -1572,10 +1854,11 @@ mod tests {
             message_ids: vec!["other".into()],
         }));
 
-        assert!(matches!(
-            state.transcript.blocks().last(),
-            Some(Block::User { pending: true, .. })
-        ));
+        assert_eq!(state.queued.len(), 1, "the unmatched message stays queued");
+        assert!(
+            !state.transcript.blocks().iter().any(|b| matches!(b, Block::User { .. })),
+            "nothing should have reached the transcript yet"
+        );
     }
 
     #[test]
@@ -2075,5 +2358,122 @@ mod tests {
                 assert_eq!(*elapsed_ms, 3000);
             }
         }
+    }
+
+    #[test]
+    fn submitted_starts_turn_progress_before_any_engine_event() {
+        use std::time::Instant;
+        let mut state = state();
+        let now = Instant::now();
+        state.apply_at(UiEvent::Submitted { text: "go".into() }, now);
+
+        let progress = state.turn_progress.as_ref().expect("progress must start on Submitted");
+        assert_eq!(progress.phase(), crate::progress::Phase::Working);
+        assert_eq!(progress.elapsed_ms(now), 0);
+    }
+
+    #[test]
+    fn turn_progress_tracks_the_true_phase_as_engine_events_arrive() {
+        use std::time::{Duration, Instant};
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Submitted { text: "go".into() }, start);
+
+        state.apply_at(
+            UiEvent::Engine(Event::Thinking { delta: "hmm".into() }),
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(state.turn_progress.as_ref().unwrap().phase(), crate::progress::Phase::Thinking);
+
+        state.apply_at(
+            UiEvent::Engine(Event::ThinkingComplete { elapsed_ms: 1000, thinking_tokens: None }),
+            start + Duration::from_secs(2),
+        );
+        state.apply_at(
+            UiEvent::Engine(Event::ToolCall {
+                tool_name: "run_command".into(),
+                input_json: "{}".into(),
+                correlation: correlation("c1"),
+            }),
+            start + Duration::from_secs(3),
+        );
+        assert_eq!(
+            state.turn_progress.as_ref().unwrap().phase(),
+            crate::progress::Phase::RunningTools
+        );
+
+        state.apply_at(
+            UiEvent::Engine(Event::AssistantText { delta: "done".into() }),
+            start + Duration::from_secs(4),
+        );
+        assert_eq!(
+            state.turn_progress.as_ref().unwrap().phase(),
+            crate::progress::Phase::Responding
+        );
+    }
+
+    #[test]
+    fn turn_progress_freezes_when_the_turn_ends_and_survives_a_duplicate_end() {
+        use std::time::{Duration, Instant};
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Submitted { text: "go".into() }, start);
+        state.apply_at(
+            UiEvent::Engine(Event::TurnComplete {
+                stop_reason: Some("end_turn".into()),
+                interrupted: false,
+                root_turn_id: None,
+                activity_id: None,
+            }),
+            start + Duration::from_secs(5),
+        );
+        assert_eq!(state.turn_progress.as_ref().unwrap().elapsed_ms(start + Duration::from_secs(5)), 5_000);
+
+        // TurnFinished (the RPC-response path) follows almost every
+        // TurnComplete; it must not move the already-frozen clock.
+        state.apply_at(
+            UiEvent::TurnFinished { interrupted: false, error: None },
+            start + Duration::from_secs(50),
+        );
+        assert_eq!(
+            state.turn_progress.as_ref().unwrap().elapsed_ms(start + Duration::from_secs(999)),
+            5_000,
+            "a duplicate end must not move an already-frozen clock"
+        );
+    }
+
+    #[test]
+    fn turn_progress_reports_the_last_responses_tokens_only_once_usage_arrives() {
+        use std::time::Instant;
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Submitted { text: "go".into() }, start);
+        assert_eq!(state.turn_progress.as_ref().unwrap().last_response_tokens(), None);
+
+        state.apply_at(
+            UiEvent::Engine(Event::Usage { input_tokens: 100, output_tokens: 42 }),
+            start,
+        );
+        assert_eq!(
+            state.turn_progress.as_ref().unwrap().last_response_tokens(),
+            Some((100, 42))
+        );
+    }
+
+    #[test]
+    fn a_new_turn_starts_a_fresh_progress_clock() {
+        use std::time::{Duration, Instant};
+        let mut state = state();
+        let start = Instant::now();
+        state.apply_at(UiEvent::Submitted { text: "first".into() }, start);
+        state.apply_at(
+            UiEvent::TurnFinished { interrupted: false, error: None },
+            start + Duration::from_secs(5),
+        );
+
+        let second_start = start + Duration::from_secs(100);
+        state.apply_at(UiEvent::Submitted { text: "second".into() }, second_start);
+        assert_eq!(state.turn_progress.as_ref().unwrap().elapsed_ms(second_start), 0);
+        assert!(!state.turn_progress.as_ref().unwrap().is_finished());
     }
 }
