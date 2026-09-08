@@ -134,6 +134,9 @@ impl App {
                     );
                 }
                 self.engine_log_path = initialized.telemetry_log_path;
+                self.header_id_selected = false;
+                self.selection.clear();
+                self.dragging = false;
 
                 let escaped = coda_render::text::sanitize(&actual_id);
                 self.notice(
@@ -166,6 +169,9 @@ impl App {
                     let escaped = coda_render::text::sanitize(&new_id);
                     // Reflect the engine's new session id in the TUI state.
                     self.state.session_id = Some(new_id);
+                    self.header_id_selected = false;
+                    self.selection.clear();
+                    self.dragging = false;
                     self.notice(
                         format!("Forked into a new session {escaped} (original frozen)."),
                         NoticeLevel::Info,
@@ -396,8 +402,7 @@ impl App {
 
         match result {
             Ok(Ok((media_type, bytes))) => {
-                let label = self.stage_image_bytes(&media_type, &bytes);
-                let token = format!("[Image {label}]");
+                let token = self.stage_image_bytes(&media_type, &bytes);
                 let size_kb = bytes.len() as f64 / 1024.0;
                 self.notice(
                     format!(

@@ -26,6 +26,7 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
         ratatui::layout::Rect::new(0, 0, width, height),
         composer.line_count(),
         false,
+        state.is_busy(),
     );
     let rows = state
         .transcript
@@ -34,6 +35,53 @@ fn render(state: &UiState, composer: &Composer, width: u16, height: u16) -> Vec<
 
     terminal
         .draw(|frame| draw::draw(frame, state, composer, &viewport, &rows, &theme, std::time::Instant::now()))
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Renders through `draw_with_pin` directly, so a test can supply a
+/// fabricated `now` (e.g. minutes in the future) without actually sleeping —
+/// needed to exercise the pinned activity row's elapsed clock and phase
+/// truthfully across a long silence.
+fn draw_at(
+    state: &UiState,
+    composer: &Composer,
+    width: u16,
+    height: u16,
+    header_id_selected: bool,
+    now: std::time::Instant,
+) -> Vec<String> {
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let mut viewport = Viewport::new();
+    let regions = draw::layout(
+        ratatui::layout::Rect::new(0, 0, width, height),
+        composer.line_count(),
+        false,
+        state.is_busy(),
+    );
+    let rows = state
+        .transcript
+        .render(regions.transcript.width as usize, state.display_mode);
+    viewport.update(rows.len(), regions.transcript.height as usize);
+
+    terminal
+        .draw(|frame| {
+            draw::draw_with_pin(
+                frame, state, composer, &viewport, &rows, &theme, None, None,
+                header_id_selected, now,
+            );
+        })
         .expect("draw");
 
     let buffer = terminal.backend().buffer().clone();
@@ -256,6 +304,7 @@ fn a_selected_span_is_rendered_differently_from_an_unselected_one() {
                     &Theme::default(),
                     None,
                     selection,
+                    false,
                     std::time::Instant::now(),
                 );
             })
@@ -303,6 +352,7 @@ fn drawing_reports_the_transcript_origin_for_mouse_mapping() {
                 &Theme::default(),
                 None,
                 None,
+                false,
                 std::time::Instant::now(),
             );
         })
@@ -735,11 +785,13 @@ fn the_completion_popup_moves_its_mark_with_the_selection() {
 }
 
 #[test]
-fn the_status_bar_animates_while_the_engine_works() {
+fn the_pinned_activity_row_animates_while_the_status_bar_no_longer_does() {
     // The composer used to swap its prompt marker for an ellipsis, which said
     // "busy" in the one place the user is being invited to type -- and said it
     // without moving, so it read as a disabled input rather than as progress.
-    // Progress belongs in the status bar, next to the word for it.
+    // Progress now belongs to the pinned activity row above the composer; the
+    // status bar keeps naming the activity but must never animate a second
+    // spinner alongside it.
     use coda_tui::render::glyphs;
 
     let mut state = session();
@@ -747,30 +799,41 @@ fn the_status_bar_animates_while_the_engine_works() {
     assert!(state.is_busy(), "submitting should start a turn");
 
     let composer = Composer::new();
-    let status_of = |state: &UiState| {
+    let activity_row = |state: &UiState| {
         render(state, &composer, 80, 10)
             .into_iter()
-            .rev()
-            .find(|row| row.contains("working"))
-            .expect("no status row said 'working'")
+            .find(|row| row.contains("Working"))
+            .expect("no pinned activity row said 'Working'")
     };
 
     let mut seen = std::collections::HashSet::new();
     for frame in 0..glyphs::SPINNER.len() {
         state.spinner = frame;
-        let row = status_of(&state);
+        let row = activity_row(&state);
         let glyph = glyphs::SPINNER[frame];
         assert!(
             row.contains(glyph),
-            "frame {frame} did not draw {glyph:?}: {row:?}"
+            "frame {frame} did not draw {glyph:?} on the activity row: {row:?}"
         );
         seen.insert(glyph);
     }
     assert!(seen.len() > 1, "a spinner that never changes is not animated");
 
+    let screen = render(&state, &composer, 80, 10);
+    let status_row = screen
+        .iter()
+        .rev()
+        .find(|row| row.contains("working"))
+        .expect("no status row said 'working'");
+    for glyph in glyphs::SPINNER {
+        assert!(
+            !status_row.contains(glyph),
+            "the status bar drew a second spinner: {status_row:?}"
+        );
+    }
+
     // The composer keeps its prompt marker throughout: it still accepts
     // typing while a turn runs, and the queue counter proves it.
-    let screen = render(&state, &composer, 80, 10);
     assert!(
         screen.iter().any(|row| row.contains(glyphs::PROMPT)),
         "the composer lost its prompt marker while busy: {screen:?}"
@@ -876,7 +939,7 @@ fn the_hint_line_reports_what_arrived_while_scrolled_away() {
     let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
 
-    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true);
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true, state.is_busy());
     let rows = state
         .transcript
         .render(regions.transcript.width as usize, state.display_mode);
@@ -930,7 +993,7 @@ fn the_way_back_stays_offered_while_scrolled_away() {
     let composer = Composer::new();
     let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
     let mut terminal = Terminal::new(TestBackend::new(100, 24)).expect("terminal");
-    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true);
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 100, 24), 1, true, state.is_busy());
     let rows = state
         .transcript
         .render(regions.transcript.width as usize, state.display_mode);
@@ -962,4 +1025,270 @@ fn the_way_back_stays_offered_while_scrolled_away() {
         left.abs_diff(right) <= 1,
         "the hint is not centred (left {left}, right {right})"
     );
+}
+
+// -- Pinned activity row (B) -------------------------------------------------
+
+#[test]
+fn submitted_shows_the_pinned_activity_row_at_zero_seconds_before_any_engine_event() {
+    let mut state = session();
+    let now = std::time::Instant::now();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    let composer = Composer::new();
+
+    let screen = draw_at(&state, &composer, 80, 24, false, now);
+    let row = screen
+        .iter()
+        .find(|r| r.contains("Working"))
+        .unwrap_or_else(|| panic!("no pinned activity row above the composer:\n{}", screen.join("\n")));
+    assert!(row.contains('0'), "expected a zero-second reading: {row:?}");
+    assert!(!row.contains("tok"), "no Usage event has arrived yet: {row:?}");
+}
+
+#[test]
+fn the_pinned_activity_row_survives_a_detached_viewport() {
+    // Scrolled away from the bottom must not hide live progress: the row is
+    // drawn independently of the transcript's own scroll position.
+    let mut state = session();
+    for i in 0..200 {
+        state.apply(UiEvent::Engine(Event::AssistantText { delta: format!("line {i}\n") }));
+    }
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    let composer = Composer::new();
+
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+    let regions = draw::layout(ratatui::layout::Rect::new(0, 0, 80, 24), 1, false, state.is_busy());
+    let rows = state.transcript.render(regions.transcript.width as usize, state.display_mode);
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), regions.transcript.height as usize);
+    viewport.scroll_up(30);
+    assert!(!viewport.is_following(), "the viewport must have detached");
+
+    terminal
+        .draw(|frame| {
+            draw::draw_with_pin(
+                frame, &state, &composer, &viewport, &rows, &theme, None, None, false,
+                std::time::Instant::now(),
+            );
+        })
+        .expect("draw");
+    let buffer = terminal.backend().buffer().clone();
+    let screen: Vec<String> = (0..24)
+        .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+        .collect();
+
+    assert!(
+        screen.iter().any(|r| r.contains("Working")),
+        "the pinned row must show even while the viewport is detached:\n{}",
+        screen.join("\n")
+    );
+}
+
+#[test]
+fn a_long_silence_advances_the_pinned_elapsed_clock_then_late_thinking_changes_the_phase() {
+    let mut state = session();
+    let before = std::time::Instant::now();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    let composer = Composer::new();
+
+    let later = before + std::time::Duration::from_secs(65);
+    let screen = draw_at(&state, &composer, 80, 24, false, later);
+    let row = screen
+        .iter()
+        .find(|r| r.contains("Working"))
+        .unwrap_or_else(|| panic!("no pinned row:\n{}", screen.join("\n")));
+    // "1:0x": tolerant of a few milliseconds of scheduling skew between
+    // capturing `before` and the state's own `Instant::now()` on Submitted.
+    assert!(row.contains("1:0"), "expected a minute:second reading: {row:?}");
+
+    // Late `Thinking` after the long silence must still flip the truthful phase.
+    state.apply(UiEvent::Engine(Event::Thinking { delta: "hmm".into() }));
+    let screen = draw_at(&state, &composer, 80, 24, false, later + std::time::Duration::from_secs(1));
+    assert!(
+        screen.iter().any(|r| r.contains("Thinking")),
+        "late Thinking did not change the pinned phase:\n{}",
+        screen.join("\n")
+    );
+}
+
+#[test]
+fn the_pinned_row_names_the_queue_instead_of_a_transcript_bubble() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    state.apply(UiEvent::Queued { text: "steer this in".into(), id: Some("s1".into()) });
+    let composer = Composer::new();
+
+    let screen = draw_at(&state, &composer, 80, 24, false, std::time::Instant::now());
+    let row = screen
+        .iter()
+        .find(|r| r.contains("Working"))
+        .expect("pinned row");
+    assert!(row.contains("1 queued"), "{row:?}");
+    assert!(
+        !screen.iter().any(|r| r.contains("steer this in")),
+        "a queued message must never appear as a transcript bubble:\n{}",
+        screen.join("\n")
+    );
+}
+
+#[test]
+fn a_delayed_delivery_mid_stream_renders_as_one_assistant_block_then_the_delivered_message() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    state.apply(UiEvent::Engine(Event::AssistantText { delta: "a".into() }));
+    state.apply(UiEvent::Queued { text: "steered".into(), id: Some("s1".into()) });
+    state.apply(UiEvent::Engine(Event::SteeringDelivered { message_ids: vec!["s1".into()] }));
+    state.apply(UiEvent::Engine(Event::AssistantText { delta: "b".into() }));
+    state.apply(UiEvent::Engine(Event::TurnComplete {
+        stop_reason: Some("end_turn".into()),
+        interrupted: false,
+        root_turn_id: None,
+        activity_id: None,
+    }));
+
+    let rows = render(&state, &Composer::new(), 80, 40);
+    assert!(rows.iter().any(|r| r.contains("ab")), "the reply must merge into one block: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains("steered")), "the delivered message must still appear: {rows:?}");
+}
+
+#[test]
+fn no_panic_at_extreme_terminal_sizes_while_busy() {
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "go".into() });
+    let composer = Composer::new();
+    for (w, h) in [(1u16, 1u16), (40, 8), (80, 24)] {
+        let _ = draw_at(&state, &composer, w, h, false, std::time::Instant::now());
+    }
+}
+
+// -- Header session-id selection (E) -----------------------------------------
+
+/// Like `draw_at`, but returns the raw styled buffer rather than plain text,
+/// so a selection that only changes styling (not glyphs) is still visible to
+/// the comparison.
+fn draw_at_buffer(
+    state: &UiState,
+    composer: &Composer,
+    width: u16,
+    height: u16,
+    header_id_selected: bool,
+) -> ratatui::buffer::Buffer {
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let mut viewport = Viewport::new();
+    let regions = draw::layout(
+        ratatui::layout::Rect::new(0, 0, width, height),
+        composer.line_count(),
+        false,
+        state.is_busy(),
+    );
+    let rows = state
+        .transcript
+        .render(regions.transcript.width as usize, state.display_mode);
+    viewport.update(rows.len(), regions.transcript.height as usize);
+    terminal
+        .draw(|frame| {
+            draw::draw_with_pin(
+                frame, state, composer, &viewport, &rows, &theme, None, None,
+                header_id_selected, std::time::Instant::now(),
+            );
+        })
+        .expect("draw");
+    terminal.backend().buffer().clone()
+}
+
+#[test]
+fn a_selected_header_id_is_rendered_differently_from_an_unselected_one() {
+    let state = session();
+    let composer = Composer::new();
+
+    let plain = draw_at_buffer(&state, &composer, 80, 24, false);
+    let selected = draw_at_buffer(&state, &composer, 80, 24, true);
+
+    assert_ne!(
+        plain, selected,
+        "a header selection must be visible on screen; if these match, nothing drew the highlight"
+    );
+}
+
+#[test]
+fn a_narrow_header_with_no_room_for_the_id_has_no_selection_effect() {
+    // Below MIN_ROWS_FOR_CHROME the header disappears entirely, so selecting
+    // it can draw nothing — there is nothing to select.
+    let state = session();
+    let composer = Composer::new();
+    let plain = draw_at_buffer(&state, &composer, 80, 8, false);
+    let selected = draw_at_buffer(&state, &composer, 80, 8, true);
+    assert_eq!(plain, selected, "no header row exists at this height to highlight");
+}
+
+// -- Cards presentation (C), through the real draw path ----------------------
+
+#[test]
+fn cards_style_draws_a_visible_border_between_two_conversation_turns() {
+    use coda_tui::transcript::TranscriptStyle;
+
+    let mut state = session();
+    state.apply(UiEvent::Submitted { text: "first question".into() });
+    state.apply(UiEvent::Engine(Event::AssistantText { delta: "first answer".into() }));
+    state.apply(UiEvent::Engine(Event::TurnComplete {
+        stop_reason: Some("end_turn".into()),
+        interrupted: false,
+        root_turn_id: None,
+        activity_id: None,
+    }));
+    state.apply(UiEvent::Submitted { text: "second question".into() });
+    state.apply(UiEvent::Engine(Event::AssistantText { delta: "second answer".into() }));
+    state.apply(UiEvent::Engine(Event::TurnComplete {
+        stop_reason: Some("end_turn".into()),
+        interrupted: false,
+        root_turn_id: None,
+        activity_id: None,
+    }));
+
+    let width = 80u16;
+    let height = 30u16;
+    let theme = Theme::warm_ember().with_depth(ColorDepth::TrueColor);
+    let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+    let composer = Composer::new();
+    let regions = draw::layout(
+        ratatui::layout::Rect::new(0, 0, width, height),
+        composer.line_count(),
+        false,
+        state.is_busy(),
+    );
+    let (rows, _) = state.transcript.render_with_block_starts_styled(
+        regions.transcript.width as usize,
+        state.display_mode,
+        TranscriptStyle::Cards,
+    );
+    let mut viewport = Viewport::new();
+    viewport.update(rows.len(), regions.transcript.height as usize);
+
+    terminal
+        .draw(|frame| {
+            draw::draw_with_pin(
+                frame, &state, &composer, &viewport, &rows, &theme, None, None, false,
+                std::time::Instant::now(),
+            );
+        })
+        .expect("draw");
+
+    let buffer = terminal.backend().buffer().clone();
+    let screen: Vec<String> = (0..height)
+        .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect::<String>().trim_end().to_string())
+        .collect();
+
+    let border_rows = screen
+        .iter()
+        .filter(|r| !r.is_empty() && r.chars().all(|c| c == '\u{2500}'))
+        .count();
+    assert!(
+        border_rows >= 2,
+        "expected at least two visible card borders (dividing and closing), got {border_rows}:\n{}",
+        screen.join("\n")
+    );
+    assert!(screen.iter().any(|r| r.contains("first question")));
+    assert!(screen.iter().any(|r| r.contains("second question")));
 }

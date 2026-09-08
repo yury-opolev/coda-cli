@@ -1,10 +1,11 @@
 //! Image staging helpers shared by `/image` and clipboard paste.
 //!
 //! Collecting these in one place enforces a single 5 MB limit and a single
-//! `[Image N]` token format across every path that stages an image.
+//! placeholder-token format across every path that stages an image.
 
 use coda_proto::messages;
 
+use crate::render::glyphs;
 use super::App;
 
 /// Maximum image-file bytes before base64 encoding, shared with `/image`.
@@ -16,32 +17,106 @@ pub(in crate::app) const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 /// screenshot that fits on a modern display, small enough to encode promptly.
 const MAX_PIXEL_COUNT: usize = 16 * 1024 * 1024;
 
-pub(super) fn images_for_draft(images: &[messages::WireImage], text: &str) -> Vec<messages::WireImage> {
-    images.iter().enumerate()
-        .filter(|(index, _)| text.contains(&format!("[Image {}]", index + 1)))
-        .map(|(_, image)| image.clone())
-        .collect()
+/// An image staged for the next user turn.
+///
+/// Identified by a stable per-attachment `id` rather than by its position in
+/// `App::staged_images`: the placeholder token embeds that id, so matching a
+/// draft's surviving tokens back to their images never depends on nothing
+/// having shifted the list — deleting one placeholder (by editing it out of
+/// the draft) excludes exactly that image, never a different one that
+/// happened to end up at the same index.
+#[derive(Debug, Clone)]
+pub(in crate::app) struct StagedImage {
+    id: String,
+    media_type: String,
+    base64: String,
+}
+
+impl StagedImage {
+    /// The placeholder token this image's marker looks for in the draft,
+    /// e.g. `[📷 coda-image-a1b2c3d4e5f6.png]`.
+    ///
+    /// A camera glyph (never a bare index) and the image's own honest,
+    /// MIME-derived extension — never a fixed `.png` regardless of what was
+    /// actually staged, which would mislabel a JPEG file as something it is
+    /// not.
+    pub fn marker(&self) -> String {
+        format!(
+            "[{} coda-image-{}.{}]",
+            glyphs::CAMERA,
+            self.id,
+            extension_for_media_type(&self.media_type)
+        )
+    }
+
+    fn to_wire(&self) -> messages::WireImage {
+        messages::WireImage {
+            media_type: self.media_type.clone(),
+            base64: self.base64.clone(),
+        }
+    }
+}
+
+/// Maps a staged image's MIME type to the extension its marker shows.
+///
+/// Every caller today only ever stages one of the four supported types —
+/// clipboard paste always encodes PNG, and `/image` rejects anything else
+/// before staging — so the fallback below is unreachable in practice. It
+/// exists so an unrecognised type is at least never asserted to be a PNG it
+/// is not.
+fn extension_for_media_type(media_type: &str) -> &'static str {
+    match media_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "img",
+    }
+}
+
+/// A short, stable, per-attachment id.
+///
+/// Not cryptographic — it only has to distinguish the handful of images a
+/// session might stage at once, and to never change for the life of one
+/// staged attachment. Twelve hex digits (48 bits) makes an accidental
+/// collision within one draft practically impossible while staying short
+/// enough to read as a filename.
+fn new_attachment_id() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..12].to_string()
+}
+
+/// Resolves which staged images a draft still references, by marker text —
+/// never by position — so a placeholder edited out of the draft excludes
+/// only its own image.
+pub(super) fn images_for_draft(images: &[StagedImage], text: &str) -> Vec<messages::WireImage> {
+    let mut ordered: Vec<_> = images
+        .iter()
+        .filter_map(|image| text.find(&image.marker()).map(|position| (position, image)))
+        .collect();
+    ordered.sort_by_key(|(position, _)| *position);
+    ordered.into_iter().map(|(_, image)| image.to_wire()).collect()
 }
 
 impl App {
-    /// Stages encoded image bytes as an attachment and inserts the placeholder
-    /// token into the composer draft.
+    /// Stages encoded image bytes as an attachment and inserts its
+    /// placeholder token into the composer draft.
     ///
-    /// Returns the 1-based attachment label so the caller can use it in a
-    /// confirmation notice.  The same label appears in the `[Image N]` token
-    /// inserted at the current cursor position.
-    pub(in crate::app) fn stage_image_bytes(&mut self, media_type: &str, bytes: &[u8]) -> usize {
-        let label = self.staged_images.len() + 1;
-        self.staged_images.push(messages::WireImage {
+    /// Returns the token itself (not just a label), so a caller can quote the
+    /// exact text that now identifies this attachment in a confirmation
+    /// notice, without reconstructing it and risking it drift out of sync.
+    pub(in crate::app) fn stage_image_bytes(&mut self, media_type: &str, bytes: &[u8]) -> String {
+        let staged = StagedImage {
+            id: new_attachment_id(),
             media_type: media_type.to_string(),
             base64: base64_encode(bytes),
-        });
-        let token = format!("[Image {label}]");
+        };
+        let token = staged.marker();
+        self.staged_images.push(staged);
         if !self.composer.is_empty() {
             self.composer.insert(" ");
         }
         self.composer.insert(&token);
-        label
+        token
     }
 }
 
@@ -117,17 +192,133 @@ pub(in crate::app) fn base64_encode(data: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn staged(id: &str, media_type: &str, base64: &str) -> StagedImage {
+        StagedImage {
+            id: id.to_string(),
+            media_type: media_type.to_string(),
+            base64: base64.to_string(),
+        }
+    }
+
+    // -- Marker format --------------------------------------------------
+
+    #[test]
+    fn the_marker_uses_the_camera_glyph_a_stable_id_and_an_honest_extension() {
+        let image = staged("a1b2c3d4e5f6", "image/jpeg", "payload");
+        assert_eq!(
+            image.marker(),
+            format!("[{} coda-image-a1b2c3d4e5f6.jpg]", glyphs::CAMERA)
+        );
+    }
+
+    #[test]
+    fn every_supported_media_type_gets_its_own_honest_extension() {
+        assert_eq!(extension_for_media_type("image/png"), "png");
+        assert_eq!(extension_for_media_type("image/jpeg"), "jpg");
+        assert_eq!(extension_for_media_type("image/gif"), "gif");
+        assert_eq!(extension_for_media_type("image/webp"), "webp");
+    }
+
+    #[test]
+    fn a_png_clipboard_screenshot_is_never_labelled_as_a_different_format() {
+        let clipboard = staged("id1", "image/png", "png-bytes");
+        assert!(clipboard.marker().ends_with(".png]"), "{}", clipboard.marker());
+    }
+
+    #[test]
+    fn a_non_png_file_keeps_its_own_extension_not_a_relabelled_png() {
+        let jpeg = staged("id2", "image/jpeg", "jpeg-bytes");
+        assert!(jpeg.marker().ends_with(".jpg]"), "{}", jpeg.marker());
+        assert!(!jpeg.marker().contains(".png"), "a JPEG must never be relabelled as a PNG");
+    }
+
+    #[test]
+    fn an_unrecognised_media_type_never_lies_that_it_is_a_png() {
+        assert_ne!(extension_for_media_type("image/bmp"), "png");
+    }
+
+    // -- Stable, distinct ids --------------------------------------------
+
+    #[test]
+    fn two_staged_attachments_get_two_distinct_stable_ids() {
+        let a = new_attachment_id();
+        let b = new_attachment_id();
+        assert_ne!(a, b, "each staged attachment needs its own unique id");
+        assert_eq!(a.len(), 12);
+        assert_eq!(b.len(), 12);
+    }
+
+    #[test]
+    fn an_images_id_never_changes_across_repeated_marker_calls() {
+        let image = staged("stable-id", "image/png", "payload");
+        assert_eq!(image.marker(), image.marker(), "the marker must be stable, not regenerated");
+    }
+
+    // -- Identity by marker, not by position ------------------------------
+
+    #[test]
+    fn reordered_markers_preserve_image_associations_after_deletion() {
+        let images = vec![
+            staged("id-first", "image/png", "first-payload"),
+            staged("id-second", "image/jpeg", "second-payload"),
+            staged("id-third", "image/gif", "third-payload"),
+        ];
+        // The middle placeholder was edited out of the draft, and the
+        // surviving two are quoted out of order. An index-based scheme would
+        // misattribute at least one of these; marker-based lookup cannot.
+        let draft = format!(
+            "here is the third one {} then the first one {}",
+            images[2].marker(),
+            images[0].marker()
+        );
+        let outgoing = images_for_draft(&images, &draft);
+        let payloads: Vec<&str> = outgoing.iter().map(|w| w.base64.as_str()).collect();
+        // WireImage has no filename: its order must match the visible labels.
+        assert_eq!(payloads, vec!["third-payload", "first-payload"]);
+        assert_eq!(images.len(), 3, "the original staging list must be untouched");
+    }
+
+    #[test]
+    fn repeated_markers_preserve_one_attachment_per_image() {
+        let images = vec![staged("id-1", "image/png", "payload")];
+        let marker = images[0].marker();
+        let outgoing = images_for_draft(&images, &format!("{marker} and again {marker}"));
+        assert_eq!(outgoing.len(), 1);
+        assert_eq!(outgoing[0].base64, "payload");
+    }
+
     #[test]
     fn deleting_a_placeholder_excludes_its_image_without_consuming_the_draft() {
-        let staged = vec![
-            messages::WireImage { media_type: "image/png".into(), base64: "first".into() },
-            messages::WireImage { media_type: "image/png".into(), base64: "second".into() },
+        let images = vec![
+            staged("id-1", "image/png", "first"),
+            staged("id-2", "image/png", "second"),
         ];
-        let outgoing = images_for_draft(&staged, "Explain [Image 2]");
+        let outgoing = images_for_draft(&images, &format!("Explain {}", images[1].marker()));
         assert_eq!(outgoing.len(), 1);
         assert_eq!(outgoing[0].base64, "second");
-        assert_eq!(staged.len(), 2, "failed sends must leave the original staging intact");
-        assert!(images_for_draft(&staged, "").is_empty());
+        assert_eq!(images.len(), 2, "failed sends must leave the original staging intact");
+        assert!(images_for_draft(&images, "").is_empty());
+    }
+
+    // -- Failed-send retry -------------------------------------------------
+
+    #[test]
+    fn a_failed_send_can_retry_because_the_marker_and_payload_are_preserved() {
+        let images = vec![staged("id-1", "image/png", "payload-1")];
+        let draft = format!("send this {}", images[0].marker());
+
+        // First attempt "fails" (the caller restores the draft verbatim and
+        // never touches staging on failure — see `App::submit`).
+        let first_attempt = images_for_draft(&images, &draft);
+        assert_eq!(first_attempt.len(), 1);
+        assert_eq!(first_attempt[0].base64, "payload-1");
+
+        // Retried with the exact same draft text: the same marker must still
+        // resolve to the very same staged image.
+        let retry = images_for_draft(&images, &draft);
+        assert_eq!(retry.len(), 1);
+        assert_eq!(retry[0].base64, "payload-1");
+        assert_eq!(retry[0].media_type, "image/png");
     }
 
     // ── PNG encoding ────────────────────────────────────────────────────────

@@ -66,6 +66,33 @@ pub enum PermissionDecision {
     Denied,
 }
 
+/// How the flattened row list groups a conversation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TranscriptStyle {
+    /// One block after another, separated by a blank row. The original,
+    /// unchanged behaviour — kept so existing plain-mode tests and helpers
+    /// still describe exactly what they always described.
+    #[default]
+    Plain,
+    /// Groups one delivered user message and everything that follows — the
+    /// reply, its tools, its reasoning, any notices — until the next
+    /// delivered user message, into a visually bordered card.
+    ///
+    /// Presentation only: the underlying `Vec<Block>` and provider history
+    /// are unchanged: cards are chrome rows inserted around the same blocks
+    /// `Plain` would have drawn, computed in the same single pass.
+    Cards,
+}
+
+/// A full-width horizontal rule marking a card boundary.
+///
+/// Wholly decorative (`is_chrome`): it must never enter a copy, and a click
+/// on it must never resolve to a fold, no matter what the block-start
+/// arithmetic around it happens to look like.
+fn card_rule(width: usize) -> RenderLine {
+    RenderLine::new(glyphs::RULE.repeat(width.max(1)), Role::Notification).as_chrome()
+}
+
 /// One logical unit of the transcript.
 #[derive(Debug, Clone)]
 pub enum Block {
@@ -92,6 +119,12 @@ pub enum Block {
         tokens: Option<i32>,
         complete: bool,
         expanded: bool,
+        /// Local `HH:mm` the reasoning finished, frozen once set.
+        ///
+        /// `None` until `ThinkingComplete` arrives, and never recomputed
+        /// after: a duplicate or late completion event must not change what
+        /// is already shown as done.
+        done_at: Option<String>,
     },
     /// A batch of tool calls made in one agent step.
     ///
@@ -164,12 +197,14 @@ impl Block {
                 tokens,
                 complete,
                 expanded,
+                done_at,
             } => render_thinking(
                 text,
                 *elapsed_ms,
                 *tokens,
                 *complete,
                 *expanded,
+                done_at.as_deref(),
                 width,
                 mode,
             ),
@@ -316,12 +351,22 @@ fn render_assistant(text: &str, complete: bool, width: usize) -> Vec<RenderLine>
         .collect()
 }
 
+/// Formats a whole number of seconds as `Ns` under a minute, else `M:SS`.
+pub(crate) fn format_duration(seconds: i64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else {
+        format!("{}:{:02}", seconds / 60, seconds % 60)
+    }
+}
+
 fn render_thinking(
     body: &str,
     elapsed_ms: i64,
     tokens: Option<i32>,
     complete: bool,
     expanded: bool,
+    done_at: Option<&str>,
     width: usize,
     mode: ToolDisplayMode,
 ) -> Vec<RenderLine> {
@@ -355,17 +400,20 @@ fn render_thinking(
         // A duration of zero means the clock never started, not that no time
         // passed: it only runs from the first delta, and encrypted reasoning
         // produces none. Claiming "0s" would be inventing a measurement.
+        //
+        // The local "done" time is appended only when known — never invented
+        // — and is frozen at whatever `ThinkingComplete` reported, so a late
+        // or duplicate completion event cannot make it jump.
+        let suffix = done_at
+            .map(|at| format!(" · done {at}"))
+            .unwrap_or_default();
         match seconds {
-            0 => format!("{fold} Thought"),
-            seconds => format!("{fold} Thought for {seconds}s"),
+            0 => format!("{fold} Thought{suffix}"),
+            seconds => format!("{fold} Thought for {}{suffix}", format_duration(seconds)),
         }
     } else {
         let seconds = elapsed_ms.max(0) / 1000;
-        let duration = if seconds < 60 {
-            format!("{seconds}s")
-        } else {
-            format!("{}:{:02}", seconds / 60, seconds % 60)
-        };
+        let duration = format_duration(seconds);
         match tokens {
             Some(tokens) => format!("{fold} Thinking... {duration} · {tokens} tok"),
             None => format!("{fold} Thinking... {duration}"),
@@ -602,16 +650,7 @@ impl Transcript {
 
     /// Renders every block to rows, inserting a blank separator between them.
     pub fn render(&self, width: usize, mode: ToolDisplayMode) -> Vec<RenderLine> {
-        let mut out = Vec::new();
-        for block in &self.blocks {
-            let rows = block.render(width, mode);
-            if rows.is_empty() {
-                continue;
-            }
-            out.extend(rows);
-            out.push(RenderLine::separator());
-        }
-        out
+        self.render_pass(width, mode, TranscriptStyle::Plain).0
     }
 
     /// Renders all blocks and returns both the flat row list and a per-block
@@ -630,9 +669,54 @@ impl Transcript {
         width: usize,
         mode: ToolDisplayMode,
     ) -> (Vec<RenderLine>, Vec<usize>) {
+        self.render_pass(width, mode, TranscriptStyle::Plain)
+    }
+
+    /// Same as [`Transcript::render_with_block_starts`], but with an explicit
+    /// presentation [`TranscriptStyle`].
+    ///
+    /// One shared pass backs every style: `Cards` differs only in the chrome
+    /// rows it inserts around a card's boundary, never in how a block itself
+    /// is laid out or where its content genuinely starts — so a click, a
+    /// fold, or a copy behaves exactly the same inside a card as outside one.
+    pub fn render_with_block_starts_styled(
+        &self,
+        width: usize,
+        mode: ToolDisplayMode,
+        style: TranscriptStyle,
+    ) -> (Vec<RenderLine>, Vec<usize>) {
+        self.render_pass(width, mode, style)
+    }
+
+    fn render_pass(
+        &self,
+        width: usize,
+        mode: ToolDisplayMode,
+        style: TranscriptStyle,
+    ) -> (Vec<RenderLine>, Vec<usize>) {
         let mut rows: Vec<RenderLine> = Vec::new();
         let mut starts: Vec<usize> = Vec::with_capacity(self.blocks.len() + 1);
+        // Whether a card is currently open, so the transcript's very last
+        // card can be closed with a border after the loop rather than only
+        // between two cards.
+        let mut card_open = false;
+
         for block in &self.blocks {
+            // A card starts at each delivered user message (every `User`
+            // block is delivered: a pending one is never pushed here at all,
+            // see `UiState`). One rule row serves as both the previous
+            // card's closing border and this one's opening border, so cards
+            // read as divided rows rather than accumulating blank chrome.
+            // Banners, session boundaries and anything before the first user
+            // message are drawn plainly, never inside a card.
+            if style == TranscriptStyle::Cards && matches!(block, Block::User { .. }) {
+                rows.push(card_rule(width));
+                card_open = true;
+            }
+
+            // Recorded *after* any chrome for this block, so it always
+            // points at the block's true first content row — never at a
+            // border pushed in front of it.
             starts.push(rows.len());
             let block_rows = block.render(width, mode);
             if !block_rows.is_empty() {
@@ -640,6 +724,11 @@ impl Transcript {
                 rows.push(RenderLine::separator());
             }
         }
+
+        if style == TranscriptStyle::Cards && card_open {
+            rows.push(card_rule(width));
+        }
+
         starts.push(rows.len()); // sentinel
         (rows, starts)
     }
@@ -762,6 +851,7 @@ mod tests {
                 tokens: Some(120),
                 complete: false,
                 expanded: false,
+                done_at: None,
             }
             .render(80, ToolDisplayMode::Summary),
         );
@@ -792,6 +882,7 @@ mod tests {
                     tokens: None,
                     complete: false,
                     expanded,
+                    done_at: None,
                 }
                 .render(80, ToolDisplayMode::Summary);
                 assert!(rows[0].text.ends_with(&format!("Thinking... {expected}")), "{rows:?}");
@@ -807,6 +898,7 @@ mod tests {
             tokens: None,
             complete: true,
             expanded,
+            done_at: None,
         };
 
         let collapsed = texts(&block(false).render(80, ToolDisplayMode::Summary));
@@ -832,6 +924,7 @@ mod tests {
                 tokens: None,
                 complete: true,
                 expanded: true,
+                done_at: None,
             }
             .render(80, ToolDisplayMode::Summary),
         );
@@ -850,6 +943,7 @@ mod tests {
             tokens: None,
             complete: true,
             expanded: true,
+            done_at: None,
         }
         .render(80, ToolDisplayMode::Hidden);
         assert!(rows.is_empty(), "{rows:?}");
@@ -863,9 +957,59 @@ mod tests {
             tokens: None,
             complete: true,
             expanded: false,
+            done_at: None,
         }
         .render(80, ToolDisplayMode::Summary);
         assert!(rows[0].text.contains("Thought for 5s"));
+    }
+
+    #[test]
+    fn finished_thinking_appends_the_frozen_done_time_when_known() {
+        let rows = Block::Thinking {
+            text: String::new(),
+            elapsed_ms: 4500,
+            tokens: None,
+            complete: true,
+            expanded: false,
+            done_at: Some("09:41".to_string()),
+        }
+        .render(80, ToolDisplayMode::Summary);
+        assert!(
+            rows[0].text.contains("Thought for 5s · done 09:41"),
+            "{:?}",
+            rows[0].text
+        );
+    }
+
+    #[test]
+    fn finished_thinking_omits_the_done_time_when_it_is_unknown() {
+        let rows = Block::Thinking {
+            text: String::new(),
+            elapsed_ms: 4500,
+            tokens: None,
+            complete: true,
+            expanded: false,
+            done_at: None,
+        }
+        .render(80, ToolDisplayMode::Summary);
+        assert!(!rows[0].text.contains("done"), "{:?}", rows[0].text);
+    }
+
+    #[test]
+    fn a_zero_duration_thought_can_still_show_a_known_done_time() {
+        // Zero elapsed means the clock never started (encrypted reasoning),
+        // not that no time passed — but the local done time is independent
+        // of that measurement and can still be known.
+        let rows = Block::Thinking {
+            text: String::new(),
+            elapsed_ms: 0,
+            tokens: None,
+            complete: true,
+            expanded: false,
+            done_at: Some("09:41".to_string()),
+        }
+        .render(80, ToolDisplayMode::Summary);
+        assert!(rows[0].text.contains("Thought · done 09:41"), "{:?}", rows[0].text);
     }
 
     #[test]
@@ -877,6 +1021,7 @@ mod tests {
                 tokens: None,
                 complete: true,
                 expanded: false,
+                done_at: None,
             }
             .render(80, ToolDisplayMode::Full),
         );
@@ -894,6 +1039,7 @@ mod tests {
                     tokens: None,
                     complete: true,
                     expanded: false,
+                    done_at: None,
                 }
                 .render(80, mode),
             );
@@ -913,6 +1059,7 @@ mod tests {
             tokens: None,
             complete: true,
             expanded: true,
+            done_at: None,
         }
         .render(24, ToolDisplayMode::Summary);
 
@@ -932,6 +1079,7 @@ mod tests {
                 tokens: None,
                 complete: true,
                 expanded: true,
+                done_at: None,
             }
             .render(width, ToolDisplayMode::Summary);
 
@@ -1112,6 +1260,7 @@ mod tests {
             tokens: Some(40),
             complete: true,
             expanded: false,
+            done_at: None,
         });
         transcript.push(Block::Tools {
             activity: ToolActivity {
@@ -1253,6 +1402,7 @@ mod tests {
                 tokens: None,
                 complete: true,
                 expanded: false,
+                done_at: None,
             }
             .render(80, ToolDisplayMode::Summary),
         );
@@ -1278,6 +1428,7 @@ mod tests {
             tokens: None,
             complete: true,
             expanded: false,
+            done_at: None,
         });
         assert!(!transcript.is_foldable(0));
 
@@ -1287,7 +1438,165 @@ mod tests {
             tokens: None,
             complete: true,
             expanded: false,
+            done_at: None,
         });
         assert!(transcript.is_foldable(1));
+    }
+
+    // -- Cards presentation (C) ----------------------------------------------
+
+    fn user_block(text: &str) -> Block {
+        Block::User {
+            text: text.to_string(),
+            timestamp: String::new(),
+            pending: false,
+            queue_id: None,
+        }
+    }
+
+    fn assistant_block(text: &str) -> Block {
+        Block::Assistant { text: text.to_string(), complete: true }
+    }
+
+    #[test]
+    fn plain_style_is_unchanged_by_the_shared_pass() {
+        // Regression guard: the refactor into one shared pass must not
+        // change a single row Plain already produced.
+        let mut transcript = Transcript::new();
+        transcript.push(user_block("hello"));
+        transcript.push(assistant_block("hi there"));
+
+        let via_render = transcript.render(80, ToolDisplayMode::Summary);
+        let (via_starts, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        let (via_styled, starts_styled) = transcript.render_with_block_starts_styled(
+            80,
+            ToolDisplayMode::Summary,
+            TranscriptStyle::Plain,
+        );
+
+        assert_eq!(via_render, via_starts);
+        assert_eq!(via_starts, via_styled);
+        assert_eq!(starts, starts_styled);
+        assert!(via_render.iter().all(|r| !r.is_chrome), "Plain must insert no chrome at all");
+    }
+
+    #[test]
+    fn cards_style_opens_a_border_at_each_delivered_user_message() {
+        let mut transcript = Transcript::new();
+        transcript.push(user_block("first"));
+        transcript.push(assistant_block("reply one"));
+        transcript.push(user_block("second"));
+        transcript.push(assistant_block("reply two"));
+
+        let (rows, _) =
+            transcript.render_with_block_starts_styled(80, ToolDisplayMode::Summary, TranscriptStyle::Cards);
+
+        let chrome_count = rows.iter().filter(|r| r.is_chrome).count();
+        // One opening border per card (2 user messages) plus one closing
+        // border after the whole transcript's last card.
+        assert_eq!(chrome_count, 3, "{rows:?}");
+    }
+
+    #[test]
+    fn cards_style_keeps_banners_and_pre_first_user_content_outside_any_card() {
+        let mut transcript = Transcript::new();
+        transcript.push(Block::Banner { wordmark: vec!["CODA".into()], details: vec!["v0".into()] });
+        transcript.push(Block::Notice { text: "connected".into(), level: NoticeLevel::Info });
+        transcript.push(user_block("hello"));
+
+        let (rows, starts) =
+            transcript.render_with_block_starts_styled(80, ToolDisplayMode::Summary, TranscriptStyle::Cards);
+
+        // No chrome before the single border that opens the first card.
+        let user_start = starts[2];
+        assert!(
+            rows[..user_start - 1].iter().all(|r| !r.is_chrome),
+            "a border must not appear before the first delivered user message: {rows:?}"
+        );
+        assert!(
+            rows[user_start - 1].is_chrome,
+            "expected exactly one border directly before the user message: {rows:?}"
+        );
+        // Exactly one border: opening the one card, plus its closing one.
+        assert_eq!(rows.iter().filter(|r| r.is_chrome).count(), 2);
+    }
+
+    #[test]
+    fn cards_style_block_starts_point_at_true_content_not_at_a_border() {
+        let mut transcript = Transcript::new();
+        transcript.push(user_block("hello"));
+        transcript.push(assistant_block("hi"));
+
+        let (rows, starts) =
+            transcript.render_with_block_starts_styled(80, ToolDisplayMode::Summary, TranscriptStyle::Cards);
+
+        for (i, &start) in starts.iter().enumerate().take(transcript.len()) {
+            if let Some(row) = rows.get(start) {
+                assert!(
+                    !row.is_chrome,
+                    "block {i}'s recorded start ({start}) points at a chrome row: {rows:?}"
+                );
+            }
+        }
+        // The very first row is the card's border, not the user block's own
+        // content — its start must be the row right after it.
+        assert!(rows[0].is_chrome);
+        assert_eq!(starts[0], 1);
+    }
+
+    #[test]
+    fn cards_style_reasoning_folds_still_work_exactly_as_in_plain_style() {
+        // No whole-card collapse is required, and existing per-block folds
+        // must be untouched: only chrome is added around blocks, nothing
+        // about a block's own rows or fold state changes.
+        let mut transcript = Transcript::new();
+        transcript.push(user_block("hello"));
+        transcript.push(Block::Thinking {
+            text: "some reasoning here".into(),
+            elapsed_ms: 1000,
+            tokens: None,
+            complete: true,
+            expanded: false,
+            done_at: None,
+        });
+        assert!(transcript.is_foldable(1));
+        transcript.toggle_fold(1);
+        assert!(matches!(transcript.blocks()[1], Block::Thinking { expanded: true, .. }));
+
+        let (rows, _) =
+            transcript.render_with_block_starts_styled(80, ToolDisplayMode::Summary, TranscriptStyle::Cards);
+        assert!(rows.iter().any(|r| r.text.contains("some reasoning here")), "{rows:?}");
+    }
+
+    #[test]
+    fn cards_style_chrome_rows_are_excluded_from_a_full_copy_including_cjk_content() {
+        use crate::selection::copy_visible_text;
+
+        let mut transcript = Transcript::new();
+        transcript.push(user_block("こんにちは世界"));
+        transcript.push(assistant_block("plain reply"));
+
+        let (rows, _) =
+            transcript.render_with_block_starts_styled(80, ToolDisplayMode::Summary, TranscriptStyle::Cards);
+        let copied = copy_visible_text(&rows, 0..rows.len());
+
+        assert!(!copied.contains(glyphs::RULE), "a card border leaked into the copy: {copied:?}");
+        assert!(copied.contains("こんにちは世界"), "{copied:?}");
+        assert!(copied.contains("plain reply"), "{copied:?}");
+    }
+
+    #[test]
+    fn a_card_border_spans_the_full_requested_width() {
+        for width in [1usize, 10, 40, 120] {
+            let mut transcript = Transcript::new();
+            transcript.push(user_block("hi"));
+            let (rows, _) = transcript.render_with_block_starts_styled(
+                width,
+                ToolDisplayMode::Summary,
+                TranscriptStyle::Cards,
+            );
+            let border = rows.iter().find(|r| r.is_chrome).expect("a border row");
+            assert_eq!(text::width(&border.text), width.max(1));
+        }
     }
 }

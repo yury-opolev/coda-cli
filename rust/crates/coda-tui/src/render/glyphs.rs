@@ -73,6 +73,12 @@ pub const RULE_VERTICAL: &str = "\u{2502}"; // │
 /// Full block, used by the scrollbar thumb.
 pub const BLOCK: &str = "\u{2588}"; // █
 
+// --- Attachments -----------------------------------------------------------
+
+/// Marks a staged image's placeholder token in the composer, e.g.
+/// `[📷 coda-image-a1b2c3d4.png]`.
+pub const CAMERA: &str = "\u{1F4F7}"; // 📷
+
 // --- Composites ----------------------------------------------------------
 //
 // Padded and bracketed forms. Assembled here rather than at the call site,

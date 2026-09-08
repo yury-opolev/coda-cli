@@ -612,8 +612,14 @@ protocol does not imply them, and getting them wrong is silently wrong:
 - Finalising a batch **resolves unfinished calls** (pending becomes skipped,
   running becomes cancelled), otherwise an interrupted turn shows tools
   apparently still running.
-- Queued messages still pending when a turn ends **never reached the model**
-  and are removed rather than left in the transcript.
+- Queued messages still in flight when a turn ends **never reached the
+  model**. They are never left as a bubble in the transcript; they move to a
+  recoverable list and a notice says how many, and `Up` on an empty composer
+  restores the most recent one without overwriting a draft or auto-sending it.
+- A steering message delivered while the reply is still streaming is
+  **deferred, not inserted immediately**: it appears only once that reply's
+  block actually closes, so a mid-stream delivery can never split one reply
+  into two.
 - Destructive keys are **two-press chords**. `Ctrl+L` is a repaint, not a
   clear; `Ctrl+D` is deliberately unbound.
 - Assistant text arrives **only as coalesced deltas**; there is no full-text
@@ -621,6 +627,12 @@ protocol does not imply them, and getting them wrong is silently wrong:
 - Thinking blocks without signatures are **dropped, not serialised**. Sending
   them back earns a provider 400, and once one is in the history every later
   turn fails too.
+- The pinned activity row above the composer and the status bar's activity
+  label **share one spinner**, never two: the row owns it, the status bar
+  never animates its own.
+- The header's session id is **its own selection target**, not part of the
+  transcript. Selecting it and copying always copies the full id, even when
+  the header clips its on-screen display.
 
 ### Security invariants
 
