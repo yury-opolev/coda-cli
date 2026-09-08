@@ -1277,7 +1277,7 @@ impl ServeHost {
         } else {
             *busy = true;
             drop(busy);
-            Some(TurnGuard { flag: &self.turn_active })
+            Some(TurnGuard { flag: &self.turn_active, steering: &self.session.steering })
         }
     }
 }
@@ -1285,10 +1285,12 @@ impl ServeHost {
 /// Releases the turn slot when dropped, including on cancellation or panic.
 struct TurnGuard<'a> {
     flag: &'a std::sync::Mutex<bool>,
+    steering: &'a coda_agent::SteeringInbox,
 }
 
 impl Drop for TurnGuard<'_> {
     fn drop(&mut self) {
+        self.steering.close_for_turn();
         // A poisoned lock still has to release the slot, otherwise one panic
         // would wedge the session permanently.
         match self.flag.lock() {
@@ -1501,18 +1503,17 @@ impl ServeBackend for ServeHost {
     }
 
     async fn session_recall_steering(&self) -> Result<Value, RpcError> {
-        let messages: Vec<RecalledMessage> = self
-            .session
-            .steering_log
-            .lock()
-            .expect("log poisoned")
-            .iter()
-            .map(|e| RecalledMessage {
-                id: e.id.clone(),
-                text: e.text.clone(),
-                enqueued_at: Some(e.enqueued_at.clone()),
+        let recalled = self.session.steering.recall_all();
+        let mut log = self.session.steering_log.lock().expect("log poisoned");
+        let messages: Vec<RecalledMessage> = recalled.iter()
+            .map(|entry| RecalledMessage {
+                id: entry.id.clone(),
+                text: entry.text.clone(),
+                enqueued_at: log.iter().find(|record| record.id == entry.id)
+                    .map(|record| record.enqueued_at.clone()),
             })
             .collect();
+        log.retain(|record| !recalled.iter().any(|entry| entry.id == record.id));
         Ok(json!({ "messages": messages }))
     }
 
@@ -2301,6 +2302,9 @@ impl ServeHost {
             Some(ctx) => coda_diagnostics::scope(ctx.clone(), run_fut).await,
             None => run_fut.await,
         };
+        // Seal before announcing completion, closing the enqueue race even
+        // while history persistence and final notifications are still running.
+        self.session.steering.close_for_turn();
         let stop_reason = turn_sink.take_stop_reason();
 
         // Clear cancel token.
@@ -3377,6 +3381,81 @@ mod tests {
         )];
         let p = project_history(&msgs);
         assert_eq!(p[0].content, "done");
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_cannot_deliver_stranded_steering_on_the_next_turn() {
+        struct InterruptedClient {
+            started: tokio::sync::Notify,
+            calls: std::sync::atomic::AtomicUsize,
+            requests: Mutex<Vec<coda_llm::ChatRequest>>,
+            held_stream: Mutex<Option<mpsc::Sender<Result<coda_llm::anthropic::StreamEvent, coda_llm::LlmError>>>>,
+        }
+        #[async_trait]
+        impl LlmClient for InterruptedClient {
+            fn provider_id(&self) -> &str { "scripted" }
+            async fn stream(&self, request: coda_llm::ChatRequest) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                self.requests.lock().unwrap().push(request.clone());
+                if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                    let (tx, rx) = mpsc::channel(1);
+                    *self.held_stream.lock().unwrap() = Some(tx);
+                    self.started.notify_one();
+                    return Ok(coda_llm::ResponseStream::new(rx));
+                }
+                ScriptedClient::new(vec![file_test_done()]).stream(request).await
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let client = Arc::new(InterruptedClient {
+            started: tokio::sync::Notify::new(),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            requests: Mutex::new(Vec::new()),
+            held_stream: Mutex::new(None),
+        });
+        let host = make_host_in_dir(dir.path().to_str().unwrap(), client.clone());
+        let first = {
+            let host = host.clone();
+            tokio::spawn(async move {
+                host.session_prompt(PromptParams { text: Some("first turn".into()), images: None }).await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), client.started.notified()).await.unwrap();
+        assert_eq!(host.session_steer(SteerParams { text: "stranded-original".into() }).await.unwrap()["ok"], true);
+        host.session_interrupt().await.unwrap();
+        let result = tokio::time::timeout(Duration::from_secs(2), first).await.unwrap().unwrap().unwrap();
+        assert_eq!(result["interrupted"], true);
+        assert!(!host.session.steering.has_pending(), "stranded messages must not auto-deliver later");
+        assert!(host.session.steering.enqueue("late old-turn input").is_none(), "turn end must seal, not reopen, the inbox");
+        host.session_prompt(PromptParams { text: Some("edited replacement".into()), images: None }).await.unwrap();
+        let requests = client.requests.lock().unwrap();
+        assert!(!requests.last().unwrap().messages.iter().any(|message| message.text().contains("stranded-original")));
+    }
+
+    #[tokio::test]
+    async fn pending_steering_is_withdrawn_when_the_turn_guard_exits_early() {
+        let host = make_host();
+        let turn = host.try_claim_turn().unwrap();
+        assert_eq!(host.session_steer(SteerParams { text: "not delivered".into() }).await.unwrap()["ok"], true);
+        drop(turn);
+        assert!(!host.session.steering.has_pending());
+        assert!(host.session.steering.enqueue("late").is_none());
+    }
+
+    #[tokio::test]
+    async fn pending_recall_withdraws_only_undelivered_messages() {
+        let host = make_host();
+        let _turn = host.try_claim_turn().unwrap();
+        let delivered = host.session_steer(SteerParams { text: "already delivered".into() }).await.unwrap();
+        let taken = host.session.steering.take_all_for_delivery();
+        assert_eq!(taken[0].id, delivered["messageId"]);
+        let pending = host.session_steer(SteerParams { text: "edit me".into() }).await.unwrap();
+        let recalled = host.session_recall_steering().await.unwrap();
+        assert_eq!(recalled["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(recalled["messages"][0]["id"], pending["messageId"]);
+        assert_eq!(recalled["messages"][0]["text"], "edit me");
+        assert!(!host.session.steering.has_pending(), "recalled text must no longer be deliverable");
+        assert!(host.session_recall_steering().await.unwrap()["messages"].as_array().unwrap().is_empty());
+        assert!(host.session.steering.take_all_for_delivery().is_empty());
     }
 
     #[tokio::test]

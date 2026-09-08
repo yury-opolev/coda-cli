@@ -612,10 +612,17 @@ protocol does not imply them, and getting them wrong is silently wrong:
 - Finalising a batch **resolves unfinished calls** (pending becomes skipped,
   running becomes cancelled), otherwise an interrupted turn shows tools
   apparently still running.
+- Pending message text is shown in a bounded `[pending]` preview area above
+  the composer, separate from streaming replies and the pinned activity row.
+  **Up on an empty composer** atomically reclaims all still-pending messages
+  from the engine for editing. Already-delivered messages cannot be reclaimed;
+  recovered drafts are never submitted automatically.
 - Queued messages still in flight when a turn ends **never reached the
   model**. They are never left as a bubble in the transcript; they move to a
   recoverable list and a notice says how many, and `Up` on an empty composer
   restores the most recent one without overwriting a draft or auto-sending it.
+  The engine seals and clears undelivered entries at turn end, including
+  interruption, so they cannot silently reappear in a later turn.
 - A steering message delivered while the reply is still streaming is
   **deferred, not inserted immediately**: it appears only once that reply's
   block actually closes, so a mid-stream delivery can never split one reply

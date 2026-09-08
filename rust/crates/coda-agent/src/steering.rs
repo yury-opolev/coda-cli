@@ -64,6 +64,20 @@ impl SteeringInbox {
         self.take_all()
     }
 
+    /// Withdraws only entries not already claimed for delivery, atomically
+    /// against the delivery path. Recalling never reopens a sealed inbox.
+    pub fn recall_all(&self) -> Vec<SteeringEntry> {
+        self.take_all()
+    }
+
+    /// Ends a turn without allowing undelivered entries to leak into the next
+    /// one. The UI retains their text for explicit recovery, not auto-delivery.
+    pub fn close_for_turn(&self) {
+        let mut inner = self.gate.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.pending.clear();
+        inner.sealed_empty = true;
+    }
+
     /// Reopen the queue for a newly-started turn without discarding any
     /// already-queued entries.
     pub fn open_for_turn(&self) {
@@ -110,6 +124,53 @@ impl Default for SteeringInbox {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn close_for_turn_discards_old_entries_and_requires_explicit_reopen() {
+        let inbox = SteeringInbox::new();
+        inbox.enqueue("old").unwrap();
+        inbox.close_for_turn();
+        assert!(!inbox.has_pending());
+        assert!(inbox.enqueue("late").is_none());
+        assert!(inbox.recall_all().is_empty());
+        inbox.open_for_turn();
+        inbox.enqueue("new").unwrap();
+        let delivered = inbox.take_all_for_delivery();
+        assert_eq!(delivered.len(), 1);
+        assert_eq!(delivered[0].text, "new");
+    }
+
+    #[test]
+    fn recall_and_delivery_have_exactly_one_winner() {
+        for _ in 0..32 {
+            let inbox = Arc::new(SteeringInbox::new());
+            let expected = inbox.enqueue("edit or deliver once").unwrap().id;
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let delivery = {
+                let inbox = Arc::clone(&inbox);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    inbox.take_all_for_delivery()
+                })
+            };
+            barrier.wait();
+            let mut entries = inbox.recall_all();
+            entries.extend(delivery.join().unwrap());
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, expected);
+            assert!(!inbox.has_pending());
+            assert!(inbox.recall_all().is_empty());
+        }
+    }
+
+    #[test]
+    fn recall_does_not_reopen_a_sealed_inbox() {
+        let inbox = SteeringInbox::new();
+        assert!(inbox.try_seal_empty());
+        assert!(inbox.recall_all().is_empty());
+        assert!(inbox.enqueue("must not enqueue").is_none());
+    }
 
     #[test]
     fn new_inbox_has_no_pending_entries() {

@@ -40,6 +40,8 @@ pub struct Regions {
     pub scrollbar: Option<Rect>,
     /// One line for transient status, above the composer.
     pub hint: Option<Rect>,
+    /// Bounded previews of pending/recoverable input, never transcript rows.
+    pub pending: Option<Rect>,
     /// One line, directly above the composer, showing what a running turn
     /// is doing right now.
     ///
@@ -66,9 +68,21 @@ const MIN_ROWS_FOR_CHROME: u16 = 12;
 /// `MIN_ROWS_FOR_CHROME` so live progress still shows on a terminal too short
 /// for the decorative header and hint rows.
 pub fn layout(area: Rect, composer_lines: usize, scrollable: bool, busy: bool) -> Regions {
+    layout_with_pending(area, composer_lines, scrollable, busy, 0)
+}
+
+pub fn layout_with_pending(
+    area: Rect, composer_lines: usize, scrollable: bool, busy: bool, pending_count: usize,
+) -> Regions {
     let chrome = area.height >= MIN_ROWS_FOR_CHROME;
     // The header and hint rows, when present.
-    let extra = if chrome { 2 } else { 0 } + if busy { 1 } else { 0 };
+    let chrome_rows = if chrome { 2 } else { 0 } + if busy { 1 } else { 0 };
+    let pending_rows = if pending_count == 0 {
+        0
+    } else {
+        pending_count.saturating_add(1).min(4) as u16
+    }.min(area.height.saturating_sub(COMPOSER_MIN_ROWS + 5 + chrome_rows));
+    let extra = chrome_rows + pending_rows;
 
     let composer_rows = (composer_lines as u16)
         .clamp(COMPOSER_MIN_ROWS, COMPOSER_MAX_ROWS)
@@ -87,6 +101,9 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool, busy: bool) -
         constraints.push(Constraint::Length(1));
     }
     constraints.push(Constraint::Min(1));
+    if pending_rows > 0 {
+        constraints.push(Constraint::Length(pending_rows));
+    }
     if busy {
         constraints.push(Constraint::Length(1));
     }
@@ -110,6 +127,7 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool, busy: bool) -
     };
     let header = chrome.then(&mut take);
     let transcript_area = take();
+    let pending = (pending_rows > 0).then(&mut take);
     let activity = busy.then(&mut take);
     let hint = chrome.then(&mut take);
     let composer = take();
@@ -130,6 +148,7 @@ pub fn layout(area: Rect, composer_lines: usize, scrollable: bool, busy: bool) -
         transcript,
         scrollbar,
         hint,
+        pending,
         activity,
         composer,
         status,
@@ -271,7 +290,10 @@ pub fn draw_with_pin(
         area,
     );
 
-    let regions = layout(area, composer.line_count(), viewport.is_scrollable(), state.is_busy());
+    let regions = layout_with_pending(
+        area, composer.line_count(), viewport.is_scrollable(), state.is_busy(),
+        state.queued.len() + state.unsent.len(),
+    );
 
     let content = draw_transcript_with_pin(
         frame,
@@ -287,6 +309,9 @@ pub fn draw_with_pin(
     }
     if let Some(scrollbar) = regions.scrollbar {
         draw_scrollbar(frame, scrollbar, viewport, theme);
+    }
+    if let Some(pending) = regions.pending {
+        draw_pending(frame, pending, state, theme);
     }
     if let Some(activity) = regions.activity {
         draw_activity(frame, activity, state, theme, now);
@@ -305,6 +330,34 @@ pub fn draw_with_pin(
     // order of these calls.
 
     content
+}
+
+fn draw_pending(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
+    let entries: Vec<_> = state.queued.iter().map(|message| ("pending", &message.text))
+        .chain(state.unsent.iter().map(|message| ("not sent", &message.text)))
+        .collect();
+    let preview_count = if area.height > 1 { area.height as usize - 1 } else { 1 };
+    let mut lines: Vec<_> = entries.iter().take(preview_count).map(|(status, message)| {
+        let preview = text::sanitize(message).split_whitespace().collect::<Vec<_>>().join(" ");
+        Line::from(Span::styled(
+            text::truncate_with_ellipsis(&format!("[{status}] {preview}"), area.width as usize),
+            theme.style(Role::PendingUser),
+        ))
+    }).collect();
+    if area.height > 1 {
+        let remaining = entries.len().saturating_sub(preview_count);
+        let mut hint = if state.queued.is_empty() {
+            "Up on empty input: recover unsent".to_owned()
+        } else {
+            "Up on empty input: reclaim pending".to_owned()
+        };
+        if remaining > 0 { hint = format!("+{remaining} more | {hint}"); }
+        lines.push(Line::from(Span::styled(
+            text::truncate_with_ellipsis(&hint, area.width as usize),
+            theme.style(Role::Notification),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 /// Abbreviates a token count so the status bar stays one line.
