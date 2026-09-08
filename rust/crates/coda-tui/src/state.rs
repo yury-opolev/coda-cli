@@ -160,6 +160,7 @@ pub enum UiEvent {
     /// rebuilt only on a width change — kept drawing the old shape, so a
     /// click did nothing at all once a turn had finished.
     ThinkingFoldToggled { block: usize },
+    ToolGroupFoldToggled { block: usize },
     /// The tool display mode changed.
     DisplayModeChanged(ToolDisplayMode),
     /// Activates assistant-text buffering for the current and future turns.
@@ -392,6 +393,7 @@ impl UiState {
                 self.unsent.retain(retained);
             }
             UiEvent::TurnFinished { interrupted, error } => {
+                self.transcript.end_tool_group();
                 self.close_open_and_flush();
                 self.transcript.finalize_activities(None);
                 self.strand_unsent_queue();
@@ -479,6 +481,9 @@ impl UiState {
             }
             UiEvent::ThinkingFoldToggled { block } => {
                 self.transcript.toggle_fold(block);
+            }
+            UiEvent::ToolGroupFoldToggled { block } => {
+                self.transcript.toggle_tool_group(block);
             }
             UiEvent::DisplayModeChanged(mode) => self.display_mode = mode,
             UiEvent::EnableAssistantBuffering => {
@@ -674,6 +679,7 @@ impl UiState {
                 root_turn_id,
                 ..
             } => {
+                self.transcript.end_tool_group();
                 self.close_open_and_flush();
                 self.transcript.finalize_activities(root_turn_id.as_deref());
                 self.strand_unsent_queue();

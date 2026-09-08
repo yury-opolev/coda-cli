@@ -193,6 +193,77 @@ pub struct ToolActivity {
     pub complete: bool,
 }
 
+/// Summary-only statistics, avoiding copies of potentially large tool results.
+#[derive(Debug, Default)]
+pub struct ToolSummary {
+    count: usize,
+    failed: usize,
+    cancelled: usize,
+    skipped: usize,
+    all_shell: bool,
+}
+
+impl ToolSummary {
+    pub fn from_calls<'a>(calls: impl IntoIterator<Item = &'a ToolCall>) -> Self {
+        let mut summary = Self { all_shell: true, ..Self::default() };
+        for call in calls {
+            summary.count += 1;
+            summary.all_shell &= call.name == "run_command";
+            summary.failed += usize::from(call.status == CallStatus::Failed);
+            summary.cancelled += usize::from(call.status == CallStatus::Cancelled);
+            summary.skipped += usize::from(call.status == CallStatus::Skipped);
+        }
+        summary.all_shell &= summary.count > 0;
+        summary
+    }
+
+    pub fn headline(&self) -> String {
+        let noun = match (self.all_shell, self.count) {
+            (true, 1) => "shell command",
+            (true, _) => "shell commands",
+            (false, 1) => "tool",
+            (false, _) => "tools",
+        };
+        let mut status = Vec::new();
+        if self.failed > 0 { status.push(format!("{} failed", self.failed)); }
+        if self.cancelled > 0 { status.push("cancelled".into()); }
+        if self.skipped > 0 { status.push(format!("{} skipped", self.skipped)); }
+        let suffix = if status.is_empty() { String::new() } else { format!(" - {}", status.join(", ")) };
+        format!("Ran {} {noun}{suffix}", self.count)
+    }
+
+    fn role(&self) -> Role {
+        if self.count > 0 && self.failed == self.count {
+            Role::Error
+        } else if self.failed > 0 {
+            Role::ToolPartialFailure
+        } else if self.cancelled > 0 || self.skipped > 0 {
+            Role::Warning
+        } else {
+            Role::ToolSuccess
+        }
+    }
+
+    pub fn render(&self, width: usize, fold: Option<&str>) -> Vec<RenderLine> {
+        let headline = self.headline();
+        let headline = match fold {
+            Some(fold) => format!("{fold} {headline}"),
+            None => headline,
+        };
+        text::wrap(&headline, width.saturating_sub(MARKER_CELLS).max(1))
+            .into_iter().enumerate().map(|(index, chunk)| {
+                let mut row = RenderLine::new(chunk, self.role())
+                    .with_gutter(if index == 0 { Gutter::AgentComplete } else { Gutter::Continuation });
+                if index == 0 {
+                    if let Some(fold) = fold {
+                        row = row.with_chrome_cells(text::width(fold) + 1);
+                    }
+                }
+                row
+            }).collect()
+    }
+}
+
 impl ToolActivity {
     pub fn running(&self) -> Vec<&ToolCall> {
         self.calls
@@ -229,31 +300,7 @@ impl ToolActivity {
 
     /// The rolled-up headline shown when the batch has finished.
     pub fn summary_headline(&self) -> String {
-        let count = self.calls.len();
-        let mut suffix = String::new();
-        let failed = self.failed();
-        let cancelled = self.cancelled();
-
-        if failed > 0 {
-            suffix.push_str(&format!(" - {failed} failed"));
-        }
-        if cancelled > 0 {
-            suffix.push_str(if failed > 0 { ", cancelled" } else { " - cancelled" });
-        }
-
-        format!("Ran {count} {}{suffix}", self.noun(count))
-    }
-
-    fn summary_role(&self) -> Role {
-        if self.failed() == self.calls.len() && !self.calls.is_empty() {
-            Role::Error
-        } else if self.failed() > 0 {
-            Role::ToolPartialFailure
-        } else if self.cancelled() > 0 {
-            Role::Warning
-        } else {
-            Role::ToolSuccess
-        }
+        ToolSummary::from_calls(&self.calls).headline()
     }
 
     /// Renders the batch according to `mode`.
@@ -272,18 +319,7 @@ impl ToolActivity {
         let child = width.saturating_sub(CHILD_CELLS).max(1);
 
         if self.complete {
-            let role = self.summary_role();
-            for (i, chunk) in text::wrap(&self.summary_headline(), content)
-                .into_iter()
-                .enumerate()
-            {
-                out.push(RenderLine::new(chunk, role).with_gutter(if i == 0 {
-                    Gutter::AgentComplete
-                } else {
-                    Gutter::Continuation
-                }));
-            }
-            return out;
+            return ToolSummary::from_calls(&self.calls).render(width, None);
         }
 
         let running = self.running();
@@ -436,6 +472,20 @@ fn push_child(out: &mut Vec<RenderLine>, text: &str, role: Role, width: usize, l
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn grouped_summary_with_fold_marker_fits_narrow_widths() {
+        let mut failed = ToolCall::new("read_file", "{}");
+        failed.status = CallStatus::Failed;
+        let mut skipped = ToolCall::new("edit", "{}");
+        skipped.status = CallStatus::Skipped;
+        let calls = [failed, skipped];
+        for width in [10, 20] {
+            let rows = ToolSummary::from_calls(&calls).render(width, Some("\u{276f}"));
+            assert!(!rows.is_empty());
+            assert!(rows.iter().all(|row| text::width(&row.text) <= width));
+        }
+    }
 
     fn call(name: &str, input: &str, status: CallStatus) -> ToolCall {
         ToolCall {

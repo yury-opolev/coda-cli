@@ -80,7 +80,7 @@ pub fn layout_with_pending(
     let pending_rows = if pending_count == 0 {
         0
     } else {
-        pending_count.saturating_add(1).min(4) as u16
+        (pending_count.min(3) + usize::from(pending_count > 3)) as u16
     }.min(area.height.saturating_sub(COMPOSER_MIN_ROWS + 5 + chrome_rows));
     let extra = chrome_rows + pending_rows;
 
@@ -336,7 +336,11 @@ fn draw_pending(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
     let entries: Vec<_> = state.queued.iter().map(|message| ("pending", &message.text))
         .chain(state.unsent.iter().map(|message| ("not sent", &message.text)))
         .collect();
-    let preview_count = if area.height > 1 { area.height as usize - 1 } else { 1 };
+    let preview_count = if entries.len() > area.height as usize && area.height > 1 {
+        area.height as usize - 1
+    } else {
+        area.height as usize
+    };
     let mut lines: Vec<_> = entries.iter().take(preview_count).map(|(status, message)| {
         let preview = text::sanitize(message).split_whitespace().collect::<Vec<_>>().join(" ");
         Line::from(Span::styled(
@@ -344,16 +348,10 @@ fn draw_pending(frame: &mut Frame, area: Rect, state: &UiState, theme: &Theme) {
             theme.style(Role::PendingUser),
         ))
     }).collect();
-    if area.height > 1 {
-        let remaining = entries.len().saturating_sub(preview_count);
-        let mut hint = if state.queued.is_empty() {
-            "Up on empty input: recover unsent".to_owned()
-        } else {
-            "Up on empty input: reclaim pending".to_owned()
-        };
-        if remaining > 0 { hint = format!("+{remaining} more | {hint}"); }
+    let remaining = entries.len().saturating_sub(preview_count);
+    if remaining > 0 && lines.len() < area.height as usize {
         lines.push(Line::from(Span::styled(
-            text::truncate_with_ellipsis(&hint, area.width as usize),
+            text::truncate_with_ellipsis(&format!("+{remaining} more"), area.width as usize),
             theme.style(Role::Notification),
         )));
     }

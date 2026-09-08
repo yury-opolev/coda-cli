@@ -7,7 +7,7 @@
 use coda_proto::Correlation;
 use coda_render::text;
 use coda_render::theme::Role;
-use coda_render::tool::{CallStatus, ToolActivity, ToolDisplayMode};
+use coda_render::tool::{CallStatus, ToolActivity, ToolDisplayMode, ToolSummary};
 use coda_render::{markdown, Gutter, RenderLine, MARKER_CELLS};
 
 use crate::render::glyphs;
@@ -500,6 +500,14 @@ fn render_permission(
 #[derive(Debug, Default)]
 pub struct Transcript {
     blocks: Vec<Block>,
+    expanded_tool_groups: std::collections::BTreeSet<usize>,
+    tool_group_boundaries: std::collections::BTreeSet<usize>,
+}
+
+fn completed_tools(block: &Block) -> bool {
+    matches!(block, Block::Tools { activity, .. }
+        if activity.complete && !activity.calls.is_empty()
+            && activity.calls.iter().all(|call| call.status.is_terminal()))
 }
 
 /// Resolves a batch's unfinished calls when it ends.
@@ -547,6 +555,8 @@ impl Transcript {
 
     pub fn clear(&mut self) {
         self.blocks.clear();
+        self.expanded_tool_groups.clear();
+        self.tool_group_boundaries.clear();
     }
 
     /// The trailing block if it is still open, so streamed content can be
@@ -593,8 +603,29 @@ impl Transcript {
     /// Anything still pending when a turn ends did not reach the model, so
     /// leaving it in the transcript would misrepresent what was sent.
     pub fn remove_pending_user(&mut self) {
-        self.blocks
-            .retain(|block| !matches!(block, Block::User { pending: true, .. }));
+        let mut old_index = 0;
+        let mut new_index = 0;
+        let mut expanded = std::collections::BTreeSet::new();
+        let mut boundaries = std::collections::BTreeSet::new();
+        self.blocks.retain(|block| {
+            if self.tool_group_boundaries.contains(&old_index) {
+                boundaries.insert(new_index);
+            }
+            let keep = !matches!(block, Block::User { pending: true, .. });
+            if keep {
+                if self.expanded_tool_groups.contains(&old_index) {
+                    expanded.insert(new_index);
+                }
+                new_index += 1;
+            }
+            old_index += 1;
+            keep
+        });
+        if self.tool_group_boundaries.contains(&old_index) {
+            boundaries.insert(new_index);
+        }
+        self.expanded_tool_groups = expanded;
+        self.tool_group_boundaries = boundaries;
     }
 
     /// Marks queued messages as delivered by their steering queue id.
@@ -646,6 +677,41 @@ impl Transcript {
             self.blocks.get(index),
             Some(Block::Thinking { text, .. }) if text.lines().any(|l| !l.trim().is_empty())
         )
+    }
+
+    pub fn is_tool_group_foldable(&self, index: usize) -> bool {
+        self.tool_group_range(index).is_some()
+    }
+
+    /// Batch/root/source IDs describe engine activity, not UI turn ownership.
+    /// Explicit boundaries prevent a later turn's adjacent tools joining this one.
+    pub fn end_tool_group(&mut self) {
+        self.tool_group_boundaries.insert(self.blocks.len());
+    }
+
+    pub fn toggle_tool_group(&mut self, index: usize) -> bool {
+        let Some(range) = self.tool_group_range(index) else { return false };
+        if !self.expanded_tool_groups.remove(&range.start) {
+            self.expanded_tool_groups.insert(range.start);
+        }
+        true
+    }
+
+    fn tool_group_range(&self, index: usize) -> Option<std::ops::Range<usize>> {
+        if !completed_tools(self.blocks.get(index)?) { return None; }
+        let mut start = index;
+        while start > 0 && !self.tool_group_boundaries.contains(&start)
+            && completed_tools(&self.blocks[start - 1])
+        {
+            start -= 1;
+        }
+        let mut end = index + 1;
+        while end < self.blocks.len() && !self.tool_group_boundaries.contains(&end)
+            && completed_tools(&self.blocks[end])
+        {
+            end += 1;
+        }
+        Some(start..end)
     }
 
     /// Renders every block to rows, inserting a blank separator between them.
@@ -701,7 +767,9 @@ impl Transcript {
         // between two cards.
         let mut card_open = false;
 
-        for block in &self.blocks {
+        let mut index = 0;
+        while index < self.blocks.len() {
+            let block = &self.blocks[index];
             // A card starts at each delivered user message (every `User`
             // block is delivered: a pending one is never pushed here at all,
             // see `UiState`). One blank boundary row serves both cards,
@@ -717,11 +785,36 @@ impl Transcript {
             // points at the block's true first content row — never at a
             // blank boundary pushed in front of it.
             starts.push(rows.len());
+            if mode == ToolDisplayMode::Summary {
+                if let Some(group) = self.tool_group_range(index) {
+                    let header_row = rows.len();
+                    starts.extend(std::iter::repeat(header_row).take(group.end - index - 1));
+                    let calls = self.blocks[group.clone()].iter().filter_map(|block| {
+                        if let Block::Tools { activity, .. } = block {
+                            Some(activity.calls.iter())
+                        } else {
+                            None
+                        }
+                    }).flatten();
+                    let expanded = self.expanded_tool_groups.contains(&group.start);
+                    let fold = if expanded { glyphs::FOLD_EXPANDED } else { glyphs::FOLD_COLLAPSED };
+                    rows.extend(ToolSummary::from_calls(calls).render(width, Some(fold)));
+                    if expanded {
+                        for block in &self.blocks[group.clone()] {
+                            rows.extend(block.render(width, ToolDisplayMode::Full));
+                        }
+                    }
+                    rows.push(RenderLine::separator());
+                    index = group.end;
+                    continue;
+                }
+            }
             let block_rows = block.render(width, mode);
             if !block_rows.is_empty() {
                 rows.extend(block_rows);
                 rows.push(RenderLine::separator());
             }
+            index += 1;
         }
 
         if style == TranscriptStyle::Cards && card_open {
@@ -737,6 +830,132 @@ impl Transcript {
 mod tests {
     use super::*;
     use coda_render::tool::{CallStatus, ToolCall};
+
+    fn completed_tool(name: &str, status: CallStatus, root: &str, source: Option<&str>) -> Block {
+        let mut call = ToolCall::new(name, "{}");
+        call.status = status;
+        call.result = Some(format!("{name} result"));
+        call.is_error = status == CallStatus::Failed;
+        Block::Tools {
+            activity: ToolActivity { calls: vec![call], complete: true },
+            key: ActivityKey { root_turn_id: Some(root.into()), activity_id: Some(name.into()) },
+            calls: vec![Correlation {
+                root_turn_id: Some(root.into()), source_id: source.map(str::to_owned),
+                ..Default::default()
+            }],
+        }
+    }
+
+    #[test]
+    fn consecutive_completed_tool_runs_share_one_summary_without_mutating_blocks() {
+        let mut transcript = Transcript::new();
+        for name in ["read_file", "grep", "glob"] {
+            transcript.push(completed_tool(name, CallStatus::Succeeded, "turn", None));
+        }
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        assert_eq!(rows.iter().filter(|row| row.text.contains("Ran 3 tools")).count(), 1);
+        assert!(!rows.iter().any(|row| row.text.contains("Ran 1 tool")));
+        assert_eq!(transcript.blocks().len(), 3);
+        assert_eq!(starts.len(), 4);
+        assert!(starts.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert_eq!(starts[3], rows.len());
+    }
+
+    #[test]
+    fn consecutive_completed_tool_runs_preserve_failed_cancelled_and_skipped_status() {
+        let mut transcript = Transcript::new();
+        for (name, status) in [
+            ("read_file", CallStatus::Succeeded), ("grep", CallStatus::Failed),
+            ("glob", CallStatus::Cancelled), ("edit", CallStatus::Skipped),
+        ] {
+            transcript.push(completed_tool(name, status, "turn", None));
+        }
+        let rows = transcript.render(120, ToolDisplayMode::Summary);
+        let header = &rows[0].text;
+        assert!(header.contains("Ran 4 tools"), "{header}");
+        assert!(header.contains("1 failed") && header.contains("cancelled") && header.contains("1 skipped"), "{header}");
+    }
+
+    #[test]
+    fn completed_tool_group_expands_results_and_collapses_from_any_member() {
+        let mut transcript = Transcript::new();
+        transcript.push(completed_tool("first", CallStatus::Succeeded, "turn", None));
+        transcript.push(completed_tool("second", CallStatus::Failed, "turn", None));
+        let collapsed = transcript.render(100, ToolDisplayMode::Summary);
+        assert_eq!(collapsed.len(), 2);
+        assert!(collapsed[0].text.contains(glyphs::FOLD_COLLAPSED));
+        assert!(transcript.toggle_tool_group(1));
+        let expanded = transcript.render(100, ToolDisplayMode::Summary);
+        assert!(expanded[0].text.contains(glyphs::FOLD_EXPANDED));
+        assert!(expanded.iter().any(|row| row.text.contains("first result")));
+        assert!(expanded.iter().any(|row| row.text.contains("second result")));
+        assert!(expanded.iter().any(|row| row.text.contains("[error]")));
+        let copied = crate::selection::copy_visible_text(&expanded, 0..expanded.len());
+        assert!(!copied.contains(glyphs::FOLD_EXPANDED));
+        assert!(copied.contains("Ran 2 tools - 1 failed"));
+        assert!(transcript.toggle_tool_group(0));
+        assert_eq!(transcript.render(100, ToolDisplayMode::Summary), collapsed);
+        assert_eq!(transcript.blocks().len(), 2);
+    }
+
+    #[test]
+    fn running_tool_batch_stays_separate_until_it_completes() {
+        let mut transcript = Transcript::new();
+        transcript.push(completed_tool("first", CallStatus::Succeeded, "turn", None));
+        let mut running = completed_tool("second", CallStatus::Running, "turn", None);
+        if let Block::Tools { activity, .. } = &mut running { activity.complete = false; }
+        transcript.push(running);
+        let rows = transcript.render(100, ToolDisplayMode::Summary);
+        assert!(rows.iter().any(|row| row.text.contains("Ran 1 tool")));
+        assert!(rows.iter().any(|row| row.text.contains("Running 1 tool")));
+        assert!(!transcript.is_tool_group_foldable(1));
+        if let Block::Tools { activity, .. } = &mut transcript.blocks_mut()[1] {
+            activity.complete = true;
+            activity.calls[0].status = CallStatus::Succeeded;
+        }
+        let rows = transcript.render(100, ToolDisplayMode::Summary);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].text.contains("Ran 2 tools"));
+    }
+
+    #[test]
+    fn tool_detail_modes_still_show_each_original_call() {
+        let mut transcript = Transcript::new();
+        transcript.push(completed_tool("first", CallStatus::Succeeded, "turn", None));
+        transcript.push(completed_tool("second", CallStatus::Failed, "turn", None));
+        for mode in [ToolDisplayMode::Compact, ToolDisplayMode::Full] {
+            let rows = transcript.render(100, mode);
+            assert!(rows.iter().any(|row| row.text.contains("first")));
+            assert!(rows.iter().any(|row| row.text.contains("second")));
+            assert!(!rows.iter().any(|row| row.text.contains("Ran 2")));
+        }
+        assert!(transcript.render(100, ToolDisplayMode::Hidden).is_empty());
+    }
+
+    #[test]
+    fn completed_tool_runs_do_not_cross_turn_or_message_boundaries() {
+        let boundaries = [
+            user("new user"),
+            Block::Assistant { text: "explanation".into(), complete: true },
+            Block::Notice { text: "warning".into(), level: NoticeLevel::Warning },
+            Block::Permission { tool: "edit".into(), preview: "approval".into(), decision: PermissionDecision::Pending },
+            Block::Thinking { text: "reasoning".into(), elapsed_ms: 1000, tokens: None, complete: true, expanded: false, done_at: None },
+        ];
+        for boundary in boundaries {
+            let mut transcript = Transcript::new();
+            transcript.push(completed_tool("first", CallStatus::Succeeded, "turn", None));
+            transcript.push(boundary);
+            transcript.push(completed_tool("second", CallStatus::Succeeded, "turn", None));
+            assert_eq!(transcript.render(120, ToolDisplayMode::Summary).iter()
+                .filter(|row| row.text.contains("Ran 1 tool")).count(), 2);
+        }
+        let mut transcript = Transcript::new();
+        transcript.push(completed_tool("first", CallStatus::Succeeded, "turn", None));
+        transcript.end_tool_group();
+        transcript.push(completed_tool("second", CallStatus::Succeeded, "other-turn", None));
+        assert_eq!(transcript.render(120, ToolDisplayMode::Summary).iter()
+            .filter(|row| row.text.contains("Ran 1 tool")).count(), 2);
+    }
 
     fn texts(lines: &[RenderLine]) -> Vec<String> {
         lines.iter().map(|l| l.text.clone()).collect()

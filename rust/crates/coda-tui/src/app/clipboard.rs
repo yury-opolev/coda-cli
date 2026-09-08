@@ -166,13 +166,19 @@ impl App {
         let Some(index) = header_block_at(&self.block_starts, &self.rows, pos.row) else {
             return false;
         };
-        if !self.state.transcript.is_foldable(index) {
+        let event = if self.state.transcript.is_foldable(index) {
+            crate::state::UiEvent::ThinkingFoldToggled { block: index }
+        } else if self.state.display_mode == coda_render::tool::ToolDisplayMode::Summary
+            && self.state.transcript.is_tool_group_foldable(index)
+        {
+            crate::state::UiEvent::ToolGroupFoldToggled { block: index }
+        } else {
             return false;
-        }
+        };
         // Through `apply`, never straight at the transcript: `apply` is what
         // invalidates the cached rows. Toggling directly flipped the fold and
         // left the screen exactly as it was.
-        self.apply(crate::state::UiEvent::ThinkingFoldToggled { block: index });
+        self.apply(event);
         true
     }
 
@@ -523,6 +529,30 @@ pub(super) fn header_block_at(
 mod fold_tests {
     use super::header_block_at;
     use coda_render::{Role, RenderLine};
+
+    #[test]
+    fn merged_tool_header_toggles_its_group_but_detail_rows_do_not() {
+        use crate::transcript::{ActivityKey, Block, Transcript};
+        use coda_render::tool::{CallStatus, ToolActivity, ToolCall, ToolDisplayMode};
+        let mut transcript = Transcript::new();
+        for name in ["first", "second"] {
+            let mut call = ToolCall::new(name, "{}");
+            call.status = CallStatus::Succeeded;
+            call.result = Some("result".into());
+            transcript.push(Block::Tools {
+                activity: ToolActivity { calls: vec![call], complete: true },
+                key: ActivityKey::default(), calls: Vec::new(),
+            });
+        }
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        let index = header_block_at(&starts, &rows, 0).unwrap();
+        assert!(transcript.is_tool_group_foldable(index));
+        assert!(transcript.toggle_tool_group(index));
+        let (rows, starts) = transcript.render_with_block_starts(80, ToolDisplayMode::Summary);
+        assert!(header_block_at(&starts, &rows, 0).is_some());
+        assert!(header_block_at(&starts, &rows, 1).is_none());
+        assert!(rows.iter().any(|row| row.text.contains("result")));
+    }
 
     /// `n` plain (non-chrome) rows, enough for any row index a test asks about.
     fn rows(n: usize) -> Vec<RenderLine> {

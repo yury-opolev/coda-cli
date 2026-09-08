@@ -1548,6 +1548,7 @@ fn is_critical_event(event: &UiEvent) -> bool {
         // rather than waiting for the streaming throttle: an idle session
         // produces no further frames to carry it.
         | UiEvent::ThinkingFoldToggled { .. }
+        | UiEvent::ToolGroupFoldToggled { .. }
         | UiEvent::Submitted { .. }
         | UiEvent::Queued { .. }
         | UiEvent::SteeringRecalled { .. }
