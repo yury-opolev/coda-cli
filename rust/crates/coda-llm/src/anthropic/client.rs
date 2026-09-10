@@ -214,9 +214,15 @@ impl AnthropicClient {
             None
         };
 
-        crate::retry::send_with_retry(&self.config.retry, "anthropic", || {
-            self.request_builder_with_auth(&url, dynamic_auth.as_deref()).json(body)
-        })
+        crate::retry::send_with_retry(
+            &self.config.retry,
+            "anthropic",
+            1,
+            coda_diagnostics::detail::Protocol::AnthropicMessages.as_str(),
+            coda_diagnostics::detail::RouteSource::FixedProviderDefault,
+            coda_diagnostics::detail::RequestShape::from_wire_json(body),
+            || self.request_builder_with_auth(&url, dynamic_auth.as_deref()).json(body),
+        )
         .await
     }
 }
@@ -230,6 +236,16 @@ impl LlmClient for AnthropicClient {
     async fn stream(&self, request: ChatRequest) -> Result<ResponseStream, LlmError> {
         let body = request::build(&request);
         let response = self.send_with_retry(&body).await?;
+        // Headers/2xx already accepted: any failure from here on is
+        // post-headers (an inline SSE error, a truncated stream), never the
+        // provider rejecting the request outright.
+        if let Some(ctx) = coda_diagnostics::current() {
+            ctx.record(coda_diagnostics::Event::StreamOpened {
+                dispatch: 1,
+                protocol: coda_diagnostics::detail::Protocol::AnthropicMessages.as_str(),
+                route_source: coda_diagnostics::detail::RouteSource::FixedProviderDefault.as_str(),
+            });
+        }
 
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
         tokio::spawn(crate::pump::pump(response, AnthropicDecoder::new(), tx));

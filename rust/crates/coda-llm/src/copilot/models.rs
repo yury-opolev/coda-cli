@@ -26,23 +26,62 @@ pub enum CopilotEndpoint {
     Responses,
 }
 
+impl CopilotEndpoint {
+    /// The fixed diagnostic protocol label for this endpoint.
+    pub fn protocol(self) -> coda_diagnostics::detail::Protocol {
+        use coda_diagnostics::detail::Protocol;
+        match self {
+            CopilotEndpoint::ChatCompletions => Protocol::CopilotChatCompletions,
+            CopilotEndpoint::Messages => Protocol::CopilotMessages,
+            CopilotEndpoint::Responses => Protocol::CopilotResponses,
+        }
+    }
+}
+
 /// Selects the best endpoint from the model's `supported_endpoints` list.
 ///
 /// Priority: Responses > Anthropic Messages > Chat Completions. Responses is
 /// tested first because a model advertising both Responses and Messages should
 /// prefer the newer API.
 pub fn resolve_endpoint(model: &ModelInfo) -> CopilotEndpoint {
+    resolve_endpoint_with_source(Some(model)).0
+}
+
+/// A model's `supported_endpoints` entry recognized by [`resolve_endpoint`].
+fn is_recognized_endpoint(entry: &str) -> bool {
+    entry.eq_ignore_ascii_case("/responses")
+        || entry.eq_ignore_ascii_case("/v1/responses")
+        || entry.eq_ignore_ascii_case("/v1/messages")
+        || entry.eq_ignore_ascii_case("/chat/completions")
+}
+
+/// Same endpoint selection as [`resolve_endpoint`], but also reports *why*:
+/// distinguishes "no metadata for this model at all" from "metadata exists
+/// but named nothing this client recognizes" from "metadata named a
+/// recognized endpoint" — so a caller can record honest routing provenance
+/// instead of claiming a metadata-driven route whenever a model row merely
+/// exists.
+pub fn resolve_endpoint_with_source(
+    model: Option<&ModelInfo>,
+) -> (CopilotEndpoint, coda_diagnostics::detail::RouteSource) {
+    use coda_diagnostics::detail::RouteSource;
+    let Some(model) = model else {
+        return (CopilotEndpoint::ChatCompletions, RouteSource::MetadataMissingDefault);
+    };
+    if !model.supported_endpoints.iter().any(|entry| is_recognized_endpoint(entry)) {
+        return (CopilotEndpoint::ChatCompletions, RouteSource::MetadataUnrecognizedDefault);
+    }
     for ep in &model.supported_endpoints {
         if ep.eq_ignore_ascii_case("/responses") || ep.eq_ignore_ascii_case("/v1/responses") {
-            return CopilotEndpoint::Responses;
+            return (CopilotEndpoint::Responses, RouteSource::ModelMetadata);
         }
     }
     for ep in &model.supported_endpoints {
         if ep.eq_ignore_ascii_case("/v1/messages") {
-            return CopilotEndpoint::Messages;
+            return (CopilotEndpoint::Messages, RouteSource::ModelMetadata);
         }
     }
-    CopilotEndpoint::ChatCompletions
+    (CopilotEndpoint::ChatCompletions, RouteSource::ModelMetadata)
 }
 
 /// Normalizes a Claude model id to the dotted form Copilot's live API requires.
@@ -279,7 +318,7 @@ mod tests {
 
     #[test]
     fn does_not_normalize_multi_segment_ids() {
-        // The regex matches only `claude-<word>-<digits>-<digits>` at the end.
+        // The parser accepts only `claude-<word>-<digits>-<digits>`.
         assert_eq!(
             normalize_model_id("claude-sonnet-4-5-20250514"),
             "claude-sonnet-4-5-20250514"

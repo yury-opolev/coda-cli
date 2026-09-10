@@ -364,7 +364,11 @@ impl ResponsesDecoder {
                     message,
                     kind: FailureKind::Transient,
                     retry_after: None,
-                    body: None,
+                    // The raw inline event payload, so the same bounded,
+                    // allowlisted structured `error.type`/`code`/`param`
+                    // extraction used for HTTP error bodies also applies
+                    // here — never the free-text message alone.
+                    body: Some(data.to_string()),
                 })
             }
 

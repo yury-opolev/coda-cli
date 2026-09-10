@@ -142,7 +142,13 @@ impl AnthropicDecoder {
                     message: message.to_string(),
                     kind: crate::error::FailureKind::Transient,
                     retry_after: None,
-                    body: None,
+                    // The raw inline SSE error payload, not the free-text
+                    // `message` alone — this lets the same bounded,
+                    // allowlisted `error.type`/`error.code`/`error.param`
+                    // extraction used for HTTP error bodies also apply to a
+                    // failure that arrived as an inline stream event rather
+                    // than a non-2xx HTTP status.
+                    body: Some(data.to_string()),
                 })
             }
             // Unknown events are ignored so a newer API cannot break the client.

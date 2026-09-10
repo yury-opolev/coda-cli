@@ -10,6 +10,7 @@
 use serde::Serialize;
 
 use crate::context::Verbosity;
+use crate::detail;
 
 /// A typed, privacy-safe diagnostic event.
 ///
@@ -75,6 +76,60 @@ pub enum Event {
     /// A subsequent attempt succeeded after one or more prior failures.
     HttpRecovery { attempt: u32 },
 
+    /// The shape/protocol/route of one physical HTTP attempt's already-built
+    /// request body, recorded immediately before it is executed. `dispatch`
+    /// counts physical dispatches (a fresh endpoint/body choice — e.g. a
+    /// Copilot chat-mismatch reroute is dispatch 2), independent of the
+    /// legacy `attempt` counter on [`Event::HttpAttempt`]/[`Event::HttpResult`]
+    /// (which restarts at 1 on every dispatch). `body_bytes` is the exact
+    /// length of the already-serialized wire body — `None` only when no
+    /// body could be measured (a build failure before any bytes existed),
+    /// never an invented `0`.
+    RequestShape {
+        dispatch: u32,
+        attempt: u32,
+        protocol: &'static str,
+        route_source: &'static str,
+        #[serde(flatten)]
+        shape: detail::RequestShape,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        body_bytes: Option<u64>,
+    },
+    /// A bounded, allowlisted structured extraction of a non-2xx HTTP error
+    /// body, recorded once its body has been read (never the raw body
+    /// itself, and never the free-text `message`).
+    HttpFailureDetails {
+        dispatch: u32,
+        attempt: u32,
+        status: u16,
+        detail: detail::ErrorBodyDetail,
+    },
+    /// A physical HTTP attempt received a successful (2xx) response and
+    /// headers; streaming of the body is about to begin. Any failure
+    /// recorded after this point for the same context is necessarily
+    /// post-headers (an inline provider error, a truncated/invalid stream,
+    /// or a dropped connection) — never a request the provider rejected
+    /// outright.
+    StreamOpened {
+        dispatch: u32,
+        protocol: &'static str,
+        route_source: &'static str,
+    },
+    /// The outer request failed before any [`Event::StreamOpened`] was ever
+    /// recorded for this context — i.e. before headers were accepted (the
+    /// HTTP retry policy already exhausted its attempts, or the request
+    /// could not even be built/sent). If no [`Event::HttpAttempt`]/
+    /// [`Event::RequestShape`] appears at all under the same envelope
+    /// `request_id`, the failure happened locally (credential lookup,
+    /// request construction) rather than as a provider refusal.
+    RequestFailure {
+        category: &'static str,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<detail::ErrorBodyDetail>,
+    },
+
     /// The streamed response failed after headers were already accepted
     /// (incomplete stream, inline provider error event, etc).
     StreamFailure {
@@ -87,6 +142,12 @@ pub enum Event {
         /// `input[22].summary` — never arbitrary provider text.
         #[serde(skip_serializing_if = "Option::is_none")]
         parameter: Option<String>,
+        /// The same bounded, allowlisted structured error extraction used by
+        /// [`Event::HttpFailureDetails`], for a failure that arrived as an
+        /// inline SSE error event rather than a non-2xx HTTP status. Absent
+        /// when the underlying error carried no body to extract from.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<detail::ErrorBodyDetail>,
     },
     /// The transport itself failed (connection reset, timeout, TLS, DNS).
     TransportFailure { category: &'static str },
@@ -134,20 +195,39 @@ impl Event {
     }
 
     /// Rewrites any field that originates from arbitrary, untrusted provider
-    /// data (currently only [`Event::TurnEnd`]'s `stop_reason`) down to a
-    /// closed, safe vocabulary. Every other variant already carries only
-    /// primitives/fixed `&'static str` classifications and passes through
-    /// unchanged.
+    /// data down to a closed, safe vocabulary. Error details are revalidated
+    /// here even when constructed without the usual extraction helpers.
     ///
     /// [`writer::Logger::record`](crate::writer::Logger::record) calls this
     /// on every event *before* building the JSON envelope, so a malicious or
     /// merely-unexpected value streamed back by a provider (which this
-    /// crate never controls) can never reach disk verbatim — only
-    /// [`KNOWN_STOP_REASONS`] or the fixed `"unknown"` label ever can.
+    /// crate never controls) is reduced to the relevant allowlist or a
+    /// fixed unknown/omitted state before it can reach disk.
     pub(crate) fn normalized(self) -> Event {
         match self {
             Event::TurnEnd { stop_reason } => {
                 Event::TurnEnd { stop_reason: normalize_stop_reason(stop_reason.as_deref()) }
+            }
+            Event::HttpFailureDetails { dispatch, attempt, status, detail } => {
+                Event::HttpFailureDetails { dispatch, attempt, status, detail: detail.normalized() }
+            }
+            Event::RequestFailure { category, status, detail } => {
+                Event::RequestFailure { category, status, detail: detail.map(detail::ErrorBodyDetail::normalized) }
+            }
+            Event::StreamFailure { category, status, provider_request_id, parameter, detail } => {
+                let detail = detail.map(detail::ErrorBodyDetail::normalized);
+                let parameter = if let Some(detail) = &detail {
+                    match &detail.parameter {
+                        detail::FieldState::Recognized { value } => Some(value.clone()),
+                        _ => None,
+                    }
+                } else {
+                    parameter.and_then(|value| match detail::recognized_parameter_text(&value) {
+                        detail::FieldState::Recognized { value } => Some(value),
+                        _ => None,
+                    })
+                };
+                Event::StreamFailure { category, status, provider_request_id, parameter, detail }
             }
             other => other,
         }

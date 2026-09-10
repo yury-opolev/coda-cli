@@ -181,8 +181,8 @@ impl Logger {
         if event.minimum_verbosity() > self.verbosity {
             return;
         }
-        // Rewrite any field sourced from arbitrary provider data (currently
-        // `TurnEnd::stop_reason`) down to a closed, safe vocabulary *before*
+        // Revalidate provider stop reasons and structured error details
+        // against their closed, safe vocabularies *before*
         // it is ever built into a JSON envelope — see `Event::normalized`.
         let event = event.normalized();
 

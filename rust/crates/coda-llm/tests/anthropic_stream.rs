@@ -5,6 +5,7 @@
 //! channel — because that is where the seams are, and a mock at the decoder
 //! boundary would not exercise them.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use coda_llm::anthropic::{AnthropicClient, AnthropicConfig, StreamEvent};
@@ -12,11 +13,63 @@ use coda_llm::{ChatRequest, Content, LlmClient, LlmError, Message, RetryPolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
+fn diag_ctx(dir: &std::path::Path) -> coda_diagnostics::DiagnosticContext {
+    let logger = coda_diagnostics::Logger::open(
+        coda_diagnostics::Options {
+            directory: dir.to_path_buf(),
+            file: None,
+            role: coda_diagnostics::ProcessRole::Run,
+            version: "test".into(),
+            verbosity: coda_diagnostics::Verbosity::Trace,
+        },
+        coda_diagnostics::Limits::default(),
+    )
+    .expect("logger opens");
+    coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+}
+
+fn diag_lines(ctx: &coda_diagnostics::DiagnosticContext) -> Vec<serde_json::Value> {
+    let path = ctx.logger().status().path.expect("a log path");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
 /// A one-shot HTTP server that replays a canned response.
 ///
 /// Returns the base URL to point a client at.
 async fn serve_text(status: u16, headers: &str, body: Vec<String>) -> String {
     serve(status, headers, body.into_iter().map(String::into_bytes).collect()).await
+}
+
+/// A server that accepts one connection per entry in `responses`, replaying
+/// each in turn — used to simulate a client retrying against the same URL.
+async fn serve_n(responses: Vec<(u16, &'static str, String)>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+
+    tokio::spawn(async move {
+        for (status, headers, body) in responses {
+            let Ok((mut socket, _)) = listener.accept().await else { return };
+            let mut buffer = vec![0u8; 8192];
+            let _ = socket.read(&mut buffer).await;
+            let reason = if status == 200 { "OK" } else { "Error" };
+            let head = format!(
+                "HTTP/1.1 {status} {reason}\r\n{headers}content-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            if socket.write_all(head.as_bytes()).await.is_err() {
+                return;
+            }
+            let _ = socket.write_all(body.as_bytes()).await;
+            let _ = socket.shutdown().await;
+        }
+    });
+
+    format!("http://127.0.0.1:{port}")
 }
 
 /// A one-shot HTTP server that replays a canned byte stream.
@@ -269,6 +322,33 @@ async fn an_inline_error_event_fails_the_stream() {
     assert!(error.is_retryable(), "an overload deserves a retry");
 }
 
+/// BUG4 regression: an SSE "error" event that arrives as the very last bytes
+/// of the connection, with no trailing blank line, is only ever seen by
+/// `SseDecoder::finish()`'s flush — not the main per-chunk loop. A decode
+/// failure there must surface as the real decoded error, never be silently
+/// discarded and misreported as a generic `IncompleteStream` (which reads
+/// as "we never heard the end" rather than "the provider told us something,
+/// and rejecting/decoding it failed").
+#[tokio::test]
+async fn a_decode_error_on_the_final_flushed_sse_event_is_not_misreported_as_incomplete_stream() {
+    let error_event = serde_json::json!({ "type": "error", "error": { "type": "overloaded_error", "message": "Overloaded-at-eof" } });
+    // Deliberately no second `\n\n`: the connection closes right after the
+    // single blank-line-less write, so this event is only ever captured by
+    // `SseDecoder::finish()`, not the main per-chunk `push()` loop.
+    let raw = format!("event: error\ndata: {error_event}\n");
+    let body = vec![start_text_block().into_bytes(), raw.into_bytes()];
+
+    let url = serve(200, sse_headers(), body).await;
+    let stream = client(url).stream(request()).await.expect("stream");
+
+    let error = stream.collect().await.expect_err("the flushed error event must still fail the stream");
+    assert!(
+        !matches!(error, LlmError::IncompleteStream),
+        "a decode failure on the flushed final event must not be misclassified as IncompleteStream, got: {error:?}"
+    );
+    assert!(error.to_string().contains("Overloaded-at-eof"), "the actual decoded error must surface: {error}");
+}
+
 #[tokio::test]
 async fn dropping_the_stream_stops_the_pump_promptly() {
     // The server sends one event and then holds the connection open forever.
@@ -359,3 +439,114 @@ async fn lists_models_over_http() {
     assert_eq!(models[0].id, "claude-opus-5");
     assert_eq!(models[0].context_limit, Some(200_000));
 }
+
+// ─── BUG4: diagnostics ───────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stream_opened_is_recorded_after_2xx_headers_before_any_pump_activity() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+    let body = vec![start_text_block(), text_delta("hi"), message_stop()];
+    let url = serve_text(200, sse_headers(), body).await;
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let stream = client(url).stream(request()).await.expect("stream");
+        stream.collect().await.expect("complete");
+    })
+    .await;
+
+    let lines = diag_lines(&ctx);
+    let opened = lines.iter().position(|l| l["kind"] == "stream_opened").expect("a stream_opened event");
+    assert_eq!(lines[opened]["dispatch"], 1);
+    assert_eq!(lines[opened]["protocol"], "anthropic_messages");
+    assert_eq!(lines[opened]["route_source"], "fixed_provider_default");
+    let result_pos = lines.iter().position(|l| l["kind"] == "http_result").expect("an http_result");
+    assert!(result_pos < opened, "stream_opened must follow the 2xx http_result: {lines:?}");
+}
+
+/// Exact wire byte length for a non-ASCII payload: `body_bytes` must equal
+/// the actual serialized UTF-8 byte length, not the character count.
+#[tokio::test]
+async fn request_shape_byte_count_is_exact_for_a_non_ascii_payload() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+    let body = vec![start_text_block(), text_delta("ok"), message_stop()];
+    let url = serve_text(200, sse_headers(), body).await;
+
+    let non_ascii_request =
+        ChatRequest::new("claude-opus-5", vec![Message::user("café ☕ 日本語 🚀 — multi-byte canary")]);
+    let expected_bytes = serde_json::to_vec(&coda_llm::anthropic::request::build(&non_ascii_request)).unwrap().len() as u64;
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let stream = client(url).stream(non_ascii_request).await.expect("stream");
+        stream.collect().await.expect("complete");
+    })
+    .await;
+
+    let lines = diag_lines(&ctx);
+    let shape = lines.iter().find(|l| l["kind"] == "request_shape").expect("a request_shape event");
+    assert_eq!(shape["body_bytes"].as_u64().unwrap(), expected_bytes);
+    assert!(expected_bytes as usize > "café ☕ 日本語 🚀 — multi-byte canary".chars().count(), "sanity: multi-byte chars must make bytes exceed char count");
+}
+
+/// A 429 (with `Retry-After`) then success: exactly one `request_shape` per
+/// physical attempt, in the same file-order as the legacy `http_attempt`/
+/// `http_result`/`http_retry`/`http_recovery` events, and the retried body's
+/// shape/bytes are identical across both attempts.
+#[tokio::test]
+async fn a_429_then_success_records_one_request_shape_per_attempt_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+
+    let url = serve_n(vec![
+        (429, "retry-after: 0\r\n", r#"{"error":{"type":"rate_limit_error","code":"rate_limit_exceeded"}}"#.to_string()),
+        (200, sse_headers(), {
+            let mut s = String::new();
+            for chunk in [start_text_block(), text_delta("ok"), message_stop()] {
+                s.push_str(&chunk);
+            }
+            s
+        }),
+    ])
+    .await;
+
+    let policy = RetryPolicy {
+        max_attempts: 3,
+        initial_backoff: Duration::from_millis(1),
+        max_backoff: Duration::from_millis(5),
+    };
+    let retrying_client = AnthropicClient::new(
+        AnthropicConfig::api_key("test-key").with_base_url(url).with_retry(policy),
+    )
+    .expect("client");
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let stream = retrying_client.stream(request()).await.expect("stream");
+        stream.collect().await.expect("complete");
+    })
+    .await;
+
+    let lines = diag_lines(&ctx);
+    let kinds: Vec<&str> = lines.iter().map(|l| l["kind"].as_str().unwrap()).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            "http_attempt",
+            "request_shape",
+            "http_result",
+            "http_failure_details",
+            "http_retry",
+            "http_attempt",
+            "request_shape",
+            "http_result",
+            "http_recovery",
+            "stream_opened",
+        ],
+        "unexpected event order: {lines:?}"
+    );
+    let shapes: Vec<_> = lines.iter().filter(|l| l["kind"] == "request_shape").collect();
+    assert_eq!(shapes.len(), 2, "one request_shape per physical attempt");
+    assert_eq!(shapes[0]["message_count"], shapes[1]["message_count"]);
+    assert_eq!(shapes[0]["body_bytes"], shapes[1]["body_bytes"], "the retried body is identical");
+}
+

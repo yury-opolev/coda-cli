@@ -117,11 +117,20 @@ impl CopilotClient {
     }
 
     fn endpoint_for(&self, model_id: &str) -> CopilotEndpoint {
-        models::cache_get(&self.config.base_url)
-            .as_deref()
-            .and_then(|ms| ms.iter().find(|m| m.id.eq_ignore_ascii_case(model_id)))
-            .map(models::resolve_endpoint)
-            .unwrap_or(CopilotEndpoint::ChatCompletions)
+        self.endpoint_for_with_source(model_id).0
+    }
+
+    /// Same as [`Self::endpoint_for`], but also reports the routing
+    /// provenance: whether a cached model row named a recognized endpoint,
+    /// no metadata was found at all, or metadata was found but named
+    /// nothing recognized.
+    fn endpoint_for_with_source(
+        &self,
+        model_id: &str,
+    ) -> (CopilotEndpoint, coda_diagnostics::detail::RouteSource) {
+        let models = models::cache_get(&self.config.base_url);
+        let model = models.as_deref().and_then(|ms| ms.iter().find(|m| m.id.eq_ignore_ascii_case(model_id)));
+        models::resolve_endpoint_with_source(model)
     }
 
     /// Build a POST request applying auth headers.
@@ -201,14 +210,22 @@ impl CopilotClient {
         &self,
         url: &str,
         endpoint: CopilotEndpoint,
+        dispatch: u32,
+        route_source: coda_diagnostics::detail::RouteSource,
         body: &serde_json::Value,
         dynamic_auth: Option<&[(String, String)]>,
     ) -> Result<reqwest::Response, LlmError> {
         // Delegate to the shared retry loop so the Anthropic and Copilot clients
         // do not duplicate the retry-after parsing, backoff and tracing logic.
-        crate::retry::send_with_retry(&self.config.retry, "copilot", || {
-            self.auth_post_with_auth(url, endpoint, dynamic_auth).json(body)
-        })
+        crate::retry::send_with_retry(
+            &self.config.retry,
+            "copilot",
+            dispatch,
+            endpoint.protocol().as_str(),
+            route_source,
+            coda_diagnostics::detail::RequestShape::from_wire_json(body),
+            || self.auth_post_with_auth(url, endpoint, dynamic_auth).json(body),
+        )
         .await
     }
 
@@ -217,7 +234,7 @@ impl CopilotClient {
     async fn prepare_and_send(
         &self,
         request: &ChatRequest,
-    ) -> Result<(CopilotEndpoint, reqwest::Response), LlmError> {
+    ) -> Result<(CopilotEndpoint, coda_diagnostics::detail::RouteSource, reqwest::Response), LlmError> {
         // Best-effort metadata load — failure falls back to ChatCompletions.
         if models::cache_get(&self.config.base_url).is_none() {
             let _ = self.do_list_models().await;
@@ -231,12 +248,12 @@ impl CopilotClient {
         };
         let dynamic_auth = dynamic_auth_owned.as_deref();
 
-        let endpoint = self.endpoint_for(&request.model);
+        let (endpoint, route_source) = self.endpoint_for_with_source(&request.model);
         let url = self.endpoint_url(endpoint);
         let body = build_body(request, endpoint);
 
-        match self.send_with_retry(&url, endpoint, &body, dynamic_auth).await {
-            Ok(r) => Ok((endpoint, r)),
+        match self.send_with_retry(&url, endpoint, 1, route_source, &body, dynamic_auth).await {
+            Ok(r) => Ok((endpoint, route_source, r)),
             Err(err) if endpoint == CopilotEndpoint::ChatCompletions && is_chat_mismatch(&err) => {
                 // The model rejected /chat/completions. Refresh metadata and retry on the
                 // correct endpoint — this happens when a model's entry arrives in the catalog
@@ -251,8 +268,11 @@ impl CopilotClient {
 
                 let new_url = self.endpoint_url(new_endpoint);
                 let new_body = build_body(request, new_endpoint);
-                let r = self.send_with_retry(&new_url, new_endpoint, &new_body, dynamic_auth).await?;
-                Ok((new_endpoint, r))
+                let reroute_source = coda_diagnostics::detail::RouteSource::RerouteAfterMismatch;
+                let r = self
+                    .send_with_retry(&new_url, new_endpoint, 2, reroute_source, &new_body, dynamic_auth)
+                    .await?;
+                Ok((new_endpoint, reroute_source, r))
             }
             Err(err) => Err(err),
         }
@@ -273,7 +293,17 @@ impl LlmClient for CopilotClient {
             request.model = normalized.into_owned();
         }
 
-        let (endpoint, response) = self.prepare_and_send(&request).await?;
+        let (endpoint, route_source, response) = self.prepare_and_send(&request).await?;
+        // Headers/2xx already accepted: any failure from here on is
+        // post-headers, never the provider rejecting the request outright.
+        if let Some(ctx) = coda_diagnostics::current() {
+            let dispatch = if route_source == coda_diagnostics::detail::RouteSource::RerouteAfterMismatch { 2 } else { 1 };
+            ctx.record(coda_diagnostics::Event::StreamOpened {
+                dispatch,
+                protocol: endpoint.protocol().as_str(),
+                route_source: route_source.as_str(),
+            });
+        }
 
         let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
         let decoder = match endpoint {

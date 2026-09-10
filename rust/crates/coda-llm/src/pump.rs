@@ -132,11 +132,21 @@ pub(crate) async fn pump<D: ProtocolDecoder>(
 
     // Flush an event left buffered by a stream that ended without a blank line.
     if let Some(event) = sse.finish() {
-        if let Ok(decoded) = decoder.decode(&event.name, &event.data) {
-            for e in decoded {
-                if tx.send(Ok(e)).await.is_err() {
-                    return;
+        match decoder.decode(&event.name, &event.data) {
+            Ok(decoded) => {
+                for e in decoded {
+                    if tx.send(Ok(e)).await.is_err() {
+                        return;
+                    }
                 }
+            }
+            Err(error) => {
+                // A decode failure on the final flushed event is a genuine
+                // protocol error, not a silently-truncated stream: reporting
+                // it as `IncompleteStream` would misclassify a decodable-but-
+                // rejected payload as "we never heard the end".
+                let _ = tx.send(Err(error)).await;
+                return;
             }
         }
     }

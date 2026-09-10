@@ -4,6 +4,7 @@
 //! These drive the full path — socket, chunked body, UTF-8 carry buffer,
 //! decoder, channel — because that is where the seams are.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use coda_llm::copilot::{CopilotClient, CopilotConfig, CopilotEndpoint};
@@ -12,6 +13,33 @@ use coda_llm::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
+
+// ─── Diagnostics test harness ──────────────────────────────────────────────
+
+fn diag_ctx(dir: &std::path::Path) -> coda_diagnostics::DiagnosticContext {
+    let logger = coda_diagnostics::Logger::open(
+        coda_diagnostics::Options {
+            directory: dir.to_path_buf(),
+            file: None,
+            role: coda_diagnostics::ProcessRole::Run,
+            version: "test".into(),
+            verbosity: coda_diagnostics::Verbosity::Trace,
+        },
+        coda_diagnostics::Limits::default(),
+    )
+    .expect("logger opens");
+    coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+}
+
+fn diag_lines(ctx: &coda_diagnostics::DiagnosticContext) -> Vec<serde_json::Value> {
+    let path = ctx.logger().status().path.expect("a log path");
+    std::fs::read_to_string(path)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
 
 // ─── Test infrastructure ─────────────────────────────────────────────────────
 
@@ -601,4 +629,271 @@ async fn mismatch_retry_gives_up_when_re_resolution_still_yields_chat() {
         "original 400 body must surface, got: {error}"
     );
     assert!(!error.is_retryable());
+}
+
+// ─── BUG4: diagnostics — dispatch/protocol/route provenance ─────────────────
+
+/// The reroute after a chat-completions mismatch is two distinct physical
+/// dispatches: dispatch 1 (chat, mismatched, no stream ever opens) and
+/// dispatch 2 (responses, succeeds) — each with its own fresh request shape
+/// and correct route-source provenance, and `stream_opened` recorded only
+/// for the dispatch that actually got a 2xx.
+#[tokio::test]
+async fn mismatch_reroute_records_two_dispatches_with_fresh_shape_and_stream_opened() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+
+    let models_chat_only = serde_json::json!({
+        "data": [{ "id": "gpt-4o", "supported_endpoints": ["/chat/completions"] }]
+    })
+    .to_string();
+    let mismatch_400 =
+        r#"{"error":{"message":"The model is not accessible via /chat/completions"}}"#.to_string();
+    let models_with_responses = serde_json::json!({
+        "data": [{ "id": "gpt-4o", "supported_endpoints": ["/responses"] }]
+    })
+    .to_string();
+
+    let url = serve_n(vec![
+        (200, json_headers(), vec![models_chat_only]),
+        (400, json_headers(), vec![mismatch_400]),
+        (200, json_headers(), vec![models_with_responses]),
+        (200, sse_headers(), vec![responses_text_delta("retry succeeded"), responses_completed(5, 3)]),
+    ])
+    .await;
+    coda_llm::copilot::models::cache_invalidate(&url);
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let stream = client(url).stream(request()).await.expect("stream");
+        stream.collect().await.expect("complete");
+    })
+    .await;
+
+    let lines = diag_lines(&ctx);
+    let shapes: Vec<_> = lines.iter().filter(|l| l["kind"] == "request_shape").collect();
+    assert_eq!(shapes.len(), 2, "one request_shape per physical dispatch: {lines:?}");
+    assert_eq!(shapes[0]["dispatch"], 1);
+    assert_eq!(shapes[0]["protocol"], "copilot_chat_completions");
+    assert_eq!(shapes[0]["route_source"], "model_metadata", "the cached model row named /chat/completions, a recognized endpoint");
+    assert_eq!(shapes[1]["dispatch"], 2);
+    assert_eq!(shapes[1]["protocol"], "copilot_responses");
+    assert_eq!(shapes[1]["route_source"], "reroute_after_mismatch");
+
+    let failure_details: Vec<_> = lines.iter().filter(|l| l["kind"] == "http_failure_details").collect();
+    assert_eq!(failure_details.len(), 1, "only dispatch 1 ever failed: {lines:?}");
+    assert_eq!(failure_details[0]["dispatch"], 1);
+
+    let opened: Vec<_> = lines.iter().filter(|l| l["kind"] == "stream_opened").collect();
+    assert_eq!(opened.len(), 1, "stream_opened only for the dispatch that actually got 2xx: {lines:?}");
+    assert_eq!(opened[0]["dispatch"], 2);
+    assert_eq!(opened[0]["protocol"], "copilot_responses");
+    assert_eq!(opened[0]["route_source"], "reroute_after_mismatch");
+
+    // stream_opened must physically follow both request_shape/http_failure_details
+    // for dispatch 1, and follow (not precede) dispatch 2's own request_shape.
+    let opened_pos = lines.iter().position(|l| l["kind"] == "stream_opened").unwrap();
+    let dispatch2_shape_pos =
+        lines.iter().position(|l| l["kind"] == "request_shape" && l["dispatch"] == 2).unwrap();
+    assert!(dispatch2_shape_pos < opened_pos);
+}
+
+/// A model whose metadata was never fetched at all (no cache, no `/models`
+/// entry for it) is `metadata_missing_default`, distinct from a model whose
+/// metadata exists but names nothing recognized
+/// (`metadata_unrecognized_default`) — collapsing the two would let a
+/// caller believe an absent catalog and an unrecognized catalog entry are
+/// the same routing decision.
+#[tokio::test]
+async fn missing_vs_unrecognized_metadata_are_recorded_distinctly() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+    let body = vec![chat_done_chunk("stop")];
+    let url = serve_text(200, sse_headers(), body).await;
+
+    // No cache at all for this base URL/model → MetadataMissingDefault.
+    coda_llm::copilot::models::cache_invalidate(&url);
+    // Pre-seed the cache with an *empty* model list is impossible (empty
+    // lists are never cached — see `models::cache_set`), so populate a
+    // *different* model id: `gpt-4o` itself is still absent from the cache.
+    coda_llm::copilot::models::cache_set(&url, vec![ModelInfo::new("some-other-model")]);
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let stream = client(url).stream(request()).await.expect("stream");
+        stream.collect().await.expect("complete");
+    })
+    .await;
+
+    let lines = diag_lines(&ctx);
+    let shape = lines.iter().find(|l| l["kind"] == "request_shape").expect("a request_shape event");
+    assert_eq!(shape["route_source"], "metadata_missing_default");
+
+    let directory = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(directory.path());
+    let url = serve_text(200, sse_headers(), vec![chat_done_chunk("stop")]).await;
+    let mut model = ModelInfo::new("gpt-4o");
+    model.supported_endpoints = vec!["/v1/embeddings".into()];
+    coda_llm::copilot::models::cache_set(&url, vec![model]);
+    coda_diagnostics::scope(ctx.clone(), async {
+        client(url).stream(request()).await.unwrap().collect().await.unwrap();
+    }).await;
+    let lines = diag_lines(&ctx);
+    let shape = lines.iter().find(|line| line["kind"] == "request_shape").unwrap();
+    assert_eq!(shape["protocol"], "copilot_chat_completions");
+    assert_eq!(shape["route_source"], "metadata_unrecognized_default");
+}
+
+#[tokio::test]
+async fn an_incomplete_http_error_body_is_unreadable_not_empty() {
+    let directory = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(directory.path());
+    let url = serve_text(
+        400,
+        "content-type: application/json\r\ncontent-length: 500\r\nconnection: close\r\n",
+        vec!["{}".into()],
+    ).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), coda_diagnostics::scope(ctx.clone(), async {
+        client_with_endpoint(url, "gpt-4o", "/responses").stream(request()).await
+    })).await.expect("body EOF must not hang");
+    assert!(matches!(result, Err(LlmError::Api { status: 400, .. })));
+    let lines = diag_lines(&ctx);
+    let detail = &lines.iter().find(|line| line["kind"] == "http_failure_details").unwrap()["detail"];
+    assert_eq!(detail["body_kind"], "unreadable");
+    for field in ["error_type", "error_code", "parameter"] {
+        assert_eq!(detail[field]["state"], "unavailable");
+    }
+    assert!(!lines.iter().any(|line| line["kind"] == "stream_opened"));
+}
+
+/// Prestream failures (the HTTP retry policy exhausted, never a 2xx) must be
+/// `request_failure`, never `stream_failure` — and no `stream_opened` is
+/// ever recorded for that context, since headers were never accepted.
+#[tokio::test]
+async fn a_prestream_400_never_opens_a_stream_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+    let body = vec![r#"{"error":{"type":"invalid_request_error","code":"model_not_found"}}"#.to_string()];
+    let url = serve_text(400, json_headers(), body).await;
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let _ = client_with_endpoint(url, "gpt-4o", "/chat/completions").stream(request()).await;
+    })
+    .await;
+
+    let lines = diag_lines(&ctx);
+    assert!(!lines.iter().any(|l| l["kind"] == "stream_opened"), "{lines:?}");
+    // The client-level `record_stream_failure`/`request_failure` split lives
+    // in coda-agent (which drives `client.stream()`); at this layer we only
+    // assert the HTTP-level facts are present and no stream ever opened.
+    assert!(lines.iter().any(|l| l["kind"] == "http_failure_details"), "{lines:?}");
+}
+
+/// Matrix over structured/unstructured provider error bodies: a recognized
+/// `type`/`code`/`param`, an unrecognized-but-well-formed one, a non-JSON
+/// body, an empty body, and an oversized body must each classify distinctly
+/// — and the actual (never-allowlisted) values must never appear anywhere
+/// in the persisted log.
+#[tokio::test]
+async fn error_body_kind_matrix_classifies_each_case_and_never_leaks_unrecognized_text() {
+    let cases: Vec<(&str, String, &str)> = vec![
+        (
+            "recognized",
+            r#"{"error":{"type":"invalid_request_error","code":"model_not_found","param":"model","message":"canary-recognized-message"}}"#.to_string(),
+            "json",
+        ),
+        (
+            "unrecognized",
+            r#"{"error":{"type":"canary-unrecognized-type","code":"canary-unrecognized-code","param":"canary.unrecognized.param"}}"#.to_string(),
+            "json",
+        ),
+        ("non_json", "canary-not-json-at-all <<>>".to_string(), "non_json"),
+        ("empty", String::new(), "empty"),
+        (
+            "oversized",
+            format!(r#"{{"error":{{"type":"invalid_request_error","code":"canary-oversized-{}"}}}}"#, "x".repeat(70_000)),
+            "oversized",
+        ),
+    ];
+
+    for (label, body, expected_kind) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = diag_ctx(dir.path());
+        let url = serve_text(400, json_headers(), vec![body.clone()]).await;
+
+        coda_diagnostics::scope(ctx.clone(), async {
+            let _ = client_with_endpoint(url, "gpt-4o", "/chat/completions").stream(request()).await;
+        })
+        .await;
+
+        let lines = diag_lines(&ctx);
+        let details = lines
+            .iter()
+            .find(|l| l["kind"] == "http_failure_details")
+            .unwrap_or_else(|| panic!("[{label}] expected http_failure_details, got: {lines:?}"));
+        assert_eq!(details["detail"]["body_kind"], expected_kind, "[{label}]");
+
+        if label == "recognized" {
+            assert_eq!(details["detail"]["error_type"]["state"], "recognized");
+            assert_eq!(details["detail"]["error_type"]["value"], "invalid_request_error");
+            assert_eq!(details["detail"]["error_code"]["state"], "recognized");
+            assert_eq!(details["detail"]["error_code"]["value"], "model_not_found");
+            assert_eq!(details["detail"]["parameter"]["state"], "recognized");
+            assert_eq!(details["detail"]["parameter"]["value"], "model");
+        }
+        if label == "unrecognized" {
+            assert_eq!(details["detail"]["error_type"]["state"], "unrecognized");
+            assert_eq!(details["detail"]["error_code"]["state"], "unrecognized");
+            assert_eq!(details["detail"]["parameter"]["state"], "unrecognized");
+        }
+        if label == "non_json" || label == "empty" {
+            assert_eq!(details["detail"]["error_type"]["state"], "unavailable");
+            assert_eq!(details["detail"]["error_code"]["state"], "unavailable");
+        }
+        if label == "oversized" {
+            assert_eq!(details["detail"]["error_type"]["state"], "omitted");
+            assert_eq!(details["detail"]["error_code"]["state"], "omitted");
+        }
+
+        for line in &lines {
+            let serialized = line.to_string();
+            assert!(!serialized.contains("canary"), "[{label}] a canary value leaked verbatim: {serialized}");
+        }
+    }
+}
+
+/// Full-log privacy scan: prompt text, tool names/schemas, and the
+/// provider's free-text `message` must never appear anywhere in the
+/// persisted JSONL, at any verbosity, even when the request carries a
+/// system prompt and tool definitions and the response 400s with a
+/// structured body whose `message` echoes them back (as real gateways do).
+#[tokio::test]
+async fn full_log_privacy_scan_finds_no_prompt_tool_or_message_canaries() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = diag_ctx(dir.path());
+
+    let secret_system = "SYSTEM-CANARY-do-not-ever-persist-this-prompt";
+    let secret_tool = "canary_tool_name_should_never_appear";
+    let secret_arg_schema = r#"{"type":"object","properties":{"canary_secret_field":{"type":"string"}}}"#;
+    let body = format!(
+        r#"{{"error":{{"type":"invalid_request_error","message":"rejected: {secret_system} / {secret_tool}"}}}}"#
+    );
+    let url = serve_text(400, json_headers(), vec![body]).await;
+
+    let request = ChatRequest::new("gpt-4o", vec![Message::user("what is my api key sk-test-canary-123?")])
+        .with_system(secret_system)
+        .with_tools(vec![coda_llm::ToolDefinition::new(secret_tool, "d", secret_arg_schema)]);
+
+    coda_diagnostics::scope(ctx.clone(), async {
+        let _ = client_with_endpoint(url, "gpt-4o", "/chat/completions").stream(request).await;
+    })
+    .await;
+
+    let raw = std::fs::read_to_string(ctx.logger().status().path.expect("a log path")).unwrap();
+    for canary in [secret_system, secret_tool, "canary_secret_field", "sk-test-canary-123", "rejected:"] {
+        assert!(!raw.contains(canary), "canary `{canary}` leaked into the diagnostic log:\n{raw}");
+    }
+    // Still records the recognized, safe classification.
+    assert!(raw.contains("invalid_request_error"));
+    assert!(raw.contains("request_shape"));
+    let shape = diag_lines(&ctx).into_iter().find(|line| line["kind"] == "request_shape").unwrap();
+    assert_eq!(shape["system_present"], true, "the chat system-role item was not reported");
 }
