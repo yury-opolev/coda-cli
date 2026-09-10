@@ -88,13 +88,27 @@ impl RetryPolicy {
 /// The `provider` label is used only in tracing — pass a short identifier such
 /// as `"anthropic"` or `"copilot"`.
 ///
-/// Records HTTP attempt/result/retry/recovery diagnostics under the ambient
-/// [`coda_diagnostics`] context, when one is present. The provider
-/// request-id header is read here, before the response body is consumed —
-/// this is the only place it is ever available.
+/// `dispatch` identifies which *physical dispatch* this call is (a fresh
+/// endpoint/body choice — Copilot's chat-mismatch reroute calls this a
+/// second time with `dispatch: 2`); `protocol`/`route_source`/`shape`
+/// describe the request this dispatch is sending and are recorded, per
+/// physical attempt, as [`coda_diagnostics::Event::RequestShape`] — computed
+/// once by the caller from the same final JSON passed to `.json(body)`, not
+/// re-derived here.
+///
+/// Records HTTP attempt/result/retry/recovery diagnostics, request-shape
+/// detail, and (on a non-2xx response) a bounded structured extraction of
+/// the error body, under the ambient [`coda_diagnostics`] context, when one
+/// is present. The provider request-id header is read here, before the
+/// response body is consumed — this is the only place it is ever available.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn send_with_retry<F>(
     policy: &RetryPolicy,
     provider: &str,
+    dispatch: u32,
+    protocol: &'static str,
+    route_source: coda_diagnostics::detail::RouteSource,
+    shape: coda_diagnostics::detail::RequestShape,
     mut make_builder: F,
 ) -> Result<reqwest::Response, LlmError>
 where
@@ -109,55 +123,19 @@ where
         }
         let started = std::time::Instant::now();
 
-        let error = match make_builder().send().await {
-            Ok(response) if response.status().is_success() => {
-                let provider_request_id = extract_request_id(&response);
-                if let Some(ctx) = &ctx {
-                    ctx.record(coda_diagnostics::Event::HttpResult {
-                        attempt,
-                        status: Some(response.status().as_u16()),
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        provider_request_id,
-                    });
-                    if retried_at_least_once {
-                        ctx.record(coda_diagnostics::Event::HttpRecovery { attempt });
-                    }
-                }
-                return Ok(response);
-            }
-            Ok(response) => {
-                let status = response.status().as_u16();
-                // Read headers BEFORE consuming the body: `.text()` moves the
-                // response, and this is the only chance to see them.
-                let provider_request_id = extract_request_id(&response);
-                let retry_after = response
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(crate::error::parse_retry_after);
-                let body = response.text().await.unwrap_or_default();
-                if let Some(ctx) = &ctx {
-                    ctx.record(coda_diagnostics::Event::HttpResult {
-                        attempt,
-                        status: Some(status),
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        provider_request_id,
-                    });
-                }
-                LlmError::from_status(status, &body, retry_after)
-            }
-            Err(e) if e.is_timeout() => {
-                if let Some(ctx) = &ctx {
-                    ctx.record(coda_diagnostics::Event::HttpResult {
-                        attempt,
-                        status: None,
-                        duration_ms: started.elapsed().as_millis() as u64,
-                        provider_request_id: None,
-                    });
-                }
-                LlmError::Transport(format!("request timed out: {e}"))
-            }
+        // Build the request (fresh per attempt: URL/body/auth headers are
+        // recaptured by the closure), splitting the client out so the exact
+        // already-serialized wire bytes can be measured before it is ever
+        // sent — this is the only point they are available without
+        // re-encoding the JSON a second time.
+        let (client, built) = make_builder().build_split();
+        let error = match built {
             Err(e) => {
+                // A build failure never reaches the network: no request
+                // existed to measure, so no `RequestShape` is recorded (a
+                // future reader must not read its absence as "0 bytes").
+                // Classification matches the pre-existing behaviour for a
+                // `.send()` build failure: `LlmError::Transport`.
                 if let Some(ctx) = &ctx {
                     ctx.record(coda_diagnostics::Event::HttpResult {
                         attempt,
@@ -167,6 +145,97 @@ where
                     });
                 }
                 LlmError::Transport(e.to_string())
+            }
+            Ok(request) => {
+                let body_bytes = request
+                    .body()
+                    .and_then(reqwest::Body::as_bytes)
+                    .map(|bytes| bytes.len() as u64);
+                if let Some(ctx) = &ctx {
+                    ctx.record(coda_diagnostics::Event::RequestShape {
+                        dispatch,
+                        attempt,
+                        protocol,
+                        route_source: route_source.as_str(),
+                        shape,
+                        body_bytes,
+                    });
+                }
+
+                // `Client::execute` is exactly what `RequestBuilder::send`
+                // calls internally once a request is built — same timeouts,
+                // same redirect handling — so behaviour is unchanged.
+                match client.execute(request).await {
+                    Ok(response) if response.status().is_success() => {
+                        let provider_request_id = extract_request_id(&response);
+                        if let Some(ctx) = &ctx {
+                            ctx.record(coda_diagnostics::Event::HttpResult {
+                                attempt,
+                                status: Some(response.status().as_u16()),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                provider_request_id,
+                            });
+                            if retried_at_least_once {
+                                ctx.record(coda_diagnostics::Event::HttpRecovery { attempt });
+                            }
+                        }
+                        return Ok(response);
+                    }
+                    Ok(response) => {
+                        let status = response.status().as_u16();
+                        // Read headers BEFORE consuming the body: `.text()` moves
+                        // the response, and this is the only chance to see them.
+                        let provider_request_id = extract_request_id(&response);
+                        let retry_after = response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(crate::error::parse_retry_after);
+                        // Captured as a `Result`, not `.unwrap_or_default()`,
+                        // so a genuine body-read failure is distinguishable
+                        // from an ordinary empty body (`Unreadable`, never
+                        // mislabelled `Empty`) in the diagnostic extraction.
+                        let text_result = response.text().await;
+                        if let Some(ctx) = &ctx {
+                            ctx.record(coda_diagnostics::Event::HttpResult {
+                                attempt,
+                                status: Some(status),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                provider_request_id,
+                            });
+                            ctx.record(coda_diagnostics::Event::HttpFailureDetails {
+                                dispatch,
+                                attempt,
+                                status,
+                                detail: crate::diagnostics::error_body_detail_from_text(&text_result),
+                            });
+                        }
+                        let body = text_result.unwrap_or_default();
+                        LlmError::from_status(status, &body, retry_after)
+                    }
+                    Err(e) if e.is_timeout() => {
+                        if let Some(ctx) = &ctx {
+                            ctx.record(coda_diagnostics::Event::HttpResult {
+                                attempt,
+                                status: None,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                provider_request_id: None,
+                            });
+                        }
+                        LlmError::Transport(format!("request timed out: {e}"))
+                    }
+                    Err(e) => {
+                        if let Some(ctx) = &ctx {
+                            ctx.record(coda_diagnostics::Event::HttpResult {
+                                attempt,
+                                status: None,
+                                duration_ms: started.elapsed().as_millis() as u64,
+                                provider_request_id: None,
+                            });
+                        }
+                        LlmError::Transport(e.to_string())
+                    }
+                }
             }
         };
 
@@ -427,6 +496,21 @@ mod tests {
         format!("http://127.0.0.1:{port}")
     }
 
+    /// A tiny, fixed test request-shape/protocol/route-source triple for
+    /// tests that only care about the retry/HTTP-diagnostics behaviour, not
+    /// about the shape fields themselves.
+    fn test_shape_args() -> (
+        &'static str,
+        coda_diagnostics::detail::RouteSource,
+        coda_diagnostics::detail::RequestShape,
+    ) {
+        (
+            coda_diagnostics::detail::Protocol::AnthropicMessages.as_str(),
+            coda_diagnostics::detail::RouteSource::FixedProviderDefault,
+            coda_diagnostics::detail::RequestShape::default(),
+        )
+    }
+
     #[tokio::test]
     async fn a_successful_attempt_records_attempt_and_result_with_the_request_id() {
         let dir = tempfile::tempdir().unwrap();
@@ -435,7 +519,8 @@ mod tests {
         let client = reqwest::Client::new();
 
         coda_diagnostics::scope(ctx.clone(), async {
-            send_with_retry(&RetryPolicy::none(), "test", || client.get(&url))
+            let (protocol, route_source, shape) = test_shape_args();
+            send_with_retry(&RetryPolicy::none(), "test", 1, protocol, route_source, shape, || client.get(&url))
                 .await
                 .expect("success");
         })
@@ -444,9 +529,10 @@ mod tests {
         let lines = read_recorded_lines(&ctx);
         assert_eq!(lines[0]["kind"], "http_attempt");
         assert_eq!(lines[0]["attempt"], 1);
-        assert_eq!(lines[1]["kind"], "http_result");
-        assert_eq!(lines[1]["status"], 200);
-        assert_eq!(lines[1]["provider_request_id"], "req-abc-123");
+        assert_eq!(lines[1]["kind"], "request_shape", "request_shape precedes the physical send: {lines:?}");
+        assert_eq!(lines[2]["kind"], "http_result");
+        assert_eq!(lines[2]["status"], 200);
+        assert_eq!(lines[2]["provider_request_id"], "req-abc-123");
         assert!(!lines.iter().any(|l| l["kind"] == "http_retry"));
     }
 
@@ -470,7 +556,8 @@ mod tests {
         };
 
         coda_diagnostics::scope(ctx.clone(), async {
-            send_with_retry(&policy, "test", || {
+            let (protocol, route_source, shape) = test_shape_args();
+            send_with_retry(&policy, "test", 1, protocol, route_source, shape, || {
                 let n = call.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let url = if n == 0 { &failing_url } else { &ok_url };
                 client.get(url)
@@ -490,6 +577,68 @@ mod tests {
         }
     }
 
+    // ── BUG4 regression: structured error/request-shape diagnostics ────────
+    //
+    // These reproduce the actual gap: today a loopback provider 400 with a
+    // structured `error.type`/`error.code`/`error.param` body, and the exact
+    // outgoing request shape/bytes, are simply never persisted. This test is
+    // written BEFORE the fix lands and is expected to fail (RED) against the
+    // pre-fix `send_with_retry`.
+    #[tokio::test]
+    async fn a_structured_400_persists_recognized_type_code_param_and_request_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(dir.path());
+        let body = r#"{"error":{"type":"invalid_request_error","code":"unsupported_parameter","param":"max_tokens","message":"top secret provider prose that must never be persisted"}}"#;
+        let url = respond_once(400, "", body).await;
+        let client = reqwest::Client::new();
+
+        coda_diagnostics::scope(ctx.clone(), async {
+            let shape = coda_diagnostics::detail::RequestShape::from_wire_json(
+                &serde_json::json!({"model": "m", "messages": [{"role":"user","content":"hi"}], "max_tokens": 100, "stream": true}),
+            );
+            let _ = send_with_retry(
+                &RetryPolicy::none(),
+                "test",
+                1,
+                coda_diagnostics::detail::Protocol::AnthropicMessages.as_str(),
+                coda_diagnostics::detail::RouteSource::FixedProviderDefault,
+                shape,
+                || client.post(&url).json(&serde_json::json!({"model": "m", "messages": [{"role":"user","content":"hi"}], "max_tokens": 100, "stream": true})),
+            )
+            .await;
+        })
+        .await;
+
+        let lines = read_recorded_lines(&ctx);
+        let shape = lines.iter().find(|l| l["kind"] == "request_shape");
+        assert!(shape.is_some(), "expected a request_shape event, got: {lines:?}");
+        let shape = shape.unwrap();
+        assert_eq!(shape["dispatch"], 1);
+        assert_eq!(shape["protocol"], "anthropic_messages");
+        assert_eq!(shape["route_source"], "fixed_provider_default");
+        assert_eq!(shape["message_count"], 1);
+        assert_eq!(shape["max_tokens_present"], true);
+        assert_eq!(shape["stream_requested"], true);
+        // The exact serialized wire body length, not a second `to_string()`.
+        let expected_bytes =
+            serde_json::to_vec(&serde_json::json!({"model": "m", "messages": [{"role":"user","content":"hi"}], "max_tokens": 100, "stream": true}))
+                .unwrap()
+                .len() as u64;
+        assert_eq!(shape["body_bytes"].as_u64().unwrap(), expected_bytes);
+
+        let failure_details = lines.iter().find(|l| l["kind"] == "http_failure_details");
+        assert!(failure_details.is_some(), "expected an http_failure_details event, got: {lines:?}");
+        let details = &failure_details.unwrap()["detail"];
+        assert_eq!(details["error_type"]["value"], "invalid_request_error");
+        assert_eq!(details["error_code"]["value"], "unsupported_parameter");
+        assert_eq!(details["parameter"]["value"], "max_tokens");
+
+        for line in &lines {
+            let serialized = line.to_string();
+            assert!(!serialized.contains("top secret"), "provider message text must never be persisted: {serialized}");
+        }
+    }
+
     #[tokio::test]
     async fn an_unusual_request_id_header_is_recorded_as_absent_not_verbatim() {
         let dir = tempfile::tempdir().unwrap();
@@ -498,13 +647,15 @@ mod tests {
         let client = reqwest::Client::new();
 
         coda_diagnostics::scope(ctx.clone(), async {
-            send_with_retry(&RetryPolicy::none(), "test", || client.get(&url))
+            let (protocol, route_source, shape) = test_shape_args();
+            send_with_retry(&RetryPolicy::none(), "test", 1, protocol, route_source, shape, || client.get(&url))
                 .await
                 .expect("success");
         })
         .await;
 
         let lines = read_recorded_lines(&ctx);
-        assert!(lines[1]["provider_request_id"].is_null());
+        let result = lines.iter().find(|l| l["kind"] == "http_result").expect("an http_result event");
+        assert!(result["provider_request_id"].is_null());
     }
 }

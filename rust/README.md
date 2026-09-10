@@ -691,10 +691,112 @@ and engine start/end, session initialized/resumed, turn start/end/failure,
 HTTP attempt/result/retry/recovery, and streamed/transport/protocol failure.
 HTTP metadata (status, a validated bounded provider request id, duration) is
 captured in the shared retry loop *before* the response body is consumed —
-the only place it is available. A recognized missing-parameter provider error
-(the `input[N].summary` shape a couple of endpoints report) may record that
-exact bounded path from a structured `error.param` field; anything else is
-category-and-status only.
+the only place it is available. Structured error fields are allowlisted;
+unknown provider text is never copied into the log.
+
+**Request shape, routing provenance, and structured error detail** (added
+for the model-specific-HTTP-400 diagnostic gap): at Normal verbosity (not
+gated to Debug/Trace), every physical HTTP attempt against a provider now
+also records:
+
+- `request_shape` — recorded immediately before the request is executed,
+  keyed by the envelope's own `request_id` plus a `dispatch: u32` (which
+  physical endpoint/body choice — a Copilot chat-completions mismatch
+  reroute is `dispatch: 2`) and the legacy per-dispatch `attempt` counter.
+  Carries the fixed wire `protocol` (`anthropic_messages`,
+  `copilot_chat_completions`, `copilot_responses`, `copilot_messages`), a
+  fixed `route_source` explaining *why* that endpoint was chosen
+  (`fixed_provider_default`, `model_metadata`, `metadata_missing_default`,
+  `metadata_unrecognized_default`, `reroute_after_mismatch`), and a
+  `RequestShape`: bounded counts (`message_count` — serialized `messages`/
+  `input` wire items, not a claim about user turns; `tools_count`, both
+  saturating at 10 000) and boolean presence flags
+  (`system_present`, `stream_requested`, `reasoning_present`,
+  `max_tokens_present`, `max_output_tokens_present`,
+  `max_completion_tokens_present`, `temperature_present`,
+  `tool_choice_present`, `parallel_tool_calls_present`,
+  `response_format_present`) computed from the *actual final serialized
+  JSON* passed to the HTTP client — never re-derived from the caller's own
+  request object, and never a value or key from the user's own
+  messages/tools. `body_bytes` is the exact length of the already-built
+  wire body (via `reqwest::Body::as_bytes`, not a second
+  `serde_json::to_string`); it is `None` — never an invented `0` — only when
+  the request itself failed to build (no bytes ever existed to measure). A
+  retried attempt within the same dispatch gets its own `request_shape`
+  record with the identical shape/bytes (the retried body did not change); a
+  reroute gets a fresh one for its new endpoint/body. For Chat Completions,
+  `system_present` also detects system-role items inside `messages`, and
+  `message_count` includes those items. Presence flags describe the serialized
+  body, not requested capabilities: options not emitted by a builder remain
+  false even when the schema reserves a flag for them.
+- `http_failure_details` — recorded once a non-2xx response's body has been
+  read, keyed by the same `dispatch`/`attempt`. Carries a bounded,
+  allowlisted structured extraction of the error body (`ErrorBodyDetail`):
+  `body_kind` (`json`/`non_json`/`empty`/`unreadable`/`oversized` — a
+  genuine body-*read* failure is `unreadable`, never conflated with an
+  ordinary empty body), and, when the body is valid JSON, three
+  independently-classified fields — `error_type`, `error_code`, `parameter`
+  — each a `{state, value?}` pair: `recognized` (value is one of the fixed
+  allowlists below), `unrecognized` (present, valid JSON, but not on the
+  allowlist — the actual value is never recorded), `missing` (valid JSON,
+  field absent), `omitted` (present but excluded for exceeding a 64-byte
+  bound — the same bound the older `parameter`-only extraction already
+  used), or `unavailable` (the body itself was not JSON/was empty/could not
+  be read, so the field cannot even be evaluated). The whole body is capped
+  at 64 KiB for this extraction (`oversized` beyond that; the full,
+  unbounded body is still kept only in memory for existing
+  retry/`LlmError` behavior, unaffected by this cap). Recognized `type`
+  values: `invalid_request_error`, `authentication_error`,
+  `permission_error`, `not_found_error`, `rate_limit_error`,
+  `overloaded_error`, `api_error`, `server_error`, `model_error`,
+  `billing_error`, `insufficient_quota`. Recognized `code` values:
+  `model_not_found`, `context_length_exceeded`, `unsupported_parameter`,
+  `unsupported_value`, `invalid_value`, `missing_required_parameter`,
+  `invalid_api_key`, `rate_limit_exceeded`, `insufficient_quota`,
+  `content_filter`, `tool_use_failed`. `parameter` reuses the existing
+  bounded, pattern-validated allowlist (top-level names plus the
+  `input[N].{summary,id,encrypted_content}` shape). The provider's free-text
+  `message` is never extracted, at any state. The writer revalidates error
+  fields against the same allowlists, including directly constructed events;
+  the older `stream_failure.parameter` field uses the same 64 KiB body cap.
+- `stream_opened` — recorded once a physical attempt's 2xx response/headers
+  are accepted, immediately before streaming/decoding begins, carrying the
+  same `dispatch`/`protocol`/`route_source`. Any failure recorded after this
+  point for the same context is necessarily post-headers (an inline
+  provider error event, a truncated/invalid stream, a mid-stream transport
+  drop) — never the provider rejecting the request outright.
+- `request_failure` — replaces what used to be misfiled as `stream_failure`
+  for a failure that happens *before* any `stream_opened` was ever recorded
+  for the context: the shared HTTP retry policy already exhausted every
+  physical attempt (or the request could not be built/sent) without ever
+  seeing a 2xx. Carries `category`/`status` plus the same optional
+  `ErrorBodyDetail` as `http_failure_details`. If no `http_attempt`/
+  `request_shape` appears at all under the same `request_id`, the failure
+  happened locally (e.g. a credential lookup) rather than as a provider
+  refusal — this crate does not attempt to distinguish that further.
+- `stream_failure` (existing event, extended) now also carries an optional
+  `detail: ErrorBodyDetail`, populated from the same bounded extractor —
+  including for a failure that arrived as an *inline* SSE `error`/
+  `response.failed` event rather than a non-2xx HTTP status (the Anthropic
+  Messages and Responses decoders now preserve that inline event's raw JSON
+  in the error's `body` for exactly this purpose; the free-text `message`
+  they already exposed is unchanged).
+
+**Known, honest limitations of this diagnostic layer**: it identifies
+*which* structured error shape a provider returned and exactly what was
+sent — it does not, and cannot, diagnose the underlying cause of any
+specific model's HTTP 400. An unrecognized `type`/`code`/`param` is recorded
+as `unrecognized`, not resolved to a friendly label. `GET /models`
+(preflight/auth/model-discovery) requests are outside the inference retry
+loop and are **not** covered by `request_shape`/`http_failure_details`/
+`stream_opened` — only an actual inference dispatch is. Raw request/response
+bodies are never persisted, at any verbosity, including Trace: there is no
+raw-dump mode. A test client that bypasses the shared HTTP retry loop (as
+several `coda-agent` unit tests do, on purpose, to isolate the agent's own
+retry arms) correctly produces no `request_shape`/`stream_opened` at all —
+an unknown/fake transport is not fabricated a route. This work does not
+change `LlmError::from_model_discovery_status`'s existing 403-vs-401
+model-listing/auth behavior (unchanged since 0.1.147) in any way.
 
 **What is never recorded, at any verbosity**: prompts, system prompts, tool
 names/arguments/results, response/request bodies or headers, encrypted

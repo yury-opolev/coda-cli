@@ -235,8 +235,11 @@ pub(crate) async fn stream_with_retries(
             Err(err) => {
                 // Bypasses the retry arms below by design: `client.stream()`
                 // already exhausted the HTTP-level retry policy internally
-                // (`send_with_retry`) before ever returning an error here.
-                record_stream_failure(attempt_ctx.as_ref(), &err);
+                // (`send_with_retry`) before ever returning an error here —
+                // i.e. before any 2xx headers were ever accepted. This is a
+                // request failure, not a stream failure: no `StreamOpened`
+                // was ever recorded for this context.
+                record_request_failure(attempt_ctx.as_ref(), &err);
                 record_model_request_end(attempt_ctx.as_ref(), outer_attempt, attempt_started, "failed");
                 sink.emit(AgentEvent::ModelRequestEnded {
                     request_id: model_request_id,
@@ -269,6 +272,19 @@ pub(crate) async fn stream_with_retries(
             request_id: model_request_id,
             outcome: outer_outcome.into(),
         });
+
+        // Recorded exactly ONCE here, immediately after the stream was
+        // actually consumed and before the retry arms below inspect the
+        // error — not only in the terminal catch-all. Without this, a
+        // failure that a retry arm swallows (context-overflow compaction,
+        // transient-transport, tool-schema eviction) would never reach
+        // Normal-verbosity diagnostics at all, even though real stream
+        // consumption (post-`StreamOpened`) genuinely failed. Ordinary
+        // cancellation stays unlogged: `record_stream_failure` already
+        // no-ops on `LlmError::Cancelled`.
+        if let Err(err) = &drive_result {
+            record_stream_failure(attempt_ctx.as_ref(), err);
+        }
 
         match drive_result {
             Ok(()) => {
@@ -380,8 +396,9 @@ pub(crate) async fn stream_with_retries(
                 }
             }
 
+            // Already recorded once, above, right after consumption — no
+            // duplicate `record_stream_failure` call here.
             Err(err) => {
-                record_stream_failure(attempt_ctx.as_ref(), &err);
                 return Err(err);
             }
         }
@@ -406,11 +423,41 @@ fn record_model_request_end(
     });
 }
 
+/// Records the outer request failing *before* any [`coda_diagnostics::Event::StreamOpened`]
+/// was ever recorded for this context — the shared HTTP retry policy already
+/// exhausted its attempts (or the request could not be built/sent), so no
+/// 2xx headers were ever accepted. Uses only closed classification and
+/// bounded, allowlisted detail — never the error's `Display`/`Debug`, which
+/// can carry provider text or a credential-bearing URL. A no-op when there
+/// is no ambient context or the "failure" is an ordinary user-initiated
+/// cancellation.
+fn record_request_failure(ctx: Option<&coda_diagnostics::DiagnosticContext>, err: &LlmError) {
+    let Some(ctx) = ctx else { return };
+    let category = coda_llm::diagnostics::category(err);
+    let event = match err {
+        LlmError::Cancelled => return,
+        LlmError::Transport(_) => coda_diagnostics::Event::TransportFailure { category },
+        LlmError::Protocol(_) => coda_diagnostics::Event::ProtocolFailure { category },
+        _ => coda_diagnostics::Event::RequestFailure {
+            category,
+            status: coda_llm::diagnostics::status(err),
+            detail: coda_llm::diagnostics::error_detail(err),
+        },
+    };
+    ctx.record(event);
+}
+
 /// Records a stream/transport/protocol failure under `ctx`'s identity, using
 /// only closed classification and bounded, allowlisted detail — never the
 /// error's `Display`/`Debug`, which can carry provider text or a
 /// credential-bearing URL. A no-op when there is no ambient context or the
 /// "failure" is an ordinary user-initiated cancellation.
+///
+/// Unlike [`record_request_failure`], this is only ever reached after the
+/// stream successfully opened (2xx headers already accepted, recorded as
+/// [`coda_diagnostics::Event::StreamOpened`] by the client) — so a
+/// `StreamFailure` here is necessarily post-headers: an inline SSE error, a
+/// truncated/invalid stream, or a connection dropped mid-response.
 fn record_stream_failure(ctx: Option<&coda_diagnostics::DiagnosticContext>, err: &LlmError) {
     let Some(ctx) = ctx else { return };
     let category = coda_llm::diagnostics::category(err);
@@ -426,6 +473,7 @@ fn record_stream_failure(ctx: Option<&coda_diagnostics::DiagnosticContext>, err:
             // `send_with_retry`; never invented at this layer.
             provider_request_id: None,
             parameter: coda_llm::diagnostics::parameter(err),
+            detail: coda_llm::diagnostics::error_detail(err),
         },
     };
     ctx.record(event);
@@ -1163,6 +1211,99 @@ mod tests {
         assert!(!content.contains("connection reset"));
     }
 
+    // ── BUG4 regression: prestream failures must be `request_failure` ───────
+
+    #[tokio::test]
+    async fn a_prestream_api_failure_is_recorded_as_request_failure_not_stream_failure() {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+
+        // `client.stream()` itself returns `Err` — i.e. the shared HTTP retry
+        // policy already exhausted every physical attempt before any 2xx
+        // response/headers were ever seen. This must be indistinguishable
+        // from "the provider rejected the request", never mislabelled as a
+        // post-headers stream failure.
+        struct RejectsBeforeAnyStreamClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for RejectsBeforeAnyStreamClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                Err(coda_llm::LlmError::Api {
+                    status: 400,
+                    message: "top-secret provider prose that must never be persisted".into(),
+                    kind: coda_llm::FailureKind::Permanent,
+                    retry_after: None,
+                    body: Some(
+                        r#"{"error":{"type":"invalid_request_error","code":"unsupported_parameter","param":"max_tokens"}}"#
+                            .into(),
+                    ),
+                })
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = RejectsBeforeAnyStreamClient;
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let result = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                None,
+                &mut blocked,
+            ),
+        )
+        .await;
+        assert!(result.is_err());
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        assert!(!content.contains("\"kind\":\"stream_failure\""), "a prestream failure must not be recorded as stream_failure: {content}");
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let failure = lines.iter().find(|l| l["kind"] == "request_failure").expect("a request_failure record");
+        assert_eq!(failure["category"], "client_error");
+        assert_eq!(failure["status"], 400);
+        assert_eq!(failure["detail"]["error_type"]["value"], "invalid_request_error");
+        assert_eq!(failure["detail"]["error_code"]["value"], "unsupported_parameter");
+        assert!(!content.contains("top-secret"), "the free-text message must never be persisted");
+        assert!(!content.contains("stream_opened"), "no stream ever opened for a prestream failure");
+    }
+
     // ── diagnostics: --diagnostic-verbosity gates optional detail only ──────
 
     #[tokio::test]
@@ -1378,5 +1519,432 @@ mod tests {
                 && !content.contains("protocol_failure"),
             "cancellation is a normal user action, not a diagnostic failure: {content}"
         );
+    }
+
+    // ── reviewfinding4: every retry-swallowed Err(drive_result) must still be
+    // recorded once, immediately after consumption — not only in the
+    // terminal catch-all ────────────────────────────────────────────────────
+    //
+    // Before the fix, `record_stream_failure` was only reachable from the
+    // final `Err(err) => { ...; return Err(err); }` arm at the bottom of the
+    // retry `match`. Any error caught by one of the three retry arms above it
+    // (context-overflow compaction, transient-transport, tool-schema
+    // eviction) was silently swallowed at Normal verbosity: the real,
+    // already-post-`StreamOpened` failure that triggered the retry left no
+    // trace at all (`ModelRequestEnd`, which does carry an outcome, is
+    // Debug-only). This block drives each recoverable family through one
+    // failing attempt and one successful retry and asserts the failure is
+    // still persisted — exactly once, under the failed attempt's own
+    // request id — and that the eventual success is unaffected.
+
+    /// One of the three retry-eligible failure families `stream_with_retries`
+    /// recognizes. Parametrizes the regression below across all three
+    /// without three near-identical test bodies.
+    enum RecoverableFamily {
+        TransientTransport,
+        ContextOverflow,
+        ToolSchema,
+    }
+
+    /// Drives `family`'s first outer attempt to a recoverable failure and its
+    /// second to success (`fail first stream then success second`), then
+    /// asserts: (1) the retry-swallowed failure is still persisted at Normal
+    /// verbosity, exactly once, carrying the failed attempt's own
+    /// `request_id`; (2) the call still eventually succeeds; (3) headers were
+    /// accepted (`client.stream()` itself returned `Ok`), so this must never
+    /// be misfiled as `request_failure`; (4) only closed, allowlisted
+    /// classification is persisted — never the free-text canary planted in
+    /// the error body/message.
+    async fn assert_recoverable_family_logs_failure_once_then_succeeds(family: RecoverableFamily) {
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::{Arc, Mutex};
+
+        const CANARY: &str = "canary-free-text-must-never-persist";
+        const TOOL_NAME: &str = "synthetic_tool";
+
+        let first_err = match family {
+            RecoverableFamily::TransientTransport => {
+                coda_llm::LlmError::Transport(format!("connection reset, {CANARY}"))
+            }
+            RecoverableFamily::ContextOverflow => coda_llm::LlmError::Api {
+                status: 400,
+                message: format!("context length exceeded, {CANARY}"),
+                kind: coda_llm::FailureKind::Permanent,
+                retry_after: None,
+                body: Some(format!(
+                    r#"{{"error":{{"type":"invalid_request_error","code":"context_length_exceeded","message":"{CANARY}"}}}}"#
+                )),
+            },
+            RecoverableFamily::ToolSchema => coda_llm::LlmError::Api {
+                status: 400,
+                message: format!("invalid tool schema, {CANARY}"),
+                kind: coda_llm::FailureKind::Permanent,
+                retry_after: None,
+                body: Some(format!(
+                    r#"{{"error":{{"type":"invalid_request_error","code":"unsupported_parameter","message":"Invalid schema for tool '{TOOL_NAME}': {CANARY}"}}}}"#
+                )),
+            },
+        };
+
+        // Headers/2xx are always accepted here — `client.stream()` itself
+        // never errors, only an already-open stream. The failure surfaces as
+        // an *event* mid-consumption, never as a `client.stream()` `Err`.
+        struct FailsOnceThenSucceedsClient {
+            calls: Mutex<usize>,
+            first_err: Mutex<Option<coda_llm::LlmError>>,
+        }
+        #[async_trait]
+        impl coda_llm::LlmClient for FailsOnceThenSucceedsClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                let n = {
+                    let mut g = self.calls.lock().unwrap();
+                    *g += 1;
+                    *g
+                };
+                let events: Vec<Result<StreamEvent, coda_llm::LlmError>> = if n == 1 {
+                    vec![Err(self.first_err.lock().unwrap().take().expect("first call only"))]
+                } else {
+                    vec![Ok(StreamEvent::TextDelta("ok".into())), Ok(done_event())]
+                };
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    for ev in events {
+                        let _ = tx.send(ev).await;
+                    }
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = FailsOnceThenSucceedsClient {
+            calls: Mutex::new(0),
+            first_err: Mutex::new(Some(first_err)),
+        };
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        if matches!(family, RecoverableFamily::ToolSchema) {
+            // Only a synthetic tool the provider is claimed to reject; must
+            // be present on `request.tools` for `try_identify_schema_rejection`
+            // to match it against the (quoted) name in the error body.
+            request.tools = vec![coda_llm::ToolDefinition::new(
+                TOOL_NAME,
+                "a synthetic tool used only by this test",
+                "{}",
+            )];
+        }
+        // Bounded to exactly one retry per family (§ "Bounds1transientretry
+        // 500ms acceptable") — enough to observe the swallow, never more.
+        let retry_cfg = RetryConfig { max_transport_retries: 1, max_schema_evictions: 1 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+        let compact: Option<&(dyn Fn() -> bool + Send + Sync)> = match family {
+            RecoverableFamily::ContextOverflow => Some(&|| true),
+            _ => None,
+        };
+
+        let result = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                compact,
+                &mut blocked,
+            ),
+        )
+        .await;
+        assert!(result.is_ok(), "the retry must still eventually succeed");
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let expected_kind = match family {
+            RecoverableFamily::TransientTransport => "transport_failure",
+            RecoverableFamily::ContextOverflow | RecoverableFamily::ToolSchema => "stream_failure",
+        };
+        let failures: Vec<&serde_json::Value> = lines.iter().filter(|l| l["kind"] == expected_kind).collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "the retry-swallowed failure must be recorded exactly once at Normal verbosity: {lines:?}"
+        );
+        assert!(
+            failures[0]["request_id"].as_str().is_some_and(|s| !s.is_empty()),
+            "the recorded failure must carry the failed outer attempt's own request id: {failures:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l["kind"] == "request_failure"),
+            "headers were accepted (client.stream() returned Ok) — this must never be a request_failure: {lines:?}"
+        );
+        // A distinct next-attempt request id is only observable at Normal if
+        // the successful retry *also* recorded a request-scoped event — it
+        // does not (no failure, and `ModelRequestStart`/`End` are
+        // Debug-only), so there is exactly one request id to observe here.
+        // Combined with the `failures.len() == 1` assertion above, this
+        // rules out the failed attempt's own record ever being duplicated
+        // onto — or conflated with — the successful retry.
+        assert!(!content.contains(CANARY), "the free-text canary must never be persisted: {content}");
+        if let Some(error_type) = failures[0].pointer("/detail/error_type/value") {
+            assert_eq!(error_type, "invalid_request_error", "error type must come from the closed allowlist: {failures:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn transient_transport_failure_is_logged_once_then_retry_succeeds() {
+        assert_recoverable_family_logs_failure_once_then_succeeds(RecoverableFamily::TransientTransport).await;
+    }
+
+    #[tokio::test]
+    async fn context_overflow_compaction_failure_is_logged_once_then_retry_succeeds() {
+        assert_recoverable_family_logs_failure_once_then_succeeds(RecoverableFamily::ContextOverflow).await;
+    }
+
+    #[tokio::test]
+    async fn tool_schema_eviction_failure_is_logged_once_then_retry_succeeds() {
+        assert_recoverable_family_logs_failure_once_then_succeeds(RecoverableFamily::ToolSchema).await;
+    }
+
+    #[tokio::test]
+    async fn a_final_nonretryable_failure_is_still_logged_exactly_once() {
+        // Guards the other half of the fix: removing the duplicate
+        // `record_stream_failure` call from the terminal catch-all arm must
+        // not silently drop the essential Normal-verbosity failure record for
+        // a genuinely non-retryable error. It must still be recorded, and
+        // (the regression a naive "add the call earlier but forget to remove
+        // the old one" fix would fail) exactly once, never twice.
+        use async_trait::async_trait;
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+
+        struct AlwaysFailsClient;
+        #[async_trait]
+        impl coda_llm::LlmClient for AlwaysFailsClient {
+            fn provider_id(&self) -> &str {
+                "mock"
+            }
+            async fn stream(
+                &self,
+                _: coda_llm::ChatRequest,
+            ) -> Result<coda_llm::ResponseStream, coda_llm::LlmError> {
+                // 500, no body: not a context-overflow shape (arm 1), not a
+                // `Transport`/`IncompleteStream` variant (arm 2), and
+                // `body.is_some()` fails (arm 3) — genuinely terminal.
+                let (tx, rx) = tokio::sync::mpsc::channel(64);
+                tokio::spawn(async move {
+                    let _ = tx
+                        .send(Err(coda_llm::LlmError::Api {
+                            status: 500,
+                            message: "internal server error, canary-must-not-persist".into(),
+                            kind: coda_llm::FailureKind::Permanent,
+                            retry_after: None,
+                            body: None,
+                        }))
+                        .await;
+                });
+                Ok(coda_llm::ResponseStream::new(rx))
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let client = AlwaysFailsClient;
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("model".to_owned(), vec![]);
+        let retry_cfg = RetryConfig { max_transport_retries: 1, max_schema_evictions: 1 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let result = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                Some(&|| true),
+                &mut blocked,
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "a genuinely non-retryable error must still surface");
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        let failures: Vec<&serde_json::Value> = lines.iter().filter(|l| l["kind"] == "stream_failure").collect();
+        assert_eq!(
+            failures.len(),
+            1,
+            "a final non-retryable failure must be logged exactly once — never zero, never duplicated: {lines:?}"
+        );
+        assert!(
+            !content.contains("canary-must-not-persist"),
+            "the free-text message must never be persisted: {content}"
+        );
+    }
+
+    // ── BUG4: agent-level phase integration with a real provider client ────
+    //
+    // `record_request_failure`/`record_stream_failure`'s "prestream vs
+    // post-headers" split is only meaningful end-to-end through a real
+    // `LlmClient` (a fake test client bypasses `send_with_retry` entirely
+    // and so never emits `RequestShape`/`StreamOpened` at all — which is
+    // itself an accepted, documented limitation, not a bug: an unknown/fake
+    // transport correctly gets no fabricated route). This drives the real
+    // `AnthropicClient` against a loopback fixture through the actual agent
+    // retry loop so `StreamOpened` truly precedes `StreamFailure`.
+    #[tokio::test]
+    async fn stream_opened_precedes_stream_failure_for_a_real_client_inline_error() {
+        use crate::events::NullSink;
+        use crate::tool::ToolQuarantine;
+        use std::sync::Arc;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        // A loopback fixture that accepts headers, sends 2xx SSE headers,
+        // opens a text block, then sends an inline `error` event — the
+        // provider accepted the request (headers/2xx already sent) but
+        // failed *after* streaming began.
+        async fn serve_inline_error() -> String {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+            let port = listener.local_addr().expect("addr").port();
+            tokio::spawn(async move {
+                let Ok((mut socket, _)) = listener.accept().await else { return };
+                let mut buf = vec![0u8; 8192];
+                let _ = socket.read(&mut buf).await;
+                let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\nconnection: close\r\n\r\n";
+                let _ = socket.write_all(head.as_bytes()).await;
+                let start = serde_json::json!({
+                    "type": "content_block_start", "index": 0,
+                    "content_block": { "type": "text", "text": "" }
+                });
+                let _ = socket.write_all(format!("event: content_block_start\ndata: {start}\n\n").as_bytes()).await;
+                let err = serde_json::json!({
+                    "type": "error",
+                    "error": { "type": "overloaded_error", "code": "rate_limit_exceeded", "message": "canary-inline-message-must-not-persist" }
+                });
+                let _ = socket.write_all(format!("event: error\ndata: {err}\n\n").as_bytes()).await;
+                let _ = socket.shutdown().await;
+            });
+            format!("http://127.0.0.1:{port}")
+        }
+
+        let url = serve_inline_error().await;
+        let real_client = coda_llm::anthropic::AnthropicClient::new(
+            coda_llm::anthropic::AnthropicConfig::api_key("test-key")
+                .with_base_url(url)
+                .with_retry(coda_llm::RetryPolicy::none()),
+        )
+        .expect("client");
+
+        let dir = tempfile::tempdir().unwrap();
+        let logger = coda_diagnostics::Logger::open(
+            coda_diagnostics::Options {
+                directory: dir.path().to_path_buf(),
+                file: None,
+                role: coda_diagnostics::ProcessRole::Serve,
+                version: "test".into(),
+                verbosity: coda_diagnostics::Verbosity::Normal,
+            },
+            coda_diagnostics::Limits::default(),
+        )
+        .expect("logger opens");
+        let ctx = coda_diagnostics::DiagnosticContext::root(Arc::new(logger), "run-1")
+            .with_session("sess-1")
+            .with_turn("turn-1");
+
+        let quarantine = ToolQuarantine::new();
+        let mut request = coda_llm::ChatRequest::new("claude-opus-5".to_owned(), vec![]);
+        let retry_cfg = RetryConfig { max_transport_retries: 0, max_schema_evictions: 0 };
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let mut blocked = None;
+
+        let result = coda_diagnostics::scope(
+            ctx.clone(),
+            stream_with_retries(
+                &real_client,
+                &mut request,
+                &quarantine,
+                &NullSink,
+                cancel,
+                &retry_cfg,
+                None,
+                &mut blocked,
+            ),
+        )
+        .await;
+        assert!(result.is_err(), "the inline provider error must still surface to the caller");
+
+        let path = ctx.logger().status().path.expect("a log path");
+        let content = std::fs::read_to_string(path).unwrap();
+        let lines: Vec<serde_json::Value> = content
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+
+        let opened_pos = lines.iter().position(|l| l["kind"] == "stream_opened").expect("a stream_opened record");
+        let failure_pos = lines.iter().position(|l| l["kind"] == "stream_failure").expect("a stream_failure record");
+        assert!(opened_pos < failure_pos, "stream_opened must precede stream_failure: {lines:?}");
+        assert!(!lines.iter().any(|l| l["kind"] == "request_failure"), "headers were accepted; this is not a prestream failure: {lines:?}");
+
+        let failure = &lines[failure_pos];
+        assert_eq!(failure["detail"]["error_type"]["value"], "overloaded_error");
+        assert_eq!(failure["detail"]["error_code"]["value"], "rate_limit_exceeded");
+
+        assert!(!content.contains("canary-inline-message-must-not-persist"), "the provider's free-text message must never be persisted: {content}");
     }
 }

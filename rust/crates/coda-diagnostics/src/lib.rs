@@ -13,6 +13,7 @@
 //!   process-global "current session".
 
 pub mod context;
+pub mod detail;
 pub mod event;
 pub mod writer;
 
